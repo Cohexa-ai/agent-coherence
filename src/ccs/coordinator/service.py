@@ -258,6 +258,12 @@ class CoordinatorService:
         self.registry.remove_artifact(artifact_id)
         return signals
 
+    def record_heartbeat(self, *, agent_id: UUID, now_tick: int) -> None:
+        """Record an agent's heartbeat tick (R12: max(prev, incoming))."""
+        if now_tick < 0:
+            raise ValueError("now_tick must be >= 0")
+        self.registry.record_heartbeat(agent_id, now_tick)
+
     def enforce_transient_timeouts(self, *, current_tick: int, timeout_ticks: int) -> int:
         """Force expired transient entries to INVALID as fail-safe recovery."""
         if timeout_ticks < 1:

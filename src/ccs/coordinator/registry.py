@@ -26,6 +26,8 @@ class ArtifactRecord:
     transient_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
     last_writer: Optional[UUID] = None
     version_history: dict[int, str] = field(default_factory=dict)
+    granted_at_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
+    last_reclamation_by_agent: dict[UUID, tuple[str, int]] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -45,6 +47,7 @@ class ArtifactRegistry:
                 "pass instance_id=str(uuid4()) or route through CCSStore which manages it automatically"
             )
         self._records: dict[UUID, ArtifactRecord] = {}
+        self._heartbeat_by_agent: dict[UUID, int] = {}
         self._state_log = state_log
         self._agent_names = agent_names
         self._instance_id: str = instance_id if instance_id is not None else str(uuid4())
@@ -142,6 +145,55 @@ class ArtifactRegistry:
                 # Roll back so the next successful emission does not create a phantom gap.
                 self._seq -= 1
                 raise
+
+        # Crash-recovery bookkeeping (no log emit, no serialization). Runs unconditionally —
+        # keeping the hot path branch-free preserves R5 byte-identity (these are dict mutations
+        # only, never serialized) and avoids subtle flag-on/flag-off divergence.
+        record = self._records[artifact_id]
+        m_or_e = {MESIState.MODIFIED, MESIState.EXCLUSIVE}
+        new_in_me = state in m_or_e
+        prev_in_me = from_state in m_or_e
+        if new_in_me:
+            if not prev_in_me:
+                # Set granted_at_tick on M∪E acquire only; M↔E transitions preserve the
+                # original grant tick (the agent has continuously held some M∪E grant).
+                record.granted_at_tick_by_agent[agent_id] = tick
+                # Slot clears on M∪E acquire ONLY (not on SHARED) — preserves jessieibarra path.
+                record.last_reclamation_by_agent.pop(agent_id, None)
+        elif prev_in_me:
+            record.granted_at_tick_by_agent.pop(agent_id, None)
+
+    def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
+        """Record an agent's heartbeat tick using max(prev, incoming) (R12 monotonicity)."""
+        prev = self._heartbeat_by_agent.get(agent_id)
+        if prev is None or now_tick > prev:
+            self._heartbeat_by_agent[agent_id] = now_tick
+
+    def last_heartbeat_tick(self, agent_id: UUID) -> int | None:
+        """Return the last recorded heartbeat tick for an agent, if any."""
+        return self._heartbeat_by_agent.get(agent_id)
+
+    def record_last_reclamation(
+        self, agent_id: UUID, artifact_id: UUID, trigger: str, tick: int
+    ) -> None:
+        """Record the most recent reclamation slot for an (agent, artifact) pair."""
+        self._records[artifact_id].last_reclamation_by_agent[agent_id] = (trigger, tick)
+
+    def get_last_reclamation(
+        self, agent_id: UUID, artifact_id: UUID
+    ) -> tuple[str, int] | None:
+        """Return the most recent reclamation slot for an (agent, artifact) pair, if any."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        return record.last_reclamation_by_agent.get(agent_id)
+
+    def granted_at_tick(self, agent_id: UUID, artifact_id: UUID) -> int | None:
+        """Return the tick at which agent acquired its current M/E grant on artifact, if any."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        return record.granted_at_tick_by_agent.get(agent_id)
 
     def get_agent_transient(self, artifact_id: UUID, agent_id: UUID) -> TransientState | None:
         """Return transient state for one agent/artifact pair if present."""
