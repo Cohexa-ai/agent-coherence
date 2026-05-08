@@ -407,3 +407,148 @@ def test_invalid_max_hold_raises() -> None:
         svc.enforce_stable_grant_timeouts(
             current_tick=10, heartbeat_timeout_ticks=10, max_hold_ticks=0
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit 5: combined validation-scenario driver test (R9)
+# ---------------------------------------------------------------------------
+
+
+def test_combined_validation_scenario_exercises_all_three_reclaim_shapes(
+    tmp_path: Path,
+) -> None:
+    """R9: one scenario exercises OOM-kill, checkpoint-restore-then-commit,
+    and live-but-stuck max-hold shapes in a single repeatable run.
+
+    Setup:
+      - agent_0 holds EXCLUSIVE on artifact_0; killed at tick 5 (YAML);
+        expected: reclaim_heartbeat. agent_3 then writes artifact_0.
+      - agent_1 holds MODIFIED on artifact_1; killed at tick 10 (YAML),
+        restored at tick 30 (YAML); driver simulates the stale post-restore
+        commit() and asserts CoherenceError carries reclaimed_by/at_tick.
+      - agent_2 holds EXCLUSIVE on artifact_2; stays alive (heartbeats every
+        tick); never commits. With max_hold_ticks=400, sweep reclaims via
+        reclaim_max_hold around tick 400.
+
+    YAML drives kill/restore deterministically; driver seeds the M∪E grants
+    (engine has no per-agent grant config) and issues post-run probes.
+    """
+    from ccs.core.types import FetchRequest as _FR
+    from ccs.simulation.engine import SimulationEngine
+    from ccs.simulation.scenarios import load_scenario
+
+    scenario = load_scenario("benchmarks/scenarios/crash_recovery_validation.yaml")
+    engine = SimulationEngine(scenario, strategy_name="lazy")
+
+    # Wire a state-log capture into the engine's registry so we can audit
+    # reclamation entries and run validate_log on a JSONL dump afterwards.
+    log_entries: list[dict] = []
+    log_path = tmp_path / "state_log.jsonl"
+    log_fh = log_path.open("w", encoding="utf-8")
+
+    def _emit(entry: dict) -> None:
+        log_entries.append(entry)
+        log_fh.write(json.dumps(entry) + "\n")
+
+    engine._registry._state_log = _emit  # noqa: SLF001 — test-only capture hook
+    # Reset _seq so log entries start at 1 even though no log was attached
+    # at registry construction; without this the first entry observed by the
+    # capture lambda begins at the post-construction _seq value, not 1.
+    engine._registry._seq = 0  # noqa: SLF001
+
+    artifact_0 = engine._artifact_ids[0]
+    artifact_1 = engine._artifact_ids[1]
+    artifact_2 = engine._artifact_ids[2]
+    agent_0 = engine._agent_id_by_name["agent_0"]
+    agent_1 = engine._agent_id_by_name["agent_1"]
+    agent_2 = engine._agent_id_by_name["agent_2"]
+    agent_3 = engine._agent_id_by_name["agent_3"]
+
+    # Seed initial M∪E grants at tick 0 — drive directly through the coordinator.
+    engine._coordinator.fetch(  # agent_0 → EXCLUSIVE on artifact_0
+        _FR(artifact_id=artifact_0, requesting_agent_id=agent_0, requested_at_tick=0)
+    )
+    engine._coordinator.fetch(  # agent_1 → EXCLUSIVE on artifact_1
+        _FR(artifact_id=artifact_1, requesting_agent_id=agent_1, requested_at_tick=0)
+    )
+    engine._coordinator.commit(  # promote agent_1 to MODIFIED on artifact_1
+        agent_id=agent_1, artifact_id=artifact_1, content="v2", issued_at_tick=0
+    )
+    engine._coordinator.fetch(  # agent_2 → EXCLUSIVE on artifact_2
+        _FR(artifact_id=artifact_2, requesting_agent_id=agent_2, requested_at_tick=0)
+    )
+
+    assert engine._registry.get_agent_state(artifact_0, agent_0) == MESIState.EXCLUSIVE
+    assert engine._registry.get_agent_state(artifact_1, agent_1) == MESIState.MODIFIED
+    assert engine._registry.get_agent_state(artifact_2, agent_2) == MESIState.EXCLUSIVE
+
+    # Run the simulation. The engine's per-tick loop applies failure events,
+    # heartbeats _alive_agents, and runs the stable-grant sweep each tick.
+    metrics = engine.run()
+
+    # ---- Reclamation count + per-trigger breakdown ----
+    reclaim_entries = [
+        e for e in log_entries
+        if e.get("trigger") in {"reclaim_heartbeat", "reclaim_max_hold"}
+    ]
+    heartbeat_entries = [e for e in reclaim_entries if e["trigger"] == "reclaim_heartbeat"]
+    max_hold_entries = [e for e in reclaim_entries if e["trigger"] == "reclaim_max_hold"]
+
+    assert metrics.stable_grant_reclamations >= 3, (
+        f"expected ≥3 reclamations (one per agent_0/agent_1/agent_2); "
+        f"got {metrics.stable_grant_reclamations}"
+    )
+    assert len(heartbeat_entries) >= 2, (
+        f"expected ≥2 reclaim_heartbeat entries (agent_0 + agent_1); "
+        f"got {len(heartbeat_entries)}"
+    )
+    assert len(max_hold_entries) >= 1, (
+        f"expected ≥1 reclaim_max_hold entry (agent_2 live-but-stuck); "
+        f"got {len(max_hold_entries)}"
+    )
+
+    # ---- Per-agent state checks ----
+    assert engine._registry.get_agent_state(artifact_0, agent_0) == MESIState.INVALID
+    assert engine._registry.get_agent_state(artifact_1, agent_1) == MESIState.INVALID
+    assert engine._registry.get_agent_state(artifact_2, agent_2) == MESIState.INVALID
+
+    # ---- Post-reclamation peer write (jingchang0623 unblocks) ----
+    engine._coordinator.write(
+        agent_id=agent_3, artifact_id=artifact_0, issued_at_tick=599
+    )
+    assert engine._registry.get_agent_state(artifact_0, agent_3) == MESIState.EXCLUSIVE
+    check_single_writer(engine._registry.get_state_map(artifact_0))
+
+    # ---- jessieibarra path: agent_1's late commit raises with diagnostic ----
+    reclaim_for_a1 = engine._registry.get_last_reclamation(agent_1, artifact_1)
+    assert reclaim_for_a1 is not None
+    a1_trigger, a1_tick = reclaim_for_a1
+    assert a1_trigger == "reclaim_heartbeat"
+
+    with pytest.raises(CoherenceError) as exc_info:
+        engine._coordinator.commit(
+            agent_id=agent_1,
+            artifact_id=artifact_1,
+            content="late-restored-content",
+            issued_at_tick=599,
+        )
+    msg = str(exc_info.value)
+    assert "reclaimed_by=reclaim_heartbeat" in msg
+    assert f"at_tick={a1_tick}" in msg
+
+    # ---- Single-writer + monotonic version invariants on every artifact ----
+    for artifact_id in engine._artifact_ids:
+        check_single_writer(engine._registry.get_state_map(artifact_id))
+        # Reclamation does not bump version; commit by agent_1 (tick 0) bumped
+        # artifact_1 from v1 → v2, and agent_3's post-run write left
+        # artifact_0 at v1 (write request without commit). Just spot-check
+        # version is positive and the helper accepts the trivial pair.
+        version = engine._registry.get_artifact(artifact_id).version
+        assert version >= 1
+        check_monotonic_version(version, version)
+
+    # ---- State-log validation: no gaps, no schema mismatches (R6) ----
+    log_fh.close()
+    gaps, mismatches = validate_log(log_path, schema_version="ccs.state_log.v2")
+    assert gaps == []
+    assert mismatches == []

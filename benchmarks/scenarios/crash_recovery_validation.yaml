@@ -1,0 +1,71 @@
+# Crash-recovery validation scenario (Unit 5, R9).
+#
+# Single combined scenario exercising all three reclamation shapes in one run:
+#   - agent_0 holds EXCLUSIVE on artifact_0, killed at tick 5, never restored.
+#     Models jingchang0623 (OOM-kill) → reclaim_heartbeat.
+#   - agent_1 holds MODIFIED on artifact_1, killed at tick 10, restored at
+#     tick 30 (driver test issues a stale commit() afterwards).
+#     Models jessieibarra (checkpoint-restore-then-commit) → reclaim_heartbeat,
+#     then late commit() raises CoherenceError carrying reclamation context.
+#   - agent_2 holds EXCLUSIVE on artifact_2 from tick 0; stays alive
+#     (continues heartbeating), never commits, never releases.
+#     Models the live-but-stuck shape → reclaim_max_hold at ~tick 400.
+#   - agent_3 acquires nothing initially; the driver test issues a write on
+#     artifact_0 after the run to confirm reclamation unblocks the artifact.
+#
+# Initial M∪E grants are seeded by the driver test (engine has no per-agent
+# write knob); see tests/test_crash_recovery.py::test_combined_validation_scenario.
+# Failure events handle kills/restore deterministically via the YAML schema.
+#
+# duration_ticks=600 > max_hold_ticks=400 so the live-but-stuck sweep fires.
+# max_hold_ticks=400 > LeaseStrategy.ttl_ticks=300 (R11 composition rule).
+
+simulation:
+  duration_ticks: 600
+  num_agents: 4
+  seed: 20260507
+  action_probability: 0.0  # Driver test owns all M∪E setup; engine action loop is silent.
+network:
+  latency_ticks: 0
+  message_loss_rate: 0.0
+scenario:
+  name: crash-recovery-validation
+  workload: custom
+  action_probability: 0.0
+  write_probability: 0.0
+artifacts:
+  - id: artifact_0
+    size_tokens: 256
+    volatility: 0.0
+    initial_version: 1
+    mutable: true
+  - id: artifact_1
+    size_tokens: 256
+    volatility: 0.0
+    initial_version: 1
+    mutable: true
+  - id: artifact_2
+    size_tokens: 256
+    volatility: 0.0
+    initial_version: 1
+    mutable: true
+strategies:
+  eager: {}
+  lazy:
+    check_interval_ticks: 100
+  lease:
+    default_ttl_ticks: 300
+  access_count:
+    max_accesses: 100
+transient:
+  timeout_ticks: 100
+context_semantics:
+  model: conditional_injection
+crash_recovery:
+  enabled: true
+  heartbeat_timeout_ticks: 8
+  max_hold_ticks: 400
+failure_events:
+  - {tick: 5, action: kill, agent: agent_0}
+  - {tick: 10, action: kill, agent: agent_1}
+  - {tick: 30, action: restore, agent: agent_1}
