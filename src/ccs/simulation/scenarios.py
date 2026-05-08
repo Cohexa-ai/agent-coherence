@@ -287,6 +287,56 @@ def _validate_crash_recovery(crash_recovery: dict[str, Any], path: Path) -> None
         )
 
 
+_SUPPORTED_FAILURE_ACTIONS = {"kill", "busy", "restore"}
+
+
+def _validate_failure_events(failure_events: Any, path: Path) -> None:
+    """Validate optional ``failure_events`` top-level list.
+
+    Each entry: ``{tick, action, agent, [until_tick]}``.
+      - ``action`` ∈ {kill, busy, restore}
+      - ``tick`` integer >= 0
+      - ``agent`` non-empty string (cross-checked against agent set at engine init)
+      - ``until_tick`` required for ``busy`` and must be > ``tick``;
+        forbidden for ``kill`` and ``restore``.
+    """
+    if failure_events is None:
+        return
+    if not isinstance(failure_events, list):
+        raise ScenarioValidationError(str(path), "'failure_events' must be a list")
+    for idx, event in enumerate(failure_events):
+        prefix = f"failure_events[{idx}]"
+        if not isinstance(event, dict):
+            raise ScenarioValidationError(str(path), f"'{prefix}' must be a mapping")
+        _require_int(event.get("tick"), path=path, field=f"{prefix}.tick", min_value=0)
+        action = event.get("action")
+        if action not in _SUPPORTED_FAILURE_ACTIONS:
+            raise ScenarioValidationError(
+                str(path),
+                f"'{prefix}.action' must be one of: {', '.join(sorted(_SUPPORTED_FAILURE_ACTIONS))}",
+            )
+        agent = event.get("agent")
+        if not isinstance(agent, str) or not agent.strip():
+            raise ScenarioValidationError(str(path), f"'{prefix}.agent' must be a non-empty string")
+        until_tick = event.get("until_tick")
+        if action == "busy":
+            if until_tick is None:
+                raise ScenarioValidationError(
+                    str(path), f"'{prefix}.until_tick' is required when action='busy'"
+                )
+            _require_int(until_tick, path=path, field=f"{prefix}.until_tick", min_value=0)
+            if int(until_tick) <= int(event["tick"]):
+                raise ScenarioValidationError(
+                    str(path), f"'{prefix}.until_tick' must be > {prefix}.tick"
+                )
+        else:
+            if until_tick is not None:
+                raise ScenarioValidationError(
+                    str(path),
+                    f"'{prefix}.until_tick' is only valid when action='busy'",
+                )
+
+
 def _validate_context_semantics(context_semantics: dict[str, Any], path: Path) -> None:
     model = context_semantics.get("model")
     if model not in _SUPPORTED_CONTEXT_MODELS:
@@ -338,6 +388,7 @@ def validate_scenario(data: dict[str, Any], scenario_path: str | Path) -> dict[s
     _validate_transient(transient, path)
     _validate_context_semantics(context_semantics, path)
     _validate_crash_recovery(crash_recovery, path)
+    _validate_failure_events(normalized.get("failure_events"), path)
 
     return _populate_runtime_aliases(normalized)
 

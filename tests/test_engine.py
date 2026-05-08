@@ -224,3 +224,281 @@ def test_engine_flag_off_state_log_is_byte_identical_with_or_without_block() -> 
 
     assert log_without_block == log_with_disabled_block
     assert len(log_without_block) > 0  # sanity: we actually captured something
+
+
+# ---- Unit 4: failure-event injection + sweep wiring -------------------------
+
+from ccs.core.states import MESIState  # noqa: E402
+from ccs.core.types import FetchRequest  # noqa: E402
+
+
+def _failure_scenario(*, num_agents: int = 2, duration: int = 50) -> dict:
+    """Minimal scenario for failure-event integration tests.
+
+    Single small artifact, deterministic action knobs, no network latency.
+    Action knobs are very low — tests drive state via direct registry/coordinator
+    calls when they need precise control over MESI lifecycle.
+    """
+    return {
+        "simulation": {
+            "duration_ticks": duration,
+            "num_agents": num_agents,
+            "seed": 7,
+            "action_probability": 0.0,
+            "actions_per_tick": 1,
+        },
+        "network": {"latency_ticks": 0, "message_loss_rate": 0.0},
+        "scenario": {
+            "name": "failure-injection",
+            "workload": "read_heavy",
+            "action_probability": 0.0,
+            "write_probability": 0.0,
+            "agent_velocity": None,
+            "revocation_tick": None,
+        },
+        "artifacts": [
+            {"id": "plan.md", "size_tokens": 100, "volatility": 0.0, "initial_version": 1, "mutable": True},
+        ],
+        "strategies": {
+            "eager": {},
+            "lazy": {"check_interval_ticks": 100},
+            "lease": {"default_ttl_ticks": 5},
+            "access_count": {"max_accesses": 4},
+            "exec_count": {"max_operations": 4},
+        },
+        "transient": {"timeout_ticks": 100},
+        "context_semantics": {"model": "conditional_injection"},
+    }
+
+
+def _capture_state_log(engine: SimulationEngine) -> list[dict]:
+    log: list[dict] = []
+    engine._registry._state_log = log.append
+    return log
+
+
+def test_failure_event_kill_triggers_heartbeat_reclaim() -> None:
+    """R1 / OOM-kill shape: A acquires E, is killed, sweep reclaims, B can write.
+
+    A is granted EXCLUSIVE on artifact_0 at tick 0. A `kill` event fires at
+    tick 5. After heartbeat_timeout_ticks elapse with no heartbeat, the
+    sweep reclaims A's grant via ``reclaim_heartbeat``. Agent B's subsequent
+    write succeeds.
+    """
+    scenario = _failure_scenario(num_agents=2, duration=30)
+    scenario["crash_recovery"] = {
+        "enabled": True,
+        "heartbeat_timeout_ticks": 5,
+        "max_hold_ticks": 1000,
+    }
+    scenario["failure_events"] = [
+        {"tick": 5, "action": "kill", "agent": "agent_0"},
+    ]
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    log = _capture_state_log(engine)
+
+    artifact_id = engine._artifact_ids[0]
+    agent_a = engine._agent_id_by_name["agent_0"]
+    agent_b = engine._agent_id_by_name["agent_1"]
+
+    # Pre-grant EXCLUSIVE to A at tick 0.
+    engine._coordinator.fetch(
+        FetchRequest(artifact_id=artifact_id, requesting_agent_id=agent_a, requested_at_tick=0)
+    )
+    assert engine._registry.get_agent_state(artifact_id, agent_a) == MESIState.EXCLUSIVE
+
+    engine.run()
+
+    assert engine._stable_grant_reclamations >= 1
+    reclaim_entries = [e for e in log if e.get("trigger") == "reclaim_heartbeat"]
+    assert len(reclaim_entries) >= 1
+    # B can now write because A's grant was reclaimed.
+    engine._coordinator.write(agent_id=agent_b, artifact_id=artifact_id, issued_at_tick=29)
+    assert engine._registry.get_agent_state(artifact_id, agent_b) == MESIState.EXCLUSIVE
+
+
+def test_failure_event_alive_agent_max_hold_reclaim() -> None:
+    """R2 / max-hold-alive shape: live agent never commits; max_hold reclaims.
+
+    A acquires MODIFIED at tick 10, then continues to be heartbeated by the
+    engine (it stays in ``_alive_agents``). After ``max_hold_ticks`` ticks
+    pass with no commit, the sweep reclaims via ``reclaim_max_hold``.
+    """
+    scenario = _failure_scenario(num_agents=1, duration=60)
+    scenario["crash_recovery"] = {
+        "enabled": True,
+        "heartbeat_timeout_ticks": 1000,  # heartbeat trigger never fires
+        "max_hold_ticks": 30,
+    }
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    log = _capture_state_log(engine)
+
+    artifact_id = engine._artifact_ids[0]
+    agent_a = engine._agent_id_by_name["agent_0"]
+
+    engine._coordinator.fetch(
+        FetchRequest(artifact_id=artifact_id, requesting_agent_id=agent_a, requested_at_tick=0)
+    )
+    engine._coordinator.commit(
+        agent_id=agent_a, artifact_id=artifact_id, content="v2", issued_at_tick=10
+    )
+    assert engine._registry.get_agent_state(artifact_id, agent_a) == MESIState.MODIFIED
+
+    engine.run()
+
+    reclaim_entries = [e for e in log if e.get("trigger") == "reclaim_max_hold"]
+    assert len(reclaim_entries) >= 1
+    assert engine._stable_grant_reclamations >= 1
+
+
+def test_busy_agent_during_sync_compute_is_falsely_reclaimed() -> None:
+    """Documents the false-reclaim-under-sync-compute shape (Carryover risk #3).
+
+    Agent A acquires EXCLUSIVE; at tick 5, a ``busy`` event fires with
+    ``until_tick = 5 + heartbeat_timeout_ticks + 1``. Inside the busy window
+    A does NOT heartbeat and does NOT act. The sweep is expected to reclaim
+    A via ``reclaim_heartbeat`` because the engine cannot distinguish
+    "blocked on long sync compute" from "crashed". This test passes by
+    DEMONSTRATING the failure mode, not by avoiding it.
+    """
+    heartbeat_timeout = 4
+    busy_start = 5
+    busy_until = busy_start + heartbeat_timeout + 2
+    scenario = _failure_scenario(num_agents=1, duration=busy_until + 5)
+    scenario["crash_recovery"] = {
+        "enabled": True,
+        "heartbeat_timeout_ticks": heartbeat_timeout,
+        "max_hold_ticks": 1000,
+    }
+    scenario["failure_events"] = [
+        {"tick": busy_start, "action": "busy", "agent": "agent_0", "until_tick": busy_until},
+    ]
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    log = _capture_state_log(engine)
+
+    artifact_id = engine._artifact_ids[0]
+    agent_a = engine._agent_id_by_name["agent_0"]
+
+    engine._coordinator.fetch(
+        FetchRequest(artifact_id=artifact_id, requesting_agent_id=agent_a, requested_at_tick=0)
+    )
+
+    engine.run()
+
+    reclaim_entries = [e for e in log if e.get("trigger") == "reclaim_heartbeat"]
+    assert len(reclaim_entries) >= 1, (
+        "expected the sync-compute busy window to trigger a false-positive heartbeat reclaim"
+    )
+    assert engine._stable_grant_reclamations >= 1
+
+
+def test_killed_agent_does_not_act() -> None:
+    """A killed agent must never reach _perform_read or _perform_write."""
+    scenario = _failure_scenario(num_agents=2, duration=30)
+    # Force every alive agent to act every tick.
+    scenario["scenario"]["action_probability"] = 1.0
+    scenario["scenario"]["write_probability"] = 0.5
+    scenario["failure_events"] = [
+        {"tick": 5, "action": "kill", "agent": "agent_0"},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=3)
+    agent_a = engine._agent_id_by_name["agent_0"]
+    agent_b = engine._agent_id_by_name["agent_1"]
+
+    seen_agents: list = []
+    original = engine._execute_single_action
+
+    def _spy(*, agent_id, now_tick):
+        if now_tick >= 5:
+            seen_agents.append((now_tick, agent_id))
+        return original(agent_id=agent_id, now_tick=now_tick)
+
+    engine._execute_single_action = _spy  # type: ignore[assignment]
+    engine.run()
+
+    # After tick 5 (kill takes effect at start of tick 5), A must never act.
+    post_kill_a = [t for t, aid in seen_agents if aid == agent_a]
+    post_kill_b = [t for t, aid in seen_agents if aid == agent_b]
+    assert post_kill_a == [], f"killed agent acted at ticks {post_kill_a}"
+    assert post_kill_b, "control: live agent should still be acting"
+
+
+def test_metrics_include_stable_grant_reclamations_field() -> None:
+    """R5: existing baseline scenarios get the new field defaulted to 0."""
+    metrics = SimulationEngine(_scenario(), strategy_name="lazy", seed=5).run()
+    payload = metrics.to_dict()
+    assert "stable_grant_reclamations" in payload
+    assert payload["stable_grant_reclamations"] == 0
+
+
+def test_baseline_state_log_byte_identical_with_disabled_flag_after_unit4() -> None:
+    """R5: with crash_recovery disabled, state-log is identical to v0.5 baseline.
+
+    Identical to the Unit 3 byte-identity test but exercises the Unit 4
+    code paths now that the sweep call site exists. The flag-off guard at
+    the call site MUST keep the heartbeat / sweep entries out of the log.
+    """
+
+    def _run_and_capture(crash_recovery_block: dict | None) -> list[dict]:
+        scenario = _scenario()
+        if crash_recovery_block is not None:
+            scenario["crash_recovery"] = crash_recovery_block
+        engine = SimulationEngine(scenario, strategy_name="lazy", seed=42)
+        log: list[dict] = []
+        engine._registry._state_log = log.append
+        engine.run()
+        artifact_id_map: dict[str, str] = {}
+        for entry in log:
+            entry["instance_id"] = "<inst>"
+            aid = entry.get("artifact_id")
+            if aid is not None:
+                aid_str = str(aid)
+                placeholder = artifact_id_map.setdefault(
+                    aid_str, f"<artifact-{len(artifact_id_map)}>"
+                )
+                entry["artifact_id"] = placeholder
+        return log
+
+    log_without_block = _run_and_capture(None)
+    log_with_disabled_block = _run_and_capture(
+        {"enabled": False, "heartbeat_timeout_ticks": 5, "max_hold_ticks": 50}
+    )
+    assert log_without_block == log_with_disabled_block
+    assert len(log_without_block) > 0
+
+
+def test_failure_event_unknown_agent_name_raises() -> None:
+    scenario = _failure_scenario(num_agents=1, duration=10)
+    scenario["failure_events"] = [
+        {"tick": 1, "action": "kill", "agent": "agent_999"},
+    ]
+    with pytest.raises(ValueError, match="unknown agent name"):
+        SimulationEngine(scenario, strategy_name="lazy", seed=1)
+
+
+def test_busy_window_auto_expires_without_restore_event() -> None:
+    """`busy` with `until_tick` flips back to alive automatically."""
+    scenario = _failure_scenario(num_agents=1, duration=20)
+    scenario["scenario"]["action_probability"] = 1.0
+    scenario["failure_events"] = [
+        {"tick": 2, "action": "busy", "agent": "agent_0", "until_tick": 6},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    agent_a = engine._agent_id_by_name["agent_0"]
+
+    seen: list[int] = []
+    original = engine._execute_single_action
+
+    def _spy(*, agent_id, now_tick):
+        if agent_id == agent_a:
+            seen.append(now_tick)
+        return original(agent_id=agent_id, now_tick=now_tick)
+
+    engine._execute_single_action = _spy  # type: ignore[assignment]
+    engine.run()
+
+    # During [2, 6) A is busy; from tick 6 onward A is alive again.
+    assert all(t < 2 or t >= 6 for t in seen), seen
+    assert any(t >= 6 for t in seen), "agent should resume acting after busy window"

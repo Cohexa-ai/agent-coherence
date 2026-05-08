@@ -186,3 +186,64 @@ def test_load_scenario_rejects_negative_max_hold(tmp_path: Path) -> None:
 
     with pytest.raises(ScenarioValidationError, match="max_hold_ticks"):
         load_scenario(str(scenario_path))
+
+
+# ---- Unit 4: failure_events schema -----------------------------------------
+
+
+def test_load_scenario_accepts_failure_events_block(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "ok-fe.yaml"
+    payload = _minimal_scenario_payload()
+    payload["failure_events"] = [
+        {"tick": 5, "action": "kill", "agent": "agent_0"},
+        {"tick": 10, "action": "busy", "agent": "agent_1", "until_tick": 20},
+        {"tick": 30, "action": "restore", "agent": "agent_0"},
+    ]
+    _write_yaml(scenario_path, payload)
+
+    config = load_scenario(str(scenario_path))
+    assert len(config["failure_events"]) == 3
+
+
+def test_load_scenario_rejects_unknown_failure_action(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-fe-action.yaml"
+    payload = _minimal_scenario_payload()
+    payload["failure_events"] = [{"tick": 1, "action": "explode", "agent": "agent_0"}]
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="action"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_busy_without_until_tick(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-fe-busy.yaml"
+    payload = _minimal_scenario_payload()
+    payload["failure_events"] = [{"tick": 1, "action": "busy", "agent": "agent_0"}]
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="until_tick"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_kill_with_until_tick(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-fe-kill-until.yaml"
+    payload = _minimal_scenario_payload()
+    payload["failure_events"] = [
+        {"tick": 1, "action": "kill", "agent": "agent_0", "until_tick": 5}
+    ]
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="until_tick"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_busy_until_tick_not_after_tick(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-fe-window.yaml"
+    payload = _minimal_scenario_payload()
+    payload["failure_events"] = [
+        {"tick": 5, "action": "busy", "agent": "agent_0", "until_tick": 5}
+    ]
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="until_tick"):
+        load_scenario(str(scenario_path))
