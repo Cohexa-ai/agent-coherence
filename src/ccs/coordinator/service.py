@@ -71,9 +71,11 @@ def _validate_crash_recovery_config(
         return
 
     if ttl is None:
-        # Built-in strategies other than LeaseStrategy expose no TTL — silent-accept
-        # is correct for those. A custom strategy ought to expose ttl_ticks; warn so
-        # the integrator notices.
+        # Built-in non-lease strategies (lazy, eager, access_count, broadcast) and
+        # any custom strategy without a ttl_ticks attribute cannot be statically
+        # validated against R11. Silent-accept matches the spec's design choice
+        # for the common case; the warn-on-non-int branch below catches the
+        # narrower "attribute exists but isn't an int" foot-gun.
         return
 
     warnings.warn(
