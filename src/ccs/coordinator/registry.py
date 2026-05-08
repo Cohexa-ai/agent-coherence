@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
+
+ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
+_M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
 
 @dataclass
@@ -27,7 +30,7 @@ class ArtifactRecord:
     last_writer: Optional[UUID] = None
     version_history: dict[int, str] = field(default_factory=dict)
     granted_at_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
-    last_reclamation_by_agent: dict[UUID, tuple[str, int]] = field(default_factory=dict)
+    last_reclamation_by_agent: dict[UUID, ReclamationSlot] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -150,15 +153,15 @@ class ArtifactRegistry:
         # keeping the hot path branch-free preserves R5 byte-identity (these are dict mutations
         # only, never serialized) and avoids subtle flag-on/flag-off divergence.
         record = self._records[artifact_id]
-        m_or_e = {MESIState.MODIFIED, MESIState.EXCLUSIVE}
-        new_in_me = state in m_or_e
-        prev_in_me = from_state in m_or_e
+        new_in_me = state in _M_OR_E_STATES
+        prev_in_me = from_state in _M_OR_E_STATES
         if new_in_me:
             if not prev_in_me:
                 # Set granted_at_tick on M∪E acquire only; M↔E transitions preserve the
                 # original grant tick (the agent has continuously held some M∪E grant).
                 record.granted_at_tick_by_agent[agent_id] = tick
-                # Slot clears on M∪E acquire ONLY (not on SHARED) — preserves jessieibarra path.
+                # Slot clears on M∪E acquire ONLY (not on SHARED) — preserves the
+                # checkpoint-restore diagnostic across SHARED re-fetches.
                 record.last_reclamation_by_agent.pop(agent_id, None)
         elif prev_in_me:
             record.granted_at_tick_by_agent.pop(agent_id, None)
@@ -181,7 +184,7 @@ class ArtifactRegistry:
 
     def get_last_reclamation(
         self, agent_id: UUID, artifact_id: UUID
-    ) -> tuple[str, int] | None:
+    ) -> ReclamationSlot | None:
         """Return the most recent reclamation slot for an (agent, artifact) pair, if any."""
         record = self._records.get(artifact_id)
         if record is None:

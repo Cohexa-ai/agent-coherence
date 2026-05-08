@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 from uuid import UUID
 
 from ccs.agent.runtime import AgentRuntime
@@ -37,7 +37,7 @@ class _FailureEvent:
     """Internal canonical form of a parsed failure_events entry."""
 
     tick: int
-    action: str  # kill | busy | restore
+    action: Literal["kill", "busy", "restore"]
     agent_id: UUID
     until_tick: int | None = None
 
@@ -144,19 +144,19 @@ class SimulationEngine:
             self._deliver_messages()
             self._execute_actions_for_tick()
             if self._strategy.broadcasts_every_tick():
-                self._broadcast_all_to_all(now_tick=self._clock.now())
+                self._broadcast_all_to_all(now_tick=now)
             self._transient_state_timeouts += self._coordinator.enforce_transient_timeouts(
-                current_tick=self._clock.now(),
+                current_tick=now,
                 timeout_ticks=timeout_ticks,
             )
             if self._crash_recovery.enabled:
                 # R5: flag-off path must be byte-identical to v0.5 baseline.
                 # Guard at the call site so no heartbeat / sweep entries land
                 # in the state-log when the feature is disabled.
-                self._emit_heartbeats_for_alive_agents(now_tick=self._clock.now())
+                self._emit_heartbeats_for_alive_agents(now_tick=now)
                 self._stable_grant_reclamations += (
                     self._coordinator.enforce_stable_grant_timeouts(
-                        current_tick=self._clock.now(),
+                        current_tick=now,
                         heartbeat_timeout_ticks=self._crash_recovery.heartbeat_timeout_ticks,
                         max_hold_ticks=self._crash_recovery.max_hold_ticks,
                     )
@@ -219,7 +219,10 @@ class SimulationEngine:
                 self._alive_agents.discard(event.agent_id)
                 self._busy_agents.add(event.agent_id)
             elif event.action == "busy":
-                assert event.until_tick is not None
+                if event.until_tick is None:
+                    raise ValueError(
+                        f"failure_event(action='busy') missing until_tick at tick={event.tick}"
+                    )
                 self._alive_agents.discard(event.agent_id)
                 self._busy_agents.add(event.agent_id)
                 self._busy_until[event.agent_id] = event.until_tick

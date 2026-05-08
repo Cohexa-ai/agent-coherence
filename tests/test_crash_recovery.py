@@ -451,9 +451,18 @@ def test_combined_validation_scenario_exercises_all_three_reclaim_shapes(
         log_fh.write(json.dumps(entry) + "\n")
 
     engine._registry._state_log = _emit  # noqa: SLF001 — test-only capture hook
-    # Reset _seq so log entries start at 1 even though no log was attached
-    # at registry construction; without this the first entry observed by the
-    # capture lambda begins at the post-construction _seq value, not 1.
+    # Reset _seq so log entries start at 1 even though no log was attached at
+    # registry construction; without this the first entry observed by the
+    # capture lambda begins at the post-construction _seq value, not 1, and
+    # validate_log() reports a gap. Capture the pre-poke value first to make
+    # the brittleness explicit: if construction starts to emit entries on its
+    # own, this assertion will catch the silent regression instead of letting
+    # the reset mask it.
+    pre_poke_seq = engine._registry._seq  # noqa: SLF001
+    assert pre_poke_seq == 0, (
+        f"registry _seq was {pre_poke_seq} at capture-hook attach time; "
+        f"construction now emits state-log entries — re-evaluate this reset"
+    )
     engine._registry._seq = 0  # noqa: SLF001
 
     artifact_0 = engine._artifact_ids[0]
@@ -494,16 +503,16 @@ def test_combined_validation_scenario_exercises_all_three_reclaim_shapes(
     heartbeat_entries = [e for e in reclaim_entries if e["trigger"] == "reclaim_heartbeat"]
     max_hold_entries = [e for e in reclaim_entries if e["trigger"] == "reclaim_max_hold"]
 
-    assert metrics.stable_grant_reclamations >= 3, (
-        f"expected ≥3 reclamations (one per agent_0/agent_1/agent_2); "
+    assert metrics.stable_grant_reclamations == 3, (
+        f"expected exactly 3 reclamations (one per agent_0/agent_1/agent_2); "
         f"got {metrics.stable_grant_reclamations}"
     )
-    assert len(heartbeat_entries) >= 2, (
-        f"expected ≥2 reclaim_heartbeat entries (agent_0 + agent_1); "
+    assert len(heartbeat_entries) == 2, (
+        f"expected exactly 2 reclaim_heartbeat entries (agent_0 + agent_1); "
         f"got {len(heartbeat_entries)}"
     )
-    assert len(max_hold_entries) >= 1, (
-        f"expected ≥1 reclaim_max_hold entry (agent_2 live-but-stuck); "
+    assert len(max_hold_entries) == 1, (
+        f"expected exactly 1 reclaim_max_hold entry (agent_2 live-but-stuck); "
         f"got {len(max_hold_entries)}"
     )
 

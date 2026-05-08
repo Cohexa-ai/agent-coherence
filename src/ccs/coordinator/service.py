@@ -83,7 +83,7 @@ def _validate_crash_recovery_config(
         f"non-integer ttl_ticks={ttl!r}; composition rule (R11) cannot be "
         f"statically verified.",
         RuntimeWarning,
-        stacklevel=2,
+        stacklevel=3,
     )
 
 
