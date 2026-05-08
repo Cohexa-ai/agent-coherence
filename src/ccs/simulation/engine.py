@@ -11,7 +11,11 @@ from uuid import UUID
 
 from ccs.agent.runtime import AgentRuntime
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import (
+    CoordinatorService,
+    CrashRecoveryConfig,
+    _validate_crash_recovery_config,
+)
 from ccs.core.clock import LogicalClock
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, InvalidationSignal
@@ -25,6 +29,19 @@ from .metrics import SimulationMetrics, StrategyComparisonReport
 
 _INVALIDATION_SIGNAL_TOKENS = 12
 _POINTER_UPDATE_TOKENS = 8
+
+
+def _build_crash_recovery_config(scenario_config: Mapping[str, Any]) -> CrashRecoveryConfig:
+    """Read optional ``crash_recovery`` block from scenario; default to safe values."""
+    block = scenario_config.get("crash_recovery") or {}
+    defaults = CrashRecoveryConfig()
+    return CrashRecoveryConfig(
+        enabled=bool(block.get("enabled", defaults.enabled)),
+        heartbeat_timeout_ticks=int(
+            block.get("heartbeat_timeout_ticks", defaults.heartbeat_timeout_ticks)
+        ),
+        max_hold_ticks=int(block.get("max_hold_ticks", defaults.max_hold_ticks)),
+    )
 
 
 class SimulationEngine:
@@ -53,6 +70,8 @@ class SimulationEngine:
             lease_ttl_ticks=int(lease_cfg.get("default_ttl_ticks", 300)),
             access_count_max_accesses=int(access_count_cfg.get("max_accesses", 100)),
         )
+        self._crash_recovery = _build_crash_recovery_config(scenario_config)
+        _validate_crash_recovery_config(self._crash_recovery, self._strategy)
         self._monitor = ConsistencyMonitor(self._strategy)
         self._network = NetworkSimulator(
             latency_ticks=int(scenario_config["network"]["latency_ticks"]),

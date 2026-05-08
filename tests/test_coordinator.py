@@ -391,3 +391,50 @@ def test_set_agent_state_bookkeeping_emits_no_extra_log_entries() -> None:
     # Exactly 3 log entries total; bookkeeping itself produced none.
     assert len(entries) - entries_before == 3
     assert registry._seq - seq_before == 3
+
+
+# ---- Unit 3: CrashRecoveryConfig + composition fail-fast --------------------
+
+from ccs.coordinator.service import (  # noqa: E402
+    CrashRecoveryConfig,
+    _validate_crash_recovery_config,
+)
+from ccs.strategies.lazy import LazyStrategy  # noqa: E402
+from ccs.strategies.lease import LeaseStrategy  # noqa: E402
+
+
+def test_crash_recovery_config_defaults_are_safe() -> None:
+    cfg = CrashRecoveryConfig()
+    assert cfg.enabled is False
+    assert cfg.heartbeat_timeout_ticks == 10
+    assert cfg.max_hold_ticks == 1000
+
+
+def test_validate_crash_recovery_config_disabled_always_accepts() -> None:
+    # Even an obviously bad max_hold_ticks vs ttl is fine when disabled.
+    cfg = CrashRecoveryConfig(enabled=False, max_hold_ticks=10)
+    _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+
+
+def test_validate_crash_recovery_config_rejects_equal_ttl() -> None:
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
+    with pytest.raises(ValueError, match="max_hold_ticks=300"):
+        _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+
+
+def test_validate_crash_recovery_config_rejects_below_ttl() -> None:
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=100)
+    with pytest.raises(ValueError):
+        _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+
+
+def test_validate_crash_recovery_config_accepts_above_ttl() -> None:
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
+    _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=200))
+
+
+def test_validate_crash_recovery_config_skips_non_lease_strategy() -> None:
+    """Strategies without ttl_ticks (lazy/eager/etc.) silent-accept (R11 skip rule)."""
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
+    # LazyStrategy exposes no ttl_ticks attribute.
+    _validate_crash_recovery_config(cfg, LazyStrategy())

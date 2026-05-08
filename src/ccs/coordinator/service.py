@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import warnings
+from dataclasses import dataclass
 from uuid import UUID
 
 from ccs.core.exceptions import CoherenceError
@@ -14,6 +16,73 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSignal
 
 from .registry import ArtifactRegistry
+
+
+@dataclass(frozen=True)
+class CrashRecoveryConfig:
+    """Configuration knobs for the stable-grant reclamation sweep.
+
+    The sweep ships disabled by default (R10) and is gated on the TLA+
+    amendment before any default-on flip.
+
+    Attributes:
+        enabled: Master flag. When ``False`` (default), the sweep is never
+            invoked and no heartbeat is required.
+        heartbeat_timeout_ticks: Sweep reclaims any M∪E grant whose holder
+            has not heartbeated within this many ticks.
+        max_hold_ticks: Sweep reclaims any M∪E grant held for at least this
+            many ticks regardless of heartbeat. Must be ``>`` the longest
+            inspectable strategy lease TTL when ``enabled=True`` (R11).
+    """
+
+    enabled: bool = False
+    heartbeat_timeout_ticks: int = 10
+    max_hold_ticks: int = 1000
+
+
+def _validate_crash_recovery_config(
+    crash_recovery: CrashRecoveryConfig,
+    strategy: object,
+) -> None:
+    """Fail-fast composition check (R11).
+
+    When the sweep is enabled, ``max_hold_ticks`` must exceed the strategy's
+    inspectable lease TTL strictly. Equal is rejected because a sweep at the
+    TTL boundary races the strategy's own refresh logic.
+
+    Strategies without an introspectable ``ttl_ticks`` attribute (lazy,
+    eager, access-count, broadcast) cannot be statically validated against
+    the rule; we emit a ``RuntimeWarning`` so a custom strategy with a
+    non-inspectable TTL is at least surfaced, but do not refuse startup.
+    """
+    if not crash_recovery.enabled:
+        return
+
+    ttl = getattr(strategy, "ttl_ticks", None)
+    if isinstance(ttl, int) and ttl > 0:
+        if crash_recovery.max_hold_ticks <= ttl:
+            raise ValueError(
+                f"crash_recovery composition violation: "
+                f"max_hold_ticks={crash_recovery.max_hold_ticks} must be > "
+                f"strategy.ttl_ticks={ttl} "
+                f"(strategy={type(strategy).__name__}); "
+                f"sweep at lease TTL boundary races strategy refresh."
+            )
+        return
+
+    if ttl is None:
+        # Built-in strategies other than LeaseStrategy expose no TTL — silent-accept
+        # is correct for those. A custom strategy ought to expose ttl_ticks; warn so
+        # the integrator notices.
+        return
+
+    warnings.warn(
+        f"crash_recovery: strategy {type(strategy).__name__} exposes a "
+        f"non-integer ttl_ticks={ttl!r}; composition rule (R11) cannot be "
+        f"statically verified.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 class CoordinatorService:

@@ -113,3 +113,76 @@ def test_load_scenario_rejects_revocation_tick_out_of_range(tmp_path: Path) -> N
     with pytest.raises(ScenarioValidationError):
         load_scenario(str(scenario_path))
 
+
+
+def _minimal_scenario_payload() -> dict:
+    return {
+        "simulation": {"duration_ticks": 10, "num_agents": 2, "seed": 1},
+        "network": {"latency_ticks": 1, "message_loss_rate": 0.0},
+        "scenario": {
+            "name": "valid",
+            "workload": "custom",
+            "action_probability": 0.5,
+            "write_probability": 0.2,
+        },
+        "artifacts": [{"id": "plan.md", "size_tokens": 1024}],
+        "strategies": {},
+        "transient": {"timeout_ticks": 5},
+        "context_semantics": {"model": "pointer"},
+    }
+
+
+def test_load_scenario_without_crash_recovery_block_uses_defaults(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "no-cr.yaml"
+    payload = _minimal_scenario_payload()
+    _write_yaml(scenario_path, payload)
+
+    config = load_scenario(str(scenario_path))
+    # Block is normalized to an empty mapping; engine reads defaults from CrashRecoveryConfig.
+    assert config["crash_recovery"] == {}
+
+
+def test_load_scenario_with_crash_recovery_block_parses(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "with-cr.yaml"
+    payload = _minimal_scenario_payload()
+    payload["crash_recovery"] = {
+        "enabled": True,
+        "heartbeat_timeout_ticks": 5,
+        "max_hold_ticks": 50,
+    }
+    _write_yaml(scenario_path, payload)
+
+    config = load_scenario(str(scenario_path))
+    assert config["crash_recovery"]["enabled"] is True
+    assert config["crash_recovery"]["heartbeat_timeout_ticks"] == 5
+    assert config["crash_recovery"]["max_hold_ticks"] == 50
+
+
+def test_load_scenario_rejects_zero_heartbeat_timeout(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-cr-hb.yaml"
+    payload = _minimal_scenario_payload()
+    payload["crash_recovery"] = {"heartbeat_timeout_ticks": 0}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="heartbeat_timeout_ticks"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_non_bool_enabled(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-cr-enabled.yaml"
+    payload = _minimal_scenario_payload()
+    payload["crash_recovery"] = {"enabled": "yes"}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="enabled"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_negative_max_hold(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-cr-mh.yaml"
+    payload = _minimal_scenario_payload()
+    payload["crash_recovery"] = {"max_hold_ticks": -1}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="max_hold_ticks"):
+        load_scenario(str(scenario_path))
