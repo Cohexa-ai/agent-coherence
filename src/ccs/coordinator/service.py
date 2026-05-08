@@ -148,6 +148,13 @@ class CoordinatorService:
         artifact = self._require_artifact(artifact_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+            reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
+            if reclamation is not None:
+                trigger, reclaimed_at_tick = reclamation
+                raise CoherenceError(
+                    f"commit_not_allowed agent={agent_id} artifact={artifact_id} "
+                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}"
+                )
             raise CoherenceError(
                 f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}"
             )
@@ -284,6 +291,75 @@ class CoordinatorService:
                 expired += 1
 
         return expired
+
+    def enforce_stable_grant_timeouts(
+        self,
+        *,
+        current_tick: int,
+        heartbeat_timeout_ticks: int,
+        max_hold_ticks: int,
+    ) -> int:
+        """Reclaim stale stable-state (M∪E) grants whose holders are gone or over-held.
+
+        Trigger order (first match wins):
+          1. ``reclaim_heartbeat`` — agent's last heartbeat is older than
+             ``heartbeat_timeout_ticks``, or the agent has never heartbeated.
+          2. ``reclaim_max_hold`` — agent's grant is at least ``max_hold_ticks``
+             old. Skipped if ``granted_at_tick`` is missing (defensive).
+
+        Pairs with a non-empty transient slot are skipped so the transient sweep
+        (which must run first) owns those entries — preserves R4 sweep ordering.
+
+        Returns the number of grants reclaimed.
+        """
+        if heartbeat_timeout_ticks < 1:
+            raise ValueError("heartbeat_timeout_ticks must be >= 1")
+        if max_hold_ticks < 1:
+            raise ValueError("max_hold_ticks must be >= 1")
+
+        m_or_e = {MESIState.MODIFIED, MESIState.EXCLUSIVE}
+        snapshot: list[tuple[UUID, UUID, MESIState]] = [
+            (artifact_id, agent_id, mesi)
+            for artifact_id in self.registry.artifact_ids()
+            for agent_id, mesi in self.registry.get_state_map(artifact_id).items()
+            if mesi in m_or_e
+        ]
+
+        reclaimed = 0
+        for artifact_id, agent_id, _mesi in snapshot:
+            # Live read — agents that entered transient since the snapshot are owned by
+            # the transient sweep, not this one (R4).
+            if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
+                continue
+
+            last_hb = self.registry.last_heartbeat_tick(agent_id)
+            heartbeat_stale = last_hb is None or (current_tick - last_hb) > heartbeat_timeout_ticks
+
+            if heartbeat_stale:
+                trigger = "reclaim_heartbeat"
+            else:
+                granted_at = self.registry.granted_at_tick(agent_id, artifact_id)
+                if granted_at is None:
+                    # Defensive: an M∪E holder without a granted_at slot should not exist.
+                    continue
+                if (current_tick - granted_at) >= max_hold_ticks:
+                    trigger = "reclaim_max_hold"
+                else:
+                    continue
+
+            self.registry.set_agent_state(
+                artifact_id,
+                agent_id,
+                MESIState.INVALID,
+                trigger=trigger,
+                tick=current_tick,
+                content_hash=None,
+            )
+            self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
+            self._validate_single_writer(artifact_id)
+            reclaimed += 1
+
+        return reclaimed
 
     def _validate_single_writer(self, artifact_id: UUID) -> None:
         check_single_writer(self.registry.get_state_map(artifact_id))
