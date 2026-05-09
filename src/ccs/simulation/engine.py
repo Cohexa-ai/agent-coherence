@@ -93,10 +93,15 @@ class SimulationEngine:
         self._agent_ids = [UUID(int=i + 1) for i in range(int(simulation["num_agents"]))]
         # Failure-injection bookkeeping. _alive_agents is the set of agents that
         # heartbeat and may issue actions on a given tick; _busy_agents is the
-        # set in a fixed-window busy state (no heartbeat, no actions). On init
-        # all agents are alive; failure events flip them.
+        # set in a fixed-window busy state (no heartbeat, no actions);
+        # _killed_agents is the set permanently sidelined by a `kill` event
+        # (cleared only by an explicit `restore`). On init all agents are alive;
+        # failure events flip them. _killed_agents is tracked separately from
+        # _busy_agents so that a busy auto-expiry never silently resurrects a
+        # killed agent (review finding ADV-01 / COR-03).
         self._alive_agents: set[UUID] = set(self._agent_ids)
         self._busy_agents: set[UUID] = set()
+        self._killed_agents: set[UUID] = set()
         self._busy_until: dict[UUID, int] = {}
         self._agent_id_by_name: dict[str, UUID] = {
             f"agent_{i}": agent_id for i, agent_id in enumerate(self._agent_ids)
@@ -206,9 +211,15 @@ class SimulationEngine:
         reached: those agents flip back to alive without a ``restore`` event.
         """
         # Auto-expire busy windows first so an event firing at the same tick
-        # observes the agent as live again.
+        # observes the agent as live again. Killed agents are NEVER restored
+        # by busy auto-expiry — only an explicit `restore` event clears a kill
+        # (review ADV-01: prevents busy×kill silent resurrection).
         if self._busy_until:
-            expired = [a for a, u in self._busy_until.items() if now_tick >= u]
+            expired = [
+                a
+                for a, u in self._busy_until.items()
+                if now_tick >= u and a not in self._killed_agents
+            ]
             for agent_id in expired:
                 self._busy_until.pop(agent_id, None)
                 self._busy_agents.discard(agent_id)
@@ -217,11 +228,18 @@ class SimulationEngine:
         for event in self._failure_events_by_tick.get(now_tick, ()):
             if event.action == "kill":
                 self._alive_agents.discard(event.agent_id)
-                self._busy_agents.add(event.agent_id)
+                self._busy_agents.discard(event.agent_id)
+                self._busy_until.pop(event.agent_id, None)
+                self._killed_agents.add(event.agent_id)
             elif event.action == "busy":
                 if event.until_tick is None:
                     raise ValueError(
                         f"failure_event(action='busy') missing until_tick at tick={event.tick}"
+                    )
+                if event.agent_id in self._killed_agents:
+                    raise ValueError(
+                        f"failure_event(action='busy') on killed agent at tick={event.tick}; "
+                        "issue a 'restore' before scheduling busy on a killed agent"
                     )
                 self._alive_agents.discard(event.agent_id)
                 self._busy_agents.add(event.agent_id)
@@ -230,6 +248,7 @@ class SimulationEngine:
                 self._alive_agents.add(event.agent_id)
                 self._busy_agents.discard(event.agent_id)
                 self._busy_until.pop(event.agent_id, None)
+                self._killed_agents.discard(event.agent_id)
             else:  # pragma: no cover — schema validator already rejects this.
                 raise ValueError(f"unsupported failure-event action '{event.action}'")
 
@@ -259,11 +278,17 @@ class SimulationEngine:
         agent_velocity = scenario.get("agent_velocity")
 
         for agent_id in self._agent_ids:
-            # Skip agents that are killed (not in _alive_agents) or in a busy
-            # window. Filter is applied BEFORE action selection so RNG state
+            # Skip agents that are killed, in a busy window, or otherwise not
+            # alive. Filter is applied BEFORE action selection so RNG state
             # is unaffected for live agents and a killed agent never reaches
-            # _perform_read / _perform_write.
-            if agent_id not in self._alive_agents or agent_id in self._busy_agents:
+            # _perform_read / _perform_write. Each set is consulted explicitly
+            # (defense in depth) — _killed_agents and _busy_agents are now
+            # disjoint after review fix ADV-01.
+            if (
+                agent_id not in self._alive_agents
+                or agent_id in self._busy_agents
+                or agent_id in self._killed_agents
+            ):
                 continue
             if agent_velocity is not None:
                 for _ in range(int(agent_velocity)):

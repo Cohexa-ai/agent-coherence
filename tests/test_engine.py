@@ -502,3 +502,80 @@ def test_busy_window_auto_expires_without_restore_event() -> None:
     # During [2, 6) A is busy; from tick 6 onward A is alive again.
     assert all(t < 2 or t >= 6 for t in seen), seen
     assert any(t >= 6 for t in seen), "agent should resume acting after busy window"
+
+
+def test_busy_then_kill_does_not_resurrect_at_busy_until_tick() -> None:
+    """Review ADV-01: busy at tick T0 with until_tick=U, then kill at T1 < U.
+
+    The busy auto-expiry at U must NOT silently resurrect the killed agent.
+    Without the fix, agent_0 would re-enter `_alive_agents` at tick U.
+    """
+    busy_until = 12
+    scenario = _failure_scenario(num_agents=1, duration=busy_until + 5)
+    scenario["failure_events"] = [
+        {"tick": 2, "action": "busy", "agent": "agent_0", "until_tick": busy_until},
+        {"tick": 5, "action": "kill", "agent": "agent_0"},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    agent_a = engine._agent_id_by_name["agent_0"]
+    engine.run()
+
+    # After the run completes, the killed agent must remain killed and never
+    # be in _alive_agents — the busy auto-expiry at tick=busy_until must not
+    # have resurrected it.
+    assert agent_a in engine._killed_agents
+    assert agent_a not in engine._alive_agents
+    assert agent_a not in engine._busy_agents
+    assert agent_a not in engine._busy_until
+
+
+def test_kill_then_restore_brings_agent_back_alive() -> None:
+    """A `restore` event after `kill` must clear the killed state."""
+    scenario = _failure_scenario(num_agents=1, duration=20)
+    scenario["failure_events"] = [
+        {"tick": 3, "action": "kill", "agent": "agent_0"},
+        {"tick": 8, "action": "restore", "agent": "agent_0"},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    agent_a = engine._agent_id_by_name["agent_0"]
+    engine.run()
+
+    assert agent_a not in engine._killed_agents
+    assert agent_a in engine._alive_agents
+
+
+def test_busy_on_killed_agent_raises() -> None:
+    """Review ADV-01: scheduling busy on a killed agent must fail loudly.
+
+    Strict semantics — silent no-op would mask operator misconfiguration.
+    """
+    scenario = _failure_scenario(num_agents=1, duration=20)
+    scenario["failure_events"] = [
+        {"tick": 3, "action": "kill", "agent": "agent_0"},
+        {"tick": 6, "action": "busy", "agent": "agent_0", "until_tick": 12},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    with pytest.raises(ValueError, match="busy.*killed agent"):
+        engine.run()
+
+
+def test_kill_then_busy_then_restore_round_trip() -> None:
+    """kill → restore → busy is the supported way to reuse a killed agent."""
+    scenario = _failure_scenario(num_agents=1, duration=20)
+    scenario["failure_events"] = [
+        {"tick": 3, "action": "kill", "agent": "agent_0"},
+        {"tick": 6, "action": "restore", "agent": "agent_0"},
+        {"tick": 9, "action": "busy", "agent": "agent_0", "until_tick": 14},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    agent_a = engine._agent_id_by_name["agent_0"]
+    engine.run()
+
+    # Final state: alive again after the busy window auto-expires.
+    assert agent_a in engine._alive_agents
+    assert agent_a not in engine._killed_agents
+    assert agent_a not in engine._busy_agents
