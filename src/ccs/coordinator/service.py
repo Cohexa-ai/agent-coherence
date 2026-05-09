@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
@@ -40,7 +43,7 @@ class CrashRecoveryConfig:
     max_hold_ticks: int = 1000
 
 
-def _validate_crash_recovery_config(
+def validate_crash_recovery_config(
     crash_recovery: CrashRecoveryConfig,
     strategy: object,
 ) -> None:
@@ -421,7 +424,13 @@ class CoordinatorService:
             else:
                 granted_at = self.registry.granted_at_tick(agent_id, artifact_id)
                 if granted_at is None:
-                    # Defensive: an M∪E holder without a granted_at slot should not exist.
+                    # M∪E holder without granted_at — should not exist; skip to avoid
+                    # blocking the sweep but log so operators can investigate.
+                    logger.warning(
+                        "sweep: M/E holder has no granted_at slot; skipping max-hold check "
+                        "agent=%s artifact=%s",
+                        agent_id, artifact_id,
+                    )
                     continue
                 if (current_tick - granted_at) >= max_hold_ticks:
                     trigger = "reclaim_max_hold"

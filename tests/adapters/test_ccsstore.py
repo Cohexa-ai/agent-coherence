@@ -1005,6 +1005,33 @@ def test_ccsstore_constructor_passthrough_failfast() -> None:
         )
 
 
+def test_ccsstore_recover_checkpoint_restore_flow() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    agent_id = store.core.agent_id_for("planner")
+
+    # Simulate stale grant reclamation
+    store.core.coordinator.enforce_stable_grant_timeouts(
+        current_tick=50, heartbeat_timeout_ticks=10, max_hold_ticks=1000,
+    )
+
+    # Recover after restart
+    store.recover(agent_name="planner", now_tick=51)
+
+    # Cache is cleared — next put should succeed (re-acquires grant)
+    entry = store.core.runtime("planner").cache.entries()
+    for e in entry.values():
+        assert e.state == MESIState.INVALID
+
+    # Fresh heartbeat recorded
+    assert store.core.registry.last_heartbeat_tick(agent_id) == 51
+
+
 def test_ccsstore_flag_off_heartbeat_noop() -> None:
     store = _store()
     _put(store, ("planner", "shared"), "plan", {"v": 1})

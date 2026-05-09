@@ -397,7 +397,7 @@ def test_set_agent_state_bookkeeping_emits_no_extra_log_entries() -> None:
 
 from ccs.coordinator.service import (  # noqa: E402
     CrashRecoveryConfig,
-    _validate_crash_recovery_config,
+    validate_crash_recovery_config,
 )
 from ccs.strategies.lazy import LazyStrategy  # noqa: E402
 from ccs.strategies.lease import LeaseStrategy  # noqa: E402
@@ -410,34 +410,34 @@ def test_crash_recovery_config_defaults_are_safe() -> None:
     assert cfg.max_hold_ticks == 1000
 
 
-def test_validate_crash_recovery_config_disabled_always_accepts() -> None:
+def testvalidate_crash_recovery_config_disabled_always_accepts() -> None:
     # Even an obviously bad max_hold_ticks vs ttl is fine when disabled.
     cfg = CrashRecoveryConfig(enabled=False, max_hold_ticks=10)
-    _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+    validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
 
 
-def test_validate_crash_recovery_config_rejects_equal_ttl() -> None:
+def testvalidate_crash_recovery_config_rejects_equal_ttl() -> None:
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
     with pytest.raises(ValueError, match="max_hold_ticks=300"):
-        _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+        validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
 
 
-def test_validate_crash_recovery_config_rejects_below_ttl() -> None:
+def testvalidate_crash_recovery_config_rejects_below_ttl() -> None:
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=100)
     with pytest.raises(ValueError):
-        _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+        validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
 
 
-def test_validate_crash_recovery_config_accepts_above_ttl() -> None:
+def testvalidate_crash_recovery_config_accepts_above_ttl() -> None:
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
-    _validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=200))
+    validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=200))
 
 
-def test_validate_crash_recovery_config_skips_non_lease_strategy() -> None:
+def testvalidate_crash_recovery_config_skips_non_lease_strategy() -> None:
     """Strategies without ttl_ticks (lazy/eager/etc.) silent-accept (R11 skip rule)."""
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
     # LazyStrategy exposes no ttl_ticks attribute.
-    _validate_crash_recovery_config(cfg, LazyStrategy())
+    validate_crash_recovery_config(cfg, LazyStrategy())
 
 
 # Review fix ADV-03: ttl_ticks=0 was silently routed to the warning path
@@ -457,31 +457,31 @@ class _StringTTLStrategy:
     ttl_ticks = "300"
 
 
-def test_validate_crash_recovery_config_zero_ttl_passes_when_max_hold_positive() -> None:
+def testvalidate_crash_recovery_config_zero_ttl_passes_when_max_hold_positive() -> None:
     """ADV-03: ttl_ticks=0 with max_hold_ticks=1 passes R11 (1 > 0). No warning."""
     import warnings as _w  # local import keeps top-of-file unchanged
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=1)
     with _w.catch_warnings():
         _w.simplefilter("error")  # Any warning fails the test.
-        _validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
+        validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
 
 
-def test_validate_crash_recovery_config_zero_ttl_rejects_zero_max_hold() -> None:
+def testvalidate_crash_recovery_config_zero_ttl_rejects_zero_max_hold() -> None:
     """ADV-03: ttl_ticks=0 with max_hold_ticks=0 IS a R11 violation (0 not > 0)."""
     # max_hold_ticks=0 is normally rejected by the int-validator at sweep time,
     # but the composition rule must still flag this combination at construction.
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=0)
     with pytest.raises(ValueError, match="max_hold_ticks=0"):
-        _validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
+        validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
 
 
-def test_validate_crash_recovery_config_non_integer_ttl_warns() -> None:
+def testvalidate_crash_recovery_config_non_integer_ttl_warns() -> None:
     """ADV-03: only genuinely non-integer ttl_ticks (e.g., string) triggers the warn path."""
     import warnings as _w
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
     with _w.catch_warnings(record=True) as caught:
         _w.simplefilter("always")
-        _validate_crash_recovery_config(cfg, _StringTTLStrategy())
+        validate_crash_recovery_config(cfg, _StringTTLStrategy())
     runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
     assert len(runtime_warnings) == 1
     assert "non-integer" in str(runtime_warnings[0].message)

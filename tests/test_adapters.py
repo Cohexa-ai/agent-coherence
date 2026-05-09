@@ -195,6 +195,44 @@ def test_recover_invalidates_cache_and_heartbeats() -> None:
     assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 200
 
 
+def test_recover_invalidates_cache_before_heartbeat() -> None:
+    """Ordering matters: cache must be invalidated before heartbeat re-seeds liveness."""
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    call_order: list[str] = []
+    orig_invalidate = core.runtime("A").invalidate_all_cache
+    orig_heartbeat = core.coordinator.record_heartbeat
+
+    def tracked_invalidate(**kwargs: object) -> None:
+        call_order.append("invalidate")
+        orig_invalidate(**kwargs)
+
+    def tracked_heartbeat(**kwargs: object) -> None:
+        call_order.append("heartbeat")
+        orig_heartbeat(**kwargs)
+
+    core.runtime("A").invalidate_all_cache = tracked_invalidate  # type: ignore[assignment]
+    core.coordinator.record_heartbeat = tracked_heartbeat  # type: ignore[assignment]
+
+    core.recover(agent_name="A", now_tick=200)
+
+    assert call_order == ["invalidate", "heartbeat"]
+
+
+def test_flag_off_write_does_not_heartbeat() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    core.write(agent_name="A", artifact_id=artifact.id, content="v2", now_tick=10)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
 def test_recover_anti_trap_after_recovery_not_immediately_reclaimed() -> None:
     core = _core_enabled(crash_recovery=CrashRecoveryConfig(
         enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000,

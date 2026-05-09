@@ -16,7 +16,7 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
     CoordinatorService,
     CrashRecoveryConfig,
-    _validate_crash_recovery_config,
+    validate_crash_recovery_config,
 )
 from ccs.core.types import Artifact, FetchResponse
 from ccs.strategies.base import SyncStrategy
@@ -69,7 +69,7 @@ class CoherenceAdapterCore:
             lease_ttl_ticks=lease_ttl_ticks,
             access_count_max_accesses=access_count_max_accesses,
         )
-        _validate_crash_recovery_config(self._crash_recovery, self.strategy)
+        validate_crash_recovery_config(self._crash_recovery, self.strategy)
         self.event_bus = event_bus if event_bus is not None else InMemoryEventBus()
         self._agents_by_name: dict[str, AgentBinding] = {}
 
@@ -171,7 +171,11 @@ class CoherenceAdapterCore:
         self.coordinator.record_heartbeat(agent_id=binding.agent_id, now_tick=now_tick)
 
     def recover(self, *, agent_name: str, now_tick: int) -> None:
-        """Invalidate agent's local cache and record a recovery heartbeat."""
+        """Invalidate agent's local cache and record a recovery heartbeat.
+
+        Cache invalidation runs unconditionally (useful as a manual flush
+        primitive regardless of feature flag); heartbeat only when enabled.
+        """
         binding = self._binding(agent_name)
         binding.runtime.invalidate_all_cache()
         if self._crash_recovery.enabled:

@@ -125,7 +125,7 @@ in order:
 3. **Trigger ordering — first match wins.** For each remaining
    pair, evaluate two conditions in order; the first match wins:
    - **Heartbeat:** if `last_heartbeat_tick(agent_id) is None` OR
-     `current_tick - last_heartbeat_tick(agent_id) > heartbeat_timeout_ticks`,
+     `current_tick - last_heartbeat_tick(agent_id) >= heartbeat_timeout_ticks`,
      reclaim with `trigger="reclaim_heartbeat"`.
    - **Max-hold:** else if `granted_at_tick(agent_id, artifact_id)
      is not None` AND `current_tick - granted_at_tick >= max_hold_ticks`,

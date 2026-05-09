@@ -15,7 +15,7 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
     CoordinatorService,
     CrashRecoveryConfig,
-    _validate_crash_recovery_config,
+    validate_crash_recovery_config,
 )
 from ccs.core.clock import LogicalClock
 from ccs.core.states import MESIState
@@ -82,7 +82,7 @@ class SimulationEngine:
             access_count_max_accesses=int(access_count_cfg.get("max_accesses", 100)),
         )
         self._crash_recovery = _build_crash_recovery_config(scenario_config)
-        _validate_crash_recovery_config(self._crash_recovery, self._strategy)
+        validate_crash_recovery_config(self._crash_recovery, self._strategy)
         self._monitor = ConsistencyMonitor(self._strategy)
         self._network = NetworkSimulator(
             latency_ticks=int(scenario_config["network"]["latency_ticks"]),
@@ -194,10 +194,17 @@ class SimulationEngine:
                     f"valid names: {sorted(self._agent_id_by_name)}"
                 )
             tick = int(event["tick"])
+            action = str(event["action"])
+            valid_actions = {"kill", "busy", "restore"}
+            if action not in valid_actions:
+                raise ValueError(
+                    f"failure_events: unknown action '{action}'; "
+                    f"valid actions: {sorted(valid_actions)}"
+                )
             until_tick = event.get("until_tick")
             parsed = _FailureEvent(
                 tick=tick,
-                action=str(event["action"]),
+                action=action,
                 agent_id=self._agent_id_by_name[agent_name],
                 until_tick=int(until_tick) if until_tick is not None else None,
             )
