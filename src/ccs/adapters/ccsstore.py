@@ -30,6 +30,7 @@ from ccs.adapters.base import CoherenceAdapterCore
 from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION, StoreMetricEvent  # re-exported for public API compatibility
 from ccs.adapters.telemetry import TelemetryExporter, build_telemetry
 from ccs.agent.runtime import CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
+from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
 from ccs.core.states import MESIState
@@ -66,6 +67,7 @@ class CCSStore(BaseStore):
         benchmark: bool = False,
         state_log: Callable[[dict[str, Any]], None] | None = None,
         content_audit_log: Callable[[dict[str, Any]], None] | None = None,
+        crash_recovery: CrashRecoveryConfig | None = None,
         **strategy_kwargs: Any,
     ) -> None:
         if on_error not in ("strict", "degrade"):
@@ -83,6 +85,7 @@ class CCSStore(BaseStore):
             content_audit_log=content_audit_log,
             audit_seq=self._audit_seq,
             retain_versions=content_audit_log is not None,
+            crash_recovery=crash_recovery,
             **strategy_kwargs,
         )
         self._on_metric = on_metric
@@ -396,6 +399,18 @@ class CCSStore(BaseStore):
             namespaces = list({ns[: op.max_depth] for ns in namespaces})
 
         return namespaces[op.offset : op.offset + op.limit]
+
+    # ------------------------------------------------------------------
+    # Crash recovery — public heartbeat / recover surface
+    # ------------------------------------------------------------------
+
+    def heartbeat(self, *, agent_name: str, now_tick: int) -> None:
+        """Record a heartbeat for the named agent. No-op when crash recovery is disabled."""
+        self.core.heartbeat(agent_name=agent_name, now_tick=now_tick)
+
+    def recover(self, *, agent_name: str, now_tick: int) -> None:
+        """Invalidate agent's local cache and record a recovery heartbeat."""
+        self.core.recover(agent_name=agent_name, now_tick=now_tick)
 
     # ------------------------------------------------------------------
     # Degradation visibility (R8 additions)
