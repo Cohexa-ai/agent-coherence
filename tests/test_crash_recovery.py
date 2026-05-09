@@ -561,3 +561,36 @@ def test_combined_validation_scenario_exercises_all_three_reclaim_shapes(
     gaps, mismatches = validate_log(log_path, schema_version="ccs.state_log.v2")
     assert gaps == []
     assert mismatches == []
+
+
+# Review fix ADV-02: heartbeat staleness uses `>=` to match max-hold's `>=`.
+# Previously heartbeat used strict `>`, so the effective heartbeat timeout was
+# N+1 ticks (one tick later than the documented 'at least N ticks since last
+# heartbeat' framing). Boundary test locks the new semantic.
+
+
+def test_heartbeat_stale_boundary_at_exact_timeout() -> None:
+    """ADV-02: at gap == heartbeat_timeout_ticks, the grant IS reclaimed.
+
+    Last heartbeat at tick 5, timeout 10, current tick 15 → gap 10 == 10 → reclaim.
+    Under the old `>` operator, gap 10 was NOT reclaimed (would have needed gap 11).
+    """
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    agent_a = uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent_a, requested_at_tick=0))
+    svc.record_heartbeat(agent_id=agent_a, now_tick=5)
+
+    # Gap = 14 - 5 = 9, just below threshold → no reclaim.
+    n_below = svc.enforce_stable_grant_timeouts(
+        current_tick=14, heartbeat_timeout_ticks=10, max_hold_ticks=1000
+    )
+    assert n_below == 0
+    assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.EXCLUSIVE
+
+    # Gap = 15 - 5 = 10 == threshold → reclaim.
+    n_at = svc.enforce_stable_grant_timeouts(
+        current_tick=15, heartbeat_timeout_ticks=10, max_hold_ticks=1000
+    )
+    assert n_at == 1
+    assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.INVALID

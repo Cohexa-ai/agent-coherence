@@ -404,7 +404,12 @@ class CoordinatorService:
                 continue
 
             last_hb = self.registry.last_heartbeat_tick(agent_id)
-            heartbeat_stale = last_hb is None or (current_tick - last_hb) > heartbeat_timeout_ticks
+            # Heartbeat uses `>=` to match max-hold's `>=` (review fix ADV-02).
+            # An effective timeout of exactly heartbeat_timeout_ticks means a
+            # grant is reclaimed when (current_tick - last_hb) reaches the
+            # threshold, not the tick after. Matches the 'at least this many
+            # ticks since last heartbeat' framing in CrashRecoveryConfig docs.
+            heartbeat_stale = last_hb is None or (current_tick - last_hb) >= heartbeat_timeout_ticks
 
             if heartbeat_stale:
                 trigger = "reclaim_heartbeat"
