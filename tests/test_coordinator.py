@@ -440,6 +440,54 @@ def test_validate_crash_recovery_config_skips_non_lease_strategy() -> None:
     _validate_crash_recovery_config(cfg, LazyStrategy())
 
 
+# Review fix ADV-03: ttl_ticks=0 was silently routed to the warning path
+# (with misleading "non-integer" text) and skipped R11 entirely. Now it's
+# treated like any other int ttl and validated against max_hold_ticks.
+
+
+class _ZeroTTLStrategy:
+    """Test fixture: strategy that exposes ttl_ticks=0 (degenerate case)."""
+
+    ttl_ticks = 0
+
+
+class _StringTTLStrategy:
+    """Test fixture: strategy with a non-integer ttl_ticks attribute."""
+
+    ttl_ticks = "300"
+
+
+def test_validate_crash_recovery_config_zero_ttl_passes_when_max_hold_positive() -> None:
+    """ADV-03: ttl_ticks=0 with max_hold_ticks=1 passes R11 (1 > 0). No warning."""
+    import warnings as _w  # local import keeps top-of-file unchanged
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=1)
+    with _w.catch_warnings():
+        _w.simplefilter("error")  # Any warning fails the test.
+        _validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
+
+
+def test_validate_crash_recovery_config_zero_ttl_rejects_zero_max_hold() -> None:
+    """ADV-03: ttl_ticks=0 with max_hold_ticks=0 IS a R11 violation (0 not > 0)."""
+    # max_hold_ticks=0 is normally rejected by the int-validator at sweep time,
+    # but the composition rule must still flag this combination at construction.
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=0)
+    with pytest.raises(ValueError, match="max_hold_ticks=0"):
+        _validate_crash_recovery_config(cfg, _ZeroTTLStrategy())
+
+
+def test_validate_crash_recovery_config_non_integer_ttl_warns() -> None:
+    """ADV-03: only genuinely non-integer ttl_ticks (e.g., string) triggers the warn path."""
+    import warnings as _w
+    cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        _validate_crash_recovery_config(cfg, _StringTTLStrategy())
+    runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime_warnings) == 1
+    assert "non-integer" in str(runtime_warnings[0].message)
+    assert "'300'" in str(runtime_warnings[0].message) or '"300"' in str(runtime_warnings[0].message)
+
+
 # Review fix COR-01 / REL-01: bookkeeping must run before the log emit so a
 # state_log raise leaves state_by_agent and granted_at_tick_by_agent
 # consistent. Without this fix, max-hold reclamation silently misses live

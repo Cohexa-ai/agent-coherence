@@ -59,7 +59,20 @@ def _validate_crash_recovery_config(
         return
 
     ttl = getattr(strategy, "ttl_ticks", None)
-    if isinstance(ttl, int) and ttl > 0:
+
+    # Built-in non-lease strategies (lazy, eager, access_count, broadcast) and
+    # any custom strategy without a ttl_ticks attribute cannot be statically
+    # validated against R11. Silent-accept matches the spec's design choice
+    # for the common case.
+    if ttl is None:
+        return
+
+    # Integer ttl (including 0 and negatives): apply the rule. Review fix
+    # ADV-02 / ADV-03: previously this branch required ttl > 0, which silently
+    # dropped ttl=0 into the "non-integer" warning path with misleading text.
+    # Now any int ttl is checked, and the warn-on-non-integer branch below
+    # only fires for genuinely non-integer attributes (string, float, etc.).
+    if isinstance(ttl, int):
         if crash_recovery.max_hold_ticks <= ttl:
             raise ValueError(
                 f"crash_recovery composition violation: "
@@ -68,14 +81,6 @@ def _validate_crash_recovery_config(
                 f"(strategy={type(strategy).__name__}); "
                 f"sweep at lease TTL boundary races strategy refresh."
             )
-        return
-
-    if ttl is None:
-        # Built-in non-lease strategies (lazy, eager, access_count, broadcast) and
-        # any custom strategy without a ttl_ticks attribute cannot be statically
-        # validated against R11. Silent-accept matches the spec's design choice
-        # for the common case; the warn-on-non-int branch below catches the
-        # narrower "attribute exists but isn't an int" foot-gun.
         return
 
     warnings.warn(
