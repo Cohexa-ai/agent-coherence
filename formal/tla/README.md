@@ -106,7 +106,7 @@ Target: **5 minutes** total for both models.
 | CrashRecovery (CI) | `CrashRecovery_CI.cfg` | 2 | 1 | 6 | 258,854 | ~18s |
 | CrashRecovery (local) | `CrashRecovery.cfg` | 3 | 2 | 12 | — | ~30+ min |
 
-CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=8) to fit the budget.
+CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=6) to fit the budget.
 The full 3-agent config (`CrashRecovery.cfg`) is for local deep runs:
 
 ```bash

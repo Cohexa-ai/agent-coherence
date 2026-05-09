@@ -120,11 +120,11 @@ SingleWriter ==
     \A art \in Artifacts :
         Cardinality(HoldersInStates(art, {"M", "E"})) <= 1
 
-(* I2: artifact version never decreases. Expressed as a state
-   predicate — version >= 1, which Init establishes. TLC checks
-   this at every reachable state. The stronger temporal property
-   (version'[art] >= version[art]) is checked by MonotonicVersion
-   being an invariant across the Init->[Next] chain. *)
+(* I2: artifact version lower bound. This state predicate checks
+   version >= 1 at every reachable state. It does NOT check the
+   stronger temporal property (version'[art] >= version[art]);
+   that holds by construction since only CommitAction modifies
+   version, and it increments by 1. *)
 MonotonicVersion ==
     \A art \in Artifacts : version[art] >= 1
 
