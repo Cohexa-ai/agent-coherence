@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -12,10 +13,16 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from ccs.agent.runtime import AgentRuntime
 from ccs.bus.event_bus import ArtifactUpdateEvent, InMemoryEventBus
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import (
+    CoordinatorService,
+    CrashRecoveryConfig,
+    validate_crash_recovery_config,
+)
 from ccs.core.types import Artifact, FetchResponse
 from ccs.strategies.base import SyncStrategy
 from ccs.strategies.selector import build_strategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,12 +49,14 @@ class CoherenceAdapterCore:
         content_audit_log: Callable[[dict[str, Any]], None] | None = None,
         audit_seq: list[int] | None = None,
         retain_versions: bool = False,
+        crash_recovery: CrashRecoveryConfig | None = None,
         **strategy_kwargs: Any,
     ) -> None:
         self._agent_names: dict[UUID, str] = {}
         self._instance_id = instance_id
         self._content_audit_log = content_audit_log
         self._audit_seq = audit_seq
+        self._crash_recovery = crash_recovery if crash_recovery is not None else CrashRecoveryConfig()
         self.registry = ArtifactRegistry(
             state_log=state_log,
             agent_names=self._agent_names,
@@ -60,10 +69,11 @@ class CoherenceAdapterCore:
             lease_ttl_ticks=lease_ttl_ticks,
             access_count_max_accesses=access_count_max_accesses,
         )
+        validate_crash_recovery_config(self._crash_recovery, self.strategy)
         self.event_bus = event_bus if event_bus is not None else InMemoryEventBus()
         self._agents_by_name: dict[str, AgentBinding] = {}
 
-    def register_agent(self, name: str) -> UUID:
+    def register_agent(self, name: str, *, now_tick: int = 0) -> UUID:
         """Register one agent runtime and subscribe it to bus events."""
         existing = self._agents_by_name.get(name)
         if existing is not None:
@@ -92,6 +102,8 @@ class CoherenceAdapterCore:
             ),
         )
         self._agents_by_name[name] = AgentBinding(name=name, agent_id=agent_id, runtime=runtime)
+        if self._crash_recovery.enabled:
+            self.coordinator.record_heartbeat(agent_id=agent_id, now_tick=now_tick)
         return agent_id
 
     def register_artifact(
@@ -106,7 +118,10 @@ class CoherenceAdapterCore:
 
     def read(self, *, agent_name: str, artifact_id: UUID, now_tick: int) -> FetchResponse:
         """Read artifact through one registered runtime."""
-        return self._binding(agent_name).runtime.read(artifact_id, now_tick=now_tick)
+        binding = self._binding(agent_name)
+        if self._crash_recovery.enabled:
+            self.coordinator.record_heartbeat(agent_id=binding.agent_id, now_tick=now_tick)
+        return binding.runtime.read(artifact_id, now_tick=now_tick)
 
     def write(
         self,
@@ -118,6 +133,8 @@ class CoherenceAdapterCore:
     ) -> Artifact:
         """Write artifact through one runtime and dispatch peer events."""
         writer = self._binding(agent_name)
+        if self._crash_recovery.enabled:
+            self.coordinator.record_heartbeat(agent_id=writer.agent_id, now_tick=now_tick)
         updated, invalidation_signals = writer.runtime.write(
             artifact_id=artifact_id,
             content=content,
@@ -145,6 +162,24 @@ class CoherenceAdapterCore:
     def content(self, *, agent_name: str, artifact_id: UUID) -> str | None:
         """Return local content cached by one agent runtime."""
         return self._binding(agent_name).runtime.content(artifact_id)
+
+    def heartbeat(self, *, agent_name: str, now_tick: int) -> None:
+        """Record a heartbeat for the named agent. No-op when crash recovery is disabled."""
+        if not self._crash_recovery.enabled:
+            return
+        binding = self._binding(agent_name)
+        self.coordinator.record_heartbeat(agent_id=binding.agent_id, now_tick=now_tick)
+
+    def recover(self, *, agent_name: str, now_tick: int) -> None:
+        """Invalidate agent's local cache and record a recovery heartbeat.
+
+        Cache invalidation runs unconditionally (useful as a manual flush
+        primitive regardless of feature flag); heartbeat only when enabled.
+        """
+        binding = self._binding(agent_name)
+        binding.runtime.invalidate_all_cache()
+        if self._crash_recovery.enabled:
+            self.coordinator.record_heartbeat(agent_id=binding.agent_id, now_tick=now_tick)
 
     def runtime(self, agent_name: str) -> AgentRuntime:
         """Return concrete runtime for adapter extensions/testing."""

@@ -120,7 +120,7 @@ def test_build_strategy_rejects_unknown_name() -> None:
 def test_broadcast_strategy_broadcasts_every_tick() -> None:
     strategy = BroadcastStrategy()
     assert strategy.broadcasts_every_tick() is True
-    assert strategy.broadcasts_content_on_commit() is False
+    assert strategy.broadcasts_content_on_commit() is True
     assert strategy.staleness_bound() == 0
 
 

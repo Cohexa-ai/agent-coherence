@@ -120,6 +120,18 @@ class AgentRuntime:
         )
         return updated, [*write_signals, *commit_signals]
 
+    def invalidate_all_cache(
+        self,
+        *,
+        invalidated_version: int | None = None,
+        issued_at_tick: int = 0,
+    ) -> None:
+        """Invalidate all local cache entries (recovery use). Does not touch coordinator state."""
+        self.cache.invalidate_all(
+            invalidated_version=invalidated_version,
+            issued_at_tick=issued_at_tick,
+        )
+
     def handle_invalidation(self, signal: InvalidationSignal) -> None:
         """Apply invalidation event from coordinator/event bus."""
         self.cache.invalidate(

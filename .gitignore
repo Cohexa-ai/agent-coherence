@@ -1,4 +1,14 @@
 doc/
+
+# Internal-only docs (specs, plans, brainstorms, solutions, etc.) are kept
+# locally but never tracked. Only the three end-user-facing docs are
+# whitelisted below; everything else under docs/ stays out of the repo.
+docs/*
+!docs/guide.md
+!docs/why-coherence-matters.md
+!docs/agent-coherence-approach.md
+
+states/
 __pycache__/
 *.pyc
 *.pyo

@@ -5,7 +5,12 @@
 
 from __future__ import annotations
 
+import logging
+import warnings
+from dataclasses import dataclass
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
@@ -14,6 +19,80 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSignal
 
 from .registry import ArtifactRegistry
+
+
+@dataclass(frozen=True)
+class CrashRecoveryConfig:
+    """Configuration knobs for the stable-grant reclamation sweep.
+
+    The sweep ships disabled by default (R10) and is gated on the TLA+
+    amendment before any default-on flip.
+
+    Attributes:
+        enabled: Master flag. When ``False`` (default), the sweep is never
+            invoked and no heartbeat is required.
+        heartbeat_timeout_ticks: Sweep reclaims any M∪E grant whose holder
+            has not heartbeated within this many ticks.
+        max_hold_ticks: Sweep reclaims any M∪E grant held for at least this
+            many ticks regardless of heartbeat. Must be ``>`` the longest
+            inspectable strategy lease TTL when ``enabled=True`` (R11).
+    """
+
+    enabled: bool = False
+    heartbeat_timeout_ticks: int = 10
+    max_hold_ticks: int = 1000
+
+
+def validate_crash_recovery_config(
+    crash_recovery: CrashRecoveryConfig,
+    strategy: object,
+) -> None:
+    """Fail-fast composition check (R11).
+
+    When the sweep is enabled, ``max_hold_ticks`` must exceed the strategy's
+    inspectable lease TTL strictly. Equal is rejected because a sweep at the
+    TTL boundary races the strategy's own refresh logic.
+
+    Strategies without an introspectable ``ttl_ticks`` attribute (lazy,
+    eager, access-count, broadcast) cannot be statically validated against
+    the rule; we emit a ``RuntimeWarning`` so a custom strategy with a
+    non-inspectable TTL is at least surfaced, but do not refuse startup.
+    """
+    if not crash_recovery.enabled:
+        return
+
+    ttl = getattr(strategy, "ttl_ticks", None)
+
+    # Built-in non-lease strategies (lazy, eager, access_count, broadcast) and
+    # any custom strategy without a ttl_ticks attribute cannot be statically
+    # validated against R11. Silent-accept matches the spec's design choice
+    # for the common case.
+    if ttl is None:
+        return
+
+    # Integer ttl (including 0 and negatives): apply the rule. Review fix
+    # ADV-02 / ADV-03: previously this branch required ttl > 0, which silently
+    # dropped ttl=0 into the "non-integer" warning path with misleading text.
+    # Now any int ttl is checked, and the warn-on-non-integer branch below
+    # only fires for genuinely non-integer attributes (string, float, etc.).
+    if isinstance(ttl, int):
+        if crash_recovery.max_hold_ticks <= ttl:
+            raise ValueError(
+                f"crash_recovery composition violation: "
+                f"max_hold_ticks={crash_recovery.max_hold_ticks} must be > "
+                f"strategy.ttl_ticks={ttl} "
+                f"(strategy={type(strategy).__name__}); "
+                f"sweep at lease TTL boundary races strategy refresh."
+            )
+        return
+
+    warnings.warn(
+        f"crash_recovery: strategy {type(strategy).__name__} exposes a "
+        f"non-integer ttl_ticks={ttl!r}; composition rule (R11) cannot be "
+        f"statically verified.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 class CoordinatorService:
@@ -148,6 +227,13 @@ class CoordinatorService:
         artifact = self._require_artifact(artifact_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+            reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
+            if reclamation is not None:
+                trigger, reclaimed_at_tick = reclamation
+                raise CoherenceError(
+                    f"commit_not_allowed agent={agent_id} artifact={artifact_id} "
+                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}"
+                )
             raise CoherenceError(
                 f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}"
             )
@@ -258,6 +344,12 @@ class CoordinatorService:
         self.registry.remove_artifact(artifact_id)
         return signals
 
+    def record_heartbeat(self, *, agent_id: UUID, now_tick: int) -> None:
+        """Record an agent's heartbeat tick (R12: max(prev, incoming))."""
+        if now_tick < 0:
+            raise ValueError("now_tick must be >= 0")
+        self.registry.record_heartbeat(agent_id, now_tick)
+
     def enforce_transient_timeouts(self, *, current_tick: int, timeout_ticks: int) -> int:
         """Force expired transient entries to INVALID as fail-safe recovery."""
         if timeout_ticks < 1:
@@ -278,6 +370,86 @@ class CoordinatorService:
                 expired += 1
 
         return expired
+
+    def enforce_stable_grant_timeouts(
+        self,
+        *,
+        current_tick: int,
+        heartbeat_timeout_ticks: int,
+        max_hold_ticks: int,
+    ) -> int:
+        """Reclaim stale stable-state (M∪E) grants whose holders are gone or over-held.
+
+        Trigger order (first match wins):
+          1. ``reclaim_heartbeat`` — agent's last heartbeat is older than
+             ``heartbeat_timeout_ticks``, or the agent has never heartbeated.
+          2. ``reclaim_max_hold`` — agent's grant is at least ``max_hold_ticks``
+             old. Skipped if ``granted_at_tick`` is missing (defensive).
+
+        Pairs with a non-empty transient slot are skipped so the transient sweep
+        (which must run first) owns those entries — preserves R4 sweep ordering.
+
+        Returns the number of grants reclaimed.
+        """
+        if heartbeat_timeout_ticks < 1:
+            raise ValueError("heartbeat_timeout_ticks must be >= 1")
+        if max_hold_ticks < 1:
+            raise ValueError("max_hold_ticks must be >= 1")
+
+        m_or_e = {MESIState.MODIFIED, MESIState.EXCLUSIVE}
+        snapshot: list[tuple[UUID, UUID, MESIState]] = [
+            (artifact_id, agent_id, mesi)
+            for artifact_id in self.registry.artifact_ids()
+            for agent_id, mesi in self.registry.get_state_map(artifact_id).items()
+            if mesi in m_or_e
+        ]
+
+        reclaimed = 0
+        for artifact_id, agent_id, _mesi in snapshot:
+            # Live read — agents that entered transient since the snapshot are owned by
+            # the transient sweep, not this one (R4).
+            if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
+                continue
+
+            last_hb = self.registry.last_heartbeat_tick(agent_id)
+            # Heartbeat uses `>=` to match max-hold's `>=` (review fix ADV-02).
+            # An effective timeout of exactly heartbeat_timeout_ticks means a
+            # grant is reclaimed when (current_tick - last_hb) reaches the
+            # threshold, not the tick after. Matches the 'at least this many
+            # ticks since last heartbeat' framing in CrashRecoveryConfig docs.
+            heartbeat_stale = last_hb is None or (current_tick - last_hb) >= heartbeat_timeout_ticks
+
+            if heartbeat_stale:
+                trigger = "reclaim_heartbeat"
+            else:
+                granted_at = self.registry.granted_at_tick(agent_id, artifact_id)
+                if granted_at is None:
+                    # M∪E holder without granted_at — should not exist; skip to avoid
+                    # blocking the sweep but log so operators can investigate.
+                    logger.warning(
+                        "sweep: M/E holder has no granted_at slot; skipping max-hold check "
+                        "agent=%s artifact=%s",
+                        agent_id, artifact_id,
+                    )
+                    continue
+                if (current_tick - granted_at) >= max_hold_ticks:
+                    trigger = "reclaim_max_hold"
+                else:
+                    continue
+
+            self.registry.set_agent_state(
+                artifact_id,
+                agent_id,
+                MESIState.INVALID,
+                trigger=trigger,
+                tick=current_tick,
+                content_hash=None,
+            )
+            self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
+            self._validate_single_writer(artifact_id)
+            reclaimed += 1
+
+        return reclaimed
 
     def _validate_single_writer(self, artifact_id: UUID) -> None:
         check_single_writer(self.registry.get_state_map(artifact_id))

@@ -5,12 +5,17 @@
 
 from __future__ import annotations
 
+import logging
+import warnings
+
+import pytest
 from uuid import NAMESPACE_URL, uuid5
 
 from ccs.adapters.autogen import AutoGenAdapter
 from ccs.adapters.base import CoherenceAdapterCore
 from ccs.adapters.crewai import CrewAIAdapter
 from ccs.adapters.langgraph import LangGraphAdapter
+from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.states import MESIState
 
 
@@ -122,3 +127,245 @@ def test_agent_id_for_unknown_name_raises_key_error() -> None:
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+# --- Crash recovery adapter tests (Unit 2) ---
+
+
+def _core_enabled(**overrides: object) -> CoherenceAdapterCore:
+    defaults = {
+        "strategy_name": "lazy",
+        "crash_recovery": CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    }
+    defaults.update(overrides)
+    return CoherenceAdapterCore(**defaults)  # type: ignore[arg-type]
+
+
+def test_piggyback_heartbeat_on_read() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=10)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 10
+
+
+def test_piggyback_heartbeat_on_write() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    core.write(agent_name="A", artifact_id=artifact.id, content="v2", now_tick=20)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 20
+
+
+def test_explicit_heartbeat_updates_tick() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+
+    core.heartbeat(agent_name="A", now_tick=42)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 42
+
+
+def test_explicit_heartbeat_out_of_order_uses_max() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+
+    core.heartbeat(agent_name="A", now_tick=50)
+    core.heartbeat(agent_name="A", now_tick=30)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 50
+
+
+def test_recover_invalidates_cache_and_heartbeats() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    core.recover(agent_name="A", now_tick=200)
+
+    entry = core.runtime("A").cache.get(artifact.id)
+    assert entry is not None
+    assert entry.state == MESIState.INVALID
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 200
+
+
+def test_recover_invalidates_cache_before_heartbeat() -> None:
+    """Ordering matters: cache must be invalidated before heartbeat re-seeds liveness."""
+    core = _core_enabled()
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    call_order: list[str] = []
+    orig_invalidate = core.runtime("A").invalidate_all_cache
+    orig_heartbeat = core.coordinator.record_heartbeat
+
+    def tracked_invalidate(**kwargs: object) -> None:
+        call_order.append("invalidate")
+        orig_invalidate(**kwargs)
+
+    def tracked_heartbeat(**kwargs: object) -> None:
+        call_order.append("heartbeat")
+        orig_heartbeat(**kwargs)
+
+    core.runtime("A").invalidate_all_cache = tracked_invalidate  # type: ignore[assignment]
+    core.coordinator.record_heartbeat = tracked_heartbeat  # type: ignore[assignment]
+
+    core.recover(agent_name="A", now_tick=200)
+
+    assert call_order == ["invalidate", "heartbeat"]
+
+
+def test_flag_off_write_does_not_heartbeat() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    core.write(agent_name="A", artifact_id=artifact.id, content="v2", now_tick=10)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
+def test_recover_anti_trap_after_recovery_not_immediately_reclaimed() -> None:
+    core = _core_enabled(crash_recovery=CrashRecoveryConfig(
+        enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000,
+    ))
+    core.register_agent("A", now_tick=0)
+    artifact = core.register_artifact(name="x.md", content="v1")
+
+    core.recover(agent_name="A", now_tick=200)
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=201)
+
+    reclaimed = core.coordinator.enforce_stable_grant_timeouts(
+        current_tick=205, heartbeat_timeout_ticks=10, max_hold_ticks=1000,
+    )
+    assert reclaimed == 0
+
+
+def test_recover_flag_off_invalidates_cache_no_heartbeat() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+    artifact = core.register_artifact(name="x.md", content="v1")
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
+
+    core.recover(agent_name="A", now_tick=200)
+
+    entry = core.runtime("A").cache.get(artifact.id)
+    assert entry.state == MESIState.INVALID
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
+def test_register_agent_seeds_heartbeat_when_enabled() -> None:
+    core = _core_enabled()
+    core.register_agent("A", now_tick=500)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) == 500
+
+
+def test_register_agent_no_seed_when_disabled() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
+def test_failfast_lease_ttl_equal_max_hold_raises() -> None:
+    with pytest.raises(ValueError, match="composition violation"):
+        CoherenceAdapterCore(
+            strategy_name="lease",
+            lease_ttl_ticks=300,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_failfast_lease_ttl_above_max_hold_raises() -> None:
+    with pytest.raises(ValueError, match="composition violation"):
+        CoherenceAdapterCore(
+            strategy_name="lease",
+            lease_ttl_ticks=500,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_failfast_lease_ttl_below_max_hold_accepts() -> None:
+    core = CoherenceAdapterCore(
+        strategy_name="lease",
+        lease_ttl_ticks=200,
+        crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+    )
+    assert core is not None
+
+
+def test_failfast_non_lease_strategy_no_warning_for_builtin() -> None:
+    # Built-in non-lease strategies (lazy, eager, access_count) have no ttl_ticks
+    # and should NOT emit a warning (silent-accept path).
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        core = CoherenceAdapterCore(
+            strategy_name="lazy",
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+    assert core is not None
+
+
+def test_framework_adapter_passthrough_langgraph_raises() -> None:
+    with pytest.raises(ValueError, match="composition violation"):
+        LangGraphAdapter(
+            strategy_name="lease",
+            lease_ttl_ticks=300,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_framework_adapter_passthrough_crewai_raises() -> None:
+    with pytest.raises(ValueError, match="composition violation"):
+        CrewAIAdapter(
+            strategy_name="lease",
+            lease_ttl_ticks=300,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_framework_adapter_passthrough_autogen_raises() -> None:
+    with pytest.raises(ValueError, match="composition violation"):
+        AutoGenAdapter(
+            strategy_name="lease",
+            lease_ttl_ticks=300,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_framework_adapter_external_core_ignores_crash_recovery_kwarg() -> None:
+    external_core = CoherenceAdapterCore(strategy_name="lazy")
+    adapter = LangGraphAdapter(
+        core=external_core,
+        crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+    )
+    assert adapter.core is external_core
+    assert adapter.core._crash_recovery.enabled is False
+
+
+def test_flag_off_read_does_not_heartbeat() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+    artifact = core.register_artifact(name="x.md", content="v1")
+
+    core.read(agent_name="A", artifact_id=artifact.id, now_tick=10)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
+def test_flag_off_heartbeat_is_noop() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("A")
+
+    core.heartbeat(agent_name="A", now_tick=42)
+
+    assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None

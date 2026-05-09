@@ -801,7 +801,7 @@ def test_coherence_degraded_warning_importable_from_adapters() -> None:
 def test_schema_version_constants_importable() -> None:
     from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
     from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION
-    assert CCS_STATE_LOG_SCHEMA_VERSION == "ccs.state_log.v1"
+    assert CCS_STATE_LOG_SCHEMA_VERSION == "ccs.state_log.v2"
     assert CCS_METRIC_SCHEMA_VERSION == "ccs.metric.v1"
 
 
@@ -926,3 +926,117 @@ def test_none_sequence_number_raises_value_error(tmp_path) -> None:
     log_file.write_text(json.dumps(bad_line) + "\n")
     with pytest.raises(ValueError, match="sequence_number"):
         validate_log(log_file)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: CCSStore heartbeat / recover (Unit 3)
+# ---------------------------------------------------------------------------
+
+
+def test_ccsstore_batch_piggyback_heartbeat() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    _get(store, ("planner", "shared"), "plan")
+
+    agent_id = store.core.agent_id_for("planner")
+    assert store.core.registry.last_heartbeat_tick(agent_id) is not None
+
+
+def test_ccsstore_explicit_heartbeat() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+
+    store.heartbeat(agent_name="planner", now_tick=42)
+
+    agent_id = store.core.agent_id_for("planner")
+    assert store.core.registry.last_heartbeat_tick(agent_id) == 42
+
+
+def test_ccsstore_heartbeat_requires_now_tick() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+
+    with pytest.raises(TypeError):
+        store.heartbeat(agent_name="planner")  # type: ignore[call-arg]
+
+
+def test_ccsstore_recover_invalidates_and_heartbeats() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    _get(store, ("planner", "shared"), "plan")
+
+    store.recover(agent_name="planner", now_tick=200)
+
+    agent_id = store.core.agent_id_for("planner")
+    runtime = store.core.runtime("planner")
+    for entry in runtime.cache.entries().values():
+        assert entry.state == MESIState.INVALID
+    assert store.core.registry.last_heartbeat_tick(agent_id) == 200
+
+
+def test_ccsstore_constructor_passthrough_failfast() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    with pytest.raises(ValueError, match="composition violation"):
+        CCSStore(
+            strategy="lease",
+            lease_ttl_ticks=300,
+            crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+        )
+
+
+def test_ccsstore_recover_checkpoint_restore_flow() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = CCSStore(
+        strategy="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    agent_id = store.core.agent_id_for("planner")
+
+    # Simulate stale grant reclamation
+    store.core.coordinator.enforce_stable_grant_timeouts(
+        current_tick=50, heartbeat_timeout_ticks=10, max_hold_ticks=1000,
+    )
+
+    # Recover after restart
+    store.recover(agent_name="planner", now_tick=51)
+
+    # Cache is cleared — next put should succeed (re-acquires grant)
+    entry = store.core.runtime("planner").cache.entries()
+    for e in entry.values():
+        assert e.state == MESIState.INVALID
+
+    # Fresh heartbeat recorded
+    assert store.core.registry.last_heartbeat_tick(agent_id) == 51
+
+
+def test_ccsstore_flag_off_heartbeat_noop() -> None:
+    store = _store()
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+
+    store.heartbeat(agent_name="planner", now_tick=42)
+
+    agent_id = store.core.agent_id_for("planner")
+    assert store.core.registry.last_heartbeat_tick(agent_id) is None

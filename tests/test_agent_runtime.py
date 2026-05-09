@@ -96,3 +96,28 @@ def test_handle_update_sets_shared_and_content() -> None:
     assert entry.state == MESIState.SHARED
     assert entry.local_version == 3
     assert runtime.content(artifact.id) == "v3"
+
+
+def test_invalidate_all_cache_clears_entries_without_coordinator_call() -> None:
+    coordinator = CoordinatorService(ArtifactRegistry())
+    a1 = coordinator.register_artifact(name="a.md", content="v1")
+    a2 = coordinator.register_artifact(name="b.md", content="v1")
+    runtime = _runtime(coordinator)
+    runtime.read(a1.id, now_tick=1)
+    runtime.read(a2.id, now_tick=1)
+
+    call_count = 0
+    orig = coordinator.record_heartbeat
+
+    def spy(**kwargs: object) -> None:
+        nonlocal call_count
+        call_count += 1
+        orig(**kwargs)
+
+    coordinator.record_heartbeat = spy  # type: ignore[assignment]
+
+    runtime.invalidate_all_cache()
+
+    assert runtime.cache.get(a1.id).state == MESIState.INVALID
+    assert runtime.cache.get(a2.id).state == MESIState.INVALID
+    assert call_count == 0

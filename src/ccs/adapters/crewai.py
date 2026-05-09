@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
+from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.types import Artifact
 
 from .base import CoherenceAdapterCore
@@ -15,8 +17,17 @@ from .base import CoherenceAdapterCore
 class CrewAIAdapter:
     """Adapter exposing task lifecycle helpers for CrewAI-style flows."""
 
-    def __init__(self, *, strategy_name: str = "lazy", core: CoherenceAdapterCore | None = None) -> None:
-        self.core = core if core is not None else CoherenceAdapterCore(strategy_name=strategy_name)
+    def __init__(
+        self,
+        *,
+        strategy_name: str = "lazy",
+        core: CoherenceAdapterCore | None = None,
+        crash_recovery: CrashRecoveryConfig | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.core = core if core is not None else CoherenceAdapterCore(
+            strategy_name=strategy_name, crash_recovery=crash_recovery, **kwargs
+        )
 
     def register_agent(self, name: str) -> UUID:
         """Register one crew member identity."""
