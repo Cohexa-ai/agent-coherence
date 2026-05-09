@@ -113,7 +113,7 @@ class TestSearchAudit:
         store.batch([_put("planner", "shared", "doc", {"text": "hello"})])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         assert len(search_entries) == 1
 
@@ -123,7 +123,7 @@ class TestSearchAudit:
         store.batch([_put("planner", "shared", "doc", {"text": "hello"})])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         assert len(search_entries) == 1
         entry = search_entries[0]
@@ -137,7 +137,7 @@ class TestSearchAudit:
         store.batch([_put("planner", "shared", "doc", value)])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         entry = search_entries[0]
         assert entry["content_hash"] is not None
@@ -151,7 +151,7 @@ class TestSearchAudit:
         ])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         assert len(search_entries) == 2
 
@@ -168,7 +168,7 @@ class TestSearchAudit:
     def test_search_no_audit_without_callback(self):
         store = CCSStore()
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         # No crash — search works without audit
 
     def test_search_audit_schema_version(self):
@@ -177,7 +177,7 @@ class TestSearchAudit:
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         assert search_entries[0]["schema_version"] == CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
 
@@ -186,7 +186,7 @@ class TestSearchAudit:
         log: list[dict] = []
         store = CCSStore(content_audit_log=log.append)
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         seq_nums = [e["sequence_number"] for e in log]
         for i in range(1, len(seq_nums)):
             assert seq_nums[i] == seq_nums[i - 1] + 1
@@ -198,7 +198,7 @@ class TestSearchAudit:
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
         log.clear()
 
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
         search_entries = [e for e in log if e["source"] == "search"]
         assert search_entries[0]["outcome"] == "error"
 
@@ -264,7 +264,7 @@ class TestEndToEndAuditPipeline:
         # 4. planner puts v2 → broadcast to reviewer → source="broadcast" + "write"
         store.batch([_put("planner", "shared", "doc", {"plan": "v2"})])
         # 5. search → source="search"
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
 
         sources = {e["source"] for e in audit}
         assert sources == {"write", "fetch", "cache_hit", "broadcast", "search"}
@@ -274,7 +274,7 @@ class TestEndToEndAuditPipeline:
         store = CCSStore(strategy="broadcast", content_audit_log=audit.append)
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
         store.batch([_get("reviewer", "shared", "doc")])
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
 
         for entry in audit:
             assert self.R1_FIELDS <= set(entry.keys()), f"missing fields in {entry}"
@@ -286,7 +286,7 @@ class TestEndToEndAuditPipeline:
         store.batch([_get("reviewer", "shared", "doc")])
         store.batch([_get("reviewer", "shared", "doc")])
         store.batch([_put("planner", "shared", "doc", {"x": 2})])
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
 
         seq_nums = [e["sequence_number"] for e in audit]
         for i in range(1, len(seq_nums)):
@@ -356,7 +356,7 @@ class TestEndToEndAuditPipeline:
         store = CCSStore(strategy="broadcast", content_audit_log=audit.append)
         store.batch([_put("planner", "shared", "doc", {"x": 1})])
         store.batch([_get("reviewer", "shared", "doc")])
-        store.batch([_search("shared")])
+        store.batch([_search("planner")])
 
         for entry in audit:
             _json.dumps(entry)
@@ -391,5 +391,5 @@ def _get(agent: str, scope: str, key: str) -> GetOp:
     return GetOp(namespace=(agent, scope), key=key)
 
 
-def _search(scope: str) -> SearchOp:
-    return SearchOp(namespace_prefix=(scope,))
+def _search(agent_or_scope: str) -> SearchOp:
+    return SearchOp(namespace_prefix=(agent_or_scope,))

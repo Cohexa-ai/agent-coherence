@@ -801,7 +801,7 @@ def test_coherence_degraded_warning_importable_from_adapters() -> None:
 def test_schema_version_constants_importable() -> None:
     from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
     from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION
-    assert CCS_STATE_LOG_SCHEMA_VERSION == "ccs.state_log.v1"
+    assert CCS_STATE_LOG_SCHEMA_VERSION == "ccs.state_log.v2"
     assert CCS_METRIC_SCHEMA_VERSION == "ccs.metric.v1"
 
 

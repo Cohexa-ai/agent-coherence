@@ -22,7 +22,7 @@ class BroadcastStrategy(SyncStrategy):
         return True
 
     def broadcasts_content_on_commit(self) -> bool:
-        return False
+        return True
 
     def invalidates_peers_on_commit(self) -> bool:
         return False
