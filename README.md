@@ -128,6 +128,12 @@ summary. Use `--initial-state '{"key": "value"}'` to pass a custom input dict.
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by
   default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
+## Formal verification
+
+Protocol safety properties (single-writer, monotonic versioning, crash-recovery
+sweep invariants) are model-checked with [TLA+/TLC](formal/tla/README.md). The
+`tla-check` CI job runs TLC on every push and PR.
+
 ## Status
 
 `v0.5` released. See [releases](https://github.com/hipvlady/agent-coherence/releases) for
