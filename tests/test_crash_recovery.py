@@ -594,3 +594,128 @@ def test_heartbeat_stale_boundary_at_exact_timeout() -> None:
     )
     assert n_at == 1
     assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.INVALID
+
+
+# Review fix T-02: defensive `granted_at_tick is None` branch in the sweep
+# is unreachable under correct lifecycle but must remain functional. Test
+# manually clears the slot to exercise the defensive `continue`.
+
+
+def test_sweep_skips_me_holder_with_missing_granted_at_slot() -> None:
+    """T-02: defensive branch — M∪E holder lacking granted_at slot is skipped, not crashed.
+
+    Under correct lifecycle this state shouldn't exist. We manually pop the slot
+    after fetch to simulate the defensive case (e.g., a bug elsewhere clearing
+    the dict). The sweep must not raise; it must continue past the orphan entry.
+    """
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    agent_a = uuid4()
+
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent_a, requested_at_tick=0))
+    assert svc.registry.granted_at_tick(agent_a, artifact.id) == 0
+
+    # Fresh heartbeat — heartbeat path will not fire.
+    svc.record_heartbeat(agent_id=agent_a, now_tick=100)
+
+    # Manually corrupt: clear the granted_at slot for an agent still in EXCLUSIVE.
+    svc.registry._records[artifact.id].granted_at_tick_by_agent.pop(agent_a, None)
+
+    # Sweep at tick 100 with max_hold=10: would normally trigger reclaim_max_hold,
+    # but the missing slot causes the defensive `continue` — no reclaim, no crash.
+    n = svc.enforce_stable_grant_timeouts(
+        current_tick=100, heartbeat_timeout_ticks=200, max_hold_ticks=10
+    )
+    assert n == 0
+    assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.EXCLUSIVE
+
+
+# Review fix T-06: double-run determinism for the R9 combined scenario.
+# The scenario is fully deterministic (seed, action_probability=0.0, no
+# network latency) — running twice must produce identical outputs.
+
+
+def test_combined_validation_scenario_is_deterministic_across_runs() -> None:
+    """T-06: a crash-recovery-enabled scenario with a kill event produces
+    identical metrics + state-log fingerprints across two runs.
+
+    Determinism is the load-bearing assumption behind the seed presence; this
+    test proves it by direct comparison and exercises the reclamation path
+    (kill at tick 5 with heartbeat_timeout_ticks=8 forces reclaim_heartbeat
+    around tick 13) so the test would catch any non-determinism in the sweep.
+    """
+    from ccs.simulation.engine import SimulationEngine
+
+    def _build_scenario() -> dict:
+        return {
+            "simulation": {
+                "duration_ticks": 25,
+                "num_agents": 2,
+                "seed": 42,
+                "action_probability": 0.0,
+                "actions_per_tick": 1,
+            },
+            "network": {"latency_ticks": 0, "message_loss_rate": 0.0},
+            "scenario": {
+                "name": "determinism-check",
+                "workload": "read_heavy",
+                "action_probability": 0.0,
+                "write_probability": 0.0,
+                "agent_velocity": None,
+                "revocation_tick": None,
+            },
+            "artifacts": [
+                {"id": "plan.md", "size_tokens": 100, "volatility": 0.0,
+                 "initial_version": 1, "mutable": True},
+            ],
+            "strategies": {
+                "eager": {},
+                "lazy": {"check_interval_ticks": 100},
+                "lease": {"default_ttl_ticks": 5},
+                "access_count": {"max_accesses": 4},
+                "exec_count": {"max_operations": 4},
+            },
+            "transient": {"timeout_ticks": 100},
+            "context_semantics": {"model": "conditional_injection"},
+            "crash_recovery": {
+                "enabled": True,
+                "heartbeat_timeout_ticks": 8,
+                "max_hold_ticks": 1000,
+            },
+            "failure_events": [
+                {"tick": 5, "action": "kill", "agent": "agent_0"},
+            ],
+        }
+
+    def _run_once() -> tuple[int, list[tuple[str, str, str]]]:
+        engine = SimulationEngine(_build_scenario(), strategy_name="lazy", seed=42)
+        # Pre-seed agent_0 with EXCLUSIVE on the artifact at tick 0 so the
+        # kill at tick 5 leaves a stale grant the sweep can reclaim.
+        agent_0 = engine._agent_id_by_name["agent_0"]
+        artifact_id = engine._artifact_ids[0]
+        engine._coordinator.fetch(
+            FetchRequest(artifact_id=artifact_id, requesting_agent_id=agent_0,
+                         requested_at_tick=0)
+        )
+        log: list[dict] = []
+        # _seq is reset because the pre-seed fetch already emitted entries —
+        # we want to compare the post-pre-seed log only.
+        assert engine._registry._seq >= 0
+        engine._registry._state_log = log.append
+        pre_seed_seq = engine._registry._seq
+        engine._registry._seq = 0
+        metrics = engine.run()
+        fingerprint = [(e["from_state"], e["to_state"], e["trigger"]) for e in log]
+        return metrics.stable_grant_reclamations, fingerprint, pre_seed_seq
+
+    count_a, fp_a, seq_a = _run_once()
+    count_b, fp_b, seq_b = _run_once()
+
+    # Sanity: the kill event drove at least one reclamation, otherwise the
+    # determinism check would be trivially-empty.
+    assert count_a >= 1, "test setup must exercise the reclaim path"
+    assert seq_a == seq_b, "pre-seed sequence number must be identical"
+    assert count_a == count_b
+    assert fp_a == fp_b
+    # Stronger: the reclamation must appear in the fingerprint.
+    assert any(t == "reclaim_heartbeat" for _, _, t in fp_a)

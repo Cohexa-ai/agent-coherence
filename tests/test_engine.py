@@ -579,3 +579,39 @@ def test_kill_then_busy_then_restore_round_trip() -> None:
     assert agent_a in engine._alive_agents
     assert agent_a not in engine._killed_agents
     assert agent_a not in engine._busy_agents
+
+
+# Review fix T-05: restore-after-kill is asserted to clear killed state but
+# was never directly verified to re-enable heartbeat emission. Test below
+# confirms that after restore, the engine emits heartbeats for the agent.
+
+
+def test_restore_after_kill_resumes_heartbeat_emission() -> None:
+    """T-05: a `restore` event must re-enable heartbeat emission for the agent.
+
+    Before restore, _emit_heartbeats_for_alive_agents skips the killed agent
+    (it's not in _alive_agents). After restore, the agent is in _alive_agents
+    again and the next tick's emission updates last_heartbeat_tick.
+    """
+    scenario = _failure_scenario(num_agents=1, duration=20)
+    scenario["crash_recovery"] = {
+        "enabled": True,
+        "heartbeat_timeout_ticks": 50,  # generous so no reclaim disturbs the test
+        "max_hold_ticks": 1000,
+    }
+    scenario["failure_events"] = [
+        {"tick": 3, "action": "kill", "agent": "agent_0"},
+        {"tick": 12, "action": "restore", "agent": "agent_0"},
+    ]
+
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+    agent_a = engine._agent_id_by_name["agent_0"]
+    engine.run()
+
+    # last_heartbeat_tick must reflect a tick AFTER the restore (12), proving
+    # that emission resumed. Run completes at duration_ticks=20, so the last
+    # heartbeat should be at tick 19 (last tick before clock.advance to 20).
+    last_hb = engine._registry.last_heartbeat_tick(agent_a)
+    assert last_hb is not None
+    assert last_hb >= 12, f"heartbeat should have resumed after restore, got {last_hb}"
+    assert last_hb <= 19, f"heartbeat must not exceed final tick, got {last_hb}"
