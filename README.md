@@ -118,10 +118,13 @@ summary. Use `--initial-state '{"key": "value"}'` to pass a custom input dict.
 
 - **Protocol** (`ccs.core`, `ccs.strategies`) — coherence state machine and synchronization
   strategies; no framework dependencies.
-- **Coordinator** (`ccs.coordinator`) — authority service tracking directory state and
-  publishing invalidations; runs in-process or out-of-process.
+- **Coordinator** (`ccs.coordinator`) — authority service tracking directory state,
+  publishing invalidations, and reclaiming stale grants (crash recovery).
 - **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen;
-  ~100 lines each.
+  ~100 lines each. Each adapter exposes `heartbeat()` and `recover()` for crash-recovery
+  liveness.
+- **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario
+  benchmarks with failure injection (kill, busy, restore).
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by
   default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
@@ -134,6 +137,12 @@ full history. Alpha — APIs may change before `v1.0`.
 content delivery (cache hit, fetch, broadcast, write, search) with SHA-256 content hashes,
 gap-free sequence numbers, and cross-validated state log entries. Pass
 `content_audit_log=callback` to `CCSStore` to enable.
+
+**What's new on `dev`:** crash recovery for stale grants — when an agent crashes or
+livelocks, its M/E grants are reclaimed so other agents can proceed. All adapters
+(LangGraph, CrewAI, AutoGen, CCSStore) expose `heartbeat()` and `recover()` for
+liveness signaling and post-restart cache invalidation. Behind feature flag
+(`enabled=False` default); see [crash-recovery spec](docs/specs/crash-recovery.md).
 
 ## Paper
 

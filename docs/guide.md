@@ -16,14 +16,16 @@ telemetry, graceful degradation, examples, and the API reference.
 4. [Strategies](#strategies)
 5. [Observability](#observability)
 6. [State transitions log](#state-transitions-log)
-7. [Inline benchmark mode](#inline-benchmark-mode)
-8. [Telemetry](#telemetry)
-9. [Graceful degradation](#graceful-degradation)
-10. [Examples](#examples)
-11. [Real-workload benchmarks](#real-workload-benchmarks)
-12. [Benchmarking your own workload](#benchmarking-your-own-workload)
-13. [API reference](#api-reference)
-14. [Low-level adapter API](#low-level-adapter-api)
+7. [Content audit log](#content-audit-log)
+8. [Crash recovery](#crash-recovery)
+9. [Inline benchmark mode](#inline-benchmark-mode)
+10. [Telemetry](#telemetry)
+11. [Graceful degradation](#graceful-degradation)
+12. [Examples](#examples)
+13. [Real-workload benchmarks](#real-workload-benchmarks)
+14. [Benchmarking your own workload](#benchmarking-your-own-workload)
+15. [API reference](#api-reference)
+16. [Low-level adapter API](#low-level-adapter-api)
 
 ---
 
@@ -194,6 +196,8 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
 | `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
+| `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
+| `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
 
 ### Error handling
 
@@ -285,6 +289,71 @@ of each artifact version so historical content can be retrieved for replay or de
 
 When both `content_audit_log` and `state_log` are enabled, `instance_id` is shared and
 `content_hash` on write audit entries matches the corresponding state log commit entry.
+
+---
+
+## Crash recovery
+
+When an agent crashes (OOM-kill, segfault) or livelocks (holds a grant indefinitely),
+its `MODIFIED` or `EXCLUSIVE` grant blocks all other agents from writing to that artifact.
+The crash-recovery extension reclaims stale grants automatically.
+
+### Enabling
+
+```python
+from ccs.coordinator.service import CrashRecoveryConfig
+
+store = CCSStore(
+    strategy="lazy",
+    crash_recovery=CrashRecoveryConfig(
+        enabled=True,
+        heartbeat_timeout_ticks=10,
+        max_hold_ticks=1000,
+    ),
+)
+```
+
+The same `crash_recovery=` kwarg works on `LangGraphAdapter`, `CrewAIAdapter`,
+`AutoGenAdapter`, and `CoherenceAdapterCore`.
+
+### How it works
+
+1. **Piggyback heartbeats.** Every `read()` / `write()` / `batch()` call automatically
+   records a heartbeat for the calling agent. No application code change needed.
+2. **Explicit heartbeat.** For long compute windows (LLM calls, blocking I/O) where no
+   adapter method is invoked, call `heartbeat()` to signal liveness:
+   ```python
+   store.heartbeat(agent_name="planner", now_tick=current_tick)
+   ```
+3. **Reclamation sweep.** The coordinator reclaims any M/E grant whose holder either:
+   - has not heartbeated within `heartbeat_timeout_ticks`, or
+   - has held the grant for at least `max_hold_ticks` (regardless of heartbeat).
+4. **Recovery after restart.** After a process restart or checkpoint reload, call
+   `recover()` to invalidate the agent's stale local cache and re-seed its heartbeat:
+   ```python
+   store.recover(agent_name="planner", now_tick=current_tick)
+   ```
+
+### Cadence guidance
+
+Call `heartbeat()` at least every `heartbeat_timeout_ticks / 3` ticks during long
+compute windows. Per-step adapter methods (e.g., `before_node`, `batch`) already
+heartbeat automatically.
+
+### Composition rule
+
+When using the `lease` strategy with crash recovery enabled, `max_hold_ticks` must
+exceed `lease_ttl_ticks`. Equal or smaller values raise `ValueError` at startup.
+
+### Flag-off behavior
+
+With `enabled=False` (the default), `heartbeat()` and `recover()` are silent no-ops.
+State-transition log output is byte-identical to v0.5. No behavior change for existing
+users.
+
+### Reference
+
+Full spec: [docs/specs/crash-recovery.md](specs/crash-recovery.md).
 
 ---
 
@@ -526,7 +595,7 @@ inline benchmarking without the CLI, see [Inline benchmark mode](#inline-benchma
 
 ## API reference
 
-### `CCSStore(strategy, benchmark, on_metric, telemetry, on_error, state_log, content_audit_log, **strategy_kwargs)`
+### `CCSStore(strategy, benchmark, on_metric, telemetry, on_error, state_log, content_audit_log, crash_recovery, **strategy_kwargs)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -537,6 +606,7 @@ inline benchmarking without the CLI, see [Inline benchmark mode](#inline-benchma
 | `on_error` | `str` | `"strict"` | `"strict"` to propagate `CoherenceError`; `"degrade"` to fall back silently |
 | `state_log` | `Callable[[dict], None] \| None` | `None` | Callback fired on every stable MESI state transition; see [State transitions log](#state-transitions-log) |
 | `content_audit_log` | `Callable[[dict], None] \| None` | `None` | Callback fired on every content delivery; see [Content audit log](#content-audit-log). Enables version retention. |
+| `crash_recovery` | `CrashRecoveryConfig \| None` | `None` | Crash-recovery configuration; see [Crash recovery](#crash-recovery). `None` uses `CrashRecoveryConfig(enabled=False)`. |
 | `**strategy_kwargs` | `Any` | — | Forwarded to the strategy constructor (`lease_ticks`, `threshold`, etc.) |
 
 ### Public imports
@@ -551,6 +621,7 @@ from ccs.adapters import (
     LangSmithExporter,
     build_telemetry,
 )
+from ccs.coordinator.service import CrashRecoveryConfig
 ```
 
 ---
@@ -562,10 +633,14 @@ surface directly:
 
 ```python
 from ccs.adapters.langgraph import LangGraphAdapter
+from ccs.coordinator.service import CrashRecoveryConfig
 
-adapter = LangGraphAdapter(strategy_name="lazy")
+adapter = LangGraphAdapter(
+    strategy_name="lazy",
+    crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+)
 for name in ("planner", "researcher", "executor"):
-    adapter.register_agent(name)
+    adapter.register_agent(name, now_tick=0)
 plan = adapter.register_artifact(name="plan.md", content="v1")
 
 context = adapter.before_node(agent_name="planner", artifact_ids=[plan.id], now_tick=1)
@@ -574,6 +649,15 @@ adapter.commit_outputs(
     writes={plan.id: context[plan.id]["content"] + "\nStep 1"},
     now_tick=2,
 )
+
+# During long compute — bridge the heartbeat gap
+adapter.core.heartbeat(agent_name="planner", now_tick=5)
+
+# After process restart — invalidate stale cache and re-seed heartbeat
+adapter.core.recover(agent_name="planner", now_tick=100)
 ```
+
+The same pattern applies to `CrewAIAdapter` and `AutoGenAdapter` — all accept
+`crash_recovery=` and expose `core.heartbeat()` / `core.recover()`.
 
 Full example: [`examples/multi_agent_planning.py`](../examples/multi_agent_planning.py).
