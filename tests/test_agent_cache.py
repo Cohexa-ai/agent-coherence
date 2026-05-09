@@ -58,3 +58,66 @@ def test_invalidate_missing_entry_creates_placeholder() -> None:
     assert invalid.state == MESIState.INVALID
     assert invalid.local_version == 2
     assert invalid.acquired_at_tick == 4
+
+
+# --- invalidate_all tests ---
+
+
+def test_invalidate_all_transitions_all_entries_to_invalid() -> None:
+    cache = ArtifactCache()
+    ids = [uuid4() for _ in range(3)]
+    states = [MESIState.MODIFIED, MESIState.EXCLUSIVE, MESIState.SHARED]
+    for aid, state in zip(ids, states):
+        cache.put(aid, ArtifactCacheEntry(artifact_id=aid, state=state, local_version=5))
+
+    cache.invalidate_all()
+
+    for aid in ids:
+        entry = cache.get(aid)
+        assert entry is not None
+        assert entry.state == MESIState.INVALID
+        assert entry.local_version == 5
+
+
+def test_invalidate_all_with_version_clamps_each_entry() -> None:
+    cache = ArtifactCache()
+    ids = [uuid4() for _ in range(3)]
+    for i, aid in enumerate(ids):
+        cache.put(aid, ArtifactCacheEntry(artifact_id=aid, state=MESIState.EXCLUSIVE, local_version=i + 1))
+
+    cache.invalidate_all(invalidated_version=2)
+
+    assert cache.get(ids[0]).local_version == 1  # min(1, 2) = 1
+    assert cache.get(ids[1]).local_version == 2  # min(2, 2) = 2
+    assert cache.get(ids[2]).local_version == 2  # min(3, 2) = 2
+    for aid in ids:
+        assert cache.get(aid).state == MESIState.INVALID
+
+
+def test_invalidate_all_empty_cache_is_noop() -> None:
+    cache = ArtifactCache()
+    cache.invalidate_all()
+    assert cache.entries() == {}
+
+
+def test_invalidate_all_already_invalid_entry_idempotent() -> None:
+    cache = ArtifactCache()
+    aid = uuid4()
+    cache.put(aid, ArtifactCacheEntry(artifact_id=aid, state=MESIState.INVALID, local_version=3))
+
+    cache.invalidate_all()
+
+    entry = cache.get(aid)
+    assert entry.state == MESIState.INVALID
+    assert entry.local_version == 3
+
+
+def test_invalidate_all_does_not_create_placeholders() -> None:
+    cache = ArtifactCache()
+    aid = uuid4()
+    cache.put(aid, ArtifactCacheEntry(artifact_id=aid, state=MESIState.SHARED, local_version=1))
+
+    cache.invalidate_all()
+
+    unknown = uuid4()
+    assert cache.get(unknown) is None

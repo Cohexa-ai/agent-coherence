@@ -53,6 +53,23 @@ class ArtifactCache:
             local_version=max(next_version, 0),
         )
 
+    def invalidate_all(
+        self,
+        *,
+        invalidated_version: int | None = None,
+        issued_at_tick: int = 0,
+    ) -> None:
+        """Set all cached entries to INVALID without creating placeholders."""
+        for artifact_id, entry in list(self._entries.items()):
+            next_version = entry.local_version
+            if invalidated_version is not None:
+                next_version = min(entry.local_version, invalidated_version)
+            self._entries[artifact_id] = replace(
+                entry,
+                state=MESIState.INVALID,
+                local_version=max(next_version, 0),
+            )
+
     def has_valid(self, artifact_id: UUID) -> bool:
         """Return whether artifact is cached in non-invalid state."""
         entry = self._entries.get(artifact_id)
