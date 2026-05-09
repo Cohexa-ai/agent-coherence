@@ -409,27 +409,31 @@ cleared before either of:
 - the feature flag becomes `enabled=True` by default, or
 - backlog item H (OCC-style write API) begins formal verification.
 
-**Gate 1 — TLA+ amendment merged.** A TLA+ amendment that formalizes
+**Gate 1 — TLA+ amendment merged.** ~~A TLA+ amendment that formalizes
 all invariants in §5 (single-writer, monotonic version, sweep
 exclusivity, trigger exclusivity, tick monotonicity, slot survival,
-flag-off byte-identity) MUST be merged.
+flag-off byte-identity) MUST be merged.~~
+**Satisfied.** `formal/tla/CrashRecovery.tla` formalizes I1–I6; I7
+(FlagOffByteIdentity) is a code-level property not modelable in TLA+.
+TLC runs in CI via `make tla-check`. See `formal/tla/README.md`.
 
 **Gate 2 — H cannot front-run C's formalization.** H's formal
 verification cannot begin until C's invariants are formalized. C's
 TLA+ amendment establishes the shared model that H extends.
+**Unblocked.** Gate 1 is satisfied; H may now extend `CrashRecovery.tla`.
 
 These gates exist so the moat-erosion concern (origin Carryover risk
 #1) does not surface in a paper deadline or H planning.
 
 ---
 
-## 10. TLA+ appendix — property list (transcription seed)
+## 10. TLA+ appendix — property list
 
-This appendix maps each invariant in §5 to a TLA+-shaped property,
-intended as the transcription source for Gate 1. Each entry names the
-property, restates the prose, and sketches its formal shape. The
-shapes use an informal notation; the actual TLA+ module will tune the
-exact temporal/state-predicate forms.
+This appendix maps each invariant in §5 to a TLA+-shaped property.
+Gate 1 is now satisfied — the actual TLA+ operators are in
+`formal/tla/MESI.tla` (I1, I2) and `formal/tla/CrashRecovery.tla`
+(I3–I6). The sketches below are retained as a prose reference; the
+canonical definitions are in the `.tla` files.
 
 ### I1 — SingleWriter (state predicate)
 
