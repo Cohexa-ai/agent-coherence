@@ -438,3 +438,80 @@ def test_validate_crash_recovery_config_skips_non_lease_strategy() -> None:
     cfg = CrashRecoveryConfig(enabled=True, max_hold_ticks=300)
     # LazyStrategy exposes no ttl_ticks attribute.
     _validate_crash_recovery_config(cfg, LazyStrategy())
+
+
+# Review fix COR-01 / REL-01: bookkeeping must run before the log emit so a
+# state_log raise leaves state_by_agent and granted_at_tick_by_agent
+# consistent. Without this fix, max-hold reclamation silently misses live
+# agents whose granted_at_tick slot was never written.
+
+from ccs.core.types import Artifact  # noqa: E402
+
+
+def test_set_agent_state_failed_log_emit_keeps_bookkeeping_consistent() -> None:
+    """COR-01: log emit raise must NOT leave state_by_agent inconsistent with bookkeeping.
+
+    With the fix, bookkeeping runs BEFORE the log emit. So if the log raises:
+    - state_by_agent shows the new state (pre-existing semantics — not changed)
+    - granted_at_tick_by_agent has the M∪E entry (NEW — was missing before fix)
+    - The next sweep can correctly evaluate max-hold for the agent.
+    """
+    seen = [0]
+
+    def flaky_log(entry):
+        seen[0] += 1
+        # Fail on every call — first M∪E acquire's log emit raises.
+        raise RuntimeError("simulated log emit failure")
+
+    registry = ArtifactRegistry(
+        state_log=flaky_log, agent_names=None, instance_id="test-instance"
+    )
+    artifact = Artifact(name="x", version=1)
+    registry.register_artifact(artifact, content="v1")
+    agent_id = uuid4()
+
+    with pytest.raises(RuntimeError, match="simulated log emit failure"):
+        registry.set_agent_state(
+            artifact.id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=42
+        )
+
+    # State mutation survived (pre-existing behavior, unchanged):
+    assert registry.get_agent_state(artifact.id, agent_id) == MESIState.EXCLUSIVE
+    # Bookkeeping is now CONSISTENT with that state — granted_at_tick is recorded:
+    assert registry.granted_at_tick(agent_id, artifact.id) == 42
+
+
+def test_set_agent_state_failed_log_emit_consistent_for_me_exit_too() -> None:
+    """COR-01 mirror case: log raise on M∪E exit still clears the slot."""
+    fail_on_call = 3
+    seen = [0]
+
+    def flaky_log(entry):
+        seen[0] += 1
+        if seen[0] >= fail_on_call:
+            raise RuntimeError("simulated log emit failure")
+
+    registry = ArtifactRegistry(
+        state_log=flaky_log, agent_names=None, instance_id="test-instance"
+    )
+    artifact = Artifact(name="x", version=1)
+    registry.register_artifact(artifact, content="v1")
+    agent_id = uuid4()
+
+    # Calls 1 & 2 succeed (acquire EXCLUSIVE, internal step). Call 3 fails.
+    registry.set_agent_state(
+        artifact.id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=10
+    )
+    registry.set_agent_state(
+        artifact.id, agent_id, MESIState.MODIFIED, trigger="commit", tick=11
+    )
+    # granted_at_tick survives the M↔E transition (preserved at acquire).
+    assert registry.granted_at_tick(agent_id, artifact.id) == 10
+
+    with pytest.raises(RuntimeError, match="simulated log emit failure"):
+        registry.set_agent_state(
+            artifact.id, agent_id, MESIState.INVALID, trigger="reclaim", tick=20
+        )
+    # Bookkeeping cleanup ran even though log emit raised.
+    assert registry.get_agent_state(artifact.id, agent_id) == MESIState.INVALID
+    assert registry.granted_at_tick(agent_id, artifact.id) is None

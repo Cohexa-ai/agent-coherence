@@ -123,36 +123,18 @@ class ArtifactRegistry:
         content_hash: str | None = None,
     ) -> None:
         """Set MESI state for one agent/artifact pair."""
-        from_state = self._records[artifact_id].state_by_agent.get(agent_id, MESIState.INVALID)
-        self._records[artifact_id].state_by_agent[agent_id] = state
-        if self._state_log is not None:
-            self._seq += 1
-            entry = {
-                "tick": tick,
-                "artifact_id": str(artifact_id),
-                "agent_id": str(agent_id),
-                "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
-                "from_state": from_state.name,
-                "to_state": state.name,
-                "trigger": trigger,
-                "version": self._records[artifact_id].artifact.version,
-                "content_hash": content_hash,
-                "sequence_number": self._seq,
-                "instance_id": self._instance_id,
-                "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
-            }
-            try:
-                self._state_log(entry)
-            except Exception:
-                # Sequence number is reserved on success, not on attempt.
-                # Roll back so the next successful emission does not create a phantom gap.
-                self._seq -= 1
-                raise
-
-        # Crash-recovery bookkeeping (no log emit, no serialization). Runs unconditionally —
-        # keeping the hot path branch-free preserves R5 byte-identity (these are dict mutations
-        # only, never serialized) and avoids subtle flag-on/flag-off divergence.
         record = self._records[artifact_id]
+        from_state = record.state_by_agent.get(agent_id, MESIState.INVALID)
+        record.state_by_agent[agent_id] = state
+
+        # Crash-recovery bookkeeping (no log emit, no serialization). Runs
+        # unconditionally and BEFORE the log emit so a state_log raise cannot
+        # leave state_by_agent and granted_at_tick_by_agent inconsistent
+        # (review fix COR-01 / REL-01: previously, a failed log emit left an
+        # M∪E entry without a granted_at_tick slot, defeating max-hold reclaim).
+        # Keeping the hot path branch-free preserves R5 byte-identity (these
+        # are dict mutations only, never serialized) and avoids subtle
+        # flag-on/flag-off divergence.
         new_in_me = state in _M_OR_E_STATES
         prev_in_me = from_state in _M_OR_E_STATES
         if new_in_me:
@@ -165,6 +147,30 @@ class ArtifactRegistry:
                 record.last_reclamation_by_agent.pop(agent_id, None)
         elif prev_in_me:
             record.granted_at_tick_by_agent.pop(agent_id, None)
+
+        if self._state_log is not None:
+            self._seq += 1
+            entry = {
+                "tick": tick,
+                "artifact_id": str(artifact_id),
+                "agent_id": str(agent_id),
+                "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
+                "from_state": from_state.name,
+                "to_state": state.name,
+                "trigger": trigger,
+                "version": record.artifact.version,
+                "content_hash": content_hash,
+                "sequence_number": self._seq,
+                "instance_id": self._instance_id,
+                "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
+            }
+            try:
+                self._state_log(entry)
+            except Exception:
+                # Sequence number is reserved on success, not on attempt.
+                # Roll back so the next successful emission does not create a phantom gap.
+                self._seq -= 1
+                raise
 
     def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
         """Record an agent's heartbeat tick using max(prev, incoming) (R12 monotonicity)."""
