@@ -425,6 +425,58 @@ TLA+ amendment establishes the shared model that H extends.
 These gates exist so the moat-erosion concern (origin Carryover risk
 #1) does not surface in a paper deadline or H planning.
 
+### 9.1 Enablement procedure (post-Gate-1)
+
+Closing Gate 1 makes `enabled=True` *legally possible*; it is not the
+flip itself. The flag flip is a separate, deliberate PR with its own
+checklist. The order below is what should happen, in this sequence:
+
+1. **Confirm prerequisites are actually met.**
+   - Adapter heartbeat plumbing merged (without it, flag-on does
+     nothing for real users — the simulation harness was the only
+     consumer of flag-on before adapters wired `heartbeat`/`recover`).
+   - Dogfood signal exists: at least one production deployment has
+     run with `crash_recovery=CrashRecoveryConfig(enabled=True)` opt-in
+     for a meaningful window with no design-level issues. Lower-risk
+     sequencing: ship C → ship adapter plumbing → dogfood → TLA+ →
+     flip.
+   - TLA+ amendment merged and `make tla-check` is clean in CI.
+   - Benchmarks updated for any expected overhead from flag-on (the
+     per-tick sweep adds work).
+
+2. **Land a small, separate "default-on flip" PR.**
+   - Change `CrashRecoveryConfig(enabled=False)` default to
+     `enabled=True` in `src/ccs/coordinator/service.py`.
+   - Update tests that asserted flag-off behavior — primarily the
+     R5 byte-identity regression test and any test constructing
+     `CCSStore` without an explicit `crash_recovery=` kwarg that
+     assumed no sweep ran.
+   - Update `benchmarks/expected.json` if numbers shifted.
+   - Update README and this spec doc to reflect the new default.
+   - Add a release-note bullet: *"Crash-recovery sweep is now on by
+     default. Adapters must call `coordinator.record_heartbeat(...)`
+     per the documented contract; built-in adapters since the
+     adapter-heartbeat-plumbing release already do this."*
+
+3. **Define rollback explicitly in the PR description.** The rollback
+   is trivial — flip the default back to `False`. No data migration,
+   no protocol incompatibility. Stating this in the PR makes the risk
+   surface visible to reviewers.
+
+4. **Monitor the first 1–2 weeks.** New sweep activity should appear
+   in state logs as `reclaim_heartbeat` and `reclaim_max_hold`
+   triggers. If unexpected reclamation appears in benign workloads,
+   that's a tuning issue (`heartbeat_timeout_ticks` too tight) — fix
+   the default, not the feature.
+
+**What does NOT happen automatically:**
+
+- Existing `CCSStore` users do not get the new default until they
+  upgrade. The default change is a minor-version bump at most; users
+  on the prior version stay on `False`.
+- H does not start formal-verification work until someone plans it.
+  Gate 2 closing means H *may* proceed — not *must*.
+
 ---
 
 ## 10. TLA+ appendix — property list
@@ -563,7 +615,8 @@ so refinement holds.
 | `failure_events` schema (kill / busy / restore) | `src/ccs/simulation/scenarios.py` | Shipped (commit `00c574e`) |
 | Combined validation scenario + driver test | `benchmarks/scenarios/crash_recovery_validation.yaml`, `tests/test_crash_recovery.py` | Shipped (commit `4528dfa`) |
 | Adapter contract wiring (`heartbeat`, `recover`, framework-adapter constructors) | `src/ccs/adapters/{base,langgraph,crewai,autogen,ccsstore}.py` | Shipped (adapter heartbeat plumbing plan) |
-| TLA+ amendment | n/a | Deferred (Gate 1; separate backlog item) |
+| TLA+ amendment (Gate 1) | `formal/tla/MESI.tla`, `formal/tla/CrashRecovery.tla`, `make tla-check` | Shipped (closes Gate 1; see §9) |
+| Default-on flip (`enabled=True`) | `src/ccs/coordinator/service.py` | **Pending** (separate PR; checklist in §9.1) |
 
 ## 12. Sources
 
