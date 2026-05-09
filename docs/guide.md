@@ -316,6 +316,16 @@ store = CCSStore(
 The same `crash_recovery=` kwarg works on `LangGraphAdapter`, `CrewAIAdapter`,
 `AutoGenAdapter`, and `CoherenceAdapterCore`.
 
+### `CrashRecoveryConfig` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `False` | Master switch. When `False`, `heartbeat()` and `recover()` are silent no-ops; the per-tick sweep does not run. |
+| `heartbeat_timeout_ticks` | `int` | `10` | Reclaim a holder's grant if the gap between `now_tick` and the holder's last heartbeat is `>= heartbeat_timeout_ticks`. |
+| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of heartbeat freshness. Bound the worst-case lock duration. |
+
+**Tick semantics.** Ticks are a logical clock — the unit is whatever `now_tick` your application advances. For LangGraph, one node invocation per tick is a sensible default. For long-running tool calls or LLM calls, advance ticks at the granularity at which you can call `heartbeat()` or expect grants to be released.
+
 ### How it works
 
 1. **Piggyback heartbeats.** Every `read()` / `write()` / `batch()` call automatically
@@ -351,9 +361,25 @@ With `enabled=False` (the default), `heartbeat()` and `recover()` are silent no-
 State-transition log output is byte-identical to v0.5. No behavior change for existing
 users.
 
+### Disabling / rollback
+
+To turn crash recovery off, omit `crash_recovery=` (it defaults to disabled) or pass
+`CrashRecoveryConfig(enabled=False)`. This is the rollback path if a default-on
+release ever surfaces an issue in your workload — flip the kwarg back to disabled
+and the sweep stops immediately. No data migration, no protocol incompatibility:
+the protocol behavior with `enabled=False` is byte-identical to a build without
+crash recovery.
+
+If you've enabled crash recovery and want to verify it isn't reclaiming benign
+holders, watch the state-transition log for `reclaim_heartbeat` and
+`reclaim_max_hold` triggers. If they fire on agents that were healthy, raise
+`heartbeat_timeout_ticks` or `max_hold_ticks` rather than disabling the feature.
+
 ### Reference
 
-Full spec: [docs/specs/crash-recovery.md](specs/crash-recovery.md).
+For the formal protocol model (TLA+/TLC) covering single-writer, monotonic
+versioning, and crash-recovery sweep invariants, see
+[`formal/tla/README.md`](../formal/tla/README.md).
 
 ---
 
