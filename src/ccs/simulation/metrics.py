@@ -40,6 +40,7 @@ class SimulationMetrics:
     tokens_invalidation: int
     context_injections: int
     transient_state_timeouts: int = 0
+    stable_grant_reclamations: int = 0
 
     @property
     def synchronization_tokens(self) -> int:

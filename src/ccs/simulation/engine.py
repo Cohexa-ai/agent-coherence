@@ -6,12 +6,17 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping, Sequence
 from uuid import UUID
 
 from ccs.agent.runtime import AgentRuntime
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import (
+    CoordinatorService,
+    CrashRecoveryConfig,
+    _validate_crash_recovery_config,
+)
 from ccs.core.clock import LogicalClock
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, InvalidationSignal
@@ -25,6 +30,29 @@ from .metrics import SimulationMetrics, StrategyComparisonReport
 
 _INVALIDATION_SIGNAL_TOKENS = 12
 _POINTER_UPDATE_TOKENS = 8
+
+
+@dataclass(frozen=True)
+class _FailureEvent:
+    """Internal canonical form of a parsed failure_events entry."""
+
+    tick: int
+    action: Literal["kill", "busy", "restore"]
+    agent_id: UUID
+    until_tick: int | None = None
+
+
+def _build_crash_recovery_config(scenario_config: Mapping[str, Any]) -> CrashRecoveryConfig:
+    """Read optional ``crash_recovery`` block from scenario; default to safe values."""
+    block = scenario_config.get("crash_recovery") or {}
+    defaults = CrashRecoveryConfig()
+    return CrashRecoveryConfig(
+        enabled=bool(block.get("enabled", defaults.enabled)),
+        heartbeat_timeout_ticks=int(
+            block.get("heartbeat_timeout_ticks", defaults.heartbeat_timeout_ticks)
+        ),
+        max_hold_ticks=int(block.get("max_hold_ticks", defaults.max_hold_ticks)),
+    )
 
 
 class SimulationEngine:
@@ -53,6 +81,8 @@ class SimulationEngine:
             lease_ttl_ticks=int(lease_cfg.get("default_ttl_ticks", 300)),
             access_count_max_accesses=int(access_count_cfg.get("max_accesses", 100)),
         )
+        self._crash_recovery = _build_crash_recovery_config(scenario_config)
+        _validate_crash_recovery_config(self._crash_recovery, self._strategy)
         self._monitor = ConsistencyMonitor(self._strategy)
         self._network = NetworkSimulator(
             latency_ticks=int(scenario_config["network"]["latency_ticks"]),
@@ -61,6 +91,24 @@ class SimulationEngine:
         )
 
         self._agent_ids = [UUID(int=i + 1) for i in range(int(simulation["num_agents"]))]
+        # Failure-injection bookkeeping. _alive_agents is the set of agents that
+        # heartbeat and may issue actions on a given tick; _busy_agents is the
+        # set in a fixed-window busy state (no heartbeat, no actions);
+        # _killed_agents is the set permanently sidelined by a `kill` event
+        # (cleared only by an explicit `restore`). On init all agents are alive;
+        # failure events flip them. _killed_agents is tracked separately from
+        # _busy_agents so that a busy auto-expiry never silently resurrects a
+        # killed agent (review finding ADV-01 / COR-03).
+        self._alive_agents: set[UUID] = set(self._agent_ids)
+        self._busy_agents: set[UUID] = set()
+        self._killed_agents: set[UUID] = set()
+        self._busy_until: dict[UUID, int] = {}
+        self._agent_id_by_name: dict[str, UUID] = {
+            f"agent_{i}": agent_id for i, agent_id in enumerate(self._agent_ids)
+        }
+        self._failure_events_by_tick: dict[int, list[_FailureEvent]] = (
+            self._parse_failure_events(scenario_config.get("failure_events"))
+        )
         self._artifact_ids: list[UUID] = []
         self._artifact_specs_by_id: dict[UUID, dict[str, Any]] = {}
         self._register_artifacts()
@@ -89,25 +137,125 @@ class SimulationEngine:
         self._tokens_invalidation = 0
         self._context_injections = 0
         self._transient_state_timeouts = 0
+        self._stable_grant_reclamations = 0
 
     def run(self) -> SimulationMetrics:
         """Run one deterministic simulation and return collected metrics."""
         duration_ticks = int(self._config["simulation"]["duration_ticks"])
         timeout_ticks = int(self._config.get("transient", {}).get("timeout_ticks", 5))
         for _ in range(duration_ticks):
+            now = self._clock.now()
+            self._apply_failure_events_for_tick(now)
             self._deliver_messages()
             self._execute_actions_for_tick()
             if self._strategy.broadcasts_every_tick():
-                self._broadcast_all_to_all(now_tick=self._clock.now())
+                self._broadcast_all_to_all(now_tick=now)
             self._transient_state_timeouts += self._coordinator.enforce_transient_timeouts(
-                current_tick=self._clock.now(),
+                current_tick=now,
                 timeout_ticks=timeout_ticks,
             )
+            if self._crash_recovery.enabled:
+                # R5: flag-off path must be byte-identical to v0.5 baseline.
+                # Guard at the call site so no heartbeat / sweep entries land
+                # in the state-log when the feature is disabled.
+                self._emit_heartbeats_for_alive_agents(now_tick=now)
+                self._stable_grant_reclamations += (
+                    self._coordinator.enforce_stable_grant_timeouts(
+                        current_tick=now,
+                        heartbeat_timeout_ticks=self._crash_recovery.heartbeat_timeout_ticks,
+                        max_hold_ticks=self._crash_recovery.max_hold_ticks,
+                    )
+                )
             self._clock.advance()
 
         # Drain messages that become due exactly at final tick.
         self._deliver_messages()
         return self._build_metrics(duration_ticks)
+
+    # ---- Failure-event injection ----------------------------------------
+
+    def _parse_failure_events(
+        self, raw_events: Any
+    ) -> dict[int, list[_FailureEvent]]:
+        """Parse and resolve agent-name references for ``failure_events``.
+
+        Validation of structure and value ranges is done by the scenario
+        validator. Here we only resolve agent names against the engine's
+        registered agent set and bucket events by tick (preserving order).
+        """
+        if not raw_events:
+            return {}
+        bucketed: dict[int, list[_FailureEvent]] = {}
+        for event in raw_events:
+            agent_name = str(event["agent"])
+            if agent_name not in self._agent_id_by_name:
+                raise ValueError(
+                    f"failure_events: unknown agent name '{agent_name}'; "
+                    f"valid names: {sorted(self._agent_id_by_name)}"
+                )
+            tick = int(event["tick"])
+            until_tick = event.get("until_tick")
+            parsed = _FailureEvent(
+                tick=tick,
+                action=str(event["action"]),
+                agent_id=self._agent_id_by_name[agent_name],
+                until_tick=int(until_tick) if until_tick is not None else None,
+            )
+            bucketed.setdefault(tick, []).append(parsed)
+        return bucketed
+
+    def _apply_failure_events_for_tick(self, now_tick: int) -> None:
+        """Apply kill/busy/restore events scheduled for ``now_tick``.
+
+        Also auto-expires ``busy`` windows whose ``until_tick`` has been
+        reached: those agents flip back to alive without a ``restore`` event.
+        """
+        # Auto-expire busy windows first so an event firing at the same tick
+        # observes the agent as live again. Killed agents are NEVER restored
+        # by busy auto-expiry — only an explicit `restore` event clears a kill
+        # (review ADV-01: prevents busy×kill silent resurrection).
+        if self._busy_until:
+            expired = [
+                a
+                for a, u in self._busy_until.items()
+                if now_tick >= u and a not in self._killed_agents
+            ]
+            for agent_id in expired:
+                self._busy_until.pop(agent_id, None)
+                self._busy_agents.discard(agent_id)
+                self._alive_agents.add(agent_id)
+
+        for event in self._failure_events_by_tick.get(now_tick, ()):
+            if event.action == "kill":
+                self._alive_agents.discard(event.agent_id)
+                self._busy_agents.discard(event.agent_id)
+                self._busy_until.pop(event.agent_id, None)
+                self._killed_agents.add(event.agent_id)
+            elif event.action == "busy":
+                if event.until_tick is None:
+                    raise ValueError(
+                        f"failure_event(action='busy') missing until_tick at tick={event.tick}"
+                    )
+                if event.agent_id in self._killed_agents:
+                    raise ValueError(
+                        f"failure_event(action='busy') on killed agent at tick={event.tick}; "
+                        "issue a 'restore' before scheduling busy on a killed agent"
+                    )
+                self._alive_agents.discard(event.agent_id)
+                self._busy_agents.add(event.agent_id)
+                self._busy_until[event.agent_id] = event.until_tick
+            elif event.action == "restore":
+                self._alive_agents.add(event.agent_id)
+                self._busy_agents.discard(event.agent_id)
+                self._busy_until.pop(event.agent_id, None)
+                self._killed_agents.discard(event.agent_id)
+            else:  # pragma: no cover — schema validator already rejects this.
+                raise ValueError(f"unsupported failure-event action '{event.action}'")
+
+    def _emit_heartbeats_for_alive_agents(self, *, now_tick: int) -> None:
+        """Emit one heartbeat per alive agent for ``now_tick``."""
+        for agent_id in self._alive_agents:
+            self._coordinator.record_heartbeat(agent_id=agent_id, now_tick=now_tick)
 
     def _register_artifacts(self) -> None:
         for artifact_cfg in self._config["artifacts"]:
@@ -130,6 +278,18 @@ class SimulationEngine:
         agent_velocity = scenario.get("agent_velocity")
 
         for agent_id in self._agent_ids:
+            # Skip agents that are killed, in a busy window, or otherwise not
+            # alive. Filter is applied BEFORE action selection so RNG state
+            # is unaffected for live agents and a killed agent never reaches
+            # _perform_read / _perform_write. Each set is consulted explicitly
+            # (defense in depth) — _killed_agents and _busy_agents are now
+            # disjoint after review fix ADV-01.
+            if (
+                agent_id not in self._alive_agents
+                or agent_id in self._busy_agents
+                or agent_id in self._killed_agents
+            ):
+                continue
             if agent_velocity is not None:
                 for _ in range(int(agent_velocity)):
                     self._execute_single_action(agent_id=agent_id, now_tick=now)
@@ -408,6 +568,7 @@ class SimulationEngine:
             tokens_invalidation=self._tokens_invalidation,
             context_injections=self._context_injections,
             transient_state_timeouts=self._transient_state_timeouts,
+            stable_grant_reclamations=self._stable_grant_reclamations,
         )
 
 

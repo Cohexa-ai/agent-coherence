@@ -76,6 +76,7 @@ def _normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
     strategies = data.setdefault("strategies", {})
     transient = data.setdefault("transient", {})
     context_semantics = data.setdefault("context_semantics", {})
+    data.setdefault("crash_recovery", {})
 
     if "num_agents" not in simulation and "agents" in simulation:
         simulation["num_agents"] = simulation["agents"]
@@ -266,6 +267,76 @@ def _validate_transient(transient: dict[str, Any], path: Path) -> None:
     )
 
 
+def _validate_crash_recovery(crash_recovery: dict[str, Any], path: Path) -> None:
+    """Validate optional ``crash_recovery`` block; absent or empty ⇒ defaults."""
+    if "enabled" in crash_recovery:
+        _require_bool(crash_recovery["enabled"], path=path, field="crash_recovery.enabled")
+    if "heartbeat_timeout_ticks" in crash_recovery:
+        _require_int(
+            crash_recovery["heartbeat_timeout_ticks"],
+            path=path,
+            field="crash_recovery.heartbeat_timeout_ticks",
+            min_value=1,
+        )
+    if "max_hold_ticks" in crash_recovery:
+        _require_int(
+            crash_recovery["max_hold_ticks"],
+            path=path,
+            field="crash_recovery.max_hold_ticks",
+            min_value=1,
+        )
+
+
+_SUPPORTED_FAILURE_ACTIONS = {"kill", "busy", "restore"}
+
+
+def _validate_failure_events(failure_events: Any, path: Path) -> None:
+    """Validate optional ``failure_events`` top-level list.
+
+    Each entry: ``{tick, action, agent, [until_tick]}``.
+      - ``action`` ∈ {kill, busy, restore}
+      - ``tick`` integer >= 0
+      - ``agent`` non-empty string (cross-checked against agent set at engine init)
+      - ``until_tick`` required for ``busy`` and must be > ``tick``;
+        forbidden for ``kill`` and ``restore``.
+    """
+    if failure_events is None:
+        return
+    if not isinstance(failure_events, list):
+        raise ScenarioValidationError(str(path), "'failure_events' must be a list")
+    for idx, event in enumerate(failure_events):
+        prefix = f"failure_events[{idx}]"
+        if not isinstance(event, dict):
+            raise ScenarioValidationError(str(path), f"'{prefix}' must be a mapping")
+        _require_int(event.get("tick"), path=path, field=f"{prefix}.tick", min_value=0)
+        action = event.get("action")
+        if action not in _SUPPORTED_FAILURE_ACTIONS:
+            raise ScenarioValidationError(
+                str(path),
+                f"'{prefix}.action' must be one of: {', '.join(sorted(_SUPPORTED_FAILURE_ACTIONS))}",
+            )
+        agent = event.get("agent")
+        if not isinstance(agent, str) or not agent.strip():
+            raise ScenarioValidationError(str(path), f"'{prefix}.agent' must be a non-empty string")
+        until_tick = event.get("until_tick")
+        if action == "busy":
+            if until_tick is None:
+                raise ScenarioValidationError(
+                    str(path), f"'{prefix}.until_tick' is required when action='busy'"
+                )
+            _require_int(until_tick, path=path, field=f"{prefix}.until_tick", min_value=0)
+            if int(until_tick) <= int(event["tick"]):
+                raise ScenarioValidationError(
+                    str(path), f"'{prefix}.until_tick' must be > {prefix}.tick"
+                )
+        else:
+            if until_tick is not None:
+                raise ScenarioValidationError(
+                    str(path),
+                    f"'{prefix}.until_tick' is only valid when action='busy'",
+                )
+
+
 def _validate_context_semantics(context_semantics: dict[str, Any], path: Path) -> None:
     model = context_semantics.get("model")
     if model not in _SUPPORTED_CONTEXT_MODELS:
@@ -307,6 +378,7 @@ def validate_scenario(data: dict[str, Any], scenario_path: str | Path) -> dict[s
     strategies = _require_mapping(normalized, path, "strategies")
     transient = _require_mapping(normalized, path, "transient")
     context_semantics = _require_mapping(normalized, path, "context_semantics")
+    crash_recovery = _require_mapping(normalized, path, "crash_recovery")
 
     _validate_simulation(simulation, path)
     _validate_network(network, path)
@@ -315,6 +387,8 @@ def validate_scenario(data: dict[str, Any], scenario_path: str | Path) -> dict[s
     _validate_strategies(strategies, path)
     _validate_transient(transient, path)
     _validate_context_semantics(context_semantics, path)
+    _validate_crash_recovery(crash_recovery, path)
+    _validate_failure_events(normalized.get("failure_events"), path)
 
     return _populate_runtime_aliases(normalized)
 

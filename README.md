@@ -51,6 +51,7 @@ codebase-review workload.
 - 📄 [Paper on arXiv (2603.15183)](https://arxiv.org/abs/2603.15183) — formal protocol, TLA+ verification, simulation results
 - 📊 [Real benchmarks](#real-workload-benchmarks) — measured on actual LangGraph graphs
 - 🔧 [User guide](docs/guide.md) — strategies, telemetry, examples
+- 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK, with citations
 
 ---
 
