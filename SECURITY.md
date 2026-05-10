@@ -22,6 +22,22 @@ even in `--dry-run`):
 The CLI flags `--no-telemetry` and `--no-network` provide the same suppression at the
 invocation level.
 
+### Rendering defaults
+
+Two environment variables override the placeholder CTA defaults baked into the
+HTML report. They are read at import time of `ccs.diagnose.render`:
+
+- `CCS_DIAGNOSE_BOOK_A_CALL_URL` — replaces the default cal.com link. Must
+  start with `http://` or `https://`; `javascript:`, `data:`, `vbscript:` are
+  rejected by `RenderOptions.__post_init__`.
+- `CCS_DIAGNOSE_CONTACT_EMAIL` — replaces the default reply-to address. Must
+  match a plain `local@host` form; URL schemes embedded in the value are
+  rejected.
+
+Both env vars are validated by the same allowlist that gates caller-supplied
+`RenderOptions(book_a_call_url=...)` / `contact_email=...` arguments — so an
+attacker who can set the env cannot smuggle an XSS sink past the renderer.
+
 ## Local config and data files
 
 `ccs-diagnose` writes to two well-known locations under XDG paths:

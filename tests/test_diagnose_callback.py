@@ -517,6 +517,117 @@ def test_record_after_finalize_raises():
 
 
 # -----------------------------------------------------------------------
+# Concurrency: shared-state methods hold ``self._lock`` (RLock)
+# -----------------------------------------------------------------------
+
+
+def test_lock_is_reentrant_for_locked_method_chains():
+    """``_track_namespace_step`` calls ``_record_verdict_signal`` under
+    the same lock; with a non-reentrant lock the chain would deadlock.
+    Verifies the lock is an ``RLock``."""
+    import threading
+
+    cb = DiagnoseCallback()
+    # ``RLock`` instances expose a different repr than plain ``Lock``;
+    # the private factory is the canonical check.
+    assert isinstance(cb._lock, type(threading.RLock()))
+
+    # Trigger the re-entrant path: a subgraph namespace forces
+    # ``_track_namespace_step`` to call ``_record_verdict_signal``
+    # while still holding the lock. A plain ``Lock`` would deadlock.
+    cb._track_namespace_step(namespace="parent|child:abc", step=0)
+    assert cb.has_verdict_signal("subgraph_observed")
+
+
+class _TrackingRLock:
+    """Test double that proxies ``threading.RLock`` and records every
+    acquire / release event so we can verify a method body actually
+    held the lock."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self._inner = threading.RLock()
+        self.events: list[str] = []
+
+    def acquire(self, *a, **kw):  # noqa: D401
+        self.events.append("acquire")
+        return self._inner.acquire(*a, **kw)
+
+    def release(self) -> None:  # noqa: D401
+        self.events.append("release")
+        self._inner.release()
+
+    def __enter__(self):  # noqa: D401
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: D401
+        self.release()
+
+
+def test_track_namespace_step_holds_lock_during_body():
+    """Verify ``_track_namespace_step`` acquires ``self._lock`` before
+    touching shared state."""
+    cb = DiagnoseCallback()
+    tracker = _TrackingRLock()
+    cb._lock = tracker  # type: ignore[assignment]
+
+    cb._track_namespace_step(namespace="ns", step=1)
+
+    assert "acquire" in tracker.events
+    assert "release" in tracker.events
+    # acquire-then-release ordering, paired
+    assert tracker.events.count("acquire") == tracker.events.count("release")
+
+
+def test_resolve_end_attribution_holds_lock_during_body():
+    """Verify ``_resolve_end_attribution`` acquires ``self._lock``
+    before iterating ``self._buffer``."""
+    cb = DiagnoseCallback()
+    tracker = _TrackingRLock()
+    cb._lock = tracker  # type: ignore[assignment]
+
+    cb._resolve_end_attribution(run_id="missing")
+
+    assert "acquire" in tracker.events
+    assert "release" in tracker.events
+    assert tracker.events.count("acquire") == tracker.events.count("release")
+
+
+def test_concurrent_track_namespace_step_no_data_corruption():
+    """Spawn 2 threads each calling ``_track_namespace_step`` 100 times;
+    the resulting ``_last_step_by_ns`` map must be coherent and no
+    exception should escape."""
+    import threading
+
+    cb = DiagnoseCallback()
+    errors: list[BaseException] = []
+
+    def producer(ns: str, n: int) -> None:
+        try:
+            for step in range(n):
+                cb._track_namespace_step(namespace=ns, step=step)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=producer, args=("ns_a", 100))
+    t2 = threading.Thread(target=producer, args=("ns_b", 100))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors, errors
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+    # Each namespace saw a strictly-increasing sequence; the final
+    # step should be n-1.
+    assert cb._last_step_by_ns["ns_a"] == 99
+    assert cb._last_step_by_ns["ns_b"] == 99
+
+
+# -----------------------------------------------------------------------
 # Integration: examples/langgraph_planner/build_graph_no_store
 # -----------------------------------------------------------------------
 

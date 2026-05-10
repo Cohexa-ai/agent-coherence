@@ -1061,3 +1061,91 @@ def test_render_options_default_construction_succeeds() -> None:
     opts = RenderOptions()
     assert opts.book_a_call_url.startswith("https://")
     assert "@" in opts.contact_email
+
+
+# -----------------------------------------------------------------------
+# Env-var overrides (resolved at module import time)
+# -----------------------------------------------------------------------
+
+
+def test_book_a_call_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``CCS_DIAGNOSE_BOOK_A_CALL_URL`` overrides the hardcoded default."""
+    import importlib
+
+    import ccs.diagnose.render as render_mod
+
+    monkeypatch.setenv(
+        "CCS_DIAGNOSE_BOOK_A_CALL_URL", "https://example.com/book-me"
+    )
+    reloaded = importlib.reload(render_mod)
+    try:
+        assert reloaded.DEFAULT_BOOK_A_CALL_URL == "https://example.com/book-me"
+        # Default-constructed RenderOptions picks up the override and
+        # passes the scheme allowlist.
+        opts = reloaded.RenderOptions()
+        assert opts.book_a_call_url == "https://example.com/book-me"
+    finally:
+        # Restore the unpatched module so later tests see the canonical
+        # default.
+        monkeypatch.delenv("CCS_DIAGNOSE_BOOK_A_CALL_URL", raising=False)
+        importlib.reload(render_mod)
+
+
+def test_contact_email_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``CCS_DIAGNOSE_CONTACT_EMAIL`` overrides the hardcoded default."""
+    import importlib
+
+    import ccs.diagnose.render as render_mod
+
+    monkeypatch.setenv("CCS_DIAGNOSE_CONTACT_EMAIL", "ops@example.com")
+    reloaded = importlib.reload(render_mod)
+    try:
+        assert reloaded.DEFAULT_CONTACT_EMAIL == "ops@example.com"
+        opts = reloaded.RenderOptions()
+        assert opts.contact_email == "ops@example.com"
+    finally:
+        monkeypatch.delenv("CCS_DIAGNOSE_CONTACT_EMAIL", raising=False)
+        importlib.reload(render_mod)
+
+
+def test_book_a_call_url_env_override_still_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malicious env-var value (``javascript:``) must still be rejected
+    by the URL scheme allowlist when ``RenderOptions`` is constructed."""
+    import importlib
+
+    import ccs.diagnose.render as render_mod
+
+    monkeypatch.setenv("CCS_DIAGNOSE_BOOK_A_CALL_URL", "javascript:alert(1)")
+    reloaded = importlib.reload(render_mod)
+    try:
+        # The module-level constant accepts whatever env says (it's just
+        # a string), but constructing RenderOptions() against that
+        # default must fail closed.
+        with pytest.raises(ValueError, match="http://"):
+            reloaded.RenderOptions()
+    finally:
+        monkeypatch.delenv("CCS_DIAGNOSE_BOOK_A_CALL_URL", raising=False)
+        importlib.reload(render_mod)
+
+
+def test_contact_email_env_override_still_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malicious env-var contact email (``javascript:foo@x``) must
+    still be rejected by the email allowlist."""
+    import importlib
+
+    import ccs.diagnose.render as render_mod
+
+    monkeypatch.setenv(
+        "CCS_DIAGNOSE_CONTACT_EMAIL", "javascript:alert(1)@evil.example"
+    )
+    reloaded = importlib.reload(render_mod)
+    try:
+        with pytest.raises(ValueError, match="URL scheme"):
+            reloaded.RenderOptions()
+    finally:
+        monkeypatch.delenv("CCS_DIAGNOSE_CONTACT_EMAIL", raising=False)
+        importlib.reload(render_mod)

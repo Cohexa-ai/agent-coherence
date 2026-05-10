@@ -44,6 +44,7 @@ the output.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,15 +69,31 @@ __all__ = [
 ]
 
 
-DEFAULT_BOOK_A_CALL_URL: str = "https://cal.com/agent-coherence/diagnose"
+DEFAULT_BOOK_A_CALL_URL: str = os.environ.get(
+    "CCS_DIAGNOSE_BOOK_A_CALL_URL",
+    "https://cal.com/agent-coherence/diagnose",
+)
 """Placeholder calendar link rendered when no override supplied.
+
+Resolves at import time from ``CCS_DIAGNOSE_BOOK_A_CALL_URL`` if set,
+else falls back to the hardcoded default. The same scheme allowlist
+that ``RenderOptions.__post_init__`` applies to caller-supplied values
+also applies to env-var overrides — an instance built with this
+default will validate as usual, so a malicious env value
+(``javascript:alert(1)``) is rejected the moment ``RenderOptions()``
+is constructed.
 
 Replace via ``RenderOptions(book_a_call_url=...)`` once the routine has
 its production cal.com handle wired through Unit 7's CLI flag.
 """
 
-DEFAULT_CONTACT_EMAIL: str = "vlad@fwdinc.net"
-"""Placeholder reply-to address. Override via ``RenderOptions``."""
+DEFAULT_CONTACT_EMAIL: str = os.environ.get(
+    "CCS_DIAGNOSE_CONTACT_EMAIL",
+    "vlad@fwdinc.net",
+)
+"""Placeholder reply-to address. Override via ``RenderOptions`` or by
+setting ``CCS_DIAGNOSE_CONTACT_EMAIL`` before import. Subject to the
+same scheme/format allowlist as caller-supplied values."""
 
 
 _TEMPLATES_DIR = Path(__file__).with_name("templates")

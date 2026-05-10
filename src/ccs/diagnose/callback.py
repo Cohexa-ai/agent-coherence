@@ -250,7 +250,11 @@ class DiagnoseCallback(BaseCallbackHandler):
         self._sequence: int = 0
         self._buffer: list[DiagnoseEvent] = []
         self._finalized = False
-        self._lock = threading.Lock()
+        # ``RLock`` because some locked methods call other locked methods
+        # (e.g. :meth:`_track_namespace_step` invokes
+        # :meth:`_record_verdict_signal`); a non-reentrant lock would
+        # deadlock under that path.
+        self._lock = threading.RLock()
 
         # Per-namespace last-seen langgraph_step for monotonicity tracking.
         self._last_step_by_ns: dict[str, int] = {}
@@ -423,39 +427,46 @@ class DiagnoseCallback(BaseCallbackHandler):
         On any monotonicity break we record a verdict signal so the
         classifier can downgrade. Subgraph hops (``|`` in the namespace)
         also trigger a verdict signal once per run.
+
+        The body holds ``self._lock`` (an ``RLock``) so concurrent
+        callback paths (future ``AsyncDiagnoseCallback``) cannot
+        race on ``_last_step_by_ns`` / ``_monotonicity_broken`` /
+        ``_subgraph_observed``. ``_record_verdict_signal`` re-acquires
+        the same lock — re-entry is safe under ``RLock``.
         """
         if step < 0:
             return
 
-        if _is_subgraph_namespace(namespace) and not self._subgraph_observed:
-            self._subgraph_observed = True
-            self._record_verdict_signal(
-                signal="subgraph_observed",
-                message=(
-                    f"Subgraph hop observed in namespace {namespace!r}; "
-                    "verdict downgraded — diagnose v0-preview supports "
-                    "single-graph runs only."
-                ),
-            )
+        with self._lock:
+            if _is_subgraph_namespace(namespace) and not self._subgraph_observed:
+                self._subgraph_observed = True
+                self._record_verdict_signal(
+                    signal="subgraph_observed",
+                    message=(
+                        f"Subgraph hop observed in namespace {namespace!r}; "
+                        "verdict downgraded — diagnose v0-preview supports "
+                        "single-graph runs only."
+                    ),
+                )
 
-        # NOTE: LangGraph can emit ``on_chain_start`` twice at the same
-        # ``(step, namespace)`` for nodes attached to a conditional edge
-        # — the edge resolver and the node body both raise the callback
-        # under the same metadata. A re-entry at the *same* step is
-        # benign and must NOT trip monotonicity. Only a strictly
-        # decreasing ``step`` within an unchanged namespace indicates
-        # an unsupported execution model.
-        last = self._last_step_by_ns.get(namespace)
-        if last is not None and step < last and not self._monotonicity_broken:
-            self._monotonicity_broken = True
-            self._record_verdict_signal(
-                signal="unsupported_execution_model",
-                message=(
-                    f"langgraph_step monotonicity broken in namespace "
-                    f"{namespace!r}: saw {step} after {last}."
-                ),
-            )
-        self._last_step_by_ns[namespace] = max(last or step, step)
+            # NOTE: LangGraph can emit ``on_chain_start`` twice at the same
+            # ``(step, namespace)`` for nodes attached to a conditional edge
+            # — the edge resolver and the node body both raise the callback
+            # under the same metadata. A re-entry at the *same* step is
+            # benign and must NOT trip monotonicity. Only a strictly
+            # decreasing ``step`` within an unchanged namespace indicates
+            # an unsupported execution model.
+            last = self._last_step_by_ns.get(namespace)
+            if last is not None and step < last and not self._monotonicity_broken:
+                self._monotonicity_broken = True
+                self._record_verdict_signal(
+                    signal="unsupported_execution_model",
+                    message=(
+                        f"langgraph_step monotonicity broken in namespace "
+                        f"{namespace!r}: saw {step} after {last}."
+                    ),
+                )
+            self._last_step_by_ns[namespace] = max(last or step, step)
 
     def _record_node_event(
         self,
@@ -548,10 +559,16 @@ class DiagnoseCallback(BaseCallbackHandler):
         return versions, hashes
 
     def _resolve_end_attribution(self, run_id: str) -> tuple[str, str, int]:
-        """Look up the most recent ``node_start`` with this run_id."""
-        for event in reversed(self._buffer):
-            if event.event_type == "node_start" and event.run_id == run_id:
-                return event.node, event.namespace, event.tick
+        """Look up the most recent ``node_start`` with this run_id.
+
+        Holds ``self._lock`` while iterating ``self._buffer`` so
+        concurrent producers cannot mutate the list mid-traversal under
+        a future async path.
+        """
+        with self._lock:
+            for event in reversed(self._buffer):
+                if event.event_type == "node_start" and event.run_id == run_id:
+                    return event.node, event.namespace, event.tick
         return "", "", -1
 
     # ---------------------------------------------------------------- #

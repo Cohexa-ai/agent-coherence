@@ -35,8 +35,12 @@ Hard guarantees
 * **No new dependencies.** Stdlib only.
 * **No network code.** Submission lives in a future unit; v0 only writes
   the local JSONL file. The user shares it manually if they choose.
-* **Atomic append.** Each line is one ``os.write`` of a JSON object plus
-  trailing ``\\n``, opened with ``O_APPEND``.
+* **Atomic append (POSIX).** Each entry is written under an exclusive
+  ``fcntl.flock`` so concurrent appenders cannot interleave bytes from
+  separate JSON objects. ``O_APPEND`` keeps the kernel's write offset
+  end-of-file even across the lock window. On Windows ``fcntl`` is
+  unavailable, so the append falls back to ``O_APPEND`` alone — best
+  effort, documented as a v0 limitation.
 """
 
 from __future__ import annotations
@@ -47,6 +51,14 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:  # pragma: no cover - POSIX-only import gate
+    import fcntl as _fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover - Windows path
+    _fcntl = None  # type: ignore[assignment]
+    _HAS_FCNTL = False
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.classifier import ClassifierVerdict
@@ -194,9 +206,16 @@ def append_calibration_entry(
         json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str) + "\n"
     )
 
-    # Open with O_CREAT | O_APPEND, mode 0o600. POSIX guarantees atomic
-    # append for writes <= PIPE_BUF; a single JSON entry on one filesystem
-    # write should fit (the diagnose payload is ~1KB worst-case).
+    # Open with O_CREAT | O_APPEND, mode 0o600. The PIPE_BUF atomicity
+    # guarantee from POSIX applies to *pipes*, not regular files — and
+    # macOS' ``PIPE_BUF`` is 512 bytes, smaller than a real diagnose
+    # entry (~1 KB). Two concurrent appenders without explicit locking
+    # can therefore interleave their bytes mid-line, producing invalid
+    # JSONL. We take an exclusive ``fcntl.flock`` for the duration of
+    # the write to make the append truly atomic on POSIX. ``os.write``
+    # may also short-write under heavy load, so the inner loop drains
+    # ``encoded`` to completion.
+    encoded = line.encode("utf-8")
     try:
         fd = os.open(
             os.fspath(target),
@@ -211,9 +230,25 @@ def append_calibration_entry(
         )
 
     try:
+        if _HAS_FCNTL:
+            assert _fcntl is not None
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
         try:
-            os.write(fd, line.encode("utf-8"))
+            remaining = encoded
+            while remaining:
+                n = os.write(fd, remaining)
+                if n <= 0:  # pragma: no cover - exotic disk-full case
+                    raise OSError(
+                        "os.write returned 0 — disk full or fd closed"
+                    )
+                remaining = remaining[n:]
         finally:
+            if _HAS_FCNTL:
+                assert _fcntl is not None
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:  # pragma: no cover - already released
+                    pass
             os.close(fd)
     except OSError as exc:
         return CalibrationWriteResult(

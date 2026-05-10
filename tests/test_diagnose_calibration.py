@@ -736,3 +736,65 @@ def test_readme_has_calibration_section() -> None:
     # Promotion gate criteria mentioned.
     assert "v0-preview" in text
     assert "Promotion to" in text
+
+
+# -------------------------------------------------------------------- #
+# Concurrent-append atomicity (POSIX flock)
+# -------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fcntl.flock is POSIX-only; Windows uses best-effort O_APPEND.",
+)
+def test_concurrent_appends_do_not_interleave_bytes(
+    tmp_path: Path,
+    fake_verdict_and_report,
+    granted_consent: ConsentState,
+) -> None:
+    """Two threads each append 100 entries to the same JSONL file.
+
+    With ``fcntl.flock``, all 200 lines must remain valid JSON and
+    the total line count must be exactly 200 — no partial-line
+    interleaving from PIPE_BUF underestimation on macOS.
+    """
+    import threading
+
+    verdict, report = fake_verdict_and_report
+    target = tmp_path / "concurrent.jsonl"
+    errors: list[BaseException] = []
+
+    def producer(n: int) -> None:
+        try:
+            for _ in range(n):
+                result = append_calibration_entry(
+                    verdict=verdict,
+                    report=report,
+                    consent=granted_consent,
+                    path=target,
+                )
+                assert result.written is True, result.reason
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=producer, args=(100,))
+    t2 = threading.Thread(target=producer, args=(100,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+
+    assert not errors, errors
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 200, f"expected 200 lines, got {len(lines)}"
+    # Every line is valid JSON — no torn writes.
+    for line in lines:
+        json.loads(line)
+    # validate_log accepts the whole file as one stream per instance_id.
+    gaps, mismatches = validate_log(
+        target,
+        stream="diagnose_calibration",
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+    assert gaps == []
+    assert mismatches == []
