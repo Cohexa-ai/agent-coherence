@@ -60,6 +60,26 @@ pytestmark = pytest.mark.skipif(
 # -------------------------------------------------------------------- #
 
 
+@pytest.fixture(autouse=True)
+def _isolate_consent(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure CLI tests never touch the user's real consent file.
+
+    Sets ``XDG_CONFIG_HOME`` to a per-test temp dir and ``CI=1`` so the
+    consent resolver never prompts (Unit 8 makes the resolver
+    non-interactive when ``CI`` is truthy).
+    """
+    cfg_dir = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_dir))
+    monkeypatch.setenv("CI", "1")
+    # Defensive: clear kill switches so the few tests that exercise the
+    # actual flow don't see an inherited DO_NOT_TRACK from the developer's
+    # shell.
+    for name in ("DO_NOT_TRACK", "DISABLE_TELEMETRY", "CCS_DIAGNOSE_NO_TELEMETRY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _invoke(argv: list[str]) -> tuple[int, str, str]:
     """Call ``main(argv)`` and capture stdout/stderr."""
     # Late import so the skip marker can short-circuit when langgraph is
@@ -259,10 +279,22 @@ def test_show_payload_schema_mismatch_errors(tmp_path: Path) -> None:
     assert "schema version mismatch" in stderr.lower()
 
 
-def test_reset_token_prints_stub(tmp_path: Path) -> None:
-    code, _, stderr = _invoke(["--reset-token"])
+def test_reset_token_prints_new_uuid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit 8: --reset-token regenerates consent.json with a fresh UUID4."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    code, stdout, _ = _invoke(["--reset-token"])
     assert code == 0
-    assert "Unit 8 stub" in stderr
+    assert "installation token regenerated:" in stdout
+    consent_file = tmp_path / "ccs-diagnose" / "consent.json"
+    assert consent_file.exists()
+    consent_data = json.loads(consent_file.read_text(encoding="utf-8"))
+    assert consent_data["granted"] is True
+    assert consent_data["policy_version"] == 1
+    # UUID4 string survives round-trip.
+    import uuid as _uuid
+    _uuid.UUID(consent_data["installation_token"])
 
 
 # -------------------------------------------------------------------- #

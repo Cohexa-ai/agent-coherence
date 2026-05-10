@@ -60,7 +60,15 @@ from ccs.diagnose.render import (
     render_html,
 )
 from ccs.diagnose.summary import terminal_summary
-from ccs.diagnose.telemetry import payload_for, payload_for_from_json
+from ccs.diagnose.telemetry import (
+    CURRENT_POLICY_VERSION,
+    ConsentState,
+    env_kill_switch_active,
+    payload_for,
+    payload_for_from_json,
+    reset_token,
+    resolve_consent,
+)
 
 __all__ = ["main", "build_parser"]
 
@@ -294,7 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_show_payload(args)
 
     if args.reset_token:
-        return _run_reset_token()
+        return _run_reset_token(args)
 
     if not args.graph:
         parser.error(
@@ -353,17 +361,64 @@ def _run_show_payload(args: argparse.Namespace) -> int:
         )
         return 1
 
-    payload = payload_for_from_json(loaded)
+    # ``--show-payload`` is a read-only operation: never prompt. We use
+    # the current persisted consent if any so the displayed
+    # ``installation_token`` matches what would actually be submitted.
+    consent = _consent_for_show_payload()
+    payload = payload_for_from_json(loaded, consent=consent)
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     return 0
 
 
-def _run_reset_token() -> int:
-    print(
-        "Unit 8 stub: --reset-token is reserved for the consent-flow update. "
-        "v0 ships without consent infrastructure; this is a no-op.",
-        file=sys.stderr,
-    )
+def _consent_for_show_payload() -> ConsentState:
+    """Resolve consent for the read-only ``--show-payload`` path.
+
+    Never prompts. Honors env-var kill switches. Falls back to the
+    persisted consent file when present and at the current policy
+    version; otherwise returns a denied state.
+    """
+    from ccs.diagnose.telemetry import load_consent
+
+    if env_kill_switch_active() is not None:
+        return ConsentState(
+            granted=False,
+            policy_version=CURRENT_POLICY_VERSION,
+            installation_token=None,
+        )
+    existing = load_consent()
+    if existing is None:
+        return ConsentState(
+            granted=False,
+            policy_version=CURRENT_POLICY_VERSION,
+            installation_token=None,
+        )
+    if existing.policy_version != CURRENT_POLICY_VERSION:
+        return ConsentState(
+            granted=False,
+            policy_version=CURRENT_POLICY_VERSION,
+            installation_token=None,
+        )
+    return existing
+
+
+def _run_reset_token(args: argparse.Namespace) -> int:
+    """Implement ``ccs-diagnose --reset-token``.
+
+    Regenerates the local ``consent.json`` with a fresh UUID4 and
+    ``granted=True``. When a kill-switch env var is active, prints a
+    warning so users understand the regeneration won't enable
+    submissions while the kill switch is set.
+    """
+    del args  # accepted for symmetry with subcommand handler signature
+    active = env_kill_switch_active()
+    if active is not None:
+        print(
+            f"warning: {active} is set; --reset-token regenerates the local "
+            "consent.json but no submissions will occur regardless",
+            file=sys.stderr,
+        )
+    new_token = reset_token()
+    print(f"installation token regenerated: {new_token}")
     return 0
 
 
@@ -373,6 +428,18 @@ def _run_reset_token() -> int:
 
 
 def _run_pipeline(args: argparse.Namespace) -> int:
+    # Resolve consent up-front so the prompt (if any) appears before any
+    # pipeline output. ``--no-telemetry`` and ``--no-network`` short-circuit
+    # to a denied-with-no-token state so the resolver never prompts.
+    if args.no_telemetry or args.no_network:
+        consent: ConsentState = ConsentState(
+            granted=False,
+            policy_version=CURRENT_POLICY_VERSION,
+            installation_token=None,
+        )
+    else:
+        consent = resolve_consent()
+
     factory_loaded = _load_graph_factory(args.graph)
     if factory_loaded is None:
         return 1
@@ -481,7 +548,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     # Trust-posture flag stubs.
     if args.dry_run:
-        payload = payload_for(verdict, report)
+        payload = payload_for(verdict, report, consent=consent)
         print(
             "\nwould submit (dry-run):\n"
             + json.dumps(payload, indent=2, sort_keys=True, default=str)
