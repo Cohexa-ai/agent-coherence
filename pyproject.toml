@@ -25,7 +25,9 @@ dependencies = ["pyyaml>=6.0"]
 ccs-simulate = "ccs.cli.simulate:main"
 ccs-compare = "ccs.cli.compare:main"
 ccs-check-architecture = "ccs.hardening.architecture:main"
+ccs-check-release = "ccs.hardening.release_readiness:main"
 ccs-benchmark = "ccs.cli.benchmark:main"
+ccs-diagnose = "ccs.cli.diagnose:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
@@ -34,7 +36,8 @@ crewai = ["crewai>=0.80"]
 otel = ["opentelemetry-api>=1.0"]
 langsmith = ["langsmith>=0.1"]
 benchmark = ["langchain-core>=0.2"]
-all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark]"]
+diagnose = ["agent-coherence[langgraph]", "jinja2>=3.1", "langchain-core>=0.2"]
+all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
