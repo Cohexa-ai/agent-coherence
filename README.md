@@ -174,6 +174,64 @@ When an agent crashes (OOM-kill, segfault) or livelocks, its `MODIFIED` or `EXCL
 
 **v0.1 — initial release.** MESI-style cache coherence for shared artifacts in multi-agent LLM systems.
 
+## Calibration corpus (`ccs-diagnose --calibration-record`)
+
+`ccs-diagnose` ships under the `langgraph-v0-preview` classifier. Submissions tagged
+`v0-preview` are excluded from the public benchmark — they accumulate in a local
+JSONL file you can share back with us if you'd like to contribute to v1 promotion.
+
+To opt in:
+
+```bash
+ccs-diagnose --graph my_module:build_graph --calibration-record
+```
+
+This appends one entry per run to `$XDG_DATA_HOME/ccs-diagnose/calibration.jsonl`
+(or `~/.local/share/ccs-diagnose/calibration.jsonl` if `XDG_DATA_HOME` is unset).
+Override the path: `--calibration-record /tmp/my_calibration.jsonl`.
+
+Each entry contains:
+
+- Stack name and version (e.g., `LangGraph 1.1.10`)
+- Classifier verdict + confidence
+- Coverage shape (counts only — no key names, no content, no hashes)
+- Timestamp
+- Schema version + sequence number + instance ID
+
+Nothing else. The file is `validate_log`-compatible — verify before sharing:
+
+```bash
+.venv/bin/python -c "from ccs.validation import validate_log; \
+    print(validate_log('$XDG_DATA_HOME/ccs-diagnose/calibration.jsonl', \
+                       schema_version='ccs.diagnose.v0-preview'))"
+```
+
+A clean file returns `([], [])` — empty gap and schema-mismatch lists.
+
+The append is gated by consent: runs without granted consent (or with
+`DO_NOT_TRACK` / `DISABLE_TELEMETRY` / `CCS_DIAGNOSE_NO_TELEMETRY` set, or
+`--no-telemetry` / `--no-network` passed) print a skip message and exit `0`
+without touching the file.
+
+### Promotion to `langgraph-v1`
+
+The `v0-preview` → `v1` promotion gate requires:
+
+1. **>= 5 real production graphs** validated across **>= 3 distinct supervisor topologies**
+2. The Tracked-Artifacts panel produces **zero unknown `__`-prefix surprises** on a
+   current LangGraph release
+3. The append-only prefix-stability rule survives a workload that **compacts message
+   history mid-run** (real-world `trim_messages` pattern)
+
+Once promoted, `v1`-tagged submissions populate the public benchmark; `v0-preview`
+calibration data is not retroactively migrated.
+
+### Sharing calibration data
+
+DM `vlad@fwdinc.net` (or open an issue on the repo) with your `calibration.jsonl`
+contents. We do not collect anything we haven't documented above; you can read every
+field before sharing.
+
 ## Paper
 
 **Token Coherence: Adapting MESI Cache Protocols to Minimize

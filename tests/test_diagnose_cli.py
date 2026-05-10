@@ -326,14 +326,15 @@ def test_no_telemetry_is_noop_in_v0(tmp_path: Path) -> None:
     assert (tmp_path / "r.html").exists()
 
 
-def test_calibration_record_prints_stub(tmp_path: Path) -> None:
+def test_calibration_record_skipped_without_consent(tmp_path: Path) -> None:
+    """In CI (consent denied), --calibration-record prints a skip message."""
     cal = tmp_path / "cal.jsonl"
-    code, _, stderr = _invoke(
+    code, stdout, _ = _invoke(
         _basic_argv(tmp_path, "--calibration-record", str(cal))
     )
     assert code == 0
-    assert "calibration" in stderr.lower()
-    # No write happened in v0.
+    assert "calibration write skipped" in stdout
+    # No file written when consent is denied.
     assert not cal.exists()
 
 

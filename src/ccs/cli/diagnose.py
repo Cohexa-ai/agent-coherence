@@ -19,11 +19,12 @@ Two subcommand-style flags bypass the main pipeline:
 * ``--reset-token`` is a Unit 8 stub — prints a not-yet-implemented
   message and exits 0. Reserved for the consent-flow update.
 
-Trust-posture flags (``--no-network``, ``--no-telemetry``,
-``--calibration-record``) accept input but are no-ops in v0; Unit 8 / 9
-will give them behaviour. ``--dry-run`` is wired today: it prints the
-telemetry payload that would be submitted (no network is involved
-because v0 has no submission code).
+Trust-posture flags ``--no-network`` and ``--no-telemetry`` short-circuit
+the consent resolver to a denied state. ``--calibration-record`` (Unit 9)
+appends the run's payload to a local JSONL file when consent is granted;
+denied / kill-switched runs print a skip message and exit 0 without
+writing. ``--dry-run`` prints the telemetry payload that would be
+submitted (no network is involved because v0 has no submission code).
 
 Architecture: lives in the ``interface`` layer alongside
 ``ccs.diagnose``. Imports flow interface → interface only.
@@ -44,6 +45,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
+from ccs.diagnose.calibration import (
+    append_calibration_entry,
+    calibration_path,
+)
 from ccs.diagnose.callback import DiagnoseCallback
 from ccs.diagnose.classifier import (
     ClassifierOverrides,
@@ -254,11 +259,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--calibration-record",
+        nargs="?",
+        const="",
         default=None,
         metavar="PATH",
         help=(
-            "Reserved for Unit 9 — append the run's payload to a local JSONL\n"
-            "calibration corpus. v0 prints a stub message and does not write."
+            "Append the run's payload to a local JSONL calibration corpus.\n"
+            "When passed without a path, the default location is used:\n"
+            "$XDG_DATA_HOME/ccs-diagnose/calibration.jsonl (or\n"
+            "~/.local/share/ccs-diagnose/calibration.jsonl when XDG_DATA_HOME\n"
+            "is unset). Pass an explicit path to override. Gated by consent —\n"
+            "denied / kill-switched runs print a skip message and exit 0."
         ),
     )
 
@@ -554,13 +565,42 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             + json.dumps(payload, indent=2, sort_keys=True, default=str)
         )
 
-    if args.calibration_record:
-        print(
-            f"\nnote: --calibration-record path {args.calibration_record!r} "
-            "is reserved for Unit 9 (calibration JSONL append); "
-            "v0 does not write to it.",
-            file=sys.stderr,
+    if args.calibration_record is not None:
+        # ``args.calibration_record`` is "" when the flag was passed without a
+        # value (nargs='?' const=""), or a non-empty path when given one.
+        cal_target = (
+            Path(args.calibration_record)
+            if args.calibration_record
+            else calibration_path()
         )
+        cal_result = append_calibration_entry(
+            verdict=verdict,
+            report=report,
+            consent=consent,
+            path=cal_target,
+        )
+        if cal_result.written:
+            print(f"\ncalibration entry appended to {cal_result.path}")
+        elif cal_result.reason == "consent_not_granted":
+            active = env_kill_switch_active()
+            if active is not None:
+                print(
+                    f"\ncalibration write skipped: kill switch active "
+                    f"({active}); unset to opt in"
+                )
+            else:
+                print(
+                    "\ncalibration write skipped: consent not granted "
+                    "(re-run without --no-telemetry / --no-network and answer "
+                    "'y' to the consent prompt to opt in)"
+                )
+        elif cal_result.reason.startswith("io_error"):
+            print(
+                f"\ncalibration write failed: {cal_result.reason}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"\ncalibration write skipped: {cal_result.reason}")
 
     return 0
 
