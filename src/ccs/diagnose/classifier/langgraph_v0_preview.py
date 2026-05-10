@@ -84,7 +84,19 @@ __all__ = [
 
 
 class Bucket(str, Enum):
-    """Write-pattern verdict buckets emitted by the v0-preview classifier."""
+    """Write-pattern verdict buckets emitted by the v0-preview classifier.
+
+    NOTE(v1): The string values for this enum mix space-separated
+    (``"single_writer per artifact"``, ``"mixed pattern"``) and
+    underscore-only (``"shared_artifact"``, ``"parallel_branch"``)
+    forms. The langgraph-v1 promotion will normalise every bucket to
+    underscore-only (e.g. ``"single_writer_per_artifact"``,
+    ``"mixed_pattern"``) so values are jq-friendly and consistent.
+    Until then, v0-preview consumers must NOT rely on the literal
+    space-containing strings — use the enum members directly
+    (``Bucket.SINGLE_WRITER``) and the bucket-display lookup in
+    ``ccs.diagnose._labels`` for human-readable copy.
+    """
 
     SINGLE_WRITER = "single_writer per artifact"
     SHARED_ARTIFACT = "shared_artifact"
@@ -172,6 +184,11 @@ class CoverageReport:
     read_count: int
     write_count: int
     artifact_count: int
+    # NOTE(v1): this field duplicates ``ClassifierVerdict.confidence``
+    # and will be removed in the langgraph-v1 promotion. v0-preview
+    # consumers should read confidence from the parent
+    # ``ClassifierVerdict`` directly. Keeping the field for now to
+    # preserve the existing JSON shape until the v1 schema bump.
     verdict_confidence: Confidence
 
 

@@ -110,27 +110,54 @@ Avoid `--extra-index-url` to a private mirror — that's the dependency-confusio
 attack vector. If you must use a private mirror, ensure `agent-coherence` is
 served only from the official PyPI index.
 
-## Manual setup checklist (for maintainers)
+## Pre-release verification (MUST pass before any `v*` tag push)
 
-The release workflow assumes the following are configured on the PyPI / GitHub
-side. Until done, releases will fail at the publish step (by design — fail-closed):
+Run the bundled verifier before tagging a release:
 
-- [ ] **PyPI Trusted Publishers configured** on `agent-coherence`'s PyPI project page
-      (Settings → Publishing → Add a new publisher → GitHub → repo + workflow filename
-      `release.yml` + environment name `pypi`)
-- [ ] **GitHub environment `pypi` created** with required reviewers (the workflow
-      uses `environment: name: pypi` to gate publish steps)
-- [ ] **Branch protection on `main`** requires PR review for `.github/workflows/`
-      changes
-- [ ] **Tag protection rule** on `v*` tags (only allow specific actors / require
-      PR-reviewed commits)
-- [ ] **2FA enforced** on all PyPI maintainers (PyPI now requires this for critical
-      projects, but verify)
-- [ ] **Typosquat name reservations** on PyPI: `agent-coherance`, `agentcoherence`,
-      `agent_coherence`, `ccs-diagnose`, `ccsdiagnose` (create empty placeholder
-      projects under the same publisher)
-- [ ] **Org-level audit log review** quarterly for unexpected workflow / secrets
-      changes
+```bash
+python tools/check_release_readiness.py
+# or, after install:
+ccs-check-release
+```
+
+The script exits non-zero if any automated check fails, and the release
+workflow runs the same script as a preflight job — a misconfigured
+project cannot publish.
+
+### Automated checks (run by `tools/check_release_readiness.py`)
+
+| Check | Verifies | Failure mode if skipped |
+|---|---|---|
+| PyPI Trusted Publishers | `gh api repos/{owner}/{repo}/environments/pypi` returns 200 | Publish step in `release.yml` falls back to anonymous OIDC and fails — but only after the build artefact is already in transit |
+| GitHub `pypi` environment | Same call confirms required reviewers are set | Anyone with workflow-write access could trigger an unreviewed publish |
+| Branch protection on `main` | `gh api repos/{owner}/{repo}/branches/main/protection` returns 200 with PR review required | Malicious workflow changes can land without review |
+| Tag protection on `v*` | `gh api repos/{owner}/{repo}/tags/protection` covers `v*` | Anyone with push access can cut an arbitrary release |
+
+### Manual verification (cannot be automated)
+
+These items the script reminds you about but cannot itself verify:
+
+- [ ] **2FA enforced** on all PyPI maintainers (PyPI requires this for
+      critical projects; recheck the PyPI account page each release)
+- [ ] **Typosquat name reservations** on PyPI: `agent-coherance`,
+      `agentcoherence`, `agent_coherence`, `ccs-diagnose`,
+      `ccsdiagnose` (empty placeholder projects under the same
+      publisher prevent name-squat attacks against unsuspecting users
+      who mistype the install command)
+- [ ] **Org-level audit log review** scheduled quarterly for unexpected
+      workflow / secrets changes (a logged-in attacker who cannot
+      directly publish may still mutate Trusted Publisher settings; the
+      audit log is the only place this is visible)
+- [ ] **CycloneDX SBOM artefact** uploaded to the GitHub Release page
+      (the workflow generates it; verify the file is attached to the
+      release before announcing)
+
+### Background
+
+The release workflow assumes the GitHub + PyPI side is configured as listed
+above. Until done, releases will fail at the publish step (by design —
+fail-closed). The verifier exists so a release does not blow up halfway
+through and leave a partial state.
 
 ## Reporting security issues
 

@@ -167,11 +167,20 @@ def test_security_md_documents_kill_switches(kill_switch: str) -> None:
     )
 
 
-def test_security_md_has_manual_setup_checklist() -> None:
+def test_security_md_has_release_readiness_gate() -> None:
+    """The pre-release verification section is the v1 of the old
+    'Manual setup checklist' — it must be present and describe both the
+    automated checks and the manual items the script cannot verify."""
     text = SECURITY_MD.read_text()
-    assert "Manual setup checklist" in text, (
-        "SECURITY.md must contain a 'Manual setup checklist' section"
+    assert "Pre-release verification" in text, (
+        "SECURITY.md must document the pre-release readiness gate"
     )
+    # Both halves of the section are required: automated + manual.
+    assert "Automated checks" in text
+    assert "Manual verification" in text
+    # The script reference must be discoverable from SECURITY.md.
+    assert "check_release_readiness.py" in text
+    assert "ccs-check-release" in text
 
 
 def test_security_md_documents_canonical_install() -> None:
