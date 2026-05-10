@@ -1,0 +1,145 @@
+# Release workflow: PyPI Trusted Publishers OIDC + PEP 740 attestations + CycloneDX SBOM.
+#
+# This workflow uses PyPI Trusted Publishers OIDC. Configuration steps in SECURITY.md.
+# Until Trusted Publishers is configured on the PyPI side, the publish step will fail
+# by design (fail-closed): we never embed long-lived API tokens in repo secrets.
+#
+# Triggers on tag push matching v*. The tag itself is the publish trigger; this file
+# landing in the repo does not publish anything.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    name: Build distribution and SBOM
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          package_init = Path("src/ccs/__init__.py").read_text()
+          version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', package_init, re.MULTILINE)
+          if version_match is None:
+              raise SystemExit("Could not find __version__ in src/ccs/__init__.py")
+
+          version = version_match.group(1)
+          release_tag = os.environ["RELEASE_TAG"]
+          expected_tag = f"v{version}"
+          if release_tag != expected_tag:
+              raise SystemExit(
+                  f"Release tag {release_tag} does not match package version {version} "
+                  f"(expected {expected_tag})"
+              )
+          print(f"Release tag {release_tag} matches package version {version}")
+          PY
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine cyclonedx-bom
+
+      - name: Build distribution artifacts
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          python -m pip install -e ".[diagnose]"
+          cyclonedx-py environment > sbom.cyclonedx.json
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+          retention-days: 30
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 30
+
+  publish:
+    name: Publish to PyPI with attestations
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: pypi
+
+    # id-token: write enables OIDC token generation for PyPI Trusted Publishers and
+    # PEP 740 attestations. No long-lived PyPI API secret is referenced anywhere
+    # in this file.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Publish to PyPI (Trusted Publishers OIDC + PEP 740 attestations)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+
+  github-release:
+    name: Create GitHub Release with SBOM
+    runs-on: ubuntu-latest
+    needs: [publish]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+
+      - name: Create GitHub release with wheel, sdist, and SBOM
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+            sbom/sbom.cyclonedx.json
+          generate_release_notes: true

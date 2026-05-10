@@ -232,6 +232,23 @@ DM `vlad@fwdinc.net` (or open an issue on the repo) with your `calibration.jsonl
 contents. We do not collect anything we haven't documented above; you can read every
 field before sharing.
 
+## Security & supply chain
+
+`agent-coherence` ships with PyPI Trusted Publishers OIDC, PEP 740 attestations,
+hash-pinned dependency lockfiles, and a documented threat model. See
+[SECURITY.md](SECURITY.md) for the full trust contract, env-var kill switches,
+and the canonical install command.
+
+For security-sensitive installs:
+
+    pip install --require-hashes -r requirements-diagnose.txt
+
+Reset the calibration consent token any time:
+
+    ccs-diagnose --reset-token
+
+Report security issues via a private GitHub security advisory.
+
 ## Paper
 
 **Token Coherence: Adapting MESI Cache Protocols to Minimize
