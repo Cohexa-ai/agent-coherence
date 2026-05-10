@@ -33,6 +33,7 @@ from ccs.agent.runtime import CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
 from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
+from ccs.core.identity import artifact_uuid
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact
 
@@ -523,7 +524,7 @@ class CCSStore(BaseStore):
     def _ensure_artifact_registered(self, namespace: tuple[str, ...], key: str) -> uuid.UUID:
         scope = tuple(namespace[1:])
         scope_str = ":".join(scope)
-        artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"ccs-artifact:{scope_str}:{key}")
+        artifact_id = artifact_uuid(scope_str, key)
         scope_key = (scope, key)
 
         if scope_key in self._artifact_map:
