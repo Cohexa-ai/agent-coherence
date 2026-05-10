@@ -223,30 +223,98 @@ def detect(
     ``token_cost_per_1k`` is a placeholder cost-per-1k-tokens estimate; the
     Unit 5 renderer surfaces the assumption to the user. Calibration in
     later units may parameterise it from the corpus.
+
+    The body is staged into helpers (each ≤ 30 lines): index resolution,
+    per-artifact divergence walk, cost extrapolation, report assembly.
     """
     # Short-circuit: classifier already decided the buffer is uninformative.
-    if verdict.bucket is Bucket.INSUFFICIENT:
+    if verdict.bucket is Bucket.INSUFFICIENT or not events:
         return _empty_report(
             strict=strict,
             cost_unmeasurable_reason="verdict_insufficient",
         )
 
-    # Empty buffers — nothing observable. Render the same "insufficient" surface
-    # so downstream renderers don't have to special-case empty inputs.
-    if not events:
-        return _empty_report(
-            strict=strict,
-            cost_unmeasurable_reason="verdict_insufficient",
-        )
+    indices = _resolve_indices(verdict=verdict, key_index=key_index)
+    walk = _walk_divergence_pairs(
+        events=events,
+        indices=indices,
+        strict=strict,
+        value_token_estimates=value_token_estimates,
+    )
+    cost = _extrapolate_costs(
+        events=events,
+        headline=walk.headline,
+        volume_per_hour=volume_per_hour,
+        token_cost_per_1k=token_cost_per_1k,
+        value_token_estimates=value_token_estimates,
+    )
+    return _assemble_detection_report(
+        walk=walk,
+        cost=cost,
+        indices=indices,
+        strict=strict,
+    )
 
-    inverse = _build_inverse_index(key_index)
-    tracked_uuids = _resolve_tracked_uuids(verdict, key_index)
-    append_only_uuids = _resolve_uuids(verdict.append_only_keys, key_index)
 
-    writes_per_artifact = _collect_writes(events, tracked_uuids=tracked_uuids)
-    reads_per_artifact = _collect_reads(events, tracked_uuids=tracked_uuids)
+# -------------------------------------------------------------------- #
+# Internals — staged helpers extracted from :func:`detect`
+# -------------------------------------------------------------------- #
 
-    # Walk reads pairwise per artifact, applying the AND clause + exclusions.
+
+@dataclass(frozen=True)
+class _ResolvedIndices:
+    inverse: dict[uuid.UUID, str]
+    tracked_uuids: set[uuid.UUID]
+    append_only_uuids: set[uuid.UUID]
+
+
+@dataclass(frozen=True)
+class _DivergenceWalk:
+    headline: tuple["DivergenceEvent", ...]
+    excluded: tuple["DivergenceEvent", ...]
+    sequential_staleness_count: int
+    cold_start_count: int
+    append_only_skip_count: int
+    reads_per_artifact: dict[uuid.UUID, list["ReadObservation"]]
+
+
+@dataclass(frozen=True)
+class _CostExtrapolation:
+    rework_tokens_this_run: int
+    rework_cost_this_run: float
+    rework_cost_annualized: float | None
+    cost_unmeasurable_reason: str | None
+
+
+def _resolve_indices(
+    *,
+    verdict: ClassifierVerdict,
+    key_index: Mapping[str, uuid.UUID],
+) -> _ResolvedIndices:
+    """Resolve the inverse / tracked / append-only UUID sets in one pass."""
+    return _ResolvedIndices(
+        inverse=_build_inverse_index(key_index),
+        tracked_uuids=_resolve_tracked_uuids(verdict, key_index),
+        append_only_uuids=_resolve_uuids(verdict.append_only_keys, key_index),
+    )
+
+
+def _walk_divergence_pairs(
+    *,
+    events: Sequence[DiagnoseEvent],
+    indices: _ResolvedIndices,
+    strict: bool,
+    value_token_estimates: Mapping[uuid.UUID, int] | None,
+) -> _DivergenceWalk:
+    """Walk reads pairwise per artifact, classifying each candidate.
+
+    Applies the AND clause first, then sequential-staleness and
+    cold-start exclusions. Returns the partitioned headline and
+    excluded event tuples (sorted) plus the per-bucket counts.
+    """
+    writes_per_artifact = _collect_writes(events, tracked_uuids=indices.tracked_uuids)
+    reads_per_artifact = _collect_reads(events, tracked_uuids=indices.tracked_uuids)
+
     headline: list[DivergenceEvent] = []
     excluded: list[DivergenceEvent] = []
     append_only_skip_count = 0
@@ -254,122 +322,148 @@ def detect(
     sequential_staleness_count = 0
 
     for aid, reads in reads_per_artifact.items():
-        key = inverse.get(aid)
+        key = indices.inverse.get(aid)
         if key is None:
-            # Untracked artifact (would mean classifier ignored it). Skip.
             continue
-
-        if aid in append_only_uuids:
-            # Per-pair count of skipped candidate examinations.
+        if aid in indices.append_only_uuids:
             append_only_skip_count += _candidate_pair_count(reads)
             continue
-
         writes = writes_per_artifact.get(aid, [])
+        seq_count, cold_count = _classify_pairs_for_artifact(
+            aid=aid,
+            key=key,
+            reads=reads,
+            writes=writes,
+            strict=strict,
+            value_token_estimates=value_token_estimates,
+            headline_out=headline,
+            excluded_out=excluded,
+        )
+        sequential_staleness_count += seq_count
+        cold_start_count += cold_count
 
-        for earlier, later in _ordered_pairs(reads):
-            if not _and_clause_satisfied(earlier, later):
-                continue
+    return _DivergenceWalk(
+        headline=tuple(sorted(headline, key=_event_sort_key)),
+        excluded=tuple(sorted(excluded, key=_event_sort_key)),
+        sequential_staleness_count=sequential_staleness_count,
+        cold_start_count=cold_start_count,
+        append_only_skip_count=append_only_skip_count,
+        reads_per_artifact=reads_per_artifact,
+    )
 
-            # Sequential-staleness rule (plan): requires a prior write AND
-            # at least one intervening write between that prior write and
-            # ``later_read``, AND ``later_read.tick - w_prior >= 2``. By
-            # construction this means we need >= 2 distinct writes at or
-            # before ``later_read.tick`` with the pattern (w_prior <
-            # w_intervening <= later_read.tick) where the gap holds.
-            if _is_sequential_staleness(writes, later.tick):
-                event = _build_event(
-                    aid=aid,
-                    key=key,
-                    earlier=earlier,
-                    later=later,
-                    writes=writes,
-                    is_sequential_staleness=True,
-                    is_cold_start=False,
-                    value_token_estimates=value_token_estimates,
-                )
-                if strict:
-                    headline.append(event)
-                else:
-                    excluded.append(event)
-                    sequential_staleness_count += 1
-                continue
 
-            # Cold-start exclusion: no write at or before ``later_read.tick``.
-            if _is_cold_start(writes, later.tick):
-                event = _build_event(
-                    aid=aid,
-                    key=key,
-                    earlier=earlier,
-                    later=later,
-                    writes=writes,
-                    is_sequential_staleness=False,
-                    is_cold_start=True,
-                    value_token_estimates=value_token_estimates,
-                )
-                excluded.append(event)
-                cold_start_count += 1
-                continue
+def _classify_pairs_for_artifact(
+    *,
+    aid: uuid.UUID,
+    key: str,
+    reads: list["ReadObservation"],
+    writes: list[Any],
+    strict: bool,
+    value_token_estimates: Mapping[uuid.UUID, int] | None,
+    headline_out: list["DivergenceEvent"],
+    excluded_out: list["DivergenceEvent"],
+) -> tuple[int, int]:
+    """Walk one artifact's read pairs; append events to the right bucket.
 
-            # No intervening-writes-between-the-reads guard either: textbook
-            # divergence is exactly "earlier reader was handed v1, writer
-            # advanced to v2, later reader was handed v1 again". Any pair
-            # where the AND clause holds and we're not in sequential-staleness
-            # or cold-start territory is a headline event.
+    Returns ``(sequential_staleness_count, cold_start_count)`` for this
+    artifact. The headline / excluded lists are mutated in place.
+    """
+    sequential_staleness_count = 0
+    cold_start_count = 0
+    for earlier, later in _ordered_pairs(reads):
+        if not _and_clause_satisfied(earlier, later):
+            continue
+        # Sequential-staleness rule (plan): requires a prior write AND
+        # at least one intervening write between that prior write and
+        # ``later_read``, AND ``later_read.tick - w_prior >= 2``.
+        if _is_sequential_staleness(writes, later.tick):
             event = _build_event(
-                aid=aid,
-                key=key,
-                earlier=earlier,
-                later=later,
-                writes=writes,
-                is_sequential_staleness=False,
-                is_cold_start=False,
+                aid=aid, key=key, earlier=earlier, later=later, writes=writes,
+                is_sequential_staleness=True, is_cold_start=False,
                 value_token_estimates=value_token_estimates,
             )
-            headline.append(event)
+            (headline_out if strict else excluded_out).append(event)
+            if not strict:
+                sequential_staleness_count += 1
+            continue
+        # Cold-start exclusion: no write at or before ``later_read.tick``.
+        if _is_cold_start(writes, later.tick):
+            excluded_out.append(_build_event(
+                aid=aid, key=key, earlier=earlier, later=later, writes=writes,
+                is_sequential_staleness=False, is_cold_start=True,
+                value_token_estimates=value_token_estimates,
+            ))
+            cold_start_count += 1
+            continue
+        # Textbook divergence: AND clause holds, no exclusion applies.
+        headline_out.append(_build_event(
+            aid=aid, key=key, earlier=earlier, later=later, writes=writes,
+            is_sequential_staleness=False, is_cold_start=False,
+            value_token_estimates=value_token_estimates,
+        ))
+    return sequential_staleness_count, cold_start_count
 
-    # Deterministic ordering for downstream rendering / golden-file tests.
-    headline_sorted = tuple(sorted(headline, key=_event_sort_key))
-    excluded_sorted = tuple(sorted(excluded, key=_event_sort_key))
 
-    heatmap = _build_heatmap(
-        reads_per_artifact=reads_per_artifact,
-        headline_events=headline_sorted,
-        inverse=inverse,
-    )
-    reader_pair_matrix = _build_reader_pair_matrix(headline_sorted)
-    top_event = _pick_top_event(headline_sorted, heatmap)
-    agent_pain_count = len({ev.later_read.node for ev in headline_sorted})
-
-    rework_tokens_this_run = sum(ev.rework_tokens for ev in headline_sorted)
+def _extrapolate_costs(
+    *,
+    events: Sequence[DiagnoseEvent],
+    headline: tuple["DivergenceEvent", ...],
+    volume_per_hour: float | None,
+    token_cost_per_1k: float,
+    value_token_estimates: Mapping[uuid.UUID, int] | None,
+) -> _CostExtrapolation:
+    """Compute per-run + annualised rework costs from the headline events."""
+    rework_tokens_this_run = sum(ev.rework_tokens for ev in headline)
     rework_cost_this_run = rework_tokens_this_run * token_cost_per_1k / 1000.0
-
     cost_unmeasurable_reason = (
         "value_token_estimates_missing" if value_token_estimates is None else None
     )
-
     rework_cost_annualized = _annualised_cost(
         rework_tokens_this_run=rework_tokens_this_run,
         observed_tick_count=_observed_tick_count(events),
         volume_per_hour=volume_per_hour,
         token_cost_per_1k=token_cost_per_1k,
     )
-
-    return DetectionReport(
-        headline_divergence_events=headline_sorted,
-        excluded_events=excluded_sorted,
-        heatmap=heatmap,
-        reader_pair_matrix=reader_pair_matrix,
-        top_event=top_event,
-        exclusion_panel=ExclusionPanel(
-            sequential_staleness_count=sequential_staleness_count,
-            cold_start_count=cold_start_count,
-            append_only_skip_count=append_only_skip_count,
-        ),
-        agent_pain_count=agent_pain_count,
+    return _CostExtrapolation(
         rework_tokens_this_run=rework_tokens_this_run,
         rework_cost_this_run=rework_cost_this_run,
         rework_cost_annualized=rework_cost_annualized,
         cost_unmeasurable_reason=cost_unmeasurable_reason,
+    )
+
+
+def _assemble_detection_report(
+    *,
+    walk: _DivergenceWalk,
+    cost: _CostExtrapolation,
+    indices: _ResolvedIndices,
+    strict: bool,
+) -> DetectionReport:
+    """Build the final :class:`DetectionReport` from the staged outputs."""
+    heatmap = _build_heatmap(
+        reads_per_artifact=walk.reads_per_artifact,
+        headline_events=walk.headline,
+        inverse=indices.inverse,
+    )
+    reader_pair_matrix = _build_reader_pair_matrix(walk.headline)
+    top_event = _pick_top_event(walk.headline, heatmap)
+    agent_pain_count = len({ev.later_read.node for ev in walk.headline})
+    return DetectionReport(
+        headline_divergence_events=walk.headline,
+        excluded_events=walk.excluded,
+        heatmap=heatmap,
+        reader_pair_matrix=reader_pair_matrix,
+        top_event=top_event,
+        exclusion_panel=ExclusionPanel(
+            sequential_staleness_count=walk.sequential_staleness_count,
+            cold_start_count=walk.cold_start_count,
+            append_only_skip_count=walk.append_only_skip_count,
+        ),
+        agent_pain_count=agent_pain_count,
+        rework_tokens_this_run=cost.rework_tokens_this_run,
+        rework_cost_this_run=cost.rework_cost_this_run,
+        rework_cost_annualized=cost.rework_cost_annualized,
+        cost_unmeasurable_reason=cost.cost_unmeasurable_reason,
         strict_mode=strict,
         schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
     )

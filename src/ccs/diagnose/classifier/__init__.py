@@ -53,6 +53,11 @@ from . import langgraph_v0_preview  # noqa: E402  (positioned for re-export)
 DEFAULT_CLASSIFIER_NAME: str = "langgraph-v0-preview"
 
 
+# EXTENSION POINT: register additional classifiers here when
+# crewai-v0-preview / autogen-v0-preview ship. Until then there is
+# only one entry, and :func:`classify` calls it directly so the
+# default path is one function call rather than three layers of
+# indirection.
 _REGISTRY: Mapping[str, Callable[..., ClassifierVerdict]] = {
     "langgraph-v0-preview": _classify_langgraph_v0_preview,
 }
@@ -62,7 +67,10 @@ def select_classifier(name: str) -> Callable[..., ClassifierVerdict]:
     """Return the ``classify`` entry point for ``name``.
 
     Raises ``ValueError`` for unknown names. Mirrors
-    :func:`ccs.strategies.selector.build_strategy`.
+    :func:`ccs.strategies.selector.build_strategy`. Kept as a public
+    extension point so future classifiers can be looked up by name
+    even though :func:`classify` itself bypasses the registry on the
+    default path.
     """
     normalized = name.strip().lower()
     if normalized not in _REGISTRY:
@@ -77,6 +85,16 @@ def classify(
     classifier_name: str = DEFAULT_CLASSIFIER_NAME,
     **kwargs: object,
 ) -> ClassifierVerdict:
-    """Run the named classifier (default: ``langgraph-v0-preview``)."""
+    """Run the named classifier (default: ``langgraph-v0-preview``).
+
+    The default name short-circuits the registry indirection and calls
+    :func:`_classify_langgraph_v0_preview` directly — there is only one
+    classifier today. Non-default names go through
+    :func:`select_classifier` for forward-compatibility.
+    """
+    if classifier_name == DEFAULT_CLASSIFIER_NAME:
+        return _classify_langgraph_v0_preview(
+            events, overrides=overrides, **kwargs
+        )
     fn = select_classifier(classifier_name)
     return fn(events, overrides=overrides, **kwargs)

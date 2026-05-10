@@ -553,34 +553,76 @@ def _run_reset_token(args: argparse.Namespace) -> int:
 
 
 def _run_pipeline(args: argparse.Namespace) -> int:
-    # Resolve consent up-front so the prompt (if any) appears before any
-    # pipeline output. ``--no-telemetry`` and ``--no-network`` short-circuit
-    # to a denied-with-no-token state so the resolver never prompts.
-    # ``--yes`` / ``--non-interactive`` bypasses the prompt and uses the
-    # persisted state if any, falling back to denied — required for agent
-    # invocations where blocking on stdin is not an option.
+    """Orchestrate the diagnose CLI pipeline.
+
+    The work is broken into four named phases (each ≤ 30 lines):
+
+    1. resolve consent
+    2. load graph + invoke under callback
+    3. classify, detect, build ownership map
+    4. render outputs (HTML / JSON / summary / dry-run / calibration)
+    """
+    consent = _resolve_consent(args)
+
+    invoke = _load_graph_and_invoke(args)
+    if isinstance(invoke, int):
+        return invoke
+    callback, initial_state, result = invoke
+
+    classify_result = _run_classify_and_detect(
+        events=callback.events,
+        args=args,
+        initial_state=initial_state,
+        result=result,
+    )
+    verdict, report, key_index = classify_result
+    ownership = _compute_ownership(callback.events, verdict, key_index)
+
+    return _write_outputs(
+        verdict=verdict,
+        report=report,
+        ownership=ownership,
+        args=args,
+        consent=consent,
+    )
+
+
+def _resolve_consent(args: argparse.Namespace) -> ConsentState:
+    """Resolve consent for the pipeline run.
+
+    ``--no-telemetry`` and ``--no-network`` short-circuit to a denied
+    state. ``--yes`` / ``--non-interactive`` skips the prompt and uses
+    the persisted state at the current policy version, falling back to
+    denied. The default path runs the interactive resolver.
+    """
     if args.no_telemetry or args.no_network:
-        consent: ConsentState = ConsentState(
+        return ConsentState(
             granted=False,
             policy_version=CURRENT_POLICY_VERSION,
             installation_token=None,
         )
-    elif args.yes:
+    if args.yes:
         existing = load_consent()
-        if (
-            existing is not None
-            and existing.policy_version == CURRENT_POLICY_VERSION
-        ):
-            consent = existing
-        else:
-            consent = ConsentState(
-                granted=False,
-                policy_version=CURRENT_POLICY_VERSION,
-                installation_token=None,
-            )
-    else:
-        consent = resolve_consent()
+        if existing is not None and existing.policy_version == CURRENT_POLICY_VERSION:
+            return existing
+        return ConsentState(
+            granted=False,
+            policy_version=CURRENT_POLICY_VERSION,
+            installation_token=None,
+        )
+    return resolve_consent()
 
+
+def _load_graph_and_invoke(
+    args: argparse.Namespace,
+) -> tuple[DiagnoseCallback, dict[str, Any] | None, Any] | int:
+    """Load the user graph factory, build it, and invoke under a callback.
+
+    Returns ``(callback, initial_state, result)`` on success, or an
+    integer exit code when graph loading / state-file parsing fails.
+    Graph-invoke exceptions surface as a warning event in the callback
+    buffer (the verdict downgrades) — never as a non-zero return.
+    """
     factory_loaded = _load_graph_factory(args.graph)
     if isinstance(factory_loaded, int):
         return factory_loaded
@@ -591,9 +633,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         print(f"error: {initial_state.message}", file=sys.stderr)
         return EXIT_GENERIC_ERROR
 
-    # When no --state-file is supplied, discover a companion
-    # ``initial_state*`` callable in the same module. LangGraph factories
-    # commonly ship one alongside the builder.
     if initial_state is None and factory_module is not None:
         companion = _discover_initial_state(factory_module, factory)
         if companion is not None:
@@ -609,29 +648,28 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     invoke_state: dict[str, Any] = (
         dict(initial_state) if isinstance(initial_state, dict) else {}
     )
-
     try:
-        result = graph.invoke(
-            invoke_state,
-            config={"callbacks": [callback]},
-        )
+        result = graph.invoke(invoke_state, config={"callbacks": [callback]})
     except Exception as exc:  # noqa: BLE001 — graph errors are user-domain
-        # Surface a warning event into the callback buffer so the verdict
-        # downgrades to insufficient with a clear ``reason``. The user still
-        # gets a (partial) report. ``record_warning`` ALSO emits a Python
-        # warning, so we don't double-warn here.
-        warning_text = (
+        callback.record_warning(
             f"graph invoke failed: {type(exc).__name__}: {exc}"
         )
-        callback.record_warning(warning_text)
         result = {}
+    return callback, initial_state, result
 
-    events = callback.events
 
-    # Derive the key universe from the initial state, the result, and any
-    # explicit --ignore / --track names. Without names the classifier can
-    # only return ``insufficient`` because UUIDs alone don't expose the
-    # ignore-rule surface.
+def _run_classify_and_detect(
+    *,
+    events: tuple[Any, ...],
+    args: argparse.Namespace,
+    initial_state: dict[str, Any] | None,
+    result: Any,
+) -> tuple[ClassifierVerdict, DetectionReport, dict]:
+    """Classify the run, detect divergence, and normalize versions.
+
+    Returns ``(verdict, report, key_index)`` so the caller can reuse the
+    key index for the ownership map without re-deriving it.
+    """
     candidate_names = _candidate_state_keys(
         initial_state=initial_state if isinstance(initial_state, dict) else None,
         result=result if isinstance(result, dict) else None,
@@ -639,15 +677,12 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         track=args.track_keys,
     )
     key_index = build_key_index(candidate_names)
-
     overrides = ClassifierOverrides(
         ignore=tuple(args.ignore_keys),
         track=tuple(args.track_keys),
     )
     verdict = classify(events, key_index=key_index, overrides=overrides)
-
     _check_writers_by_key_consistency(verdict)
-
     report = detect(
         events,
         verdict=verdict,
@@ -659,10 +694,32 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         value_token_estimates=None,
         token_cost_per_1k=args.cost_per_1k_tokens,
     )
-    report = _normalize_version_strings(report)
+    return verdict, _normalize_version_strings(report), key_index
 
-    ownership = compute_ownership_map(events, verdict, key_index)
 
+def _compute_ownership(
+    events: tuple[Any, ...],
+    verdict: ClassifierVerdict,
+    key_index: dict,
+) -> tuple:
+    """Thin wrapper around :func:`compute_ownership_map` for symmetry."""
+    return compute_ownership_map(events, verdict, key_index)
+
+
+def _write_outputs(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    ownership: tuple,
+    args: argparse.Namespace,
+    consent: ConsentState,
+) -> int:
+    """Render HTML, JSON, terminal summary, dry-run payload, calibration.
+
+    Returns the final exit code. HTML failures degrade to a notice in
+    the summary; JSON failures return ``EXIT_IO_ERROR``. ``--dry-run``
+    is always non-zero only on prior failures.
+    """
     try:
         options = RenderOptions(
             lead_pain_type=_resolve_lead_pain_type(args),
@@ -673,28 +730,17 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE_ERROR
+
     output_html = Path(args.output_html)
-    html_written = True
-    try:
-        render_html(
-            verdict=verdict,
-            report=report,
-            ownership=ownership,
-            output_path=output_html,
-            options=options,
-        )
-    except OSError as exc:
-        html_written = False
-        print(
-            f"error: failed to write HTML report to {output_html}: {exc}",
-            file=sys.stderr,
-        )
+    html_written = _try_render_html(
+        verdict=verdict,
+        report=report,
+        ownership=ownership,
+        output_path=output_html,
+        options=options,
+    )
 
-    # ``--output-json -`` writes the JSON to stdout; anything else writes
-    # it to the given path. Stdout-mode also routes the human summary
-    # to stderr so callers can pipe stdout straight into ``jq`` etc.
     output_json_to_stdout = (not args.no_json) and args.output_json == "-"
-
     if not args.no_json and not output_json_to_stdout:
         output_json = Path(args.output_json)
         try:
@@ -706,6 +752,71 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             )
             return EXIT_IO_ERROR
 
+    _emit_summary_and_payloads(
+        verdict=verdict,
+        report=report,
+        consent=consent,
+        args=args,
+        output_html=output_html,
+        output_json_to_stdout=output_json_to_stdout,
+        html_written=html_written,
+    )
+
+    if html_written is False and (args.no_json or output_json_to_stdout):
+        return EXIT_IO_ERROR
+
+    if args.calibration_record is not None:
+        _record_calibration(
+            verdict=verdict,
+            report=report,
+            consent=consent,
+            calibration_arg=args.calibration_record,
+        )
+    return 0
+
+
+def _try_render_html(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    ownership: tuple,
+    output_path: Path,
+    options: RenderOptions,
+) -> bool:
+    """Render HTML report; on OSError print to stderr and return False."""
+    try:
+        render_html(
+            verdict=verdict,
+            report=report,
+            ownership=ownership,
+            output_path=output_path,
+            options=options,
+        )
+        return True
+    except OSError as exc:
+        print(
+            f"error: failed to write HTML report to {output_path}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _emit_summary_and_payloads(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    consent: ConsentState,
+    args: argparse.Namespace,
+    output_html: Path,
+    output_json_to_stdout: bool,
+    html_written: bool,
+) -> None:
+    """Print terminal summary, optional JSON-to-stdout, and dry-run payload.
+
+    Stream routing: when ``--dry-run`` or ``--output-json -`` is in
+    play, the human summary goes to stderr so stdout stays a
+    machine-readable JSON artefact pipeable into ``jq``.
+    """
     summary_text = terminal_summary(
         verdict=verdict, report=report, html_path=output_html
     )
@@ -714,11 +825,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "(HTML report missing — see error above for details.)\n\n"
             + summary_text
         )
-    # Route the dry-run JSON payload — and the ``--output-json -`` JSON
-    # report — to stdout (machine-readable artefact) and the human
-    # summary to stderr so callers can pipe stdout straight into ``jq``
-    # etc. without stripping. Non-dry-run keeps the historical behaviour
-    # (summary on stdout) so downstream tooling stays stable.
     summary_to_stderr = args.dry_run or output_json_to_stdout
     summary_stream = sys.stderr if summary_to_stderr else sys.stdout
     print(summary_text, file=summary_stream)
@@ -726,52 +832,51 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     if output_json_to_stdout:
         payload_dict = build_report_json(verdict, report)
         print(json.dumps(payload_dict, indent=2, sort_keys=True, default=str))
-
     if args.dry_run:
         payload = payload_for(verdict, consent=consent)
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
-    if html_written is False and (args.no_json or output_json_to_stdout):
-        return EXIT_IO_ERROR
 
-    if args.calibration_record is not None:
-        # ``args.calibration_record`` is "" when the flag was passed without a
-        # value (nargs='?' const=""), or a non-empty path when given one.
-        cal_target = (
-            Path(args.calibration_record)
-            if args.calibration_record
-            else calibration_path()
-        )
-        cal_result = append_calibration_entry(
-            verdict=verdict,
-            report=report,
-            consent=consent,
-            path=cal_target,
-        )
-        if cal_result.written:
-            print(f"\ncalibration entry appended to {cal_result.path}")
-        elif cal_result.reason == "consent_not_granted":
-            active = env_kill_switch_active()
-            if active is not None:
-                print(
-                    f"\ncalibration write skipped: kill switch active "
-                    f"({active}); unset to opt in"
-                )
-            else:
-                print(
-                    "\ncalibration write skipped: consent not granted "
-                    "(re-run without --no-telemetry / --no-network and answer "
-                    "'y' to the consent prompt to opt in)"
-                )
-        elif cal_result.reason.startswith("io_error"):
+def _record_calibration(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    consent: ConsentState,
+    calibration_arg: str,
+) -> None:
+    """Append one calibration entry and print a status message.
+
+    ``calibration_arg`` is the raw ``args.calibration_record`` value:
+    ``""`` when ``--calibration-record`` was passed without a path
+    (use the XDG default), or a non-empty path string.
+    """
+    cal_target = Path(calibration_arg) if calibration_arg else calibration_path()
+    cal_result = append_calibration_entry(
+        verdict=verdict, report=report, consent=consent, path=cal_target
+    )
+    if cal_result.written:
+        print(f"\ncalibration entry appended to {cal_result.path}")
+        return
+    if cal_result.reason == "consent_not_granted":
+        active = env_kill_switch_active()
+        if active is not None:
             print(
-                f"\ncalibration write failed: {cal_result.reason}",
-                file=sys.stderr,
+                f"\ncalibration write skipped: kill switch active "
+                f"({active}); unset to opt in"
             )
         else:
-            print(f"\ncalibration write skipped: {cal_result.reason}")
-
-    return 0
+            print(
+                "\ncalibration write skipped: consent not granted "
+                "(re-run without --no-telemetry / --no-network and answer "
+                "'y' to the consent prompt to opt in)"
+            )
+    elif cal_result.reason.startswith("io_error"):
+        print(
+            f"\ncalibration write failed: {cal_result.reason}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"\ncalibration write skipped: {cal_result.reason}")
 
 
 # -------------------------------------------------------------------- #

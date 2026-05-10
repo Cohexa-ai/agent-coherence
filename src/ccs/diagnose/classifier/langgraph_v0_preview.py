@@ -229,39 +229,101 @@ def classify(
     will populate the index from the merged state schema; tests pass it
     directly. Without an index the classifier returns ``insufficient`` with
     ``reason='below coverage threshold'`` because no key can be attributed.
+
+    The body delegates to staged helpers (each ≤ 30 lines):
+    short-circuit on unsupported execution model, partition keys
+    (apply ignore rules), analyse append-only patterns, compute the
+    coverage/confidence qualifier, then pick a bucket.
     """
     overrides = overrides or ClassifierOverrides()
 
     # 1. Hard short-circuit: any unsupported execution-model signal wins.
-    unsupported_signal = _first_unsupported_execution_signal(events)
-    if unsupported_signal is not None:
-        return _insufficient_verdict(
-            reason=unsupported_signal,
-            tracked_keys=(),
-            ignored_framework_keys=(),
-            ignored_ephemera_keys=(),
-            append_only_keys=(),
-            mutable_keys=(),
-            unknown_underscore_keys=(),
-            tick_count=_distinct_tick_count(events),
-            read_count=0,
-            write_count=0,
+    unsupported = _short_circuit_unsupported(events)
+    if unsupported is not None:
+        return unsupported
+
+    # 2. Resolve the universe of keys, partition them, and analyse
+    # append-only structure (steps 2-4 of the plan).
+    analysis = _build_classification_analysis(
+        events=events, overrides=overrides, key_index=key_index
+    )
+
+    if analysis.confidence is Confidence.INSUFFICIENT:
+        return _insufficient_verdict_from_analysis(
+            analysis, reason="below coverage threshold"
         )
 
-    # 2. Resolve the universe of keys for this run.
-    resolved_index = _resolve_key_index(events=events, overrides=overrides, key_index=key_index)
-    all_keys = frozenset(resolved_index)
+    # 6-7. Pick a bucket and enforce single-writer consistency.
+    writers_by_key = _writers_by_key(
+        events, tracked_keys=analysis.tracked, key_index=analysis.resolved_index
+    )
+    bucket = _pick_bucket(
+        events=events,
+        writers_by_key=writers_by_key,
+        confidence=analysis.confidence,
+        key_index=analysis.resolved_index,
+    )
+    bucket = _enforce_single_writer_consistency(bucket, writers_by_key)
+    return _build_verdict(
+        analysis=analysis, bucket=bucket, writers_by_key=writers_by_key
+    )
 
-    # 3. Apply ignore rules + overrides to derive tracked / framework / ephemera.
-    partition = _partition_keys(all_keys, overrides=overrides)
+
+# -------------------------------------------------------------------- #
+# Internals — staged helpers extracted from :func:`classify`
+# -------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _ClassificationAnalysis:
+    """Intermediate state shared across the classify pipeline stages."""
+
+    resolved_index: Mapping[str, uuid.UUID]
+    partition: "_KeyPartition"
+    tracked: frozenset[str]
+    append_only: frozenset[str]
+    mutable: frozenset[str]
+    coverage_stats: "_CoverageStats"
+    confidence: Confidence
+
+
+def _short_circuit_unsupported(
+    events: Sequence[DiagnoseEvent],
+) -> ClassifierVerdict | None:
+    """Return an insufficient verdict when an unsupported execution-model
+    signal is present, else ``None`` to let normal classification continue."""
+    unsupported_signal = _first_unsupported_execution_signal(events)
+    if unsupported_signal is None:
+        return None
+    return _insufficient_verdict(
+        reason=unsupported_signal,
+        tracked_keys=(),
+        ignored_framework_keys=(),
+        ignored_ephemera_keys=(),
+        append_only_keys=(),
+        mutable_keys=(),
+        unknown_underscore_keys=(),
+        tick_count=_distinct_tick_count(events),
+        read_count=0,
+        write_count=0,
+    )
+
+
+def _build_classification_analysis(
+    *,
+    events: Sequence[DiagnoseEvent],
+    overrides: ClassifierOverrides,
+    key_index: Mapping[str, uuid.UUID] | None,
+) -> _ClassificationAnalysis:
+    """Run the deterministic pre-bucket pipeline (steps 2-5 of the plan)."""
+    resolved_index = _resolve_key_index(
+        events=events, overrides=overrides, key_index=key_index
+    )
+    partition = _partition_keys(frozenset(resolved_index), overrides=overrides)
     tracked = partition.tracked
-
-    # 4. Append-only analysis on the tracked set.
     append_only, mutable = _analyse_append_only(
         events, tracked_keys=tracked, key_index=resolved_index
     )
-
-    # 5. Coverage from tracked events.
     coverage_stats = _coverage(
         events, tracked_keys=tracked, key_index=resolved_index
     )
@@ -270,53 +332,58 @@ def classify(
         read_count=coverage_stats.read_count,
         write_count=coverage_stats.write_count,
     )
-
-    if confidence is Confidence.INSUFFICIENT:
-        return _insufficient_verdict(
-            reason="below coverage threshold",
-            tracked_keys=tuple(sorted(tracked)),
-            ignored_framework_keys=tuple(sorted(partition.framework)),
-            ignored_ephemera_keys=tuple(sorted(partition.ephemera)),
-            append_only_keys=tuple(sorted(append_only)),
-            mutable_keys=tuple(sorted(mutable)),
-            unknown_underscore_keys=tuple(sorted(partition.unknown_underscore)),
-            tick_count=coverage_stats.tick_count,
-            read_count=coverage_stats.read_count,
-            write_count=coverage_stats.write_count,
-        )
-
-    # 6. Compute writer attribution per tracked artifact.
-    writers_by_key = _writers_by_key(
-        events, tracked_keys=tracked, key_index=resolved_index
-    )
-
-    # 7. Naive bucket selection per the decision matrix.
-    bucket = _pick_bucket(
-        events=events,
-        writers_by_key=writers_by_key,
+    return _ClassificationAnalysis(
+        resolved_index=resolved_index,
+        partition=partition,
+        tracked=tracked,
+        append_only=append_only,
+        mutable=mutable,
+        coverage_stats=coverage_stats,
         confidence=confidence,
-        key_index=resolved_index,
     )
 
-    # 8. Single-writer-verdict consistency check.
-    bucket = _enforce_single_writer_consistency(bucket, writers_by_key)
 
+def _insufficient_verdict_from_analysis(
+    analysis: _ClassificationAnalysis, *, reason: str
+) -> ClassifierVerdict:
+    """Build the ``insufficient`` verdict from an in-flight analysis."""
+    return _insufficient_verdict(
+        reason=reason,
+        tracked_keys=tuple(sorted(analysis.tracked)),
+        ignored_framework_keys=tuple(sorted(analysis.partition.framework)),
+        ignored_ephemera_keys=tuple(sorted(analysis.partition.ephemera)),
+        append_only_keys=tuple(sorted(analysis.append_only)),
+        mutable_keys=tuple(sorted(analysis.mutable)),
+        unknown_underscore_keys=tuple(sorted(analysis.partition.unknown_underscore)),
+        tick_count=analysis.coverage_stats.tick_count,
+        read_count=analysis.coverage_stats.read_count,
+        write_count=analysis.coverage_stats.write_count,
+    )
+
+
+def _build_verdict(
+    *,
+    analysis: _ClassificationAnalysis,
+    bucket: Bucket,
+    writers_by_key: Mapping[str, set[str]],
+) -> ClassifierVerdict:
+    """Assemble the final :class:`ClassifierVerdict`."""
     return ClassifierVerdict(
         bucket=bucket,
-        confidence=confidence,
+        confidence=analysis.confidence,
         coverage=CoverageReport(
-            tick_count=coverage_stats.tick_count,
-            read_count=coverage_stats.read_count,
-            write_count=coverage_stats.write_count,
-            artifact_count=len(tracked),
-            verdict_confidence=confidence,
+            tick_count=analysis.coverage_stats.tick_count,
+            read_count=analysis.coverage_stats.read_count,
+            write_count=analysis.coverage_stats.write_count,
+            artifact_count=len(analysis.tracked),
+            verdict_confidence=analysis.confidence,
         ),
-        tracked_keys=tuple(sorted(tracked)),
-        ignored_framework_keys=tuple(sorted(partition.framework)),
-        ignored_ephemera_keys=tuple(sorted(partition.ephemera)),
-        append_only_keys=tuple(sorted(append_only)),
-        mutable_keys=tuple(sorted(mutable)),
-        unknown_underscore_keys=tuple(sorted(partition.unknown_underscore)),
+        tracked_keys=tuple(sorted(analysis.tracked)),
+        ignored_framework_keys=tuple(sorted(analysis.partition.framework)),
+        ignored_ephemera_keys=tuple(sorted(analysis.partition.ephemera)),
+        append_only_keys=tuple(sorted(analysis.append_only)),
+        mutable_keys=tuple(sorted(analysis.mutable)),
+        unknown_underscore_keys=tuple(sorted(analysis.partition.unknown_underscore)),
         writers_by_key={
             key: tuple(sorted(writers_by_key[key])) for key in sorted(writers_by_key)
         },

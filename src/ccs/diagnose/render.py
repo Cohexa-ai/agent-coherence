@@ -48,7 +48,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, TypedDict
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -238,13 +238,79 @@ def build_environment() -> Environment:
 # -------------------------------------------------------------------- #
 
 
+class _ReportContext(TypedDict):
+    """Type signature for the Jinja2 template context.
+
+    Lists every key the template consumes, so a missing or renamed
+    field is a static-analysis failure instead of a Jinja2
+    ``UndefinedError`` at render time. ``total=True`` (the default) —
+    every field is required.
+    """
+
+    # Headline + verdict
+    headline_label: str
+    headline_subtitle: str
+    verdict_reason: str
+    is_insufficient: bool
+    secondary_kpi_kind: str
+    # Cost KPI
+    rework_cost_annualized: float | None
+    rework_cost_annualized_str: str | None
+    rework_tokens_this_run: int | None
+    cost_unmeasurable_reason: str | None
+    cost_unmeasurable_message: str
+    # Auditability KPI
+    agent_pain_count: int
+    headline_event_count: int
+    # Section toggles
+    has_events: bool
+    show_heatmap: bool
+    show_reader_pairs: bool
+    show_excluded: bool
+    show_ownership_appendix: bool
+    # Section 2 data
+    top_event: Any
+    top_event_writes: Any
+    ownership: tuple[OwnershipRow, ...]
+    # Section 3 data
+    heatmap_rows: tuple[Any, ...]
+    # Section 4 data
+    reader_pairs: Any
+    # Section 5 data
+    exclusion_panel: Any
+    strict_mode: bool
+    # Section 6 data
+    tracked_keys: Any
+    ignored_framework_keys: Any
+    ignored_ephemera_keys: Any
+    append_only_keys: Any
+    mutable_keys: Any
+    unknown_underscore_keys: Any
+    # Section 7 data
+    coverage: Any
+    coverage_thresholds: Any
+    confidence_label: str
+    # Sections 8 & 9 — static copy
+    copy_does_not_measure: str
+    copy_cannot_tell_you: str
+    # Section 10 — CTA
+    cta_variant: str
+    book_a_call_url: str
+    contact_email: str
+    warm_lead_questions: Any
+    upgrade_triggers: Any
+    soft_ask_message: str
+    # Footer
+    schema_version: str
+
+
 def _build_context(
     *,
     verdict: ClassifierVerdict,
     report: DetectionReport,
     ownership: tuple[OwnershipRow, ...],
     options: RenderOptions,
-) -> dict[str, object]:
+) -> _ReportContext:
     """Compose the Jinja2 template context.
 
     All copy strings the template renders flow through here — the template
@@ -252,44 +318,44 @@ def _build_context(
     flags. Putting copy decisions in Python keeps them out of the template
     where autoescape applies (so a typo in copy can't accidentally inject
     HTML).
-    """
-    has_events = len(report.headline_divergence_events) >= 1
-    show_heatmap = any(row.divergent_reads > 0 for row in report.heatmap)
-    show_reader_pairs = len(report.reader_pair_matrix) >= 1
-    show_excluded = (
-        report.exclusion_panel.sequential_staleness_count
-        + report.exclusion_panel.cold_start_count
-        + report.exclusion_panel.append_only_skip_count
-    ) > 0
 
-    # Mixed-divergence layout: at least one event present, but more
-    # tracked artifacts than divergent ones — surface the full Ownership
-    # Map as a collapsible appendix to Section 3.
-    show_ownership_appendix = (
-        has_events
-        and show_heatmap
-        and len(ownership) > sum(1 for _ in report.heatmap)
+    The body is a merge of four theme-grouped helpers (verdict, cost,
+    section toggles, copy) that each return their own slice as a plain
+    dict — easier to test and reason about in isolation.
+    """
+    toggles = _build_section_toggles(report=report, ownership=ownership)
+    return _ReportContext(  # type: ignore[typeddict-item]
+        **_build_verdict_fields(verdict=verdict, report=report, options=options),
+        **_build_cost_fields(report=report),
+        **toggles,
+        **_build_section_data(verdict=verdict, report=report, ownership=ownership),
+        **_build_copy_fields(verdict=verdict, report=report, options=options),
     )
 
+
+def _build_verdict_fields(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    options: RenderOptions,
+) -> dict[str, Any]:
+    """Headline label, subtitle, verdict reason, secondary-KPI selector."""
+    headline = _build_headline(verdict)
     secondary_kpi_kind = _pick_secondary_kpi(
         lead_pain_type=options.lead_pain_type, report=report
     )
-
-    cta_variant = _pick_cta_variant(
-        verdict=verdict, report=report, options=options
-    )
-
-    headline = _build_headline(verdict)
-    copy = _COPY  # Static copy block (mandatory sections 8 & 9).
-
     return {
-        # Headline + verdict
         "headline_label": headline.label,
         "headline_subtitle": headline.subtitle,
         "verdict_reason": verdict.reason or "",
         "is_insufficient": verdict.bucket is Bucket.INSUFFICIENT,
         "secondary_kpi_kind": secondary_kpi_kind,
-        # Cost KPI (only meaningful when secondary_kpi_kind == "cost")
+    }
+
+
+def _build_cost_fields(*, report: DetectionReport) -> dict[str, Any]:
+    """Cost / auditability KPI fields and the unmeasurable-fallback copy."""
+    return {
         "rework_cost_annualized": report.rework_cost_annualized,
         "rework_cost_annualized_str": _format_currency_per_year(
             report.rework_cost_annualized
@@ -299,52 +365,92 @@ def _build_context(
         "cost_unmeasurable_message": _COPY_COST_UNMEASURABLE.get(
             report.cost_unmeasurable_reason or "", ""
         ),
-        # Auditability KPI
         "agent_pain_count": report.agent_pain_count,
         "headline_event_count": len(report.headline_divergence_events),
-        # Section toggles
+    }
+
+
+def _build_section_toggles(
+    *,
+    report: DetectionReport,
+    ownership: tuple[OwnershipRow, ...],
+) -> dict[str, bool]:
+    """Boolean flags the template uses to gate optional sections."""
+    has_events = len(report.headline_divergence_events) >= 1
+    show_heatmap = any(row.divergent_reads > 0 for row in report.heatmap)
+    show_reader_pairs = len(report.reader_pair_matrix) >= 1
+    show_excluded = (
+        report.exclusion_panel.sequential_staleness_count
+        + report.exclusion_panel.cold_start_count
+        + report.exclusion_panel.append_only_skip_count
+    ) > 0
+    # Mixed-divergence layout: at least one event present, but more
+    # tracked artifacts than divergent ones — surface the full Ownership
+    # Map as a collapsible appendix to Section 3.
+    show_ownership_appendix = (
+        has_events
+        and show_heatmap
+        and len(ownership) > sum(1 for _ in report.heatmap)
+    )
+    return {
         "has_events": has_events,
         "show_heatmap": show_heatmap,
         "show_reader_pairs": show_reader_pairs,
         "show_excluded": show_excluded,
         "show_ownership_appendix": show_ownership_appendix,
-        # Section 2 data
+    }
+
+
+def _build_section_data(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    ownership: tuple[OwnershipRow, ...],
+) -> dict[str, Any]:
+    """Per-section data structures (sections 2-7)."""
+    return {
         "top_event": report.top_event,
         "top_event_writes": _top_event_writes(report),
         "ownership": ownership,
-        # Section 3 data
         "heatmap_rows": tuple(
             row for row in report.heatmap if row.divergent_reads > 0
         ),
-        # Section 4 data
         "reader_pairs": report.reader_pair_matrix,
-        # Section 5 data
         "exclusion_panel": report.exclusion_panel,
         "strict_mode": report.strict_mode,
-        # Section 6 data
         "tracked_keys": verdict.tracked_keys,
         "ignored_framework_keys": verdict.ignored_framework_keys,
         "ignored_ephemera_keys": verdict.ignored_ephemera_keys,
         "append_only_keys": verdict.append_only_keys,
         "mutable_keys": verdict.mutable_keys,
         "unknown_underscore_keys": verdict.unknown_underscore_keys,
-        # Section 7 data
         "coverage": verdict.coverage,
         "coverage_thresholds": _COVERAGE_THRESHOLDS,
         "confidence_label": _CONFIDENCE_LABEL.get(
             verdict.confidence, str(verdict.confidence.value)
         ),
-        # Sections 8 & 9
-        "copy_does_not_measure": copy.does_not_measure,
-        "copy_cannot_tell_you": copy.cannot_tell_you,
-        # Section 10 — CTA
+    }
+
+
+def _build_copy_fields(
+    *,
+    verdict: ClassifierVerdict,
+    report: DetectionReport,
+    options: RenderOptions,
+) -> dict[str, Any]:
+    """Static copy blocks and the dynamic CTA section (section 10 + 8/9)."""
+    cta_variant = _pick_cta_variant(
+        verdict=verdict, report=report, options=options
+    )
+    return {
+        "copy_does_not_measure": _COPY.does_not_measure,
+        "copy_cannot_tell_you": _COPY.cannot_tell_you,
         "cta_variant": cta_variant,
         "book_a_call_url": options.book_a_call_url,
         "contact_email": options.contact_email,
         "warm_lead_questions": _build_warm_lead_questions(report),
         "upgrade_triggers": _COPY_UPGRADE_TRIGGERS,
         "soft_ask_message": _COPY_SOFT_ASK,
-        # Footer
         "schema_version": report.schema_version,
     }
 
