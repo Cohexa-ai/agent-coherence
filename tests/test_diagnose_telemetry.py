@@ -631,16 +631,16 @@ _FORBIDDEN_FIELDS = frozenset(
 def test_payload_for_field_set_is_strict(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     assert frozenset(payload.keys()) == _EXPECTED_FIELDS
 
 
 def test_payload_for_does_not_leak_forbidden_fields(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     leaked = _FORBIDDEN_FIELDS & set(payload.keys())
     assert leaked == set(), f"payload leaked forbidden fields: {leaked}"
     # Defensive: nested structures shouldn't either.
@@ -652,11 +652,10 @@ def test_payload_for_does_not_leak_forbidden_fields(
 def test_payload_for_consent_granted_includes_token(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
+    verdict, _report = fake_verdict_and_report
     token = uuid.uuid4()
     payload = payload_for(
         verdict,
-        report,
         consent=ConsentState(
             granted=True,
             policy_version=CURRENT_POLICY_VERSION,
@@ -670,10 +669,9 @@ def test_payload_for_consent_granted_includes_token(
 def test_payload_for_consent_denied_no_token(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
+    verdict, _report = fake_verdict_and_report
     payload = payload_for(
         verdict,
-        report,
         consent=ConsentState(
             granted=False,
             policy_version=CURRENT_POLICY_VERSION,
@@ -687,16 +685,16 @@ def test_payload_for_consent_denied_no_token(
 def test_payload_for_consent_none_defaults_to_denied(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     assert payload["installation_token"] is None
 
 
 def test_payload_for_coverage_shape(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     coverage = payload["coverage"]
     assert set(coverage.keys()) == {
         "tick_count",
@@ -709,8 +707,8 @@ def test_payload_for_coverage_shape(
 def test_payload_for_timestamp_is_iso_utc(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     ts = payload["timestamp_utc"]
     assert isinstance(ts, str)
     # ISO-8601 with TZ info.
@@ -721,8 +719,8 @@ def test_payload_for_timestamp_is_iso_utc(
 def test_payload_for_schema_version_pinned(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     assert payload["schema_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
     assert payload["classifier_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 
@@ -731,10 +729,9 @@ def test_payload_for_token_only_when_granted_and_present(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
     """granted=True but token=None must still emit None (defensive)."""
-    verdict, report = fake_verdict_and_report
+    verdict, _report = fake_verdict_and_report
     payload = payload_for(
         verdict,
-        report,
         consent=ConsentState(
             granted=True,
             policy_version=CURRENT_POLICY_VERSION,
@@ -819,8 +816,8 @@ def test_detect_stack_returns_string(
     fake_verdict_and_report: tuple[ClassifierVerdict, DetectionReport],
 ) -> None:
     """payload['stack'] must be a non-empty string."""
-    verdict, report = fake_verdict_and_report
-    payload = payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = payload_for(verdict)
     stack = payload["stack"]
     assert isinstance(stack, str)
     assert stack.startswith("LangGraph")
@@ -842,8 +839,8 @@ def test_detect_stack_handles_missing_package(
     monkeypatch.setattr(
         "importlib.metadata.version", _fake_version
     )
-    verdict, report = fake_verdict_and_report
-    payload = telemetry_mod.payload_for(verdict, report)
+    verdict, _report = fake_verdict_and_report
+    payload = telemetry_mod.payload_for(verdict)
     assert payload["stack"] == "LangGraph (version-unknown)"
 
 

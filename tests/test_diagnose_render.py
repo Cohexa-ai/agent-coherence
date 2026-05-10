@@ -996,3 +996,68 @@ def test_heatmap_omits_rows_with_zero_divergent_reads():
     heatmap_section = html[heatmap_section_idx:next_section_idx]
     assert "A" in heatmap_section
     assert ">B<" not in heatmap_section  # filtered out
+
+
+# -------------------------------------------------------------------- #
+# RenderOptions URL / email scheme allowlist (XSS prevention)
+# -------------------------------------------------------------------- #
+
+
+def test_render_options_rejects_javascript_book_url() -> None:
+    """``javascript:`` href must be rejected at construction time."""
+    with pytest.raises(ValueError, match="book_a_call_url"):
+        RenderOptions(book_a_call_url="javascript:alert(1)")
+
+
+def test_render_options_rejects_data_book_url() -> None:
+    with pytest.raises(ValueError, match="book_a_call_url"):
+        RenderOptions(book_a_call_url="data:text/html,<script>alert(1)</script>")
+
+
+def test_render_options_rejects_vbscript_book_url() -> None:
+    with pytest.raises(ValueError, match="book_a_call_url"):
+        RenderOptions(book_a_call_url="vbscript:msgbox(1)")
+
+
+def test_render_options_rejects_javascript_contact_email() -> None:
+    """``javascript:`` payload in contact_email must be rejected."""
+    with pytest.raises(ValueError, match="contact_email"):
+        RenderOptions(contact_email="javascript:alert(1)")
+
+
+def test_render_options_rejects_data_contact_email() -> None:
+    with pytest.raises(ValueError, match="contact_email"):
+        RenderOptions(contact_email="data:text/html,<script>alert(1)</script>")
+
+
+def test_render_options_rejects_email_without_at_symbol() -> None:
+    with pytest.raises(ValueError, match="contact_email"):
+        RenderOptions(contact_email="not-an-email")
+
+
+def test_render_options_rejects_email_with_whitespace() -> None:
+    with pytest.raises(ValueError, match="contact_email"):
+        RenderOptions(contact_email="user @example.com")
+
+
+def test_render_options_accepts_https_book_url() -> None:
+    """https:// is the canonical happy path."""
+    opts = RenderOptions(book_a_call_url="https://cal.com/team/diagnose")
+    assert opts.book_a_call_url == "https://cal.com/team/diagnose"
+
+
+def test_render_options_accepts_http_book_url() -> None:
+    opts = RenderOptions(book_a_call_url="http://localhost:8080/book")
+    assert opts.book_a_call_url == "http://localhost:8080/book"
+
+
+def test_render_options_accepts_normal_email() -> None:
+    opts = RenderOptions(contact_email="alice@example.com")
+    assert opts.contact_email == "alice@example.com"
+
+
+def test_render_options_default_construction_succeeds() -> None:
+    """The defaults must satisfy the validators (no regression on the happy path)."""
+    opts = RenderOptions()
+    assert opts.book_a_call_url.startswith("https://")
+    assert "@" in opts.contact_email

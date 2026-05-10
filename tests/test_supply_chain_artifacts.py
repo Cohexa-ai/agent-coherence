@@ -73,8 +73,16 @@ def test_release_workflow_declares_id_token_write() -> None:
 
 def test_release_workflow_uses_pypa_publish_with_attestations() -> None:
     text = RELEASE_WORKFLOW.read_text()
-    assert "pypa/gh-action-pypi-publish@release/v1" in text, (
-        "release.yml must use pypa/gh-action-pypi-publish@release/v1"
+    # The workflow must reference pypa/gh-action-pypi-publish — either by
+    # the floating ``release/v1`` tag or pinned to a commit SHA with the
+    # tag preserved as a trailing comment (the supply-chain hardened form).
+    floating = "pypa/gh-action-pypi-publish@release/v1"
+    sha_pinned = "pypa/gh-action-pypi-publish@" in text and (
+        "# release/v1" in text or "#release/v1" in text
+    )
+    assert floating in text or sha_pinned, (
+        "release.yml must use pypa/gh-action-pypi-publish "
+        "(release/v1 or SHA-pinned with a release/v1 comment)"
     )
     assert "attestations: true" in text, (
         "release.yml must enable PEP 740 attestations: attestations: true"

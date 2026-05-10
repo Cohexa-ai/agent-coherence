@@ -115,7 +115,8 @@ def _build_entry(
     merge so the output has exactly one ``schema_version`` field — keeping
     the entry both auditable and ``validate_log``-compatible.
     """
-    payload = payload_for(verdict, report, consent=consent)
+    del report  # report fields are not surfaced in the payload
+    payload = payload_for(verdict, consent=consent)
     payload_no_schema = {k: v for k, v in payload.items() if k != "schema_version"}
     return {
         # ``validate_log`` 3-tuple (top level, required).

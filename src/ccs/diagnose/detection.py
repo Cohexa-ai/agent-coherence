@@ -86,7 +86,8 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Any
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.callback import DiagnoseEvent
@@ -100,6 +101,7 @@ __all__ = [
     "ExclusionPanel",
     "DetectionReport",
     "detect",
+    "build_report_json",
 ]
 
 
@@ -740,3 +742,60 @@ def _empty_report(
         strict_mode=strict,
         schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
     )
+
+
+# -------------------------------------------------------------------- #
+# Public report-JSON serialization primitive
+# -------------------------------------------------------------------- #
+
+
+def build_report_json(
+    verdict: ClassifierVerdict, report: DetectionReport
+) -> dict[str, Any]:
+    """Construct the ``report.json`` payload from a verdict + report.
+
+    Returns a dict shaped like::
+
+        {
+            "schema_version": "ccs.diagnose.v0-preview",
+            "verdict": {...},
+            "report": {...},
+        }
+
+    Round-trips cleanly through :func:`json.dumps` with ``default=str`` to
+    coerce any nested ``UUID`` / ``Path`` / enum values that survive
+    :func:`dataclasses.asdict`. The wrapping payload's ``schema_version``
+    is the canonical one — the nested ``report`` block has its own copy
+    stripped so downstream tools don't have to choose which to trust.
+
+    This is the public primitive behind ``ccs-diagnose --output-json``;
+    extracted from the CLI so other surfaces (programmatic adapters,
+    test harnesses, future v1 endpoints) can reuse it without dragging
+    in argparse.
+    """
+    return {
+        "schema_version": CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+        "verdict": _verdict_to_dict(verdict),
+        "report": _report_to_dict(report),
+    }
+
+
+def _verdict_to_dict(verdict: ClassifierVerdict) -> dict[str, Any]:
+    raw = asdict(verdict)
+    raw["bucket"] = verdict.bucket.value
+    raw["confidence"] = verdict.confidence.value
+    raw["coverage"]["verdict_confidence"] = verdict.coverage.verdict_confidence.value
+    # ``writers_by_key`` keys are str already; coerce values to lists.
+    raw["writers_by_key"] = {
+        k: list(v) for k, v in verdict.writers_by_key.items()
+    }
+    return raw
+
+
+def _report_to_dict(report: DetectionReport) -> dict[str, Any]:
+    raw = asdict(report)
+    # The wrapping payload already declares ``schema_version`` at the top
+    # level. Strip the nested copy so callers don't have to special-case
+    # which one to trust.
+    raw.pop("schema_version", None)
+    return raw

@@ -26,6 +26,7 @@ from ccs.diagnose.detection import (
     HeatmapRow,
     ReadObservation,
     ReaderPairCount,
+    build_report_json,
     detect,
 )
 
@@ -513,3 +514,56 @@ def test_schema_version_echoed():
     events, key_index = _divergent_run()
     report = detect(events, verdict=_verdict(tracked_keys=("Y",)), key_index=key_index)
     assert report.schema_version == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
+
+
+# -------------------------------------------------------------------- #
+# build_report_json — public report.json serialization primitive (#18)
+# -------------------------------------------------------------------- #
+
+
+def test_build_report_json_round_trips_through_json_dumps():
+    """``build_report_json`` produces a dict serialisable by ``json.dumps``.
+
+    The wrapping dict contains ``UUID`` values (artifact identities) and
+    enum strings; ``json.dumps(..., default=str)`` is the same encoder
+    the CLI uses to write report.json to disk. This test pins the
+    contract so the public surface stays portable.
+    """
+    import json
+
+    events, key_index = _divergent_run()
+    verdict = _verdict(tracked_keys=("Y",))
+    report = detect(events, verdict=verdict, key_index=key_index)
+    payload = build_report_json(verdict, report)
+    encoded = json.dumps(payload, default=str)
+    # Round-trip survives without error and the result is a dict.
+    decoded = json.loads(encoded)
+    assert isinstance(decoded, dict)
+
+
+def test_build_report_json_field_set():
+    """The top-level keys are exactly schema_version / verdict / report."""
+    events, key_index = _divergent_run()
+    verdict = _verdict(tracked_keys=("Y",))
+    report = detect(events, verdict=verdict, key_index=key_index)
+    payload = build_report_json(verdict, report)
+    assert set(payload.keys()) == {"schema_version", "verdict", "report"}
+
+
+def test_build_report_json_strips_nested_schema_version():
+    """The wrapping dict's schema_version is canonical; nested copy is dropped."""
+    events, key_index = _divergent_run()
+    verdict = _verdict(tracked_keys=("Y",))
+    report = detect(events, verdict=verdict, key_index=key_index)
+    payload = build_report_json(verdict, report)
+    assert payload["schema_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
+    assert "schema_version" not in payload["report"]
+
+
+def test_build_report_json_lazy_reexport_from_package():
+    """``ccs.diagnose.build_report_json`` lazy re-export resolves to the
+    same callable as the canonical name in ``ccs.diagnose.detection``."""
+    import ccs.diagnose as pkg
+    from ccs.diagnose.detection import build_report_json as canonical
+
+    assert pkg.build_report_json is canonical

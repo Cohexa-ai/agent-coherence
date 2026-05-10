@@ -42,7 +42,7 @@ import signal
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +59,12 @@ from ccs.diagnose.classifier import (
     build_key_index,
     classify,
 )
-from ccs.diagnose.detection import DetectionReport, ReadObservation, detect
+from ccs.diagnose.detection import (
+    DetectionReport,
+    ReadObservation,
+    build_report_json,
+    detect,
+)
 from ccs.diagnose.ownership import compute_ownership_map
 from ccs.diagnose.render import (
     DEFAULT_BOOK_A_CALL_URL,
@@ -84,6 +89,34 @@ __all__ = ["main", "build_parser"]
 
 _DEFAULT_HTML_PATH = "diagnose_report.html"
 _DEFAULT_JSON_PATH = "diagnose_report.json"
+
+# -------------------------------------------------------------------- #
+# Exit codes
+# -------------------------------------------------------------------- #
+# Distinct codes per failure category make the CLI scriptable for agents
+# and CI pipelines that need to branch on *why* a run failed without
+# parsing stderr. ``EXIT_USAGE_ERROR`` is the argparse default; the rest
+# extend it with diagnose-specific categories.
+
+EXIT_OK: int = 0
+EXIT_GENERIC_ERROR: int = 1
+EXIT_USAGE_ERROR: int = 2  # argparse default
+EXIT_DEPENDENCY_MISSING: int = 3  # langgraph (or other extras) not installed
+EXIT_SCHEMA_MISMATCH: int = 4  # --show-payload version not in allowlist
+EXIT_IO_ERROR: int = 5  # filesystem write/read failure
+
+
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset(
+    {"ccs.diagnose.v0-preview", "ccs.diagnose.v1"}
+)
+"""Schema versions accepted by ``--show-payload``.
+
+The CLI emits ``v0-preview``; future units will promote to ``v1`` after
+the calibration gate. ``--show-payload`` accepts both so an installation
+with a tip-of-tree CLI can still inspect old report.json files (and so
+v1-tagged reports load on a v0-preview CLI during the migration window).
+"""
+
 _MAX_INPUT_FILE_SIZE: int = 10 * 1024 * 1024
 """Upper bound for ``--show-payload`` and ``--state-file`` reads.
 
@@ -152,6 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  ccs-diagnose --graph examples/langgraph_planner/main.py:build_graph_no_store\n"
             "  ccs-diagnose --graph my/graph.py:factory --volume 50 --strict\n"
             "  ccs-diagnose --show-payload diagnose_report.json\n"
+            "\n"
+            "Exit codes:\n"
+            "  0  success\n"
+            "  1  generic error (graph load failure, JSON parse, etc.)\n"
+            "  2  usage error (argparse, mutually exclusive flags, bad URL/email)\n"
+            "  3  dependency missing (import error from graph or extras)\n"
+            "  4  schema mismatch (--show-payload version not supported)\n"
+            "  5  I/O error (write/read failed; oversized input file)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -186,7 +227,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_JSON_PATH,
         help=(
             "Output path for the machine-readable JSON report.\n"
-            f"Default: {_DEFAULT_JSON_PATH} (always emitted unless --no-json)."
+            f"Default: {_DEFAULT_JSON_PATH} (always emitted unless --no-json).\n"
+            "Pass '-' to write the JSON to stdout instead; the human-\n"
+            "readable summary is then routed to stderr so callers can pipe\n"
+            "stdout straight into ``jq`` etc."
         ),
     )
     parser.add_argument(
@@ -285,14 +329,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-network",
         action="store_true",
         help=(
-            "Reserved for Unit 8 — disables outbound submission. v0 has no\n"
-            "submission code, so this flag is a no-op for forward-compat."
+            "v0 alias for --no-telemetry (no network code exists in v0;\n"
+            "flag reserved for v1 endpoint POST suppression). Suppresses\n"
+            "the consent prompt and forces a denied state."
         ),
     )
     parser.add_argument(
         "--no-telemetry",
         action="store_true",
-        help="Reserved for Unit 8 — disables telemetry. No-op in v0.",
+        help=(
+            "Skip the consent prompt and calibration write entirely;\n"
+            "suppress all telemetry-shaped output. Functionally identical\n"
+            "to --no-network in v0."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "--non-interactive",
+        dest="yes",
+        action="store_true",
+        help=(
+            "Skip the interactive consent prompt; use persisted state or\n"
+            "treat as denied. Required for non-TTY agent invocations\n"
+            "where the consent prompt would block forever."
+        ),
     )
     parser.add_argument(
         "--calibration-record",
@@ -351,7 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error: --show-payload and --reset-token are mutually exclusive",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_USAGE_ERROR
 
     if args.show_payload:
         return _run_show_payload(args)
@@ -367,7 +427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(or use --show-payload PATH / --reset-token)",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_USAGE_ERROR
 
     return _run_pipeline(args)
 
@@ -392,14 +452,14 @@ def _run_show_payload(args: argparse.Namespace) -> int:
                 f"{_MAX_INPUT_FILE_SIZE} bytes",
                 file=sys.stderr,
             )
-            return 1
+            return EXIT_IO_ERROR
         loaded_text = payload_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         print(f"error: cannot read --show-payload target: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_IO_ERROR
     except OSError as exc:
         print(f"error: cannot read --show-payload target: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_IO_ERROR
 
     try:
         loaded = json.loads(loaded_text)
@@ -408,7 +468,7 @@ def _run_show_payload(args: argparse.Namespace) -> int:
             f"error: --show-payload target is not valid JSON: {exc}",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_GENERIC_ERROR
 
     if not isinstance(loaded, dict):
         print(
@@ -416,16 +476,17 @@ def _run_show_payload(args: argparse.Namespace) -> int:
             f"got {type(loaded).__name__}",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_GENERIC_ERROR
 
     schema_version = loaded.get("schema_version")
-    if schema_version != CCS_DIAGNOSE_LOG_SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        supported_display = ", ".join(sorted(SUPPORTED_SCHEMA_VERSIONS))
         print(
             f"error: schema version mismatch in {payload_path}: "
-            f"expected {CCS_DIAGNOSE_LOG_SCHEMA_VERSION!r}, got {schema_version!r}",
+            f"expected one of [{supported_display}], got {schema_version!r}",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_SCHEMA_MISMATCH
 
     # ``--show-payload`` is a read-only operation: never prompt. We use
     # the current persisted consent if any so the displayed
@@ -495,24 +556,40 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     # Resolve consent up-front so the prompt (if any) appears before any
     # pipeline output. ``--no-telemetry`` and ``--no-network`` short-circuit
     # to a denied-with-no-token state so the resolver never prompts.
+    # ``--yes`` / ``--non-interactive`` bypasses the prompt and uses the
+    # persisted state if any, falling back to denied — required for agent
+    # invocations where blocking on stdin is not an option.
     if args.no_telemetry or args.no_network:
         consent: ConsentState = ConsentState(
             granted=False,
             policy_version=CURRENT_POLICY_VERSION,
             installation_token=None,
         )
+    elif args.yes:
+        existing = load_consent()
+        if (
+            existing is not None
+            and existing.policy_version == CURRENT_POLICY_VERSION
+        ):
+            consent = existing
+        else:
+            consent = ConsentState(
+                granted=False,
+                policy_version=CURRENT_POLICY_VERSION,
+                installation_token=None,
+            )
     else:
         consent = resolve_consent()
 
     factory_loaded = _load_graph_factory(args.graph)
-    if factory_loaded is None:
-        return 1
+    if isinstance(factory_loaded, int):
+        return factory_loaded
     factory, factory_module = factory_loaded
 
     initial_state = _load_state_file(args.state_file)
     if isinstance(initial_state, _LoadError):
         print(f"error: {initial_state.message}", file=sys.stderr)
-        return 1
+        return EXIT_GENERIC_ERROR
 
     # When no --state-file is supplied, discover a companion
     # ``initial_state*`` callable in the same module. LangGraph factories
@@ -526,7 +603,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         graph = _build_graph(factory, initial_state)
     except _PipelineError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_GENERIC_ERROR
 
     callback = DiagnoseCallback()
     invoke_state: dict[str, Any] = (
@@ -586,13 +663,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     ownership = compute_ownership_map(events, verdict, key_index)
 
-    options = RenderOptions(
-        lead_pain_type=_resolve_lead_pain_type(args),
-        warm_lead=args.warm_lead,
-        book_a_call_url=args.book_a_call_url,
-        contact_email=args.contact_email,
-        redact_keys=False,  # post-v0
-    )
+    try:
+        options = RenderOptions(
+            lead_pain_type=_resolve_lead_pain_type(args),
+            warm_lead=args.warm_lead,
+            book_a_call_url=args.book_a_call_url,
+            contact_email=args.contact_email,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
     output_html = Path(args.output_html)
     html_written = True
     try:
@@ -610,7 +690,12 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    if not args.no_json:
+    # ``--output-json -`` writes the JSON to stdout; anything else writes
+    # it to the given path. Stdout-mode also routes the human summary
+    # to stderr so callers can pipe stdout straight into ``jq`` etc.
+    output_json_to_stdout = (not args.no_json) and args.output_json == "-"
+
+    if not args.no_json and not output_json_to_stdout:
         output_json = Path(args.output_json)
         try:
             _write_report_json(verdict=verdict, report=report, path=output_json)
@@ -619,7 +704,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 f"error: failed to write JSON report to {output_json}: {exc}",
                 file=sys.stderr,
             )
-            return 1
+            return EXIT_IO_ERROR
 
     summary_text = terminal_summary(
         verdict=verdict, report=report, html_path=output_html
@@ -629,19 +714,25 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "(HTML report missing — see error above for details.)\n\n"
             + summary_text
         )
-    # Route the dry-run JSON payload to stdout (machine-readable artefact)
-    # and the human summary to stderr so callers can pipe stdout straight
-    # into ``jq`` etc. without stripping. Non-dry-run keeps the historical
-    # behaviour (summary on stdout) so downstream tooling stays stable.
-    summary_stream = sys.stderr if args.dry_run else sys.stdout
+    # Route the dry-run JSON payload — and the ``--output-json -`` JSON
+    # report — to stdout (machine-readable artefact) and the human
+    # summary to stderr so callers can pipe stdout straight into ``jq``
+    # etc. without stripping. Non-dry-run keeps the historical behaviour
+    # (summary on stdout) so downstream tooling stays stable.
+    summary_to_stderr = args.dry_run or output_json_to_stdout
+    summary_stream = sys.stderr if summary_to_stderr else sys.stdout
     print(summary_text, file=summary_stream)
 
+    if output_json_to_stdout:
+        payload_dict = build_report_json(verdict, report)
+        print(json.dumps(payload_dict, indent=2, sort_keys=True, default=str))
+
     if args.dry_run:
-        payload = payload_for(verdict, report, consent=consent)
+        payload = payload_for(verdict, consent=consent)
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
-    if html_written is False and args.no_json:
-        return 1
+    if html_written is False and (args.no_json or output_json_to_stdout):
+        return EXIT_IO_ERROR
 
     if args.calibration_record is not None:
         # ``args.calibration_record`` is "" when the flag was passed without a
@@ -699,17 +790,21 @@ class _LoadError:
     message: str
 
 
-def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | None:
+def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | int:
     """Parse ``PATH:FUNCTION`` and return ``(factory, module)``.
 
-    On any error prints to stderr and returns ``None``.
+    On any error prints to stderr and returns the appropriate
+    :data:`EXIT_*` integer code. ``ImportError`` (i.e. the
+    ``[diagnose]`` extras are missing) returns
+    :data:`EXIT_DEPENDENCY_MISSING`; all other failures return
+    :data:`EXIT_GENERIC_ERROR`.
     """
     if ":" not in graph_arg:
         print(
             f"error: --graph must be in PATH:FUNCTION format; got {graph_arg!r}",
             file=sys.stderr,
         )
-        return None
+        return EXIT_GENERIC_ERROR
 
     colon_idx = graph_arg.rfind(":")
     path_str = graph_arg[:colon_idx]
@@ -718,7 +813,7 @@ def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | None:
     graph_path = Path(path_str)
     if not graph_path.exists():
         print(f"error: graph file not found: {graph_path}", file=sys.stderr)
-        return None
+        return EXIT_GENERIC_ERROR
 
     module_dir = str(graph_path.parent.resolve())
     if module_dir not in sys.path:
@@ -729,7 +824,7 @@ def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | None:
     )
     if spec is None or spec.loader is None:
         print(f"error: cannot load module from {graph_path}", file=sys.stderr)
-        return None
+        return EXIT_GENERIC_ERROR
 
     module = importlib.util.module_from_spec(spec)
     try:
@@ -740,10 +835,10 @@ def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | None:
             "Tip: install the diagnose extras: pip install \"agent-coherence[diagnose]\"",
             file=sys.stderr,
         )
-        return None
+        return EXIT_DEPENDENCY_MISSING
     except Exception as exc:  # noqa: BLE001 — surface user errors verbatim
         print(f"error: failed to import {graph_path}: {exc}", file=sys.stderr)
-        return None
+        return EXIT_GENERIC_ERROR
 
     factory = getattr(module, fn_name, None)
     if factory is None:
@@ -751,7 +846,7 @@ def _load_graph_factory(graph_arg: str) -> tuple[Any, Any] | None:
             f"error: function {fn_name!r} not found in {graph_path}",
             file=sys.stderr,
         )
-        return None
+        return EXIT_GENERIC_ERROR
     return factory, module
 
 
@@ -1014,49 +1109,15 @@ def _write_report_json(
 ) -> None:
     """Write the verdict + report to ``path`` as a single JSON object.
 
-    Shape:
-
-    .. code-block::
-
-        {
-            "schema_version": "ccs.diagnose.v0-preview",
-            "verdict": {...asdict(verdict)...},
-            "report": {...asdict(report)...},
-        }
-
-    UUIDs and Paths are coerced via ``default=str`` for JSON safety.
+    Thin wrapper over :func:`build_report_json` that writes the result to
+    disk. UUIDs and Paths are coerced via ``default=str`` for JSON safety.
     """
-    payload = {
-        "schema_version": CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
-        "verdict": _verdict_to_dict(verdict),
-        "report": _report_to_dict(report),
-    }
+    payload = build_report_json(verdict, report)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, default=str),
         encoding="utf-8",
     )
-
-
-def _verdict_to_dict(verdict: ClassifierVerdict) -> dict[str, Any]:
-    raw = asdict(verdict)
-    raw["bucket"] = verdict.bucket.value
-    raw["confidence"] = verdict.confidence.value
-    raw["coverage"]["verdict_confidence"] = verdict.coverage.verdict_confidence.value
-    # ``writers_by_key`` keys are str already; coerce values to lists.
-    raw["writers_by_key"] = {
-        k: list(v) for k, v in verdict.writers_by_key.items()
-    }
-    return raw
-
-
-def _report_to_dict(report: DetectionReport) -> dict[str, Any]:
-    raw = asdict(report)
-    # The wrapping payload already declares ``schema_version`` at the top
-    # level. Strip the nested copy so callers don't have to special-case
-    # which one to trust.
-    raw.pop("schema_version", None)
-    return raw
 
 
 if __name__ == "__main__":

@@ -30,9 +30,9 @@ Topology exposure
 
 State-key names render verbatim (with autoescape applied). Production
 keys often encode internal service names or proprietary workflow shape;
-users sharing the HTML accept this. ``RenderOptions.redact_keys`` is a
-no-op placeholder for the post-v0 ``--redact-keys`` flag that will hash
-key names with a per-run salt.
+users sharing the HTML accept this. Post-v0 ``--redact-keys`` will hash
+key names with a per-run salt; the option will be added back to
+``RenderOptions`` when that lands.
 
 Determinism
 ===========
@@ -44,6 +44,7 @@ the output.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -82,6 +83,9 @@ _TEMPLATES_DIR = Path(__file__).with_name("templates")
 _TEMPLATE_NAME = "diagnose_report.html"
 
 
+_EMAIL_PATTERN = re.compile(r"^[^@\s<>\"'\\]+@[^@\s<>\"'\\]+$")
+
+
 @dataclass(frozen=True)
 class RenderOptions:
     """Caller-supplied knobs for the HTML renderer.
@@ -96,15 +100,70 @@ class RenderOptions:
     ``warm_lead`` switches the CTA from cold-lead default to a 2-question
     seed for an upcoming call (no soft-ask, no book-a-call link).
 
-    ``redact_keys`` is a no-op in v0; reserved for the post-v0 hashing
-    feature so Unit 7's CLI can wire the flag without code churn here.
+    ``book_a_call_url`` and ``contact_email`` are validated in
+    ``__post_init__`` to reject ``javascript:`` / ``data:`` / ``vbscript:``
+    URI schemes. Jinja2 autoescape sanitizes HTML but does not gate URL
+    schemes — an attacker-controlled CLI flag like
+    ``--book-a-call-url 'javascript:alert(1)'`` would otherwise render a
+    live click-to-execute href in the report.
     """
 
     lead_pain_type: Literal["cost", "auditability", "auto"] = "auto"
     warm_lead: bool = False
     book_a_call_url: str = DEFAULT_BOOK_A_CALL_URL
     contact_email: str = DEFAULT_CONTACT_EMAIL
-    redact_keys: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_book_a_call_url(self.book_a_call_url)
+        _validate_contact_email(self.contact_email)
+
+
+def _validate_book_a_call_url(url: str) -> None:
+    """Reject any URL whose scheme isn't ``http`` or ``https``.
+
+    The CTA renders ``<a href="{{ book_a_call_url }}">`` so a
+    ``javascript:`` (or ``data:``, ``vbscript:``) scheme would produce a
+    live XSS sink that Jinja2 autoescape does NOT block.
+    """
+    if not isinstance(url, str):
+        raise ValueError(
+            f"book_a_call_url must be a string; got {type(url).__name__}"
+        )
+    lowered = url.strip().lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise ValueError(
+            "book_a_call_url must start with http:// or https:// "
+            f"(rejected: {url!r})"
+        )
+
+
+def _validate_contact_email(email: str) -> None:
+    """Reject anything that doesn't look like a plain email address.
+
+    The CTA renders ``<a href="mailto:{{ contact_email }}">``. Embedding a
+    URL scheme inside the user-supplied value (``javascript:alert(1)``)
+    would land in the ``mailto:`` href verbatim — most clients tolerate
+    the prefix and the underlying scheme is still clickable. Reject
+    schemes explicitly and require an ``@`` to keep the value
+    well-formed.
+    """
+    if not isinstance(email, str):
+        raise ValueError(
+            f"contact_email must be a string; got {type(email).__name__}"
+        )
+    stripped = email.strip()
+    lowered = stripped.lower()
+    forbidden_prefixes = ("javascript:", "data:", "vbscript:", "file:")
+    if any(lowered.startswith(prefix) for prefix in forbidden_prefixes):
+        raise ValueError(
+            "contact_email must not embed a URL scheme "
+            f"(rejected: {email!r})"
+        )
+    if not _EMAIL_PATTERN.match(stripped):
+        raise ValueError(
+            "contact_email must look like a plain email address "
+            f"(rejected: {email!r})"
+        )
 
 
 def render_html(
@@ -270,8 +329,6 @@ def _build_context(
         "soft_ask_message": _COPY_SOFT_ASK,
         # Footer
         "schema_version": report.schema_version,
-        # Reserved for post-v0 — currently no-op.
-        "redact_keys": options.redact_keys,
     }
 
 

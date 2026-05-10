@@ -267,7 +267,8 @@ def test_show_payload_with_graph_warns_and_succeeds(tmp_path: Path) -> None:
 
 def test_show_payload_missing_file_errors(tmp_path: Path) -> None:
     code, _, stderr = _invoke(["--show-payload", str(tmp_path / "nope.json")])
-    assert code == 1
+    # I/O error: file not found.
+    assert code == 5
     assert "cannot read" in stderr.lower()
 
 
@@ -275,7 +276,8 @@ def test_show_payload_schema_mismatch_errors(tmp_path: Path) -> None:
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"random": "stuff"}), encoding="utf-8")
     code, _, stderr = _invoke(["--show-payload", str(bad)])
-    assert code == 1
+    # Schema mismatch: dedicated exit code (#25).
+    assert code == 4
     assert "schema version mismatch" in stderr.lower()
 
 
@@ -471,7 +473,8 @@ def test_html_output_path_unwritable_returns_nonzero(tmp_path: Path) -> None:
         )
     finally:
         readonly.chmod(0o700)
-    assert code == 1
+    # I/O error: HTML write failed; --no-json + html_written=False ⇒ exit 5.
+    assert code == 5
     assert "failed to write HTML report" in stderr
 
 
@@ -564,3 +567,202 @@ def test_python_m_help_exits_zero() -> None:
     )
     assert result.returncode == 0
     assert "ccs-diagnose" in result.stdout
+
+
+# -------------------------------------------------------------------- #
+# Cluster 1 — Security: URL scheme allowlist on book-a-call / contact-email
+# -------------------------------------------------------------------- #
+
+
+def test_book_a_call_url_javascript_scheme_rejected(tmp_path: Path) -> None:
+    """``--book-a-call-url 'javascript:alert(1)'`` exits with usage error."""
+    code, _, stderr = _invoke(
+        _basic_argv(tmp_path, "--book-a-call-url", "javascript:alert(1)")
+    )
+    # Validation rejects the scheme; usage error code (#25).
+    assert code == 2
+    assert "book_a_call_url" in stderr or "javascript" in stderr.lower()
+
+
+def test_contact_email_javascript_scheme_rejected(tmp_path: Path) -> None:
+    """``--contact-email 'javascript:alert(1)'`` exits with usage error."""
+    code, _, stderr = _invoke(
+        _basic_argv(tmp_path, "--contact-email", "javascript:alert(1)")
+    )
+    assert code == 2
+    assert "contact_email" in stderr or "javascript" in stderr.lower()
+
+
+# -------------------------------------------------------------------- #
+# Cluster 1 — Security: --show-payload schema-version allowlist (#3)
+# -------------------------------------------------------------------- #
+
+
+def test_show_payload_accepts_v1_schema(tmp_path: Path) -> None:
+    """``ccs.diagnose.v1`` must round-trip through --show-payload."""
+    bad = tmp_path / "v1.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "schema_version": "ccs.diagnose.v1",
+                "verdict": {
+                    "bucket": "single_writer",
+                    "confidence": "high",
+                    "coverage": {
+                        "tick_count": 1,
+                        "read_count": 1,
+                        "write_count": 1,
+                        "artifact_count": 1,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, stdout, _ = _invoke(["--show-payload", str(bad)])
+    assert code == 0
+    payload = json.loads(stdout)
+    # Top-level schema_version reflects what the file declared.
+    assert payload["schema_version"] == "ccs.diagnose.v1"
+
+
+# -------------------------------------------------------------------- #
+# Cluster 2 — Agent readiness: --yes / --non-interactive (#5)
+# -------------------------------------------------------------------- #
+
+
+def test_yes_flag_skips_prompt_with_no_consent_file(tmp_path: Path) -> None:
+    """--yes runs the pipeline as denied when no consent.json exists."""
+    code, stdout, _ = _invoke(_basic_argv(tmp_path, "--yes", "--dry-run"))
+    assert code == 0
+    payload = json.loads(stdout.strip())
+    assert payload["installation_token"] is None
+
+
+def test_yes_flag_uses_persisted_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When consent.json exists at the current policy version, --yes reuses it."""
+    cfg_dir = tmp_path / "xdg"
+    cfg_dir.mkdir()
+    consent_dir = cfg_dir / "ccs-diagnose"
+    consent_dir.mkdir()
+    import uuid as _uuid
+
+    token = _uuid.uuid4()
+    (consent_dir / "consent.json").write_text(
+        json.dumps(
+            {
+                "granted": True,
+                "policy_version": 1,
+                "installation_token": str(token),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_dir))
+    code, stdout, _ = _invoke(_basic_argv(tmp_path, "--yes", "--dry-run"))
+    assert code == 0
+    payload = json.loads(stdout.strip())
+    assert payload["installation_token"] == str(token)
+
+
+def test_yes_flag_alias_non_interactive(tmp_path: Path) -> None:
+    """--non-interactive is an alias for --yes."""
+    code, stdout, _ = _invoke(
+        _basic_argv(tmp_path, "--non-interactive", "--dry-run")
+    )
+    assert code == 0
+    payload = json.loads(stdout.strip())
+    assert payload["installation_token"] is None
+
+
+# -------------------------------------------------------------------- #
+# Cluster 2 — Agent readiness: --output-json - sentinel (#6)
+# -------------------------------------------------------------------- #
+
+
+def test_output_json_dash_writes_to_stdout(tmp_path: Path) -> None:
+    """``--output-json -`` writes the JSON payload to stdout."""
+    code, stdout, _ = _invoke(
+        [
+            "--graph",
+            GRAPH_FACTORY,
+            "--output-html",
+            str(tmp_path / "r.html"),
+            "--output-json",
+            "-",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(stdout.strip())
+    assert payload["schema_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
+    assert "verdict" in payload
+    assert "report" in payload
+
+
+def test_output_json_dash_routes_summary_to_stderr(tmp_path: Path) -> None:
+    """In stdout-mode, the human summary is on stderr (not mixed with JSON)."""
+    code, stdout, stderr = _invoke(
+        [
+            "--graph",
+            GRAPH_FACTORY,
+            "--output-html",
+            str(tmp_path / "r.html"),
+            "--output-json",
+            "-",
+        ]
+    )
+    assert code == 0
+    # JSON parse must NOT see the summary text mixed in.
+    json.loads(stdout.strip())
+    assert "Your write pattern" in stderr
+    assert "Your write pattern" not in stdout
+
+
+def test_output_json_dash_skips_json_file_write(tmp_path: Path) -> None:
+    """``--output-json -`` does not create diagnose_report.json on disk."""
+    code, _, _ = _invoke(
+        [
+            "--graph",
+            GRAPH_FACTORY,
+            "--output-html",
+            str(tmp_path / "r.html"),
+            "--output-json",
+            "-",
+        ]
+    )
+    assert code == 0
+    # The default JSON path lives in the cwd; ensure no surprising file
+    # snuck out under the literal name ``-``.
+    assert not (tmp_path / "-").exists()
+    # And no default-named file landed beside the html in tmp_path.
+    assert not (tmp_path / "diagnose_report.json").exists()
+
+
+# -------------------------------------------------------------------- #
+# Cluster 3 — Distinct exit codes per failure category (#25)
+# -------------------------------------------------------------------- #
+
+
+def test_show_payload_oversize_returns_exit_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oversized --show-payload input returns EXIT_IO_ERROR (5)."""
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps({"schema_version": "ccs.diagnose.v0-preview"}))
+    # Force-stub the size guard rather than write 10MB of text.
+    import ccs.cli.diagnose as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_MAX_INPUT_FILE_SIZE", 1)
+    code, _, stderr = _invoke(["--show-payload", str(big)])
+    assert code == 5
+    assert "exceeds" in stderr.lower()
+
+
+def test_invalid_json_in_show_payload_returns_exit_1(tmp_path: Path) -> None:
+    """A malformed JSON file under --show-payload returns generic error 1."""
+    bad = tmp_path / "bad.json"
+    bad.write_text("not valid json{", encoding="utf-8")
+    code, _, _ = _invoke(["--show-payload", str(bad)])
+    assert code == 1

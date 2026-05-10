@@ -542,22 +542,23 @@ def _detect_stack() -> str:
 
 def payload_for(
     verdict: ClassifierVerdict,
-    report: DetectionReport,
     *,
     consent: ConsentState | None = None,
 ) -> dict[str, Any]:
-    """Return the anonymized telemetry payload for a verdict + report.
+    """Return the anonymized telemetry payload for a verdict.
 
     This function is the *single auditable surface* of what would be
     submitted. The schema is asserted strictly by
     ``test_diagnose_telemetry.py``.
 
     Pure aside from the timestamp (``datetime.now(UTC)``) and the
-    one-shot importlib metadata lookup in :func:`_detect_stack`. ``report``
-    is accepted for API symmetry with future units; v0 does not extract
-    any field from it (the verdict carries every count we surface).
+    one-shot importlib metadata lookup in :func:`_detect_stack`. The
+    detection report is intentionally NOT a parameter — every field this
+    payload surfaces lives on the verdict (bucket, confidence, coverage
+    counts). Callers wanting to ship report-derived metrics in a future
+    schema version should add a new payload constructor rather than
+    expanding this signature.
     """
-    del report  # intentionally unused in v0; reserved for forward-compat
     state = consent if consent is not None else _denied()
     return {
         "schema_version": CCS_DIAGNOSE_LOG_SCHEMA_VERSION,

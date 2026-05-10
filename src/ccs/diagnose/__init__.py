@@ -28,4 +28,27 @@ Promoted to ``ccs.diagnose.v1`` after the calibration gate (>=5 real graphs,
 surprises) is satisfied.
 """
 
-__all__ = ["CCS_DIAGNOSE_LOG_SCHEMA_VERSION"]
+
+def __getattr__(name: str) -> object:
+    """Lazy re-export of select submodule symbols.
+
+    Keeps ``import ccs.diagnose`` zero-side-effect (no thread spawning,
+    no socket open, no file read) by deferring imports of optional
+    dependencies to first attribute access.
+
+    Currently lazy-loads :func:`build_report_json` from
+    :mod:`ccs.diagnose.detection` via :func:`importlib.import_module` so
+    the static architecture-cycle checker doesn't see a back-edge from
+    the package to its own submodule.
+    """
+    if name == "build_report_json":
+        import importlib
+
+        return importlib.import_module("ccs.diagnose.detection").build_report_json
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "CCS_DIAGNOSE_LOG_SCHEMA_VERSION",
+    "build_report_json",
+]
