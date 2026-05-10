@@ -10,7 +10,7 @@ name so the CLI (Unit 7) can switch implementations as the corpus grows.
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from ccs.diagnose.callback import DiagnoseEvent
 

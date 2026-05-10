@@ -6,13 +6,11 @@
 from __future__ import annotations
 
 import uuid
-from typing import Iterable, Mapping
+from collections.abc import Mapping
 
 import pytest
 
-from ccs.core.hashing import compute_content_hash
 from ccs.core.identity import artifact_uuid
-from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.callback import DEFAULT_SCOPE, DiagnoseEvent, DiagnoseWarning
 from ccs.diagnose.classifier import (
     Bucket,
@@ -24,66 +22,12 @@ from ccs.diagnose.classifier import (
     select_classifier,
 )
 
-
-# -------------------------------------------------------------------- #
-# Test helpers
-# -------------------------------------------------------------------- #
-
-
-_INSTANCE_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
-
-
-def _hash(value: object) -> str:
-    return compute_content_hash(repr(value))
-
-
-def _ids_for(keys: Iterable[str]) -> dict[str, uuid.UUID]:
-    return {k: artifact_uuid(DEFAULT_SCOPE, k) for k in keys}
-
-
-def _make_event(
-    *,
-    sequence: int,
-    tick: int,
-    node: str,
-    event_type: str,
-    state: Mapping[str, object] | None = None,
-    verdict_signal: str | None = None,
-    message: str = "",
-    run_id: str = "run-x",
-    namespace: str = "",
-) -> DiagnoseEvent:
-    """Build a synthetic ``DiagnoseEvent`` for classifier unit tests.
-
-    ``state`` is the merged state dict (for ``node_start``) or the
-    return-dict (for ``node_end``); each value is hashed exactly the way
-    ``DiagnoseCallback`` does so the UUID derivation matches the production
-    classifier path. Versions and content hashes are identical here (no
-    checkpointer overlay), matching the callback's fallback when no
-    checkpointer is attached.
-    """
-    state = state or {}
-    versions: dict[uuid.UUID, str] = {}
-    hashes: dict[uuid.UUID, str] = {}
-    for key, value in state.items():
-        aid = artifact_uuid(DEFAULT_SCOPE, key)
-        h = _hash(value)
-        versions[aid] = h
-        hashes[aid] = h
-    return DiagnoseEvent(
-        sequence_number=sequence,
-        instance_id=_INSTANCE_ID,
-        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
-        tick=tick,
-        node=node,
-        event_type=event_type,  # type: ignore[arg-type]
-        artifact_versions=versions,
-        content_hashes=hashes,
-        run_id=run_id,
-        namespace=namespace,
-        verdict_signal=verdict_signal,  # type: ignore[arg-type]
-        message=message,
-    )
+from diagnose_helpers import (
+    INSTANCE_ID as _INSTANCE_ID,
+    hash_value as _hash,
+    ids_for as _ids_for,
+    make_event as _make_event,
+)
 
 
 def _build_high_coverage_run(
@@ -719,6 +663,50 @@ def test_unsupported_execution_signal_short_circuits() -> None:
     assert verdict.bucket is Bucket.INSUFFICIENT
     assert verdict.confidence is Confidence.INSUFFICIENT
     assert verdict.reason == "unsupported_execution_model"
+
+
+def test_subgraph_observed_signal_short_circuits() -> None:
+    """A ``subgraph_observed`` signal must also short-circuit to insufficient."""
+    events: list[DiagnoseEvent] = [
+        _make_event(
+            sequence=1,
+            tick=-1,
+            node="",
+            event_type="verdict_signal",
+            verdict_signal="subgraph_observed",
+            message="subgraph namespace observed",
+        )
+    ]
+    high_events, key_index = _build_high_coverage_run(
+        artifacts={"plan": "planner"}, tick_count=60
+    )
+    events.extend(high_events)
+    verdict = classify(events, key_index=key_index)
+    assert verdict.bucket is Bucket.INSUFFICIENT
+    assert verdict.confidence is Confidence.INSUFFICIENT
+    assert verdict.reason == "subgraph_observed"
+
+
+def test_remote_graph_attached_signal_short_circuits() -> None:
+    """A ``remote_graph_attached`` signal must also short-circuit to insufficient."""
+    events: list[DiagnoseEvent] = [
+        _make_event(
+            sequence=1,
+            tick=-1,
+            node="",
+            event_type="verdict_signal",
+            verdict_signal="remote_graph_attached",
+            message="RemoteGraph instance encountered",
+        )
+    ]
+    high_events, key_index = _build_high_coverage_run(
+        artifacts={"plan": "planner"}, tick_count=60
+    )
+    events.extend(high_events)
+    verdict = classify(events, key_index=key_index)
+    assert verdict.bucket is Bucket.INSUFFICIENT
+    assert verdict.confidence is Confidence.INSUFFICIENT
+    assert verdict.reason == "remote_graph_attached"
 
 
 # -------------------------------------------------------------------- #

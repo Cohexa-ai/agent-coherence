@@ -72,7 +72,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from collections.abc import Mapping
+from typing import Any, TextIO
 
 from ccs import __version__ as agent_coherence_version
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
@@ -388,6 +389,8 @@ _PROMPT_TEXT = (
     "  - classifier verdict + confidence\n"
     "  - coverage shape (turns / reads / writes -- counts only, no values)\n"
     "  - timestamp\n"
+    "  - installation_token (locally generated UUID4; links multiple runs from\n"
+    "    this machine; reset any time with --reset-token)\n"
     "\n"
     "NOT collected, stored, logged, or transmitted:\n"
     "  - agent names, artifact names, content, hashes\n"

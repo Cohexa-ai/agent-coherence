@@ -56,8 +56,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ccs.diagnose.classifier import Bucket, ClassifierVerdict, Confidence
+from ccs.diagnose.classifier import Bucket, ClassifierVerdict
 from ccs.diagnose.detection import DetectionReport, DivergenceEvent
+
+from ._labels import BUCKET_DISPLAY as _BUCKET_DISPLAY
+from ._labels import CONFIDENCE_LABEL as _CONFIDENCE_DISPLAY
 
 __all__ = ["terminal_summary"]
 
@@ -71,21 +74,6 @@ _NODE_NAME_MAX_CHARS: int = 30
 _ARTIFACT_KEY_MAX_CHARS: int = 40
 _TRUNCATE_MIN_VISIBLE: int = 12
 _ELLIPSIS: str = "…"  # Unicode horizontal ellipsis.
-
-
-_BUCKET_DISPLAY: dict[Bucket, str] = {
-    Bucket.SINGLE_WRITER: "single_writer per artifact",
-    Bucket.SHARED_ARTIFACT: "shared_artifact",
-    Bucket.PARALLEL_BRANCH: "parallel_branch",
-    Bucket.MIXED_PATTERN: "mixed pattern",
-    Bucket.INSUFFICIENT: "insufficient coverage",
-}
-
-_CONFIDENCE_DISPLAY: dict[Confidence, str] = {
-    Confidence.HIGH: "high",
-    Confidence.PRELIMINARY: "preliminary",
-    Confidence.INSUFFICIENT: "insufficient",
-}
 
 
 # -------------------------------------------------------------------- #

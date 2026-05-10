@@ -232,10 +232,11 @@ def classify(
     """
     overrides = overrides or ClassifierOverrides()
 
-    # 1. Hard short-circuit: any unsupported_execution_model signal wins.
-    if _has_unsupported_execution_signal(events):
+    # 1. Hard short-circuit: any unsupported execution-model signal wins.
+    unsupported_signal = _first_unsupported_execution_signal(events)
+    if unsupported_signal is not None:
         return _insufficient_verdict(
-            reason="unsupported_execution_model",
+            reason=unsupported_signal,
             tracked_keys=(),
             ignored_framework_keys=(),
             ignored_ephemera_keys=(),
@@ -750,12 +751,34 @@ def _enforce_single_writer_consistency(
 # -------------------------------------------------------------------- #
 
 
-def _has_unsupported_execution_signal(events: Sequence[DiagnoseEvent]) -> bool:
-    return any(
-        ev.event_type == "verdict_signal"
-        and ev.verdict_signal == "unsupported_execution_model"
-        for ev in events
-    )
+# Verdict signals that short-circuit classification to ``insufficient``.
+# Mirrors ``RunVerdictSignal`` in ``ccs.diagnose.callback`` — kept as a
+# module-level frozenset so the predicate is a fast membership check and
+# the contract is documented in one place.
+_UNSUPPORTED_EXECUTION_SIGNALS: frozenset[str] = frozenset(
+    {
+        "unsupported_execution_model",
+        "subgraph_observed",
+        "remote_graph_attached",
+    }
+)
+
+
+def _first_unsupported_execution_signal(
+    events: Sequence[DiagnoseEvent],
+) -> str | None:
+    """Return the first verdict-signal event that disqualifies classification.
+
+    Returns the ``verdict_signal`` string (used as the verdict ``reason``) or
+    ``None`` if no disqualifying signal is present.
+    """
+    for ev in events:
+        if (
+            ev.event_type == "verdict_signal"
+            and ev.verdict_signal in _UNSUPPORTED_EXECUTION_SIGNALS
+        ):
+            return ev.verdict_signal
+    return None
 
 
 def _insufficient_verdict(

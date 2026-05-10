@@ -6,12 +6,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import Iterable, Mapping
 
-from ccs.core.hashing import compute_content_hash
-from ccs.core.identity import artifact_uuid
-from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
-from ccs.diagnose.callback import DEFAULT_SCOPE, DiagnoseEvent
+from ccs.diagnose.callback import DiagnoseEvent
 from ccs.diagnose.classifier import (
     Bucket,
     ClassifierVerdict,
@@ -20,50 +16,12 @@ from ccs.diagnose.classifier import (
 )
 from ccs.diagnose.ownership import OwnershipRow, compute_ownership_map
 
-
-_INSTANCE_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
-
-
-def _ids_for(keys: Iterable[str]) -> dict[str, uuid.UUID]:
-    return {k: artifact_uuid(DEFAULT_SCOPE, k) for k in keys}
-
-
-def _hash(value: object) -> str:
-    return compute_content_hash(repr(value))
-
-
-def _make_event(
-    *,
-    sequence: int,
-    tick: int,
-    node: str,
-    event_type: str,
-    state: Mapping[str, object] | None = None,
-    explicit_versions: Mapping[str, str] | None = None,
-) -> DiagnoseEvent:
-    state = state or {}
-    versions: dict[uuid.UUID, str] = {}
-    hashes: dict[uuid.UUID, str] = {}
-    for key, value in state.items():
-        aid = artifact_uuid(DEFAULT_SCOPE, key)
-        h = _hash(value)
-        versions[aid] = h
-        hashes[aid] = h
-    if explicit_versions:
-        for key, version in explicit_versions.items():
-            versions[artifact_uuid(DEFAULT_SCOPE, key)] = version
-    return DiagnoseEvent(
-        sequence_number=sequence,
-        instance_id=_INSTANCE_ID,
-        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
-        tick=tick,
-        node=node,
-        event_type=event_type,  # type: ignore[arg-type]
-        artifact_versions=versions,
-        content_hashes=hashes,
-        run_id="run-x",
-        namespace="",
-    )
+from diagnose_helpers import (
+    INSTANCE_ID as _INSTANCE_ID,
+    hash_value as _hash,
+    ids_for as _ids_for,
+    make_event as _make_event,
+)
 
 
 def _verdict(

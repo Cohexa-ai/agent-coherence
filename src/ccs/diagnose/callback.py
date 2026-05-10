@@ -53,7 +53,8 @@ import threading
 import uuid
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Mapping
+from collections.abc import Mapping
+from typing import Any, Literal
 
 from langchain_core.callbacks import BaseCallbackHandler
 
@@ -483,7 +484,14 @@ class DiagnoseCallback(BaseCallbackHandler):
             )
             self._buffer.append(event)
 
-    def _record_warning(self, message: str) -> None:
+    def record_warning(self, message: str) -> None:
+        """Append a ``warning`` event to the buffer and emit a Python warning.
+
+        Public hook for callers (e.g. the CLI) that need to surface a
+        non-fatal observation into the same buffer the classifier consumes —
+        this lets the verdict downgrade with a clean ``reason`` instead of
+        only writing to ``warnings.warn``.
+        """
         with self._lock:
             self._ensure_writable()
             event = DiagnoseEvent(
@@ -497,6 +505,10 @@ class DiagnoseCallback(BaseCallbackHandler):
             )
             self._buffer.append(event)
         warnings.warn(message, DiagnoseWarning, stacklevel=2)
+
+    # Deprecated alias retained for any private callers; prefer
+    # :meth:`record_warning`.
+    _record_warning = record_warning
 
     def _record_verdict_signal(
         self, *, signal: RunVerdictSignal, message: str
@@ -582,8 +594,8 @@ class DiagnoseCallback(BaseCallbackHandler):
                 ev.message for ev in self._buffer if ev.event_type == "warning"
             )
 
-    def node_events(self) -> Iterable[DiagnoseEvent]:
-        """Iterate over node_start/node_end events only (skip warnings)."""
+    def node_events(self) -> tuple[DiagnoseEvent, ...]:
+        """Return node_start/node_end events as an immutable tuple."""
         with self._lock:
             return tuple(
                 ev

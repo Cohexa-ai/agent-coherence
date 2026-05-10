@@ -31,7 +31,8 @@ forward whatever string-form we receive.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping
+from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -109,16 +110,7 @@ class DiagnoseCheckpointer(MemorySaver):
                 )
         except Exception:  # pragma: no cover — defensive: never crash user's graph.
             pass
+        # ``put_writes`` is intentionally NOT overridden: writes are
+        # channel-level and the callback already observes the merged
+        # state via ``put``, so the parent implementation is correct.
         return super().put(config, checkpoint, metadata, new_versions)
-
-    def put_writes(
-        self,
-        config: Any,
-        writes: Sequence[tuple[str, Any]],
-        task_id: str,
-        task_path: str = "",
-    ) -> None:
-        """Delegate to parent. ``writes`` are channel-level; the callback
-        sees the merged state via ``put`` already, so no forward needed.
-        """
-        return super().put_writes(config, writes, task_id, task_path)

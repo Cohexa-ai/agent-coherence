@@ -54,6 +54,9 @@ from ccs.diagnose.classifier import Bucket, ClassifierVerdict, Confidence
 from ccs.diagnose.detection import DetectionReport
 from ccs.diagnose.ownership import OwnershipRow
 
+from ._labels import BUCKET_DISPLAY as _BUCKET_DISPLAY
+from ._labels import CONFIDENCE_LABEL as _CONFIDENCE_LABEL
+
 __all__ = [
     "RenderOptions",
     "render_html",
@@ -293,20 +296,6 @@ def _build_headline(verdict: ClassifierVerdict) -> _Headline:
     return _Headline(label=label, subtitle=subtitle)
 
 
-_BUCKET_DISPLAY: dict[Bucket, str] = {
-    Bucket.SINGLE_WRITER: "single_writer per artifact",
-    Bucket.SHARED_ARTIFACT: "shared_artifact",
-    Bucket.PARALLEL_BRANCH: "parallel_branch",
-    Bucket.MIXED_PATTERN: "mixed pattern",
-    Bucket.INSUFFICIENT: "insufficient coverage",
-}
-
-_CONFIDENCE_LABEL: dict[Confidence, str] = {
-    Confidence.HIGH: "high",
-    Confidence.PRELIMINARY: "preliminary",
-    Confidence.INSUFFICIENT: "insufficient",
-}
-
 # Mirrors classifier internals; quoted in Section 7 so users can audit
 # why the report was flagged at its given confidence.
 _COVERAGE_THRESHOLDS: dict[str, int] = {
@@ -317,8 +306,10 @@ _COVERAGE_THRESHOLDS: dict[str, int] = {
 
 
 def _pick_secondary_kpi(
-    *, lead_pain_type: str, report: DetectionReport
-) -> str:
+    *,
+    lead_pain_type: Literal["cost", "auditability", "auto"],
+    report: DetectionReport,
+) -> Literal["cost", "auditability"]:
     if lead_pain_type == "cost":
         return "cost"
     if lead_pain_type == "auditability":

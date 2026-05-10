@@ -303,15 +303,16 @@ def test_reset_token_prints_new_uuid(
 
 
 def test_dry_run_prints_telemetry_payload(tmp_path: Path) -> None:
-    code, stdout, _ = _invoke(_basic_argv(tmp_path, "--dry-run"))
+    code, stdout, stderr = _invoke(_basic_argv(tmp_path, "--dry-run"))
     assert code == 0
-    assert "would submit (dry-run)" in stdout
-    # Find the JSON block after the marker.
-    marker = "would submit (dry-run):"
-    block = stdout.split(marker, 1)[1].strip()
-    payload = json.loads(block)
+    # Dry-run routes the machine-readable JSON payload to stdout and the
+    # human-readable summary to stderr so callers can pipe stdout straight
+    # into ``jq`` etc.
+    payload = json.loads(stdout.strip())
     assert payload["schema_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
     assert payload["installation_token"] is None
+    # The summary text always mentions the user's write pattern.
+    assert "Your write pattern" in stderr
 
 
 def test_no_network_is_noop_in_v0(tmp_path: Path) -> None:
@@ -374,19 +375,104 @@ def build_bad():
 """,
         encoding="utf-8",
     )
-    code, stdout, _ = _invoke(
-        [
-            "--graph",
-            f"{bad_module}:build_bad",
-            "--output-html",
-            str(tmp_path / "r.html"),
-            "--no-json",
-        ]
-    )
+    out_json = tmp_path / "r.json"
+    with pytest.warns(Warning, match="graph invoke failed"):
+        code, stdout, _ = _invoke(
+            [
+                "--graph",
+                f"{bad_module}:build_bad",
+                "--output-html",
+                str(tmp_path / "r.html"),
+                "--output-json",
+                str(out_json),
+            ]
+        )
     # The user still gets a (partial) report; exit 0 is the chosen
     # behaviour (graceful degradation).
     assert code == 0
     assert "Your write pattern" in stdout
+    # The warning was also routed into the callback buffer (and onward to
+    # the JSON report's verdict reason) so downstream stages have a clean
+    # signal rather than only a Python warning.
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["verdict"]["bucket"] == "insufficient"
+
+
+def test_writers_by_key_consistency_silent_for_insufficient_verdict(
+    tmp_path: Path,
+) -> None:
+    """Insufficient verdicts have empty writers_by_key by design — no warning."""
+    bad_module = tmp_path / "bad_graph.py"
+    bad_module.write_text(
+        """
+def build_bad():
+    class _Graph:
+        def invoke(self, state, config=None):
+            raise RuntimeError('boom')
+    return _Graph()
+""",
+        encoding="utf-8",
+    )
+    with pytest.warns(Warning, match="graph invoke failed"):
+        code, _, stderr = _invoke(
+            [
+                "--graph",
+                f"{bad_module}:build_bad",
+                "--output-html",
+                str(tmp_path / "r.html"),
+                "--no-json",
+            ]
+        )
+    assert code == 0
+    assert "writers_by_key inconsistency" not in stderr
+
+
+def test_volume_rejects_inf(tmp_path: Path) -> None:
+    code, _, stderr = _invoke(_basic_argv(tmp_path, "--volume", "inf"))
+    assert code == 2
+    assert "finite" in stderr.lower() or "non-negative" in stderr.lower()
+
+
+def test_volume_rejects_nan(tmp_path: Path) -> None:
+    code, _, stderr = _invoke(_basic_argv(tmp_path, "--volume", "nan"))
+    assert code == 2
+    assert "finite" in stderr.lower() or "non-negative" in stderr.lower()
+
+
+def test_volume_rejects_negative(tmp_path: Path) -> None:
+    code, _, stderr = _invoke(_basic_argv(tmp_path, "--volume", "-1"))
+    assert code == 2
+    assert "non-negative" in stderr.lower()
+
+
+def test_report_json_has_no_duplicate_schema_version(tmp_path: Path) -> None:
+    """``schema_version`` is at the top level only — never nested under report."""
+    code, _, _ = _invoke(_basic_argv(tmp_path))
+    assert code == 0
+    loaded = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert loaded["schema_version"] == CCS_DIAGNOSE_LOG_SCHEMA_VERSION
+    assert "schema_version" not in loaded["report"]
+
+
+def test_html_output_path_unwritable_returns_nonzero(tmp_path: Path) -> None:
+    """A read-only output dir surfaces a clean error and exits non-zero."""
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o500)
+    try:
+        code, _, stderr = _invoke(
+            [
+                "--graph",
+                GRAPH_FACTORY,
+                "--output-html",
+                str(readonly / "r.html"),
+                "--no-json",
+            ]
+        )
+    finally:
+        readonly.chmod(0o700)
+    assert code == 1
+    assert "failed to write HTML report" in stderr
 
 
 def test_writers_by_key_consistent_for_clean_run(tmp_path: Path) -> None:

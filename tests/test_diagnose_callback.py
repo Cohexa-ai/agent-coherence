@@ -391,6 +391,22 @@ def test_missing_langgraph_node_attributes_as_unknown_with_warning():
     assert any(ev.event_type == "warning" for ev in cb.events)
 
 
+def test_record_warning_appends_warning_event_and_emits_python_warning():
+    """Public ``record_warning`` is the supported hook for non-fatal observations.
+
+    External callers (the CLI's graph-invoke-failure path) need a way to
+    surface a warning into the buffer the classifier consumes — this test
+    pins the contract.
+    """
+    cb = DiagnoseCallback()
+    with pytest.warns(DiagnoseWarning, match="user signal"):
+        cb.record_warning("user signal")
+    warnings_in_buffer = [ev for ev in cb.events if ev.event_type == "warning"]
+    assert len(warnings_in_buffer) == 1
+    assert warnings_in_buffer[0].message == "user signal"
+    assert warnings_in_buffer[0].tick == -1
+
+
 def test_outer_langgraph_wrapper_event_is_silently_ignored():
     cb = DiagnoseCallback()
     run_id = uuid.uuid4()

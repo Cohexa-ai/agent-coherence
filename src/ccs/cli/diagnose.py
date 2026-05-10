@@ -37,12 +37,14 @@ import dataclasses
 import importlib.util
 import inspect
 import json
+import math
+import signal
 import sys
 import uuid
-import warnings
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.calibration import (
@@ -51,6 +53,7 @@ from ccs.diagnose.calibration import (
 )
 from ccs.diagnose.callback import DiagnoseCallback
 from ccs.diagnose.classifier import (
+    Bucket,
     ClassifierOverrides,
     ClassifierVerdict,
     build_key_index,
@@ -69,6 +72,7 @@ from ccs.diagnose.telemetry import (
     CURRENT_POLICY_VERSION,
     ConsentState,
     env_kill_switch_active,
+    load_consent,
     payload_for,
     payload_for_from_json,
     reset_token,
@@ -80,6 +84,14 @@ __all__ = ["main", "build_parser"]
 
 _DEFAULT_HTML_PATH = "diagnose_report.html"
 _DEFAULT_JSON_PATH = "diagnose_report.json"
+_MAX_INPUT_FILE_SIZE: int = 10 * 1024 * 1024
+"""Upper bound for ``--show-payload`` and ``--state-file`` reads.
+
+Both flags ultimately ``json.loads`` the file. 10 MB is comfortably above the
+realistic shape of either artefact (verdict + report or LangGraph initial
+state) while bounding worst-case memory if a user points the CLI at a
+multi-gigabyte file by accident.
+"""
 _DEFAULT_TOKEN_COST_PER_1K: float = 0.003
 """Placeholder cost per 1K tokens. Mirrors :func:`ccs.diagnose.detection.detect`.
 
@@ -91,6 +103,30 @@ the renderer footer surfaces the assumption so users can recalibrate.
 # -------------------------------------------------------------------- #
 # Argparse
 # -------------------------------------------------------------------- #
+
+
+def _finite_non_negative_float(value: str) -> float:
+    """argparse ``type=`` callable that rejects ``inf`` / ``nan`` / negatives.
+
+    Without this guard, downstream cost-extrapolation code multiplies the
+    flag by other quantities and surfaces ``OverflowError`` instead of a
+    clean argparse error.
+    """
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite, non-negative number; got {value!r}"
+        ) from exc
+    if not math.isfinite(result):
+        raise argparse.ArgumentTypeError(
+            f"expected a finite, non-negative number; got {value!r}"
+        )
+    if result < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative number; got {value!r}"
+        )
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -160,12 +196,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--volume",
-        type=float,
+        type=_finite_non_negative_float,
         default=None,
         metavar="N",
         help=(
             "Interactions per hour for cost extrapolation. When supplied,\n"
-            "the renderer surfaces an annualized rework-cost floor."
+            "the renderer surfaces an annualized rework-cost floor.\n"
+            "Must be a finite, non-negative number."
         ),
     )
     parser.add_argument(
@@ -287,8 +324,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--reset-token",
         action="store_true",
         help=(
-            "Unit 8 stub — reserved for the consent-flow update. v0 prints\n"
-            "a not-yet-implemented message and exits 0."
+            "Regenerate the local installation token in consent.json and "
+            "print the new UUID."
         ),
     )
 
@@ -297,6 +334,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``ccs-diagnose`` entry point. Returns the process exit code."""
+    # Restore the default SIGPIPE behaviour so piping into ``head`` etc. exits
+    # cleanly with status 141 instead of raising ``BrokenPipeError`` from the
+    # interpreter. Windows lacks SIGPIPE; the ``hasattr`` guard keeps the
+    # entrypoint portable.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
     parser = build_parser()
     args = parser.parse_args(argv)
     args.ignore_keys = _parse_csv(args.ignore)
@@ -316,10 +360,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_reset_token(args)
 
     if not args.graph:
-        parser.error(
-            "--graph is required (or use --show-payload PATH / --reset-token)"
+        # Match argparse's own format so the exit-code path is uniform
+        # across all error branches (each returns an int).
+        print(
+            f"{parser.prog}: error: --graph is required "
+            "(or use --show-payload PATH / --reset-token)",
+            file=sys.stderr,
         )
-        return 2  # parser.error raises SystemExit(2); kept for the type checker.
+        return 2
 
     return _run_pipeline(args)
 
@@ -338,6 +386,13 @@ def _run_show_payload(args: argparse.Namespace) -> int:
 
     payload_path = Path(args.show_payload)
     try:
+        if payload_path.stat().st_size > _MAX_INPUT_FILE_SIZE:
+            print(
+                f"error: --show-payload target {payload_path} exceeds "
+                f"{_MAX_INPUT_FILE_SIZE} bytes",
+                file=sys.stderr,
+            )
+            return 1
         loaded_text = payload_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         print(f"error: cannot read --show-payload target: {exc}", file=sys.stderr)
@@ -388,8 +443,6 @@ def _consent_for_show_payload() -> ConsentState:
     persisted consent file when present and at the current policy
     version; otherwise returns a denied state.
     """
-    from ccs.diagnose.telemetry import load_consent
-
     if env_kill_switch_active() is not None:
         return ConsentState(
             granted=False,
@@ -488,11 +541,12 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 — graph errors are user-domain
         # Surface a warning event into the callback buffer so the verdict
         # downgrades to insufficient with a clear ``reason``. The user still
-        # gets a (partial) report.
+        # gets a (partial) report. ``record_warning`` ALSO emits a Python
+        # warning, so we don't double-warn here.
         warning_text = (
             f"graph invoke failed: {type(exc).__name__}: {exc}"
         )
-        warnings.warn(warning_text, stacklevel=1)
+        callback.record_warning(warning_text)
         result = {}
 
     events = callback.events
@@ -540,30 +594,54 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         redact_keys=False,  # post-v0
     )
     output_html = Path(args.output_html)
-    render_html(
-        verdict=verdict,
-        report=report,
-        ownership=ownership,
-        output_path=output_html,
-        options=options,
-    )
+    html_written = True
+    try:
+        render_html(
+            verdict=verdict,
+            report=report,
+            ownership=ownership,
+            output_path=output_html,
+            options=options,
+        )
+    except OSError as exc:
+        html_written = False
+        print(
+            f"error: failed to write HTML report to {output_html}: {exc}",
+            file=sys.stderr,
+        )
 
     if not args.no_json:
         output_json = Path(args.output_json)
-        _write_report_json(verdict=verdict, report=report, path=output_json)
+        try:
+            _write_report_json(verdict=verdict, report=report, path=output_json)
+        except OSError as exc:
+            print(
+                f"error: failed to write JSON report to {output_json}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
 
     summary_text = terminal_summary(
         verdict=verdict, report=report, html_path=output_html
     )
-    print(summary_text)
+    if not html_written:
+        summary_text = (
+            "(HTML report missing — see error above for details.)\n\n"
+            + summary_text
+        )
+    # Route the dry-run JSON payload to stdout (machine-readable artefact)
+    # and the human summary to stderr so callers can pipe stdout straight
+    # into ``jq`` etc. without stripping. Non-dry-run keeps the historical
+    # behaviour (summary on stdout) so downstream tooling stays stable.
+    summary_stream = sys.stderr if args.dry_run else sys.stdout
+    print(summary_text, file=summary_stream)
 
-    # Trust-posture flag stubs.
     if args.dry_run:
         payload = payload_for(verdict, report, consent=consent)
-        print(
-            "\nwould submit (dry-run):\n"
-            + json.dumps(payload, indent=2, sort_keys=True, default=str)
-        )
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+    if html_written is False and args.no_json:
+        return 1
 
     if args.calibration_record is not None:
         # ``args.calibration_record`` is "" when the flag was passed without a
@@ -729,6 +807,13 @@ def _load_state_file(path: str | None) -> dict[str, Any] | None | _LoadError:
     state_path = Path(path)
     if not state_path.exists():
         return _LoadError(f"--state-file not found: {state_path}")
+    try:
+        if state_path.stat().st_size > _MAX_INPUT_FILE_SIZE:
+            return _LoadError(
+                f"--state-file {state_path} exceeds {_MAX_INPUT_FILE_SIZE} bytes"
+            )
+    except OSError as exc:
+        return _LoadError(f"--state-file stat error: {exc}")
     text = state_path.read_text(encoding="utf-8")
     suffix = state_path.suffix.lower()
     try:
@@ -850,6 +935,11 @@ def _check_writers_by_key_consistency(verdict: ClassifierVerdict) -> None:
     still get a report, but they're warned the classifier and the
     downstream stages may disagree.
     """
+    # Insufficient verdicts return empty ``writers_by_key`` by design (the
+    # short-circuit paths skip writer attribution). Skipping the consistency
+    # check avoids a guaranteed false positive on every short-circuit run.
+    if verdict.bucket is Bucket.INSUFFICIENT:
+        return
     expected = set(verdict.tracked_keys)
     actual = set(verdict.writers_by_key)
     missing = expected - actual
@@ -961,8 +1051,19 @@ def _verdict_to_dict(verdict: ClassifierVerdict) -> dict[str, Any]:
 
 
 def _report_to_dict(report: DetectionReport) -> dict[str, Any]:
-    return asdict(report)
+    raw = asdict(report)
+    # The wrapping payload already declares ``schema_version`` at the top
+    # level. Strip the nested copy so callers don't have to special-case
+    # which one to trust.
+    raw.pop("schema_version", None)
+    return raw
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # Mirror the conventional shell exit status for a SIGPIPE-killed
+        # process. Without this, piping into ``head`` etc. surfaces a
+        # spurious traceback at interpreter shutdown.
+        raise SystemExit(141) from None

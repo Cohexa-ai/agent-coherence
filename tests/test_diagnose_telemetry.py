@@ -314,6 +314,10 @@ def test_prompt_copy_lists_collected_and_not_collected() -> None:
     assert "agent names" in text.lower()
     assert "artifact names" in text.lower()
     assert "ip addresses" in text.lower()
+    # ``installation_token`` must be disclosed to satisfy the consent
+    # contract: it links multiple runs from a single machine.
+    assert "installation_token" in text
+    assert "--reset-token" in text
 
 
 # -------------------------------------------------------------------- #
