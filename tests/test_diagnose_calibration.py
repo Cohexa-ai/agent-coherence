@@ -722,13 +722,21 @@ def test_cli_do_not_track_forces_skip_even_with_calibration(
 
 
 # -------------------------------------------------------------------- #
-# README documentation
+# ccs-diagnose CLI documentation
 # -------------------------------------------------------------------- #
 
 
-def test_readme_has_calibration_section() -> None:
-    readme = Path(__file__).resolve().parent.parent / "README.md"
-    text = readme.read_text(encoding="utf-8")
+def test_ccs_diagnose_doc_has_calibration_section() -> None:
+    """The dedicated ccs-diagnose CLI reference at docs/ccs-diagnose.md
+    must document the calibration corpus, the --calibration-record flag,
+    validate_log compatibility, and the v0-preview -> v1 promotion gate.
+
+    Previously inline in README.md; relocated to a dedicated doc during the
+    v0.7 README groom so the README stays product-focused. README now
+    surfaces this content via a TOC pointer at docs/ccs-diagnose.md.
+    """
+    doc = Path(__file__).resolve().parent.parent / "docs" / "ccs-diagnose.md"
+    text = doc.read_text(encoding="utf-8")
     assert "## Calibration corpus" in text
     assert "--calibration-record" in text
     assert "calibration.jsonl" in text
