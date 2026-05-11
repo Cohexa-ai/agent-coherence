@@ -50,11 +50,20 @@ __all__ = [
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One automated-check outcome — name, pass/fail, human-readable detail."""
+    """One automated-check outcome.
+
+    ``ok=True``  → check passed.
+    ``ok=False`` → check failed (hard block on the release path).
+    ``ok=True``  + ``skipped=True`` → check could not be verified from this
+        execution context (e.g. CI's ``GITHUB_TOKEN`` lacks the scope to
+        read branch protection rules); operators must verify manually with
+        a PAT. Treated as a warning, not a release blocker.
+    """
 
     name: str
     ok: bool
     detail: str
+    skipped: bool = False
 
 
 def _gh_api(path: str) -> tuple[int, str, str]:
@@ -106,18 +115,39 @@ def check_branch_protection(owner: str, repo: str, branch: str) -> CheckResult:
     A 200 response means *some* protection is in place. The script does
     not assert on the rule shape because GitHub returns different
     fields by plan tier (free / team / enterprise).
+
+    The ``repos/{owner}/{repo}/branches/{branch}/protection`` endpoint
+    requires admin scope. GitHub Actions' default ``GITHUB_TOKEN``
+    cannot reach it and returns ``HTTP 403: Resource not accessible by
+    integration`` — that is a CI-context limitation, not a real
+    configuration failure. We treat 403 as ``skipped`` (warning) so a
+    CI preflight run does not fail-closed when the actual protection
+    rules are in place but unreadable from this token.
     """
+    name = f"Branch protection on '{branch}'"
     rc, _, err = _gh_api(f"repos/{owner}/{repo}/branches/{branch}/protection")
     if rc == 0:
         return CheckResult(
-            name=f"Branch protection on '{branch}'",
+            name=name,
             ok=True,
             detail="protection rules retrieved successfully",
         )
+    err_text = err.strip()
+    # gh exits non-zero on 403; the stderr contains the HTTP code and message.
+    if "403" in err_text and "Resource not accessible by integration" in err_text:
+        return CheckResult(
+            name=name,
+            ok=True,
+            skipped=True,
+            detail=(
+                "could not verify from CI (GITHUB_TOKEN lacks admin scope); "
+                "verify locally with `ccs-check-release` before tag push"
+            ),
+        )
     return CheckResult(
-        name=f"Branch protection on '{branch}'",
+        name=name,
         ok=False,
-        detail=err.strip() or f"gh api returned {rc}",
+        detail=err_text or f"gh api returned {rc}",
     )
 
 
@@ -223,7 +253,12 @@ def format_report(results: Sequence[CheckResult]) -> str:
     lines = ["Automated release-readiness checks:", ""]
     width = max((len(r.name) for r in results), default=0)
     for r in results:
-        status = "PASS" if r.ok else "FAIL"
+        if r.skipped:
+            status = "WARN"
+        elif r.ok:
+            status = "PASS"
+        else:
+            status = "FAIL"
         lines.append(f"  [{status}] {r.name:<{width}}  {r.detail}")
     lines.append("")
     lines.append("Manual verification still required (cannot be automated):")
