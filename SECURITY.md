@@ -95,7 +95,7 @@ example of a malicious release published under a trusted name. Our mitigations:
 | Threat | Control | Status |
 |---|---|---|
 | Stolen/leaked maintainer PyPI token | PyPI Trusted Publishers via OIDC — no static token exists to steal | Workflow shipped; PyPI-side setup pending |
-| Hijacked maintainer GitHub account | Required PR review on `.github/workflows/release.yml`; tag-protection on `v*` | **Manual:** repo-settings step |
+| Hijacked maintainer GitHub account | Required PR review on `.github/workflows/release.yml`; ruleset protecting `refs/tags/v*` (admin-only bypass) | **Manual:** repo-settings step |
 | Typosquat package install | Reserve obvious typo variants (`agent-coherance`, `agentcoherence`, `agent_coherence`, `ccs-diagnose`, `ccsdiagnose`) under same publisher | **Manual:** PyPI-side step |
 | Dependency-confusion attack via `--extra-index-url` | Canonical install command documented; no private mirror references | Documented |
 | Unverified release tampering | PEP 740 attestations + SBOM | Workflow shipped |
@@ -131,7 +131,7 @@ project cannot publish.
 | PyPI Trusted Publishers | `gh api repos/{owner}/{repo}/environments/pypi` returns 200 | Publish step in `release.yml` falls back to anonymous OIDC and fails — but only after the build artefact is already in transit |
 | GitHub `pypi` environment | Same call confirms required reviewers are set | Anyone with workflow-write access could trigger an unreviewed publish |
 | Branch protection on `main` | `gh api repos/{owner}/{repo}/branches/main/protection` returns 200 with PR review required | Malicious workflow changes can land without review |
-| Tag protection on `v*` | `gh api repos/{owner}/{repo}/tags/protection` covers `v*` | Anyone with push access can cut an arbitrary release |
+| Tag protection on `v*` | An active tag ruleset (`gh api repos/{owner}/{repo}/rulesets`) includes `refs/tags/v*` in its conditions | Anyone with push access can cut an arbitrary release |
 
 ### Manual verification (cannot be automated)
 
