@@ -1,0 +1,567 @@
+{% macro render_ownership_table(rows) -%}
+<table>
+  <thead>
+    <tr>
+      <th>artifact_key</th>
+      <th>writers (agent &middot; writes)</th>
+      <th>readers (agent &middot; reads)</th>
+      <th>versions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr class="{% if row.writers|length >= 2 %}multi-writer{% endif %}">
+        <td data-label="artifact_key">
+          <code>{{ row.artifact_key }}</code>
+          {% if row.append_only %}<span class="tag tag-append-only">append-only</span>{% endif %}
+        </td>
+        <td data-label="writers">
+          {% if row.writers %}
+            {% for agent, count in row.writers %}{{ agent }} ({{ count }}){% if not loop.last %}, {% endif %}{% endfor %}
+          {% else %}
+            <span class="note">none observed</span>
+          {% endif %}
+        </td>
+        <td data-label="readers">
+          {% if row.readers %}
+            {% for agent, count in row.readers %}{{ agent }} ({{ count }}){% if not loop.last %}, {% endif %}{% endfor %}
+          {% else %}
+            <span class="note">none observed</span>
+          {% endif %}
+        </td>
+        <td data-label="versions"><code>{{ row.version_range }}</code></td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{%- endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccs-diagnose v0-preview report</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --fg: #1a1f24;
+  --muted: #5a6470;
+  --line: #d4dce3;
+  --panel: #f7f9fb;
+  --accent: #1f6feb;
+  --warn-bg: #fff8e6;
+  --warn-line: #e6c46e;
+  --multi-bg: #fff1ed;
+  --multi-line: #ed7c5c;
+  --code-bg: #f0f3f7;
+  --kpi-bg: #eef4fb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.5;
+  font-size: 15px;
+}
+.wrap {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 32px 20px 60px;
+}
+h1 {
+  font-size: 26px;
+  margin: 0 0 6px;
+  line-height: 1.2;
+}
+h2 {
+  font-size: 18px;
+  margin: 28px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+h3 {
+  font-size: 15px;
+  margin: 18px 0 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+p { margin: 8px 0; }
+ul, ol { margin: 8px 0 8px 22px; padding: 0; }
+li { margin: 3px 0; }
+code, .mono, .timeline {
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 13px;
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.subtitle {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 14px;
+}
+.kpi {
+  background: var(--kpi-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 12px 0 18px;
+}
+.kpi-value {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+.kpi-detail {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin: 8px 0;
+}
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: var(--panel);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--muted);
+}
+.multi-writer {
+  background: var(--multi-bg);
+}
+.multi-writer td:first-child {
+  border-left: 3px solid var(--multi-line);
+}
+.bar {
+  display: inline-block;
+  height: 8px;
+  background: var(--accent);
+  border-radius: 2px;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.note {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 6px 0;
+}
+.callout {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 10px 0;
+  font-size: 14px;
+}
+.timeline {
+  display: block;
+  background: var(--code-bg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.timeline-row { margin: 0; }
+.cta {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 18px 0;
+}
+.cta a {
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+.cta a:hover { text-decoration: underline; }
+.button-link {
+  display: inline-block;
+  margin: 8px 0;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font-weight: 500;
+}
+.footer {
+  margin-top: 36px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+details {
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: var(--panel);
+}
+details summary {
+  cursor: pointer;
+  font-weight: 500;
+  color: var(--muted);
+}
+details[open] summary { margin-bottom: 8px; }
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--code-bg);
+  color: var(--muted);
+  margin-left: 4px;
+}
+.tag-append-only {
+  background: #e7f3ec;
+  color: #1f6e3a;
+}
+@media (max-width: 600px) {
+  .wrap { padding: 18px 12px 40px; }
+  h1 { font-size: 22px; }
+  table, thead, tbody, th, td, tr { display: block; }
+  thead { display: none; }
+  tr {
+    border-bottom: 1px solid var(--line);
+    padding: 6px 0;
+  }
+  td { border: none; padding: 3px 0; }
+  td::before {
+    content: attr(data-label) ": ";
+    color: var(--muted);
+    font-size: 12px;
+  }
+}
+@media print {
+  body { background: white; }
+  .wrap { max-width: none; padding: 0; }
+  details { break-inside: avoid; }
+  details > * { display: block; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+{# ============================================================ #}
+{# Section 1 - Headline                                          #}
+{# ============================================================ #}
+<h1>{{ headline_label }}</h1>
+<p class="subtitle">{{ headline_subtitle }}</p>
+
+{% if is_insufficient %}
+  <div class="kpi">
+    <p class="kpi-value">Run was too short to classify</p>
+    <p class="kpi-detail">{{ verdict_reason }}</p>
+  </div>
+{% else %}
+  {% if secondary_kpi_kind == "cost" %}
+    {% if cost_unmeasurable_reason %}
+      <div class="kpi">
+        <p class="kpi-value">Rework cost: unmeasurable</p>
+        <p class="kpi-detail">{{ cost_unmeasurable_message }}</p>
+      </div>
+    {% else %}
+      <div class="kpi">
+        <p class="kpi-value">Rework cost (annualized): {{ rework_cost_annualized_str }}</p>
+        <p class="kpi-detail">
+          floor &mdash; does not include broadcast rebroadcasting or redundant fetches.
+          Based on {{ rework_tokens_this_run }} tokens this run.
+        </p>
+      </div>
+    {% endif %}
+  {% else %}
+    <div class="kpi">
+      <p class="kpi-value">{{ headline_event_count }} divergence event{{ '' if headline_event_count == 1 else 's' }} affecting {{ agent_pain_count }} node{{ '' if agent_pain_count == 1 else 's' }}</p>
+      <p class="kpi-detail">
+        agent_pain_count: distinct later_read.node values across headline events.
+      </p>
+    </div>
+  {% endif %}
+{% endif %}
+
+{% if not is_insufficient %}
+
+{# ============================================================ #}
+{# Section 2 - Above-the-fold panel                              #}
+{# ============================================================ #}
+<h2>{% if has_events %}The Event That Matters Most{% else %}Artifact Ownership Map{% endif %}</h2>
+
+{% if has_events and top_event %}
+  <p class="note">
+    Forensic mini-timeline of the highest-impact divergence event.
+    Field names follow ReadObservation semantics &mdash; runtime "handed" the node
+    a value at this version, not "node read" attribution.
+  </p>
+  <div class="timeline">
+<p class="timeline-row">artifact_key:        {{ top_event.artifact_key }}</p>
+<p class="timeline-row">earlier_read:        node={{ top_event.earlier_read.node }} tick={{ top_event.earlier_read.tick }} version={{ top_event.earlier_read.version }}</p>
+<p class="timeline-row">later_read:          node={{ top_event.later_read.node }} tick={{ top_event.later_read.tick }} version={{ top_event.later_read.version }}</p>
+{% if top_event.canonical_writer %}
+<p class="timeline-row">canonical_writer:    {{ top_event.canonical_writer }} (tick {{ top_event.canonical_writer_tick }}) &mdash; most recent observed writer at later_read.tick</p>
+{% endif %}
+{% if top_event.is_sequential_staleness %}
+<p class="timeline-row">classification:      sequential_staleness (promoted to headline by --strict)</p>
+{% endif %}
+  </div>
+{% else %}
+  <p class="note">
+    No headline divergence events were observed. The map below shows every
+    tracked artifact's writers and readers as observed during the run.
+    Multi-writer rows are highlighted &mdash; these are the shared_artifact shape
+    at the artifact level even when no individual divergence event was caught.
+  </p>
+  {{ render_ownership_table(ownership) }}
+{% endif %}
+
+{# ============================================================ #}
+{# Section 3 - Per-Artifact Heatmap                              #}
+{# ============================================================ #}
+{% if show_heatmap %}
+<h2>Per-Artifact Heatmap</h2>
+<table>
+  <thead>
+    <tr>
+      <th>artifact_key</th>
+      <th>divergent_reads</th>
+      <th>total_reads</th>
+      <th>share</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in heatmap_rows %}
+      <tr>
+        <td data-label="artifact_key"><code>{{ row.artifact_key }}</code></td>
+        <td data-label="divergent_reads">{{ row.divergent_reads }}</td>
+        <td data-label="total_reads">{{ row.total_reads }}</td>
+        <td data-label="share">
+          {% set pct = (row.divergent_reads * 100 / row.total_reads) if row.total_reads > 0 else 0 %}
+          <span class="bar" style="width: {{ pct|round(0, 'floor')|int }}%"></span>
+          {{ pct|round(1) }}%
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if show_ownership_appendix %}
+<details>
+  <summary>All tracked artifacts (Ownership Map appendix &mdash; single-writer rows shown for completeness)</summary>
+  {{ render_ownership_table(ownership) }}
+</details>
+{% endif %}
+
+{% endif %}
+
+{# ============================================================ #}
+{# Section 4 - Reader-Pair Matrix                                #}
+{# ============================================================ #}
+{% if show_reader_pairs %}
+<h2>Reader-Pair Matrix</h2>
+<p class="note">
+  Top (earlier_read.node, later_read.node) pairs by headline divergence
+  event count. Pair semantics are observation-only &mdash; both nodes were
+  *handed* the artifact at different versions; whether they read it is
+  unobservable.
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>earlier_reader</th>
+      <th>later_reader</th>
+      <th>events</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for pair in reader_pairs %}
+      <tr>
+        <td data-label="earlier_reader">{{ pair.earlier_reader }}</td>
+        <td data-label="later_reader">{{ pair.later_reader }}</td>
+        <td data-label="events">{{ pair.event_count }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# ============================================================ #}
+{# Section 5 - Excluded panel                                    #}
+{# ============================================================ #}
+{% if show_excluded %}
+<h2>What We Excluded</h2>
+<div class="panel">
+  <ul>
+    <li>sequential_staleness: {{ exclusion_panel.sequential_staleness_count }}
+      <span class="note">(read came &gt;=2 ticks after a prior write with at least one intervening write &mdash; often expected)</span>
+    </li>
+    <li>cold_start: {{ exclusion_panel.cold_start_count }}
+      <span class="note">(later_read is the first observation; nothing to be stale against)</span>
+    </li>
+    <li>append_only_skip: {{ exclusion_panel.append_only_skip_count }}
+      <span class="note">(messages / *_log / *_history candidate pairs skipped &mdash; version churn expected)</span>
+    </li>
+  </ul>
+  {% if (not strict_mode) and exclusion_panel.sequential_staleness_count > 0 %}
+    <p class="note">
+      Re-run with <code>--strict</code> to promote sequential_staleness
+      exclusions back into the headline count.
+    </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endif %} {# /not is_insufficient #}
+
+{# ============================================================ #}
+{# Section 6 - Tracked Artifacts (Transparency Panel)            #}
+{# ============================================================ #}
+<h2>Tracked Artifacts (Transparency Panel)</h2>
+<div class="panel">
+  <p>
+    Tracked: {{ tracked_keys|length }}
+    &middot; Ignored: {{ ignored_framework_keys|length + ignored_ephemera_keys|length }}
+    ({{ ignored_framework_keys|length }} framework, {{ ignored_ephemera_keys|length }} ephemera)
+    &middot; Append-only: {{ append_only_keys|length }}
+    &middot; Mutable: {{ mutable_keys|length }}
+  </p>
+  {% if tracked_keys %}
+    <h3>tracked</h3>
+    <p>{% for key in tracked_keys %}<code>{{ key }}</code>{% if not loop.last %} {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% if append_only_keys %}
+    <h3>append-only</h3>
+    <p>{% for key in append_only_keys %}<code>{{ key }}</code><span class="tag tag-append-only">append-only</span>{% if not loop.last %} {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% if ignored_framework_keys %}
+    <h3>ignored &mdash; framework</h3>
+    <p>{% for key in ignored_framework_keys %}<code>{{ key }}</code>{% if not loop.last %} {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% if ignored_ephemera_keys %}
+    <h3>ignored &mdash; ephemera</h3>
+    <p>{% for key in ignored_ephemera_keys %}<code>{{ key }}</code>{% if not loop.last %} {% endif %}{% endfor %}</p>
+  {% endif %}
+</div>
+
+{% if unknown_underscore_keys %}
+<div class="callout">
+  <strong>Staleness sensor:</strong> the run surfaced
+  {{ unknown_underscore_keys|length }} unknown <code>__</code>-prefixed
+  key{{ '' if unknown_underscore_keys|length == 1 else 's' }} not in the
+  v0-preview framework allow-list. v0 ignores them safely; the
+  calibration corpus tracks them so future versions add explicit handling.
+  <p>Detected:
+    {% for key in unknown_underscore_keys %}<code>{{ key }}</code>{% if not loop.last %} {% endif %}{% endfor %}
+  </p>
+</div>
+{% endif %}
+
+{# ============================================================ #}
+{# Section 7 - Coverage                                          #}
+{# ============================================================ #}
+<h2>Coverage</h2>
+<div class="panel">
+  <p>
+    {{ coverage.tick_count }} turns
+    &middot; {{ coverage.read_count }} reads
+    &middot; {{ coverage.write_count }} writes
+    &middot; {{ coverage.artifact_count }} artifacts
+    &middot; {{ confidence_label }} confidence
+  </p>
+  <p class="note">
+    Thresholds for high confidence:
+    tick_count &gt;= {{ coverage_thresholds.tick_count }},
+    read_count &gt;= {{ coverage_thresholds.read_count }},
+    write_count &gt;= {{ coverage_thresholds.write_count }}.
+  </p>
+</div>
+
+{# ============================================================ #}
+{# Section 8 - What This Report Does NOT Measure (mandatory)     #}
+{# ============================================================ #}
+<h2>What This Report Does NOT Measure</h2>
+<div class="panel">
+  <ul>
+    {% for line in copy_does_not_measure %}
+      <li>{{ line }}</li>
+    {% endfor %}
+  </ul>
+</div>
+
+{# ============================================================ #}
+{# Section 9 - What This Report Cannot Tell You (mandatory)      #}
+{# ============================================================ #}
+<h2>What This Report Cannot Tell You</h2>
+<div class="panel">
+  <ul>
+    {% for line in copy_cannot_tell_you %}
+      <li>{{ line }}</li>
+    {% endfor %}
+  </ul>
+</div>
+
+{# ============================================================ #}
+{# Section 10 - CTA (variant-selected)                           #}
+{# ============================================================ #}
+<h2>Next Step</h2>
+<div class="cta">
+  {% if cta_variant == "warm_lead" %}
+    <p>For our call, two questions I'd love your read on:</p>
+    <ol>
+      <li>{{ warm_lead_questions[0] }}</li>
+      <li>{{ warm_lead_questions[1] }}</li>
+    </ol>
+  {% elif cta_variant == "cold_lead" %}
+    <p><strong>30-min walk-through</strong> &mdash; I'll trace your top-3 divergence events live.</p>
+    <p><a class="button-link" href="{{ book_a_call_url }}">Book a 30-min call</a></p>
+    <p class="note">{{ soft_ask_message }}</p>
+    <p>Or reply to <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>.</p>
+  {% elif cta_variant == "forward_looking" %}
+    <p>Zero divergence events in this run. If any of these are on your roadmap, the conversation is worth having before you build:</p>
+    <ol>
+      {% for trigger in upgrade_triggers %}
+        <li>{{ trigger }}</li>
+      {% endfor %}
+    </ol>
+    <p><a class="button-link" href="{{ book_a_call_url }}">Book a 30-min call</a></p>
+    <p class="note">{{ soft_ask_message }}</p>
+  {% else %} {# insufficient #}
+    <p>Run was too short to classify &mdash; coverage shape:
+      {{ coverage.tick_count }} ticks
+      / {{ coverage.read_count }} reads
+      / {{ coverage.write_count }} writes.
+      Re-run on a longer workload, or schedule a 15-min call to discuss
+      what shape would tell us something:
+      <a href="{{ book_a_call_url }}">{{ book_a_call_url }}</a>.
+    </p>
+  {% endif %}
+</div>
+
+<div class="footer">
+  Generated by ccs-diagnose &middot; schema: <code>{{ schema_version }}</code>
+  &middot; <a href="https://github.com/hipvlady/agent-coherence">github.com/hipvlady/agent-coherence</a>
+</div>
+
+</div>
+</body>
+</html>

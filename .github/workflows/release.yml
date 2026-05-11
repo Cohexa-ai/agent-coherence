@@ -1,0 +1,170 @@
+# Release workflow: PyPI Trusted Publishers OIDC + PEP 740 attestations + CycloneDX SBOM.
+#
+# This workflow uses PyPI Trusted Publishers OIDC. End-user trust contract in
+# docs/security.md. Maintainer-side pre-release verification gate is documented
+# in the local-only SECURITY.md at the repo root.
+# Until Trusted Publishers is configured on the PyPI side, the publish step will fail
+# by design (fail-closed): we never embed long-lived API tokens in repo secrets.
+#
+# Triggers on tag push matching v*. The tag itself is the publish trigger; this file
+# landing in the repo does not publish anything.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  preflight:
+    name: Release-readiness preflight
+    runs-on: ubuntu-latest
+
+    # ``gh api`` calls into the same repo for environment / branch /
+    # tag protection lookups. ``contents: read`` is enough; the
+    # default ``GITHUB_TOKEN`` is auto-exposed to ``gh``.
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify release-readiness configuration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python tools/check_release_readiness.py
+
+  build:
+    name: Build distribution and SBOM
+    runs-on: ubuntu-latest
+    needs: [preflight]
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          package_init = Path("src/ccs/__init__.py").read_text()
+          version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', package_init, re.MULTILINE)
+          if version_match is None:
+              raise SystemExit("Could not find __version__ in src/ccs/__init__.py")
+
+          version = version_match.group(1)
+          release_tag = os.environ["RELEASE_TAG"]
+          expected_tag = f"v{version}"
+          if release_tag != expected_tag:
+              raise SystemExit(
+                  f"Release tag {release_tag} does not match package version {version} "
+                  f"(expected {expected_tag})"
+              )
+          print(f"Release tag {release_tag} matches package version {version}")
+          PY
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine cyclonedx-bom
+
+      - name: Build distribution artifacts
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          python -m pip install -e ".[diagnose]"
+          cyclonedx-py environment > sbom.cyclonedx.json
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: python-package
+          path: dist/
+          retention-days: 30
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 30
+
+  publish:
+    name: Publish to PyPI with attestations
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: pypi
+
+    # id-token: write enables OIDC token generation for PyPI Trusted Publishers and
+    # PEP 740 attestations. No long-lived PyPI API secret is referenced anywhere
+    # in this file.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Publish to PyPI (Trusted Publishers OIDC + PEP 740 attestations)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
+        with:
+          attestations: true
+
+  github-release:
+    name: Create GitHub Release with SBOM
+    runs-on: ubuntu-latest
+    needs: [publish]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Download SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: sbom
+          path: sbom/
+
+      - name: Create GitHub release with wheel, sdist, and SBOM
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: |
+            dist/*
+            sbom/sbom.cyclonedx.json
+          generate_release_notes: true

@@ -1,10 +1,18 @@
-# CCSStore User Guide
+# agent-coherence User Guide
 
 When two agents share state, one of them is usually reading a stale copy.
 This guide shows how to drop in `agent-coherence` — surfacing those reads
 and serving fresh artifacts on demand, with a one-line import change.
+
+`agent-coherence` is **vendor-neutral by design**: the same protocol and
+the same library work across LangGraph, CrewAI, AutoGen, and any custom
+orchestrator, with any model provider (Anthropic, OpenAI, Google, Mistral,
+open-source). Pick the integration extra that matches your stack; the
+concepts below apply uniformly.
+
 Below: installation, namespace convention, sync strategies, observability,
-telemetry, graceful degradation, examples, and the API reference.
+telemetry, graceful degradation, examples, the `ccs-diagnose` CLI, the
+full command-line toolset, and the API reference.
 
 ---
 
@@ -24,16 +32,27 @@ telemetry, graceful degradation, examples, and the API reference.
 12. [Examples](#examples)
 13. [Real-workload benchmarks](#real-workload-benchmarks)
 14. [Benchmarking your own workload](#benchmarking-your-own-workload)
-15. [API reference](#api-reference)
-16. [Low-level adapter API](#low-level-adapter-api)
+15. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+16. [Command-line tools](#command-line-tools)
+17. [API reference](#api-reference)
+18. [Low-level adapter API](#low-level-adapter-api)
+19. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
 
 ---
 
 ## Installation
 
+Pick the integration extra that matches your stack. The library is the same across all of them — only the adapter surface changes.
+
 ```bash
-# Core — LangGraph adapter only
+# LangGraph (drop-in CCSStore)
 pip install "agent-coherence[langgraph]"
+
+# CrewAI adapter
+pip install "agent-coherence[crewai]"
+
+# ccs-diagnose CLI (stale-read detector for LangGraph graphs)
+pip install "agent-coherence[diagnose]"
 
 # With OpenTelemetry metrics
 pip install "agent-coherence[langgraph,otel]"
@@ -41,9 +60,11 @@ pip install "agent-coherence[langgraph,otel]"
 # With LangSmith tracing
 pip install "agent-coherence[langgraph,langsmith]"
 
-# Everything
+# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose)
 pip install "agent-coherence[all]"
 ```
+
+For security-sensitive installs with full transitive hash pinning, see [SECURITY.md](SECURITY.md#hash-pinned-install-for-security-sensitive-users) and the bundled `requirements-diagnose.txt`.
 
 ---
 
@@ -587,7 +608,7 @@ invalidations, more misses. The planning workload has 1 write and 12 reads (75% 
 rate). The high-churn workload has 4 writes and 8 reads (50% hit rate).
 
 For the simulation-based results from the paper (84–95% savings), see
-[reproduce.md](reproduce.md).
+[REPRODUCE.md](REPRODUCE.md).
 
 ---
 
@@ -616,6 +637,64 @@ ccs-benchmark --graph my_graph.py:build_graph --initial-state '{"query": "hello"
 
 The CLI runs the graph once and prints `print_benchmark_summary()` output. For
 inline benchmarking without the CLI, see [Inline benchmark mode](#inline-benchmark-mode).
+
+---
+
+## `ccs-diagnose` — detect stale reads
+
+A standalone CLI for detecting divergent reads in an existing LangGraph graph without changing any code. Passive callback, zero outbound network in v0, HTML + JSON reports. Install with `pip install "agent-coherence[diagnose]"`.
+
+See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags, exit codes, trust posture, calibration corpus, and the `langgraph-v0-preview` → `v1` promotion gate.
+
+---
+
+## Command-line tools
+
+All bundled CLIs are installed as console scripts when you
+`pip install agent-coherence`.
+
+| Command | Extra needed | What it does |
+|---|---|---|
+| `ccs-diagnose` | `[diagnose]` | Detect stale reads / divergent versions in a LangGraph graph |
+| `ccs-benchmark` | `[langgraph,benchmark]` | Measure token savings of `CCSStore` on your own LangGraph graph |
+| `ccs-simulate` | — | Run a protocol-only simulation scenario from a YAML file |
+| `ccs-compare` | — | Compare two or more strategies on the same scenario |
+| `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
+| `ccs-check-release` | — | Verify PyPI Trusted Publishers + branch/tag protection before a `v*` tag push |
+
+Run any command with `--help` for the full option list.
+
+### `ccs-simulate` and `ccs-compare`
+
+```bash
+# Run a single strategy against a YAML scenario
+ccs-simulate --scenario benchmarks/scenarios/planning_canonical.yaml --strategy lazy
+
+# Compare two or more strategies on the same scenario
+ccs-compare --scenario benchmarks/scenarios/planning_canonical.yaml --strategies eager lazy
+```
+
+YAML scenarios in `benchmarks/scenarios/` define a deterministic workload
+(agent count, artifacts, write probability, network latency/loss, strategy
+config). Output is a `StrategyComparisonReport` printed to stdout — useful
+when you want protocol-only numbers without spinning up a real LangGraph
+graph. See [REPRODUCE.md](REPRODUCE.md) for the simulation methodology behind
+the paper's headline numbers.
+
+### `ccs-check-architecture` and `ccs-check-release`
+
+```bash
+# Architecture boundary check — fails non-zero if any layer imports upward
+ccs-check-architecture
+
+# Pre-release verification — fails non-zero if PyPI Trusted Publishers,
+# branch protection on main, or v* tag protection are missing
+ccs-check-release
+```
+
+Both are designed for CI gating. `ccs-check-architecture` runs on every push;
+`ccs-check-release` runs as a preflight job before any wheel is built for a
+`v*` tag.
 
 ---
 
@@ -687,3 +766,66 @@ The same pattern applies to `CrewAIAdapter` and `AutoGenAdapter` — all accept
 `crash_recovery=` and expose `core.heartbeat()` / `core.recover()`.
 
 Full example: [`examples/multi_agent_planning.py`](../examples/multi_agent_planning.py).
+
+---
+
+## CrewAI and AutoGen adapters
+
+The protocol is framework-agnostic; only the adapter surface changes. Both
+adapters share the same `register_agent`, `register_artifact`, `before_node`,
+`commit_outputs`, `heartbeat`, and `recover` API as `LangGraphAdapter`.
+
+### CrewAI
+
+```bash
+pip install "agent-coherence[crewai]"
+```
+
+```python
+from ccs.adapters.crewai import CrewAIAdapter
+from ccs.coordinator.service import CrashRecoveryConfig
+
+adapter = CrewAIAdapter(
+    strategy_name="lazy",
+    crash_recovery=CrashRecoveryConfig(enabled=False),
+)
+for name in ("researcher", "writer", "editor"):
+    adapter.register_agent(name, now_tick=0)
+brief = adapter.register_artifact(name="brief.md", content="initial brief")
+
+# Read shared state at task start
+ctx = adapter.before_node(agent_name="researcher", artifact_ids=[brief.id], now_tick=1)
+
+# Write task output back
+adapter.commit_outputs(
+    agent_name="researcher",
+    writes={brief.id: ctx[brief.id]["content"] + "\nfindings: ..."},
+    now_tick=2,
+)
+```
+
+### AutoGen
+
+```bash
+pip install "agent-coherence[autogen]"
+```
+
+```python
+from ccs.adapters.autogen import AutoGenAdapter
+
+adapter = AutoGenAdapter(strategy_name="lazy")
+# Same register_agent / register_artifact / before_node / commit_outputs surface.
+```
+
+### Custom orchestrators
+
+```python
+from ccs.adapters.base import CoherenceAdapterCore
+
+adapter = CoherenceAdapterCore(strategy_name="lazy")
+# Same surface. Wrap whatever framework you're using and call before_node /
+# commit_outputs at the natural boundaries (typically: before a tool call or
+# LLM step, and after the step produces new state).
+```
+
+Crash recovery (`heartbeat` / `recover`) is identical across all four adapters.

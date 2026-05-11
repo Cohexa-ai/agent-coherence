@@ -12,7 +12,7 @@ Results in [Token Coherence: Adapting MESI Cache Protocols to Minimize Synchroni
 ```bash
 git clone https://github.com/hipvlady/agent-coherence
 cd agent-coherence
-bash reproduce.sh
+bash scripts/reproduce.sh
 ```
 
 ## Output files
@@ -32,7 +32,7 @@ bash reproduce.sh
 
 `benchmarks/results/step5/` contains the committed canonical baseline (see `generated_on` in `SUMMARY.md` / `manifest.json`; 10 runs per strategy, `eager` + `lazy`).
 
-`reproduce.sh` re-runs all scenarios and verifies output against `SUMMARY.md` within ±0.5% tolerance using `tools/verify_baseline.py`.
+`scripts/reproduce.sh` re-runs all scenarios and verifies output against `SUMMARY.md` within ±0.5% tolerance using `tools/verify_baseline.py`.
 
 ## Simulation scope
 
