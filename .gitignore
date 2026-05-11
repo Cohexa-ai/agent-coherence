@@ -9,6 +9,7 @@ docs/*
 !docs/agent-coherence-approach.md
 !docs/REPRODUCE.md
 !docs/SECURITY.md
+!docs/ccs-diagnose.md
 
 states/
 __pycache__/

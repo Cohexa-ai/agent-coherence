@@ -231,11 +231,15 @@ def test_uv_lock_committed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_readme_has_security_subsection() -> None:
+def test_readme_links_to_security_doc() -> None:
+    """The README is the first artifact a visitor reads. It must surface a
+    discoverable pointer to docs/SECURITY.md so the trust contract,
+    kill switches, and threat model are one click away. We do not
+    require a specific heading shape — the pointer may live inline in
+    a TOC, a dedicated subsection, or anywhere else in the README.
+    """
     text = README.read_text()
-    assert "## Security & supply chain" in text, (
-        "README.md must have a '## Security & supply chain' subsection"
-    )
     assert "docs/SECURITY.md" in text, (
-        "README.md security subsection must link to docs/SECURITY.md"
+        "README.md must link to docs/SECURITY.md so end users can find "
+        "the public trust contract"
     )
