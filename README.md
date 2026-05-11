@@ -134,7 +134,7 @@ Savings scale with read/write ratio:
 | Code review (moderate) | 3 | 8:3 | 60% | 5,320 | 2,835 | **47%** |
 | High-churn (write-heavy) | 4 | 8:4 | 50% | 3,250 | 2,317 | **29%** |
 
-For protocol-only simulation methodology, see [REPRODUCE.md](REPRODUCE.md).
+For protocol-only simulation methodology, see [docs/reproduce.md](docs/reproduce.md).
 
 ### Benchmark your own workload
 

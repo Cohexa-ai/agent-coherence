@@ -587,7 +587,7 @@ invalidations, more misses. The planning workload has 1 write and 12 reads (75% 
 rate). The high-churn workload has 4 writes and 8 reads (50% hit rate).
 
 For the simulation-based results from the paper (84–95% savings), see
-[REPRODUCE.md](../REPRODUCE.md).
+[reproduce.md](reproduce.md).
 
 ---
 
