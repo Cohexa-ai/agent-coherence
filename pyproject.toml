@@ -25,9 +25,13 @@ dependencies = ["pyyaml>=6.0"]
 ccs-simulate = "ccs.cli.simulate:main"
 ccs-compare = "ccs.cli.compare:main"
 ccs-check-architecture = "ccs.hardening.architecture:main"
-ccs-check-release = "ccs.hardening.release_readiness:main"
 ccs-benchmark = "ccs.cli.benchmark:main"
 ccs-diagnose = "ccs.cli.diagnose:main"
+# Note: ccs-check-release is intentionally NOT exposed as a public console
+# script. It's a maintainer-only pre-tag-push verifier that queries this
+# repo's GitHub admin settings (hardcoded defaults to hipvlady/agent-coherence).
+# End users have no use case. CI invokes it directly via
+# `python tools/check_release_readiness.py`. Maintainers run the same path.
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
