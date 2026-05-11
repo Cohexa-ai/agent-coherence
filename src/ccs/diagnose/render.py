@@ -71,9 +71,9 @@ __all__ = [
 
 DEFAULT_BOOK_A_CALL_URL: str = os.environ.get(
     "CCS_DIAGNOSE_BOOK_A_CALL_URL",
-    "https://cal.com/agent-coherence/diagnose",
+    "https://cal.com/agent-coherence",
 )
-"""Placeholder calendar link rendered when no override supplied.
+"""Production calendar link rendered in the report CTA when no override supplied.
 
 Resolves at import time from ``CCS_DIAGNOSE_BOOK_A_CALL_URL`` if set,
 else falls back to the hardcoded default. The same scheme allowlist
@@ -83,8 +83,8 @@ default will validate as usual, so a malicious env value
 (``javascript:alert(1)``) is rejected the moment ``RenderOptions()``
 is constructed.
 
-Replace via ``RenderOptions(book_a_call_url=...)`` once the routine has
-its production cal.com handle wired through Unit 7's CLI flag.
+Override per-invocation via ``RenderOptions(book_a_call_url=...)`` or the
+``--book-a-call-url`` CLI flag.
 """
 
 DEFAULT_CONTACT_EMAIL: str = os.environ.get(
