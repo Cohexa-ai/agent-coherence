@@ -1,7 +1,7 @@
 # Release workflow: PyPI Trusted Publishers OIDC + PEP 740 attestations + CycloneDX SBOM.
 #
 # This workflow uses PyPI Trusted Publishers OIDC. End-user trust contract in
-# docs/SECURITY.md. Maintainer-side pre-release verification gate is documented
+# docs/security.md. Maintainer-side pre-release verification gate is documented
 # in the local-only SECURITY.md at the repo root.
 # Until Trusted Publishers is configured on the PyPI side, the publish step will fail
 # by design (fail-closed): we never embed long-lived API tokens in repo secrets.

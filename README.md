@@ -34,14 +34,14 @@ store = CCSStore(strategy="lazy")
 | Code review (moderate) | 3 | 8:3 | 60% | **47%** |
 | High-churn (write-heavy) | 4 | 8:4 | 50% | **29%** |
 
-*Measured on real LangGraph graphs; see [docs/REPRODUCE.md](docs/REPRODUCE.md) and the [user guide](docs/guide.md#real-workload-benchmarks).*
+*Measured on real LangGraph graphs; see [docs/reproduce.md](docs/reproduce.md) and the [user guide](docs/guide.md#real-workload-benchmarks).*
 
 ---
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
-- 🔐 [Security & supply chain](docs/SECURITY.md) — kill switches, hash-pinned install, attestation verification, threat model
+- 🔐 [Security & supply chain](docs/security.md) — kill switches, hash-pinned install, attestation verification, threat model
 - 📜 [Changelog](CHANGELOG.md) — version history
 - 📄 [Paper on arXiv (2603.15183)](https://arxiv.org/abs/2603.15183) — formal protocol, TLA+ verification, simulation results
 

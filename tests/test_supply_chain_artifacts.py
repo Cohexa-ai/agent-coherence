@@ -7,7 +7,7 @@ Validates the presence and structural correctness of:
 
 * ``.github/workflows/release.yml`` — Trusted Publishers OIDC + PEP 740 attestations
 * ``requirements-diagnose.txt`` — hash-pinned reproducible install path
-* ``docs/SECURITY.md`` — end-user trust contract (env-var kill switches,
+* ``docs/security.md`` — end-user trust contract (env-var kill switches,
   hash-pinned install, attestation verification, threat model, canonical
   install command, security-issue reporting)
 * ``uv.lock`` — committed developer lockfile
@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 REQUIREMENTS_DIAGNOSE = REPO_ROOT / "requirements-diagnose.txt"
-SECURITY_MD = REPO_ROOT / "docs" / "SECURITY.md"
+SECURITY_MD = REPO_ROOT / "docs" / "security.md"
 UV_LOCK = REPO_ROOT / "uv.lock"
 README = REPO_ROOT / "README.md"
 
@@ -160,7 +160,7 @@ def test_requirements_diagnose_excludes_self() -> None:
 
 
 def test_security_md_exists() -> None:
-    assert SECURITY_MD.is_file(), "docs/SECURITY.md must exist"
+    assert SECURITY_MD.is_file(), "docs/security.md must exist"
 
 
 @pytest.mark.parametrize(
@@ -170,7 +170,7 @@ def test_security_md_exists() -> None:
 def test_security_md_documents_kill_switches(kill_switch: str) -> None:
     text = SECURITY_MD.read_text()
     assert kill_switch in text, (
-        f"docs/SECURITY.md must document {kill_switch} env-var kill switch"
+        f"docs/security.md must document {kill_switch} env-var kill switch"
     )
 
 
@@ -182,7 +182,7 @@ def test_security_md_documents_kill_switches(kill_switch: str) -> None:
 def test_security_md_documents_canonical_install() -> None:
     text = SECURITY_MD.read_text()
     assert "https://pypi.org/simple/" in text, (
-        "docs/SECURITY.md must document the canonical pypi.org install command"
+        "docs/security.md must document the canonical pypi.org install command"
     )
     assert "agent-coherence[diagnose]" in text
 
@@ -210,7 +210,7 @@ def test_security_md_threat_model_present() -> None:
         "deepeval",
     ):
         assert needle in text, (
-            f"docs/SECURITY.md threat model must mention {needle!r}"
+            f"docs/security.md threat model must mention {needle!r}"
         )
 
 
@@ -233,13 +233,13 @@ def test_uv_lock_committed() -> None:
 
 def test_readme_links_to_security_doc() -> None:
     """The README is the first artifact a visitor reads. It must surface a
-    discoverable pointer to docs/SECURITY.md so the trust contract,
+    discoverable pointer to docs/security.md so the trust contract,
     kill switches, and threat model are one click away. We do not
     require a specific heading shape — the pointer may live inline in
     a TOC, a dedicated subsection, or anywhere else in the README.
     """
     text = README.read_text()
-    assert "docs/SECURITY.md" in text, (
-        "README.md must link to docs/SECURITY.md so end users can find "
+    assert "docs/security.md" in text, (
+        "README.md must link to docs/security.md so end users can find "
         "the public trust contract"
     )
