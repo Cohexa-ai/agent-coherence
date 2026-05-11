@@ -7,9 +7,16 @@ Validates the presence and structural correctness of:
 
 * ``.github/workflows/release.yml`` — Trusted Publishers OIDC + PEP 740 attestations
 * ``requirements-diagnose.txt`` — hash-pinned reproducible install path
-* ``SECURITY.md`` — trust contract + manual setup checklist
+* ``docs/SECURITY.md`` — end-user trust contract (env-var kill switches,
+  hash-pinned install, attestation verification, threat model, canonical
+  install command, security-issue reporting)
 * ``uv.lock`` — committed developer lockfile
 * ``README.md`` — security & supply chain pointer subsection
+
+The maintainer-side pre-release verification gate (``ccs-check-release`` and
+its manual checklist) is documented in a local-only operations file at the
+repo root and is not asserted here, because it intentionally never lands in
+the public tree.
 
 These are file-existence + content-grep + YAML-validity checks. We do not try to
 validate full GitHub Actions workflow semantics (that's GitHub's job) — we only
@@ -27,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 REQUIREMENTS_DIAGNOSE = REPO_ROOT / "requirements-diagnose.txt"
-SECURITY_MD = REPO_ROOT / "SECURITY.md"
+SECURITY_MD = REPO_ROOT / "docs" / "SECURITY.md"
 UV_LOCK = REPO_ROOT / "uv.lock"
 README = REPO_ROOT / "README.md"
 
@@ -153,7 +160,7 @@ def test_requirements_diagnose_excludes_self() -> None:
 
 
 def test_security_md_exists() -> None:
-    assert SECURITY_MD.is_file(), "SECURITY.md must exist at repo root"
+    assert SECURITY_MD.is_file(), "docs/SECURITY.md must exist"
 
 
 @pytest.mark.parametrize(
@@ -163,30 +170,19 @@ def test_security_md_exists() -> None:
 def test_security_md_documents_kill_switches(kill_switch: str) -> None:
     text = SECURITY_MD.read_text()
     assert kill_switch in text, (
-        f"SECURITY.md must document {kill_switch} env-var kill switch"
+        f"docs/SECURITY.md must document {kill_switch} env-var kill switch"
     )
 
 
-def test_security_md_has_release_readiness_gate() -> None:
-    """The pre-release verification section is the v1 of the old
-    'Manual setup checklist' — it must be present and describe both the
-    automated checks and the manual items the script cannot verify."""
-    text = SECURITY_MD.read_text()
-    assert "Pre-release verification" in text, (
-        "SECURITY.md must document the pre-release readiness gate"
-    )
-    # Both halves of the section are required: automated + manual.
-    assert "Automated checks" in text
-    assert "Manual verification" in text
-    # The script reference must be discoverable from SECURITY.md.
-    assert "check_release_readiness.py" in text
-    assert "ccs-check-release" in text
+# The pre-release verification gate (``ccs-check-release`` and its manual
+# checklist) is intentionally maintainer-only and lives in a local-only file
+# at the repo root. It is not asserted here.
 
 
 def test_security_md_documents_canonical_install() -> None:
     text = SECURITY_MD.read_text()
     assert "https://pypi.org/simple/" in text, (
-        "SECURITY.md must document the canonical pypi.org install command"
+        "docs/SECURITY.md must document the canonical pypi.org install command"
     )
     assert "agent-coherence[diagnose]" in text
 
@@ -213,7 +209,9 @@ def test_security_md_threat_model_present() -> None:
         "Dependency-confusion",
         "deepeval",
     ):
-        assert needle in text, f"SECURITY.md threat model must mention {needle!r}"
+        assert needle in text, (
+            f"docs/SECURITY.md threat model must mention {needle!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -238,4 +236,6 @@ def test_readme_has_security_subsection() -> None:
     assert "## Security & supply chain" in text, (
         "README.md must have a '## Security & supply chain' subsection"
     )
-    assert "SECURITY.md" in text, "README.md security subsection must link to SECURITY.md"
+    assert "docs/SECURITY.md" in text, (
+        "README.md security subsection must link to docs/SECURITY.md"
+    )
