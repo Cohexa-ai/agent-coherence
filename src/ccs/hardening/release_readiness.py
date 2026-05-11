@@ -122,41 +122,83 @@ def check_branch_protection(owner: str, repo: str, branch: str) -> CheckResult:
 
 
 def check_tag_protection(owner: str, repo: str, pattern: str) -> CheckResult:
-    """Verify tag protection covers ``pattern``."""
-    rc, out, err = _gh_api(f"repos/{owner}/{repo}/tags/protection")
+    """Verify a repository ruleset covers tags matching ``pattern``.
+
+    GitHub deprecated the legacy ``/repos/{owner}/{repo}/tags/protection``
+    endpoint for new use; rulesets are the supported replacement. This
+    check looks for an active tag-targeting ruleset whose
+    ``conditions.ref_name.include`` contains ``refs/tags/<pattern>``.
+
+    Two ``gh api`` calls per matching ruleset: one to list rulesets
+    (which returns only summary fields), then one per tag ruleset to
+    fetch ``conditions``. Stops at the first matching ruleset.
+    """
+    expected_ref = f"refs/tags/{pattern}"
+    name = f"Tag protection covers '{pattern}'"
+
+    rc, out, err = _gh_api(f"repos/{owner}/{repo}/rulesets")
     if rc != 0:
         return CheckResult(
-            name=f"Tag protection covers '{pattern}'",
+            name=name,
             ok=False,
             detail=err.strip() or f"gh api returned {rc}",
         )
     try:
-        rules = json.loads(out) or []
+        rulesets = json.loads(out) or []
     except json.JSONDecodeError:
         return CheckResult(
-            name=f"Tag protection covers '{pattern}'",
-            ok=False,
-            detail="response was not valid JSON",
+            name=name, ok=False, detail="response was not valid JSON"
         )
-    if not isinstance(rules, list):
+    if not isinstance(rulesets, list):
         return CheckResult(
-            name=f"Tag protection covers '{pattern}'",
+            name=name,
             ok=False,
-            detail=f"unexpected response shape: {type(rules).__name__}",
+            detail=f"unexpected response shape: {type(rulesets).__name__}",
         )
-    has_match = any(
-        isinstance(rule, dict) and rule.get("pattern") == pattern for rule in rules
-    )
-    if has_match:
+
+    tag_rulesets = [
+        rs
+        for rs in rulesets
+        if isinstance(rs, dict)
+        and rs.get("target") == "tag"
+        and rs.get("enforcement") == "active"
+        and rs.get("id") is not None
+    ]
+    if not tag_rulesets:
         return CheckResult(
-            name=f"Tag protection covers '{pattern}'",
-            ok=True,
-            detail=f"rule with pattern '{pattern}' present",
+            name=name,
+            ok=False,
+            detail="no active tag-targeting rulesets exist",
         )
+
+    for rs in tag_rulesets:
+        rs_id = rs["id"]
+        rc2, out2, _ = _gh_api(f"repos/{owner}/{repo}/rulesets/{rs_id}")
+        if rc2 != 0:
+            continue
+        try:
+            detail = json.loads(out2)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        conditions = detail.get("conditions") or {}
+        ref_name = conditions.get("ref_name") or {}
+        includes = ref_name.get("include") or []
+        if isinstance(includes, list) and expected_ref in includes:
+            return CheckResult(
+                name=name,
+                ok=True,
+                detail=(
+                    f"ruleset '{detail.get('name', rs_id)}' (id={rs_id}) "
+                    f"covers {expected_ref}"
+                ),
+            )
+
     return CheckResult(
-        name=f"Tag protection covers '{pattern}'",
+        name=name,
         ok=False,
-        detail=f"no tag-protection rule with pattern '{pattern}'",
+        detail=f"no active tag ruleset covers {expected_ref}",
     )
 
 

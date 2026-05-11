@@ -105,27 +105,116 @@ def test_branch_protection_check_fails_on_404(
     assert result.ok is False
 
 
-def test_tag_protection_check_passes_when_pattern_present(
+def _ruleset_routes(
+    owner: str,
+    repo: str,
+    *,
+    list_payload: list[dict[str, Any]],
+    detail_payloads: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, tuple[int, str, str]]:
+    """Build a routing table for the rulesets list + per-ruleset detail calls."""
+    routes: dict[str, tuple[int, str, str]] = {
+        f"repos/{owner}/{repo}/rulesets": (0, json.dumps(list_payload), "")
+    }
+    for rs_id, detail in (detail_payloads or {}).items():
+        routes[f"repos/{owner}/{repo}/rulesets/{rs_id}"] = (
+            0, json.dumps(detail), ""
+        )
+    return routes
+
+
+def test_tag_protection_check_passes_when_active_tag_ruleset_covers_pattern(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rules = [{"pattern": "v*"}, {"pattern": "release-*"}]
-    monkeypatch.setattr(
-        release_readiness, "_gh_api", _gh_stub(0, json.dumps(rules))
+    routes = _ruleset_routes(
+        "o",
+        "r",
+        list_payload=[
+            {"id": 42, "target": "tag", "enforcement": "active",
+             "name": "Protect v* release tags"},
+            {"id": 43, "target": "branch", "enforcement": "active",
+             "name": "Main protection"},
+        ],
+        detail_payloads={
+            42: {
+                "id": 42,
+                "name": "Protect v* release tags",
+                "conditions": {
+                    "ref_name": {
+                        "include": ["refs/tags/v*"],
+                        "exclude": [],
+                    }
+                },
+            },
+        },
     )
+    monkeypatch.setattr(release_readiness, "_gh_api", _routed_gh_stub(routes))
     result = release_readiness.check_tag_protection("o", "r", "v*")
     assert result.ok is True
+    assert "refs/tags/v*" in result.detail
 
 
-def test_tag_protection_check_fails_when_pattern_missing(
+def test_tag_protection_check_fails_when_no_tag_rulesets_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rules: list[dict[str, Any]] = [{"pattern": "release-*"}]
-    monkeypatch.setattr(
-        release_readiness, "_gh_api", _gh_stub(0, json.dumps(rules))
+    routes = _ruleset_routes(
+        "o",
+        "r",
+        list_payload=[
+            {"id": 1, "target": "branch", "enforcement": "active",
+             "name": "Branch only"},
+        ],
     )
+    monkeypatch.setattr(release_readiness, "_gh_api", _routed_gh_stub(routes))
     result = release_readiness.check_tag_protection("o", "r", "v*")
     assert result.ok is False
-    assert "no tag-protection rule" in result.detail
+    assert "no active tag-targeting rulesets" in result.detail
+
+
+def test_tag_protection_check_fails_when_ruleset_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routes = _ruleset_routes(
+        "o",
+        "r",
+        list_payload=[
+            {"id": 7, "target": "tag", "enforcement": "disabled",
+             "name": "Inactive tag rule"},
+        ],
+    )
+    monkeypatch.setattr(release_readiness, "_gh_api", _routed_gh_stub(routes))
+    result = release_readiness.check_tag_protection("o", "r", "v*")
+    assert result.ok is False
+    assert "no active tag-targeting rulesets" in result.detail
+
+
+def test_tag_protection_check_fails_when_pattern_not_in_includes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routes = _ruleset_routes(
+        "o",
+        "r",
+        list_payload=[
+            {"id": 11, "target": "tag", "enforcement": "active",
+             "name": "Release tags"},
+        ],
+        detail_payloads={
+            11: {
+                "id": 11,
+                "name": "Release tags",
+                "conditions": {
+                    "ref_name": {
+                        "include": ["refs/tags/release-*"],
+                        "exclude": [],
+                    }
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(release_readiness, "_gh_api", _routed_gh_stub(routes))
+    result = release_readiness.check_tag_protection("o", "r", "v*")
+    assert result.ok is False
+    assert "no active tag ruleset covers refs/tags/v*" in result.detail
 
 
 def test_tag_protection_check_fails_on_non_list_response(
@@ -141,6 +230,19 @@ def test_tag_protection_check_fails_on_non_list_response(
     assert "unexpected response shape" in result.detail
 
 
+def test_tag_protection_check_fails_when_list_call_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        release_readiness,
+        "_gh_api",
+        _gh_stub(1, "", "HTTP 404: Not Found"),
+    )
+    result = release_readiness.check_tag_protection("o", "r", "v*")
+    assert result.ok is False
+    assert "404" in result.detail
+
+
 # -------------------------------------------------------------------- #
 # Aggregate + CLI
 # -------------------------------------------------------------------- #
@@ -154,8 +256,24 @@ def _all_ok_routes(owner: str, repo: str) -> dict[str, tuple[int, str, str]]:
         f"repos/{owner}/{repo}/branches/main/protection": (
             0, json.dumps({"required": True}), ""
         ),
-        f"repos/{owner}/{repo}/tags/protection": (
-            0, json.dumps([{"pattern": "v*"}]), ""
+        f"repos/{owner}/{repo}/rulesets": (
+            0,
+            json.dumps([
+                {"id": 99, "target": "tag", "enforcement": "active",
+                 "name": "Protect v* release tags"}
+            ]),
+            "",
+        ),
+        f"repos/{owner}/{repo}/rulesets/99": (
+            0,
+            json.dumps({
+                "id": 99,
+                "name": "Protect v* release tags",
+                "conditions": {
+                    "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+                },
+            }),
+            "",
         ),
     }
 
