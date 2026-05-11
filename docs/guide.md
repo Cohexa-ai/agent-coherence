@@ -660,7 +660,6 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-simulate` | — | Run a protocol-only simulation scenario from a YAML file |
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
-| `ccs-check-release` | — | Verify PyPI Trusted Publishers + branch/tag protection before a `v*` tag push |
 
 Run any command with `--help` for the full option list.
 
@@ -681,20 +680,14 @@ when you want protocol-only numbers without spinning up a real LangGraph
 graph. See [REPRODUCE.md](REPRODUCE.md) for the simulation methodology behind
 the paper's headline numbers.
 
-### `ccs-check-architecture` and `ccs-check-release`
+### `ccs-check-architecture`
 
 ```bash
 # Architecture boundary check — fails non-zero if any layer imports upward
 ccs-check-architecture
-
-# Pre-release verification — fails non-zero if PyPI Trusted Publishers,
-# branch protection on main, or v* tag protection are missing
-ccs-check-release
 ```
 
-Both are designed for CI gating. `ccs-check-architecture` runs on every push;
-`ccs-check-release` runs as a preflight job before any wheel is built for a
-`v*` tag.
+Designed for CI gating; runs on every push. The companion script `tools/check_release_readiness.py` (also runs in CI as the release-workflow preflight) is maintainer-only and intentionally not exposed as a console script — it queries this repo's GitHub admin settings and has no end-user use case.
 
 ---
 
