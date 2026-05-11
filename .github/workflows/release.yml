@@ -27,10 +27,15 @@ jobs:
     runs-on: ubuntu-latest
 
     # ``gh api`` calls into the same repo for environment / branch /
-    # tag protection lookups. ``contents: read`` is enough; the
-    # default ``GITHUB_TOKEN`` is auto-exposed to ``gh``.
+    # tag protection lookups. ``administration: read`` is required for
+    # ``repos/{owner}/{repo}/branches/{branch}/protection`` — the
+    # default ``GITHUB_TOKEN`` cannot read branch protection metadata
+    # without it. The other two checks (pypi env, tag ruleset) work
+    # with ``contents: read`` alone but we grant both scopes uniformly
+    # because all three checks fire from the same script invocation.
     permissions:
       contents: read
+      administration: read
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
