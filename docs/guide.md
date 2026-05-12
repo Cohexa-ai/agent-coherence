@@ -343,7 +343,7 @@ The same `crash_recovery=` kwarg works on `LangGraphAdapter`, `CrewAIAdapter`,
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `False` | Master switch. When `False`, `heartbeat()` and `recover()` are silent no-ops; the per-tick sweep does not run. |
 | `heartbeat_timeout_ticks` | `int` | `10` | Reclaim a holder's grant if the gap between `now_tick` and the holder's last heartbeat is `>= heartbeat_timeout_ticks`. |
-| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of heartbeat freshness. Bound the worst-case lock duration. |
+| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of how recently the holder heartbeated. Bound the worst-case lock duration. |
 
 **Tick semantics.** Ticks are a logical clock — the unit is whatever `now_tick` your application advances. For LangGraph, one node invocation per tick is a sensible default. For long-running tool calls or LLM calls, advance ticks at the granularity at which you can call `heartbeat()` or expect grants to be released.
 
@@ -705,7 +705,7 @@ ccs-diagnose --graph my_graph.py:build_graph --yes
 
 | Flag | Purpose |
 |---|---|
-| `--graph PATH:FUNCTION` | Path + factory name; required for the main pipeline |
+| `--graph PATH:FUNCTION` | Path + factory name; required for the main diagnostic run |
 | `--state-file PATH` | JSON or YAML file passed to `graph.invoke()` |
 | `--output-html PATH` | HTML output (default: `diagnose_report.html`) |
 | `--output-json PATH` | JSON output (default: `diagnose_report.json`; `-` for stdout) |
