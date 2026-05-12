@@ -133,23 +133,42 @@ def format_event(event: StoreMetricEvent) -> None:
 
 
 def setup_temp_fixture() -> Path:
-    """Copy the TS fixture to a tmp working dir so the source tree is never mutated."""
+    """Copy the TS fixture to a tmp working dir so the source tree is never mutated.
+
+    Cleans up the tmp dir on any failure during setup, so we don't leak partial
+    copies if shutil.copytree or the symlink call raises.
+    """
     work_dir = Path(tempfile.mkdtemp(prefix="refactor_demo_"))
     dest = work_dir / "fixture_repo_ts"
-    # Skip node_modules in the copy; symlink it after for tsc invocation.
-    shutil.copytree(
-        FIXTURE_REPO_TS,
-        dest,
-        ignore=shutil.ignore_patterns("node_modules", "dist", "*.tsbuildinfo"),
-    )
-    src_modules = FIXTURE_REPO_TS / "node_modules"
-    if src_modules.exists():
-        (dest / "node_modules").symlink_to(src_modules)
+    try:
+        # Skip node_modules in the copy; symlink it after for tsc invocation.
+        shutil.copytree(
+            FIXTURE_REPO_TS,
+            dest,
+            ignore=shutil.ignore_patterns("node_modules", "dist", "*.tsbuildinfo"),
+        )
+        src_modules = FIXTURE_REPO_TS / "node_modules"
+        if src_modules.exists():
+            (dest / "node_modules").symlink_to(src_modules)
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
     return dest
 
 
 def run_tsc(fixture_root: Path) -> tuple[int, str]:
-    """Run ``npx tsc --noEmit`` against the fixture root. Returns (rc, output)."""
+    """Run ``npx tsc --noEmit`` against the fixture root. Returns (rc, output).
+
+    Returns ``(127, message)`` when the Node toolchain is missing rather than
+    letting ``FileNotFoundError`` propagate as a raw traceback — the demo's
+    expected failure mode for an unprepared environment should be legible.
+    """
+    if shutil.which("npx") is None:
+        return (
+            127,
+            "npx not found on PATH. The refactor demo needs Node.js >=18 and a "
+            "one-time `npm install` inside examples/refactor_demo/fixture_repo_ts/.",
+        )
     proc = subprocess.run(
         ["npx", "tsc", "--noEmit"],
         cwd=fixture_root,
@@ -204,12 +223,37 @@ def run(variant: str = "with") -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Refactor demo: write-side coherence vs without.")
+    parser = argparse.ArgumentParser(
+        prog="examples.refactor_demo.main",
+        description=(
+            "Refactor demo: two scripted sub-agents (planner + executor) collaborate on "
+            "a shared task-spec artifact through CCSStore, then real tsc runs against a "
+            "real TypeScript fixture. Three variants illustrate write-side coherence."
+        ),
+        epilog=(
+            "EXIT CODES:\n"
+            "  0   --variant=with: write-side coherence prevented the stale read; tsc passed.\n"
+            "  >0  --variant=no-invalidation or --variant=context-cache: stale spec produced "
+            "a real tsc failure (typically TS2305). This is the demo's INTENDED outcome and is "
+            "not an error.\n"
+            "  127 npx not on PATH. Install Node >=18 and run `npm install` inside "
+            "examples/refactor_demo/fixture_repo_ts/.\n"
+            "\n"
+            "PREREQUISITES: Node >=18, npm. The fixture's node_modules is gitignored; run "
+            "`npm install` once locally before invoking the demo or its tests."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--variant",
         choices=("with", "no-invalidation", "context-cache"),
         default="with",
-        help="Demo variant. Default: with (write-side coherence on).",
+        help=(
+            "Demo variant. Default: with (write-side coherence on; tsc passes). "
+            "no-invalidation: protocol-level proof — same store, event bus patched, "
+            "stale v1 wins, tsc fails. context-cache: simulated LLM context-window cache, "
+            "stale v1 wins, tsc fails."
+        ),
     )
     args = parser.parse_args(argv)
     return run(variant=args.variant)

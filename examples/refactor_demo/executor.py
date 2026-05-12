@@ -49,18 +49,22 @@ def _apply_rename(spec: dict[str, Any], fixture_root: Path) -> list[str]:
 
     # Rename the definition in auth.ts (the export and the function name).
     auth_path = fixture_root / "src" / "auth.ts"
-    auth_text = auth_path.read_text()
+    auth_text = auth_path.read_text(encoding="utf-8")
     auth_text = auth_text.replace(f"function {old}(", f"function {new}(")
-    auth_path.write_text(auth_text)
+    auth_path.write_text(auth_text, encoding="utf-8")
     touched.append("src/auth.ts")
 
-    # Rename call sites in each listed caller.
+    # Rename call sites in each listed caller. The bare ``str.replace`` is
+    # safe here because the demo's fixture contains no compound identifiers
+    # like ``validateUserRole`` or string literals embedding the symbol name.
+    # Do not lift this function into a generic refactor tool without an
+    # ast-aware rename; see plan Risks for the credibility note.
     for rel in spec["callers"]:
         caller_path = fixture_root / rel
-        text = caller_path.read_text()
+        text = caller_path.read_text(encoding="utf-8")
         # Update both the import and the call site.
         text = text.replace(old, new)
-        caller_path.write_text(text)
+        caller_path.write_text(text, encoding="utf-8")
         touched.append(rel)
 
     return touched
@@ -77,6 +81,15 @@ def executor_read_node(state: dict) -> dict:
     store: CCSStore = lg_get_store()  # type: ignore[assignment]
     item = store.get((EXECUTOR_AGENT, SHARED_SCOPE), TASK_KEY)
     spec = item.value if item is not None else None
+    if spec is None:
+        # Defensive: in the demo's canonical graph the planner runs before the
+        # executor, so this branch is unreachable. Future graph reorders or
+        # standalone unit tests of this node should still produce a coherent
+        # log line rather than a KeyError on ``spec['version']``.
+        return {
+            "log": [*state.get("log", []), "executor: read returned no spec"],
+            "cached_spec": None,
+        }
     return {
         "log": [*state.get("log", []), f"executor: read spec v{spec['version']} (cached)"],
         "cached_spec": spec,

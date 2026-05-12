@@ -22,19 +22,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-# The ``examples/`` tree is not on pytest's pythonpath (pyproject sets
-# ``pythonpath = ["src", "."]`` but pytest's import-context for tests doesn't
-# seem to honor "." for namespace-style discovery of ``examples``). Prepending
-# the repo root here is the most local fix and only affects this test module.
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 import pytest
+
+# ``examples.refactor_demo`` is resolved via pyproject's
+# ``[tool.pytest.ini_options] pythonpath = ["src", "."]``. No per-file
+# sys.path manipulation is needed; do not reintroduce one here.
 
 # Skip the whole module if langgraph isn't installed (e.g. bare [dev] install).
 pytest.importorskip("langgraph.graph")
@@ -78,8 +73,10 @@ def test_with_coherence_executor_commit_refetches_v2() -> None:
         final = graph.invoke({"log": [], "fixture_root": str(fixture_root), "cached_spec": None})
 
         assert final["committed_spec_version"] == 2
-        # Two callers stay (from v1: middleware, login, refresh) + utils/session.ts (v2's addition) + auth.ts
+        # 3 v1 callers (middleware, login, refresh) + utils/session.ts (v2 addition) + auth.ts = 5
         assert len(final["committed_files"]) == 5
+        # Identity check, not just count: the 4th caller must be in the rename set with-coherence.
+        assert "src/utils/session.ts" in final["committed_files"]
 
         # The executor's commit-time get is a cache miss (cache was INVALID after planner v2).
         executor_gets = [e for e in events if e.operation == "get" and e.agent_name == EXECUTOR_AGENT]
@@ -134,6 +131,8 @@ def test_no_invalidation_executor_commits_stale_v1() -> None:
         assert final["committed_spec_version"] == 1
         # 3 callers from v1 + auth.ts = 4 files (utils/session.ts is missed).
         assert len(final["committed_files"]) == 4
+        # Identity check: utils/session.ts must NOT be in the rename set when v1 wins.
+        assert "src/utils/session.ts" not in final["committed_files"]
 
         # The commit-time re-read is a cache HIT because the bus was patched.
         executor_gets = [e for e in events if e.operation == "get" and e.agent_name == EXECUTOR_AGENT]
@@ -181,6 +180,8 @@ def test_context_cache_executor_commits_from_graph_state() -> None:
 
         assert final["committed_spec_version"] == 1
         assert len(final["committed_files"]) == 4
+        # Identity check: utils/session.ts must NOT be in the rename set when v1 wins.
+        assert "src/utils/session.ts" not in final["committed_files"]
 
         # Executor only does ONE get (executor_read_node). No commit-time re-read.
         executor_gets = [e for e in events if e.operation == "get" and e.agent_name == EXECUTOR_AGENT]
