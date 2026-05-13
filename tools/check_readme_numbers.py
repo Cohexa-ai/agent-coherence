@@ -1,8 +1,17 @@
 """Pre-commit hook: verify README benchmark table values match expected.json.
 
 Reads benchmarks/expected.json, rounds each token_reduction_pct to the nearest integer,
-and checks that each rounded value appears as **NN%** in the
-## Real-workload benchmarks section of README.md.
+and checks that each rounded value appears as **NN%** in the README's benchmark
+table.
+
+The table is located in priority order:
+  1. The block under a ``## Real-workload benchmarks`` section heading, if present.
+  2. Failing that, the block starting at the table's column-header line
+     (``| Workload | Agents | Reads:Writes | Hit rate | Savings |``) and
+     extending until the first non-table line.
+
+This works whether the README places the table at the top with no section
+heading (current main) or under a dedicated heading (some prior shapes).
 
 Exits 0 if all values match. Exits 1 if any value is missing, or if required files
 are absent.
@@ -23,16 +32,37 @@ _EXPECTED_PATH = _REPO_ROOT / "benchmarks" / "expected.json"
 _README_PATH = _REPO_ROOT / "README.md"
 
 _SECTION_HEADER = "## Real-workload benchmarks"
+_TABLE_HEADER = "| Workload | Agents | Reads:Writes | Hit rate | Savings |"
 _BOLD_PCT_RE = re.compile(r"\*\*(\d+)%\*\*")
 
 
 def _extract_readme_section(readme_text: str) -> str:
-    """Return the text from ## Real-workload benchmarks to the next ## section."""
+    """Return the README block that contains the benchmark table.
+
+    Tries the named section heading first; if absent, falls back to extracting
+    the table block by its column-header line. Returns "" if neither anchor
+    is found.
+    """
+    # Path 1: dedicated section heading.
     start = readme_text.find(_SECTION_HEADER)
-    if start == -1:
+    if start != -1:
+        end = readme_text.find("\n## ", start + len(_SECTION_HEADER))
+        return readme_text[start:end] if end != -1 else readme_text[start:]
+
+    # Path 2: direct table-header anchor. Extract from the column-header line
+    # downward until a non-table line (blank line, non-`|` line, or `## `).
+    table_start = readme_text.find(_TABLE_HEADER)
+    if table_start == -1:
         return ""
-    end = readme_text.find("\n## ", start + len(_SECTION_HEADER))
-    return readme_text[start:end] if end != -1 else readme_text[start:]
+
+    lines = readme_text[table_start:].splitlines(keepends=True)
+    block: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("## ") or not stripped.startswith("|"):
+            break
+        block.append(line)
+    return "".join(block)
 
 
 def check_readme_numbers(expected_path: Path, readme_path: Path) -> bool:
@@ -57,7 +87,10 @@ def check_readme_numbers(expected_path: Path, readme_path: Path) -> bool:
     section = _extract_readme_section(readme_path.read_text())
     if not section:
         print(
-            f"ERROR: '{_SECTION_HEADER}' section not found in README.md.",
+            f"ERROR: Could not locate the benchmark table in README.md. "
+            f"Expected either a '{_SECTION_HEADER}' section heading or a "
+            f"table beginning with the column-header line "
+            f"'{_TABLE_HEADER}'.",
             file=sys.stderr,
         )
         return False

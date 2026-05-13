@@ -49,7 +49,7 @@ store = CCSStore(strategy="lazy")
 
 Each shared artifact is cached locally per agent and reads serve from the local cache when that copy is fresh. Writes commit to a coordinator, which sends lightweight invalidation signals (~12 tokens) to peers so the next read fetches the new version instead of rebroadcasting the full artifact. Consistency is single-writer-multiple-reader per artifact with bounded staleness — peers re-fetch on next read.
 
-Five synchronization strategies ship out of the box: `lazy` (default), `eager`, `lease` (TTL-based), `access_count`, and `broadcast`. Pick the one that matches your workload's read/write ratio and freshness needs.
+Five synchronization strategies ship out of the box: `lazy` (default), `eager`, `lease` (TTL-based), `access_count`, and `broadcast`. Pick the one that matches your workload's read/write ratio and how aggressively cached reads should refresh.
 
 ## Architecture
 
@@ -63,7 +63,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-`v0.7` released. See [CHANGELOG.md](CHANGELOG.md) for the version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
+`v0.7.1` released — refactor demo for write-side coherence + CI Node toolchain for real `tsc` validation. See [CHANGELOG.md](CHANGELOG.md) for the version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
 ## Paper
 

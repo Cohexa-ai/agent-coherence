@@ -1,0 +1,12 @@
+{
+  "name": "refactor-demo-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal TypeScript fixture for the agent-coherence planner-executor refactor demo. Not published; used only by examples/refactor_demo/ to exercise real tsc against a real project.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

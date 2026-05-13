@@ -45,7 +45,12 @@ all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
+# ``src`` makes the ccs package importable. ``.`` adds the repo root so tests
+# under ``tests/`` can ``from examples.refactor_demo import ...`` for the
+# refactor demo test suite. Test files must not live under any directory
+# whose name shadows a top-level package — for example, do NOT create
+# ``tests/examples/`` (would shadow the real ``examples/`` package).
 
 [tool.setuptools]
 package-dir = { "" = "src" }
