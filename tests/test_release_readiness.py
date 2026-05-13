@@ -105,6 +105,39 @@ def test_branch_protection_check_fails_on_404(
     assert result.ok is False
 
 
+def test_branch_protection_check_skips_on_403_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub Actions GITHUB_TOKEN cannot read branch protection (requires
+    admin scope, PAT-only). We treat 403 as a [WARN] skipped check so the
+    preflight does not fail-closed in CI; operators verify locally."""
+    monkeypatch.setattr(
+        release_readiness,
+        "_gh_api",
+        _gh_stub(1, "", "HTTP 403: Resource not accessible by integration"),
+    )
+    result = release_readiness.check_branch_protection("o", "r", "main")
+    assert result.ok is True
+    assert result.skipped is True
+    assert "verify locally" in result.detail
+
+
+def test_branch_protection_check_fails_on_other_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the specific 'Resource not accessible by integration' 403 is
+    treated as a skip — other 403s (e.g. token revoked, repo private) are
+    still hard failures."""
+    monkeypatch.setattr(
+        release_readiness,
+        "_gh_api",
+        _gh_stub(1, "", "HTTP 403: Forbidden"),
+    )
+    result = release_readiness.check_branch_protection("o", "r", "main")
+    assert result.ok is False
+    assert result.skipped is False
+
+
 def _ruleset_routes(
     owner: str,
     repo: str,

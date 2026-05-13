@@ -343,7 +343,7 @@ The same `crash_recovery=` kwarg works on `LangGraphAdapter`, `CrewAIAdapter`,
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `False` | Master switch. When `False`, `heartbeat()` and `recover()` are silent no-ops; the per-tick sweep does not run. |
 | `heartbeat_timeout_ticks` | `int` | `10` | Reclaim a holder's grant if the gap between `now_tick` and the holder's last heartbeat is `>= heartbeat_timeout_ticks`. |
-| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of heartbeat freshness. Bound the worst-case lock duration. |
+| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of how recently the holder heartbeated. Bound the worst-case lock duration. |
 
 **Tick semantics.** Ticks are a logical clock — the unit is whatever `now_tick` your application advances. For LangGraph, one node invocation per tick is a sensible default. For long-running tool calls or LLM calls, advance ticks at the granularity at which you can call `heartbeat()` or expect grants to be released.
 
@@ -642,162 +642,9 @@ inline benchmarking without the CLI, see [Inline benchmark mode](#inline-benchma
 
 ## `ccs-diagnose` — detect stale reads
 
-`ccs-diagnose` attaches a passive callback to an existing LangGraph graph and
-classifies its write pattern (`single_writer` / `shared_artifact` /
-`parallel_branch` / `mixed`). It reports artifacts whose reads were handed
-divergent versions across nodes — divergence the runtime is already producing
-but never surfaces.
+A standalone CLI for detecting divergent reads in an existing LangGraph graph without changing any code. Passive callback, zero outbound network in v0, HTML + JSON reports. Install with `pip install "agent-coherence[diagnose]"`.
 
-It runs as a witness-quality surface: it observes what the runtime *handed* a
-node, not what the node read. Upgrading to `CCSStore` lifts these observations
-into provable per-key attribution — same diagnose surface, no callback
-rewiring.
-
-### Install and run
-
-```bash
-pip install "agent-coherence[diagnose]"
-
-ccs-diagnose --graph path/to/your_graph.py:build_graph
-```
-
-The factory must accept zero arguments (or accept an initial state file via
-`--state-file`) and return a compiled LangGraph graph. The CLI runs the graph
-once with a passive observer and writes two reports:
-
-| Output | Default path | Purpose |
-|---|---|---|
-| HTML report | `diagnose_report.html` | Human-readable: classification verdict, divergence witnesses, tracked-artifacts panel, cost extrapolation, CTA |
-| JSON report | `diagnose_report.json` | Machine-readable: full schema for piping into `jq`, dashboards, or `--show-payload` re-rendering |
-
-### Common invocations
-
-```bash
-# Basic — run the pipeline and write both reports
-ccs-diagnose --graph my_graph.py:build_graph
-
-# Pass an initial state
-ccs-diagnose --graph my_graph.py:build_graph --state-file initial_state.json
-
-# Cost extrapolation (interactions per hour)
-ccs-diagnose --graph my_graph.py:build_graph --volume 50
-
-# Pipe JSON straight into jq (summary goes to stderr)
-ccs-diagnose --graph my_graph.py:build_graph --output-json - | jq .verdict
-
-# Re-render a previously emitted report without re-running the graph
-ccs-diagnose --show-payload diagnose_report.json
-
-# Strict mode — promote sequential-staleness exclusions back into the headline
-ccs-diagnose --graph my_graph.py:build_graph --strict
-
-# Restrict tracked keys
-ccs-diagnose --graph my_graph.py:build_graph --ignore tmp_buf,debug_trace --track shared_doc
-
-# Calibration corpus — appends a single payload entry to a local JSONL file
-ccs-diagnose --graph my_graph.py:build_graph --calibration-record
-
-# Non-TTY agent invocations (consent prompt would otherwise block)
-ccs-diagnose --graph my_graph.py:build_graph --yes
-```
-
-### Flags
-
-| Flag | Purpose |
-|---|---|
-| `--graph PATH:FUNCTION` | Path + factory name; required for the main pipeline |
-| `--state-file PATH` | JSON or YAML file passed to `graph.invoke()` |
-| `--output-html PATH` | HTML output (default: `diagnose_report.html`) |
-| `--output-json PATH` | JSON output (default: `diagnose_report.json`; `-` for stdout) |
-| `--no-json` | Suppress JSON output |
-| `--volume N` | Interactions per hour for annualized cost extrapolation |
-| `--lead-pain-type {cost,auditability,auto}` | Which secondary KPI rides the headline |
-| `--cost-per-1k-tokens FLOAT` | Token cost assumption for extrapolation |
-| `--strict` | Promote sequential-staleness exclusions back into the headline count |
-| `--ignore KEY1,KEY2` | State keys to skip (supports `__`-prefixed) |
-| `--track KEY1,KEY2` | Force-track keys (wins over `--ignore`) |
-| `--warm-lead` | Switch the CTA to a warm-conversation 2-question seed |
-| `--book-a-call-url URL` | Override CTA calendar URL (also: `CCS_DIAGNOSE_BOOK_A_CALL_URL`) |
-| `--contact-email EMAIL` | Override CTA reply-to (also: `CCS_DIAGNOSE_CONTACT_EMAIL`) |
-| `--show-payload PATH` | Re-render a previously emitted `report.json`; bypasses graph load |
-| `--dry-run` | Print the payload that would be submitted (v0 has no network code) |
-| `--no-network` / `--no-telemetry` | Suppress consent prompt and calibration write |
-| `--yes` / `--non-interactive` | Skip consent prompt (required for non-TTY agent invocations) |
-| `--calibration-record [PATH]` | Append payload to local JSONL calibration corpus |
-| `--reset-token` | Regenerate the local installation token |
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | Generic error (graph load failure, JSON parse, etc.) |
-| `2` | Usage error (argparse, mutually exclusive flags, bad URL/email) |
-| `3` | Dependency missing (import error from graph or extras) |
-| `4` | Schema mismatch (`--show-payload` version not supported) |
-| `5` | I/O error (write/read failed; oversized input file) |
-
-### Trust posture
-
-`ccs-diagnose` makes **zero outbound network requests** in v0. The HTML
-renderer uses Jinja2 with `select_autoescape`. The `--book-a-call-url` and
-`--contact-email` values are validated against an allowlist that rejects
-`javascript:`, `data:`, and `vbscript:` schemes (the same allowlist guards
-the `CCS_DIAGNOSE_BOOK_A_CALL_URL` / `CCS_DIAGNOSE_CONTACT_EMAIL` env-var
-overrides).
-
-Three independent kill switches suppress all telemetry-shaped output (no
-consent prompt, no calibration write, no payload generation):
-
-- `DO_NOT_TRACK=1` (cross-tool consensus per consoledonottrack.com)
-- `DISABLE_TELEMETRY=1`
-- `CCS_DIAGNOSE_NO_TELEMETRY=1`
-
-`--no-telemetry` and `--no-network` are the per-invocation equivalents. See
-[SECURITY.md](SECURITY.md) for the full trust contract, supply-chain threat
-model, and attestation-verification commands.
-
-### Calibration corpus
-
-The `--calibration-record` flag appends one entry per run to a local JSONL file
-at `$XDG_DATA_HOME/ccs-diagnose/calibration.jsonl` (or
-`~/.local/share/ccs-diagnose/calibration.jsonl` when `XDG_DATA_HOME` is unset).
-The file is mode `0600`. Override the path with
-`--calibration-record /tmp/my_calibration.jsonl`.
-
-Each entry contains:
-
-- Stack name and version (e.g., `LangGraph 1.1.10`)
-- Classifier verdict + confidence
-- Coverage shape (counts only — no key names, no content, no hashes)
-- Timestamp
-- Schema version + sequence number + instance ID
-
-Nothing else. The file is `validate_log`-compatible:
-
-```bash
-python -c "from ccs.validation import validate_log; \
-    print(validate_log('$XDG_DATA_HOME/ccs-diagnose/calibration.jsonl', \
-                       schema_version='ccs.diagnose.v0-preview'))"
-```
-
-A clean file returns `([], [])` — empty gap and schema-mismatch lists.
-
-#### Promotion to `langgraph-v1`
-
-`ccs-diagnose` ships under the `langgraph-v0-preview` classifier. The
-`v0-preview` → `v1` promotion gate requires:
-
-1. **>= 5 real production graphs** validated across **>= 3 distinct supervisor topologies**
-2. The Tracked-Artifacts panel produces **zero unknown `__`-prefix surprises** on a current LangGraph release
-3. The append-only prefix-stability rule survives a workload that **compacts message history mid-run** (real-world `trim_messages` pattern)
-
-Once promoted, `v1`-tagged submissions populate the public benchmark.
-`v0-preview` calibration data is not retroactively migrated.
-
-To contribute calibration data, DM `vlad@fwdinc.net` or open an issue on the
-repo with your `calibration.jsonl` contents. Nothing is collected that isn't
-documented above; you can read every field before sharing.
+See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags, exit codes, trust posture, calibration corpus, and the `langgraph-v0-preview` → `v1` promotion gate.
 
 ---
 
@@ -813,7 +660,6 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-simulate` | — | Run a protocol-only simulation scenario from a YAML file |
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
-| `ccs-check-release` | — | Verify PyPI Trusted Publishers + branch/tag protection before a `v*` tag push |
 
 Run any command with `--help` for the full option list.
 
@@ -834,20 +680,14 @@ when you want protocol-only numbers without spinning up a real LangGraph
 graph. See [REPRODUCE.md](REPRODUCE.md) for the simulation methodology behind
 the paper's headline numbers.
 
-### `ccs-check-architecture` and `ccs-check-release`
+### `ccs-check-architecture`
 
 ```bash
 # Architecture boundary check — fails non-zero if any layer imports upward
 ccs-check-architecture
-
-# Pre-release verification — fails non-zero if PyPI Trusted Publishers,
-# branch protection on main, or v* tag protection are missing
-ccs-check-release
 ```
 
-Both are designed for CI gating. `ccs-check-architecture` runs on every push;
-`ccs-check-release` runs as a preflight job before any wheel is built for a
-`v*` tag.
+Designed for CI gating; runs on every push. The companion script `tools/check_release_readiness.py` (also runs in CI as the release-workflow preflight) is maintainer-only and intentionally not exposed as a console script — it queries this repo's GitHub admin settings and has no end-user use case.
 
 ---
 
