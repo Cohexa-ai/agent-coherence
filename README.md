@@ -63,7 +63,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-`v0.7` released. See [CHANGELOG.md](CHANGELOG.md) for the version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
+`v0.7.1` released — refactor demo for write-side coherence + CI Node toolchain for real `tsc` validation. See [CHANGELOG.md](CHANGELOG.md) for the version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
 ## Paper
 
