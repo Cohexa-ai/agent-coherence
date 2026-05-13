@@ -58,6 +58,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,diagnose]"
 
+      # Node toolchain for the refactor-demo's TypeScript fixture. Without
+      # this, _has_tsc() in tests/test_refactor_demo.py is False and all real
+      # tsc end-to-end tests silently skip, leaving the demo's central
+      # correctness claim unverified in CI.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "20"
+
+      - name: Install refactor-demo TS fixture dependencies
+        working-directory: examples/refactor_demo/fixture_repo_ts
+        run: npm ci
+
       - name: Run test suite
         run: pytest -q --junitxml=test-results.xml
 

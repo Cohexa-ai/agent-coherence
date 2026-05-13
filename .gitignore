@@ -7,8 +7,9 @@ docs/*
 !docs/guide.md
 !docs/why-coherence-matters.md
 !docs/agent-coherence-approach.md
-!docs/REPRODUCE.md
-!docs/SECURITY.md
+!docs/reproduce.md
+!docs/security.md
+!docs/ccs-diagnose.md
 
 states/
 __pycache__/
