@@ -76,17 +76,31 @@ prefer `requirements-diagnose.txt` for reproducible installs.
 Each wheel published to PyPI ships with a Sigstore-backed PEP 740 attestation
 tied to the GitHub Actions workflow that built it. To verify before installing:
 
-    # Using pypi-attestations:
     pip install pypi-attestations
     pypi-attestations verify --provenance \
         --repo hipvlady/agent-coherence \
         --workflow release.yml \
         agent_coherence-X.Y.Z-py3-none-any.whl
 
-    # Or using gh:
-    gh attestation verify <wheel> --repo hipvlady/agent-coherence
-
 The PyPI page also displays the verified provenance in the release sidebar.
+You can also inspect the raw signed attestation directly:
+
+    curl -s \
+      https://pypi.org/integrity/agent-coherence/X.Y.Z/agent_coherence-X.Y.Z-py3-none-any.whl/provenance \
+      | python3 -m json.tool
+
+The `publisher` block in each attestation bundle should report
+`{kind: GitHub, repository: hipvlady/agent-coherence, workflow: release.yml, environment: pypi}`.
+A publisher mismatch is the signature of a Trusted Publisher misconfiguration —
+do not install if the values diverge from those above.
+
+> **Note on `gh attestation verify`.** That command queries GitHub's SLSA
+> build-provenance attestation store, which the current release workflow does
+> not populate. It will return HTTP 404 against this package's wheels. The
+> PEP 740 attestation lives on PyPI; use `pypi-attestations verify` or the
+> raw `curl` inspection above. A future release-workflow enhancement could
+> add an `actions/attest-build-provenance` step to also publish SLSA
+> attestations to GitHub, at which point `gh attestation verify` would work.
 
 ## CycloneDX SBOM
 
