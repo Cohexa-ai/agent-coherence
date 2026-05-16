@@ -1,0 +1,36 @@
+{
+  "cwd": "/private/var/folders/3f/ym6k1f9n7wvfkfx6ntlsjrbh0000gn/T/coh-probe.j4E2Q40m8B",
+  "duration_ms": 6,
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "bypassPermissions",
+  "session_id": "9490b372-f745-43d7-b8c2-567eff24f9ca",
+  "tool_input": {
+    "file_path": "/private/var/folders/3f/ym6k1f9n7wvfkfx6ntlsjrbh0000gn/T/coh-probe.j4E2Q40m8B/foo.txt",
+    "new_string": "new-line",
+    "old_string": "old-line",
+    "replace_all": false
+  },
+  "tool_name": "Edit",
+  "tool_response": {
+    "filePath": "/private/var/folders/3f/ym6k1f9n7wvfkfx6ntlsjrbh0000gn/T/coh-probe.j4E2Q40m8B/foo.txt",
+    "newString": "new-line",
+    "oldString": "old-line",
+    "originalFile": "old-line\n",
+    "replaceAll": false,
+    "structuredPatch": [
+      {
+        "lines": [
+          "-old-line",
+          "+new-line"
+        ],
+        "newLines": 1,
+        "newStart": 1,
+        "oldLines": 1,
+        "oldStart": 1
+      }
+    ],
+    "userModified": false
+  },
+  "tool_use_id": "toolu_016XmgMAY3Z7w3cY2yog6SwE",
+  "transcript_path": "/Users/vladparakhin/.claude/projects/-private-var-folders-3f-ym6k1f9n7wvfkfx6ntlsjrbh0000gn-T-coh-probe-j4E2Q40m8B/9490b372-f745-43d7-b8c2-567eff24f9ca.jsonl"
+}
