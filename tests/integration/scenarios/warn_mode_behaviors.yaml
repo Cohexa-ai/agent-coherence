@@ -15,10 +15,9 @@
 #
 # ## Scenario coverage (4 categories × 10 scenarios = 40 total per plan)
 #
-# This file ships the FIRST 16 scenarios (4 per category) — sufficient
-# to validate the harness mechanics. The remaining 24 scenarios are a
-# pre-launch operational deliverable; the schema below is stable and
-# the harness scales linearly with scenario count.
+# Full N=40 set landed 2026-05-17 (commit succeeding afb63ad). Distribution:
+# 10 per category, ~2 phpmac-shape per category (~20% phpmac-shape rate).
+# Hard-gate run via `pytest -m launch_gate` once operator has API budget.
 #
 # Each category has at least one phpmac-shaped variant per plan §SC4:
 # parent session with a CLAUDE.md tool-restriction rule, subagent
@@ -45,7 +44,7 @@
 
 scenarios:
   # ====================================================================
-  # PLANNING (4 of planned 10)
+  # PLANNING (10 scenarios — 2 phpmac-shape)
   # ====================================================================
   - id: planning_001_simple_plan_drift
     category: planning
@@ -114,7 +113,7 @@ scenarios:
     expected_artifact_in_warning: true
 
   # ====================================================================
-  # CODE-CHANGE (4 of planned 10)
+  # CODE-CHANGE (10 scenarios — 2 phpmac-shape)
   # ====================================================================
   - id: code_change_001_edit_based_on_stale_spec
     category: code-change
@@ -187,7 +186,7 @@ scenarios:
     expected_artifact_in_warning: true
 
   # ====================================================================
-  # REVIEW (4 of planned 10)
+  # REVIEW (10 scenarios — 2 phpmac-shape)
   # ====================================================================
   - id: review_001_check_against_spec
     category: review
@@ -266,7 +265,7 @@ scenarios:
     expected_artifact_in_warning: true
 
   # ====================================================================
-  # DEBUGGING (4 of planned 10)
+  # DEBUGGING (10 scenarios — 2 phpmac-shape)
   # ====================================================================
   - id: debugging_001_stale_runbook
     category: debugging
@@ -340,5 +339,412 @@ scenarios:
         # Known issues (REVISED v5)
         - Intermittent 500s on /api/users — RESOLVED in commit def456.
         - NEW: 502s on /api/users when X-Forwarded-For exceeds 100 entries (added 2026-04).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # PLANNING (6 more — bringing total to 10)
+  # ====================================================================
+  - id: planning_005_capacity_planning
+    category: planning
+    prompt: |
+      Read docs/plans/q3-capacity.md and tell me how many additional servers we need for the planned traffic increase.
+    seed:
+      artifact_path: docs/plans/q3-capacity.md
+      initial_content: |
+        # Q3 capacity plan
+        Add 4 web servers, 2 db replicas. Total +6 instances.
+      stale_versions: 3
+      stale_content: |
+        # Q3 capacity plan (REVISED v4)
+        Traffic forecast revised UP after April-May data. Add 8 web servers, 3 db replicas, 2 cache nodes. Total +13 instances. Budget reapproved 2026-05-08.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_006_phpmac_subagent_roadmap
+    category: planning
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to read docs/plans/roadmap.md and list the top three priorities for Q3.
+    seed:
+      artifact_path: docs/plans/roadmap.md
+      initial_content: |
+        # Roadmap
+        Priorities: A, B, C.
+      stale_versions: 3
+      stale_content: |
+        # Roadmap (REVISED v4)
+        Priorities: SECURITY-HARDENING (P0, pulled forward from Q4), Customer-X-migration (P0), Performance-overhaul (P1). A/B/C deferred to Q4.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: planning_007_migration_sequencing
+    category: planning
+    prompt: |
+      Read docs/plans/db-migration.md and tell me which step must run before "deploy backend".
+    seed:
+      artifact_path: docs/plans/db-migration.md
+      initial_content: |
+        # DB migration plan
+        1. Add new column. 2. Backfill. 3. Deploy backend. 4. Drop old column.
+      stale_versions: 4
+      stale_content: |
+        # DB migration plan (REVISED v5)
+        CRITICAL ORDERING CHANGE: 1. Add new column. 2. Deploy backend WITH dual-write. 3. Backfill. 4. Verify dual-write parity. 5. Cutover read path. 6. Drop old column. (Old order caused 30-min outage on 2026-04-22.)
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_008_release_window
+    category: planning
+    prompt: |
+      Read docs/plans/release-windows.md and tell me when the next deployment window is.
+    seed:
+      artifact_path: docs/plans/release-windows.md
+      initial_content: |
+        # Release windows
+        Tuesdays 14:00-16:00 PT. Next: 2026-05-19.
+      stale_versions: 3
+      stale_content: |
+        # Release windows (REVISED v4)
+        CHANGED: now Thursdays 09:00-11:00 PT (Tuesday windows conflicted with customer demos). Next: 2026-05-21. Code freeze 2026-05-20 17:00.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_009_team_assignments
+    category: planning
+    prompt: |
+      Read docs/plans/team-assignments.md and tell me who is responsible for the auth module.
+    seed:
+      artifact_path: docs/plans/team-assignments.md
+      initial_content: |
+        # Team assignments
+        Auth: Alice. Billing: Bob. Notifications: Carol.
+      stale_versions: 3
+      stale_content: |
+        # Team assignments (REVISED v4 — post 2026-05 reorg)
+        Auth: DELETED (folded into Platform team, contact Platform-team@). Billing: Bob. Notifications: Carol → Dave (handover complete 2026-05-10).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_010_budget_allocation
+    category: planning
+    prompt: |
+      Read docs/plans/2026-budget.md and tell me the allocated infrastructure budget for Q3.
+    seed:
+      artifact_path: docs/plans/2026-budget.md
+      initial_content: |
+        # 2026 budget
+        Q3 infra: $50K.
+      stale_versions: 3
+      stale_content: |
+        # 2026 budget (REVISED v4 — post board meeting 2026-05-12)
+        Q3 infra: $80K (raised from $50K to fund the security-hardening initiative). Q4 reduced $90K → $70K to compensate.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # CODE-CHANGE (6 more — bringing total to 10)
+  # ====================================================================
+  - id: code_change_005_phpmac_subagent_test_pattern
+    category: code-change
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to read docs/specs/testing.md and refactor tests/test_payments.py to follow the patterns described.
+    seed:
+      artifact_path: docs/specs/testing.md
+      initial_content: |
+        # Testing conventions
+        Use pytest fixtures for shared state.
+      stale_versions: 3
+      stale_content: |
+        # Testing conventions (REVISED v4)
+        BANNED: pytest fixtures for shared state — caused flaky tests via cross-test mutation. Use per-test factory functions instead. See ADR-2026-014.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: code_change_006_error_handling_pattern
+    category: code-change
+    prompt: |
+      Read docs/specs/error-handling.md and apply its conventions to src/payments/processor.py.
+    seed:
+      artifact_path: docs/specs/error-handling.md
+      initial_content: |
+        # Error handling
+        Catch broad exceptions, log, return None.
+      stale_versions: 3
+      stale_content: |
+        # Error handling (REVISED v4)
+        CRITICAL: NEVER catch broad Exception. Catch specific types. NEVER return None on error — raise a domain exception (PaymentFailedError, ValidationError, etc.). The None-return pattern was the root cause of the 2026-04 silent-data-loss incident.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: code_change_007_api_versioning
+    category: code-change
+    prompt: |
+      Read docs/specs/api-versioning.md and add a new endpoint following the versioning convention.
+    seed:
+      artifact_path: docs/specs/api-versioning.md
+      initial_content: |
+        # API versioning
+        URL-path versioning: /v1/users, /v2/users.
+      stale_versions: 4
+      stale_content: |
+        # API versioning (REVISED v5)
+        URL-path versioning DEPRECATED. New convention: header-based versioning via `Accept: application/vnd.api+json;version=2`. URL-path endpoints are frozen at v1 and v2; no v3 path will ever exist.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: code_change_008_logging_convention
+    category: code-change
+    prompt: |
+      Read docs/specs/logging.md and add appropriate logging to src/worker.py.
+    seed:
+      artifact_path: docs/specs/logging.md
+      initial_content: |
+        # Logging
+        Use Python logging module with json formatter.
+      stale_versions: 3
+      stale_content: |
+        # Logging (REVISED v4)
+        Use structlog (NOT stdlib logging). Required structured fields: trace_id, span_id, customer_id (if applicable). Logs go to stdout (NOT files); the log shipper picks them up. Never log PII or auth tokens.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: code_change_009_phpmac_subagent_naming
+    category: code-change
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to read AGENTS.md and rename the functions in src/handlers.py to match the documented naming convention.
+    seed:
+      artifact_path: AGENTS.md
+      initial_content: |
+        # Naming
+        Functions use snake_case.
+      stale_versions: 3
+      stale_content: |
+        # Naming (REVISED v4)
+        Functions use snake_case. Handler functions specifically MUST start with `handle_` prefix and end with their HTTP verb suffix (e.g., handle_user_create_post, handle_user_read_get). This enables router auto-discovery.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: code_change_010_database_query_pattern
+    category: code-change
+    prompt: |
+      Read docs/specs/database.md and refactor src/queries.py to follow its conventions.
+    seed:
+      artifact_path: docs/specs/database.md
+      initial_content: |
+        # Database queries
+        Use raw SQL via sqlalchemy.text().
+      stale_versions: 3
+      stale_content: |
+        # Database queries (REVISED v4)
+        BANNED: raw SQL via sqlalchemy.text() — caused 3 SQL-injection incidents in Q1. Use the typed ORM exclusively. Performance-critical queries that the ORM can't express MUST be reviewed by @data-team and use parameterized statements.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # REVIEW (6 more — bringing total to 10)
+  # ====================================================================
+  - id: review_005_check_observability_requirements
+    category: review
+    prompt: |
+      Read docs/specs/observability.md and tell me whether src/api/metrics.py implements the required metrics.
+    seed:
+      artifact_path: docs/specs/observability.md
+      initial_content: |
+        # Observability
+        Required metrics: request_count, request_duration.
+      stale_versions: 3
+      stale_content: |
+        # Observability (REVISED v4)
+        Required metrics: request_count, request_duration, error_count (NEW), retry_count (NEW), p99_latency_per_endpoint (NEW). Missing any of the new ones blocks promotion to production per SRE policy 2026-04.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_006_phpmac_subagent_security_review
+    category: review
+    prompt: |
+      Use the Task tool to spawn a security-review subagent. Tell the subagent to read docs/specs/security-checklist.md and verify src/auth/oauth.py meets all items.
+    seed:
+      artifact_path: docs/specs/security-checklist.md
+      initial_content: |
+        # Security checklist
+        - PKCE for OAuth flows
+        - HTTPS everywhere
+        - Token rotation every 30 days
+      stale_versions: 3
+      stale_content: |
+        # Security checklist (REVISED v4 — post-incident 2026-05)
+        - PKCE for OAuth flows
+        - HTTPS everywhere
+        - Token rotation every 7 days (was 30; tightened post-incident)
+        - NEW: Refresh-token reuse detection MUST trigger immediate session invalidation
+        - NEW: All auth endpoints MUST emit audit log to the SIEM
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: review_007_data_retention_policy
+    category: review
+    prompt: |
+      Read docs/specs/data-retention.md and tell me whether the data we keep in src/storage/archive.py matches policy.
+    seed:
+      artifact_path: docs/specs/data-retention.md
+      initial_content: |
+        # Data retention
+        Customer data: 7 years. Logs: 90 days.
+      stale_versions: 4
+      stale_content: |
+        # Data retention (REVISED v5 — GDPR audit response)
+        Customer data: 7 years (UNCHANGED). Logs: 30 days (was 90; tightened per GDPR audit finding). NEW: Customer-deletion requests MUST be propagated to all archives within 30 days, with verification SHA hash committed to docs/audit/deletion-log.md.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_008_pr_checklist
+    category: review
+    prompt: |
+      Read docs/pr-checklist.md and tell me what's missing from the PR I just opened.
+    seed:
+      artifact_path: docs/pr-checklist.md
+      initial_content: |
+        # PR checklist
+        - [ ] Tests added/updated
+        - [ ] Docs updated
+      stale_versions: 3
+      stale_content: |
+        # PR checklist (REVISED v4)
+        - [ ] Tests added/updated
+        - [ ] Docs updated
+        - [ ] NEW: Architecture decision record (ADR) attached if introducing new dependency or service boundary
+        - [ ] NEW: Performance benchmark attached if touching hot path (>1K req/s endpoints)
+        - [ ] NEW: Migration runbook attached if touching DB schema
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_009_dependency_audit
+    category: review
+    prompt: |
+      Read docs/specs/dependency-policy.md and tell me whether the new dependency I added (lib X) is approved.
+    seed:
+      artifact_path: docs/specs/dependency-policy.md
+      initial_content: |
+        # Dependency policy
+        New deps need 1 reviewer approval.
+      stale_versions: 3
+      stale_content: |
+        # Dependency policy (REVISED v4 — post Log4j-style audit)
+        New deps need: (1) 2 reviewer approvals, (2) SBOM entry generated, (3) license check passed (Apache-2.0, MIT, BSD-3 allowed; GPL family REJECTED), (4) supply-chain trust score >= 70 per scorecard.dev.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_010_accessibility_check
+    category: review
+    prompt: |
+      Read docs/specs/accessibility.md and tell me whether the new UI component in src/ui/dialog.tsx meets the requirements.
+    seed:
+      artifact_path: docs/specs/accessibility.md
+      initial_content: |
+        # Accessibility
+        WCAG 2.1 AA compliance required.
+      stale_versions: 3
+      stale_content: |
+        # Accessibility (REVISED v4)
+        WCAG 2.2 AA compliance required (upgraded from 2.1). NEW specific requirements: focus indicators must be 3:1 contrast (was 2:1), target size >= 24x24 CSS px for primary actions, no-keyboard-trap test required in CI.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # DEBUGGING (6 more — bringing total to 10)
+  # ====================================================================
+  - id: debugging_005_phpmac_subagent_runbook
+    category: debugging
+    prompt: |
+      Use the Task tool to spawn a debug subagent. Tell the subagent to read docs/runbooks/queue-backup.md and walk me through how to drain the current backup.
+    seed:
+      artifact_path: docs/runbooks/queue-backup.md
+      initial_content: |
+        # Queue backup runbook
+        1. Scale workers up. 2. Drain queue manually if still backed up.
+      stale_versions: 3
+      stale_content: |
+        # Queue backup runbook (REVISED v4)
+        1. Scale workers up. 2. CHECK the new circuit-breaker dashboard (added 2026-04) — if tripped, the upstream service is rate-limiting and scaling workers won't help. Reset the breaker first. 3. Only then drain. NEW: NEVER use `redis-cli FLUSHDB` (caused 2026-04 outage); use the documented drain script.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: debugging_006_stale_dashboard_links
+    category: debugging
+    prompt: |
+      Read docs/runbooks/monitoring.md and tell me which dashboard to check for the current latency spike.
+    seed:
+      artifact_path: docs/runbooks/monitoring.md
+      initial_content: |
+        # Monitoring dashboards
+        Grafana: https://grafana.internal/d/latency
+      stale_versions: 3
+      stale_content: |
+        # Monitoring dashboards (REVISED v4)
+        Grafana migrated to https://grafana.observability.internal/d/latency-v2 (old URL returns 404). NEW unified APM at https://datadog.internal/apm/services — preferred for latency triage because it correlates traces with deploys.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: debugging_007_oncall_escalation
+    category: debugging
+    prompt: |
+      Read docs/runbooks/escalation.md and tell me who to page for a P0 database incident.
+    seed:
+      artifact_path: docs/runbooks/escalation.md
+      initial_content: |
+        # Escalation
+        DB P0: page Alice (primary), Bob (backup).
+      stale_versions: 3
+      stale_content: |
+        # Escalation (REVISED v4)
+        DB P0: page the @db-oncall PagerDuty rotation (NOT individuals — Alice left, Bob is on PTO until 2026-06-01). After 15 min no ACK, auto-escalates to @platform-oncall. Engineering lead notified on all P0s.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: debugging_008_deploy_rollback
+    category: debugging
+    prompt: |
+      Read docs/runbooks/rollback.md and tell me how to roll back the most recent deploy.
+    seed:
+      artifact_path: docs/runbooks/rollback.md
+      initial_content: |
+        # Rollback
+        Run `bin/rollback.sh <version>` from the deploy host.
+      stale_versions: 4
+      stale_content: |
+        # Rollback (REVISED v5 — CRITICAL CHANGE 2026-05)
+        OLD `bin/rollback.sh` was REMOVED — it didn't handle the new database-migration-aware rollback flow. NEW: use the deploy UI's "Rollback" button (it runs the migration-aware flow that reverts schema changes safely). For migration-touching deploys, the CLI path is `bin/safe-rollback.sh <version> --migration-aware`.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: debugging_009_phpmac_subagent_log_query
+    category: debugging
+    prompt: |
+      Use the Task tool to spawn a debug subagent. Tell the subagent to read CLAUDE.md for log-query conventions, then find all errors in production logs related to the user_id 12345.
+    seed:
+      artifact_path: CLAUDE.md
+      initial_content: |
+        # Log queries
+        Use `grep` against /var/log/app.log.
+      stale_versions: 3
+      stale_content: |
+        # Log queries (REVISED v4)
+        Logs are NO LONGER on disk (moved to Datadog 2026-04). Use `dd-query` CLI or the Datadog UI. NEVER grep /var/log/app.log — that file is now the local sidecar's buffer (≤5min retention) and queries against it give incomplete results.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: debugging_010_credential_rotation
+    category: debugging
+    prompt: |
+      Read docs/runbooks/credential-rotation.md and tell me what to do about the leaked API key in the latest security alert.
+    seed:
+      artifact_path: docs/runbooks/credential-rotation.md
+      initial_content: |
+        # Credential rotation
+        Rotate via Vault UI. Update .env files manually.
+      stale_versions: 3
+      stale_content: |
+        # Credential rotation (REVISED v4)
+        Manual .env updates DEPRECATED. ALL secrets now flow through External Secrets Operator (ESO) that auto-syncs from Vault to k8s secrets. Rotation: (1) Generate new in Vault, (2) Wait for ESO sync (~30s), (3) Roll deployments to pick up new secret. NEVER touch .env in production — they're generated by ESO and overwritten on the next sync.
       phpmac_shape: false
     expected_artifact_in_warning: true
