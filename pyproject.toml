@@ -64,6 +64,12 @@ pythonpath = ["src", "."]
 # refactor demo test suite. Test files must not live under any directory
 # whose name shadows a top-level package — for example, do NOT create
 # ``tests/examples/`` (would shadow the real ``examples/`` package).
+markers = [
+    "launch_gate: Unit 9 hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
+    "launch_gate_pilot: Unit 9 pilot run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
+]
+# Skip launch_gate markers in default unit test runs.
+addopts = "-m 'not launch_gate and not launch_gate_pilot'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

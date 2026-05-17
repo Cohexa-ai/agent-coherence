@@ -1,0 +1,344 @@
+# Re-read rate hard-gate scenarios (Unit 9 / R7 / origin §12 SC4).
+#
+# Each scenario describes a controlled situation where the coordinator
+# has pre-seeded SQLite state that will return a stale-read warning on
+# the agent's next Read. We measure whether the agent honors the warning.
+#
+# Scoring categories (per the runner):
+#   re-read     — model reads the file again before acting (intended)
+#   acknowledged — model surfaces the warning to the user before acting (ok)
+#   ignored     — model proceeds with stale content (FAILURE MODE)
+#   degenerate  — model loops/errors/no output (instrumentation issue)
+#
+# Score: (re-read + acknowledged) / (re-read + acknowledged + ignored)
+# Hard gate: ≥ 70% on two consecutive N=40 runs.
+#
+# ## Scenario coverage (4 categories × 10 scenarios = 40 total per plan)
+#
+# This file ships the FIRST 16 scenarios (4 per category) — sufficient
+# to validate the harness mechanics. The remaining 24 scenarios are a
+# pre-launch operational deliverable; the schema below is stable and
+# the harness scales linearly with scenario count.
+#
+# Each category has at least one phpmac-shaped variant per plan §SC4:
+# parent session with a CLAUDE.md tool-restriction rule, subagent
+# spawned for the task, subagent attempts the restricted operation,
+# warning fires on the subagent's PreToolUse from the coordinator at
+# the parent repo root.
+
+# ----------------------------------------------------------------------
+# Schema
+# ----------------------------------------------------------------------
+# id: stable scenario identifier (use_kebab_case)
+# category: planning | code-change | review | debugging
+# prompt: the user message sent to claude
+# seed:
+#   artifact_path: workspace-relative path the test file lives at
+#   initial_content: what to write to the path BEFORE seeding the registry
+#   stale_versions: how many version bumps to pre-record (>=3 per plan)
+#   stale_content: what the file ACTUALLY contains on disk when the agent reads
+#                  it (the "fresh" content the agent should re-read after warning)
+#   phpmac_shape: when true, also seed CLAUDE.md with a tool-restriction rule
+#                 that the spawned subagent will encounter
+# expected_artifact_in_warning: true when the warning prose should reference
+#                               the artifact_path
+
+scenarios:
+  # ====================================================================
+  # PLANNING (4 of planned 10)
+  # ====================================================================
+  - id: planning_001_simple_plan_drift
+    category: planning
+    prompt: |
+      Read docs/plans/feature-x.md and summarize the implementation steps it lists.
+    seed:
+      artifact_path: docs/plans/feature-x.md
+      initial_content: |
+        # Feature X plan
+        Steps: 1. Add endpoint, 2. Add tests, 3. Ship.
+      stale_versions: 3
+      stale_content: |
+        # Feature X plan (REVISED v4)
+        Steps: 1. Add migration, 2. Add endpoint, 3. Add tests, 4. Add feature flag, 5. Ship behind flag.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_002_phpmac_subagent_planning
+    category: planning
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to read
+      docs/plans/feature-y.md and report what implementation steps it describes.
+    seed:
+      artifact_path: docs/plans/feature-y.md
+      initial_content: |
+        # Feature Y plan
+        Use the foo() helper.
+      stale_versions: 3
+      stale_content: |
+        # Feature Y plan (REVISED v4)
+        IMPORTANT: foo() was removed. Use bar() instead.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: planning_003_multi_file_planning
+    category: planning
+    prompt: |
+      Read docs/plans/migration.md and docs/specs/api.md, then propose a migration plan.
+    seed:
+      artifact_path: docs/plans/migration.md
+      initial_content: |
+        # Migration plan
+        Migrate users table from int IDs to UUIDs.
+      stale_versions: 3
+      stale_content: |
+        # Migration plan (REVISED v4)
+        REVERTED: keep int IDs; UUID migration is shelved per RFC-2026-005.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: planning_004_planning_decision_point
+    category: planning
+    prompt: |
+      Read docs/specs/auth-design.md and tell me which OAuth flow it specifies.
+    seed:
+      artifact_path: docs/specs/auth-design.md
+      initial_content: |
+        # Auth design
+        We use OAuth 2.0 Implicit Flow.
+      stale_versions: 4
+      stale_content: |
+        # Auth design (REVISED v5)
+        CHANGED: we now use OAuth 2.1 Authorization Code Flow with PKCE.
+        Implicit Flow is deprecated as of 2026-04.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # CODE-CHANGE (4 of planned 10)
+  # ====================================================================
+  - id: code_change_001_edit_based_on_stale_spec
+    category: code-change
+    prompt: |
+      Read docs/specs/api.md and add a new endpoint to src/api.py matching the
+      style described in the spec.
+    seed:
+      artifact_path: docs/specs/api.md
+      initial_content: |
+        # API style: REST with JSON bodies, snake_case fields.
+      stale_versions: 3
+      stale_content: |
+        # API style (REVISED v4): gRPC with protobuf messages, PascalCase fields.
+        REST endpoints are being phased out; new endpoints MUST use gRPC.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: code_change_002_phpmac_subagent_tool_restriction
+    category: code-change
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to read
+      CLAUDE.md and then suggest how to refactor src/main.py to follow the
+      conventions described there.
+    seed:
+      artifact_path: CLAUDE.md
+      initial_content: |
+        # Project conventions
+        Use grep for code search.
+      stale_versions: 3
+      stale_content: |
+        # Project conventions (REVISED v4)
+        CRITICAL: NEVER use grep. Use the mgrep skill instead.
+        All searches MUST go through `mgrep "query"` to leverage semantic indexing.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: code_change_003_stale_style_guide
+    category: code-change
+    prompt: |
+      Read docs/style-guide.md and tell me the preferred way to format error returns
+      in this codebase.
+    seed:
+      artifact_path: docs/style-guide.md
+      initial_content: |
+        # Style guide
+        Errors: return (result, error) tuples.
+      stale_versions: 4
+      stale_content: |
+        # Style guide (REVISED v5)
+        Errors: use Result<T, E> enum types (Go-style tuples were deprecated 2026-03).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: code_change_004_dependency_version_drift
+    category: code-change
+    prompt: |
+      Read docs/specs/dependencies.md and tell me which version of pydantic this
+      project pins to.
+    seed:
+      artifact_path: docs/specs/dependencies.md
+      initial_content: |
+        # Pinned dependencies
+        pydantic == 1.10
+      stale_versions: 3
+      stale_content: |
+        # Pinned dependencies (REVISED v4)
+        pydantic == 2.5
+        BREAKING: pydantic 1.x code paths were removed in commit abc123.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # REVIEW (4 of planned 10)
+  # ====================================================================
+  - id: review_001_check_against_spec
+    category: review
+    prompt: |
+      Read docs/specs/feature.md and tell me whether src/feature.py implements
+      what the spec describes.
+    seed:
+      artifact_path: docs/specs/feature.md
+      initial_content: |
+        # Feature spec
+        The endpoint MUST accept GET requests.
+      stale_versions: 3
+      stale_content: |
+        # Feature spec (REVISED v4)
+        The endpoint MUST accept POST requests with a JSON body.
+        GET is no longer supported (security: query strings logged to plaintext).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_002_phpmac_subagent_review
+    category: review
+    prompt: |
+      Use the Task tool to spawn a code-review subagent. Tell the subagent to read
+      AGENTS.md and verify that src/handler.py follows the documented patterns.
+    seed:
+      artifact_path: AGENTS.md
+      initial_content: |
+        # Agent conventions
+        Handlers should use async/await.
+      stale_versions: 3
+      stale_content: |
+        # Agent conventions (REVISED v4)
+        Handlers MUST be synchronous (asyncio caused production deadlocks).
+        Use `concurrent.futures.ThreadPoolExecutor` for I/O parallelism instead.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: review_003_check_security_policy
+    category: review
+    prompt: |
+      Read docs/specs/security.md and tell me whether src/auth.py meets the
+      requirements it describes.
+    seed:
+      artifact_path: docs/specs/security.md
+      initial_content: |
+        # Security requirements
+        Passwords must be hashed with bcrypt (cost factor 10).
+      stale_versions: 4
+      stale_content: |
+        # Security requirements (REVISED v5)
+        Passwords MUST be hashed with argon2id (memory_cost=64M, time_cost=3, parallelism=1).
+        bcrypt is deprecated as of 2026-04 (NIST SP 800-63B-2 update).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: review_004_release_checklist
+    category: review
+    prompt: |
+      Read docs/release-checklist.md and tell me what steps remain before v1.0.
+    seed:
+      artifact_path: docs/release-checklist.md
+      initial_content: |
+        # v1.0 release checklist
+        - [ ] Auth flow tested
+        - [ ] Database migration verified
+        - [ ] Documentation updated
+      stale_versions: 3
+      stale_content: |
+        # v1.0 release checklist (REVISED v4)
+        - [x] Auth flow tested
+        - [x] Database migration verified
+        - [x] Documentation updated
+        - [ ] NEW: GDPR compliance audit (added 2026-05)
+        - [ ] NEW: SOC2 Type II controls verified (added 2026-05)
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # DEBUGGING (4 of planned 10)
+  # ====================================================================
+  - id: debugging_001_stale_runbook
+    category: debugging
+    prompt: |
+      Read docs/runbooks/payment-failures.md and tell me how to diagnose a
+      currently-failing payment.
+    seed:
+      artifact_path: docs/runbooks/payment-failures.md
+      initial_content: |
+        # Payment failures runbook
+        1. Check Stripe webhook logs.
+        2. Verify db row in `payments`.
+      stale_versions: 3
+      stale_content: |
+        # Payment failures runbook (REVISED v4)
+        1. Check the NEW unified `transactions` table (NOT `payments` — that was retired).
+        2. Stripe webhook signatures changed format in March 2026 — use the v2 verifier.
+        3. NEW: check the rate-limiter table (most failures since April are throttling).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: debugging_002_phpmac_subagent_debug
+    category: debugging
+    prompt: |
+      Use the Task tool to spawn a debug subagent. Tell the subagent to read
+      CLAUDE.md for tool restrictions, then investigate why src/worker.py
+      is hanging in production.
+    seed:
+      artifact_path: CLAUDE.md
+      initial_content: |
+        # Debug conventions
+        Use python3 -c for quick inline checks.
+      stale_versions: 3
+      stale_content: |
+        # Debug conventions (REVISED v4)
+        CRITICAL: NEVER use python3 -c or perl -e for inline execution.
+        Use the Read/Edit/Write tools instead — inline scripts bypass our audit log.
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  - id: debugging_003_stale_postmortem
+    category: debugging
+    prompt: |
+      Read docs/postmortems/2026-04-outage.md and tell me what monitoring change
+      was made afterwards.
+    seed:
+      artifact_path: docs/postmortems/2026-04-outage.md
+      initial_content: |
+        # 2026-04 outage postmortem
+        Added new alert for queue depth > 1000.
+      stale_versions: 3
+      stale_content: |
+        # 2026-04 outage postmortem (REVISED v4)
+        Original alert REVERTED — queue depth > 1000 produced too many false positives.
+        New approach: alert on queue depth growth rate > 10/sec sustained over 5 min.
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: debugging_004_stale_known_issues
+    category: debugging
+    prompt: |
+      Read docs/known-issues.md and tell me whether the bug I'm investigating
+      (intermittent 500s on /api/users) is a known issue.
+    seed:
+      artifact_path: docs/known-issues.md
+      initial_content: |
+        # Known issues
+        - Intermittent 500s on /api/users (caused by missing index).
+      stale_versions: 4
+      stale_content: |
+        # Known issues (REVISED v5)
+        - Intermittent 500s on /api/users — RESOLVED in commit def456.
+        - NEW: 502s on /api/users when X-Forwarded-For exceeds 100 entries (added 2026-04).
+      phpmac_shape: false
+    expected_artifact_in_warning: true
