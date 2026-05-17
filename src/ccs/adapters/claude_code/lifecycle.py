@@ -344,7 +344,14 @@ _SPAWNED_REGISTRY: dict[str, _SpawnedEntry] = {}
 
 def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
     """Create ``<root>/.coherence/`` with mode 0700 if missing. Returns
-    the dir path, or None if the parent repo is read-only."""
+    the dir path, or None if the parent repo is read-only.
+
+    Also writes ``.coherence/.gitignore`` containing ``*`` per KTD-13 so
+    a careless ``git add .`` doesn't accidentally commit the SQLite
+    state.db (containing MESI state + agent UUIDs), the hook.secret
+    (a credential), or the server.pid file. The README claims these are
+    auto-gitignored — this is the implementation.
+    """
     coherence_dir = coordinator_root / ".coherence"
     try:
         coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -354,6 +361,17 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
             coordinator_root, exc,
         )
         return None
+    # Write .gitignore (idempotent — only write if missing to avoid
+    # clobbering any operator customization)
+    gitignore = coherence_dir / ".gitignore"
+    if not gitignore.exists():
+        try:
+            gitignore.write_text("*\n")
+        except OSError as exc:
+            logger.warning(
+                "could not write %s: %s — workspace data risks being committed",
+                gitignore, exc,
+            )
     return coherence_dir
 
 
