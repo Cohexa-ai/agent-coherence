@@ -828,10 +828,13 @@ class SqliteArtifactRegistry:
         invalidated by ``preempter_agent_id``. The next hook handler that
         sees ``victim_agent_id`` should pop and surface the notice.
 
-        UPSERT semantics: if the victim is preempted again on the same
-        artifact (by a third agent) before the first notice is popped, the
-        latest preempter wins — that's the right UX (surface the most
-        recent revocation, not the oldest).
+        UPSERT semantics (F5 hardening): the row stays at the notice with
+        the LATEST wall-clock timestamp, not the latest commit order. If
+        Y commits at ts=100 then Z commits at ts=50 (out-of-order due to
+        scheduling jitter), Y's notice wins because Y's preemption is the
+        more recent fact about the world. The WHERE clause makes the
+        update conditional on excluded.preempted_at_unix_ts being strictly
+        greater than the existing row's.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -844,6 +847,7 @@ class SqliteArtifactRegistry:
                     ON CONFLICT(agent_id, artifact_id) DO UPDATE SET
                         preempter_agent_id = excluded.preempter_agent_id,
                         preempted_at_unix_ts = excluded.preempted_at_unix_ts
+                    WHERE excluded.preempted_at_unix_ts > pending_notices.preempted_at_unix_ts
                     """,
                     (
                         victim_agent_id.hex,
@@ -892,8 +896,8 @@ class SqliteArtifactRegistry:
     ) -> Optional[tuple[UUID, float]]:
         """Non-destructive lookup: is there a pending notice for this
         (agent, artifact) pair? Returns (preempter_agent_id, ts) or None.
-        Used by post-edit failure path to enrich the error reason without
-        consuming the notice (so the next pre-event still sees it)."""
+        Kept for telemetry / status surface use. The post-edit failure path
+        uses :meth:`pop_preemption_notice` instead (F4 single-consumer)."""
         with self._lock:
             row = self._conn.execute(
                 """
@@ -905,6 +909,66 @@ class SqliteArtifactRegistry:
         if row is None:
             return None
         return UUID(hex=row[0]), float(row[1])
+
+    def pop_preemption_notice(
+        self, agent_id: UUID, artifact_id: UUID
+    ) -> Optional[tuple[UUID, float]]:
+        """F4 hardening: atomically SELECT + DELETE the single notice for
+        this (agent, artifact) pair. Returns (preempter_agent_id, ts) or
+        None. Used by the post-edit failure path so the notice is consumed
+        at the point it surfaces in the error reason, preventing the next
+        pre-event from re-emitting the same preemption prose."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT preempter_agent_id, preempted_at_unix_ts
+                    FROM pending_notices WHERE agent_id = ? AND artifact_id = ?
+                    """,
+                    (agent_id.hex, artifact_id.hex),
+                ).fetchone()
+                if row is not None:
+                    self._conn.execute(
+                        "DELETE FROM pending_notices WHERE agent_id = ? AND artifact_id = ?",
+                        (agent_id.hex, artifact_id.hex),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        if row is None:
+            return None
+        return UUID(hex=row[0]), float(row[1])
+
+    def evict_stale_notices(
+        self, *, max_age_sec: float, now_unix: Optional[float] = None
+    ) -> int:
+        """F2 hardening: bound storage by deleting notices older than
+        ``max_age_sec``. Returns rows deleted. Called periodically (e.g.
+        on session register) so orphan notices for sessions that never
+        return — e.g. dead Claude Code processes — don't accumulate.
+
+        ``now_unix`` is parameterized so tests can pin the clock without
+        monkey-patching ``time.time``; defaults to ``time.time()``.
+        """
+        if now_unix is None:
+            import time as _time
+            now_unix = _time.time()
+        cutoff = now_unix - max_age_sec
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "DELETE FROM pending_notices WHERE preempted_at_unix_ts < ?",
+                    (cutoff,),
+                )
+                deleted = cursor.rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return deleted
 
     # ------------------------------------------------------------------
     # Internals

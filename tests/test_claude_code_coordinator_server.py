@@ -639,6 +639,149 @@ def test_a1_no_preemption_no_notice(client: _Client) -> None:
 
 
 # ----------------------------------------------------------------------
+# A1 hardening — adversarial review findings F1-F5
+# ----------------------------------------------------------------------
+
+
+def test_a1_stop_hook_surfaces_pending_notices(client: _Client) -> None:
+    """F1 (P0): the canonical phpmac case — X preempted, X never fires
+    another pre-event (model decided next action is a Bash/Grep, or turn
+    just ends). Stop fires. Without this, X's notice orphans and X never
+    learns. Fix: Stop pops + includes in response body."""
+    x = _sid("X"); y = _sid("Y")
+    # X holds E
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    # Y preempts X
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    # X's turn ends without another pre-event — Stop fires
+    s, body = client.post("/hooks/session-stop", {"session_id": x})
+    assert s == 200
+    assert body["ok"] is True
+    # Response body MUST include the preemption notices (telemetry-visible
+    # in stream-json) so the silent-drop is impossible.
+    assert "notices" in body, f"Stop response must surface pending notices; got {body}"
+    notices = body["notices"]
+    assert len(notices) >= 1
+    # Notice references the preempted artifact + preempter
+    notice = notices[0]
+    assert notice["path"] == "plan.md"
+    assert notice["preempter_session_id"].startswith(y[:8]) or notice["preempter_session_id"] == y
+
+
+def test_a1_stop_hook_consumes_notices_no_orphan(client: _Client) -> None:
+    """F1 consequence: Stop POPS notices, so they don't orphan if X never
+    returns. After Stop, a subsequent pre-read by X shouldn't see the
+    same notice text (already consumed at Stop)."""
+    x = _sid("X"); y = _sid("Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    # Stop consumes
+    _, stop_body = client.post("/hooks/session-stop", {"session_id": x})
+    assert "notices" in stop_body and len(stop_body["notices"]) >= 1
+    # X's hypothetical next-turn pre-read MUST NOT re-surface the same notice
+    _, body = client.post("/hooks/pre-read", {"session_id": x, "path": "plan.md"})
+    if "hookSpecificOutput" in body:
+        msg = body["hookSpecificOutput"]["additionalContext"]
+        # Notice was consumed at Stop; pre-read may still show stale-read
+        # warning (X is INVALID) but should not contain preemption prose.
+        assert "preempted" not in msg.lower() and "revoked" not in msg.lower(), (
+            f"notice should be consumed at Stop; pre-read re-surfaced: {msg}"
+        )
+
+
+def test_a1_prose_capped_under_10kb_with_many_notices(client: _Client) -> None:
+    """F3 (P1): N preemption notices compound prose linearly. Cap at 4KB
+    prose (~10KB total with prepended stale-read warnings). Coalesce
+    after first 3 notices."""
+    x = _sid("X")
+    # Set up 20 artifacts under tracked paths, X holds E on all, then 20
+    # other sessions each preempt X on a distinct artifact.
+    paths = [f"docs/specs/preempt-{i:02d}.md" for i in range(20)]
+    for path in paths:
+        client.post("/hooks/pre-edit", {"session_id": x, "path": path})
+    for i, path in enumerate(paths):
+        attacker = _sid(f"attacker-{i}")
+        client.post("/hooks/pre-edit", {"session_id": attacker, "path": path})
+    # X's next hook will see 20 pending notices
+    _, body = client.post("/hooks/pre-read",
+                          {"session_id": x, "path": paths[0]})
+    if "hookSpecificOutput" in body:
+        msg = body["hookSpecificOutput"]["additionalContext"]
+        assert len(msg.encode("utf-8")) <= 10240, (
+            f"additionalContext should fit in 10KB cap; got {len(msg.encode('utf-8'))} bytes"
+        )
+        # And the message should mention coalescing (e.g., "and N more")
+        # so the model knows there are unsurfaced notices.
+        # Permit "more" or "additional" or a count expression
+        assert any(w in msg.lower() for w in ("more", "additional", "(...)")), (
+            f"prose should signal coalescing when notices truncated; got: {msg}"
+        )
+
+
+def test_a1_orphan_notices_evicted_after_ttl(coordinator) -> None:
+    """F2 (P1): orphan notices (victim session never returns to pop) are
+    eventually evicted to bound state growth. Registry exposes
+    evict_stale_notices(max_age_sec) for the lifecycle sweep."""
+    import time
+    # Create a notice manually with an old timestamp
+    from uuid import UUID, uuid4
+    victim = uuid4()
+    preempter = uuid4()
+    # Need an artifact_id that exists (FK)
+    from ccs.core.types import Artifact
+    art = Artifact(id=uuid4(), name="orphan-test.md", version=1, content_hash="h")
+    coordinator.registry.register_artifact(art, content="")
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=victim,
+        artifact_id=art.id,
+        preempter_agent_id=preempter,
+        preempted_at_unix_ts=time.time() - 3600,  # 1 hour old
+    )
+    # Sanity: notice present
+    notices = coordinator.registry.pop_pending_notices(victim)
+    coordinator.registry.record_preemption_notice(  # re-record after pop drained
+        victim_agent_id=victim,
+        artifact_id=art.id,
+        preempter_agent_id=preempter,
+        preempted_at_unix_ts=time.time() - 3600,
+    )
+    # Evict everything older than 30 minutes
+    evicted = coordinator.registry.evict_stale_notices(max_age_sec=1800)
+    assert evicted >= 1, f"expected to evict the 1-hour-old notice; evicted {evicted}"
+    # Now empty
+    assert coordinator.registry.pop_pending_notices(victim) == []
+
+
+def test_a1_upsert_uses_wall_clock_not_commit_order(coordinator) -> None:
+    """F5 (P3): UPSERT must keep the most-recent-by-WALL-CLOCK notice,
+    not the most-recent-by-COMMIT-order. If Y commits at clock=100 but
+    Z commits later at clock=99 (out-of-order), the row stays at Y's
+    record (later wall-clock)."""
+    from uuid import uuid4
+    from ccs.core.types import Artifact
+    victim = uuid4()
+    art = Artifact(id=uuid4(), name="upsert-test.md", version=1, content_hash="h")
+    coordinator.registry.register_artifact(art, content="")
+    y = uuid4(); z = uuid4()
+    # Record Y at clock=100 (later in wall-clock)
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=victim, artifact_id=art.id,
+        preempter_agent_id=y, preempted_at_unix_ts=100.0,
+    )
+    # Then record Z at clock=50 (earlier in wall-clock, later in commit order)
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=victim, artifact_id=art.id,
+        preempter_agent_id=z, preempted_at_unix_ts=50.0,
+    )
+    # The remaining notice should be Y's (later wall-clock wins)
+    notices = coordinator.registry.pop_pending_notices(victim)
+    assert len(notices) == 1
+    artifact_id, preempter, ts = notices[0]
+    assert preempter == y, f"expected Y (later wall-clock) to win, got {preempter}"
+    assert ts == 100.0
+
+
+# ----------------------------------------------------------------------
 # Boundary validators (A2 + A3 + A8 — adversarial review hardening)
 # ----------------------------------------------------------------------
 

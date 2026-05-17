@@ -660,13 +660,19 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
                 content_hash=content_hash,
             )
         except CoherenceError as exc:
-            # A1: if this commit failed because the grant was preempted
+            # A1 + F4: if this commit failed because the grant was preempted
             # silently, enrich the reason with the preemption context so
             # the caller (and any stream-json telemetry) sees WHO took the
             # grant and WHEN — not just the generic CoherenceError text.
-            notice = coordinator.registry.peek_preemption_notice(agent_id, artifact_id)
-            if notice is not None:
-                preempter_id, preempted_at = notice
+            #
+            # F4 (P2): consume the notice here (single-consumer semantics) so
+            # the next pre-event for this (agent, artifact) does NOT re-emit
+            # the same preemption prose. The subagent flagged this as a
+            # double-emit hazard — the post-edit-failure response IS the
+            # surfacing channel for this specific case.
+            popped = _pop_specific_notice(coordinator, agent_id, artifact_id)
+            if popped is not None:
+                preempter_id, preempted_at = popped
                 preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
@@ -717,7 +723,38 @@ def _handle_session_stop(req, coordinator: CoordinatorHTTPServer) -> None:
                 released.append(artifact.name)
             except CoherenceError as exc:
                 logger.warning("session-stop release failed for %s: %s", artifact_id, exc)
-        return {"ok": True, "released_artifacts": released}
+
+        # F1 (P0): pop any pending preemption notices for the ending session.
+        # The phpmac canonical case: X was preempted, but X's next action was
+        # a Bash/Grep (not a tracked file op), or the turn just ended — so
+        # no pre-read / pre-edit / post-edit fires to drain the notice queue.
+        # Without this drain, notices orphan indefinitely (or until F2 evict).
+        # We surface them in the response body (telemetry-visible via
+        # stream-json `--include-hook-events`) AND, opportunistically, as
+        # `additionalContext` so any post-Stop processing or human-readable
+        # log still carries the signal.
+        pending = coordinator.registry.pop_pending_notices(agent_id)
+        notices_payload: list[dict] = []
+        for art_id, preempter_id, ts in pending:
+            art = coordinator.registry.get_artifact(art_id)
+            preempter_session = _agent_id_to_session(coordinator, preempter_id) or ""
+            notices_payload.append({
+                "path": art.name if art else "<unknown-artifact>",
+                "preempter_session_id": preempter_session,
+                "preempter_session_short": (preempter_session[:8] if preempter_session else "<unknown>"),
+                "preempted_at_unix_ts": ts,
+                "preempted_at_iso": _iso_utc(ts),
+            })
+
+        response: dict = {"ok": True, "released_artifacts": released}
+        if notices_payload:
+            response["notices"] = notices_payload
+            # Render prose for stream-json consumers / human inspection.
+            response["hookSpecificOutput"] = {
+                "hookEventName": "Stop",
+                "additionalContext": _build_preemption_text(coordinator, pending),
+            }
+        return response
 
     _run_or_degrade(req, coordinator, work)
 
@@ -874,18 +911,50 @@ def _iso_utc(unix_ts: float) -> str:
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
 
 
+def _pop_specific_notice(
+    coordinator: CoordinatorHTTPServer,
+    agent_id: UUID,
+    artifact_id: UUID,
+) -> Optional[tuple[UUID, float]]:
+    """F4 hardening helper: atomically consume a single (agent, artifact)
+    preemption notice. Returns (preempter_agent_id, ts) or None."""
+    return coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
+
+
+#: F3 hardening — render up to this many notices verbatim; coalesce the
+#: rest into a single "Plus K more …" line that points at the status surface.
+#: Chosen so the rendered prose stays comfortably under Claude Code's 10KB
+#: additionalContext cap even with the prepended stale-read warning (each
+#: verbatim line ≈ 250 bytes; budget of 3 × 250 + header/footer keeps total
+#: well under 4KB before any stale-read prepend).
+_PREEMPTION_PROSE_VERBATIM_CAP = 3
+
+
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
     notices: list[tuple[UUID, UUID, float]],
 ) -> str:
-    """A1: render pending preemption notices as additionalContext prose.
+    """A1 + F3: render pending preemption notices as additionalContext prose.
 
     notices: list of (artifact_id, preempter_agent_id, preempted_at_unix_ts).
     Variance per invocation comes from the timestamps (real preemption time)
-    + the session-id prefixes. Multiple notices → multi-line prose.
+    + the session-id prefixes.
+
+    F3 hardening: render newest-first up to ``_PREEMPTION_PROSE_VERBATIM_CAP``
+    notices in full. If more remain, coalesce them into a single overflow line
+    pointing at the ``/agent-coherence status`` console for the full list.
+    This bounds the prose to a constant-size block regardless of N, sidesteps
+    Claude Code's 10KB additionalContext cap, and uses the status surface as
+    the overflow channel rather than silently truncating.
     """
+    # Sort newest first — the most recent preemption is the most informative
+    # signal for the agent's next decision.
+    sorted_notices = sorted(notices, key=lambda n: n[2], reverse=True)
+    verbatim = sorted_notices[:_PREEMPTION_PROSE_VERBATIM_CAP]
+    overflow = sorted_notices[_PREEMPTION_PROSE_VERBATIM_CAP:]
+
     lines: list[str] = ["⚠ Coordinator notice: your EXCLUSIVE grant was preempted:"]
-    for artifact_id, preempter_id, ts in notices:
+    for artifact_id, preempter_id, ts in verbatim:
         artifact = coordinator.registry.get_artifact(artifact_id)
         path = artifact.name if artifact else "<unknown-artifact>"
         preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
@@ -893,6 +962,12 @@ def _build_preemption_text(
             f"  • {path} — preempted/revoked by session {preempter_session[:8]} "
             f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
             f"in your worktree but is NOT reflected in the coordinator's version."
+        )
+    if overflow:
+        lines.append(
+            f"  • Plus {len(overflow)} more preemptions since your last activity; "
+            f"run `/agent-coherence status` (or query GET /status on the coordinator) "
+            f"for the full list."
         )
     lines.append(
         "Re-read affected files before continuing if you need the latest "
