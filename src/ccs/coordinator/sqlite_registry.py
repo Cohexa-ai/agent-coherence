@@ -217,6 +217,21 @@ class SqliteArtifactRegistry:
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            -- A1: preemption notices. When one agent invalidates another's
+            -- M∪E grant (via CoordinatorService.write), the victim gets a
+            -- pending notice that surfaces on their next pre-read / pre-edit
+            -- hook. PRIMARY KEY (agent_id, artifact_id) means a second
+            -- preemption on the same (victim, artifact) UPSERTs — the
+            -- latest preempter wins, which is the right UX.
+            CREATE TABLE pending_notices (
+                agent_id              TEXT NOT NULL,
+                artifact_id           TEXT NOT NULL,
+                preempter_agent_id    TEXT NOT NULL,
+                preempted_at_unix_ts  REAL NOT NULL,
+                PRIMARY KEY (agent_id, artifact_id),
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+            );
             """
         )
         # Seed instance_id and sequence counter.
@@ -244,6 +259,21 @@ class SqliteArtifactRegistry:
         # Caller's explicit instance_id wins (rare; typically used in tests).
         self._instance_id = instance_id_override or rows["instance_id"]
         self._seq = int(rows["sequence_number"])
+        # A1 forward-compat: ensure pending_notices exists even on dbs
+        # initialized before this table was added. PRAGMA user_version stays
+        # at 1; this is an additive change that doesn't warrant a migration.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_notices (
+                agent_id              TEXT NOT NULL,
+                artifact_id           TEXT NOT NULL,
+                preempter_agent_id    TEXT NOT NULL,
+                preempted_at_unix_ts  REAL NOT NULL,
+                PRIMARY KEY (agent_id, artifact_id),
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+            )
+            """
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -781,6 +811,100 @@ class SqliteArtifactRegistry:
                 "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
             ).fetchone()
         return UUID(hex=row[0]) if row else None
+
+    # ------------------------------------------------------------------
+    # A1 — Preemption notices (silent-grant-revocation surfacing)
+    # ------------------------------------------------------------------
+
+    def record_preemption_notice(
+        self,
+        *,
+        victim_agent_id: UUID,
+        artifact_id: UUID,
+        preempter_agent_id: UUID,
+        preempted_at_unix_ts: float,
+    ) -> None:
+        """Record that ``victim_agent_id`` had its M∪E grant on ``artifact_id``
+        invalidated by ``preempter_agent_id``. The next hook handler that
+        sees ``victim_agent_id`` should pop and surface the notice.
+
+        UPSERT semantics: if the victim is preempted again on the same
+        artifact (by a third agent) before the first notice is popped, the
+        latest preempter wins — that's the right UX (surface the most
+        recent revocation, not the oldest).
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO pending_notices
+                        (agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(agent_id, artifact_id) DO UPDATE SET
+                        preempter_agent_id = excluded.preempter_agent_id,
+                        preempted_at_unix_ts = excluded.preempted_at_unix_ts
+                    """,
+                    (
+                        victim_agent_id.hex,
+                        artifact_id.hex,
+                        preempter_agent_id.hex,
+                        preempted_at_unix_ts,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def pop_pending_notices(
+        self, agent_id: UUID
+    ) -> list[tuple[UUID, UUID, float]]:
+        """Atomically SELECT and DELETE all pending notices for ``agent_id``.
+        Returns list of ``(artifact_id, preempter_agent_id, preempted_at_unix_ts)``.
+        Empty list if no pending notices."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT artifact_id, preempter_agent_id, preempted_at_unix_ts
+                    FROM pending_notices WHERE agent_id = ?
+                    """,
+                    (agent_id.hex,),
+                ).fetchall()
+                if rows:
+                    self._conn.execute(
+                        "DELETE FROM pending_notices WHERE agent_id = ?",
+                        (agent_id.hex,),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return [
+            (UUID(hex=r[0]), UUID(hex=r[1]), float(r[2]))
+            for r in rows
+        ]
+
+    def peek_preemption_notice(
+        self, agent_id: UUID, artifact_id: UUID
+    ) -> Optional[tuple[UUID, float]]:
+        """Non-destructive lookup: is there a pending notice for this
+        (agent, artifact) pair? Returns (preempter_agent_id, ts) or None.
+        Used by post-edit failure path to enrich the error reason without
+        consuming the notice (so the next pre-event still sees it)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT preempter_agent_id, preempted_at_unix_ts
+                FROM pending_notices WHERE agent_id = ? AND artifact_id = ?
+                """,
+                (agent_id.hex, artifact_id.hex),
+            ).fetchone()
+        if row is None:
+            return None
+        return UUID(hex=row[0]), float(row[1])
 
     # ------------------------------------------------------------------
     # Internals

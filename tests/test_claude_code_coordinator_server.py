@@ -532,6 +532,113 @@ def test_stale_warnings_vary_per_invocation(client: _Client) -> None:
 
 
 # ----------------------------------------------------------------------
+# A1 — Preemption notice (silent-grant-revocation surfacing)
+# ----------------------------------------------------------------------
+
+
+def test_a1_preemption_surfaces_on_victim_next_pre_read(client: _Client) -> None:
+    """A1 load-bearing test (canonical phpmac scenario).
+
+    Sequence: X pre-edits (holds E) → Y pre-edits (silently invalidates X) →
+    X's next pre-read MUST surface a preemption notice naming Y + the
+    artifact + when. Without this, X never learns its grant was revoked
+    and X's content silently fails to land in the coordinator's view."""
+    x = _sid("X"); y = _sid("Y")
+    # X acquires EXCLUSIVE
+    s, _ = client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    assert s == 200
+    # Y preempts X (Y now holds E, X is INVALID, X received NO notification)
+    s, _ = client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    assert s == 200
+    # X's NEXT pre-read MUST surface the preemption via hookSpecificOutput
+    status, body = client.post("/hooks/pre-read", {"session_id": x, "path": "plan.md"})
+    assert status == 200, body
+    assert "hookSpecificOutput" in body, (
+        "X's next hook MUST inject the preemption notice into additionalContext; "
+        f"got {body}"
+    )
+    out = body["hookSpecificOutput"]
+    msg = out["additionalContext"]
+    msg_lower = msg.lower()
+    assert any(word in msg_lower for word in ("preempted", "revoked", "acquired by")), (
+        f"prose should name the preemption explicitly; got: {msg}"
+    )
+    assert "plan.md" in msg
+    assert y[:8] in msg, f"prose should name the preempter session prefix; got: {msg}"
+
+
+def test_a1_preemption_surfaces_on_victim_next_pre_edit(client: _Client) -> None:
+    """A1: surface preemption even when X's next hook is pre-edit, not pre-read."""
+    x = _sid("X"); y = _sid("Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    status, body = client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    assert status == 200
+    # pre-edit response shape: either {ok: true} OR hookSpecificOutput for collision/preemption
+    assert "hookSpecificOutput" in body, (
+        "pre-edit after being preempted MUST inject the notice; got {}"
+    ).format(body)
+    msg = body["hookSpecificOutput"]["additionalContext"]
+    msg_lower = msg.lower()
+    assert any(w in msg_lower for w in ("preempted", "revoked")), (
+        f"prose should name the preemption; got: {msg}"
+    )
+
+
+def test_a1_preemption_surfaces_in_post_edit_failure_reason(client: _Client) -> None:
+    """A1: when X tries to post-edit after being silently preempted, the
+    failure response MUST name the preempter (not just generic CoherenceError)."""
+    x = _sid("X"); y = _sid("Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+    s, body = client.post("/hooks/post-edit",
+                           {"session_id": x, "path": "plan.md",
+                            "content_hash": _hash("h"), "success": True})
+    assert s == 200
+    assert body.get("ok") is False, f"post-edit on preempted grant must fail; got {body}"
+    reason = body.get("reason", "")
+    reason_lower = reason.lower()
+    assert any(w in reason_lower for w in ("preempted", "revoked", "acquired by")), (
+        f"failure reason must name the preemption; got: {reason}"
+    )
+    assert y[:8] in reason, f"reason should name preempter session prefix; got: {reason}"
+
+
+def test_a1_preemption_notice_consumed_after_one_surface(client: _Client) -> None:
+    """A1: preemption notices are pop-and-clear — the victim sees the notice
+    on their NEXT hook, but a subsequent hook (without a fresh preemption)
+    sees fresh/normal response."""
+    x = _sid("X"); y = _sid("Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    # First X hook after preemption: surfaces notice
+    _, body1 = client.post("/hooks/pre-read", {"session_id": x, "path": "plan.md"})
+    assert "hookSpecificOutput" in body1
+    # Second X hook: notice is consumed; response is normal stale-read shape
+    # (X is still INVALID on plan.md, so this will be stale, but NOT carry the
+    # preemption notice text anymore — that was popped).
+    _, body2 = client.post("/hooks/pre-read", {"session_id": x, "path": "plan.md"})
+    if "hookSpecificOutput" in body2:
+        msg2 = body2["hookSpecificOutput"]["additionalContext"]
+        # The second message can carry a stale-read warning, but should NOT
+        # repeat the preemption notice text.
+        assert "preempted" not in msg2.lower() and "revoked" not in msg2.lower(), (
+            f"preemption notice should be consumed after first surface; got: {msg2}"
+        )
+
+
+def test_a1_no_preemption_no_notice(client: _Client) -> None:
+    """A1 negative: a session that's never been preempted gets no notice."""
+    x = _sid("X")
+    # X never preempted — pre-edit just works
+    s, body = client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    assert s == 200
+    if "hookSpecificOutput" in body:
+        msg = body["hookSpecificOutput"]["additionalContext"]
+        assert "preempted" not in msg.lower() and "revoked" not in msg.lower()
+
+
+# ----------------------------------------------------------------------
 # Boundary validators (A2 + A3 + A8 — adversarial review hardening)
 # ----------------------------------------------------------------------
 

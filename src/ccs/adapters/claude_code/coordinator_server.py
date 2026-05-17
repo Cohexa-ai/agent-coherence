@@ -483,9 +483,37 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
             artifact_id, agent_id, MESIState.SHARED,
             trigger="post_stale_read", tick=now, content_hash=content_hash,
         )
-        return _payloads.build_stale_response(summary)
+        resp = _payloads.build_stale_response(summary)
+        # A1: if THIS session has pending preemption notices, prepend them
+        # to the additionalContext so X learns about Y's revocation alongside
+        # the stale-read warning.
+        notices = coordinator.registry.pop_pending_notices(agent_id)
+        if notices:
+            notice_text = _build_preemption_text(coordinator, notices)
+            resp["hookSpecificOutput"]["additionalContext"] = (
+                notice_text + "\n\n" + resp["hookSpecificOutput"]["additionalContext"]
+            )
+        return resp
 
-    _run_or_degrade(req, coordinator, work)
+    # Wrap _run_or_degrade so we can also pop notices for the FRESH-response
+    # path (work() returned {status: "fresh"} without going through stale logic).
+    def work_with_notice_surfacing() -> dict:
+        result = work()
+        if result.get("status") == "fresh" and "hookSpecificOutput" not in result:
+            notices = coordinator.registry.pop_pending_notices(agent_id)
+            if notices:
+                notice_text = _build_preemption_text(coordinator, notices)
+                return {
+                    "status": "fresh",
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "additionalContext": notice_text,
+                    },
+                }
+        return result
+
+    _run_or_degrade(req, coordinator, work_with_notice_surfacing)
 
 
 def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
@@ -513,6 +541,9 @@ def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
 
+        # A1: snapshot peers in M∪E BEFORE write so we can record preemption
+        # notices for victims after the side-effecting invalidation.
+        peers_in_me = _peers_in_me_excluding(coordinator, artifact_id, agent_id)
         # Detect collision BEFORE acquiring: is any other session in M∪E?
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
 
@@ -522,14 +553,49 @@ def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
+        # A1: record preemption notices for the agents whose M∪E grants we
+        # just silently revoked via the write() side effect. The victims
+        # will see these on their next pre-read / pre-edit hook.
+        for victim_id in peers_in_me:
+            coordinator.registry.record_preemption_notice(
+                victim_agent_id=victim_id,
+                artifact_id=artifact_id,
+                preempter_agent_id=agent_id,
+                preempted_at_unix_ts=_payloads.now_unix(),
+            )
+
+        # Pop any notices for THIS session (the caller of pre-edit) and
+        # merge into the response (A1: surface on the victim's next hook
+        # of any kind).
+        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notice_text = _build_preemption_text(coordinator, notices) if notices else None
+
         if holder_id is not None:
-            # Surface the collision via additionalContext (KTD-9 same-hash mitigation).
+            # Existing collision surfacing path. If we also have preemption
+            # notices for this session, prepend them.
             holder_session = _agent_id_to_session(coordinator, holder_id)
-            return _payloads.build_collision_response(
+            resp = _payloads.build_collision_response(
                 holder_session_id=holder_session or "<unknown>",
                 holder_acquired_at_unix_ts=float(holder_ts or _payloads.now_unix()),
                 path=path,
             )
+            if notice_text:
+                resp["hookSpecificOutput"]["additionalContext"] = (
+                    notice_text + "\n\n" + resp["hookSpecificOutput"]["additionalContext"]
+                )
+            return resp
+
+        if notice_text:
+            # No collision, but THIS session was preempted previously —
+            # promote {ok: true} into a hookSpecificOutput.
+            return {
+                "ok": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": notice_text,
+                },
+            }
         return {"ok": True}
 
     _run_or_degrade(req, coordinator, work)
@@ -594,6 +660,22 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
                 content_hash=content_hash,
             )
         except CoherenceError as exc:
+            # A1: if this commit failed because the grant was preempted
+            # silently, enrich the reason with the preemption context so
+            # the caller (and any stream-json telemetry) sees WHO took the
+            # grant and WHEN — not just the generic CoherenceError text.
+            notice = coordinator.registry.peek_preemption_notice(agent_id, artifact_id)
+            if notice is not None:
+                preempter_id, preempted_at = notice
+                preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+                reason = (
+                    f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
+                    f"preempted by session {preempter_session[:8]} at "
+                    f"{_iso_utc(preempted_at)}. Your edit landed in your local "
+                    f"worktree but will not be reflected in the coordinator's "
+                    f"version. Underlying coordinator error: {exc}"
+                )
+                return {"ok": False, "reason": reason, "preempted": True}
             return {"ok": False, "reason": str(exc)}
         return {"ok": True}
 
@@ -767,6 +849,57 @@ def _exclusive_holder(
             granted_at = coordinator.registry.granted_at_tick(other_id, artifact_id)
             return other_id, granted_at
     return None, None
+
+
+def _peers_in_me_excluding(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+) -> list[UUID]:
+    """A1: return the list of agents currently in MODIFIED or EXCLUSIVE on
+    the given artifact, EXCLUDING the given agent. Used to snapshot victims
+    BEFORE service.write side-effects invalidate them, so the plugin can
+    record preemption notices for each."""
+    state_map = coordinator.registry.get_state_map(artifact_id)
+    return [
+        peer_id
+        for peer_id, state in state_map.items()
+        if peer_id != agent_id and state in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
+    ]
+
+
+def _iso_utc(unix_ts: float) -> str:
+    """Format a unix timestamp as an ISO 8601 UTC string for prose."""
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+
+
+def _build_preemption_text(
+    coordinator: CoordinatorHTTPServer,
+    notices: list[tuple[UUID, UUID, float]],
+) -> str:
+    """A1: render pending preemption notices as additionalContext prose.
+
+    notices: list of (artifact_id, preempter_agent_id, preempted_at_unix_ts).
+    Variance per invocation comes from the timestamps (real preemption time)
+    + the session-id prefixes. Multiple notices → multi-line prose.
+    """
+    lines: list[str] = ["⚠ Coordinator notice: your EXCLUSIVE grant was preempted:"]
+    for artifact_id, preempter_id, ts in notices:
+        artifact = coordinator.registry.get_artifact(artifact_id)
+        path = artifact.name if artifact else "<unknown-artifact>"
+        preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+        lines.append(
+            f"  • {path} — preempted/revoked by session {preempter_session[:8]} "
+            f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
+            f"in your worktree but is NOT reflected in the coordinator's version."
+        )
+    lines.append(
+        "Re-read affected files before continuing if you need the latest "
+        "coordinator-tracked version, or proceed knowing your edits remain "
+        "local-only until you re-acquire and commit."
+    )
+    return "\n".join(lines)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> Optional[str]:
