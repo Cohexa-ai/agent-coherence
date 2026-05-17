@@ -91,10 +91,13 @@ def test_coordinator_not_in_git_repo_exits_1(
 def test_coordinator_spawns_and_prints_port(
     git_workspace: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Happy path: agent-coherence-coordinator --root <git> → exits 0,
-    prints 'port=NNNN'."""
+    """Happy path: agent-coherence-coordinator --root <git> --no-detach
+    → exits 0, prints 'port=NNNN'. Uses --no-detach to keep the
+    coordinator in-process so the test's stop_coordinator can find it."""
     try:
-        rc = coherence_coordinator.main(["--root", str(git_workspace)])
+        rc = coherence_coordinator.main([
+            "--root", str(git_workspace), "--no-detach",
+        ])
         captured = capsys.readouterr()
         assert rc == 0
         assert captured.out.startswith("port=")
@@ -109,12 +112,104 @@ def test_coordinator_quiet_flag_suppresses_port_line(
 ) -> None:
     """--quiet suppresses stdout but still exits 0."""
     try:
-        rc = coherence_coordinator.main(["--root", str(git_workspace), "--quiet"])
+        rc = coherence_coordinator.main([
+            "--root", str(git_workspace), "--quiet", "--no-detach",
+        ])
         captured = capsys.readouterr()
         assert rc == 0
         assert captured.out == ""
     finally:
         stop_coordinator(git_workspace)
+
+
+def test_coordinator_detached_spawn_survives_parent_exit(
+    git_workspace: Path,
+) -> None:
+    """The load-bearing smoke-finding regression: a real detached subprocess
+    must keep the coordinator alive after the launching CLI exits, so a
+    subsequent agent-coherence-status invocation can reach it. This was
+    broken in the initial Unit 6 implementation — coordinator was a
+    daemon thread that died with its parent."""
+    import subprocess
+    import sys
+    import errno as _errno
+
+    # Run the real CLI as a subprocess (not in-process) — replicates
+    # what a user invocation does.
+    proc = subprocess.run(
+        [sys.executable, "-m", "ccs.cli.coherence_coordinator",
+         "--root", str(git_workspace)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert proc.stdout.startswith("port="), proc.stdout
+    port = int(proc.stdout.strip().split("=")[1])
+
+    # Critical assertion: the port must be reachable AFTER the launching
+    # process has exited. This is the regression case.
+    import socket as _s
+    sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    sock.settimeout(1.0)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sock.close()
+        reachable = True
+    except OSError as exc:
+        reachable = False
+        pytest.fail(
+            f"detached coordinator at port {port} not reachable after "
+            f"parent exit (errno={exc.errno})"
+        )
+
+    # Clean up the detached process by reading its pid + killing it.
+    pid_file = git_workspace / ".coherence" / "server.pid"
+    if pid_file.exists():
+        lines = pid_file.read_text().splitlines()
+        if lines:
+            try:
+                pid = int(lines[0])
+                os.kill(pid, 15)  # SIGTERM — daemon exits cleanly
+            except (ValueError, ProcessLookupError):
+                pass
+
+
+def test_coordinator_second_invocation_reuses_existing(
+    git_workspace: Path,
+) -> None:
+    """Once a coordinator is live, a second `agent-coherence-coordinator`
+    invocation must short-circuit to its port without re-forking. The
+    existing-coordinator probe in main() does the TCP check."""
+    import subprocess
+    import sys
+
+    # First invocation — detached spawn.
+    proc1 = subprocess.run(
+        [sys.executable, "-m", "ccs.cli.coherence_coordinator",
+         "--root", str(git_workspace)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc1.returncode == 0
+    port_1 = int(proc1.stdout.strip().split("=")[1])
+
+    try:
+        # Second invocation — must return same port via short-circuit.
+        proc2 = subprocess.run(
+            [sys.executable, "-m", "ccs.cli.coherence_coordinator",
+             "--root", str(git_workspace)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc2.returncode == 0
+        port_2 = int(proc2.stdout.strip().split("=")[1])
+        assert port_2 == port_1, "second invocation must reuse the live coordinator's port"
+    finally:
+        # Clean up
+        pid_file = git_workspace / ".coherence" / "server.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().splitlines()[0])
+                os.kill(pid, 15)
+            except (ValueError, ProcessLookupError, IndexError):
+                pass
 
 
 # ----------------------------------------------------------------------
@@ -142,7 +237,13 @@ def test_status_renders_table_against_live_coordinator(
     assert rc == 0
     assert "Coordinator:" in captured.out
     assert f"pid={os.getpid()}" in captured.out
-    assert "No tracked artifacts" in captured.out or "Tracked artifacts:" in captured.out
+    # Status now shows policy state and disambiguates empty-registry from empty-policy.
+    assert "Policy:" in captured.out
+    assert (
+        "No artifacts observed yet" in captured.out
+        or "Observed artifacts:" in captured.out
+        or "No tracked artifacts (policy is empty)" in captured.out
+    )
 
 
 def test_status_json_mode_emits_raw_payload(

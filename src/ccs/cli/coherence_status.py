@@ -81,16 +81,40 @@ def _render_table(payload: dict[str, Any]) -> None:
     """Manual column alignment — stdlib only, no rich/tabulate."""
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
+    policy = payload.get("policy_summary", {})
     uptime = payload.get("coordinator_uptime_s", 0.0)
     pid = payload.get("coordinator_pid", 0)
 
     print(f"Coordinator: pid={pid} uptime={uptime:.0f}s")
     print()
 
+    # Policy section first — distinguishes "what's eligible to be tracked"
+    # (defaults + user-added patterns) from "what's been observed so far"
+    # (tracked_artifacts, which requires at least one Read to seed).
+    if policy:
+        default_n = policy.get("default_pattern_count", 0)
+        user_n = policy.get("user_added_pattern_count", 0)
+        ignored_n = policy.get("ignored_pattern_count", 0)
+        print(
+            "Policy: "
+            f"{default_n} default pattern(s), "
+            f"{user_n} user-added, "
+            f"{ignored_n} ignored"
+        )
+        print()
+
     if not tracked:
-        print("No tracked artifacts.")
+        # Disambiguate: empty registry vs empty policy. Policy may match
+        # paths the registry hasn't observed yet (first Read seeds them).
+        if policy and (policy.get("default_pattern_count", 0) + policy.get("user_added_pattern_count", 0)) > 0:
+            print(
+                "No artifacts observed yet (paths matching the policy will "
+                "be registered on first Read)."
+            )
+        else:
+            print("No tracked artifacts (policy is empty).")
     else:
-        print("Tracked artifacts:")
+        print("Observed artifacts:")
         path_w = max(len("path"), max(len(a.get("path", "")) for a in tracked))
         print(f"  {'path':<{path_w}}  {'version':>7}")
         print(f"  {'-' * path_w}  {'-' * 7}")
