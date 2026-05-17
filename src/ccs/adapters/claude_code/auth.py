@@ -69,13 +69,25 @@ def ensure_secret(coordinator_root: Path) -> str:
             return token
         logger.warning("hook.secret exists but is empty; regenerating")
 
-    # Generate fresh secret. write_text + chmod is the cleanest stdlib path;
-    # we accept a brief mode-0644 window between create and chmod because
-    # this only happens on first spawn ever in a workspace and the file is
-    # inside a 0700 directory.
+    # Generate fresh secret. Atomic create with mode 0600 via O_EXCL +
+    # explicit mode argument — no window where the file is mode 0644.
+    # If the file already exists at this point (race with another spawn),
+    # O_EXCL raises FileExistsError; we re-load and return the existing
+    # secret (last-writer-wins-but-content-identical from the user's POV).
     token = secrets.token_hex(SECRET_BYTES)
-    secret_path.write_text(token + "\n")
-    os.chmod(secret_path, 0o600)
+    try:
+        fd = os.open(str(secret_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # Another concurrent spawn won the race. Re-read.
+        existing = secret_path.read_text().strip()
+        if existing:
+            return existing
+        # File was created by the racer but is somehow empty — fall through
+        # and retry generation (very narrow window where we can recover).
+        token = secrets.token_hex(SECRET_BYTES)
+        fd = os.open(str(secret_path), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
     logger.info("generated shared secret at %s", secret_path)
     return token
 

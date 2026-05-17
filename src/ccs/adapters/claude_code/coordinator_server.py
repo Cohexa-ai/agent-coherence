@@ -32,10 +32,10 @@ Lifecycle (spawn, port-file, idle-shutdown, sweep) lives in :mod:`lifecycle`
 
 from __future__ import annotations
 
-import hashlib
 import http.server
 import json
 import logging
+import re
 import socketserver
 import threading
 import time
@@ -71,6 +71,21 @@ in one request body (security-lens P1)."""
 MAX_POLICY_YAML_BYTES = 64 * 1024
 """Cap on the resulting tracked.yaml / ignored.yaml file size (security-lens P1)."""
 
+MAX_PATH_LEN = 1024
+"""Cap on inbound path length to defend against memory/DoS and prose-injection
+attacks. 1024 covers nested-deep paths in any realistic project."""
+
+_SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                            re.IGNORECASE)
+"""UUID4 shape. CC v2.1.131 fixtures (cc_hook_stdin/) confirm session_ids
+are always UUIDs. Rejecting non-UUIDs closes the unbounded-agent_names
+abuse vector (Adv #13)."""
+
+_CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+"""SHA-256 hex shape. Rejecting malformed hashes closes the
+caller-supplied-hash abuse vector (Adv #6) where an authenticated client
+could mint v1 with attacker-chosen hash strings."""
+
 
 # ----------------------------------------------------------------------
 # Session → agent UUID derivation (matches src/ccs/adapters/base.py:82)
@@ -92,6 +107,63 @@ def session_to_agent_name(session_id: str) -> str:
 def monotonic_seconds() -> int:
     """Tick basis for the coordinator. 1 tick = 1 second of wall clock."""
     return int(time.time())
+
+
+# ----------------------------------------------------------------------
+# Boundary validators (Adv-review hardening A2 + A3 + A8)
+# ----------------------------------------------------------------------
+
+
+def validate_session_id(session_id: Any) -> Optional[str]:
+    """Return reason if invalid, None if valid. UUID-shape required."""
+    if not isinstance(session_id, str):
+        return "session_id must be a string"
+    if not _SESSION_ID_RE.match(session_id):
+        return "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"
+    return None
+
+
+def validate_path(path: Any) -> Optional[str]:
+    """Return reason if invalid, None if valid. The coordinator stores paths
+    as parent-repo-relative — KTD-7 normalization happens client-side (the
+    hook script must compute repo-relative from CC's absolute tool_input.
+    file_path). The boundary validation here is defense-in-depth against
+    bad hook clients AND prose-injection abuse (Adv #4 + Adv #11)."""
+    if not isinstance(path, str):
+        return "path must be a string"
+    if not path:
+        return "path is empty"
+    if len(path) > MAX_PATH_LEN:
+        return f"path exceeds {MAX_PATH_LEN} chars"
+    if path.startswith("/"):
+        return "path must be relative (no leading /)"
+    if path.startswith("\\"):
+        return "path must be relative (no leading \\)"
+    # ANY control character rejected — guards against newline injection into
+    # additionalContext prose (Adv #11) and other terminal-control mischief.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in path):
+        return "path contains control characters"
+    # .. traversal at any segment boundary
+    parts = path.replace("\\", "/").split("/")
+    if ".." in parts:
+        return "path contains '..' traversal"
+    return None
+
+
+def validate_content_hash(content_hash: Any, *, required: bool) -> Optional[str]:
+    """Return reason if invalid, None if valid. content_hash is OPTIONAL on
+    pre-read (the caller may not have it yet) but REQUIRED on post-edit
+    (the caller just wrote the file and computed it). Empty string is
+    always rejected to avoid the silent-record-known-wrong-hash anti-pattern."""
+    if content_hash is None and not required:
+        return None
+    if not isinstance(content_hash, str):
+        return "content_hash must be a string"
+    if not content_hash:
+        return "content_hash is empty (omit the field instead if unknown)"
+    if not _CONTENT_HASH_RE.match(content_hash):
+        return "content_hash must be 64 hex characters (sha-256)"
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -324,11 +396,20 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
     path = body.get("path", "")
     content_hash = body.get("content_hash") or None
 
-    if not session_id or not isinstance(session_id, str):
-        req._json(400, {"error": "missing session_id"})
+    err = validate_session_id(session_id)
+    if err:
+        req._json(400, {"error": f"missing session_id" if err.startswith("session_id must be a string") else err})
         return
-    if not path or not isinstance(path, str):
-        req._json(400, {"error": "missing or empty path"})
+    err = validate_path(path)
+    if err:
+        # Mirror the prior "missing or empty path" message shape for empty/missing
+        # to keep client-side error-handling stable.
+        msg = "missing or empty path" if err in ("path is empty", "path must be a string") else err
+        req._json(400, {"error": msg})
+        return
+    err = validate_content_hash(content_hash, required=False)
+    if err:
+        req._json(400, {"error": err})
         return
 
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
@@ -382,12 +463,18 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
         )
 
         last_writer_id = _last_writer_for(coordinator, artifact_id)
+        # last_writer_at_unix_ts is REAL — from the artifact's updated_at
+        # in the registry (semantically honest, A5). warning_generated_at
+        # is now() to guarantee per-invocation variation (A5 + structural
+        # defense for v0.2 strict-mode flip).
+        last_writer_ts = _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
         summary: _payloads.StaleSummary = {
             "path": path,
             "current_version": artifact.version,
             "prior_version_seen_by_session": prior_seen,
             "last_writer_session_id": last_writer_id or "<unknown>",
-            "last_writer_at_unix_ts": _payloads.now_unix(),
+            "last_writer_at_unix_ts": last_writer_ts,
+            "warning_generated_at_unix_ts": _payloads.now_unix(),
             "hash_differs": hash_differs,
         }
 
@@ -408,8 +495,9 @@ def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
         return
     session_id = body.get("session_id")
     path = body.get("path", "")
-    if not session_id or not path:
-        req._json(400, {"error": "missing session_id or path"})
+    err = validate_session_id(session_id) or validate_path(path)
+    if err:
+        req._json(400, {"error": "missing session_id or path" if "missing" in err or "empty" in err else err})
         return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
@@ -454,10 +542,17 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
         return
     session_id = body.get("session_id")
     path = body.get("path", "")
-    content_hash = body.get("content_hash") or hashlib.sha256(b"").hexdigest()
+    content_hash = body.get("content_hash")  # required when success=true
     success = bool(body.get("success", True))
-    if not session_id or not path:
-        req._json(400, {"error": "missing session_id or path"})
+    err = validate_session_id(session_id) or validate_path(path)
+    if err:
+        req._json(400, {"error": "missing session_id or path" if "missing" in err or "empty" in err else err})
+        return
+    # content_hash is required only on success — if the tool succeeded, the
+    # hook script computed it from the worktree's post-write state.
+    err = validate_content_hash(content_hash, required=bool(success))
+    if err:
+        req._json(400, {"error": err})
         return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
@@ -511,8 +606,9 @@ def _handle_session_stop(req, coordinator: CoordinatorHTTPServer) -> None:
     if body is None:
         return
     session_id = body.get("session_id")
-    if not session_id:
-        req._json(400, {"error": "missing session_id"})
+    err = validate_session_id(session_id)
+    if err:
+        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
         return
 
     agent_id = coordinator.register_session(session_id)
@@ -583,8 +679,14 @@ def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
 
 def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script."""
+    # A4: snapshot artifact_ids and _agent_names BEFORE iterating, to avoid
+    # `RuntimeError: dictionary changed size during iteration` racing against
+    # a concurrent register_session in another handler.
+    artifact_ids_snapshot = list(coordinator.registry.artifact_ids())
+    agent_names_snapshot = list(coordinator._agent_names.items())
+
     tracked: list[dict] = []
-    for artifact_id in coordinator.registry.artifact_ids():
+    for artifact_id in artifact_ids_snapshot:
         art = coordinator.registry.get_artifact(artifact_id)
         if art is None:
             continue
@@ -595,9 +697,9 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
         })
     # Per-session state map: from agent_names keys we know who's registered.
     sessions: list[dict] = []
-    for agent_id, name in coordinator._agent_names.items():
+    for agent_id, name in agent_names_snapshot:
         per_artifact: dict[str, str] = {}
-        for artifact_id in coordinator.registry.artifact_ids():
+        for artifact_id in artifact_ids_snapshot:
             state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             if state is not None and state != MESIState.INVALID:
                 art = coordinator.registry.get_artifact(artifact_id)
@@ -681,6 +783,21 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> O
         first_agent = next(iter(state_map))
         return _agent_id_to_session(coordinator, first_agent)
     return None
+
+
+def _last_writer_unix_ts(
+    coordinator: CoordinatorHTTPServer, artifact_id: UUID
+) -> Optional[float]:
+    """Return the REAL wall-clock time the artifact was last written, from
+    `artifacts.updated_at` in the registry. Reads directly via the registry's
+    private connection because this is a plugin-internal projection. None if
+    the artifact is unknown."""
+    with coordinator.registry._lock:
+        row = coordinator.registry._conn.execute(
+            "SELECT updated_at FROM artifacts WHERE id = ?",
+            (artifact_id.hex,),
+        ).fetchone()
+    return float(row[0]) if row else None
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> Optional[str]:

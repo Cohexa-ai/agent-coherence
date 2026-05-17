@@ -69,12 +69,22 @@ class PolicyUntrackRequest(TypedDict):
 
 
 class StaleSummary(TypedDict):
-    """Structured stale-read metadata. NEVER includes content/hash bytes."""
+    """Structured stale-read metadata. NEVER includes content/hash bytes.
+
+    Two timestamps serve different purposes:
+    - `last_writer_at_unix_ts` is from the registry's `artifacts.updated_at`
+      (the REAL commit wall-clock); semantically honest.
+    - `warning_generated_at_unix_ts` is `now()` at handler time; provides
+      structural per-invocation variation that survives the case where two
+      reads of the same stale state somehow occur (defense-in-depth against
+      the §13.5 retry-loop hazard once v0.2 strict mode flips allow→deny).
+    """
     path: str
     current_version: int
     prior_version_seen_by_session: Optional[int]
     last_writer_session_id: str
     last_writer_at_unix_ts: float
+    warning_generated_at_unix_ts: float
     hash_differs: bool
 
 
@@ -140,10 +150,14 @@ class ErrorResponse(TypedDict):
 def stale_read_warning(summary: StaleSummary) -> str:
     """Build the stale-read additionalContext message.
 
-    Per-invocation variation: timestamp + last-writer session id + version
-    deltas all change between invocations, so identical-reason retry loops
-    (the §13.5 hazard) are structurally impossible. When v0.2 strict mode
-    swaps allow → deny, this template already varies.
+    Per-invocation variation: both `last_writer_at_unix_ts` (real commit tick)
+    and `warning_generated_at_unix_ts` (handler-time `now()`) appear in the
+    prose. The latter guarantees byte-different text on every invocation,
+    structurally precluding the §13.5 retry-loop hazard when v0.2 strict
+    mode flips allow → deny.
+
+    F1 fix: distinguishes "first observation of this artifact" from
+    "previously-seen-but-now-invalidated" cases with accurate prose.
 
     Constraint: no content bytes, no content hashes, no diff text.
     """
@@ -151,8 +165,17 @@ def stale_read_warning(summary: StaleSummary) -> str:
     last_writer_ts = datetime.fromtimestamp(
         summary["last_writer_at_unix_ts"], tz=timezone.utc
     ).isoformat()
+    generated_ts = datetime.fromtimestamp(
+        summary["warning_generated_at_unix_ts"], tz=timezone.utc
+    ).isoformat()
     prior = summary.get("prior_version_seen_by_session")
-    prior_clause = f"you saw v{prior}" if prior is not None else "you haven't read this version yet"
+    if prior is not None:
+        prior_clause = f"you previously saw v{prior}"
+    else:
+        prior_clause = (
+            "this is the first time your session has observed this artifact "
+            "(another session in this workspace registered it before you)"
+        )
     if summary["hash_differs"]:
         divergence = (
             "Your worktree's current content also differs from the coordinator's "
@@ -165,8 +188,8 @@ def stale_read_warning(summary: StaleSummary) -> str:
             "is purely about version-tracking metadata."
         )
     return (
-        f"⚠ Stale read: {summary['path']} was updated by session "
-        f"{last_writer_short} at {last_writer_ts} (UTC). "
+        f"⚠ Stale read [warning emitted {generated_ts}]: {summary['path']} was "
+        f"updated by session {last_writer_short} at {last_writer_ts}. "
         f"Current version is v{summary['current_version']}; {prior_clause}. "
         f"{divergence} "
         f"Consider re-reading {summary['path']} before acting on stale assumptions."
