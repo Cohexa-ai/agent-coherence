@@ -161,28 +161,51 @@ def test_pre_read_fixture_parses_and_calls_coordinator(
     live_coordinator, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """P2 ce-review fix #10 (testing): tightened assertion from the
+    earlier `isinstance(response, dict)` to specific key checks. A
+    coordinator returning ``{"garbage": True}`` would have passed the
+    old version. Now we assert one of the known response shapes:
+    ``{"status": "fresh"}`` for untracked / fresh paths, or
+    ``{"hookSpecificOutput": ...}`` for stale-warning responses."""
     workspace, _ = live_coordinator
     (workspace / "docs" / "specs").mkdir(parents=True, exist_ok=True)
     (workspace / "docs" / "specs" / "test.md").write_text("seed")
     fixture = _load_fixture("pre_read.json")
     rc, response = _drive("pre-read", fixture, workspace, monkeypatch, capsys)
     assert rc == 0, f"hook-client exited non-zero: {response}"
-    # Untracked path → fresh response (acceptable). Tracked path → stale or
-    # fresh with hookSpecificOutput. Either way, the parse path didn't error.
-    assert isinstance(response, dict)
+    # Coordinator's pre-read returns either {"status": "fresh"} (untracked
+    # or no version delta) or a dict carrying "hookSpecificOutput" (stale
+    # warning case). One of these MUST be present — else the coordinator
+    # returned garbage and the contract is broken.
+    assert "status" in response or "hookSpecificOutput" in response, (
+        f"pre-read response missing both 'status' and 'hookSpecificOutput' "
+        f"keys; got: {response}"
+    )
+    if "status" in response:
+        assert response["status"] in ("fresh", "stale"), response
 
 
 def test_pre_edit_fixture_parses_and_calls_coordinator(
     live_coordinator, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """Same tightening as pre_read: assert specific response shape, not
+    just dict-ness."""
     workspace, _ = live_coordinator
     (workspace / "docs" / "specs").mkdir(parents=True, exist_ok=True)
     (workspace / "docs" / "specs" / "test.md").write_text("seed")
     fixture = _load_fixture("pre_edit.json")
     rc, response = _drive("pre-edit", fixture, workspace, monkeypatch, capsys)
     assert rc == 0, f"hook-client exited non-zero: {response}"
-    assert isinstance(response, dict)
+    # pre-edit returns either {"status": "fresh"} or a collision response
+    # with hookSpecificOutput. Empty {} is also valid (no-op when the
+    # path isn't tracked — hook-client emits {} on coordinator HTTP error).
+    if response:  # non-empty
+        assert (
+            "status" in response
+            or "hookSpecificOutput" in response
+            or response.get("ok") is True
+        ), f"pre-edit response shape unrecognized: {response}"
 
 
 def test_post_edit_fixture_parses_and_calls_coordinator(
@@ -193,7 +216,9 @@ def test_post_edit_fixture_parses_and_calls_coordinator(
     tool_response — we observed CC's contract uses `userModified` and
     `structuredPatch` instead. Our hook-client defaults success=True
     when the field is missing, which matches the observed semantics
-    (PostToolUse only fires when the edit actually applied)."""
+    (PostToolUse only fires when the edit actually applied).
+
+    P2 ce-review fix #10: assert specific response shape."""
     workspace, _ = live_coordinator
     target = workspace / "docs" / "specs" / "test.md"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +226,16 @@ def test_post_edit_fixture_parses_and_calls_coordinator(
     fixture = _load_fixture("post_edit.json")
     rc, response = _drive("post-edit", fixture, workspace, monkeypatch, capsys)
     assert rc == 0
-    assert isinstance(response, dict)
+    # post-edit returns {"ok": True/False, ...}. Empty {} indicates the
+    # coordinator returned an HTTP error and the hook degraded silently
+    # (also acceptable per the graceful-degradation contract).
+    if response:
+        assert "ok" in response, (
+            f"post-edit response missing 'ok' key; got: {response}"
+        )
+        assert isinstance(response["ok"], bool), (
+            f"post-edit response 'ok' must be bool; got: {response['ok']!r}"
+        )
 
 
 def test_session_stop_fixture_parses_and_calls_coordinator(

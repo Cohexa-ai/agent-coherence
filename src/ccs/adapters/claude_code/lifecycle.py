@@ -410,9 +410,14 @@ def _rewrite_pidfile_drop_port(fd: int, pid: int) -> None:
     os.fsync(fd)
 
 
-def _read_port_from_file(pid_file: Path) -> Optional[int]:
+def read_port_from_file(pid_file: Path) -> Optional[int]:
     """Read the port line from the pid file. Returns None if absent,
-    empty, malformed, or the file doesn't exist."""
+    empty, malformed, or the file doesn't exist.
+
+    Public API (promoted from the private ``_read_port_from_file`` per
+    P2 ce-review fix #17 / maintainability + kieran-python). CLI scripts
+    and external callers should use this function rather than reaching
+    into the underscore-prefixed name."""
     try:
         text = pid_file.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -454,9 +459,13 @@ def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:
     return -1
 
 
-def _tcp_probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
+def tcp_probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
     """Loser-side / generic TCP probe with the connect_retry budget. Used
-    by hook-handler-style callers that have already paid a port-read."""
+    by hook-handler-style callers that have already paid a port-read.
+
+    Public API (promoted from the private ``_tcp_probe`` per P2 ce-review
+    fix #17). The underscore-prefixed alias is retained for backward
+    compatibility with internal callers."""
     return _probe_with_budget(
         port, bind_host, cfg.connect_retry_attempts, cfg.connect_retry_interval_sec
     )
@@ -666,3 +675,16 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
 
         entry.shutdown_done.set()
         return True
+
+
+# ----------------------------------------------------------------------
+# Backward-compat aliases (P2 ce-review fix #17)
+# ----------------------------------------------------------------------
+# The names below were promoted to public API (read_port_from_file,
+# tcp_probe) but the underscore-prefixed forms are imported by other
+# library modules (_coherence_client.py, coherence_coordinator.py).
+# Keep the aliases so internal call sites don't have to flip in lockstep.
+# New code should prefer the public names.
+
+_read_port_from_file = read_port_from_file
+_tcp_probe = tcp_probe

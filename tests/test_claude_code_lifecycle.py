@@ -476,7 +476,16 @@ def test_g5_port_dropped_before_shutdown_completes(
     """G5: pid file's port line is dropped BEFORE coordinator.shutdown()
     returns — so a concurrent loser reading the file during the drain
     window sees 'no port' instead of a port pointing at a coordinator
-    that is about to die."""
+    that is about to die.
+
+    P2 ce-review fix #12 (testing): the earlier version of this test
+    guarded the assertion behind `if not shutdown_done.is_set()`. On
+    fast machines coordinator.shutdown() completes within the 50ms sleep
+    window, leaving the assertion silently skipped — the test passed
+    without actually checking G5. Fix: monkeypatch coordinator.shutdown
+    to inject a 500ms sleep so the drain window deterministically
+    outlasts the assertion window. The assertion is now unconditional.
+    """
     cfg = LifecycleConfig(
         idle_shutdown_sec=0,
         sweep_interval_sec=0,  # no idle-shutdown loop interference
@@ -487,10 +496,23 @@ def test_g5_port_dropped_before_shutdown_completes(
     pid_file = workspace / ".coherence" / "server.pid"
     assert _read_port_from_file(pid_file) == port
 
-    # Trigger shutdown in a background thread; check the pid file
-    # IMMEDIATELY before HTTPServer.shutdown()'s 500ms polling returns.
-    import threading as _t
+    # Inject a deterministic sleep into coordinator.shutdown so the drain
+    # window outlasts the assertion check window on any host (fast laptop
+    # or slow CI). The monkeypatch wraps the real shutdown so cleanup
+    # still happens.
+    entry = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())]
+    real_shutdown = entry.coordinator.shutdown
+    drain_started = __import__("threading").Event()
 
+    def slow_shutdown():
+        drain_started.set()
+        time.sleep(0.5)  # 500ms drain window — much longer than the assertion check
+        real_shutdown()
+
+    entry.coordinator.shutdown = slow_shutdown  # type: ignore[method-assign]
+
+    # Trigger shutdown in a background thread.
+    import threading as _t
     shutdown_done = _t.Event()
 
     def trigger():
@@ -499,20 +521,26 @@ def test_g5_port_dropped_before_shutdown_completes(
 
     t = _t.Thread(target=trigger, daemon=True)
     t.start()
-    # Give the shutdown thread time to enter _shutdown_sequence and drop
-    # the port (which is the FIRST step). Should happen within a few ms.
-    time.sleep(0.05)
-    # If G5 is honored, port is already dropped even though shutdown_done
-    # is not yet set (server.shutdown() is still polling).
-    if not shutdown_done.is_set():
-        port_visible = _read_port_from_file(pid_file)
-        # Port should be dropped to None within the drain window. If
-        # shutdown_done already fired (race), the test is inconclusive
-        # but should not assert false-positive.
-        assert port_visible is None, (
-            "G5 violation: port still visible at "
-            f"{port_visible} while shutdown is still draining"
-        )
+
+    # Wait until coordinator.shutdown has been entered (drain_started fires)
+    # then wait an additional small margin to ensure the port-drop step
+    # (which happens BEFORE coordinator.shutdown in _shutdown_sequence) has
+    # already committed to disk.
+    assert drain_started.wait(timeout=2.0), (
+        "monkeypatched shutdown was not entered within 2s"
+    )
+    # We're now inside the 500ms drain window. The port MUST be dropped
+    # (G5 ordering: drop port BEFORE coordinator.shutdown).
+    assert not shutdown_done.is_set(), (
+        "shutdown completed unexpectedly fast — drain window too short to test G5"
+    )
+    port_visible = _read_port_from_file(pid_file)
+    assert port_visible is None, (
+        "G5 violation: port still visible at "
+        f"{port_visible} while shutdown is mid-drain (port-drop must "
+        f"precede coordinator.shutdown per _shutdown_sequence ordering)"
+    )
+
     t.join(timeout=5.0)
     assert shutdown_done.is_set()
 

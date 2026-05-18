@@ -853,38 +853,58 @@ def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
 
 
 def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
-    """GET /status — drives the agent-coherence-status console script."""
+    """GET /status — drives the agent-coherence-status console script.
+
+    P2 ce-review fix #18 (kieran-python): batched the per-(session,
+    artifact) query loop. The previous version did
+    ``get_agent_state(artifact_id, agent_id)`` and a SECOND
+    ``get_artifact(artifact_id)`` per inner iteration — O(sessions ×
+    artifacts) SQLite round-trips per /status request. Now we
+    build a single ``{artifact_id: Artifact}`` lookup outside the loop
+    and call ``get_state_map(artifact_id)`` once per artifact (which
+    returns ``{agent_id: MESIState}`` in one query). Per-session
+    iteration becomes a dict lookup — O(artifacts) total queries.
+    """
     # A4: snapshot artifact_ids and _agent_names BEFORE iterating, to avoid
     # `RuntimeError: dictionary changed size during iteration` racing against
     # a concurrent register_session in another handler.
     artifact_ids_snapshot = list(coordinator.registry.artifact_ids())
     agent_names_snapshot = list(coordinator._agent_names.items())
 
-    tracked: list[dict] = []
+    # Single-pass artifact resolution: one get_artifact per artifact id,
+    # cached in artifact_by_id for the inner-loop lookups below.
+    artifact_by_id = {}
     for artifact_id in artifact_ids_snapshot:
         art = coordinator.registry.get_artifact(artifact_id)
-        if art is None:
-            continue
-        tracked.append({
-            "path": art.name,
-            "version": art.version,
-            "id": str(artifact_id),
-        })
-    # Per-session state map: from agent_names keys we know who's registered.
+        if art is not None:
+            artifact_by_id[artifact_id] = art
+
+    tracked: list[dict] = [
+        {"path": art.name, "version": art.version, "id": str(artifact_id)}
+        for artifact_id, art in artifact_by_id.items()
+    ]
+
+    # Single-pass per-artifact state map: one get_state_map per artifact
+    # (returns all agents' states for that artifact in one query). The
+    # session/artifact cross-product becomes a dict lookup.
+    state_by_artifact = {
+        artifact_id: coordinator.registry.get_state_map(artifact_id)
+        for artifact_id in artifact_by_id  # only artifacts we actually have
+    }
+
     sessions: list[dict] = []
     for agent_id, name in agent_names_snapshot:
         per_artifact: dict[str, str] = {}
-        for artifact_id in artifact_ids_snapshot:
-            state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+        for artifact_id, art in artifact_by_id.items():
+            state = state_by_artifact[artifact_id].get(agent_id)
             if state is not None and state != MESIState.INVALID:
-                art = coordinator.registry.get_artifact(artifact_id)
-                if art is not None:
-                    per_artifact[art.name] = state.name
+                per_artifact[art.name] = state.name
         sessions.append({
             "agent_name": name,
             "agent_id": str(agent_id),
             "states": per_artifact,
         })
+
     req._json(200, {
         "tracked_artifacts": tracked,
         "sessions": sessions,

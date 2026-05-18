@@ -132,6 +132,21 @@ class SqliteArtifactRegistry:
                 "which manages instance_id persistence in registry_meta"
             )
 
+        # P2 ce-review fix #5 (maintainability): retain_versions=True was
+        # silently ignored, diverging from ArtifactRegistry's contract
+        # where True enables version-history queries. Raising here makes
+        # the divergence loud — callers expecting history get a clear
+        # error rather than silent None returns from get_content_at_version().
+        # retain_versions=False (the default) is the only supported value
+        # in v0.1; full version history is a v0.2 audit-trail feature.
+        if retain_versions:
+            raise NotImplementedError(
+                "SqliteArtifactRegistry does not yet support retain_versions=True. "
+                "Version history is a v0.2 audit feature; v0.1 only stores the "
+                "latest version per artifact. Use the in-memory ArtifactRegistry "
+                "if you need version history, or wait for v0.2."
+            )
+
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock = threading.RLock()
@@ -362,7 +377,11 @@ class SqliteArtifactRegistry:
                     ),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -425,7 +444,11 @@ class SqliteArtifactRegistry:
                     ),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -444,7 +467,11 @@ class SqliteArtifactRegistry:
                 )
                 # FK cascade handles agent_states cleanup
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -588,7 +615,11 @@ class SqliteArtifactRegistry:
                     )
 
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -631,7 +662,11 @@ class SqliteArtifactRegistry:
                      transient_state.name, entered_tick),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -649,7 +684,11 @@ class SqliteArtifactRegistry:
                     (artifact_id.hex, agent_id.hex),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -692,7 +731,11 @@ class SqliteArtifactRegistry:
                     (agent_id.hex, now_tick),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -720,7 +763,11 @@ class SqliteArtifactRegistry:
                     (trigger, tick, artifact_id.hex, agent_id.hex),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -821,7 +868,11 @@ class SqliteArtifactRegistry:
                 if row is None:
                     raise  # genuine integrity error, not the race
                 return UUID(hex=row[0])
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -899,7 +950,11 @@ class SqliteArtifactRegistry:
                     ),
                 )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
 
@@ -925,7 +980,11 @@ class SqliteArtifactRegistry:
                         (agent_id.hex,),
                     )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
         return [
@@ -991,7 +1050,11 @@ class SqliteArtifactRegistry:
                         (agent_id.hex, artifact_id.hex),
                     )
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
         if row is None:
@@ -1024,7 +1087,11 @@ class SqliteArtifactRegistry:
                 )
                 deleted = cursor.rowcount
                 self._conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
+                # P2 ce-review fix #14 (kieran-python): BaseException catches
+                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
+                # before propagation — otherwise the connection is left with an
+                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
         return deleted
