@@ -112,6 +112,12 @@ PLUGIN_REPO = Path("/Users/vladparakhin/projects/agent-coherence-plugin")
 CLAUDE_BIN = Path("/Users/vladparakhin/.npm-global/bin/claude")
 HARD_GATE_THRESHOLD = 0.70
 MIN_N_FOR_LAUNCH = 40
+# Per-scenario wall-clock cap. The harness docstring notes ~5min/scenario
+# under realistic conditions (dominated by OTHER user-installed plugins
+# firing on every hook event). Setting the timeout to exactly that figure
+# guarantees borderline scenarios trip it, so we give 2× headroom and
+# treat a timeout as a DEGENERATE classification (see _run_scenario).
+SCENARIO_TIMEOUT_SEC = 600
 
 
 # ----------------------------------------------------------------------
@@ -299,24 +305,39 @@ def _run_scenario(scenario: dict[str, Any], tmp_root: Path) -> ScenarioResult:
             transcript_path = transcript_dir / f"{scenario['id']}.stream.jsonl"
             try:
                 env = {**os.environ, "PATH": f"{CLAUDE_BIN.parent}:{os.environ.get('PATH','')}"}
-                proc = subprocess.run(
-                    [
-                        str(CLAUDE_BIN),
-                        "--plugin-dir", str(PLUGIN_REPO),
-                        "--include-hook-events",
-                        "--output-format", "stream-json",
-                        "--print",
-                        "--verbose",
-                        "--permission-mode", "bypassPermissions",
-                        "--model", "haiku",
-                        scenario["prompt"],
-                    ],
-                    cwd=workspace,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
+                try:
+                    proc = subprocess.run(
+                        [
+                            str(CLAUDE_BIN),
+                            "--plugin-dir", str(PLUGIN_REPO),
+                            "--include-hook-events",
+                            "--output-format", "stream-json",
+                            "--print",
+                            "--verbose",
+                            "--permission-mode", "bypassPermissions",
+                            "--model", "haiku",
+                            scenario["prompt"],
+                        ],
+                        cwd=workspace,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=SCENARIO_TIMEOUT_SEC,
+                    )
+                except subprocess.TimeoutExpired:
+                    # A claude invocation that exceeds the per-scenario
+                    # wall-clock budget is treated as DEGENERATE rather
+                    # than crashing the whole gate run — preserves the
+                    # signal from the other N-1 scenarios and surfaces
+                    # via the degenerate_rate < 10% instrumentation gate.
+                    return ScenarioResult(
+                        scenario_id=scenario["id"],
+                        category=scenario["category"],
+                        phpmac_shape=scenario["seed"].get("phpmac_shape", False),
+                        verdict=Verdict.DEGENERATE,
+                        warning_seen=False,
+                        notes=f"claude timeout after {SCENARIO_TIMEOUT_SEC}s",
+                    )
                 transcript_path.write_text(proc.stdout)
                 # Score IN-MEMORY immediately
                 verdict, warning_seen, ac_text = _classify(
