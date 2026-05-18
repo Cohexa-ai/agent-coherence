@@ -160,4 +160,4 @@ Once promoted, `v1`-tagged submissions populate the public benchmark; `v0-previe
 
 ## Sharing calibration data
 
-DM `vlad@fwdinc.net` (or open an issue on the repo) with your `calibration.jsonl` contents. Nothing is collected that isn't documented above; you can read every field before sharing.
+DM `vlad@agent-coherence.dev` (or open an issue on the repo) with your `calibration.jsonl` contents. Nothing is collected that isn't documented above; you can read every field before sharing.

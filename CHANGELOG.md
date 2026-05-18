@@ -6,6 +6,117 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+## [0.8.0a1] — 2026-05-17
+
+**Alpha pre-release.** This is the first release containing the Claude Code
+plugin work (Phases 0 through F of the v0.1 plan). Packaged as a pre-release
+(`a1`) so existing `pip install agent-coherence` users on the 0.7.x line are
+not silently upgraded to a build whose entry points target a new use case.
+
+To install: `pip install agent-coherence>=0.8.0a1` or
+`pip install agent-coherence --pre`.
+
+### Added — Claude Code plugin (v0.1 alpha)
+
+The plugin lives at [hipvlady/agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin)
+and depends on this library for the coordinator backend. New library entry
+points wired in this release:
+
+- **`agent-coherence-coordinator`** — lazy-spawn the per-workspace HTTP
+  coordinator. Forks a detached subprocess via `subprocess.Popen` with
+  `start_new_session=True` so the coordinator survives the launching
+  shim's exit. Used by the plugin's `SessionStart` hook.
+- **`agent-coherence-status`** — print tracked artifacts × per-session
+  MESI states + policy summary. Backs `/agent-coherence status`.
+- **`agent-coherence-track <path>...`** / **`agent-coherence-untrack <path>...`**
+  — append paths to `.coherence/tracked.yaml` / `.coherence/ignored.yaml`
+  and reload the live policy. Path-traversal validation matches the
+  underlying TrackedArtifactPolicy.
+- **`agent-coherence-hook-client {pre-read|pre-edit|post-edit|session-stop}`**
+  — command-type hook handler that reads CC's hook payload from stdin,
+  resolves the coordinator port + bearer from `.coherence/`, POSTs to the
+  appropriate endpoint, forwards the response to stdout. Required because
+  Claude Code v2.1.131's hooks.json schema validator rejects URL templates
+  containing `${COHERENCE_PORT}` at LOAD time (Phase E.0 probe 2A finding),
+  so HTTP-type hooks with templated URLs are not viable.
+
+### Added — core library
+
+- **`src/ccs/coordinator/sqlite_registry.py`** — `SqliteArtifactRegistry`,
+  a drop-in replacement for `ArtifactRegistry` that persists state to
+  SQLite-WAL across coordinator restarts. Preserves the 22-method public
+  surface plus three plugin extensions: `resolve_or_register` (KTD-9
+  first-observation seeding), `artifacts_held_by_agent` (KTD-11 Stop
+  release), `evict_stale_notices` (F2 orphan-notice TTL eviction).
+  Schema includes a `pending_notices` table for cross-session
+  preemption surfacing.
+- **`src/ccs/adapters/claude_code/`** — coordinator HTTP server,
+  resolver, policy, auth, lifecycle, and hook payload contracts.
+  ~2,800 lines net new, all gated by the existing architecture-layer
+  rules (`tools/check_architecture.py` enforces).
+
+### Added — tests
+
+- `tests/test_claude_code_coordinator_server.py` — 63 tests including
+  boundary validation, A1 preemption-notice surfacing, F1-F5
+  hardening regression tests.
+- `tests/test_claude_code_lifecycle.py` — 15 tests including the
+  load-bearing 10-process race test (multiprocessing.Pool) and the
+  G3/G4/G5/G6 hardening regression tests from the post-Unit-5
+  adversarial review.
+- `tests/test_claude_code_cli.py` — 21 tests covering all four CLI
+  scripts including the detached-subprocess regression that the
+  manual smoke surfaced (`8015f80`).
+- `tests/test_claude_code_hook_client.py` — 12 tests for the
+  command-type hook bridge.
+- `tests/test_claude_code_contract.py` — 16 tests driven by real CC
+  v2.1.131 stdin payloads recorded in `tests/fixtures/cc_hook_stdin/`.
+  CI early-warning system for Claude Code version drift.
+- `tests/test_claude_code_e2e.py` — 15 tests for bootstrap permissions,
+  KTD-12 shared-secret auth (401/200/401), DNS-rebinding mitigation,
+  KTD-13 state.db schema verification, coordinator-down graceful
+  degradation, and subprocess-spawn integration.
+- `tests/integration/test_warn_mode_behavior_change.py` + 40 scenarios —
+  R7 hard-launch-gate harness (`@pytest.mark.launch_gate`). 4 categories
+  × 10 scenarios × 10 phpmac-shape variants. Operator-runnable via
+  `pytest -m launch_gate` (~$1.60, ~3 hours per N=40 run).
+
+Total: 1101 passing, 2 skipped, 2 launch_gate deselected by default.
+
+### Fixed — Claude Code plugin v0.1 hardening
+
+- **A1 preemption notices** (`a76597a`) — F1 Stop hook pops + surfaces
+  pending notices (canonical phpmac case where X never fires another
+  pre-event); F2 orphan eviction with TTL; F3 10KB prose cap with
+  newest-first coalescing; F4 single-consumer pop on post-edit
+  failure; F5 UPSERT ordering uses wall-clock not commit-order.
+- **Unit 5 lifecycle hardening** (`e545a4a`) — G2 self-probe budget,
+  G3 entry short-circuit, G4 abort-on-shutdown-raise, G5 reorder (drop
+  port BEFORE coordinator.shutdown), G6 per-coordinator shutdown mutex,
+  G8 Windows ImportError guard, G9 retry budget bumped 30 → 60.
+- **Unit 6 detached coordinator** (`8015f80`) — `agent-coherence-coordinator`
+  now forks a detached subprocess so the coordinator survives the
+  launching shim's exit. Previously the daemon-thread coordinator died
+  with the parent CLI process (caught by manual hands-on smoke; tests
+  passed because they spawn + assert in the same Python process).
+- **KTD-13 .gitignore** — `_ensure_coherence_dir()` now writes
+  `.coherence/.gitignore` containing `*` on first spawn. The README
+  claimed this auto-gitignored but the code never did. Idempotent:
+  doesn't clobber operator customizations.
+
+### Changed
+
+- **`pyproject.toml`** — registered `launch_gate` and `launch_gate_pilot`
+  pytest markers; default `pytest -q` runs skip them via `addopts`.
+
+### Plan reference
+
+Full architectural rationale in
+[`docs/plans/2026-05-13-001-feat-claude-code-coherence-plugin-v0.1-plan.md`](docs/plans/2026-05-13-001-feat-claude-code-coherence-plugin-v0.1-plan.md)
+including Phase 0 buildability probes, KTD decisions (1-13), per-unit
+adversarial review findings, and operator deliverables for v0.1
+launch.
+
 ## [0.7.1] — 2026-05-13
 
 ### Added
