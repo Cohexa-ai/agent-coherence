@@ -309,6 +309,16 @@ def _run_scenario(scenario: dict[str, Any], tmp_root: Path) -> ScenarioResult:
                     proc = subprocess.run(
                         [
                             str(CLAUDE_BIN),
+                            # `--setting-sources project` skips the user-level
+                            # settings.json, which is where the OTHER plugins
+                            # (hookify, claude-mem, compound-engineering, etc.)
+                            # are configured. Without this, those plugins'
+                            # hooks fire on every event in the test session
+                            # and dominate wall-clock time (measured 26× slower
+                            # in 2026-05-18 calibration). `--plugin-dir` still
+                            # loads the agent-coherence plugin under test —
+                            # the two flags are orthogonal.
+                            "--setting-sources", "project",
                             "--plugin-dir", str(PLUGIN_REPO),
                             "--include-hook-events",
                             "--output-format", "stream-json",
