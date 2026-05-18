@@ -933,6 +933,21 @@ class SqliteArtifactRegistry:
             for r in rows
         ]
 
+    def get_artifact_updated_at(self, artifact_id: UUID) -> Optional[float]:
+        """Return the wall-clock unix timestamp of the artifact's last
+        update, or None if the artifact is unknown.
+
+        P2 ce-review fix #16 (maintainability + kieran-python): the plugin
+        adapter previously reached into ``_conn`` and ``_lock`` directly
+        to read this column — a layer violation that would break on any
+        connection-pool refactor. This public accessor replaces that."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT updated_at FROM artifacts WHERE id = ?",
+                (artifact_id.hex,),
+            ).fetchone()
+        return float(row[0]) if row else None
+
     def peek_preemption_notice(
         self, agent_id: UUID, artifact_id: UUID
     ) -> Optional[tuple[UUID, float]]:

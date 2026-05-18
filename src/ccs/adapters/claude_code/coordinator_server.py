@@ -1042,15 +1042,12 @@ def _last_writer_unix_ts(
     coordinator: CoordinatorHTTPServer, artifact_id: UUID
 ) -> Optional[float]:
     """Return the REAL wall-clock time the artifact was last written, from
-    `artifacts.updated_at` in the registry. Reads directly via the registry's
-    private connection because this is a plugin-internal projection. None if
-    the artifact is unknown."""
-    with coordinator.registry._lock:
-        row = coordinator.registry._conn.execute(
-            "SELECT updated_at FROM artifacts WHERE id = ?",
-            (artifact_id.hex,),
-        ).fetchone()
-    return float(row[0]) if row else None
+    `artifacts.updated_at` in the registry. None if the artifact is unknown.
+
+    P2 ce-review fix #16: uses the public ``get_artifact_updated_at()``
+    accessor on SqliteArtifactRegistry instead of reaching into ``_conn``
+    + ``_lock`` directly. Layer violation closed."""
+    return coordinator.registry.get_artifact_updated_at(artifact_id)
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> Optional[str]:
