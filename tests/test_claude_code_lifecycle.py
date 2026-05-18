@@ -368,8 +368,14 @@ def test_ten_process_race_one_binds_others_read_same_port(
     assert len(unique_ports) == 1, (
         f"expected exactly one bound port; got {unique_ports} from pids {pids}"
     )
-    # All 10 pids must be distinct (spawn pool guarantees this; sanity check).
-    assert len(set(pids)) == 10
+    # At least 2 distinct pids prove SOME concurrency happened (sanity).
+    # We don't require all 10 distinct — `mp.Pool(10)` reuses worker processes
+    # across tasks on single-CPU CI runners, so the same pid can appear in
+    # multiple results. The load-bearing assertion is `len(unique_ports) == 1`
+    # above; pid distinctness was a soft "did the pool spread work" check.
+    assert len(set(pids)) >= 2, (
+        f"all 10 tasks ran in a single worker (no concurrency) — got pids {set(pids)}"
+    )
     # Clean up: kill the holder if it's still alive (the holder is one
     # of the worker subprocesses, which exited at pool teardown — the
     # OS released the flock and torn down the socket).
