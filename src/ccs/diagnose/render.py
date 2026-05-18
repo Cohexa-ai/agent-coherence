@@ -89,7 +89,7 @@ Override per-invocation via ``RenderOptions(book_a_call_url=...)`` or the
 
 DEFAULT_CONTACT_EMAIL: str = os.environ.get(
     "CCS_DIAGNOSE_CONTACT_EMAIL",
-    "vlad@fwdinc.net",
+    "vlad@agent-coherence.dev",
 )
 """Placeholder reply-to address. Override via ``RenderOptions`` or by
 setting ``CCS_DIAGNOSE_CONTACT_EMAIL`` before import. Subject to the

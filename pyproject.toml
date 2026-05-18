@@ -27,6 +27,19 @@ ccs-compare = "ccs.cli.compare:main"
 ccs-check-architecture = "ccs.hardening.architecture:main"
 ccs-benchmark = "ccs.cli.benchmark:main"
 ccs-diagnose = "ccs.cli.diagnose:main"
+# Claude Code coordinator console scripts (Unit 6 / R1, R4). The plugin's
+# bin/ensure-coordinator shim wraps the first; the latter three back the
+# /agent-coherence {status,track,untrack} slash commands documented in
+# origin §11.
+agent-coherence-coordinator = "ccs.cli.coherence_coordinator:main"
+agent-coherence-status = "ccs.cli.coherence_status:main"
+agent-coherence-track = "ccs.cli.coherence_track:main"
+agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
+# Phase E.0 probe 2A surfaced that CC v2.1.131 rejects hooks.json URLs
+# containing ${COHERENCE_PORT} at LOAD TIME. HTTP-type hooks are not viable;
+# the plugin uses command-type hooks that invoke this client, which reads
+# .coherence/server.pid directly. See docs/probes/2026-05-17-*.md.
+agent-coherence-hook-client = "ccs.cli.coherence_hook_client:main"
 # Note: ccs-check-release is intentionally NOT exposed as a public console
 # script. It's a maintainer-only pre-tag-push verifier that queries this
 # repo's GitHub admin settings (hardcoded defaults to hipvlady/agent-coherence).
@@ -51,6 +64,12 @@ pythonpath = ["src", "."]
 # refactor demo test suite. Test files must not live under any directory
 # whose name shadows a top-level package — for example, do NOT create
 # ``tests/examples/`` (would shadow the real ``examples/`` package).
+markers = [
+    "launch_gate: Unit 9 hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
+    "launch_gate_pilot: Unit 9 pilot run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
+]
+# Skip launch_gate markers in default unit test runs.
+addopts = "-m 'not launch_gate and not launch_gate_pilot'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
