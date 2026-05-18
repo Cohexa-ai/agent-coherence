@@ -433,7 +433,14 @@ def _read_port_from_file(pid_file: Path) -> Optional[int]:
 
 def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:
     """Bounded retry for the brief window where the holder has the lock
-    but hasn't written the port yet. Returns -1 if the retry exhausts."""
+    but hasn't written the port yet. Returns -1 if the retry exhausts.
+
+    P2 ce-review fix #20 (maintainability + reliability): kept as a
+    TEST-ONLY utility. Production callers use the unified spawn-or-join
+    loop in :func:`ensure_coordinator` which handles the same retry
+    pattern alongside flock acquisition (G1 fix). Do not call from
+    production code paths — the inlined version covers both port-read
+    and lock-acquire retries simultaneously."""
     for _ in range(cfg.port_file_retry_attempts):
         port = _read_port_from_file(pid_file)
         if port is not None:
@@ -640,8 +647,10 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
                 1800, exc,
             )
             # shutdown_done remains UNSET so a retry is possible. Return
-            # False (P3 #26 fix: return value now reflects completion).
-            return False
+            # True because this invocation DID run the sequence body
+            # (whose outcome was abort). Caller can inspect
+            # entry.shutdown_done to distinguish complete vs aborted.
+            return True
 
         # Step 4 + 5: release the flock + close fd. Wrap each in try/except
         # so a failure at this stage (rare — lock already validly held)
