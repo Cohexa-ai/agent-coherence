@@ -133,7 +133,12 @@ def _normalize_relative(p: str) -> Optional[str]:
     though the hook handler also normalizes upstream)."""
     if not p:
         return None
-    cleaned = p.lstrip("./")
+    # P1 ce-review fix (kieran-python + correctness convergence): use
+    # removeprefix, NOT lstrip. lstrip strips a SET of characters {".", "/"}
+    # so ".env" → "env", ".gitignore" → "gitignore", silently making dotfile
+    # patterns in tracked.yaml unmatchable. removeprefix strips the literal
+    # "./" prefix only (Python 3.9+).
+    cleaned = p.removeprefix("./")
     if not cleaned:
         # Pure "." or "./"; not a file path.
         return None

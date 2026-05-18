@@ -542,14 +542,21 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
 
 def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     """Wall-clock idle watcher. When ``time.time() - last_request_at >=
-    idle_shutdown_sec``, runs the race-safe shutdown sequence and pops
-    the registry entry."""
+    idle_shutdown_sec``, runs the race-safe shutdown sequence.
+
+    P2 ce-review fix #7 (reliability): retry shutdown on the next tick if
+    G4 abort path fired (coordinator.shutdown raised) — previously the
+    loop exited permanently on the first attempt, leaving flock held
+    forever and the idle thread dead.
+    """
     coordinator = entry.coordinator
     while not coordinator.shutting_down:
         time.sleep(cfg.sweep_interval_sec)
         if coordinator.shutting_down:
             break
-        idle_for = time.time() - coordinator._last_request_at  # type: ignore[attr-defined]
+        # P3 ce-review fix #39: use the public idle_seconds property (was
+        # private _last_request_at + type: ignore).
+        idle_for = coordinator.idle_seconds
         if idle_for >= cfg.idle_shutdown_sec:
             logger.info(
                 "coordinator idle for %.0fs (>= %ss threshold) — shutting down",
@@ -558,7 +565,15 @@ def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             _shutdown_sequence(entry)
             if entry.shutdown_done.is_set():
                 _SPAWNED_REGISTRY.pop(str(coordinator.coordinator_root), None)
-            return
+                return
+            # G4 abort: shutdown_done NOT set — loop continues so the next
+            # sweep tick will retry. Stable-grant reclamation
+            # (max_hold_ticks) remains the long-term safety net but we
+            # should still try again ourselves rather than wedging the
+            # idle thread.
+            logger.warning(
+                "shutdown aborted (G4); will retry on next sweep tick"
+            )
 
 
 def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
@@ -582,8 +597,15 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
       4. Release the flock.
       5. Close the fd.
 
-    Returns True if this caller actually executed the sequence; False if
-    the sequence was already done by a previous caller.
+    Returns True if this caller's invocation actually ran the sequence
+    (whether it completed cleanly OR aborted on G4). Returns False only
+    when shutdown_done was already set on entry (no-op).
+
+    To check whether shutdown ACTUALLY COMPLETED (vs aborted via G4),
+    check ``entry.shutdown_done.is_set()`` after the call — that's the
+    truth source. The return value is "did THIS caller execute the
+    sequence body" so concurrent callers can distinguish "I did the
+    work" from "someone else already did it".
     """
     with entry.shutdown_lock:
         if entry.shutdown_done.is_set():
@@ -617,8 +639,9 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
                 # config thresholds not on entry; using a generic mention
                 1800, exc,
             )
-            # Note: shutdown_done remains UNSET so a retry is possible.
-            return True
+            # shutdown_done remains UNSET so a retry is possible. Return
+            # False (P3 #26 fix: return value now reflects completion).
+            return False
 
         # Step 4 + 5: release the flock + close fd. Wrap each in try/except
         # so a failure at this stage (rare — lock already validly held)

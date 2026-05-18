@@ -24,9 +24,11 @@ from typing import Sequence
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
+    err,
     http_status_from_error,
     post,
     resolve_endpoint,
+    validate_relative_path,
 )
 
 
@@ -54,13 +56,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = args.root if args.root is not None else find_coordinator_root()
     if root is None:
-        print("agent-coherence-untrack: not in a git repository", flush=True)
+        err("agent-coherence-untrack: not in a git repository")
         return 1
 
     invalid: list[tuple[str, str]] = []
     valid: list[str] = []
     for p in args.paths:
-        reason = _validate_path(p)
+        reason = validate_relative_path(p)
         if reason is not None:
             invalid.append((p, reason))
         else:
@@ -68,38 +70,29 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not valid:
         for p, reason in invalid:
-            print(f"agent-coherence-untrack: rejected {p!r}: {reason}", flush=True)
+            err(f"agent-coherence-untrack: rejected {p!r}: {reason}")
         return 1
 
     try:
         endpoint = resolve_endpoint(Path(root))
         payload = post(endpoint, "/policy/untrack", {"paths": valid})
     except CoordinatorUnavailable as exc:
-        print(f"agent-coherence-untrack: {exc}", flush=True)
+        err(f"agent-coherence-untrack: {exc}")
         return 2
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
         msg = (body or {}).get("error", str(exc))
-        print(f"agent-coherence-untrack: HTTP {exc.code}: {msg}", flush=True)
+        err(f"agent-coherence-untrack: HTTP {exc.code}: {msg}")
         return 2
 
     removed: list[str] = payload.get("removed", [])
     for p in removed:
+        # Success → stdout (machine-parseable by callers).
         print(f"agent-coherence-untrack: untracked {p}", flush=True)
     for p, reason in invalid:
-        print(f"agent-coherence-untrack: rejected {p!r}: {reason}", flush=True)
+        err(f"agent-coherence-untrack: rejected {p!r}: {reason}")
 
     return 0
-
-
-def _validate_path(p: str) -> str | None:
-    if not p:
-        return "empty"
-    if p.startswith("/"):
-        return "path must be relative (no leading '/')"
-    if ".." in Path(p).parts:
-        return "path must not contain '..' traversal"
-    return None
 
 
 if __name__ == "__main__":

@@ -180,67 +180,109 @@ class SqliteArtifactRegistry:
                 )
 
     def _apply_v1_schema(self, instance_id: str | None) -> None:
-        """Create tables, indexes, and seed registry_meta. Caller holds lock."""
+        """Create tables, indexes, and seed registry_meta. Caller holds lock.
+
+        P1 ce-review fix (correctness): schema init must be atomic against
+        SIGKILL. Earlier version ran executescript() THEN a separate PRAGMA
+        user_version — SIGKILL between left user_version=0 with all tables
+        present → next startup hit "table already exists" → DB permanently
+        unbootable until manual rm.
+
+        executescript() commits each statement in autocommit, so embedding
+        the PRAGMA in the script only NARROWS the window — doesn't close it.
+        The truly atomic fix is an explicit BEGIN IMMEDIATE / COMMIT wrapping
+        all DDL + meta seed + PRAGMA user_version (which IS transactional
+        when issued inside an explicit transaction per SQLite docs).
+        """
         c = self._conn
-        c.executescript(
-            """
-            CREATE TABLE artifacts (
-                id              TEXT PRIMARY KEY,
-                name            TEXT NOT NULL UNIQUE,
-                version         INTEGER NOT NULL,
-                content_hash    TEXT NOT NULL,
-                size_tokens     INTEGER,
-                last_writer_id  TEXT,
-                updated_at      REAL NOT NULL
-            );
-            CREATE INDEX idx_artifacts_name ON artifacts(name);
-
-            CREATE TABLE agent_states (
-                artifact_id          TEXT NOT NULL,
-                agent_id             TEXT NOT NULL,
-                state                TEXT NOT NULL,
-                transient_state      TEXT,
-                transient_tick       INTEGER,
-                granted_at_tick      INTEGER,
-                last_reclaim_trigger TEXT,
-                last_reclaim_tick    INTEGER,
-                PRIMARY KEY (artifact_id, agent_id),
-                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE heartbeats (
-                agent_id   TEXT PRIMARY KEY,
-                last_tick  INTEGER NOT NULL
-            );
-
-            CREATE TABLE registry_meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-
-            -- A1: preemption notices. When one agent invalidates another's
-            -- M∪E grant (via CoordinatorService.write), the victim gets a
-            -- pending notice that surfaces on their next pre-read / pre-edit
-            -- hook. PRIMARY KEY (agent_id, artifact_id) means a second
-            -- preemption on the same (victim, artifact) UPSERTs — the
-            -- latest preempter wins, which is the right UX.
-            CREATE TABLE pending_notices (
-                agent_id              TEXT NOT NULL,
-                artifact_id           TEXT NOT NULL,
-                preempter_agent_id    TEXT NOT NULL,
-                preempted_at_unix_ts  REAL NOT NULL,
-                PRIMARY KEY (agent_id, artifact_id),
-                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-            );
-            """
-        )
-        # Seed instance_id and sequence counter.
         seed_id = instance_id if instance_id is not None else str(uuid4())
-        c.execute(
-            "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
-            ("instance_id", seed_id, "sequence_number", "0"),
-        )
-        c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
+        # Use individual execute() calls (NOT executescript) so the explicit
+        # BEGIN IMMEDIATE transaction is honored uniformly across Python
+        # versions — executescript() has version-dependent quirks around
+        # auto-committing on entry.
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute(
+                """
+                CREATE TABLE artifacts (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL UNIQUE,
+                    version         INTEGER NOT NULL,
+                    content_hash    TEXT NOT NULL,
+                    size_tokens     INTEGER,
+                    last_writer_id  TEXT,
+                    updated_at      REAL NOT NULL
+                )
+                """
+            )
+            c.execute("CREATE INDEX idx_artifacts_name ON artifacts(name)")
+            c.execute(
+                """
+                CREATE TABLE agent_states (
+                    artifact_id          TEXT NOT NULL,
+                    agent_id             TEXT NOT NULL,
+                    state                TEXT NOT NULL,
+                    transient_state      TEXT,
+                    transient_tick       INTEGER,
+                    granted_at_tick      INTEGER,
+                    last_reclaim_trigger TEXT,
+                    last_reclaim_tick    INTEGER,
+                    PRIMARY KEY (artifact_id, agent_id),
+                    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE heartbeats (
+                    agent_id   TEXT PRIMARY KEY,
+                    last_tick  INTEGER NOT NULL
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE registry_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+            # A1: preemption notices. When one agent invalidates another's
+            # M∪E grant (via CoordinatorService.write), the victim gets a
+            # pending notice that surfaces on their next pre-read / pre-edit
+            # hook. PRIMARY KEY (agent_id, artifact_id) means a second
+            # preemption on the same (victim, artifact) UPSERTs — the
+            # latest preempter wins, which is the right UX.
+            c.execute(
+                """
+                CREATE TABLE pending_notices (
+                    agent_id              TEXT NOT NULL,
+                    artifact_id           TEXT NOT NULL,
+                    preempter_agent_id    TEXT NOT NULL,
+                    preempted_at_unix_ts  REAL NOT NULL,
+                    PRIMARY KEY (agent_id, artifact_id),
+                    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+                )
+                """
+            )
+            c.execute(
+                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
+                ("instance_id", seed_id, "sequence_number", "0"),
+            )
+            # PRAGMA is transactional inside an explicit BEGIN; cannot take
+            # parameter bindings, so SCHEMA_USER_VERSION (int constant) is
+            # interpolated directly.
+            c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            # BaseException catches KeyboardInterrupt mid-init too so the
+            # partial state doesn't poison the next start.
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         self._instance_id = seed_id
         self._seq = 0
 
@@ -953,8 +995,10 @@ class SqliteArtifactRegistry:
         monkey-patching ``time.time``; defaults to ``time.time()``.
         """
         if now_unix is None:
-            import time as _time
-            now_unix = _time.time()
+            # P3 ce-review fix #37: use module-level `time` import (was a
+            # deferred `import time as _time` that shadowed the top-level
+            # import and confused readers).
+            now_unix = time.time()
         cutoff = now_unix - max_age_sec
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")

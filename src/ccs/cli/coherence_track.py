@@ -24,9 +24,11 @@ from typing import Sequence
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
+    err,
     http_status_from_error,
     post,
     resolve_endpoint,
+    validate_relative_path,
 )
 
 
@@ -54,14 +56,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = args.root if args.root is not None else find_coordinator_root()
     if root is None:
-        print("agent-coherence-track: not in a git repository", flush=True)
+        err("agent-coherence-track: not in a git repository")
         return 1
 
     # Local pre-validation so we can fail fast without a network round-trip.
     invalid: list[tuple[str, str]] = []
     valid: list[str] = []
     for p in args.paths:
-        reason = _validate_path(p)
+        reason = validate_relative_path(p)
         if reason is not None:
             invalid.append((p, reason))
         else:
@@ -69,55 +71,42 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not valid:
         for p, reason in invalid:
-            print(f"agent-coherence-track: rejected {p!r}: {reason}", flush=True)
+            err(f"agent-coherence-track: rejected {p!r}: {reason}")
         return 1
 
     try:
         endpoint = resolve_endpoint(Path(root))
         payload = post(endpoint, "/policy/track", {"paths": valid})
     except CoordinatorUnavailable as exc:
-        print(f"agent-coherence-track: {exc}", flush=True)
+        err(f"agent-coherence-track: {exc}")
         return 2
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
         msg = (body or {}).get("error", str(exc))
-        print(f"agent-coherence-track: HTTP {exc.code}: {msg}", flush=True)
+        err(f"agent-coherence-track: HTTP {exc.code}: {msg}")
         return 2
 
     added: list[str] = payload.get("added", [])
     rejected: list[dict] = payload.get("rejected", [])
     for p in added:
-        # Warn if the path doesn't exist on disk yet — operationally fine
-        # (will be seeded on first Read), but worth surfacing.
+        # Success → stdout (machine-parseable by callers). Warn-on-stderr
+        # if the path doesn't exist on disk yet (operationally fine, but
+        # worth surfacing as diagnostic info).
         disk_path = Path(root) / p
         if not disk_path.exists():
-            print(
-                f"agent-coherence-track: tracked {p} (warning: does not exist on disk yet)",
-                flush=True,
-            )
+            print(f"agent-coherence-track: tracked {p}", flush=True)
+            err(f"agent-coherence-track: warning: {p} does not exist on disk yet")
         else:
             print(f"agent-coherence-track: tracked {p}", flush=True)
     for entry in rejected:
-        print(
-            f"agent-coherence-track: rejected {entry.get('path', '')}: {entry.get('reason', '')}",
-            flush=True,
+        err(
+            f"agent-coherence-track: rejected {entry.get('path', '')}: "
+            f"{entry.get('reason', '')}"
         )
     for p, reason in invalid:
-        print(f"agent-coherence-track: rejected {p!r}: {reason}", flush=True)
+        err(f"agent-coherence-track: rejected {p!r}: {reason}")
 
     return 0
-
-
-def _validate_path(p: str) -> str | None:
-    """Mirror the Unit 3 TrackedArtifactPolicy validator. Returns None on
-    valid, error string on invalid."""
-    if not p:
-        return "empty"
-    if p.startswith("/"):
-        return "path must be relative (no leading '/')"
-    if ".." in Path(p).parts:
-        return "path must not contain '..' traversal"
-    return None
 
 
 if __name__ == "__main__":

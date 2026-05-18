@@ -52,8 +52,10 @@ from ccs.adapters.claude_code.lifecycle import (
     _tcp_probe,
     LifecycleConfig,
     ensure_coordinator,
+    stop_coordinator,
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
+from ccs.cli._coherence_client import err
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root_arg = args.root if args.root is not None else find_coordinator_root()
     if root_arg is None:
-        print("agent-coherence-coordinator: not in a git repository", flush=True)
+        err("agent-coherence-coordinator: not in a git repository")
         return 1
     root = Path(root_arg).resolve()
 
@@ -113,10 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_detach:
         port = ensure_coordinator(root)
         if port == -1:
-            print(
-                "agent-coherence-coordinator: coordinator could not be spawned",
-                flush=True,
-            )
+            err("agent-coherence-coordinator: coordinator could not be spawned")
             return 2
         if not args.quiet:
             print(f"port={port}", flush=True)
@@ -184,10 +183,7 @@ def _spawn_detached(root: Path, *, quiet: bool) -> int:
             close_fds=True,
         )
     except OSError as exc:
-        print(
-            f"agent-coherence-coordinator: could not spawn detached worker: {exc}",
-            flush=True,
-        )
+        err(f"agent-coherence-coordinator: could not spawn detached worker: {exc}")
         return 2
 
     cfg = LifecycleConfig()
@@ -199,10 +195,9 @@ def _spawn_detached(root: Path, *, quiet: bool) -> int:
             return 0
         time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
 
-    print(
+    err(
         "agent-coherence-coordinator: detached worker did not become reachable "
-        f"within {_DETACH_PORT_WAIT_ATTEMPTS * _DETACH_PORT_WAIT_INTERVAL_SEC:.0f}s",
-        flush=True,
+        f"within {_DETACH_PORT_WAIT_ATTEMPTS * _DETACH_PORT_WAIT_INTERVAL_SEC:.0f}s"
     )
     return 2
 

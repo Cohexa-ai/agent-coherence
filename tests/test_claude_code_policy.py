@@ -117,6 +117,39 @@ def test_ignore_wins_over_tracked(root: Path) -> None:
 
 
 # --------------------------------------------------------------------
+# Dotfile paths — regression coverage for ce-review P1 finding #1
+# --------------------------------------------------------------------
+#
+# Before the fix at policy.py:136, _normalize_relative used p.lstrip("./")
+# which strips a SET of characters {".", "/"}, silently mangling dotfile
+# paths (.env → env, .gitignore → gitignore). A user-added dotfile pattern
+# in tracked.yaml stored as ".env" but normalized to "env" on is_tracked()
+# check, making it unmatchable. The fix uses removeprefix("./") which only
+# strips the literal "./" prefix.
+#
+# These parametrize entries would have caught the bug had they existed.
+
+
+@pytest.mark.parametrize("dotfile_path", [
+    ".env",
+    ".gitignore",
+    ".hidden/plan.md",
+    ".coherence/state.db",
+    "subdir/.env",
+])
+def test_dotfile_paths_track_correctly_when_added(root: Path, dotfile_path: str) -> None:
+    """A user-added dotfile pattern in tracked.yaml must match the same
+    dotfile path on is_tracked() — verifies the removeprefix fix on
+    _normalize_relative."""
+    (root / ".coherence" / "tracked.yaml").write_text(f"- {dotfile_path}\n")
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.is_tracked(dotfile_path), (
+        f"dotfile {dotfile_path!r} added to tracked.yaml but is_tracked() returns False "
+        f"— check _normalize_relative's prefix-stripping (must NOT use lstrip)"
+    )
+
+
+# --------------------------------------------------------------------
 # Path-traversal guard (security-lens review)
 # --------------------------------------------------------------------
 

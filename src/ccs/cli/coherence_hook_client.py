@@ -91,14 +91,54 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point. Wraps the real dispatch in a top-level except so that no
+    unexpected exception (refactor regression, payload-builder bug, anything
+    not anticipated) can violate the always-exit-0 hook contract.
+
+    P2 ce-review fix #8 (reliability): top-level broad except guarantees the
+    hook contract — emit ``{}`` and exit 0 no matter what fails.
+    P3 ce-review fix #27 (agent-native): isatty guard prevents indefinite
+    block when a developer runs the hook-client manually for testing.
+    P3 ce-review fix #24 (cli-readiness): empty stdin path now emits ``{}``
+    for consistency with the malformed-stdin path (both produce parseable
+    JSON for any upstream wrapper doing json.loads on stdout).
+    """
+    try:
+        return _main_inner(argv)
+    except SystemExit:
+        # argparse / explicit sys.exit — propagate normally
+        raise
+    except BaseException:
+        # CC must never see the hook block its tool call. Even on
+        # KeyboardInterrupt or an unexpected programming error, emit the
+        # no-op response and exit 0.
+        _emit_empty()
+        return 0
+
+
+def _main_inner(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Developer footgun: if stdin is a TTY, the read below would block
+    # indefinitely. Emit a brief usage hint to stderr and exit clean so
+    # someone testing manually understands what's expected.
+    if sys.stdin.isatty():
+        print(
+            "agent-coherence-hook-client: stdin is a terminal — "
+            "this command expects a Claude Code hook JSON payload on stdin.",
+            file=sys.stderr,
+        )
+        _emit_empty()
+        return 0
 
     # Read CC's hook stdin payload.
     try:
         raw = sys.stdin.read()
     except OSError:
-        return 0  # no stdin — nothing to do; exit clean per CC hook conventions.
+        _emit_empty()
+        return 0  # no stdin — emit {} for output consistency
     if not raw.strip():
+        _emit_empty()  # consistent with malformed-stdin path
         return 0
 
     try:
@@ -121,7 +161,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit_empty()
         return 0
 
-    # Dispatch.
+    # Dispatch. Broader except below catches any unexpected exception from
+    # payload builders or _call (e.g., AttributeError from a malformed
+    # cc_payload, refactor-introduced exception type) so hook never blocks.
     try:
         if args.subcommand == "pre-read":
             payload = _build_pre_read(cc_payload, root_path)
@@ -142,6 +184,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit_empty()
         return 0
     except _SkipHook:
+        _emit_empty()
+        return 0
+    except Exception:
+        # P2 ce-review fix #8: any unexpected exception from a payload
+        # builder, _call, or future refactor must NOT propagate — CC
+        # requires the hook to exit clean. The top-level except in main()
+        # also catches but that's BaseException-wide; this one preserves
+        # KeyboardInterrupt propagation to the outer handler.
         _emit_empty()
         return 0
 

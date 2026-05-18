@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
+    err,
     get,
     http_status_from_error,
     resolve_endpoint,
@@ -53,19 +54,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = args.root if args.root is not None else find_coordinator_root()
     if root is None:
-        print("agent-coherence-status: not in a git repository", flush=True)
+        err("agent-coherence-status: not in a git repository")
         return 1
 
     try:
         endpoint = resolve_endpoint(Path(root))
         payload = get(endpoint, "/status")
     except CoordinatorUnavailable as exc:
-        print(f"agent-coherence-status: {exc}", flush=True)
+        err(f"agent-coherence-status: {exc}")
         return 0  # graceful — no coordinator is a normal state
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
         msg = (body or {}).get("error", str(exc))
-        print(f"agent-coherence-status: HTTP {exc.code}: {msg}", flush=True)
+        err(f"agent-coherence-status: HTTP {exc.code}: {msg}")
         return 2
 
     if args.json:

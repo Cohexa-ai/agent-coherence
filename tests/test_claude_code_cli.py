@@ -85,7 +85,8 @@ def test_coordinator_not_in_git_repo_exits_1(
     rc = coherence_coordinator.main([])
     captured = capsys.readouterr()
     assert rc == 1
-    assert "not in a git repository" in captured.out
+    # ce-review P2 fix #15: errors now go to stderr (was stdout)
+    assert "not in a git repository" in captured.err
 
 
 def test_coordinator_spawns_and_prints_port(
@@ -224,7 +225,8 @@ def test_status_no_coordinator_exits_0_with_graceful_message(
     rc = coherence_status.main(["--root", str(git_workspace)])
     captured = capsys.readouterr()
     assert rc == 0
-    assert "no coordinator running" in captured.out
+    # ce-review P2 fix #15: graceful-no-coordinator message now goes to stderr
+    assert "no coordinator running" in captured.err
 
 
 def test_status_renders_table_against_live_coordinator(
@@ -278,7 +280,8 @@ def test_track_rejects_invalid_paths_without_network(
     rc = coherence_track.main(["--root", str(git_workspace), bad_path])
     captured = capsys.readouterr()
     assert rc == 1
-    assert reason_substr in captured.out
+    # ce-review P2 fix #15: rejection messages go to stderr
+    assert reason_substr in captured.err
 
 
 def test_track_no_coordinator_running_exits_2(
@@ -288,7 +291,8 @@ def test_track_no_coordinator_running_exits_2(
     rc = coherence_track.main(["--root", str(git_workspace), "docs/plan.md"])
     captured = capsys.readouterr()
     assert rc == 2
-    assert "no coordinator running" in captured.out
+    # ce-review P2 fix #15: coordinator-unavailable message goes to stderr
+    assert "no coordinator running" in captured.err
 
 
 def test_track_against_live_coordinator(
@@ -320,7 +324,10 @@ def test_track_warns_on_path_not_on_disk(
     rc = coherence_track.main(["--root", str(workspace), "docs/future.md"])
     captured = capsys.readouterr()
     assert rc == 0
-    assert "does not exist on disk yet" in captured.out
+    # Success ("tracked docs/future.md") on stdout; warning ("does not exist
+    # on disk yet") on stderr per ce-review P2 fix #15.
+    assert "tracked docs/future.md" in captured.out
+    assert "does not exist on disk yet" in captured.err
 
 
 def test_untrack_against_live_coordinator(
@@ -349,7 +356,8 @@ def test_untrack_rejects_invalid_paths_without_network(
     rc = coherence_untrack.main(["--root", str(git_workspace), bad_path])
     captured = capsys.readouterr()
     assert rc == 1
-    assert reason_substr in captured.out
+    # ce-review P2 fix #15: rejection messages go to stderr
+    assert reason_substr in captured.err
 
 
 # ----------------------------------------------------------------------

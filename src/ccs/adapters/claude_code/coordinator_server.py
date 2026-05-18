@@ -35,11 +35,13 @@ from __future__ import annotations
 import http.server
 import json
 import logging
+import os
 import re
 import socketserver
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -51,7 +53,6 @@ from ccs.adapters.claude_code.auth import (
     verify_host,
 )
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
-from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import CoherenceError
@@ -219,11 +220,6 @@ class CoordinatorHTTPServer:
         self.port = self._server.server_port
         self._serve_thread: Optional[threading.Thread] = None
 
-    @classmethod
-    def from_root(cls, coordinator_root: Path, **kwargs: Any) -> "CoordinatorHTTPServer":
-        """Convenience for the lifecycle module."""
-        return cls(coordinator_root, **kwargs)
-
     def serve_in_thread(self) -> None:
         """Start the serving loop in a daemon thread."""
         if self._serve_thread is not None:
@@ -262,6 +258,22 @@ class CoordinatorHTTPServer:
     @property
     def uptime_s(self) -> float:
         return time.time() - self._started_at
+
+    @property
+    def last_request_at(self) -> float:
+        """Wall-clock timestamp of the most recent request, or the
+        server start time if no requests have hit it yet.
+
+        P3 ce-review fix #39 (kieran-python): the idle-shutdown loop in
+        lifecycle.py previously reached into the private
+        ``_last_request_at`` with a ``# type: ignore[attr-defined]``.
+        This public property removes the cross-module private access."""
+        return self._last_request_at
+
+    @property
+    def idle_seconds(self) -> float:
+        """Wall-clock seconds since the most recent request."""
+        return time.time() - self._last_request_at
 
     @property
     def shutting_down(self) -> bool:
@@ -670,7 +682,7 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
             # the same preemption prose. The subagent flagged this as a
             # double-emit hazard — the post-edit-failure response IS the
             # surfacing channel for this specific case.
-            popped = _pop_specific_notice(coordinator, agent_id, artifact_id)
+            popped = coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
             if popped is not None:
                 preempter_id, preempted_at = popped
                 preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
@@ -760,7 +772,18 @@ def _handle_session_stop(req, coordinator: CoordinatorHTTPServer) -> None:
 
 
 def _handle_policy_track(req, coordinator: CoordinatorHTTPServer) -> None:
-    """POST /policy/track — Unit 6 CLI add to tracked.yaml."""
+    """POST /policy/track — Unit 6 CLI add to tracked.yaml.
+
+    P2 ce-review fixes:
+    - #4 (security YAML injection): every path passes validate_path() which
+      rejects control chars (newlines), absolute paths, and ../ traversal
+      before being appended to tracked.yaml. Without this, an authenticated
+      caller could POST {"paths":["real.md\\n- injected.yaml"]} and inject
+      additional patterns.
+    - #11 (correctness 500→400): _append_policy_yaml's ValueError on YAML
+      cap overflow is caught and returned as HTTP 400 instead of falling
+      through the catch-all as a 500.
+    """
     body = req._read_json()
     if body is None:
         return
@@ -771,15 +794,38 @@ def _handle_policy_track(req, coordinator: CoordinatorHTTPServer) -> None:
     if len(paths) > MAX_POLICY_PATHS_PER_REQUEST:
         req._json(400, {"error": f"max {MAX_POLICY_PATHS_PER_REQUEST} paths per request"})
         return
+    # Pre-validate each path: filter out malformed entries (path traversal,
+    # absolute paths, control chars including the newlines that previously
+    # allowed YAML injection). Invalid paths join the response's `rejected`
+    # list — preserves partial-accept semantics while defending against
+    # injection into tracked.yaml.
+    safe_paths: list[str] = []
+    pre_rejected: list[dict] = []
+    for p in paths:
+        v_err = validate_path(p)
+        if v_err is not None:
+            pre_rejected.append({"path": p, "reason": v_err})
+        else:
+            safe_paths.append(p)
     yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
-    added, rejected = _append_policy_yaml(yaml_path, paths)
+    try:
+        added, rejected = _append_policy_yaml(yaml_path, safe_paths)
+    except ValueError as exc:
+        req._json(400, {"error": str(exc)})
+        return
     # Reload the live policy so subsequent hook calls see the additions.
     coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
-    req._json(200, {"ok": True, "added": added, "rejected": rejected})
+    req._json(200, {
+        "ok": True, "added": added, "rejected": rejected + pre_rejected,
+    })
 
 
 def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
-    """POST /policy/untrack — Unit 6 CLI add to ignored.yaml."""
+    """POST /policy/untrack — Unit 6 CLI add to ignored.yaml.
+
+    Same hardening as /policy/track: per-path validate_path call + ValueError
+    → HTTP 400 mapping.
+    """
     body = req._read_json()
     if body is None:
         return
@@ -790,8 +836,18 @@ def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
     if len(paths) > MAX_POLICY_PATHS_PER_REQUEST:
         req._json(400, {"error": f"max {MAX_POLICY_PATHS_PER_REQUEST} paths per request"})
         return
+    # Same defense-in-depth + partial-accept as /policy/track.
+    safe_paths: list[str] = []
+    for p in paths:
+        v_err = validate_path(p)
+        if v_err is None:
+            safe_paths.append(p)
     yaml_path = coordinator.coordinator_root / ".coherence" / "ignored.yaml"
-    added, _ = _append_policy_yaml(yaml_path, paths)
+    try:
+        added, _ = _append_policy_yaml(yaml_path, safe_paths)
+    except ValueError as exc:
+        req._json(400, {"error": str(exc)})
+        return
     coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
     req._json(200, {"ok": True, "removed": added})
 
@@ -833,7 +889,7 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
         "tracked_artifacts": tracked,
         "sessions": sessions,
         "coordinator_uptime_s": coordinator.uptime_s,
-        "coordinator_pid": _os_pid(),
+        "coordinator_pid": os.getpid(),
         "policy_summary": coordinator.policy.summary(),
     })
 
@@ -907,18 +963,7 @@ def _peers_in_me_excluding(
 
 def _iso_utc(unix_ts: float) -> str:
     """Format a unix timestamp as an ISO 8601 UTC string for prose."""
-    from datetime import datetime, timezone
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
-
-
-def _pop_specific_notice(
-    coordinator: CoordinatorHTTPServer,
-    agent_id: UUID,
-    artifact_id: UUID,
-) -> Optional[tuple[UUID, float]]:
-    """F4 hardening helper: atomically consume a single (agent, artifact)
-    preemption notice. Returns (preempter_agent_id, ts) or None."""
-    return coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
 
 
 #: F3 hardening — render up to this many notices verbatim; coalesce the
@@ -1048,8 +1093,3 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         raise ValueError(f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded")
     yaml_path.write_text(new_content)
     return added, rejected
-
-
-def _os_pid() -> int:
-    import os as _os
-    return _os.getpid()

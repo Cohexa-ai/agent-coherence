@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -33,6 +34,34 @@ logger = logging.getLogger(__name__)
 #: 4s; we add headroom for connection setup. CLI users are interactive so a
 #: 6s ceiling is preferable to retrying.
 CLI_HTTP_TIMEOUT_SEC = 6.0
+
+
+def err(message: str) -> None:
+    """Write a diagnostic / error line to stderr.
+
+    P2 ce-review fix #15 (cli-readiness): error output must go to stderr so
+    agents composing workflows can read machine-parseable data from stdout
+    (e.g., ``port=$(agent-coherence-coordinator)``) without prose pollution.
+    Success output stays on stdout via plain ``print()``.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
+def validate_relative_path(p: str) -> Optional[str]:
+    """Reject absolute paths, ``..`` traversal, and empty input. Returns
+    None on valid, a reason string on invalid.
+
+    P2 ce-review fix #6 (maintainability): consolidates the
+    ``_validate_path`` helper that previously existed byte-for-byte in
+    both coherence_track.py and coherence_untrack.py — divergence risk
+    eliminated. Both scripts now import this single source of truth."""
+    if not p:
+        return "empty"
+    if p.startswith("/"):
+        return "path must be relative (no leading '/')"
+    if ".." in Path(p).parts:
+        return "path must not contain '..' traversal"
+    return None
 
 
 @dataclass(frozen=True)
