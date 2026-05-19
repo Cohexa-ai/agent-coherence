@@ -117,6 +117,12 @@ class LifecycleConfig:
     #: Transient-state timeout (fail-safe for unfinished M↔E protocol steps).
     transient_timeout_sec: int = 60
 
+    #: KTD-H — Unit 5 L1: cap on inode re-opens during one ``ensure_coordinator``
+    #: call. Each external ``rm -rf .coherence/ && recreate`` consumes one
+    #: revalidation. Churn beyond this budget indicates a runaway external
+    #: process; the coordinator returns -1 and lets the hook degrade.
+    inode_revalidation_budget: int = 5
+
 
 _DEFAULT_CONFIG = LifecycleConfig()
 
@@ -175,6 +181,12 @@ def ensure_coordinator(
 
     # Unified spawn-or-join loop (G1 fix per Unit 5 §5.654 — the
     # idle-shutdown-vs-spawn race). On each attempt:
+    #   0. KTD-H (Unit 5 L1): revalidate fd's inode against the on-disk
+    #      path. If an external process unlinked `.coherence/` and
+    #      recreated it mid-retry, our fd points at the orphaned inode
+    #      and any flock/write happens invisibly. Re-open and restart
+    #      the retry counter on mismatch (bounded by the revalidation
+    #      budget to defend against pathological churn).
     #   1. Try to acquire the flock (non-blocking). If acquired, we're
     #      the winner — bind, write port, serve, return.
     #   2. If contended, try to read a valid port from the file. If
@@ -185,24 +197,60 @@ def ensure_coordinator(
     #
     # This handles both the cold-start thundering herd (holder is
     # mid-bind; port appears) and the idle-shutdown race (holder is
-    # mid-shutdown; flock releases) without baking in an order.
-    for attempt in range(cfg.port_file_retry_attempts):
+    # mid-shutdown; flock releases) without baking in an order, plus
+    # the rm -rf race that KTD-H closes.
+    revalidations_remaining = cfg.inode_revalidation_budget
+    attempt = 0
+    while attempt < cfg.port_file_retry_attempts:
+        # KTD-H: per-iteration inode revalidation. Cheap (~50μs) — st_dev
+        # + st_ino comparison detects unlink-and-recreate races before the
+        # flock attempt commits us to an orphan.
+        if not _inode_matches(fd, pid_file):
+            if revalidations_remaining <= 0:
+                logger.warning(
+                    "ensure_coordinator: inode revalidation budget exhausted "
+                    "(%d revalidations); external churn on .coherence/ — giving up",
+                    cfg.inode_revalidation_budget,
+                )
+                _close_quiet(fd)
+                return -1
+            revalidations_remaining -= 1
+            logger.info(
+                "ensure_coordinator: server.pid inode mismatch (rm -rf race?); "
+                "re-opening (%d revalidations remaining)",
+                revalidations_remaining,
+            )
+            _close_quiet(fd)
+            # Re-create the .coherence dir in case the rm -rf removed it too.
+            new_coherence_dir = _ensure_coherence_dir(coordinator_root)
+            if new_coherence_dir is None:
+                return -1
+            coherence_dir = new_coherence_dir
+            pid_file = coherence_dir / "server.pid"
+            new_fd = _open_pidfile(pid_file)
+            if new_fd is None:
+                return -1
+            fd = new_fd
+            attempt = 0  # KTD-H: restart the retry counter on re-open
+            continue
+
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno not in (errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN):
-                os.close(fd)
+                _close_quiet(fd)
                 raise
             # Contended — try to read the port.
             port = _read_port_from_file(pid_file)
             if port is not None:
-                os.close(fd)
+                _close_quiet(fd)
                 return port
             # Port file empty (holder mid-bind or mid-shutdown). Wait
             # and try the whole loop again — on the next iteration we
             # may either see the port populated OR acquire the released
             # lock ourselves.
             time.sleep(cfg.port_file_retry_interval_sec)
+            attempt += 1
             continue
 
         # Winner — we hold the lock. Bind, write port, serve.
@@ -240,7 +288,7 @@ def ensure_coordinator(
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
-                os.close(fd)
+                _close_quiet(fd)
             raise
 
     # Retry budget exhausted without acquiring the lock or seeing a
@@ -249,7 +297,7 @@ def ensure_coordinator(
     # which would itself be a bug in this module — OR the holder is
     # mid-shutdown for longer than the retry budget. Either way, return
     # -1 so the caller degrades gracefully.
-    os.close(fd)
+    _close_quiet(fd)
     logger.warning(
         "ensure_coordinator: %d attempts exhausted without acquiring lock or reading port",
         cfg.port_file_retry_attempts,
@@ -383,6 +431,38 @@ def _open_pidfile(pid_file: Path) -> Optional[int]:
         logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd
+
+
+def _close_quiet(fd: int) -> None:
+    """Best-effort close. Swallows OSError so cleanup paths can chain
+    without separate try/except blocks — closing an already-bad fd just
+    means the underlying file was already gone."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _inode_matches(fd: int, path: Path) -> bool:
+    """KTD-H Unit 5 L1 helper. Returns True iff the file currently at
+    ``path`` shares (st_dev, st_ino) with the open ``fd``. Used to detect
+    the unlink-and-recreate race where an external ``rm -rf .coherence/``
+    leaves our fd orphaned on a no-longer-reachable inode.
+
+    Returns False on any stat/fstat failure or mismatch — caller treats
+    that as "revalidate" rather than trying to disambiguate. Cost is
+    roughly two syscalls (~50μs) per call, executed once per retry
+    iteration."""
+    try:
+        fd_stat = os.fstat(fd)
+    except OSError:
+        return False
+    try:
+        path_stat = os.stat(path)
+    except OSError:
+        # Path was unlinked, or its parent dir was. Definitely mismatch.
+        return False
+    return (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
 def _write_pidfile(fd: int, pid: int, port: int) -> None:

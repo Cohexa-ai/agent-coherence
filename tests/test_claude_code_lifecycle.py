@@ -645,3 +645,129 @@ def test_g4_shutdown_raise_aborts_without_releasing_lock(
     # Manual cleanup for the test (otherwise we'd leak the lock_fd).
     monkeypatch.undo()
     stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# KTD-H (Unit 5 L1) — inode revalidation per retry iteration
+# ----------------------------------------------------------------------
+
+
+def test_h1_inode_matches_helper_detects_unlink_recreate(workspace: Path) -> None:
+    """Unit-level: ``_inode_matches`` returns True when fd and path point
+    at the same inode, and False after an external unlink + recreate."""
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pid_file = coherence_dir / "server.pid"
+    pid_file.write_text("", encoding="utf-8")
+    fd = os.open(pid_file, os.O_RDWR)
+    try:
+        # Same inode → match.
+        assert lifecycle._inode_matches(fd, pid_file) is True
+
+        # Unlink + recreate → mismatch.
+        pid_file.unlink()
+        pid_file.write_text("", encoding="utf-8")
+        assert lifecycle._inode_matches(fd, pid_file) is False
+    finally:
+        os.close(fd)
+
+
+def test_h2_inode_matches_returns_false_when_path_absent(workspace: Path) -> None:
+    """If the path is unlinked entirely (no recreate), the helper still
+    returns False rather than raising — caller treats as 'revalidate'."""
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pid_file = coherence_dir / "server.pid"
+    pid_file.write_text("", encoding="utf-8")
+    fd = os.open(pid_file, os.O_RDWR)
+    try:
+        pid_file.unlink()
+        assert lifecycle._inode_matches(fd, pid_file) is False
+    finally:
+        os.close(fd)
+
+
+def test_h3_ensure_coordinator_recovers_after_rm_rf_race(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KTD-H end-to-end: simulate an external ``rm -rf .coherence/`` between
+    the pid-file open and the first retry iteration. ``ensure_coordinator``
+    must detect the inode mismatch, re-open, and still bind a coordinator
+    on a fresh inode rather than holding an orphan fd."""
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.02,
+        inode_revalidation_budget=3,
+        spawn_self_probe_attempts=20,
+        spawn_self_probe_interval_sec=0.05,
+    )
+
+    # Monkey-patch _open_pidfile so the FIRST call performs the open AND
+    # immediately wipes the directory (simulating `rm -rf .coherence`
+    # racing in just after open). Subsequent calls open normally.
+    real_open = lifecycle._open_pidfile
+    call_count = {"n": 0}
+
+    def open_then_wipe(pid_file: Path) -> Optional[int]:
+        call_count["n"] += 1
+        fd = real_open(pid_file)
+        if fd is None:
+            return None
+        if call_count["n"] == 1:
+            # Simulate the race: external rm -rf wipes .coherence/ AFTER
+            # we got our fd. Our fd now refers to an orphaned inode.
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+        return fd
+
+    monkeypatch.setattr(lifecycle, "_open_pidfile", open_then_wipe)
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port > 0, (
+            f"expected ensure_coordinator to recover via inode revalidation; got {port}"
+        )
+        # The live pid file should match the bound port.
+        pid_file = workspace / ".coherence" / "server.pid"
+        live_port = _read_port_from_file(pid_file)
+        assert live_port == port, (
+            f"pid file ({live_port}) does not reflect bound port ({port}) — "
+            "winner may have written to an orphaned inode"
+        )
+        # At least one revalidation must have occurred.
+        assert call_count["n"] >= 2, (
+            f"_open_pidfile called only {call_count['n']} time(s); "
+            "expected at least 2 (initial + revalidation re-open)"
+        )
+    finally:
+        monkeypatch.undo()
+        stop_coordinator(workspace)
+
+
+def test_h4_revalidation_budget_exhaustion_returns_minus_one(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological churn: every iteration sees a fresh inode mismatch.
+    The revalidation budget caps the recovery work and returns -1 cleanly
+    rather than spinning forever."""
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=5,
+        port_file_retry_interval_sec=0.01,
+        inode_revalidation_budget=2,
+    )
+
+    # Force _inode_matches to always report mismatch — simulates an
+    # adversary unlinking the pid file every iteration.
+    monkeypatch.setattr(lifecycle, "_inode_matches", lambda _fd, _path: False)
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port == -1, (
+            f"expected -1 after revalidation budget exhausted; got {port}"
+        )
+    finally:
+        monkeypatch.undo()
