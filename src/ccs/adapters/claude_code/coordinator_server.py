@@ -47,6 +47,7 @@ from typing import Any, Callable, Optional
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code import hook_payloads as _payloads
+from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.auth import (
     ensure_secret,
     verify_bearer,
@@ -852,6 +853,228 @@ def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
     req._json(200, {"ok": True, "removed": added})
 
 
+def _handle_pre_bash(req, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /hooks/pre-bash — KTD-N H4 mitigation.
+
+    The v0.2 Phase 0 falsifiability experiment (see
+    ``docs/probes/2026-05-19-ktd-e-falsifiability/REPORT.md``) confirmed
+    that when a stale-read warning fires on Read, the model retries 2-5
+    times then routes around via `Bash cat plan.md` — bypassing the
+    coherence layer entirely if Bash is unhooked. KTD-N closes that gap
+    for v0.1.1's warn mode (without this, marketplace cohort sees silent
+    stale-read misses on the common Bash routing pattern).
+
+    Detects tracked-artifact READS in the Bash command via
+    ``bash_path_detector.detect_tracked_paths``. For each detected path,
+    runs the same stale-vs-fresh logic as ``/hooks/pre-read``. False
+    negatives are acceptable (adversarial obfuscation, command
+    substitution, etc. are OUT of scope per KTD-N).
+
+    Request: ``{session_id, command}``.
+    Response:
+      - ``{status: "fresh"}`` if no tracked paths detected (fast path)
+      - ``{status: "fresh"}`` if all detected paths are fresh
+      - ``{status: "stale", hookSpecificOutput: {...}, stale_paths: [...]}``
+        if any detected path is stale; ``additionalContext`` lists the
+        affected paths and prepends any pending preemption notices
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    command = body.get("command")
+
+    err = validate_session_id(session_id)
+    if err:
+        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
+        return
+    if not isinstance(command, str) or not command.strip():
+        req._json(400, {"error": "missing or empty command"})
+        return
+    if len(command) > 16384:
+        # Bash commands beyond 16K are pathological; reject rather than
+        # spend CPU on the regex pipeline. Matches MAX_REQUEST_BODY_BYTES
+        # spirit (KTD-K item 4 / R21 — defense in depth).
+        req._json(413, {"error": "command too long"})
+        return
+
+    # Detect tracked paths the command would read. is_tracked is the
+    # policy gate — handler never touches SQLite for an untracked workspace.
+    tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
+    if not tracked_paths:
+        req._json(200, {"status": "fresh"})
+        return
+
+    agent_id = coordinator.register_session(session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
+        stale_summaries: list[dict] = []
+        for path in tracked_paths:
+            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            if artifact_id is None:
+                # First observation per KTD-9 — seed v1 + grant SHARED so
+                # subsequent reads see fresh.
+                artifact_id = coordinator.registry.resolve_or_register(
+                    path, content_hash=""
+                )
+                coordinator.registry.set_agent_state(
+                    artifact_id, agent_id, MESIState.SHARED,
+                    trigger="first_bash_read", tick=now,
+                )
+                continue
+            agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+            if agent_state is not None and agent_state != MESIState.INVALID:
+                continue  # fresh on this path
+            # Stale. Record summary; re-grant SHARED to suppress repeat fires.
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            stale_summaries.append({
+                "path": path,
+                "current_version": artifact.version,
+            })
+            coordinator.registry.set_agent_state(
+                artifact_id, agent_id, MESIState.SHARED,
+                trigger="post_stale_bash", tick=now,
+            )
+
+        notices = coordinator.registry.pop_pending_notices(agent_id)
+
+        if not stale_summaries and not notices:
+            return {"status": "fresh"}
+
+        # Build merged additionalContext: notices first (most-urgent),
+        # then bash-multipath stale warning.
+        parts: list[str] = []
+        if notices:
+            parts.append(_build_preemption_text(coordinator, notices))
+        if stale_summaries:
+            paths_str = ", ".join(
+                f"{s['path']} (current v{s['current_version']})"
+                for s in stale_summaries
+            )
+            parts.append(
+                f"⚠ Bash command reads tracked artifacts that have been "
+                f"updated since your session's last fresh read: {paths_str}. "
+                f"The command will still execute (v0.1.1 is warn-only), but "
+                f"consider re-reading via the Read tool before relying on "
+                f"the output as ground truth."
+            )
+
+        resp: dict[str, Any] = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",  # v0.1.1 warn-only per KTD-E
+                "additionalContext": "\n\n".join(parts),
+            },
+        }
+        if stale_summaries:
+            resp["status"] = "stale"
+            resp["stale_paths"] = [s["path"] for s in stale_summaries]
+        else:
+            resp["status"] = "fresh"
+        return resp
+
+    _run_or_degrade(req, coordinator, work)
+
+
+def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /hooks/pre-grep — KTD-N H4 mitigation, Grep variant.
+
+    Same threat model as ``/hooks/pre-bash`` but for the Grep tool:
+    when the model uses Grep over a directory containing tracked
+    artifacts, surface stale-read warnings for any artifacts the
+    session has not freshened since peer commits.
+
+    Request: ``{session_id, search_root}`` where ``search_root`` is
+    the parent-repo-relative path Grep is scanning (== Grep tool's
+    ``path`` arg, empty string for workspace root).
+
+    Response shape mirrors /hooks/pre-bash.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    search_root = body.get("search_root", "")
+
+    err = validate_session_id(session_id)
+    if err:
+        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
+        return
+    # search_root may be "" (workspace root). If non-empty, apply path validator.
+    if search_root != "":
+        v = validate_path(search_root)
+        if v is not None:
+            req._json(400, {"error": v})
+            return
+
+    # Find registry-known tracked artifacts under the search root.
+    tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    if not tracked_paths:
+        req._json(200, {"status": "fresh"})
+        return
+
+    agent_id = coordinator.register_session(session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
+        stale_summaries: list[dict] = []
+        for path in tracked_paths:
+            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            if artifact_id is None:
+                continue  # registry-listed but raced away; skip
+            agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+            if agent_state is not None and agent_state != MESIState.INVALID:
+                continue
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            stale_summaries.append({
+                "path": path,
+                "current_version": artifact.version,
+            })
+            coordinator.registry.set_agent_state(
+                artifact_id, agent_id, MESIState.SHARED,
+                trigger="post_stale_grep", tick=now,
+            )
+
+        notices = coordinator.registry.pop_pending_notices(agent_id)
+
+        if not stale_summaries and not notices:
+            return {"status": "fresh"}
+
+        parts: list[str] = []
+        if notices:
+            parts.append(_build_preemption_text(coordinator, notices))
+        if stale_summaries:
+            paths_str = ", ".join(
+                f"{s['path']} (current v{s['current_version']})"
+                for s in stale_summaries
+            )
+            parts.append(
+                f"⚠ Grep search over tracked artifacts your session has "
+                f"not freshened since peer commits: {paths_str}. The "
+                f"results may reflect outdated content. Consider re-reading "
+                f"via Read before acting on Grep output."
+            )
+
+        resp: dict[str, Any] = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "additionalContext": "\n\n".join(parts),
+            },
+        }
+        if stale_summaries:
+            resp["status"] = "stale"
+            resp["stale_paths"] = [s["path"] for s in stale_summaries]
+        else:
+            resp["status"] = "fresh"
+        return resp
+
+    _run_or_degrade(req, coordinator, work)
+
+
 def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
@@ -919,6 +1142,12 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-edit"): _handle_pre_edit,
     ("POST", "/hooks/post-edit"): _handle_post_edit,
     ("POST", "/hooks/session-stop"): _handle_session_stop,
+    # v0.1.1 KTD-N — H4 mitigation: catch model routing-around-via-Bash/Grep
+    # to bypass the Read-only stale-read warning. Per the v0.2 Phase 0
+    # falsifiability experiment, the model retries Read 2-5 times then
+    # routes via `bash cat plan.md`; unhooked Bash means silent stale miss.
+    ("POST", "/hooks/pre-bash"): _handle_pre_bash,
+    ("POST", "/hooks/pre-grep"): _handle_pre_grep,
     ("POST", "/policy/track"): _handle_policy_track,
     ("POST", "/policy/untrack"): _handle_policy_untrack,
     ("GET", "/status"): _handle_status,
