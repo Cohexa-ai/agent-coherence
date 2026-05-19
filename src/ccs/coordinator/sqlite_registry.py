@@ -161,8 +161,23 @@ class SqliteArtifactRegistry:
         )
         # WAL for concurrent readers + bounded busy_timeout for write contention.
         # synchronous=NORMAL is durable enough for non-financial use.
+        #
+        # busy_timeout=1500ms per v0.1.1 KTD-K REVISED ordering rule (lowered
+        # from 2000ms). SQLite's busy_timeout is per-LOCK-ACQUISITION retry
+        # budget, NOT per-transaction. A `write` transaction issues two lock
+        # acquisitions (BEGIN IMMEDIATE acquires RESERVED + COMMIT promotes to
+        # EXCLUSIVE), each consuming up to busy_timeout. Under sustained
+        # contention, the prior 2000ms could compose to 4000ms cumulative —
+        # equal to or above the 4s handler watchdog ceiling, racing the
+        # SQLITE_BUSY return against the FuturesTimeout. The corrected formula
+        # `busy_timeout ≤ (HANDLER_DEADLINE_SEC − safety) / max_lock_acquisitions`
+        # gives `(4s − 0.5s safety) / 2 = 1.75s`; round down to 1500ms with
+        # additional safety margin against multi-statement transactions that
+        # may carry >2 lock acquisitions. See v0.1.1 plan KTD-K + the prior
+        # version of this constant; do NOT raise without re-deriving against
+        # the worst-case-lock-acquisition count for the hot path.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=2000")
+        self._conn.execute("PRAGMA busy_timeout=1500")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
