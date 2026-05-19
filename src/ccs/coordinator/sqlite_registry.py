@@ -920,6 +920,42 @@ class SqliteArtifactRegistry:
             ).fetchone()
         return UUID(hex=row[0]) if row else None
 
+    def artifact_names_under_prefix(self, prefix: str) -> list[str]:
+        """Return tracked-artifact paths registered under a directory prefix.
+
+        Used by ``/hooks/pre-grep`` (v0.1.1 KTD-N) to find tracked artifacts
+        a Grep operation would scan. Prefix matching uses SQL ``LIKE`` with
+        ``escape`` to defang any ``%``/``_`` wildcards in the operator-
+        supplied search root. Empty/``.``/``./`` prefix returns all
+        registered artifacts (Grep over workspace root).
+        """
+        # Normalize prefix. Treat empty / "." / "./" as "all artifacts".
+        if prefix in ("", ".", "./"):
+            with self._lock:
+                rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
+            return [r[0] for r in rows]
+        # Strip trailing slash; ensure we don't accidentally claim
+        # "docs/specs-internal/" as a child of "docs/specs/".
+        normalized = prefix.rstrip("/") + "/"
+        # Escape SQL LIKE wildcards.
+        escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = escaped + "%"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'",
+                (pattern,),
+            ).fetchall()
+        # Also include the prefix itself if it's a tracked file (e.g.,
+        # `grep PATTERN plan.md` where path == "plan.md" exact).
+        with self._lock:
+            exact = self._conn.execute(
+                "SELECT name FROM artifacts WHERE name = ?", (prefix.rstrip("/"),)
+            ).fetchone()
+        names = [r[0] for r in rows]
+        if exact is not None and exact[0] not in names:
+            names.append(exact[0])
+        return names
+
     # ------------------------------------------------------------------
     # A1 — Preemption notices (silent-grant-revocation surfacing)
     # ------------------------------------------------------------------

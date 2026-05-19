@@ -78,7 +78,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "subcommand",
-        choices=["pre-read", "pre-edit", "post-edit", "session-stop"],
+        choices=[
+            "pre-read",
+            "pre-edit",
+            "post-edit",
+            "session-stop",
+            # v0.1.1 KTD-N — H4 mitigation: extended hook coverage.
+            "pre-bash",
+            "pre-grep",
+        ],
         help="Which coordinator endpoint to invoke. Maps 1:1 to the CC hook event.",
     )
     parser.add_argument(
@@ -177,6 +185,12 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
         elif args.subcommand == "session-stop":
             payload = _build_session_stop(cc_payload)
             response = _call(endpoint, "/hooks/session-stop", payload)
+        elif args.subcommand == "pre-bash":
+            payload = _build_pre_bash(cc_payload)
+            response = _call(endpoint, "/hooks/pre-bash", payload)
+        elif args.subcommand == "pre-grep":
+            payload = _build_pre_grep(cc_payload)
+            response = _call(endpoint, "/hooks/pre-grep", payload)
         else:  # pragma: no cover — argparse already validates
             _emit_empty()
             return 0
@@ -272,6 +286,44 @@ def _build_post_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
 def _build_session_stop(cc: dict[str, Any]) -> dict[str, Any]:
     session_id = _require_session_id(cc)
     return {"session_id": session_id}
+
+
+def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:
+    """v0.1.1 KTD-N — translate CC's Bash PreToolUse payload to the
+    /hooks/pre-bash coordinator request shape.
+
+    CC fires PreToolUse Bash with ``tool_input.command`` = the raw shell
+    command string the model is about to execute. The coordinator's
+    handler detects tracked-artifact reads in that command via the
+    Bash path detector and surfaces stale-read warnings.
+    """
+    session_id = _require_session_id(cc)
+    tool_input = cc.get("tool_input") or {}
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise _SkipHook("tool_input.command missing or empty")
+    return {"session_id": session_id, "command": command}
+
+
+def _build_pre_grep(cc: dict[str, Any]) -> dict[str, Any]:
+    """v0.1.1 KTD-N — translate CC's Grep PreToolUse payload to the
+    /hooks/pre-grep coordinator request shape.
+
+    CC's Grep tool takes a ``path`` arg (the search root, parent-repo-
+    relative). Empty/absent → workspace root.
+    """
+    session_id = _require_session_id(cc)
+    tool_input = cc.get("tool_input") or {}
+    raw_path = tool_input.get("path", "")
+    if raw_path is None:
+        raw_path = ""
+    if not isinstance(raw_path, str):
+        raise _SkipHook("tool_input.path must be a string")
+    # The Grep tool's path is already workspace-relative in CC's payload;
+    # no transformation needed beyond stripping a leading "./" for parity
+    # with the validator's normalization expectations.
+    search_root = raw_path[2:] if raw_path.startswith("./") else raw_path
+    return {"session_id": session_id, "search_root": search_root}
 
 
 # ----------------------------------------------------------------------

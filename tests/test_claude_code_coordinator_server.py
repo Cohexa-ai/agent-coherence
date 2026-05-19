@@ -971,3 +971,156 @@ def test_concurrent_pre_read_no_deadlock(client: _Client) -> None:
     for t in threads: t.start()
     for t in threads: t.join()
     assert results == [200] * 10
+
+
+# ======================================================================
+# v0.1.1 KTD-N — H4 mitigation: /hooks/pre-bash + /hooks/pre-grep
+# ======================================================================
+
+
+def test_pre_bash_untracked_command_returns_fresh_fastpath(coordinator, client: _Client) -> None:
+    """A Bash command that reads no tracked artifacts returns fresh
+    without touching SQLite. Mirrors pre-read fast-path."""
+    before = len(coordinator.registry.artifact_ids())
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "ls -la /etc"},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}
+    assert len(coordinator.registry.artifact_ids()) == before
+
+
+def test_pre_bash_first_observation_returns_fresh(client: _Client) -> None:
+    """KTD-9 first-observation seeding via Bash. `cat plan.md` on a fresh
+    workspace seeds plan.md + grants SHARED + returns fresh."""
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_pre_bash_after_peer_write_returns_stale(client: _Client) -> None:
+    """H4 mitigation core test: session A's `bash cat plan.md` after a
+    peer commit returns stale, NOT silent fresh. This is the gap KTD-N
+    closes — without the Bash hook, A's bash-cat would bypass the
+    coherence layer entirely (the H4 finding from v0.2 Phase 0)."""
+    # A first-reads via pre-read.
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    # B commits v2.
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": _sid("B"), "path": "plan.md", "content_hash": _hash("h2"), "success": True})
+    # A bash-cats plan.md → stale warning fires.
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert "hookSpecificOutput" in body
+    out = body["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert out["permissionDecision"] == "allow"  # v0.1.1 warn-only per KTD-E
+    assert "plan.md" in out["additionalContext"]
+    assert "Bash command" in out["additionalContext"]
+    assert body["stale_paths"] == ["plan.md"]
+
+
+def test_pre_bash_warn_mode_never_returns_deny(client: _Client) -> None:
+    """v0.1.1 invariant: pre-bash MUST NOT return deny (warn-only per KTD-E)."""
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": _sid("B"), "path": "plan.md", "content_hash": _hash("h2"), "success": True})
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    if "hookSpecificOutput" in body:
+        assert body["hookSpecificOutput"]["permissionDecision"] != "deny"
+
+
+def test_pre_bash_pipeline_with_tracked_arg(client: _Client) -> None:
+    """`cat README.md || cat plan.md` — pipeline-split detection finds plan.md."""
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": _sid("B"), "path": "plan.md", "content_hash": _hash("h2"), "success": True})
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat README.md || cat plan.md"},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert "plan.md" in body["stale_paths"]
+
+
+def test_pre_bash_missing_session_id_400(client: _Client) -> None:
+    status, body = client.post("/hooks/pre-bash", {"command": "cat plan.md"})
+    assert status == 400
+    assert "session_id" in body["error"]
+
+
+def test_pre_bash_empty_command_400(client: _Client) -> None:
+    status, body = client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": ""})
+    assert status == 400
+    assert "command" in body["error"]
+
+
+def test_pre_bash_oversized_command_413(client: _Client) -> None:
+    big = "cat plan.md " + ("x" * 20_000)
+    status, body = client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": big})
+    assert status == 413
+
+
+def test_pre_bash_grep_substring_no_false_positive(client: _Client) -> None:
+    """Per KTD-N false-positive test: a literal quoted pattern that
+    contains a tracked filename must NOT fire. `grep "cat plan.md" notes.txt`
+    has plan.md inside the quoted search-pattern string, NOT as a file arg."""
+    status, body = client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": 'grep "cat plan.md is a tracked file" notes.txt'},
+    )
+    assert status == 200
+    # notes.txt is not tracked; plan.md is inside a quoted string. No detection.
+    assert body == {"status": "fresh"}
+
+
+def test_pre_grep_no_tracked_artifacts_under_root_returns_fresh(client: _Client) -> None:
+    """Empty workspace — grep over `src/` finds zero tracked artifacts."""
+    status, body = client.post(
+        "/hooks/pre-grep",
+        {"session_id": _sid("A"), "search_root": "src"},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_pre_grep_after_peer_write_returns_stale(client: _Client) -> None:
+    """H4 mitigation for Grep: session A's grep over a directory
+    containing peer-updated tracked artifacts returns stale."""
+    # A first-reads plan.md (registers it).
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    # B commits v2.
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": _sid("B"), "path": "plan.md", "content_hash": _hash("h2"), "success": True})
+    # A greps the workspace root (covers plan.md).
+    status, body = client.post(
+        "/hooks/pre-grep",
+        {"session_id": _sid("A"), "search_root": ""},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert "plan.md" in body["stale_paths"]
+    assert "Grep search" in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_pre_grep_missing_session_id_400(client: _Client) -> None:
+    status, body = client.post("/hooks/pre-grep", {"search_root": ""})
+    assert status == 400
+    assert "session_id" in body["error"]
+
+
+def test_pre_grep_path_traversal_400(client: _Client) -> None:
+    status, body = client.post("/hooks/pre-grep", {"session_id": _sid("A"), "search_root": "../escape"})
+    assert status == 400
