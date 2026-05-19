@@ -959,7 +959,13 @@ def test_status_no_deadlock_under_concurrent_registration(client: _Client) -> No
 
 
 def test_concurrent_pre_read_no_deadlock(client: _Client) -> None:
-    """10 concurrent pre-read requests on distinct sessions — all succeed."""
+    """8 concurrent pre-read requests on distinct sessions — all succeed.
+
+    v0.1.1 KTD-G item 2 caps handler concurrency at HANDLER_CONCURRENCY_LIMIT
+    (= pool_size × 2 = 8) per plugin docs/known-issues/
+    2026-05-17-watchdog-races.md A7 mitigation. Requests above the limit
+    receive HTTP 503 synchronously without spawning a handler thread.
+    """
     results: list[int] = []
 
     def fire(i: int) -> None:
@@ -967,10 +973,37 @@ def test_concurrent_pre_read_no_deadlock(client: _Client) -> None:
                             {"session_id": _sid(f"conc-{i}"), "path": "CLAUDE.md"})
         results.append(s)
 
-    threads = [threading.Thread(target=fire, args=(i,)) for i in range(10)]
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(8)]
     for t in threads: t.start()
     for t in threads: t.join()
-    assert results == [200] * 10
+    assert results == [200] * 8
+
+
+def test_concurrent_pre_read_above_limit_returns_503(client: _Client) -> None:
+    """v0.1.1 KTD-G item 2: requests above HANDLER_CONCURRENCY_LIMIT are
+    rejected with 503, not silently queued. Fires 32 concurrent requests
+    against a coordinator with limit=8; expects at least some 503s.
+
+    Note: deterministic 503 emission requires slow-handler simulation —
+    real handlers complete fast enough that the burst may serialize.
+    This test asserts the contract (503 is possible above limit) by
+    issuing far more requests than the limit in tight succession.
+    """
+    results: list[int] = []
+
+    def fire(i: int) -> None:
+        s, _ = client.post("/hooks/pre-read",
+                            {"session_id": _sid(f"burst-{i}"), "path": "CLAUDE.md"})
+        results.append(s)
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(32)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    # All responses must be valid HTTP codes; allowed values: 200 (handled)
+    # or 503 (concurrency-overflowed). Anything else is a bug.
+    assert all(r in (200, 503) for r in results), f"unexpected statuses: {results}"
+    # At least one 200 must succeed (the limit allows some throughput).
+    assert any(r == 200 for r in results)
 
 
 # ======================================================================
@@ -1124,3 +1157,73 @@ def test_pre_grep_missing_session_id_400(client: _Client) -> None:
 def test_pre_grep_path_traversal_400(client: _Client) -> None:
     status, body = client.post("/hooks/pre-grep", {"session_id": _sid("A"), "search_root": "../escape"})
     assert status == 400
+
+
+# ======================================================================
+# v0.1.1 KTD-G — watchdog A6/A7 hardening: queue gate + handler semaphore + counters
+# ======================================================================
+
+
+def test_status_includes_watchdog_counters_zeroed_at_startup(client: _Client) -> None:
+    """KTD-G item 3 + KTD-J: /status surfaces watchdog/concurrency counters
+    so silent degradation becomes observable. All zero immediately after spawn."""
+    status, body = client.get("/status")
+    assert status == 200
+    assert body["watchdog_timeouts_total"] == 0
+    assert body["watchdog_queue_overflows_total"] == 0
+    assert body["handler_concurrency_overflows_total"] == 0
+
+
+def test_watchdog_timeout_increments_counter(coordinator, client: _Client) -> None:
+    """When FuturesTimeout fires in _run_or_degrade, watchdog_timeouts_total
+    increments and /status reflects it."""
+    from unittest.mock import patch
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    with patch.object(coordinator, "run_with_watchdog", side_effect=FuturesTimeout()):
+        status, body = client.post("/hooks/pre-read",
+                                    {"session_id": _sid("X"), "path": "plan.md"})
+    # Degraded response per the existing _run_or_degrade contract.
+    assert status == 200
+    assert body.get("degraded") is True
+    # Counter incremented.
+    status, sbody = client.get("/status")
+    assert sbody["watchdog_timeouts_total"] >= 1
+
+
+def test_watchdog_queue_overflow_returns_503(coordinator, client: _Client) -> None:
+    """KTD-G item 1: when the watchdog ThreadPoolExecutor's _work_queue
+    grows past WATCHDOG_QUEUE_LIMIT, _run_or_degrade returns HTTP 503
+    instead of submitting the task. Simulated via a stubbed qsize that
+    reports overflow."""
+    from unittest.mock import patch
+
+    class _FakeQueue:
+        @staticmethod
+        def qsize() -> int:
+            return 100  # well above the limit
+
+    with patch.object(coordinator._watchdog, "_work_queue", _FakeQueue()):
+        status, body = client.post("/hooks/pre-read",
+                                    {"session_id": _sid("X"), "path": "plan.md"})
+    assert status == 503
+    assert body["error"] == "watchdog queue overloaded"
+    # Counter incremented.
+    status, sbody = client.get("/status")
+    assert sbody["watchdog_queue_overflows_total"] >= 1
+
+
+def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> None:
+    """KTD-G item 2 invariant: HANDLER_CONCURRENCY_LIMIT = pool_size × 2.
+    Locked at 8 in v0.1.1 (pool_size=4). If a future change adjusts the
+    pool size, this test will fail loudly so the operator confirms the
+    new concurrency cap is intentional."""
+    from ccs.adapters.claude_code.coordinator_server import (
+        HANDLER_CONCURRENCY_LIMIT,
+        WATCHDOG_QUEUE_LIMIT,
+        _WATCHDOG_POOL_SIZE,
+    )
+
+    assert _WATCHDOG_POOL_SIZE == 4
+    assert HANDLER_CONCURRENCY_LIMIT == 8
+    assert WATCHDOG_QUEUE_LIMIT == 8

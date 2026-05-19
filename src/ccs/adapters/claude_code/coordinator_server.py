@@ -63,6 +63,19 @@ logger = logging.getLogger(__name__)
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+# v0.1.1 KTD-G concurrency limits per plugin docs/known-issues/
+# 2026-05-17-watchdog-races.md A7 fix. Watchdog pool size × 2 is the
+# upper bound on both (i) work queue depth before we reject with 503,
+# and (ii) concurrent HTTP handler threads. Two layers because:
+#   - The queue-depth gate (item 1) catches submit-time overflow.
+#   - The handler semaphore (item 2) caps thread creation upstream of
+#     the watchdog pool, preventing a session that's slow-rolling N
+#     overlapping requests from starving the watchdog pool's queue.
+# Both are independently effective; running both is defense in depth.
+_WATCHDOG_POOL_SIZE = 4
+WATCHDOG_QUEUE_LIMIT = _WATCHDOG_POOL_SIZE * 2
+HANDLER_CONCURRENCY_LIMIT = _WATCHDOG_POOL_SIZE * 2
 """Each endpoint's coordinator call is bounded to 4s by the watchdog;
 leaves 1s of margin under the 5s Claude Code hook timeout (KTD-12 / Unit 4)."""
 
@@ -196,6 +209,14 @@ class CoordinatorHTTPServer:
         self._last_request_at = self._started_at
         self._shutting_down = False
         self._agent_names: dict[UUID, str] = dict(agent_names or {})
+        # v0.1.1 KTD-G item 3: surface watchdog/concurrency degradation
+        # rather than letting it stay silent. Counters are read by
+        # _handle_status; incremented in _run_or_degrade (timeouts +
+        # queue overflows) and _ThreadingHTTPServer.process_request
+        # (handler concurrency overflows). Plain ints — CPython GIL
+        # guarantees atomicity for the single-attribute increment idiom.
+        self._watchdog_timeouts_total: int = 0
+        self._watchdog_queue_overflows_total: int = 0
 
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
@@ -212,12 +233,23 @@ class CoordinatorHTTPServer:
         self.secret = ensure_secret(self.coordinator_root)
 
         # Handler watchdog executor — bounded to a small pool, the work is
-        # SQLite-bound and we want timeouts not parallelism.
-        self._watchdog = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coord-wd")
+        # SQLite-bound and we want timeouts not parallelism. Size matches
+        # _WATCHDOG_POOL_SIZE; KTD-G concurrency limits derive from this.
+        self._watchdog = ThreadPoolExecutor(
+            max_workers=_WATCHDOG_POOL_SIZE,
+            thread_name_prefix="coord-wd",
+        )
 
-        # ThreadingHTTPServer — handlers see this instance via .server.coordinator
+        # ThreadingHTTPServer — handlers see this instance via .server.coordinator.
+        # KTD-G item 2: concurrency_limit caps handler threads at
+        # HANDLER_CONCURRENCY_LIMIT (= pool_size × 2); requests above the
+        # limit get a synchronous 503 without spawning a handler thread.
         handler_cls = _make_handler_class(self)
-        self._server = _ThreadingHTTPServer((bind_host, port), handler_cls)
+        self._server = _ThreadingHTTPServer(
+            (bind_host, port),
+            handler_cls,
+            concurrency_limit=HANDLER_CONCURRENCY_LIMIT,
+        )
         self.port = self._server.server_port
         self._serve_thread: Optional[threading.Thread] = None
 
@@ -295,10 +327,84 @@ class CoordinatorHTTPServer:
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """ThreadingMixIn + HTTPServer — concurrent hook handling per request."""
+    """ThreadingMixIn + HTTPServer — concurrent hook handling per request,
+    with v0.1.1 KTD-G item 2 handler concurrency semaphore.
+
+    Per plugin docs/known-issues/2026-05-17-watchdog-races.md A7: without
+    an upper bound on concurrent handler threads, a same-secret client
+    issuing slow-rolling overlapping requests can saturate the watchdog
+    pool's _work_queue. KTD-G item 2 caps thread creation upstream of
+    the watchdog pool by acquiring a BoundedSemaphore (limit =
+    HANDLER_CONCURRENCY_LIMIT = pool_size × 2) BEFORE spawning the
+    handler thread. Excess requests receive HTTP 503 synchronously
+    without spawning a thread.
+
+    The semaphore is bounded so over-release surfaces as ValueError —
+    catches the bug where a handler exit path forgets the release
+    rather than silently allowing extra concurrent handlers.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: type,
+        *,
+        concurrency_limit: int,
+    ) -> None:
+        super().__init__(server_address, RequestHandlerClass)
+        self._concurrency_sem = threading.BoundedSemaphore(concurrency_limit)
+        # KTD-G item 3: surfaced in /status. Plain int + GIL-atomic increment.
+        self.handler_concurrency_overflows_total: int = 0
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Override ThreadingMixIn.process_request to gate handler spawn
+        on the concurrency semaphore. If at limit, send 503 directly
+        without spawning a thread."""
+        if not self._concurrency_sem.acquire(blocking=False):
+            self.handler_concurrency_overflows_total += 1
+            self._send_concurrency_503(request)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # If thread spawn fails (rare), release so we don't leak a slot.
+            self._concurrency_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        """Override to release the concurrency semaphore in the handler
+        thread's finally block, so the slot is freed when the handler
+        completes (NOT when process_request returns — that happens
+        immediately after thread spawn)."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._concurrency_sem.release()
+
+    @staticmethod
+    def _send_concurrency_503(request: Any) -> None:
+        """Send a minimal 503 response without going through the full
+        BaseHTTPRequestHandler pipeline (which would spawn a thread).
+        Conforms to KTD-B.3 C1: single-key {error: lowercase phrase}.
+        """
+        body = b'{"error":"handler concurrency exceeded"}'
+        response = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            + body
+        )
+        try:
+            request.sendall(response)
+        except (OSError, BrokenPipeError):
+            # Client gave up before we could respond; nothing to recover.
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -1128,12 +1234,19 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
             "states": per_artifact,
         })
 
+    # v0.1.1 KTD-G item 3 + KTD-J: surface watchdog / concurrency degradation
+    # via /status so silent degradation is observable. agent-coherence-status
+    # CLI consumes this block; operators reading bug reports can spot
+    # watchdog saturation immediately.
     req._json(200, {
         "tracked_artifacts": tracked,
         "sessions": sessions,
         "coordinator_uptime_s": coordinator.uptime_s,
         "coordinator_pid": os.getpid(),
         "policy_summary": coordinator.policy.summary(),
+        "watchdog_timeouts_total": coordinator._watchdog_timeouts_total,
+        "watchdog_queue_overflows_total": coordinator._watchdog_queue_overflows_total,
+        "handler_concurrency_overflows_total": coordinator._server.handler_concurrency_overflows_total,
     })
 
 
@@ -1161,10 +1274,44 @@ _ROUTES: dict[tuple[str, str], Callable] = {
 
 def _run_or_degrade(req, coordinator: CoordinatorHTTPServer, work: Callable[[], dict]) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
-    and return 200 {status:"fresh"} so the user's tool call proceeds."""
+    and return 200 {status:"fresh"} so the user's tool call proceeds.
+
+    v0.1.1 KTD-G:
+      - Item 1: queue-depth gate. Reject with HTTP 503 if the watchdog
+        ThreadPoolExecutor's _work_queue is past WATCHDOG_QUEUE_LIMIT
+        items. Prevents the silent-degradation cascade documented in
+        plugin docs/known-issues/2026-05-17-watchdog-races.md A7 where
+        queued tasks wait long enough in the executor queue that they
+        race the future's timeout on submit-side.
+      - Item 3: increment ``_watchdog_timeouts_total`` on FuturesTimeout
+        so silent degradation becomes observable via /status.
+
+    Item 2 (handler concurrency semaphore) lives in
+    _ThreadingHTTPServer.process_request — gates BEFORE this function
+    is reached.
+    """
+    # KTD-G item 1: queue-depth gate. Use a defensive try because
+    # ThreadPoolExecutor's _work_queue attribute is technically private
+    # — guard against future stdlib changes that would break this.
+    try:
+        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
+    except AttributeError:
+        qsize = 0
+    if qsize > WATCHDOG_QUEUE_LIMIT:
+        coordinator._watchdog_queue_overflows_total += 1
+        logger.warning(
+            "watchdog queue at %d items (limit %d); rejecting with 503",
+            qsize,
+            WATCHDOG_QUEUE_LIMIT,
+        )
+        req._json(503, {"error": "watchdog queue overloaded"})
+        return
+
     try:
         result = coordinator.run_with_watchdog(work)
     except FuturesTimeout:
+        # KTD-G item 3: surface watchdog degradation via /status counter.
+        coordinator._watchdog_timeouts_total += 1
         logger.warning("handler watchdog timeout after %ss; degrading to fresh", HANDLER_TIMEOUT_SEC)
         req._json(200, {"status": "fresh", "degraded": True})
         return
