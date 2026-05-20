@@ -344,6 +344,68 @@ def test_self_test_returns_3_when_no_coordinator_running(
 
 
 # ----------------------------------------------------------------------
+# Unit 8 — agent-coherence-coordinator --prepare-for-migration
+# ----------------------------------------------------------------------
+
+
+def test_prepare_for_migration_no_coordinator_running_is_noop(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Idempotent: --prepare-for-migration on a workspace with no
+    .coherence/server.pid is a no-op exit 0 so it's safe to script
+    as a pre-switch step that may not always find a live coordinator."""
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "no coordinator running" in captured.out
+
+
+def test_prepare_for_migration_releases_grants_and_shuts_down(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decision 1 contract: with an EXCLUSIVE grant held by some agent
+    on some tracked artifact, --prepare-for-migration releases the
+    grant (state transitions away from M/E) and the coordinator's HTTP
+    server is no longer reachable when the command returns."""
+    import socket
+    workspace, port = live_coordinator
+
+    # Set up an EXCLUSIVE grant via the real HTTP path so registry
+    # state matches what a real client would have written.
+    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    endpoint = resolve_endpoint(workspace)
+    sid = "11111111-2222-4111-8111-aaaaaaaaaaaa"
+    _post(endpoint, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    # Now drive the migration helper.
+    rc = coherence_coordinator.main([
+        "--root", str(workspace), "--prepare-for-migration",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0, (
+        f"prepare-for-migration failed: stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    # Output should report at least one released grant.
+    assert "released" in captured.out
+
+    # Coordinator must no longer be TCP-reachable.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sock.close()
+        pytest.fail(
+            f"coordinator at port={port} still accepting connections after "
+            "--prepare-for-migration"
+        )
+    except OSError:
+        pass  # expected — connection refused after shutdown
+
+
+# ----------------------------------------------------------------------
 # coherence_track + coherence_untrack — validation + happy path
 # ----------------------------------------------------------------------
 
