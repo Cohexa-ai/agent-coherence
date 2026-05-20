@@ -254,6 +254,12 @@ def ensure_coordinator(
             continue
 
         # Winner — we hold the lock. Bind, write port, serve.
+        # KTD-H/I/L3 (Unit 5 L3): time the winner path so operators have a
+        # signal for cold-start regressions. Telemetry-only — no default
+        # behavior change. Surfaced via the coordinator's
+        # ``cold_start_duration_ms`` attribute for the future /status
+        # endpoint (Unit 8).
+        cold_start_start = time.monotonic()
         try:
             coordinator = CoordinatorHTTPServer(coordinator_root, port=0, bind_host=bind_host)
             port = coordinator.port
@@ -273,15 +279,18 @@ def ensure_coordinator(
             # is actually accepting. Cold-start (Python interpreter +
             # SQLite WAL rehydration) can take well past the loser-side
             # connect_retry budget.
-            if not _self_probe(port, cfg, bind_host=bind_host):
+            probe_ok = _self_probe(port, cfg, bind_host=bind_host)
+            cold_start_ms = (time.monotonic() - cold_start_start) * 1000.0
+            coordinator.cold_start_duration_ms = cold_start_ms
+            if not probe_ok:
                 logger.warning(
                     "coordinator bound port=%d but self-probe exhausted after %dms; returning anyway",
                     port,
                     int(cfg.spawn_self_probe_attempts * cfg.spawn_self_probe_interval_sec * 1000),
                 )
             logger.info(
-                "coordinator spawned: pid=%d port=%d root=%s",
-                os.getpid(), port, coordinator_root,
+                "coordinator spawned: pid=%d port=%d root=%s cold_start=%.1fms",
+                os.getpid(), port, coordinator_root, cold_start_ms,
             )
             return port
         except Exception:
