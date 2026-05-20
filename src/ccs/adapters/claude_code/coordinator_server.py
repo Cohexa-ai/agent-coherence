@@ -585,15 +585,24 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     self._json(401, {"error": "missing or invalid bearer token"})
                     return
 
-                # Route
+                # Route. R12 (Unit 6): query string is intentionally
+                # separated from the route key so /status?detail=full
+                # dispatches to the same handler as /status, with the
+                # handler reading the detail parameter for tier gating.
+                raw_path = self.path
+                if "?" in raw_path:
+                    route_path, query = raw_path.split("?", 1)
+                else:
+                    route_path, query = raw_path, ""
+                self._query_string = query  # consumed by status handler
                 try:
-                    handler = _ROUTES.get((method, self.path))
+                    handler = _ROUTES.get((method, route_path))
                     if handler is None:
-                        self._json(404, {"error": f"unknown route {method} {self.path}"})
+                        self._json(404, {"error": f"unknown route {method} {route_path}"})
                         return
                     handler(self, coordinator)
                 except Exception as exc:
-                    logger.exception("unhandled error in handler for %s %s", method, self.path)
+                    logger.exception("unhandled error in handler for %s %s", method, route_path)
                     self._json(500, {"error": f"internal: {type(exc).__name__}"})
             finally:
                 coordinator.release_handler_slot()
@@ -1333,26 +1342,54 @@ def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
 def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
-    P2 ce-review fix #18 (kieran-python): batched the per-(session,
-    artifact) query loop. The previous version did
-    ``get_agent_state(artifact_id, agent_id)`` and a SECOND
-    ``get_artifact(artifact_id)`` per inner iteration — O(sessions ×
-    artifacts) SQLite round-trips per /status request. Now we
-    build a single ``{artifact_id: Artifact}`` lookup outside the loop
-    and call ``get_state_map(artifact_id)`` once per artifact (which
-    returns ``{agent_id: MESIState}`` in one query). Per-session
-    iteration becomes a dict lookup — O(artifacts) total queries.
+    R12 (Unit 6): three-tier disclosure model.
+
+    | tier      | query                | extra requirement              |
+    |-----------|----------------------|--------------------------------|
+    | minimal   | (none) or detail=minimal | none                       |
+    | metrics   | ?detail=metrics      | none — telemetry block only    |
+    | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
+
+    ``minimal`` is the default and includes no absolute paths (workspace
+    root is reported as a sentinel ``.``). ``metrics`` returns only the
+    counter block — useful for operators scraping /status into a
+    dashboard without leaking workspace state. ``full`` is the legacy
+    everything-block plus absolute ``coordinator_root`` and ``coordinator_pid``,
+    gated by the explicit ``Coherence-Local-Operator: true`` header so a
+    same-user adversary (Adversary 1 in auth.py) cannot trivially grab
+    the operator's home-directory path. Bearer auth is enforced by the
+    dispatcher; the header is a SECOND factor specifically for the
+    elevated tier.
     """
-    # A4 + R10 (Unit 6): snapshot artifact_ids and _agent_names BEFORE
-    # iterating, to avoid `RuntimeError: dictionary changed size during
-    # iteration` racing against a concurrent register_session in another
-    # handler. The snapshot is now taken under the dedicated
-    # _agent_names_lock via the public accessor — no GIL reliance.
+    detail = _parse_detail_query(getattr(req, "_query_string", ""))
+    if detail == "full":
+        if req.headers.get("Coherence-Local-Operator", "").lower() != "true":
+            req._json(403, {
+                "error": (
+                    "detail=full requires the Coherence-Local-Operator: true "
+                    "opt-in header in addition to the Bearer secret (R12)."
+                ),
+            })
+            return
+
+    # Counter block — present at every tier so the telemetry-only
+    # consumer (?detail=metrics) doesn't pay for the artifact/session walk.
+    counters = {
+        "coordinator_uptime_s": coordinator.uptime_s,
+        "watchdog_timeouts_total": coordinator._watchdog_timeouts_total,
+        "watchdog_queue_overflows_total": coordinator._watchdog_queue_overflows_total,
+        "handler_concurrency_overflows_total": coordinator._server.handler_concurrency_overflows_total,
+        "in_flight_drain_timed_out": coordinator._in_flight_drain_timed_out,
+        "cold_start_duration_ms": coordinator.cold_start_duration_ms,
+    }
+    if detail == "metrics":
+        req._json(200, {"detail": "metrics", **counters})
+        return
+
+    # Artifacts + sessions — needed for minimal AND full tiers. Keep the
+    # P2 ce-review fix #18 batched-query pattern.
     artifact_ids_snapshot = list(coordinator.registry.artifact_ids())
     agent_names_snapshot = coordinator.agent_names_snapshot()
-
-    # Single-pass artifact resolution: one get_artifact per artifact id,
-    # cached in artifact_by_id for the inner-loop lookups below.
     artifact_by_id = {}
     for artifact_id in artifact_ids_snapshot:
         art = coordinator.registry.get_artifact(artifact_id)
@@ -1363,15 +1400,10 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
         {"path": art.name, "version": art.version, "id": str(artifact_id)}
         for artifact_id, art in artifact_by_id.items()
     ]
-
-    # Single-pass per-artifact state map: one get_state_map per artifact
-    # (returns all agents' states for that artifact in one query). The
-    # session/artifact cross-product becomes a dict lookup.
     state_by_artifact = {
         artifact_id: coordinator.registry.get_state_map(artifact_id)
-        for artifact_id in artifact_by_id  # only artifacts we actually have
+        for artifact_id in artifact_by_id
     }
-
     sessions: list[dict] = []
     for agent_id, name in agent_names_snapshot:
         per_artifact: dict[str, str] = {}
@@ -1385,20 +1417,39 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
             "states": per_artifact,
         })
 
-    # v0.1.1 KTD-G item 3 + KTD-J: surface watchdog / concurrency degradation
-    # via /status so silent degradation is observable. agent-coherence-status
-    # CLI consumes this block; operators reading bug reports can spot
-    # watchdog saturation immediately.
-    req._json(200, {
+    base = {
+        "detail": detail,
         "tracked_artifacts": tracked,
         "sessions": sessions,
-        "coordinator_uptime_s": coordinator.uptime_s,
-        "coordinator_pid": os.getpid(),
         "policy_summary": coordinator.policy.summary(),
-        "watchdog_timeouts_total": coordinator._watchdog_timeouts_total,
-        "watchdog_queue_overflows_total": coordinator._watchdog_queue_overflows_total,
-        "handler_concurrency_overflows_total": coordinator._server.handler_concurrency_overflows_total,
-    })
+        **counters,
+    }
+    if detail == "full":
+        base["coordinator_root"] = str(coordinator.coordinator_root)
+        base["coordinator_pid"] = os.getpid()
+    else:
+        # Minimal: replace absolute workspace path with sentinel "." so the
+        # default tier never leaks $HOME or directory layout.
+        base["coordinator_root"] = "."
+    req._json(200, base)
+
+
+def _parse_detail_query(query: str) -> str:
+    """R12 (Unit 6): map a raw ``?detail=...`` query string to one of
+    ``{minimal, metrics, full}``. Unknown values fall back to ``minimal``
+    so a typo never exposes more than the default tier."""
+    if not query:
+        return "minimal"
+    for part in query.split("&"):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        if key.strip() == "detail":
+            v = value.strip().lower()
+            if v in ("minimal", "metrics", "full"):
+                return v
+            return "minimal"
+    return "minimal"
 
 
 _ROUTES: dict[tuple[str, str], Callable] = {
