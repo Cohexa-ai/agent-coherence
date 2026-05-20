@@ -262,6 +262,57 @@ def test_status_json_mode_emits_raw_payload(
     assert data["coordinator_pid"] == os.getpid()
 
 
+def test_status_detail_metrics_renders_counter_block(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """KTD-J (Unit 8): --detail metrics returns the counter block only —
+    no artifact/session walk in the output."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main([
+        "--root", str(workspace), "--detail", "metrics",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Coordinator metrics:" in captured.out
+    assert "backend=python" in captured.out
+    # Endpoint counter block must be present (zero-valued is fine on a
+    # fresh coordinator with no hook traffic yet).
+    assert "Counters:" in captured.out
+    assert "pre_read_total" in captured.out
+    assert "intra_task_acquire_release_total" in captured.out
+    # No artifact/session block in metrics mode.
+    assert "Observed artifacts" not in captured.out
+    assert "Sessions:" not in captured.out
+
+
+def test_status_detail_minimal_redacts_pid(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--detail minimal must not surface pid in the rendered output."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main([
+        "--root", str(workspace), "--detail", "minimal",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Coordinator:" in captured.out
+    # pid is not in the minimal tier so the header omits it.
+    assert f"pid={os.getpid()}" not in captured.out
+
+
+def test_status_full_default_includes_counters_below_sessions(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default --detail=full table rendering now includes a Counters
+    section after the artifacts/sessions block."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main(["--root", str(workspace)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Counters:" in captured.out
+    assert "pre_read_total" in captured.out
+
+
 # ----------------------------------------------------------------------
 # coherence_track + coherence_untrack — validation + happy path
 # ----------------------------------------------------------------------
