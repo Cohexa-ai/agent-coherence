@@ -31,6 +31,7 @@ import hmac
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -44,52 +45,90 @@ hex-encoded shared secret. Mode 0600 — owner-read-only."""
 SECRET_BYTES = 32
 """32 bytes of random entropy → 64-char hex token in the Authorization header."""
 
+ENSURE_SECRET_MAX_RETRIES = 5
+"""R11 (Unit 6): bound on the empty-file recovery loop in :func:`ensure_secret`.
+If we observe 'file exists but is empty' more than this many times in a row,
+something pathological is happening (a racer that creates but never writes,
+a misbehaving editor, disk-full mid-write); fail closed rather than risk
+clobbering valid secrets via O_TRUNC."""
+
+ENSURE_SECRET_RETRY_SLEEP_SEC = 0.020
+"""R11 (Unit 6): brief sleep between empty-file recovery attempts so a
+racer that has the file open but hasn't flushed its write yet gets a
+chance to make progress before we re-poll."""
+
 _BEARER_PREFIX = "Bearer "
 _HOST_ALLOWLIST: frozenset[str] = frozenset({"localhost", "127.0.0.1"})
+
+
+class EnsureSecretError(RuntimeError):
+    """R11 (Unit 6): ensure_secret could not converge — the file exists
+    but stays empty across ENSURE_SECRET_MAX_RETRIES attempts. The
+    coordinator startup path should treat this as fatal; the alternative
+    (O_TRUNC re-write of a file another process may have just populated)
+    risks clobbering a concurrent racer's valid secret and giving two
+    spawn-side processes different secrets for the same workspace."""
 
 
 def ensure_secret(coordinator_root: Path) -> str:
     """Generate-and-persist the shared secret if missing; otherwise load it.
 
     Idempotent: safe to call from every coordinator spawn. Returns the
-    hex-encoded secret. Raises OSError if the .coherence directory cannot
-    be created or the file cannot be written (graceful-degradation should
-    happen at the lifecycle layer, not here).
+    hex-encoded secret. Raises ``OSError`` if the ``.coherence`` directory
+    cannot be created (graceful-degradation should happen at the
+    lifecycle layer, not here). Raises :class:`EnsureSecretError` if a
+    ``hook.secret`` file exists but stays empty across
+    ``ENSURE_SECRET_MAX_RETRIES`` attempts — see R11 for the rationale
+    on failing closed instead of falling back to O_TRUNC.
+
+    R11 (Unit 6): the empty-file recovery branch is now a bounded
+    O_EXCL retry loop instead of the prior O_TRUNC re-write. The
+    O_TRUNC path could clobber a concurrent spawn's valid secret in
+    the narrow window between O_EXCL-create and write — both processes
+    would then walk away with DIFFERENT secrets for the same workspace,
+    which silently breaks all peer hooks until one coordinator restarts.
     """
     coherence_dir = coordinator_root / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     secret_path = coherence_dir / SECRET_FILENAME
 
-    if secret_path.is_file():
-        # Existing secret — load it. Don't rotate without explicit invalidation
-        # (see project_plugin_release_sequence.md: v0.1 secret persists across
-        # restarts; v0.2 may add rotation).
-        token = secret_path.read_text().strip()
-        if token:
-            return token
-        logger.warning("hook.secret exists but is empty; regenerating")
+    for attempt in range(ENSURE_SECRET_MAX_RETRIES):
+        # Fast path: file exists and is populated.
+        if secret_path.is_file():
+            token = secret_path.read_text().strip()
+            if token:
+                return token
 
-    # Generate fresh secret. Atomic create with mode 0600 via O_EXCL +
-    # explicit mode argument — no window where the file is mode 0644.
-    # If the file already exists at this point (race with another spawn),
-    # O_EXCL raises FileExistsError; we re-load and return the existing
-    # secret (last-writer-wins-but-content-identical from the user's POV).
-    token = secrets.token_hex(SECRET_BYTES)
-    try:
-        fd = os.open(str(secret_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        # Another concurrent spawn won the race. Re-read.
-        existing = secret_path.read_text().strip()
-        if existing:
-            return existing
-        # File was created by the racer but is somehow empty — fall through
-        # and retry generation (very narrow window where we can recover).
-        token = secrets.token_hex(SECRET_BYTES)
-        fd = os.open(str(secret_path), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(token + "\n")
-    logger.info("generated shared secret at %s", secret_path)
-    return token
+        # Try the atomic O_EXCL create. Either we win (write our secret)
+        # or someone else owns the file (re-read on next iteration).
+        new_token = secrets.token_hex(SECRET_BYTES)
+        try:
+            fd = os.open(
+                str(secret_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            # Another process owns the file. Brief sleep so they can
+            # finish writing, then loop back to the fast-path re-read.
+            if attempt + 1 < ENSURE_SECRET_MAX_RETRIES:
+                time.sleep(ENSURE_SECRET_RETRY_SLEEP_SEC)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(new_token + "\n")
+        logger.info("generated shared secret at %s", secret_path)
+        return new_token
+
+    # All retries observed the file existing but staying empty. We do
+    # NOT O_TRUNC over it — that would risk overwriting a concurrent
+    # racer's just-written secret. Fail closed; coordinator startup
+    # aborts with an actionable error.
+    raise EnsureSecretError(
+        f"hook.secret at {secret_path} exists but stayed empty across "
+        f"{ENSURE_SECRET_MAX_RETRIES} attempts; refusing to O_TRUNC over a "
+        f"file another process may be writing concurrently. Manually "
+        f"remove {secret_path} if it is genuinely stale."
+    )
 
 
 def load_secret(coordinator_root: Path) -> Optional[str]:
