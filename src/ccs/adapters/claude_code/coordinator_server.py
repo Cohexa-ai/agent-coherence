@@ -1612,6 +1612,96 @@ def _parse_detail_query(query: str) -> str:
     return "minimal"
 
 
+def _handle_prepare_for_migration(req, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /admin/prepare-for-migration — release-all-grants then schedule shutdown.
+
+    Unit 8 (Decision 1, locked 2026-05-18): operator runs
+    ``agent-coherence-coordinator --prepare-for-migration`` before
+    switching the Python/Node backend. This endpoint backs the CLI:
+
+    1. Snapshot every (agent, artifact) pair currently in MODIFIED or
+       EXCLUSIVE state.
+    2. Invalidate each — agents lose their write grants cleanly so the
+       new backend cannot inherit silent stale-grant state.
+    3. Schedule shutdown via a background thread (a small delay so this
+       response can flush to the CLI before the serve loop tears down).
+    4. Return {released, errors, shutdown_scheduled_in_ms}.
+
+    Requires the same elevated-tier signal as /status?detail=full:
+    Bearer + ``Coherence-Local-Operator: true`` header. The CLI sets
+    both; a same-user adversary trying to crash the coordinator needs
+    to read hook.secret AND know the magic header — the same bar as
+    /status?detail=full's pid disclosure.
+    """
+    if req.headers.get("Coherence-Local-Operator", "").lower() != "true":
+        req._json(403, {
+            "error": (
+                "prepare-for-migration requires the Coherence-Local-Operator: "
+                "true opt-in header (operator-only endpoint)."
+            ),
+        })
+        return
+
+    now = monotonic_seconds()
+    released = 0
+    errors: list[dict[str, str]] = []
+
+    # Snapshot artifacts + per-artifact state maps under the registry's
+    # own consistency guarantees, then invalidate each M/E grant. We do
+    # NOT hold any lock across invalidations — service.invalidate is
+    # designed for one-at-a-time use, and the per-artifact write
+    # serialization in the registry is sufficient.
+    for artifact_id in list(coordinator.registry.artifact_ids()):
+        state_map = coordinator.registry.get_state_map(artifact_id)
+        for agent_id, state in list(state_map.items()):
+            if state not in (MESIState.MODIFIED, MESIState.EXCLUSIVE):
+                continue
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            if artifact is None:
+                continue
+            try:
+                coordinator.service.invalidate(
+                    agent_id=agent_id,
+                    artifact_id=artifact_id,
+                    new_version=artifact.version,
+                    issuer_agent_id=agent_id,
+                    issued_at_tick=now,
+                )
+                released += 1
+            except CoherenceError as exc:
+                errors.append({
+                    "artifact_id": str(artifact_id),
+                    "agent_id": str(agent_id),
+                    "reason": str(exc),
+                })
+
+    # Schedule shutdown. Background thread gives this response time to
+    # flush before serve_forever exits. 100ms is enough for the kernel
+    # to drain the response socket but short enough that the CLI's poll
+    # observes the port-down transition without long idle waits.
+    SHUTDOWN_DELAY_MS = 100
+
+    def _scheduled_shutdown() -> None:
+        time.sleep(SHUTDOWN_DELAY_MS / 1000.0)
+        try:
+            coordinator.shutdown()
+        except Exception:  # pragma: no cover — best-effort cleanup
+            logger.exception("scheduled shutdown after prepare-for-migration failed")
+
+    threading.Thread(
+        target=_scheduled_shutdown,
+        name="prepare-for-migration-shutdown",
+        daemon=True,
+    ).start()
+
+    req._json(200, {
+        "ok": True,
+        "released": released,
+        "errors": errors,
+        "shutdown_scheduled_in_ms": SHUTDOWN_DELAY_MS,
+    })
+
+
 _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-read"): _handle_pre_read,
     ("POST", "/hooks/pre-edit"): _handle_pre_edit,
@@ -1626,6 +1716,7 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/policy/track"): _handle_policy_track,
     ("POST", "/policy/untrack"): _handle_policy_untrack,
     ("GET", "/status"): _handle_status,
+    ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
 }
 
 
@@ -1643,6 +1734,9 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/policy/track"): "policy_track_total",
     ("POST", "/policy/untrack"): "policy_untrack_total",
     ("GET", "/status"): "status_total",
+    # /admin/prepare-for-migration intentionally not counted — it
+    # initiates shutdown, so counting it would never be observable via
+    # subsequent /status calls (coordinator is already down).
 }
 
 
