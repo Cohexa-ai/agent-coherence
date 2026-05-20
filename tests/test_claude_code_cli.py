@@ -313,6 +313,36 @@ def test_status_full_default_includes_counters_below_sessions(
     assert "pre_read_total" in captured.out
 
 
+def test_self_test_passes_against_live_coordinator(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """KTD-J --self-test smoke: full pre-read → pre-edit → post-edit →
+    stale pre-read chain must report OK against a healthy coordinator."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+    captured = capsys.readouterr()
+    assert rc == 0, (
+        f"--self-test failed unexpectedly: stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    assert "OK" in captured.out
+    assert "pre-read STALE" in captured.out
+
+
+def test_self_test_returns_3_when_no_coordinator_running(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If the coordinator isn't running, --self-test exits 3 with an
+    actionable diagnostic — operators can distinguish 'no coordinator'
+    from 'coordinator broken'."""
+    rc = coherence_status.main([
+        "--root", str(git_workspace), "--self-test",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "coordinator unreachable" in captured.err or "coordinator" in captured.err
+
+
 # ----------------------------------------------------------------------
 # coherence_track + coherence_untrack — validation + happy path
 # ----------------------------------------------------------------------

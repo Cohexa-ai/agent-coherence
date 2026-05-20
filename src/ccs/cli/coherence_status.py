@@ -10,6 +10,15 @@ Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
 - 1: not in a git repo
 - 2: coordinator running but returned an error
+- 3: --self-test exercised but the smoke scenario failed
+
+KTD-J (Unit 8): ``--self-test`` runs an end-to-end smoke against a real
+coordinator. Two synthetic sessions exercise the stale-read warning
+path; the smoke fails if (a) the coordinator is unreachable, (b) the
+stale-warning response shape is wrong, or (c) counters do not increment
+in the expected pattern. README's post-install step points operators at
+this command so silent install regressions are caught locally before
+they reach a real agent session.
 """
 
 from __future__ import annotations
@@ -61,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
             "operator view used by /agent-coherence status."
         ),
     )
+    # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
+    # scenario against a real coordinator; exits non-zero if the smoke
+    # detects a regression. README's "After install:" step calls this.
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Run an end-to-end smoke against a live coordinator. "
+            "Validates pre-read/pre-edit/post-edit chain, stale-warning "
+            "emission, and counter increments. Exits 0 on success, 3 on "
+            "failure with an actionable diagnostic on stderr."
+        ),
+    )
     return parser
 
 
@@ -71,6 +93,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if root is None:
         err("agent-coherence-status: not in a git repository")
         return 1
+
+    if args.self_test:
+        return _run_self_test(Path(root))
 
     try:
         endpoint = resolve_endpoint(Path(root))
@@ -102,6 +127,127 @@ def main(argv: Sequence[str] | None = None) -> int:
         _render_metrics(payload)
     else:
         _render_table(payload)
+    return 0
+
+
+def _run_self_test(root: Path) -> int:
+    """KTD-J (Unit 8): end-to-end smoke against a live coordinator.
+
+    Two synthetic sessions A and B drive the stale-read warning path:
+
+    1. A pre-reads ``plan.md`` (tracked by default policy) — fresh, seeds v1.
+    2. B pre-edits ``plan.md`` — acquires EXCLUSIVE.
+    3. B post-edits — commits v2, releases EXCLUSIVE.
+    4. A pre-reads ``plan.md`` again — stale warning fires.
+    5. Verify ``status: stale`` + ``hookSpecificOutput.additionalContext``
+       prose contains the path.
+    6. Verify ``stale_warning_emitted_total`` incremented in ``/status``.
+
+    Returns 0 on success, 3 on any verification failure. Diagnostics
+    print to stderr so the README's post-install step ("run
+    ``agent-coherence-status --self-test``") gives the operator an
+    actionable error rather than a stack trace.
+    """
+    from ccs.cli._coherence_client import post as _post
+    import uuid as _uuid
+
+    try:
+        endpoint = resolve_endpoint(root)
+    except CoordinatorUnavailable as exc:
+        err(
+            f"agent-coherence-status --self-test: coordinator unreachable "
+            f"({exc}). Spawn one first by running any hook (or "
+            f"``agent-coherence-coordinator``)."
+        )
+        return 3
+
+    # Deterministic-but-distinct UUIDs so re-runs against the same
+    # workspace produce predictable agent-name surfaces.
+    ns = _uuid.UUID("11111111-2222-4333-8444-555555555555")
+    sid_a = str(_uuid.uuid5(ns, "self-test-A"))
+    sid_b = str(_uuid.uuid5(ns, "self-test-B"))
+    path = "plan.md"  # part of DEFAULT_TRACKED_PATTERNS
+
+    def _step(name: str, body: dict[str, Any]) -> Optional[dict[str, Any]]:
+        try:
+            return _post(endpoint, name, body)
+        except urllib.error.HTTPError as exc:
+            err(f"--self-test: {name} returned HTTP {exc.code}")
+            return None
+
+    # Step 1 — A's first read seeds the artifact.
+    r1 = _step("/hooks/pre-read", {
+        "session_id": sid_a, "path": path,
+        "content_hash": "a" * 64,
+    })
+    if r1 is None or r1.get("status") != "fresh":
+        err(f"--self-test: expected fresh on first pre-read, got {r1!r}")
+        return 3
+
+    # Step 2 — B pre-edits.
+    r2 = _step("/hooks/pre-edit", {"session_id": sid_b, "path": path})
+    if r2 is None or not r2.get("ok", True):
+        err(f"--self-test: pre-edit failed: {r2!r}")
+        return 3
+
+    # Step 3 — B commits.
+    r3 = _step("/hooks/post-edit", {
+        "session_id": sid_b, "path": path,
+        "content_hash": "b" * 64, "success": True,
+    })
+    if r3 is None or not r3.get("ok"):
+        err(f"--self-test: post-edit failed: {r3!r}")
+        return 3
+
+    # Step 4 — A re-reads → expect stale.
+    r4 = _step("/hooks/pre-read", {"session_id": sid_a, "path": path})
+    if r4 is None:
+        return 3
+    if r4.get("status") != "stale":
+        err(
+            f"--self-test: expected stale warning on A's re-read after B's "
+            f"commit, got {r4.get('status')!r} (full response: {r4!r}). "
+            f"This usually means the hooks aren't wired or the coordinator "
+            f"is running a stale build."
+        )
+        return 3
+    out = r4.get("hookSpecificOutput") or {}
+    ctx = out.get("additionalContext", "")
+    if path not in ctx:
+        err(
+            f"--self-test: stale-warning prose did not mention {path}: "
+            f"{ctx!r}"
+        )
+        return 3
+
+    # Step 5 — counters reflect the activity.
+    try:
+        status = get(
+            endpoint, "/status?detail=metrics",
+            extra_headers={"Coherence-Local-Operator": "true"},
+        )
+    except urllib.error.HTTPError as exc:
+        err(f"--self-test: /status returned HTTP {exc.code}")
+        return 3
+    if status.get("stale_warning_emitted_total", 0) < 1:
+        err(
+            "--self-test: stale_warning_emitted_total did not increment "
+            "(coordinator KTD-J counters appear to be inert)."
+        )
+        return 3
+    eps = status.get("endpoint_counters") or {}
+    if eps.get("pre_read_total", 0) < 2 or eps.get("post_edit_total", 0) < 1:
+        err(
+            f"--self-test: endpoint counters did not reflect the four-step "
+            f"scenario: {eps!r}"
+        )
+        return 3
+
+    print("agent-coherence-status --self-test: OK", flush=True)
+    print(
+        f"  pre-read fresh → pre-edit → post-edit commit → pre-read STALE "
+        f"({path}) — all four steps observed."
+    )
     return 0
 
 
