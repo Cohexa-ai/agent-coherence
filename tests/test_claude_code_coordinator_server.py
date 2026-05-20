@@ -416,6 +416,9 @@ def test_policy_untrack_persists_to_ignored_yaml(coordinator, client: _Client) -
 
 
 def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None:
+    """Default (minimal) tier still surfaces tracked artifacts + sessions +
+    counters; operator-level fields (coordinator_pid, absolute root) move
+    to ``?detail=full`` per R12."""
     a_sid = _sid("A")
     client.post("/hooks/pre-read", {"session_id": a_sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": a_sid, "path": "spec.md"})
@@ -427,8 +430,11 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     sessions = {sess["agent_name"] for sess in b["sessions"]}
     assert f"claude-session-{a_sid}" in sessions
     assert b["coordinator_uptime_s"] > 0
-    assert isinstance(b["coordinator_pid"], int)
     assert "policy_summary" in b
+    # R12: minimal tier never leaks coordinator_pid or absolute root.
+    assert b.get("detail") == "minimal"
+    assert b.get("coordinator_root") == "."
+    assert "coordinator_pid" not in b
 
 
 # ----------------------------------------------------------------------
@@ -1646,6 +1652,79 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
     assert "stayed empty" in str(exc.value)
     # The file must remain empty — we did NOT O_TRUNC over it.
     assert secret_path.stat().st_size == 0
+
+
+# ----------------------------------------------------------------------
+# R12 (Unit 6) — /status three-tier disclosure
+# ----------------------------------------------------------------------
+
+
+def test_r12_status_minimal_default_hides_coordinator_root_and_pid(
+    client: _Client,
+) -> None:
+    """The default (no query) response is the minimal tier — coordinator_root
+    is the sentinel "." and coordinator_pid is absent."""
+    s, b = client.get("/status")
+    assert s == 200
+    assert b["detail"] == "minimal"
+    assert b["coordinator_root"] == "."
+    assert "coordinator_pid" not in b
+
+
+def test_r12_status_full_requires_operator_header(client: _Client) -> None:
+    """?detail=full without the Coherence-Local-Operator: true opt-in header
+    must be rejected with 403 — Bearer auth alone is not sufficient for
+    the elevated tier."""
+    s, b = client.get("/status?detail=full")
+    assert s == 403
+    assert "operator" in b["error"].lower()
+
+
+def test_r12_status_full_with_operator_header_exposes_root_and_pid(
+    client: _Client, coordinator,
+) -> None:
+    """?detail=full + Coherence-Local-Operator: true returns the absolute
+    coordinator_root and coordinator_pid for legitimate operator inspection."""
+    s, b = client.request(
+        "GET", "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert s == 200
+    assert b["detail"] == "full"
+    assert b["coordinator_root"] == str(coordinator.coordinator_root)
+    assert isinstance(b["coordinator_pid"], int)
+    # Full tier also retains the artifact/session block.
+    assert "tracked_artifacts" in b
+    assert "sessions" in b
+
+
+def test_r12_status_metrics_returns_counters_only(client: _Client) -> None:
+    """?detail=metrics returns only the counter block — no artifact/session
+    walk, no leak of workspace state. Useful for dashboard scrapers."""
+    s, b = client.get("/status?detail=metrics")
+    assert s == 200
+    assert b["detail"] == "metrics"
+    assert "tracked_artifacts" not in b
+    assert "sessions" not in b
+    assert "policy_summary" not in b
+    # Counters must be present.
+    for k in (
+        "coordinator_uptime_s",
+        "watchdog_timeouts_total",
+        "handler_concurrency_overflows_total",
+        "in_flight_drain_timed_out",
+        "cold_start_duration_ms",
+    ):
+        assert k in b, f"counter {k} missing from metrics tier"
+
+
+def test_r12_status_unknown_detail_falls_back_to_minimal(client: _Client) -> None:
+    """A typo'd ?detail=value must NOT silently grant more access — it
+    falls back to minimal, never to full."""
+    s, b = client.get("/status?detail=fully")
+    assert s == 200
+    assert b["detail"] == "minimal"
+    assert "coordinator_pid" not in b
 
 
 def test_r11_ensure_secret_concurrent_threads_return_identical(

@@ -59,7 +59,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         endpoint = resolve_endpoint(Path(root))
-        payload = get(endpoint, "/status")
+        # R12 (Unit 6): agent-coherence-status is a local operator CLI
+        # running in the workspace it inspects, so it qualifies for the
+        # full tier. Pass the explicit Coherence-Local-Operator opt-in
+        # header so coordinator_pid and the absolute coordinator_root are
+        # included in the rendered table.
+        payload = get(
+            endpoint,
+            "/status?detail=full",
+            extra_headers={"Coherence-Local-Operator": "true"},
+        )
     except CoordinatorUnavailable as exc:
         err(f"agent-coherence-status: {exc}")
         return 0  # graceful — no coordinator is a normal state

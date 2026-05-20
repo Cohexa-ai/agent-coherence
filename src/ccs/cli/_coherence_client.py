@@ -118,17 +118,30 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     return CoordinatorEndpoint(port=port, bearer=bearer)
 
 
-def get(endpoint: CoordinatorEndpoint, path: str) -> dict[str, Any]:
+def get(
+    endpoint: CoordinatorEndpoint,
+    path: str,
+    *,
+    extra_headers: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Authenticated GET. Raises :class:`CoordinatorUnavailable` on network
     error; raises :class:`urllib.error.HTTPError` for non-2xx so the caller
-    can format status codes explicitly."""
+    can format status codes explicitly.
+
+    R12 (Unit 6): ``extra_headers`` lets local-operator CLIs (e.g.,
+    ``agent-coherence-status``) add ``Coherence-Local-Operator: true``
+    for the elevated ``/status?detail=full`` tier without hard-coding
+    that header here."""
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {endpoint.bearer}",
+        "Host": "127.0.0.1",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url=f"{endpoint.base_url}{path}",
         method="GET",
-        headers={
-            "Authorization": f"Bearer {endpoint.bearer}",
-            "Host": "127.0.0.1",
-        },
+        headers=headers,
     )
     return _execute(req)
 

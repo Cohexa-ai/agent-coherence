@@ -198,13 +198,17 @@ def test_auth_rejects_request_with_wrong_bearer(live) -> None:
 
 
 def test_auth_accepts_request_with_correct_bearer(live) -> None:
-    """Correct token → 200 + valid JSON status."""
+    """Correct token → 200 + valid JSON status. R12 (Unit 6): default
+    tier no longer includes ``coordinator_pid`` (operator-elevated). The
+    e2e contract here is "Bearer auth gets you a 200 with the minimal
+    shape", not "Bearer auth gets you operator-level fields"."""
     _, port, secret = live
     status, body = _request(port, "/status", bearer=secret)
     assert status == 200
     payload = json.loads(body)
-    assert "coordinator_pid" in payload
+    assert payload["detail"] == "minimal"
     assert "tracked_artifacts" in payload
+    assert "coordinator_pid" not in payload  # gated by ?detail=full + opt-in header
 
 
 # ----------------------------------------------------------------------
