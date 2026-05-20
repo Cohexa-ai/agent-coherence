@@ -771,3 +771,36 @@ def test_h4_revalidation_budget_exhaustion_returns_minus_one(
         )
     finally:
         monkeypatch.undo()
+
+
+# ----------------------------------------------------------------------
+# Unit 5 L3 — cold-start instrumentation (telemetry only)
+# ----------------------------------------------------------------------
+
+
+def test_l3_cold_start_duration_populated_on_winner_path(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """L3 instrumentation: the lifecycle winner path measures the wall-clock
+    time from CoordinatorHTTPServer construction through self-probe success
+    and stores it on the coordinator for the future /status endpoint."""
+    port = ensure_coordinator(workspace, config=fast_cfg)
+    assert port > 0
+    try:
+        entry = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())]
+        # Some time must have been recorded — fast hardware can finish under
+        # 50ms but never zero.
+        assert entry.coordinator.cold_start_duration_ms > 0.0
+        # Sanity ceiling: even on a slow CI runner, cold start under the
+        # spawn self-probe budget plus a generous margin.
+        ceiling_ms = (
+            fast_cfg.spawn_self_probe_attempts
+            * fast_cfg.spawn_self_probe_interval_sec
+            * 1000.0
+        ) + 1000.0
+        assert entry.coordinator.cold_start_duration_ms < ceiling_ms, (
+            f"cold_start_duration_ms={entry.coordinator.cold_start_duration_ms:.1f} "
+            f"exceeded ceiling {ceiling_ms:.1f}ms"
+        )
+    finally:
+        stop_coordinator(workspace)

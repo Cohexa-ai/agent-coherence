@@ -237,6 +237,13 @@ class CoordinatorHTTPServer:
         self._in_flight = 0
         self._in_flight_drain_timed_out = False
 
+        # KTD-H/I/L3 (Unit 5 L3) — cold-start timing populated by the
+        # lifecycle winner path after self-probe completes. Telemetry
+        # surface for the future /status endpoint (Unit 8). 0.0 until the
+        # lifecycle module sets it; remains 0.0 when the server is
+        # constructed directly in tests.
+        self.cold_start_duration_ms: float = 0.0
+
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
         self.registry = SqliteArtifactRegistry(
