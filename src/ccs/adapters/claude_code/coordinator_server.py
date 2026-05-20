@@ -223,6 +223,13 @@ class CoordinatorHTTPServer:
         self._last_request_at = self._started_at
         self._shutting_down = False
         self._agent_names: dict[UUID, str] = dict(agent_names or {})
+        # R10 (Unit 6): explicit lock around _agent_names mutation. CPython's
+        # GIL makes single-key dict assignment effectively atomic today, but
+        # the project standard is "don't rely on GIL" so the contract holds
+        # on PyPy / future free-threading builds and so the snapshot pattern
+        # at _handle_status (list(items()) under the lock) sees a consistent
+        # view. threading.Lock per pattern (NOT RLock — no nested acquisition).
+        self._agent_names_lock = threading.Lock()
         # v0.1.1 KTD-G item 3: surface watchdog/concurrency degradation
         # rather than letting it stay silent. Counters are read by
         # _handle_status; incremented in _run_or_degrade (timeouts +
@@ -408,11 +415,31 @@ class CoordinatorHTTPServer:
         return self._shutting_down
 
     def register_session(self, session_id: str) -> UUID:
-        """Idempotent session registration. Returns the deterministic agent UUID."""
+        """Idempotent session registration. Returns the deterministic agent UUID.
+
+        R10 (Unit 6): mutation is wrapped in ``_agent_names_lock`` so the
+        check-then-set is atomic w.r.t. concurrent registrations AND so
+        :meth:`agent_name_for` snapshots see a consistent dict — relying
+        on the GIL is forbidden by the project standard."""
         agent_id = session_to_agent_id(session_id)
-        if agent_id not in self._agent_names:
-            self._agent_names[agent_id] = session_to_agent_name(session_id)
+        with self._agent_names_lock:
+            if agent_id not in self._agent_names:
+                self._agent_names[agent_id] = session_to_agent_name(session_id)
         return agent_id
+
+    def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
+        """R10 (Unit 6): return a stable list snapshot of (agent_id, name)
+        pairs taken under the lock — callers iterate over the snapshot
+        rather than the live dict so a concurrent register_session cannot
+        invalidate the iteration (RuntimeError: dictionary changed size)."""
+        with self._agent_names_lock:
+            return list(self._agent_names.items())
+
+    def agent_name_for(self, agent_id: UUID) -> Optional[str]:
+        """R10 (Unit 6): single-key read under the lock. Returns None if
+        the agent has never been registered."""
+        with self._agent_names_lock:
+            return self._agent_names.get(agent_id)
 
     def run_with_watchdog(self, fn: Callable[[], Any]) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
@@ -1316,11 +1343,13 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
     returns ``{agent_id: MESIState}`` in one query). Per-session
     iteration becomes a dict lookup — O(artifacts) total queries.
     """
-    # A4: snapshot artifact_ids and _agent_names BEFORE iterating, to avoid
-    # `RuntimeError: dictionary changed size during iteration` racing against
-    # a concurrent register_session in another handler.
+    # A4 + R10 (Unit 6): snapshot artifact_ids and _agent_names BEFORE
+    # iterating, to avoid `RuntimeError: dictionary changed size during
+    # iteration` racing against a concurrent register_session in another
+    # handler. The snapshot is now taken under the dedicated
+    # _agent_names_lock via the public accessor — no GIL reliance.
     artifact_ids_snapshot = list(coordinator.registry.artifact_ids())
-    agent_names_snapshot = list(coordinator._agent_names.items())
+    agent_names_snapshot = coordinator.agent_names_snapshot()
 
     # Single-pass artifact resolution: one get_artifact per artifact id,
     # cached in artifact_by_id for the inner-loop lookups below.
@@ -1569,8 +1598,10 @@ def _last_writer_unix_ts(
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> Optional[str]:
-    """Reverse the session_to_agent_id mapping via agent_names."""
-    name = coordinator._agent_names.get(agent_id)
+    """Reverse the session_to_agent_id mapping via agent_names. R10 (Unit 6):
+    routes through the lock-aware public accessor instead of reaching into
+    the private dict directly."""
+    name = coordinator.agent_name_for(agent_id)
     if name and name.startswith("claude-session-"):
         return name[len("claude-session-"):]
     return None
@@ -1579,9 +1610,19 @@ def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Honors MAX_POLICY_YAML_BYTES — raises ValueError if the resulting file
-    would exceed the cap."""
+    would exceed the cap.
+
+    R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
+    exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
+    /policy/track or /policy/untrack requests cannot interleave their
+    reads-and-writes and corrupt the YAML (e.g., both read the same
+    pre-state, both compute "previous + my_paths", second write loses the
+    first writer's additions). fcntl is POSIX-only; on the deferred
+    Windows path this is a no-op (lifecycle already disables the
+    coordinator on Windows per _FCNTL_AVAILABLE)."""
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
-    # Validate each path the same way TrackedArtifactPolicy does.
+    # Validate each path the same way TrackedArtifactPolicy does. This
+    # validation is pure (no I/O) so it lives outside the lock window.
     added: list[str] = []
     rejected: list[dict] = []
     for p in new_paths:
@@ -1599,12 +1640,45 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     if not added:
         return added, rejected
 
-    existing = ""
-    if yaml_path.is_file():
-        existing = yaml_path.read_text()
-    new_lines = "\n".join(f"- {p}" for p in added)
-    new_content = (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing else (new_lines + "\n")
-    if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
-        raise ValueError(f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded")
-    yaml_path.write_text(new_content)
-    return added, rejected
+    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
+    try:
+        import fcntl as _fcntl
+        lock_fd: Optional[int] = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            existing = yaml_path.read_text() if yaml_path.is_file() else ""
+            new_lines = "\n".join(f"- {p}" for p in added)
+            new_content = (
+                (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
+                else (new_lines + "\n")
+            )
+            if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
+                raise ValueError(
+                    f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
+                )
+            yaml_path.write_text(new_content)
+            return added, rejected
+        finally:
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+    except ImportError:
+        # Windows fallback: no fcntl. Lifecycle already disables the
+        # coordinator on Windows, but degrade defensively if reached.
+        existing = yaml_path.read_text() if yaml_path.is_file() else ""
+        new_lines = "\n".join(f"- {p}" for p in added)
+        new_content = (
+            (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
+            else (new_lines + "\n")
+        )
+        if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
+            raise ValueError(
+                f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
+            )
+        yaml_path.write_text(new_content)
+        return added, rejected

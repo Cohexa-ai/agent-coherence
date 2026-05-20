@@ -1446,3 +1446,124 @@ def test_r21_body_at_cap_accepted(coordinator) -> None:
         # — but the body must have been READ, proving the cap let it through).
         assert resp.status in (200, 400)
     del client  # silence unused-var lint
+
+
+# ----------------------------------------------------------------------
+# R10 (Unit 6) — _agent_names mutation under threading.Lock
+# ----------------------------------------------------------------------
+
+
+def test_r10_agent_names_lock_serializes_concurrent_registration(
+    coordinator,
+) -> None:
+    """Eight threads concurrently call register_session with distinct
+    session ids; the resulting dict must contain exactly the union with
+    no torn entries (no missing keys, no overwrites)."""
+    expected: set[str] = set()
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+
+    def churner(thread_idx: int) -> None:
+        barrier.wait()
+        for j in range(50):
+            sid = _sid(f"r10-{thread_idx}-{j}")
+            with lock:
+                expected.add(sid)
+            coordinator.register_session(sid)
+
+    threads = [threading.Thread(target=churner, args=(i,)) for i in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    snapshot = coordinator.agent_names_snapshot()
+    names = {name for _, name in snapshot}
+    assert len(snapshot) >= len(expected)
+    for sid in expected:
+        assert f"claude-session-{sid}" in names, (
+            f"session {sid} missing from snapshot (lock failed to serialize)"
+        )
+
+
+def test_r10_status_snapshot_consistent_under_churn(
+    coordinator, client: _Client,
+) -> None:
+    """A reader calling /status while writers churn register_session must
+    NEVER see RuntimeError from a torn iteration. The lock-protected
+    snapshot is the contract."""
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def writer() -> None:
+        i = 0
+        while not stop.is_set():
+            try:
+                coordinator.register_session(_sid(f"r10-churn-{i}"))
+            except Exception as e:
+                errors.append(e)
+            i += 1
+
+    writers = [threading.Thread(target=writer) for _ in range(4)]
+    for t in writers: t.start()
+    try:
+        for _ in range(20):
+            s, _ = client.get("/status")
+            assert s == 200, "status returned non-200 under register_session churn"
+    finally:
+        stop.set()
+        for t in writers: t.join(timeout=2.0)
+    assert not errors, f"writer threads hit errors: {errors[:3]}"
+
+
+def test_r10_agent_name_for_returns_none_for_unknown(coordinator) -> None:
+    """The single-key accessor returns None for an agent that has never
+    been registered, without raising."""
+    fake_id = uuid.uuid5(uuid.NAMESPACE_URL, "ccs-agent:claude-session-never-registered")
+    assert coordinator.agent_name_for(fake_id) is None
+
+
+# ----------------------------------------------------------------------
+# R14 (Unit 6) — _append_policy_yaml under fcntl.flock
+# ----------------------------------------------------------------------
+
+
+def test_r14_concurrent_policy_track_no_lost_writes(coordinator, client: _Client) -> None:
+    """Eight threads each POST /policy/track with one unique path; every
+    request that the coordinator accepts (status 200) must have its path
+    persisted in tracked.yaml — no read-modify-write interleaving losing
+    entries. R14's contract is about lost writes among ACCEPTED requests,
+    not about 503s from the KTD-G concurrency cap (which is a separate
+    pre-handler reject)."""
+    target_paths = [f"r14/path_{i}.md" for i in range(8)]
+    barrier = threading.Barrier(len(target_paths))
+    results: list[tuple[str, int]] = []
+    results_lock = threading.Lock()
+
+    def add_path(p: str) -> None:
+        barrier.wait()
+        s, _ = client.post("/policy/track", {"paths": [p]})
+        with results_lock:
+            results.append((p, s))
+
+    threads = [threading.Thread(target=add_path, args=(p,)) for p in target_paths]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    accepted = [p for p, s in results if s == 200]
+    assert accepted, f"no requests succeeded — KTD-G cap may be too tight: {results}"
+
+    yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    text = yaml_path.read_text()
+    for p in accepted:
+        assert f"- {p}" in text, (
+            f"path {p!r} lost despite 200 response — fcntl.flock did not serialize"
+        )
+
+
+def test_r14_lock_file_created_next_to_yaml(coordinator, client: _Client) -> None:
+    """The fcntl lock uses a sidecar ``<yaml>.lock`` file; verify it
+    appears and stays present (the file is reused across calls)."""
+    client.post("/policy/track", {"paths": ["r14_sidecar.md"]})
+    lock_path = (
+        coordinator.coordinator_root / ".coherence" / "tracked.yaml.lock"
+    )
+    assert lock_path.is_file(), "tracked.yaml.lock sidecar was not created"
