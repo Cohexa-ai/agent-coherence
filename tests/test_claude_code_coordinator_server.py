@@ -1365,3 +1365,84 @@ def test_i6_dispatch_decrements_even_when_handler_raises(
         assert coordinator._in_flight == 0
     finally:
         mod._ROUTES[("POST", "/hooks/pre-read")] = original
+
+
+# ----------------------------------------------------------------------
+# R21 (Unit 6) — MAX_REQUEST_BODY_BYTES cap before rfile.read
+# ----------------------------------------------------------------------
+
+
+def test_r21_request_body_overflow_returns_413(coordinator) -> None:
+    """A Content-Length header that exceeds MAX_REQUEST_BODY_BYTES must
+    be rejected with 413 BEFORE the coordinator reads the body into
+    memory — protects against single-request OOM by a hostile or buggy
+    client inside the trust boundary."""
+    import http.client
+    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
+    from ccs.adapters.claude_code.auth import load_secret
+
+    secret = load_secret(coordinator.coordinator_root)
+    assert secret is not None
+
+    # Build the request manually to control Content-Length precisely.
+    # We claim n+1 bytes but only send 1 byte — server must reject on
+    # header alone, not after reading the (oversized) body.
+    over_n = MAX_REQUEST_BODY_BYTES + 1
+    conn = http.client.HTTPConnection("127.0.0.1", coordinator.port, timeout=5)
+    try:
+        conn.request(
+            "POST", "/hooks/pre-read",
+            body=b"x",  # intentional mismatch — header says oversized, body is tiny
+            headers={
+                "Authorization": f"Bearer {secret}",
+                "Host": "127.0.0.1",
+                "Content-Type": "application/json",
+                "Content-Length": str(over_n),
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 413, (
+            f"expected 413 for oversized Content-Length={over_n}; got {resp.status}"
+        )
+        body = json.loads(resp.read().decode("utf-8"))
+        assert "exceeds" in body["error"].lower()
+        assert str(over_n) in body["error"]
+    finally:
+        conn.close()
+
+
+def test_r21_body_at_cap_accepted(coordinator) -> None:
+    """Boundary: a body at exactly MAX_REQUEST_BODY_BYTES (still well
+    over our real payload sizes) is accepted, not 413'd off."""
+    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
+    from ccs.adapters.claude_code.auth import load_secret
+
+    secret = load_secret(coordinator.coordinator_root)
+    assert secret is not None
+
+    # Craft a JSON object whose serialized length equals the cap. We pad
+    # the session_id label so the overall JSON hits the byte count.
+    base = {"session_id": _sid("r21"), "path": "CLAUDE.md", "pad": ""}
+    base_bytes = json.dumps(base).encode("utf-8")
+    pad_len = MAX_REQUEST_BODY_BYTES - len(base_bytes)
+    assert pad_len > 0
+    base["pad"] = "x" * pad_len
+    payload = json.dumps(base).encode("utf-8")
+    assert len(payload) == MAX_REQUEST_BODY_BYTES
+
+    client = _Client("127.0.0.1", coordinator.port, secret)
+    # Use the raw urllib client to ensure we control Content-Length.
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/pre-read"
+    req = urlrequest.Request(
+        url, data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Host": "127.0.0.1",
+            "Content-Type": "application/json",
+        },
+    )
+    with urlrequest.urlopen(req, timeout=5) as resp:
+        # Server may 200 (fresh) or 400 (unknown extra fields are tolerated
+        # — but the body must have been READ, proving the cap let it through).
+        assert resp.status in (200, 400)
+    del client  # silence unused-var lint
