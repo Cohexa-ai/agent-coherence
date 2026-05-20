@@ -1567,3 +1567,109 @@ def test_r14_lock_file_created_next_to_yaml(coordinator, client: _Client) -> Non
         coordinator.coordinator_root / ".coherence" / "tracked.yaml.lock"
     )
     assert lock_path.is_file(), "tracked.yaml.lock sidecar was not created"
+
+
+# ----------------------------------------------------------------------
+# R11 (Unit 6) — ensure_secret bounded O_EXCL retry, fail-closed
+# ----------------------------------------------------------------------
+
+
+def test_r11_ensure_secret_recovers_from_empty_file_during_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a stale empty hook.secret exists when ensure_secret runs (e.g.,
+    a previous coordinator crashed between O_EXCL-create and write), the
+    bounded retry loop must eventually populate it without clobbering
+    via O_TRUNC. We simulate this by pre-creating the empty file, then
+    letting ensure_secret retry through to a clean O_EXCL after we
+    unlink it from a sidecar 'racer' thread."""
+    import threading as _t
+    from ccs.adapters.claude_code import auth as _auth
+
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    secret_path = coherence_dir / _auth.SECRET_FILENAME
+
+    # Make the file exist but be empty (mimics crashed predecessor).
+    secret_path.touch(mode=0o600)
+    assert secret_path.stat().st_size == 0
+
+    # Speed up the test: shorter retry sleep, but keep retry count.
+    monkeypatch.setattr(_auth, "ENSURE_SECRET_RETRY_SLEEP_SEC", 0.020)
+
+    # Simulate a racer that unlinks the empty file mid-retry, allowing
+    # ensure_secret's next O_EXCL to succeed.
+    def racer() -> None:
+        time.sleep(0.040)
+        try:
+            secret_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    t = _t.Thread(target=racer)
+    t.start()
+    try:
+        token = _auth.ensure_secret(tmp_path)
+    finally:
+        t.join(timeout=2.0)
+    # Contract: ensure_secret returned a token (recovery from empty
+    # file succeeded). We intentionally do NOT re-read the file —
+    # the racer may have unlinked AFTER ensure_secret returned, which
+    # is fine for the in-process race but would race the assertion
+    # on slow CI runners.
+    assert token
+    assert len(token) == 64
+
+
+def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If hook.secret stays empty across all retries, ensure_secret MUST
+    raise EnsureSecretError rather than O_TRUNC over it. The old behavior
+    would silently overwrite a concurrent racer's valid secret, leaving
+    two spawn-side processes with different secrets for the same
+    workspace — a silent total-protocol-break failure mode."""
+    from ccs.adapters.claude_code import auth as _auth
+
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    secret_path = coherence_dir / _auth.SECRET_FILENAME
+    secret_path.touch(mode=0o600)
+    assert secret_path.stat().st_size == 0
+
+    # Shorten retry sleep so the test finishes fast.
+    monkeypatch.setattr(_auth, "ENSURE_SECRET_RETRY_SLEEP_SEC", 0.001)
+    monkeypatch.setattr(_auth, "ENSURE_SECRET_MAX_RETRIES", 3)
+
+    with pytest.raises(_auth.EnsureSecretError) as exc:
+        _auth.ensure_secret(tmp_path)
+    assert "stayed empty" in str(exc.value)
+    # The file must remain empty — we did NOT O_TRUNC over it.
+    assert secret_path.stat().st_size == 0
+
+
+def test_r11_ensure_secret_concurrent_threads_return_identical(
+    tmp_path: Path,
+) -> None:
+    """Multiple threads spawning concurrently must all walk away with the
+    SAME secret (one wins O_EXCL, the others read what the winner wrote).
+    Thread-level test exercises the in-process race; the cross-process
+    case is identical at the syscall layer (O_EXCL is OS-enforced)."""
+    from ccs.adapters.claude_code.auth import ensure_secret
+
+    tokens: list[str] = []
+    tokens_lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker() -> None:
+        barrier.wait()
+        tok = ensure_secret(tmp_path)
+        with tokens_lock:
+            tokens.append(tok)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert len(set(tokens)) == 1, (
+        f"concurrent ensure_secret returned different tokens: {set(tokens)}"
+    )
