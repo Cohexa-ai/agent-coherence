@@ -79,6 +79,13 @@ HANDLER_CONCURRENCY_LIMIT = _WATCHDOG_POOL_SIZE * 2
 """Each endpoint's coordinator call is bounded to 4s by the watchdog;
 leaves 1s of margin under the 5s Claude Code hook timeout (KTD-12 / Unit 4)."""
 
+IN_FLIGHT_DRAIN_TIMEOUT_SEC = 5.0
+"""KTD-I (Unit 5 L2): ``shutdown()`` waits up to this many seconds for
+in-flight handlers to complete before closing the SQLite registry. After
+the deadline, any still-running handlers are abandoned — they may raise
+``sqlite3.ProgrammingError`` and return HTTP 500 to their clients. Better
+a 500 than a wedged shutdown (silent hang vs observable failure)."""
+
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
 in one request body (security-lens P1)."""
@@ -218,6 +225,18 @@ class CoordinatorHTTPServer:
         self._watchdog_timeouts_total: int = 0
         self._watchdog_queue_overflows_total: int = 0
 
+        # KTD-I (Unit 5 L2) — in-flight handler counter. Incremented at
+        # dispatch entry via :meth:`acquire_handler_slot`, decremented in
+        # the handler's finally via :meth:`release_handler_slot`.
+        # :meth:`shutdown` blocks on the counter reaching zero for up to
+        # IN_FLIGHT_DRAIN_TIMEOUT_SEC before closing the SQLite registry,
+        # so a handler mid-write doesn't see ProgrammingError on a closed
+        # connection (silent hang → observable 500 at worst).
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_zero = threading.Condition(self._in_flight_lock)
+        self._in_flight = 0
+        self._in_flight_drain_timed_out = False
+
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
         self.registry = SqliteArtifactRegistry(
@@ -263,16 +282,78 @@ class CoordinatorHTTPServer:
         self._serve_thread.start()
 
     def shutdown(self) -> None:
-        """Stop the server, drain in-flight handlers, close storage."""
+        """Stop the server, drain in-flight handlers, close storage.
+
+        KTD-I (Unit 5 L2): waits up to ``IN_FLIGHT_DRAIN_TIMEOUT_SEC`` for
+        the in-flight counter to reach zero before closing the SQLite
+        registry. Sets ``shutting_down`` BEFORE the drain so new dispatch
+        attempts 503 immediately and don't replenish the counter. After
+        the deadline, closes regardless — handlers still mid-write may
+        raise ``sqlite3.ProgrammingError`` (becoming HTTP 500 to clients),
+        which is observable. The alternative — wedging shutdown waiting
+        for a stuck handler — is silent and worse.
+        """
         if self._shutting_down:
             return
         self._shutting_down = True
         try:
-            self._server.shutdown()
+            # http.server.HTTPServer.shutdown() blocks on an Event set by
+            # serve_forever's exit. If serve_in_thread was never called,
+            # serve_forever never ran, and the event was never set —
+            # shutdown() would wait forever. Guard against that so unit
+            # tests that construct a server purely for state manipulation
+            # can still tear it down cleanly.
+            if self._serve_thread is not None:
+                self._server.shutdown()
             self._server.server_close()
         finally:
+            self._drain_in_flight(IN_FLIGHT_DRAIN_TIMEOUT_SEC)
             self._watchdog.shutdown(wait=True, cancel_futures=False)
             self.registry.close()
+
+    def acquire_handler_slot(self) -> bool:
+        """KTD-I L2: atomic shutting_down check + counter increment.
+
+        Returns False if shutdown has started between the dispatcher's
+        outer ``shutting_down`` check and this call (race window of a few
+        microseconds). Returns True iff the slot was acquired and the
+        caller MUST pair with :meth:`release_handler_slot`."""
+        with self._in_flight_lock:
+            if self._shutting_down:
+                return False
+            self._in_flight += 1
+            return True
+
+    def release_handler_slot(self) -> None:
+        """KTD-I L2: decrement the counter and notify drain waiters when
+        it reaches zero. Safe to call from any handler thread's finally."""
+        with self._in_flight_lock:
+            self._in_flight -= 1
+            if self._in_flight <= 0:
+                self._in_flight = 0  # defensive — never go negative
+                self._in_flight_zero.notify_all()
+
+    def _drain_in_flight(self, timeout_sec: float) -> None:
+        """Wait up to ``timeout_sec`` for in-flight handlers to complete.
+
+        Sets :attr:`_in_flight_drain_timed_out` if the deadline elapses
+        with handlers still running, so operators can observe the event
+        via the eventual /status surface (deferred to Unit 8)."""
+        if timeout_sec <= 0:
+            return
+        deadline = time.monotonic() + timeout_sec
+        with self._in_flight_lock:
+            while self._in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._in_flight_drain_timed_out = True
+                    logger.warning(
+                        "shutdown drain timed out after %.1fs with %d handler(s) still in-flight; "
+                        "closing registry anyway (KTD-I — observable 500 > wedged shutdown)",
+                        timeout_sec, self._in_flight,
+                    )
+                    return
+                self._in_flight_zero.wait(timeout=remaining)
 
     def __enter__(self) -> "CoordinatorHTTPServer":
         self.serve_in_thread()
@@ -441,30 +522,40 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
             self._dispatch("GET")
 
         def _dispatch(self, method: str) -> None:
-            if coordinator.shutting_down:
+            # KTD-I L2: acquire_handler_slot does the atomic shutting_down
+            # check + counter increment. If shutdown started between this
+            # call and the dispatcher entry, the slot is denied and we 503
+            # without touching the SQLite registry (which may already be
+            # mid-close).
+            if not coordinator.acquire_handler_slot():
                 self._json(503, {"error": "coordinator shutting down"})
                 return
-            coordinator.mark_request()
-
-            # Auth + Host check on every endpoint
-            if not verify_host(self.headers.get("Host")):
-                self._json(403, {"error": "host header not allowlisted"})
-                logger.warning("rejected request with bad Host: %r", self.headers.get("Host"))
-                return
-            if not verify_bearer(self.headers.get("Authorization"), coordinator.secret):
-                self._json(401, {"error": "missing or invalid bearer token"})
-                return
-
-            # Route
             try:
-                handler = _ROUTES.get((method, self.path))
-                if handler is None:
-                    self._json(404, {"error": f"unknown route {method} {self.path}"})
+                coordinator.mark_request()
+
+                # Auth + Host check on every endpoint
+                if not verify_host(self.headers.get("Host")):
+                    self._json(403, {"error": "host header not allowlisted"})
+                    logger.warning(
+                        "rejected request with bad Host: %r", self.headers.get("Host")
+                    )
                     return
-                handler(self, coordinator)
-            except Exception as exc:
-                logger.exception("unhandled error in handler for %s %s", method, self.path)
-                self._json(500, {"error": f"internal: {type(exc).__name__}"})
+                if not verify_bearer(self.headers.get("Authorization"), coordinator.secret):
+                    self._json(401, {"error": "missing or invalid bearer token"})
+                    return
+
+                # Route
+                try:
+                    handler = _ROUTES.get((method, self.path))
+                    if handler is None:
+                        self._json(404, {"error": f"unknown route {method} {self.path}"})
+                        return
+                    handler(self, coordinator)
+                except Exception as exc:
+                    logger.exception("unhandled error in handler for %s %s", method, self.path)
+                    self._json(500, {"error": f"internal: {type(exc).__name__}"})
+            finally:
+                coordinator.release_handler_slot()
 
         # ----------------------------------------------------------
         # Helpers

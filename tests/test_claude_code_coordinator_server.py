@@ -1227,3 +1227,141 @@ def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> Non
     assert _WATCHDOG_POOL_SIZE == 4
     assert HANDLER_CONCURRENCY_LIMIT == 8
     assert WATCHDOG_QUEUE_LIMIT == 8
+
+
+# ----------------------------------------------------------------------
+# KTD-I (Unit 5 L2) — in-flight handler semaphore drain on shutdown
+# ----------------------------------------------------------------------
+
+
+def test_i1_acquire_release_pair_balances_counter(tmp_path: Path) -> None:
+    """Unit-level: acquire/release balance the in-flight counter; the
+    drain condition is signalled on the zero transition."""
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i1")
+    try:
+        assert srv._in_flight == 0
+        assert srv.acquire_handler_slot() is True
+        assert srv._in_flight == 1
+        assert srv.acquire_handler_slot() is True
+        assert srv._in_flight == 2
+        srv.release_handler_slot()
+        assert srv._in_flight == 1
+        srv.release_handler_slot()
+        assert srv._in_flight == 0
+    finally:
+        srv.shutdown()
+
+
+def test_i2_acquire_denied_after_shutdown_started(tmp_path: Path) -> None:
+    """Once ``_shutting_down`` flips, acquire_handler_slot returns False
+    so the dispatcher 503s instead of touching a closing registry."""
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i2")
+    srv.serve_in_thread()
+    try:
+        # Manually flip the flag (mimics in-progress shutdown without
+        # actually closing the registry, so we can keep poking).
+        srv._shutting_down = True
+        assert srv.acquire_handler_slot() is False
+        assert srv._in_flight == 0
+    finally:
+        srv._shutting_down = False  # let shutdown() proceed normally
+        srv.shutdown()
+
+
+def test_i3_shutdown_waits_for_in_flight_handler(tmp_path: Path) -> None:
+    """End-to-end: a long-running handler keeps the in-flight counter
+    above zero; shutdown() must block on the drain until the handler
+    returns rather than closing the registry under it."""
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i3")
+    srv.serve_in_thread()
+    time.sleep(0.05)
+    secret = load_secret(srv.coordinator_root)
+    assert secret is not None
+    client = _Client("127.0.0.1", srv.port, secret)
+
+    # Simulate a slow handler by acquiring a slot from the test thread
+    # (no real handler invoked — we only need to keep _in_flight > 0
+    # for the drain to wait on).
+    assert srv.acquire_handler_slot() is True
+
+    shutdown_done = threading.Event()
+    def shutdown_thread() -> None:
+        srv.shutdown()
+        shutdown_done.set()
+    t = threading.Thread(target=shutdown_thread)
+    t.start()
+
+    # shutdown() should be blocked in the drain loop.
+    assert not shutdown_done.wait(timeout=0.5), (
+        "shutdown returned before the in-flight slot was released"
+    )
+
+    # Releasing the slot wakes the drain and lets shutdown complete.
+    srv.release_handler_slot()
+    assert shutdown_done.wait(timeout=2.0), "shutdown did not complete after drain"
+    t.join(timeout=2.0)
+    assert srv._in_flight_drain_timed_out is False
+    del client  # silence unused-var lint
+
+
+def test_i4_shutdown_drain_timeout_records_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a handler stays in-flight past the drain timeout, shutdown
+    closes the registry anyway and records the timeout for observability."""
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i4")
+    srv.serve_in_thread()
+    time.sleep(0.05)
+
+    # Keep an in-flight slot held for the duration of the test.
+    assert srv.acquire_handler_slot() is True
+
+    # Shrink the drain timeout so the test finishes in <1s.
+    import ccs.adapters.claude_code.coordinator_server as mod
+    monkeypatch.setattr(mod, "IN_FLIGHT_DRAIN_TIMEOUT_SEC", 0.1)
+    try:
+        srv.shutdown()
+        assert srv._in_flight_drain_timed_out is True, (
+            "drain timeout should set the observability flag"
+        )
+    finally:
+        # Release the artificially-held slot so the test doesn't leak.
+        srv.release_handler_slot()
+
+
+def test_i5_dispatch_pairs_acquire_with_release(client: _Client, coordinator) -> None:
+    """Integration: a normal pre-read request increments and decrements
+    the in-flight counter exactly once, leaving it at zero on return."""
+    assert coordinator._in_flight == 0
+    status, _ = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("i5"), "path": "CLAUDE.md"},
+    )
+    assert status == 200
+    assert coordinator._in_flight == 0, (
+        f"in-flight counter leaked: expected 0, got {coordinator._in_flight}"
+    )
+
+
+def test_i6_dispatch_decrements_even_when_handler_raises(
+    client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive: if a handler raises mid-dispatch (becoming a 500), the
+    finally block must still release the slot."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    original = mod._ROUTES[("POST", "/hooks/pre-read")]
+
+    def raising_handler(req, coord) -> None:
+        raise RuntimeError("simulated handler failure")
+
+    monkeypatch.setitem(mod._ROUTES, ("POST", "/hooks/pre-read"), raising_handler)
+    try:
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid("i6"), "path": "CLAUDE.md"},
+        )
+        assert status == 500
+        # Counter must have been decremented despite the exception.
+        assert coordinator._in_flight == 0
+    finally:
+        mod._ROUTES[("POST", "/hooks/pre-read")] = original
