@@ -1455,6 +1455,165 @@ def test_r21_body_at_cap_accepted(coordinator) -> None:
 
 
 # ----------------------------------------------------------------------
+# KTD-J (Unit 8) — telemetry counters
+# ----------------------------------------------------------------------
+
+
+def test_j1_per_endpoint_counters_increment_on_dispatch(client: _Client, coordinator) -> None:
+    """5 pre-reads + 3 pre-edits + 3 post-edits + 1 session-stop must show
+    up in the per-endpoint counter block of /status?detail=full."""
+    for i in range(5):
+        client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid(f"j1-{i}"), "path": "plan.md"},
+        )
+    for i in range(3):
+        client.post(
+            "/hooks/pre-edit",
+            {"session_id": _sid(f"j1-edit-{i}"), "path": f"path_{i}.md"},
+        )
+    for i in range(3):
+        client.post(
+            "/hooks/post-edit",
+            {
+                "session_id": _sid(f"j1-edit-{i}"),
+                "path": f"path_{i}.md",
+                "content_hash": _hash(f"h{i}"),
+                "success": True,
+            },
+        )
+    client.post(
+        "/hooks/session-stop", {"session_id": _sid("j1-stop")}
+    )
+
+    s, b = client.request(
+        "GET", "/status?detail=metrics",
+    )
+    assert s == 200
+    counters = b["endpoint_counters"]
+    assert counters["pre_read_total"] == 5
+    assert counters["pre_edit_total"] == 3
+    assert counters["post_edit_total"] == 3
+    assert counters["session_stop_total"] == 1
+
+
+def test_j2_status_counter_request_itself_increments(client: _Client, coordinator) -> None:
+    """A /status call counts itself — the increment fires before the
+    handler runs."""
+    _, b1 = client.get("/status")
+    _, b2 = client.get("/status")
+    assert (
+        b2["endpoint_counters"]["status_total"]
+        > b1["endpoint_counters"]["status_total"]
+    )
+
+
+def test_j3_counters_reset_to_zero_on_fresh_coordinator(tmp_path: Path) -> None:
+    """Counters are CACHE, not persistent state. A fresh coordinator
+    instance starts with zeros even when state.db already exists."""
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="j3")
+    try:
+        snap = srv.endpoint_counters_snapshot()
+        assert all(v == 0 for v in snap.values())
+        assert srv._intra_task_acquire_release_total == 0
+        assert srv._stale_warning_emitted_total == 0
+        assert srv._stale_warning_reread_total == 0
+    finally:
+        srv.shutdown()
+
+
+def test_j4_stale_emitted_and_reread_counters_track_warning_cycle(
+    client: _Client, coordinator,
+) -> None:
+    """Two-session stale scenario: A reads, B writes, A re-reads → stale
+    warning fires (emitted=1). A reads again with the same artifact →
+    that's the re-read (reread=1)."""
+    a = _sid("j4-A"); b = _sid("j4-B")
+    client.post("/hooks/pre-read",
+                {"session_id": a, "path": "plan.md", "content_hash": _hash("h1")})
+    client.post("/hooks/pre-edit", {"session_id": b, "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": b, "path": "plan.md",
+                                     "content_hash": _hash("h2"), "success": True})
+    # A re-reads — stale warning fires.
+    s, body = client.post("/hooks/pre-read",
+                          {"session_id": a, "path": "plan.md"})
+    assert body["status"] == "stale"
+    # A re-reads again (the re-read after the warning).
+    client.post("/hooks/pre-read",
+                {"session_id": a, "path": "plan.md"})
+
+    _, status_body = client.get("/status?detail=metrics")
+    assert status_body["stale_warning_emitted_total"] >= 1
+    assert status_body["stale_warning_reread_total"] >= 1
+
+
+def test_j5_intra_task_acquire_release_increments_on_successful_post_edit(
+    client: _Client, coordinator,
+) -> None:
+    """A pre-edit followed by a successful post-edit on a tracked path
+    must bump the intra-task acquire-release counter exactly once.
+    Untracked paths fast-path through pre-edit/post-edit without
+    acquiring E, so the counter is the load-bearing signal that fine-
+    grained write protection was actually exercised."""
+    sid = _sid("j5")
+    before = coordinator._intra_task_acquire_release_total
+    # plan.md matches the default tracked policy.
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid, "path": "plan.md",
+                 "content_hash": _hash("j5"), "success": True})
+    assert coordinator._intra_task_acquire_release_total == before + 1
+
+
+def test_j6_failed_post_edit_does_not_increment_acquire_release(
+    client: _Client, coordinator,
+) -> None:
+    """If post-edit reports failure, the counter does NOT increment —
+    the contract is 'fine-grained write protection actually used', not
+    'attempted'."""
+    sid = _sid("j6")
+    before = coordinator._intra_task_acquire_release_total
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid, "path": "plan.md",
+                 "content_hash": _hash("j6"), "success": False})
+    assert coordinator._intra_task_acquire_release_total == before
+
+
+def test_j7_status_exposes_coordinator_backend_and_version(client: _Client) -> None:
+    """KTD-J: /status shape includes coordinator_backend + coordinator_version
+    for cross-implementation operator observability."""
+    _, b = client.get("/status?detail=metrics")
+    assert b["coordinator_backend"] == "python"
+    assert isinstance(b["coordinator_version"], str)
+    assert b["coordinator_version"]  # non-empty
+
+
+def test_j8_counters_increment_even_when_handler_raises(
+    client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract per the plan: per-endpoint counters count ATTEMPTED
+    requests, not successful ones. A handler that raises mid-dispatch
+    (becoming a 500) must still leave the counter incremented."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    original = mod._ROUTES[("POST", "/hooks/pre-read")]
+    def raising(req, coord):
+        raise RuntimeError("simulated handler failure")
+    monkeypatch.setitem(mod._ROUTES, ("POST", "/hooks/pre-read"), raising)
+    try:
+        before = coordinator.endpoint_counters_snapshot()["pre_read_total"]
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid("j8"), "path": "j8.md"},
+        )
+        assert status == 500
+        after = coordinator.endpoint_counters_snapshot()["pre_read_total"]
+        assert after == before + 1, "counter must increment even on handler exception"
+    finally:
+        mod._ROUTES[("POST", "/hooks/pre-read")] = original
+
+
+# ----------------------------------------------------------------------
 # R10 (Unit 6) — _agent_names mutation under threading.Lock
 # ----------------------------------------------------------------------
 
