@@ -46,6 +46,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit the raw JSON response instead of the rendered table.",
     )
+    # KTD-J (Unit 8): --detail mirrors the /status three-tier disclosure
+    # model. Default 'full' so the local-operator CLI keeps surfacing pid
+    # + absolute root + all counters; 'metrics' for dashboard scrapers
+    # that want only the counter block; 'minimal' for a redacted view
+    # safe to paste in bug reports.
+    parser.add_argument(
+        "--detail",
+        choices=["minimal", "full", "metrics"],
+        default="full",
+        help=(
+            "Disclosure tier (default: full). 'minimal' redacts coordinator_pid "
+            "and absolute paths; 'metrics' returns counters only; 'full' is the "
+            "operator view used by /agent-coherence status."
+        ),
+    )
     return parser
 
 
@@ -59,14 +74,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         endpoint = resolve_endpoint(Path(root))
-        # R12 (Unit 6): agent-coherence-status is a local operator CLI
-        # running in the workspace it inspects, so it qualifies for the
-        # full tier. Pass the explicit Coherence-Local-Operator opt-in
-        # header so coordinator_pid and the absolute coordinator_root are
-        # included in the rendered table.
+        # R12 (Unit 6) + KTD-J (Unit 8): the detail tier is selected via
+        # --detail. Only 'full' needs the Coherence-Local-Operator opt-in
+        # header; the lower tiers degrade by design if the header is
+        # missing, but we always set it from this CLI since it's a
+        # legitimate local operator.
         payload = get(
             endpoint,
-            "/status?detail=full",
+            f"/status?detail={args.detail}",
             extra_headers={"Coherence-Local-Operator": "true"},
         )
     except CoordinatorUnavailable as exc:
@@ -83,7 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_json.dumps(payload, indent=2), flush=True)
         return 0
 
-    _render_table(payload)
+    if args.detail == "metrics":
+        _render_metrics(payload)
+    else:
+        _render_table(payload)
     return 0
 
 
@@ -94,8 +112,17 @@ def _render_table(payload: dict[str, Any]) -> None:
     policy = payload.get("policy_summary", {})
     uptime = payload.get("coordinator_uptime_s", 0.0)
     pid = payload.get("coordinator_pid", 0)
+    backend = payload.get("coordinator_backend", "python")
+    version = payload.get("coordinator_version", "")
 
-    print(f"Coordinator: pid={pid} uptime={uptime:.0f}s")
+    header_bits: list[str] = []
+    if pid:
+        header_bits.append(f"pid={pid}")
+    header_bits.append(f"uptime={uptime:.0f}s")
+    header_bits.append(f"backend={backend}")
+    if version:
+        header_bits.append(f"version={version}")
+    print("Coordinator: " + " ".join(header_bits))
     print()
 
     # Policy section first — distinguishes "what's eligible to be tracked"
@@ -134,20 +161,79 @@ def _render_table(payload: dict[str, Any]) -> None:
 
     if not sessions:
         print("No active sessions.")
+    else:
+        print("Sessions:")
+        for s in sessions:
+            sid = s.get("agent_id", "?")
+            name = s.get("agent_name", "")
+            per_artifact = s.get("states", {})
+            print(f"  {sid[:8]}  {name}")
+            if not per_artifact:
+                print("    (no held grants)")
+                continue
+            path_w = max(len(p) for p in per_artifact)
+            for path, state in sorted(per_artifact.items()):
+                print(f"    {path:<{path_w}}  {state}")
+
+    # KTD-J (Unit 8): counters section. Only printed when the payload
+    # actually carries counter data — the minimal tier strips them.
+    _render_counter_block(payload)
+
+
+def _render_counter_block(payload: dict[str, Any]) -> None:
+    """KTD-J counter block, printed after the artifacts/sessions section
+    of the full-tier table. No-op if the payload doesn't carry counters
+    (e.g., minimal tier responses)."""
+    endpoint_counters = payload.get("endpoint_counters") or {}
+    has_endpoint_counters = any(v for v in endpoint_counters.values())
+    keys_present = [
+        k for k in (
+            "intra_task_acquire_release_total",
+            "stale_warning_emitted_total",
+            "stale_warning_reread_total",
+            "watchdog_timeouts_total",
+            "watchdog_queue_overflows_total",
+            "handler_concurrency_overflows_total",
+            "cold_start_duration_ms",
+        ) if k in payload
+    ]
+    if not has_endpoint_counters and not keys_present:
         return
 
-    print("Sessions:")
-    for s in sessions:
-        sid = s.get("agent_id", "?")
-        name = s.get("agent_name", "")
-        per_artifact = s.get("states", {})
-        print(f"  {sid[:8]}  {name}")
-        if not per_artifact:
-            print("    (no held grants)")
-            continue
-        path_w = max(len(p) for p in per_artifact)
-        for path, state in sorted(per_artifact.items()):
-            print(f"    {path:<{path_w}}  {state}")
+    print()
+    print("Counters:")
+    if endpoint_counters:
+        # Stable order so operator-facing output is diff-friendly.
+        for name in (
+            "pre_read_total",
+            "pre_edit_total",
+            "post_edit_total",
+            "session_stop_total",
+            "pre_bash_total",
+            "pre_grep_total",
+            "policy_track_total",
+            "policy_untrack_total",
+            "status_total",
+        ):
+            value = endpoint_counters.get(name, 0)
+            print(f"  {name:<40}  {value}")
+    for name in keys_present:
+        value = payload.get(name, 0)
+        if isinstance(value, float):
+            value_str = f"{value:.1f}"
+        else:
+            value_str = str(value)
+        print(f"  {name:<40}  {value_str}")
+
+
+def _render_metrics(payload: dict[str, Any]) -> None:
+    """KTD-J `--detail metrics` rendering — counter block only, no
+    artifact/session detail. Used by dashboard scrapers that want a
+    consistent counter format without parsing JSON."""
+    backend = payload.get("coordinator_backend", "python")
+    version = payload.get("coordinator_version", "")
+    print(f"Coordinator metrics: backend={backend} version={version}")
+    _render_counter_block(payload)
 
 
 if __name__ == "__main__":
