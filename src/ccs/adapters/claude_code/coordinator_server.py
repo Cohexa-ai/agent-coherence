@@ -104,6 +104,21 @@ to read into memory. Matches MAX_POLICY_YAML_BYTES — generous for the
 buggy client cannot OOM the coordinator with a single oversized body.
 Validated BEFORE rfile.read so we never allocate the offending buffer."""
 
+
+def _resolve_coordinator_version() -> str:
+    """KTD-J (Unit 8): surface the package version via /status so operators
+    pasting status output into bug reports always include which build
+    they're running. Reads ``ccs.__version__`` lazily so test fixtures
+    that import this module before ``ccs`` is fully loaded don't crash."""
+    try:
+        from ccs import __version__ as _v
+        return _v
+    except Exception:  # pragma: no cover — defensive against import order
+        return "unknown"
+
+
+_COORDINATOR_VERSION: str = _resolve_coordinator_version()
+
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
                             re.IGNORECASE)
 """UUID4 shape. CC v2.1.131 fixtures (cc_hook_stdin/) confirm session_ids
@@ -257,6 +272,60 @@ class CoordinatorHTTPServer:
         # lifecycle module sets it; remains 0.0 when the server is
         # constructed directly in tests.
         self.cold_start_duration_ms: float = 0.0
+
+        # KTD-J (Unit 8) — telemetry counters. CACHE, not persistent
+        # state: reset to 0 on coordinator respawn (do NOT persist in
+        # state.db per the plan rationale). Plain ints — CPython's
+        # GIL guarantees atomicity for ``+= 1``; the contract is
+        # "advisory, not auditable", so a missed increment on a
+        # future free-threading build is acceptable.
+        #
+        # Per-endpoint request counters — drive operator visibility
+        # into which hooks fire and how often. Surfaced via
+        # /status?detail=full and /status?detail=metrics.
+        self._endpoint_counters: dict[str, int] = {
+            "pre_read_total": 0,
+            "pre_edit_total": 0,
+            "post_edit_total": 0,
+            "session_stop_total": 0,
+            "pre_bash_total": 0,
+            "pre_grep_total": 0,
+            "policy_track_total": 0,
+            "policy_untrack_total": 0,
+            "status_total": 0,
+        }
+        self._endpoint_counters_lock = threading.Lock()
+
+        # KTD-J product-signal counters. These shape v0.2 / hosted-tier
+        # decisions, so each has documented economic meaning.
+        #
+        # intra_task_acquire_release_total: how often a session acquired
+        # EXCLUSIVE and released within the same dispatch chain. Sizes
+        # the hosted-tier upsell argument (signal that fine-grained
+        # write protection is exercised, not idle).
+        #
+        # stale_warning_emitted_total: how often /hooks/pre-read or
+        # /hooks/pre-bash returned a stale-summary response. Denominator
+        # for the operator-computed re-read rate.
+        #
+        # stale_warning_reread_total: how often the agent re-read after
+        # a stale warning (heuristic: same session re-reads same path
+        # within HANDLER_TIMEOUT_SEC × 4 of receiving a stale warning).
+        # Numerator for re-read rate; operator computes the ratio at
+        # query time.
+        self._intra_task_acquire_release_total: int = 0
+        self._stale_warning_emitted_total: int = 0
+        self._stale_warning_reread_total: int = 0
+
+        # KTD-J re-read detection: a stale warning marks an (agent, artifact)
+        # pair as "warned"; the next pre-read on that pair consumes the
+        # marker and bumps :attr:`_stale_warning_reread_total`. The set
+        # cannot grow without bound — any subsequent pre-read clears the
+        # entry, and a worst-case scenario of one entry per active
+        # (agent, artifact) pair is the same upper bound as the registry's
+        # own state map.
+        self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
+        self._stale_warned_pairs_lock = threading.Lock()
 
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
@@ -441,6 +510,60 @@ class CoordinatorHTTPServer:
         with self._agent_names_lock:
             return self._agent_names.get(agent_id)
 
+    def increment_endpoint_counter(self, name: str) -> None:
+        """KTD-J (Unit 8): bump a per-endpoint counter. Names match the
+        keys in ``_endpoint_counters`` (e.g., ``pre_read_total``). Unknown
+        names are silently ignored — counters are advisory; a typo in a
+        future endpoint dispatch must not crash the request."""
+        with self._endpoint_counters_lock:
+            if name in self._endpoint_counters:
+                self._endpoint_counters[name] += 1
+
+    def endpoint_counters_snapshot(self) -> dict[str, int]:
+        """KTD-J (Unit 8): stable snapshot of per-endpoint counters.
+        Taken under the lock so concurrent increments cannot tear the
+        view."""
+        with self._endpoint_counters_lock:
+            return dict(self._endpoint_counters)
+
+    def increment_intra_task_acquire_release(self) -> None:
+        """KTD-J product-signal counter. Increment when a session's
+        EXCLUSIVE grant is released within the same dispatch chain that
+        acquired it (post-edit on the same artifact as the pre-edit).
+        Documents how often fine-grained write protection actually fires
+        — feeds the v0.2 / hosted-tier upsell case."""
+        # CPython GIL guarantees atomicity of += on a plain int; no
+        # explicit lock needed for this advisory counter.
+        self._intra_task_acquire_release_total += 1
+
+    def increment_stale_warning_emitted(self) -> None:
+        """KTD-J: denominator counter for operator-computed re-read rate."""
+        self._stale_warning_emitted_total += 1
+
+    def increment_stale_warning_reread(self) -> None:
+        """KTD-J: numerator counter for operator-computed re-read rate."""
+        self._stale_warning_reread_total += 1
+
+    def mark_stale_warned(self, agent_id: UUID, artifact_id: UUID) -> None:
+        """KTD-J: stamp an (agent, artifact) pair as having received a
+        stale warning. The next pre-read on the same pair consumes the
+        marker via :meth:`consume_stale_marker` and bumps the re-read
+        counter."""
+        with self._stale_warned_pairs_lock:
+            self._stale_warned_pairs.add((agent_id, artifact_id))
+
+    def consume_stale_marker(self, agent_id: UUID, artifact_id: UUID) -> bool:
+        """KTD-J: returns True (and clears the marker) if a stale warning
+        had been emitted for this (agent, artifact) pair since the last
+        consumption. Returns False otherwise. Used by pre-read entry to
+        bump the re-read counter exactly once per warning cycle."""
+        with self._stale_warned_pairs_lock:
+            pair = (agent_id, artifact_id)
+            if pair in self._stale_warned_pairs:
+                self._stale_warned_pairs.remove(pair)
+                return True
+            return False
+
     def run_with_watchdog(self, fn: Callable[[], Any]) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
         :class:`FuturesTimeout` on timeout (caller decides degradation)."""
@@ -600,6 +723,13 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     if handler is None:
                         self._json(404, {"error": f"unknown route {method} {route_path}"})
                         return
+                    # KTD-J (Unit 8): bump the per-endpoint counter BEFORE
+                    # invoking the handler so timeouts/exceptions still
+                    # show up in operator-visible counters. Contract:
+                    # counts attempted requests, not successful ones.
+                    counter_name = _ENDPOINT_COUNTER_NAMES.get((method, route_path))
+                    if counter_name is not None:
+                        coordinator.increment_endpoint_counter(counter_name)
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -717,6 +847,13 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
             )
             return {"status": "fresh"}
 
+        # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
+        # artifact) pair emitted a stale warning, count THIS call as the
+        # re-read. Increment whether the re-read returns fresh or stale —
+        # the agent attempted the read either way.
+        if coordinator.consume_stale_marker(agent_id, artifact_id):
+            coordinator.increment_stale_warning_reread()
+
         artifact = coordinator.registry.get_artifact(artifact_id)
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
@@ -761,6 +898,10 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
             trigger="post_stale_read", tick=now, content_hash=content_hash,
         )
         resp = _payloads.build_stale_response(summary)
+        # KTD-J (Unit 8): bump the stale-warning emission counter +
+        # mark the pair so a follow-up pre-read counts as a re-read.
+        coordinator.increment_stale_warning_emitted()
+        coordinator.mark_stale_warned(agent_id, artifact_id)
         # A1: if THIS session has pending preemption notices, prepend them
         # to the additionalContext so X learns about Y's revocation alongside
         # the stale-read warning.
@@ -960,6 +1101,10 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
                 )
                 return {"ok": False, "reason": reason, "preempted": True}
             return {"ok": False, "reason": str(exc)}
+        # KTD-J (Unit 8): successful commit means an EXCLUSIVE grant was
+        # acquired (pre-edit) and released (post-edit) within this same
+        # turn → sizes the hosted-tier upsell case.
+        coordinator.increment_intra_task_acquire_release()
         return {"ok": True}
 
     _run_or_degrade(req, coordinator, work)
@@ -1235,6 +1380,9 @@ def _handle_pre_bash(req, coordinator: CoordinatorHTTPServer) -> None:
         if stale_summaries:
             resp["status"] = "stale"
             resp["stale_paths"] = [s["path"] for s in stale_summaries]
+            # KTD-J (Unit 8): one increment per stale RESPONSE, regardless
+            # of how many paths the response summarizes.
+            coordinator.increment_stale_warning_emitted()
         else:
             resp["status"] = "fresh"
         return resp
@@ -1332,6 +1480,8 @@ def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
         if stale_summaries:
             resp["status"] = "stale"
             resp["stale_paths"] = [s["path"] for s in stale_summaries]
+            # KTD-J (Unit 8): one increment per stale pre-grep response.
+            coordinator.increment_stale_warning_emitted()
         else:
             resp["status"] = "fresh"
         return resp
@@ -1373,14 +1523,24 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
             return
 
     # Counter block — present at every tier so the telemetry-only
-    # consumer (?detail=metrics) doesn't pay for the artifact/session walk.
+    # consumer (?detail=metrics) doesn't pay for the artifact/session
+    # walk. KTD-J (Unit 8) adds per-endpoint + product-signal counters
+    # alongside the existing watchdog/concurrency counters.
     counters = {
         "coordinator_uptime_s": coordinator.uptime_s,
+        "coordinator_backend": "python",
+        "coordinator_version": _COORDINATOR_VERSION,
         "watchdog_timeouts_total": coordinator._watchdog_timeouts_total,
         "watchdog_queue_overflows_total": coordinator._watchdog_queue_overflows_total,
         "handler_concurrency_overflows_total": coordinator._server.handler_concurrency_overflows_total,
         "in_flight_drain_timed_out": coordinator._in_flight_drain_timed_out,
         "cold_start_duration_ms": coordinator.cold_start_duration_ms,
+        # KTD-J per-endpoint counters (snapshot taken under lock).
+        "endpoint_counters": coordinator.endpoint_counters_snapshot(),
+        # KTD-J product-signal counters.
+        "intra_task_acquire_release_total": coordinator._intra_task_acquire_release_total,
+        "stale_warning_emitted_total": coordinator._stale_warning_emitted_total,
+        "stale_warning_reread_total": coordinator._stale_warning_reread_total,
     }
     if detail == "metrics":
         req._json(200, {"detail": "metrics", **counters})
@@ -1466,6 +1626,23 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/policy/track"): _handle_policy_track,
     ("POST", "/policy/untrack"): _handle_policy_untrack,
     ("GET", "/status"): _handle_status,
+}
+
+
+# KTD-J (Unit 8): route → counter-name lookup. Used by ``_dispatch`` to
+# bump per-endpoint counters BEFORE invoking the handler (contract:
+# counts attempted requests, not successful ones, so a timeout or
+# exception still shows up in operator-visible /status output).
+_ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
+    ("POST", "/hooks/pre-read"): "pre_read_total",
+    ("POST", "/hooks/pre-edit"): "pre_edit_total",
+    ("POST", "/hooks/post-edit"): "post_edit_total",
+    ("POST", "/hooks/session-stop"): "session_stop_total",
+    ("POST", "/hooks/pre-bash"): "pre_bash_total",
+    ("POST", "/hooks/pre-grep"): "pre_grep_total",
+    ("POST", "/policy/track"): "policy_track_total",
+    ("POST", "/policy/untrack"): "policy_untrack_total",
+    ("GET", "/status"): "status_total",
 }
 
 
