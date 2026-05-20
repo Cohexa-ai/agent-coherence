@@ -97,6 +97,13 @@ MAX_PATH_LEN = 1024
 """Cap on inbound path length to defend against memory/DoS and prose-injection
 attacks. 1024 covers nested-deep paths in any realistic project."""
 
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+"""R21 (Unit 6): hard cap on the Content-Length the HTTP server is willing
+to read into memory. Matches MAX_POLICY_YAML_BYTES — generous for the
+~1 KB hook payloads we actually expect, tight enough that a hostile or
+buggy client cannot OOM the coordinator with a single oversized body.
+Validated BEFORE rfile.read so we never allocate the offending buffer."""
+
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
                             re.IGNORECASE)
 """UUID4 shape. CC v2.1.131 fixtures (cc_hook_stdin/) confirm session_ids
@@ -576,6 +583,23 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                 return None
             if n <= 0:
                 return {}
+            # R21 (Unit 6): cap the body BEFORE rfile.read so a hostile or
+            # buggy client cannot allocate an oversized buffer in the
+            # coordinator process. Validates Content-Length only — chunked
+            # transfer encoding is not supported by http.server in any
+            # case, so a missing/zero Content-Length already short-circuits
+            # above.
+            if n > MAX_REQUEST_BODY_BYTES:
+                self._json(
+                    413,
+                    {
+                        "error": (
+                            f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes "
+                            f"(Content-Length={n})"
+                        )
+                    },
+                )
+                return None
             raw = self.rfile.read(n)
             try:
                 obj = json.loads(raw.decode("utf-8"))
