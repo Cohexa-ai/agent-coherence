@@ -393,11 +393,24 @@ class CoordinatorHTTPServer:
             # shutdown() would wait forever. Guard against that so unit
             # tests that construct a server purely for state manipulation
             # can still tear it down cleanly.
+            #
+            # COR-01: order is shutdown → drain → server_close → registry.close.
+            # _server.shutdown() stops the serve_forever accept loop but does
+            # NOT close in-flight handler threads (they own their accepted
+            # sockets and finish writing on their own). Drain those slots
+            # BEFORE server_close + registry.close, so the registry remains
+            # open while a handler is still mid-transaction. Closing the
+            # listening socket is independent of accepted-connection sockets
+            # but keeping it open through the drain matches the canonical
+            # shutdown ordering and removes a refactor footgun.
             if self._serve_thread is not None:
                 self._server.shutdown()
-            self._server.server_close()
         finally:
             self._drain_in_flight(IN_FLIGHT_DRAIN_TIMEOUT_SEC)
+            try:
+                self._server.server_close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                logger.exception("server_close raised during shutdown")
             self._watchdog.shutdown(wait=True, cancel_futures=False)
             self.registry.close()
 
