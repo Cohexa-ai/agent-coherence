@@ -530,6 +530,9 @@ class SqliteArtifactRegistry:
         does not create a phantom gap.
         """
         with self._lock:
+            # COR-02: initialised outside the try so the except handler can
+            # check it even if BEGIN IMMEDIATE or any pre-_seq SQL raises.
+            seq_incremented_in_iteration = False
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 # Fetch prior state for the from→to log entry + bookkeeping decisions.
@@ -602,8 +605,16 @@ class SqliteArtifactRegistry:
                 # Mutation-then-log: emit state_log BEFORE commit. If the callback
                 # raises, ROLLBACK undoes the agent_states change AND we decrement
                 # _seq so gap detection stays consistent.
+                #
+                # COR-02: track _seq mutation in this iteration so the outer
+                # BaseException handler can also roll it back. Without this, a
+                # COMMIT failure leaves in-memory _seq ahead of persisted
+                # registry_meta.sequence_number — subsequent successful emissions
+                # produce a phantom gap. The inner Exception-during-state_log
+                # path already decrements; the outer ROLLBACK path now does too.
                 if self._state_log is not None:
                     self._seq += 1
+                    seq_incremented_in_iteration = True
                     entry = {
                         "tick": tick,
                         "artifact_id": str(artifact_id),
@@ -622,6 +633,7 @@ class SqliteArtifactRegistry:
                         self._state_log(entry)
                     except Exception:
                         self._seq -= 1
+                        seq_incremented_in_iteration = False
                         raise
                     # Persist new _seq value so cross-restart consumers see continuity.
                     self._conn.execute(
@@ -630,12 +642,18 @@ class SqliteArtifactRegistry:
                     )
 
                 self._conn.execute("COMMIT")
+                # COMMIT succeeded — _seq is durably persisted; no rollback needed.
+                seq_incremented_in_iteration = False
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
                 # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
                 # before propagation — otherwise the connection is left with an
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
+                # COR-02: if _seq was bumped in this iteration but COMMIT (or any
+                # later step) failed, decrement to match the rolled-back DB state.
+                if seq_incremented_in_iteration:
+                    self._seq -= 1
                 raise
 
     # ------------------------------------------------------------------
