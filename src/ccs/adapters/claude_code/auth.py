@@ -33,7 +33,6 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +93,15 @@ def ensure_secret(coordinator_root: Path) -> str:
 
     for attempt in range(ENSURE_SECRET_MAX_RETRIES):
         # Fast path: file exists and is populated.
+        # SEC-02 / finding #40: wrap read_text() in try/except so that a
+        # same-UID concurrent unlink between is_file() and read_text()
+        # (TOCTOU) causes a retry instead of a propagated FileNotFoundError
+        # that would crash coordinator startup.
         if secret_path.is_file():
-            token = secret_path.read_text().strip()
+            try:
+                token = secret_path.read_text().strip()
+            except (FileNotFoundError, OSError):
+                continue
             if token:
                 return token
 
@@ -131,18 +137,23 @@ def ensure_secret(coordinator_root: Path) -> str:
     )
 
 
-def load_secret(coordinator_root: Path) -> Optional[str]:
+def load_secret(coordinator_root: Path) -> str | None:
     """Load the secret if it exists. Returns None if the file is missing.
     Used by hook clients (CLI scripts, console-script entry points) that
     should NEVER create the secret — only the coordinator-spawn path does."""
     secret_path = coordinator_root / ".coherence" / SECRET_FILENAME
     if not secret_path.is_file():
         return None
-    token = secret_path.read_text().strip()
+    # SEC-02 / finding #40: same TOCTOU guard as ensure_secret — a concurrent
+    # unlink between is_file() and read_text() returns None instead of raising.
+    try:
+        token = secret_path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return None
     return token or None
 
 
-def verify_bearer(authorization_header: Optional[str], expected_secret: str) -> bool:
+def verify_bearer(authorization_header: str | None, expected_secret: str) -> bool:
     """Constant-time comparison of an Authorization header against the
     expected secret. Returns True only when the header is present, well-
     formed (``Bearer <token>``), and the token matches exactly.
@@ -158,7 +169,7 @@ def verify_bearer(authorization_header: Optional[str], expected_secret: str) -> 
     return hmac.compare_digest(presented, expected_secret)
 
 
-def verify_host(host_header: Optional[str]) -> bool:
+def verify_host(host_header: str | None) -> bool:
     """Reject Host headers that don't resolve to localhost/127.0.0.1.
 
     Block DNS rebinding: an attacker page at attacker.com resolves

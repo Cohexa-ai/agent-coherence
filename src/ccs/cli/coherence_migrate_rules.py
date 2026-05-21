@@ -35,7 +35,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Sequence
 
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 
@@ -183,7 +183,7 @@ class _Report:
         return out
 
 
-def _read_claude_md(workspace: Path) -> Optional[str]:
+def _read_claude_md(workspace: Path) -> str | None:
     """Read CLAUDE.md from the workspace root. Returns None if absent —
     detection has nothing to do but the CLI still exits 0 to keep the
     helper safe to script in setup wizards."""
@@ -227,7 +227,7 @@ def detect_rules(workspace: Path) -> _Report:
         return report
     report.already_present = _existing_deny_entries(workspace)
     for rule in _RULES:
-        match: Optional[re.Match[str]] = None
+        match: re.Match[str] | None = None
         for trigger in rule.triggers:
             match = trigger.search(text)
             if match is not None:
@@ -278,15 +278,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write proposed entries into .claude/settings.local.json "
             "after a confirmation prompt. Without this flag, the CLI "
-            "prints proposals only."
+            "prints proposals only. Requires --yes in non-interactive / "
+            "piped contexts (CLR-05)."
         ),
     )
     parser.add_argument(
         "--yes",
         action="store_true",
         help=(
-            "Skip the --apply confirmation prompt. Useful for setup "
-            "wizards and CI smoke runs."
+            "Skip the --apply confirmation prompt. Required in non-interactive "
+            "contexts (CI, agent pipelines, piped stdin). Without this flag, "
+            "--apply will error if stdin is not a TTY."
         ),
     )
     return parser
@@ -367,6 +369,15 @@ def _apply_entries(
     the file could not be written."""
     settings_path = workspace / ".claude" / "settings.local.json"
     if prompt_for_confirmation:
+        # CLR-05 / finding #7: block in non-interactive context so pipelines
+        # fail fast instead of hanging on stdin. Require --yes in CI/agent use.
+        if not sys.stdin.isatty():
+            print(
+                "agent-coherence-migrate-rules: --apply requires --yes in "
+                "non-interactive / piped contexts",
+                file=sys.stderr,
+            )
+            return 2
         try:
             print(
                 f"Apply {len(proposed)} deny entr"

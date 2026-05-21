@@ -48,8 +48,8 @@ from pathlib import Path
 from typing import Sequence
 
 from ccs.adapters.claude_code.lifecycle import (
-    _read_port_from_file,
-    _tcp_probe,
+    read_port_from_file as _read_port_from_file,
+    tcp_probe as _tcp_probe,
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
@@ -164,6 +164,7 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
     """
     from ccs.cli._coherence_client import (
         CoordinatorUnavailable,
+        post as _post,
         resolve_endpoint,
     )
     import urllib.error as _urlerr
@@ -189,7 +190,11 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
         return 0
 
     try:
-        resp = _post_with_operator_header(endpoint, "/admin/prepare-for-migration", {})
+        # M-04 / finding #28: use the shared _coherence_client.post() with
+        # extra_headers instead of the now-deleted _post_with_operator_header().
+        # Uses CLI_HTTP_TIMEOUT_SEC (6.0s) instead of the old hardcoded 5s.
+        resp = _post(endpoint, "/admin/prepare-for-migration", {},
+                     extra_headers={"Coherence-Local-Operator": "true"})
     except _urlerr.HTTPError as exc:
         err(f"agent-coherence-coordinator: prepare-for-migration HTTP {exc.code}")
         return 2
@@ -227,30 +232,6 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
         if errors:
             print(f"  errors: {errors}", flush=True)
     return 0
-
-
-def _post_with_operator_header(endpoint, path: str, body: dict) -> dict:
-    """POST with the Coherence-Local-Operator: true opt-in. Mirrors the
-    pattern used by agent-coherence-status for the elevated /status?detail=full
-    tier; agent-coherence-coordinator now needs the same for the
-    /admin/prepare-for-migration endpoint."""
-    import json as _json
-    import urllib.request as _urlrequest
-
-    payload = _json.dumps(body).encode("utf-8")
-    req = _urlrequest.Request(
-        url=f"{endpoint.base_url}{path}",
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {endpoint.bearer}",
-            "Host": "127.0.0.1",
-            "Content-Type": "application/json",
-            "Coherence-Local-Operator": "true",
-        },
-    )
-    with _urlrequest.urlopen(req, timeout=5) as resp:
-        return _json.loads(resp.read().decode("utf-8") or "{}")
 
 
 def _run_daemonized(root: Path) -> int:

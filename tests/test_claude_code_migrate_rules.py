@@ -89,6 +89,14 @@ def test_detect_sed_for_files(workspace: Path) -> None:
     assert any(r.name == "sed_for_files" for r in report.detected)
 
 
+def test_detect_awk_for_files(workspace: Path) -> None:
+    """T-04 / finding #23: awk_for_files positive-detection test (was missing)."""
+    _write_claude_md(workspace, "Don't use awk to read or edit files.")
+    report = detect_rules(workspace)
+    assert any(r.name == "awk_for_files" for r in report.detected)
+    assert "Bash(awk:*)" in report.proposed_entries
+
+
 # ----------------------------------------------------------------------
 # Detection — negative cases (false-positive resistance)
 # ----------------------------------------------------------------------

@@ -43,7 +43,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Protocol
+from typing import runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code import hook_payloads as _payloads
@@ -60,6 +61,27 @@ from ccs.core.exceptions import CoherenceError
 from ccs.core.states import MESIState
 
 logger = logging.getLogger(__name__)
+
+
+# Finding #30 — typed interface for the `req` parameter passed to all
+# endpoint handlers. The concrete implementation lives inside the
+# _make_handler_class closure as a BaseHTTPRequestHandler subclass; the
+# Protocol lets handlers declare the interface they need without coupling
+# to the concrete class or breaking the closure structure.
+@runtime_checkable
+class _RequestProtocol(Protocol):
+    """Minimal interface every endpoint handler expects from `req`."""
+
+    headers: Any  # http.client.HTTPMessage (Mapping-like)
+    path: str
+
+    def _read_json(self) -> dict | None:
+        """Read + parse the request body as JSON. Returns None on error."""
+        ...
+
+    def _json(self, status: int, body: dict) -> None:
+        """Write a JSON response with the given HTTP status code."""
+        ...
 
 
 HANDLER_TIMEOUT_SEC = 4.0
@@ -158,16 +180,22 @@ def monotonic_seconds() -> int:
 # ----------------------------------------------------------------------
 
 
-def validate_session_id(session_id: Any) -> Optional[str]:
-    """Return reason if invalid, None if valid. UUID-shape required."""
+def validate_session_id(
+    session_id: Any,
+) -> tuple[Literal["MISSING", "MALFORMED"], str] | None:
+    """Return (error_kind, reason) if invalid, None if valid. UUID-shape required.
+
+    AC-51 / finding #51: structured error kind lets callers branch on MISSING vs
+    MALFORMED without string-prefix matching (``err.startswith(...)``).
+    """
     if not isinstance(session_id, str):
-        return "session_id must be a string"
+        return ("MISSING", "missing session_id")
     if not _SESSION_ID_RE.match(session_id):
-        return "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"
+        return ("MALFORMED", "session_id must be a UUID (8-4-4-4-12 hex with hyphens)")
     return None
 
 
-def validate_path(path: Any) -> Optional[str]:
+def validate_path(path: Any) -> str | None:
     """Return reason if invalid, None if valid. The coordinator stores paths
     as parent-repo-relative — KTD-7 normalization happens client-side (the
     hook script must compute repo-relative from CC's absolute tool_input.
@@ -194,7 +222,7 @@ def validate_path(path: Any) -> Optional[str]:
     return None
 
 
-def validate_content_hash(content_hash: Any, *, required: bool) -> Optional[str]:
+def validate_content_hash(content_hash: Any, *, required: bool) -> str | None:
     """Return reason if invalid, None if valid. content_hash is OPTIONAL on
     pre-read (the caller may not have it yet) but REQUIRED on post-edit
     (the caller just wrote the file and computed it). Empty string is
@@ -228,9 +256,9 @@ class CoordinatorHTTPServer:
         *,
         port: int = 0,  # 0 = OS picks
         bind_host: str = "127.0.0.1",
-        agent_names: Optional[dict[UUID, str]] = None,
-        state_log: Optional[Callable[[dict[str, Any]], None]] = None,
-        instance_id: Optional[str] = None,
+        agent_names: dict[UUID, str] | None = None,
+        state_log: Callable[[dict[str, Any]], None] | None = None,
+        instance_id: str | None = None,
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
         self.bind_host = bind_host
@@ -360,7 +388,7 @@ class CoordinatorHTTPServer:
             concurrency_limit=HANDLER_CONCURRENCY_LIMIT,
         )
         self.port = self._server.server_port
-        self._serve_thread: Optional[threading.Thread] = None
+        self._serve_thread: threading.Thread | None = None
 
     def serve_in_thread(self) -> None:
         """Start the serving loop in a daemon thread."""
@@ -383,9 +411,15 @@ class CoordinatorHTTPServer:
         which is observable. The alternative — wedging shutdown waiting
         for a stuck handler — is silent and worse.
         """
-        if self._shutting_down:
-            return
-        self._shutting_down = True
+        # REL-05 / finding #42: protect the check-then-set with a lock so
+        # concurrent callers (idle thread + stop_coordinator) cannot both
+        # observe _shutting_down=False and both enter the shutdown body.
+        # _in_flight_lock is the right granularity: shutdown is what drives
+        # the drain, so no new lock is needed.
+        with self._in_flight_lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
         try:
             # http.server.HTTPServer.shutdown() blocks on an Event set by
             # serve_forever's exit. If serve_in_thread was never called,
@@ -504,7 +538,7 @@ class CoordinatorHTTPServer:
         with self._agent_names_lock:
             return list(self._agent_names.items())
 
-    def agent_name_for(self, agent_id: UUID) -> Optional[str]:
+    def agent_name_for(self, agent_id: UUID) -> str | None:
         """R10 (Unit 6): single-key read under the lock. Returns None if
         the agent has never been registered."""
         with self._agent_names_lock:
@@ -543,6 +577,41 @@ class CoordinatorHTTPServer:
     def increment_stale_warning_reread(self) -> None:
         """KTD-J: numerator counter for operator-computed re-read rate."""
         self._stale_warning_reread_total += 1
+
+    # Finding #31 — infrastructure counters now use the same public-method
+    # pattern as product-signal counters. _run_or_degrade calls these
+    # instead of reaching into private attributes directly.
+
+    def increment_watchdog_timeout(self) -> None:
+        """M-03 / finding #31: increment the watchdog-timeout operator counter.
+        Mirrors the increment_* pattern for product-signal counters."""
+        self._watchdog_timeouts_total += 1
+
+    def increment_watchdog_queue_overflow(self) -> None:
+        """M-03 / finding #31: increment the watchdog queue-overflow counter."""
+        self._watchdog_queue_overflows_total += 1
+
+    def counters_snapshot(self) -> dict[str, Any]:
+        """M-03 / finding #31: stable snapshot of ALL coordinator counters
+        (per-endpoint + product-signal + infrastructure + watchdog).
+
+        ``_handle_status`` uses this instead of reaching into private attrs,
+        giving a single source-of-truth for the counter set.
+        """
+        return {
+            "watchdog_timeouts_total": self._watchdog_timeouts_total,
+            "watchdog_queue_overflows_total": self._watchdog_queue_overflows_total,
+            "handler_concurrency_overflows_total": (
+                self._server.handler_concurrency_overflows_total
+                if self._server is not None else 0
+            ),
+            "in_flight_drain_timed_out": self._in_flight_drain_timed_out,
+            "cold_start_duration_ms": self.cold_start_duration_ms,
+            "endpoint_counters": self.endpoint_counters_snapshot(),
+            "intra_task_acquire_release_total": self._intra_task_acquire_release_total,
+            "stale_warning_emitted_total": self._stale_warning_emitted_total,
+            "stale_warning_reread_total": self._stale_warning_reread_total,
+        }
 
     def mark_stale_warned(self, agent_id: UUID, artifact_id: UUID) -> None:
         """KTD-J: stamp an (agent, artifact) pair as having received a
@@ -741,7 +810,7 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
         # Helpers
         # ----------------------------------------------------------
 
-        def _read_json(self) -> Optional[dict]:
+        def _read_json(self) -> dict | None:
             try:
                 n = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -794,7 +863,7 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
 # ----------------------------------------------------------------------
 
 
-def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-read — stale-read check + KTD-9 first-observation seeding."""
     body = req._read_json()
     if body is None:
@@ -803,15 +872,15 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
     path = body.get("path", "")
     content_hash = body.get("content_hash") or None
 
-    err = validate_session_id(session_id)
-    if err:
-        req._json(400, {"error": f"missing session_id" if err.startswith("session_id must be a string") else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
         return
-    err = validate_path(path)
-    if err:
+    path_err = validate_path(path)
+    if path_err:
         # Mirror the prior "missing or empty path" message shape for empty/missing
         # to keep client-side error-handling stable.
-        msg = "missing or empty path" if err in ("path is empty", "path must be a string") else err
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
     err = validate_content_hash(content_hash, required=False)
@@ -934,16 +1003,20 @@ def _handle_pre_read(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work_with_notice_surfacing)
 
 
-def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-edit — acquire EXCLUSIVE (KTD-1) + KTD-9 collision surfacing."""
     body = req._read_json()
     if body is None:
         return
     session_id = body.get("session_id")
     path = body.get("path", "")
-    err = validate_session_id(session_id) or validate_path(path)
-    if err:
-        req._json(400, {"error": "missing session_id or path" if "missing" in err or "empty" in err else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        req._json(400, {"error": "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err})
         return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
@@ -1019,7 +1092,7 @@ def _handle_pre_edit(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work)
 
 
-def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/post-edit — commit on success, release on failure (KTD-1)."""
     body = req._read_json()
     if body is None:
@@ -1028,9 +1101,13 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
     path = body.get("path", "")
     content_hash = body.get("content_hash")  # required when success=true
     success = bool(body.get("success", True))
-    err = validate_session_id(session_id) or validate_path(path)
-    if err:
-        req._json(400, {"error": "missing session_id or path" if "missing" in err or "empty" in err else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        req._json(400, {"error": "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err})
         return
     # content_hash is required only on success — if the tool succeeded, the
     # hook script computed it from the worktree's post-write state.
@@ -1110,15 +1187,15 @@ def _handle_post_edit(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work)
 
 
-def _handle_session_stop(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/session-stop — release uncommitted EXCLUSIVE grants (KTD-11)."""
     body = req._read_json()
     if body is None:
         return
     session_id = body.get("session_id")
-    err = validate_session_id(session_id)
-    if err:
-        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
         return
 
     agent_id = coordinator.register_session(session_id)
@@ -1181,7 +1258,7 @@ def _handle_session_stop(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work)
 
 
-def _handle_policy_track(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /policy/track — Unit 6 CLI add to tracked.yaml.
 
     P2 ce-review fixes:
@@ -1230,7 +1307,7 @@ def _handle_policy_track(req, coordinator: CoordinatorHTTPServer) -> None:
     })
 
 
-def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /policy/untrack — Unit 6 CLI add to ignored.yaml.
 
     Same hardening as /policy/track: per-path validate_path call + ValueError
@@ -1247,22 +1324,28 @@ def _handle_policy_untrack(req, coordinator: CoordinatorHTTPServer) -> None:
         req._json(400, {"error": f"max {MAX_POLICY_PATHS_PER_REQUEST} paths per request"})
         return
     # Same defense-in-depth + partial-accept as /policy/track.
+    # AC-06 / finding #27: collect pre_rejected so the response is symmetric
+    # with /policy/track's {ok, removed, rejected} shape. Previously, invalid
+    # paths were silently dropped with no rejected field in the response.
     safe_paths: list[str] = []
+    pre_rejected: list[dict] = []
     for p in paths:
         v_err = validate_path(p)
         if v_err is None:
             safe_paths.append(p)
+        else:
+            pre_rejected.append({"path": p, "reason": v_err})
     yaml_path = coordinator.coordinator_root / ".coherence" / "ignored.yaml"
     try:
-        added, _ = _append_policy_yaml(yaml_path, safe_paths)
+        added, yaml_rejected = _append_policy_yaml(yaml_path, safe_paths)
     except ValueError as exc:
         req._json(400, {"error": str(exc)})
         return
     coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
-    req._json(200, {"ok": True, "removed": added})
+    req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
-def _handle_pre_bash(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-bash — KTD-N H4 mitigation.
 
     The v0.2 Phase 0 falsifiability experiment (see
@@ -1293,9 +1376,9 @@ def _handle_pre_bash(req, coordinator: CoordinatorHTTPServer) -> None:
     session_id = body.get("session_id")
     command = body.get("command")
 
-    err = validate_session_id(session_id)
-    if err:
-        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
         return
     if not isinstance(command, str) or not command.strip():
         req._json(400, {"error": "missing or empty command"})
@@ -1390,7 +1473,7 @@ def _handle_pre_bash(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work)
 
 
-def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-grep — KTD-N H4 mitigation, Grep variant.
 
     Same threat model as ``/hooks/pre-bash`` but for the Grep tool:
@@ -1410,9 +1493,9 @@ def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
     session_id = body.get("session_id")
     search_root = body.get("search_root", "")
 
-    err = validate_session_id(session_id)
-    if err:
-        req._json(400, {"error": "missing session_id" if err.startswith("session_id must be a string") else err})
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
         return
     # search_root may be "" (workspace root). If non-empty, apply path validator.
     if search_root != "":
@@ -1489,7 +1572,7 @@ def _handle_pre_grep(req, coordinator: CoordinatorHTTPServer) -> None:
     _run_or_degrade(req, coordinator, work)
 
 
-def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
     R12 (Unit 6): three-tier disclosure model.
@@ -1526,21 +1609,13 @@ def _handle_status(req, coordinator: CoordinatorHTTPServer) -> None:
     # consumer (?detail=metrics) doesn't pay for the artifact/session
     # walk. KTD-J (Unit 8) adds per-endpoint + product-signal counters
     # alongside the existing watchdog/concurrency counters.
+    # M-03 / finding #31: use counters_snapshot() instead of reaching into
+    # private attrs directly — single source of truth for the counter set.
     counters = {
         "coordinator_uptime_s": coordinator.uptime_s,
         "coordinator_backend": "python",
         "coordinator_version": _COORDINATOR_VERSION,
-        "watchdog_timeouts_total": coordinator._watchdog_timeouts_total,
-        "watchdog_queue_overflows_total": coordinator._watchdog_queue_overflows_total,
-        "handler_concurrency_overflows_total": coordinator._server.handler_concurrency_overflows_total,
-        "in_flight_drain_timed_out": coordinator._in_flight_drain_timed_out,
-        "cold_start_duration_ms": coordinator.cold_start_duration_ms,
-        # KTD-J per-endpoint counters (snapshot taken under lock).
-        "endpoint_counters": coordinator.endpoint_counters_snapshot(),
-        # KTD-J product-signal counters.
-        "intra_task_acquire_release_total": coordinator._intra_task_acquire_release_total,
-        "stale_warning_emitted_total": coordinator._stale_warning_emitted_total,
-        "stale_warning_reread_total": coordinator._stale_warning_reread_total,
+        **coordinator.counters_snapshot(),
     }
     if detail == "metrics":
         req._json(200, {"detail": "metrics", **counters})
@@ -1612,7 +1687,7 @@ def _parse_detail_query(query: str) -> str:
     return "minimal"
 
 
-def _handle_prepare_for_migration(req, coordinator: CoordinatorHTTPServer) -> None:
+def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /admin/prepare-for-migration — release-all-grants then schedule shutdown.
 
     Unit 8 (Decision 1, locked 2026-05-18): operator runs
@@ -1629,9 +1704,16 @@ def _handle_prepare_for_migration(req, coordinator: CoordinatorHTTPServer) -> No
 
     Requires the same elevated-tier signal as /status?detail=full:
     Bearer + ``Coherence-Local-Operator: true`` header. The CLI sets
-    both; a same-user adversary trying to crash the coordinator needs
-    to read hook.secret AND know the magic header — the same bar as
-    /status?detail=full's pid disclosure.
+    both automatically.
+
+    Security note (SEC-01): the ``Coherence-Local-Operator: true`` header
+    value is a static, well-known string embedded in public source — it does
+    NOT constitute a second factor against Adversary 1 (same OS user who can
+    read the 0600 hook.secret file). This endpoint is a DoS surface within
+    the Adversary 1 boundary: a same-UID process with hook.secret access can
+    force coordinator shutdown and grant release. This is accepted per the
+    v0.1 threat model. The header serves as an explicit opt-in signal for
+    operator-automation tooling, not as a security gate.
     """
     if req.headers.get("Coherence-Local-Operator", "").lower() != "true":
         req._json(403, {
@@ -1745,7 +1827,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
 # ----------------------------------------------------------------------
 
 
-def _run_or_degrade(req, coordinator: CoordinatorHTTPServer, work: Callable[[], dict]) -> None:
+def _run_or_degrade(req: _RequestProtocol, coordinator: CoordinatorHTTPServer, work: Callable[[], dict]) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
     and return 200 {status:"fresh"} so the user's tool call proceeds.
 
@@ -1771,7 +1853,7 @@ def _run_or_degrade(req, coordinator: CoordinatorHTTPServer, work: Callable[[], 
     except AttributeError:
         qsize = 0
     if qsize > WATCHDOG_QUEUE_LIMIT:
-        coordinator._watchdog_queue_overflows_total += 1
+        coordinator.increment_watchdog_queue_overflow()  # finding #31
         logger.warning(
             "watchdog queue at %d items (limit %d); rejecting with 503",
             qsize,
@@ -1784,7 +1866,7 @@ def _run_or_degrade(req, coordinator: CoordinatorHTTPServer, work: Callable[[], 
         result = coordinator.run_with_watchdog(work)
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
-        coordinator._watchdog_timeouts_total += 1
+        coordinator.increment_watchdog_timeout()  # finding #31
         logger.warning("handler watchdog timeout after %ss; degrading to fresh", HANDLER_TIMEOUT_SEC)
         req._json(200, {"status": "fresh", "degraded": True})
         return
@@ -1800,7 +1882,7 @@ def _exclusive_holder(
     artifact_id: UUID,
     *,
     exclude_agent: UUID,
-) -> tuple[Optional[UUID], Optional[int]]:
+) -> tuple[UUID | None, int | None]:
     """Return (agent_id, granted_at_tick) of any current M∪E holder OTHER
     than the given agent. Used for KTD-9 collision detection in pre-edit."""
     state_map = coordinator.registry.get_state_map(artifact_id)
@@ -1891,8 +1973,20 @@ def _build_preemption_text(
     return "\n".join(lines)
 
 
-def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> Optional[str]:
-    """Return the session_id (not agent UUID) of the artifact's last writer, if any."""
+def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
+    """Return the session_id (not agent UUID) of the artifact's last writer, if any.
+
+    Best signal: an agent currently in MODIFIED state (they are the current writer).
+
+    Fallback caveat (COR-09): if no agent holds MODIFIED, we fall back to the
+    first entry in the state_map by insertion order. This agent may be in SHARED
+    or EXCLUSIVE state — it is not necessarily the actual last writer. In the
+    common case the querying agent itself may be in state_map (e.g. in SHARED),
+    meaning the stale-read warning could attribute the file to the very session
+    receiving the warning. This is a known limitation of the in-memory fallback;
+    a future improvement should use ``artifacts.last_writer_id`` from the DB
+    (via ``_fetch_artifact_row``) instead of the state_map fallback.
+    """
     # The registry's _fetch_artifact_row returns last_writer_id; we expose it
     # via lookup. For now derive from agent_names cache.
     state_map = coordinator.registry.get_state_map(artifact_id)
@@ -1900,7 +1994,7 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> O
     for agent_id, state in state_map.items():
         if state == MESIState.MODIFIED:
             return _agent_id_to_session(coordinator, agent_id)
-    # Fall back: any known agent (better than nothing).
+    # Fallback: first known agent by insertion order (see docstring caveat).
     if state_map:
         first_agent = next(iter(state_map))
         return _agent_id_to_session(coordinator, first_agent)
@@ -1909,7 +2003,7 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> O
 
 def _last_writer_unix_ts(
     coordinator: CoordinatorHTTPServer, artifact_id: UUID
-) -> Optional[float]:
+) -> float | None:
     """Return the REAL wall-clock time the artifact was last written, from
     `artifacts.updated_at` in the registry. None if the artifact is unknown.
 
@@ -1919,7 +2013,7 @@ def _last_writer_unix_ts(
     return coordinator.registry.get_artifact_updated_at(artifact_id)
 
 
-def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> Optional[str]:
+def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:
     """Reverse the session_to_agent_id mapping via agent_names. R10 (Unit 6):
     routes through the lock-aware public accessor instead of reaching into
     the private dict directly."""
@@ -1965,7 +2059,7 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
     try:
         import fcntl as _fcntl
-        lock_fd: Optional[int] = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        lock_fd: int | None = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
             existing = yaml_path.read_text() if yaml_path.is_file() else ""

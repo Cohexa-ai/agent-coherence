@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Sequence
 
 import yaml
 
@@ -53,6 +54,34 @@ the 1000-path benchmark in Unit 8 verifies 0 false positives across Node,
 Rust, Django, and other-ecosystem path samples."""
 
 
+def _compile_glob_pattern(pattern: str) -> re.Pattern[str] | None:
+    """PERF-2 / finding #16: pre-compile a ``**``-containing glob pattern into
+    a re.Pattern at construction time. Returns None for patterns without ``**``
+    (those use fnmatch at match-time with no string-build overhead)."""
+    if "**" not in pattern:
+        return None
+    parts: list[str] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                parts.append(".*")
+                i += 2
+                if i < len(pattern) and pattern[i] == "/":
+                    i += 1
+            else:
+                parts.append("[^/]*")
+                i += 1
+        elif c == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(c))
+            i += 1
+    return re.compile("^" + "".join(parts) + "$")
+
+
 @dataclass
 class TrackedArtifactPolicy:
     """Decide whether a parent-repo-relative path is coordinated.
@@ -68,6 +97,25 @@ class TrackedArtifactPolicy:
     rejected_patterns: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     """Patterns rejected by the path-traversal guard, with reason. Surfaced
     by :meth:`rejected` for status/debug visibility."""
+
+    # PERF-2 / finding #16: pre-compiled regex cache for ``**`` patterns.
+    # Built in __post_init__ so the cost is paid exactly once at load time.
+    _compiled_patterns: dict[str, re.Pattern[str]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        """Pre-compile all ``**``-containing patterns across all pattern sets."""
+        for patterns in (
+            self.tracked_patterns,
+            self.ignored_patterns,
+            self.user_added_patterns,
+        ):
+            for p in patterns:
+                if p not in self._compiled_patterns:
+                    compiled = _compile_glob_pattern(p)
+                    if compiled is not None:
+                        self._compiled_patterns[p] = compiled
 
     @classmethod
     def load(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
@@ -98,12 +146,16 @@ class TrackedArtifactPolicy:
             # Absolute path or .. traversal — never tracked.
             return False
 
-        tracked = _matches_any(normalized, self.tracked_patterns) or _matches_any(
-            normalized, self.user_added_patterns
+        # PERF-2 / finding #16: pass pre-compiled cache so _glob_match skips
+        # the string-build loop for ``**`` patterns.
+        cache = self._compiled_patterns
+        tracked = (
+            _matches_any(normalized, self.tracked_patterns, cache)
+            or _matches_any(normalized, self.user_added_patterns, cache)
         )
         if not tracked:
             return False
-        if _matches_any(normalized, self.ignored_patterns):
+        if _matches_any(normalized, self.ignored_patterns, cache):
             return False
         return True
 
@@ -127,7 +179,7 @@ class TrackedArtifactPolicy:
 # ----------------------------------------------------------------------
 
 
-def _normalize_relative(p: str) -> Optional[str]:
+def _normalize_relative(p: str) -> str | None:
     """Return the path with leading ``./`` stripped, or None if the path
     is absolute or contains ``..`` components (defense-in-depth even
     though the hook handler also normalizes upstream)."""
@@ -149,25 +201,41 @@ def _normalize_relative(p: str) -> Optional[str]:
     return cleaned
 
 
-def _matches_any(path: str, patterns: Iterable[str]) -> bool:
+def _matches_any(
+    path: str,
+    patterns: Iterable[str],
+    compiled: dict[str, re.Pattern[str]] | None = None,
+) -> bool:
     """Glob-match path against a list of patterns. Uses ``fnmatch`` for
-    ``*``/``?`` semantics; ``**`` is treated as zero-or-more path segments."""
+    ``*``/``?`` semantics; ``**`` is treated as zero-or-more path segments.
+
+    PERF-2 / finding #16: ``compiled`` is an optional pre-compiled pattern
+    cache (keyed by pattern string). When provided, ``**`` patterns skip the
+    string-build loop and use the cached re.Pattern directly."""
     posix_path = path.replace("\\", "/")
     for pattern in patterns:
-        if _glob_match(posix_path, pattern):
+        if _glob_match(posix_path, pattern, compiled):
             return True
     return False
 
 
-def _glob_match(path: str, pattern: str) -> bool:
-    """Match a posix-style path against a glob pattern supporting ``**``."""
+def _glob_match(
+    path: str,
+    pattern: str,
+    compiled: dict[str, re.Pattern[str]] | None = None,
+) -> bool:
+    """Match a posix-style path against a glob pattern supporting ``**``.
+
+    PERF-2 / finding #16: when ``compiled`` is provided, ``**`` patterns use
+    the pre-compiled re.Pattern directly, skipping the string-build loop."""
     # fnmatch handles ``*`` (any chars in segment) and ``?`` (single char).
     # For ``**`` (any number of path segments), convert to a regex-equivalent.
     if "**" not in pattern:
         return fnmatch.fnmatchcase(path, pattern)
-    # Translate ``**`` → ``.*``, ``*`` → ``[^/]*``, ``?`` → ``.``, escape rest.
-    import re
-
+    # Fast path: use the pre-compiled pattern if available.
+    if compiled is not None and pattern in compiled:
+        return compiled[pattern].match(path) is not None
+    # Slow path (called without a cache, e.g. from tests): build on the fly.
     parts: list[str] = []
     i = 0
     while i < len(pattern):
@@ -188,8 +256,8 @@ def _glob_match(path: str, pattern: str) -> bool:
         else:
             parts.append(re.escape(c))
             i += 1
-    regex = "^" + "".join(parts) + "$"
-    return re.match(regex, path) is not None
+    regex_str = "^" + "".join(parts) + "$"
+    return re.match(regex_str, path) is not None
 
 
 def _load_yaml_patterns(
@@ -240,7 +308,7 @@ def _load_yaml_patterns(
     return surviving
 
 
-def _validate_pattern(pattern: str) -> Optional[str]:
+def _validate_pattern(pattern: str) -> str | None:
     """Path-traversal guard. Returns None if pattern is acceptable, else
     a short reason string."""
     if not pattern:
