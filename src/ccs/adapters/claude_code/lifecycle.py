@@ -36,7 +36,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
@@ -135,7 +134,7 @@ _DEFAULT_CONFIG = LifecycleConfig()
 def ensure_coordinator(
     coordinator_root: Path,
     *,
-    config: Optional[LifecycleConfig] = None,
+    config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> int:
     """Lazy-spawn entry point.
@@ -166,7 +165,7 @@ def ensure_coordinator(
     existing = _SPAWNED_REGISTRY.get(resolved_key)
     if existing is not None and not existing.shutdown_done.is_set():
         existing_port = existing.coordinator.port
-        if _tcp_probe(existing_port, cfg, bind_host=bind_host):
+        if tcp_probe(existing_port, cfg, bind_host=bind_host):
             return existing_port
         # Existing entry not actually reachable — fall through to respawn.
         logger.warning(
@@ -241,7 +240,7 @@ def ensure_coordinator(
                 _close_quiet(fd)
                 raise
             # Contended — try to read the port.
-            port = _read_port_from_file(pid_file)
+            port = read_port_from_file(pid_file)
             if port is not None:
                 _close_quiet(fd)
                 return port
@@ -317,7 +316,7 @@ def ensure_coordinator(
 def connect_or_spawn(
     coordinator_root: Path,
     *,
-    config: Optional[LifecycleConfig] = None,
+    config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> int:
     """Hook-handler entry point.
@@ -330,8 +329,8 @@ def connect_or_spawn(
 
     cfg = config or _DEFAULT_CONFIG
     pid_file = coordinator_root / ".coherence" / "server.pid"
-    port = _read_port_from_file(pid_file)
-    if port is not None and _tcp_probe(port, cfg, bind_host=bind_host):
+    port = read_port_from_file(pid_file)
+    if port is not None and tcp_probe(port, cfg, bind_host=bind_host):
         return port
 
     # Stale or absent — spawn (or join existing holder via fcntl race).
@@ -341,7 +340,7 @@ def connect_or_spawn(
     # ensure_coordinator already self-probes on the spawn path; here we
     # only re-probe if the caller landed in the loser-read path (where
     # the just-read port may belong to a coordinator mid-shutdown).
-    if not _tcp_probe(port, cfg, bind_host=bind_host):
+    if not tcp_probe(port, cfg, bind_host=bind_host):
         logger.warning("coordinator spawned at port=%d but TCP probe failed", port)
         return -1
     return port
@@ -399,7 +398,7 @@ class _SpawnedEntry:
 _SPAWNED_REGISTRY: dict[str, _SpawnedEntry] = {}
 
 
-def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
+def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     """Create ``<root>/.coherence/`` with mode 0700 if missing. Returns
     the dir path, or None if the parent repo is read-only.
 
@@ -432,7 +431,7 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
     return coherence_dir
 
 
-def _open_pidfile(pid_file: Path) -> Optional[int]:
+def _open_pidfile(pid_file: Path) -> int | None:
     """Open (creating if needed) the pid file with mode 0600 for fcntl use."""
     try:
         fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o600)
@@ -499,11 +498,11 @@ def _rewrite_pidfile_drop_port(fd: int, pid: int) -> None:
     os.fsync(fd)
 
 
-def read_port_from_file(pid_file: Path) -> Optional[int]:
+def read_port_from_file(pid_file: Path) -> int | None:
     """Read the port line from the pid file. Returns None if absent,
     empty, malformed, or the file doesn't exist.
 
-    Public API (promoted from the private ``_read_port_from_file`` per
+    Public API (promoted from the private ``read_port_from_file`` per
     P2 ce-review fix #17 / maintainability + kieran-python). CLI scripts
     and external callers should use this function rather than reaching
     into the underscore-prefixed name."""
@@ -536,7 +535,7 @@ def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:
     production code paths — the inlined version covers both port-read
     and lock-acquire retries simultaneously."""
     for _ in range(cfg.port_file_retry_attempts):
-        port = _read_port_from_file(pid_file)
+        port = read_port_from_file(pid_file)
         if port is not None:
             return port
         time.sleep(cfg.port_file_retry_interval_sec)
@@ -552,7 +551,7 @@ def tcp_probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") 
     """Loser-side / generic TCP probe with the connect_retry budget. Used
     by hook-handler-style callers that have already paid a port-read.
 
-    Public API (promoted from the private ``_tcp_probe`` per P2 ce-review
+    Public API (promoted from the private ``tcp_probe`` per P2 ce-review
     fix #17). The underscore-prefixed alias is retained for backward
     compatibility with internal callers."""
     return _probe_with_budget(
@@ -767,13 +766,6 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
 
 
 # ----------------------------------------------------------------------
-# Backward-compat aliases (P2 ce-review fix #17)
-# ----------------------------------------------------------------------
-# The names below were promoted to public API (read_port_from_file,
-# tcp_probe) but the underscore-prefixed forms are imported by other
-# library modules (_coherence_client.py, coherence_coordinator.py).
-# Keep the aliases so internal call sites don't have to flip in lockstep.
-# New code should prefer the public names.
-
-_read_port_from_file = read_port_from_file
-_tcp_probe = tcp_probe
+# Backward-compat aliases removed (finding #46: all internal callers now
+# import the public names directly via `read_port_from_file as read_port_from_file`
+# or `tcp_probe as tcp_probe`). No alias needed.

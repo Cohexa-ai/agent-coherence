@@ -95,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     if args.self_test:
-        return _run_self_test(Path(root))
+        return _run_self_test(Path(root), json_mode=args.json)
 
     try:
         endpoint = resolve_endpoint(Path(root))
@@ -130,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _run_self_test(root: Path) -> int:
+def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     """KTD-J (Unit 8): end-to-end smoke against a live coordinator.
 
     Two synthetic sessions A and B drive the stale-read warning path:
@@ -168,7 +168,7 @@ def _run_self_test(root: Path) -> int:
     sid_b = str(_uuid.uuid5(ns, "self-test-B"))
     path = "plan.md"  # part of DEFAULT_TRACKED_PATTERNS
 
-    def _step(name: str, body: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def _step(name: str, body: dict[str, Any]) -> dict[str, Any] | None:
         try:
             return _post(endpoint, name, body)
         except urllib.error.HTTPError as exc:
@@ -243,11 +243,22 @@ def _run_self_test(root: Path) -> int:
         )
         return 3
 
-    print("agent-coherence-status --self-test: OK", flush=True)
-    print(
-        f"  pre-read fresh → pre-edit → post-edit commit → pre-read STALE "
-        f"({path}) — all four steps observed."
-    )
+    if json_mode:
+        import json as _json
+        steps = [
+            "pre-read fresh",
+            "pre-edit",
+            "post-edit commit",
+            f"pre-read STALE ({path})",
+        ]
+        print(_json.dumps({"self_test": "pass", "steps_observed": steps, "error": None}), flush=True)
+    else:
+        print("agent-coherence-status --self-test: OK", flush=True)
+        print(
+            f"  pre-read fresh → pre-edit → post-edit commit → pre-read STALE "
+            f"({path}) — all four steps observed.",
+            flush=True,
+        )
     return 0
 
 

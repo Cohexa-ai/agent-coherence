@@ -24,9 +24,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from ccs.adapters.claude_code.lifecycle import _read_port_from_file
+from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def err(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def validate_relative_path(p: str) -> Optional[str]:
+def validate_relative_path(p: str) -> str | None:
     """Reject absolute paths, ``..`` traversal, and empty input. Returns
     None on valid, a reason string on invalid.
 
@@ -122,7 +122,7 @@ def get(
     endpoint: CoordinatorEndpoint,
     path: str,
     *,
-    extra_headers: Optional[dict[str, str]] = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Authenticated GET. Raises :class:`CoordinatorUnavailable` on network
     error; raises :class:`urllib.error.HTTPError` for non-2xx so the caller
@@ -146,18 +146,32 @@ def get(
     return _execute(req)
 
 
-def post(endpoint: CoordinatorEndpoint, path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Authenticated POST with JSON body."""
+def post(
+    endpoint: CoordinatorEndpoint,
+    path: str,
+    body: dict[str, Any],
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Authenticated POST with JSON body.
+
+    M-04 / finding #28: ``extra_headers`` mirrors the pattern on ``get()``
+    so callers can add e.g. ``Coherence-Local-Operator: true`` without
+    reimplementing the urllib transport layer.
+    """
     payload = json.dumps(body).encode("utf-8")
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {endpoint.bearer}",
+        "Host": "127.0.0.1",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url=f"{endpoint.base_url}{path}",
         data=payload,
         method="POST",
-        headers={
-            "Authorization": f"Bearer {endpoint.bearer}",
-            "Host": "127.0.0.1",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     return _execute(req)
 
@@ -188,7 +202,7 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         ) from exc
 
 
-def http_status_from_error(exc: urllib.error.HTTPError) -> Optional[dict[str, Any]]:
+def http_status_from_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
     """Best-effort JSON decode of an HTTPError body, for one-line user output."""
     try:
         raw = exc.read()

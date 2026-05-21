@@ -26,7 +26,7 @@ import pytest
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
-    _read_port_from_file,
+    read_port_from_file as _read_port_from_file,
     connect_or_spawn,
     ensure_coordinator,
     stop_coordinator,
@@ -652,9 +652,10 @@ def test_g4_shutdown_raise_aborts_without_releasing_lock(
 # ----------------------------------------------------------------------
 
 
-def test_h1_inode_matches_helper_detects_unlink_recreate(workspace: Path) -> None:
-    """Unit-level: ``_inode_matches`` returns True when fd and path point
-    at the same inode, and False after an external unlink + recreate."""
+def test_l1_inode_match_helper_detects_unlink_recreate(workspace: Path) -> None:
+    """L1 invariant: ``_inode_matches`` returns True when fd and path point
+    at the same inode, and False after an external unlink + recreate.
+    Canonical l1_ prefix per plan §'Cross-cutting test discipline' line 789."""
     coherence_dir = workspace / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     pid_file = coherence_dir / "server.pid"
@@ -670,6 +671,10 @@ def test_h1_inode_matches_helper_detects_unlink_recreate(workspace: Path) -> Non
         assert lifecycle._inode_matches(fd, pid_file) is False
     finally:
         os.close(fd)
+
+
+def test_h1_inode_matches_helper_detects_unlink_recreate(workspace: Path) -> None:  # backward alias
+    return test_l1_inode_match_helper_detects_unlink_recreate(workspace)
 
 
 def test_h2_inode_matches_returns_false_when_path_absent(workspace: Path) -> None:

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Literal, NotRequired, Optional, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 
 # ----------------------------------------------------------------------
@@ -81,7 +81,7 @@ class StaleSummary(TypedDict):
     """
     path: str
     current_version: int
-    prior_version_seen_by_session: Optional[int]
+    prior_version_seen_by_session: int | None
     last_writer_session_id: str
     last_writer_at_unix_ts: float
     warning_generated_at_unix_ts: float
@@ -93,9 +93,15 @@ class FreshResponse(TypedDict):
 
 
 class StaleResponse(TypedDict):
-    """The complete hookSpecificOutput Claude Code will use to inject the
-    stale-read warning into the agent's context."""
+    """The complete wire shape for a stale-read response (AC-04 / finding #25).
+
+    ``build_stale_response`` emits all three fields; tests access
+    ``body['status']`` and ``body['summary']['path']`` directly.
+    Document the full shape so typed consumers have an accurate contract.
+    """
     hookSpecificOutput: "PreToolUseHookOutput"
+    status: Literal["stale"]
+    summary: StaleSummary
 
 
 class PreToolUseHookOutput(TypedDict):
@@ -129,6 +135,7 @@ class PolicyTrackResponse(TypedDict):
 class PolicyUntrackResponse(TypedDict):
     ok: Literal[True]
     removed: list[str]
+    rejected: list[dict]  # [{"path": "...", "reason": "..."}, ...] — AC-06 / finding #27
 
 
 class StatusResponse(TypedDict):

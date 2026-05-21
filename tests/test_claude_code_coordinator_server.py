@@ -634,14 +634,22 @@ def test_a1_preemption_notice_consumed_after_one_surface(client: _Client) -> Non
 
 
 def test_a1_no_preemption_no_notice(client: _Client) -> None:
-    """A1 negative: a session that's never been preempted gets no notice."""
+    """A1 negative: a session that's never been preempted gets no notice.
+
+    Finding #24: the previous conditional `if 'hookSpecificOutput' in body`
+    made this assertion unreachable (X was never preempted so the field is
+    absent). Replace with an unconditional assertion: the response must be
+    exactly {ok: True} with no hookSpecificOutput at all.
+    """
     x = _sid("X")
-    # X never preempted — pre-edit just works
+    # X never preempted — pre-edit must return exactly {ok: True} with no
+    # preemption output.
     s, body = client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
     assert s == 200
-    if "hookSpecificOutput" in body:
-        msg = body["hookSpecificOutput"]["additionalContext"]
-        assert "preempted" not in msg.lower() and "revoked" not in msg.lower()
+    assert body.get("ok") is True, f"expected ok=True, got: {body!r}"
+    assert "hookSpecificOutput" not in body, (
+        f"pre-edit for a never-preempted session must not carry hookSpecificOutput; got: {body!r}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1180,9 +1188,9 @@ def test_status_includes_watchdog_counters_zeroed_at_startup(client: _Client) ->
     assert body["handler_concurrency_overflows_total"] == 0
 
 
-def test_watchdog_timeout_increments_counter(coordinator, client: _Client) -> None:
-    """When FuturesTimeout fires in _run_or_degrade, watchdog_timeouts_total
-    increments and /status reflects it."""
+def test_a6_watchdog_timeout_increments_counter(coordinator, client: _Client) -> None:
+    """A6 — handler timeout / sweep deadlock: when FuturesTimeout fires in
+    _run_or_degrade, watchdog_timeouts_total increments and /status reflects it."""
     from unittest.mock import patch
     from concurrent.futures import TimeoutError as FuturesTimeout
 
@@ -1197,11 +1205,11 @@ def test_watchdog_timeout_increments_counter(coordinator, client: _Client) -> No
     assert sbody["watchdog_timeouts_total"] >= 1
 
 
-def test_watchdog_queue_overflow_returns_503(coordinator, client: _Client) -> None:
-    """KTD-G item 1: when the watchdog ThreadPoolExecutor's _work_queue
-    grows past WATCHDOG_QUEUE_LIMIT, _run_or_degrade returns HTTP 503
-    instead of submitting the task. Simulated via a stubbed qsize that
-    reports overflow."""
+def test_a7_watchdog_queue_overflow_returns_503(coordinator, client: _Client) -> None:
+    """A7 — sweep-concurrent-write / shutdown-mid-sweep: when the watchdog
+    ThreadPoolExecutor's _work_queue grows past WATCHDOG_QUEUE_LIMIT,
+    _run_or_degrade returns HTTP 503 instead of submitting the task.
+    Simulated via a stubbed qsize that reports overflow."""
     from unittest.mock import patch
 
     class _FakeQueue:
@@ -1459,7 +1467,7 @@ def test_r21_body_at_cap_accepted(coordinator) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_j1_per_endpoint_counters_increment_on_dispatch(client: _Client, coordinator) -> None:
+def test_a8_per_endpoint_counters_increment_on_dispatch(client: _Client, coordinator) -> None:
     """5 pre-reads + 3 pre-edits + 3 post-edits + 1 session-stop must show
     up in the per-endpoint counter block of /status?detail=full."""
     for i in range(5):
@@ -1497,7 +1505,7 @@ def test_j1_per_endpoint_counters_increment_on_dispatch(client: _Client, coordin
     assert counters["session_stop_total"] == 1
 
 
-def test_j2_status_counter_request_itself_increments(client: _Client, coordinator) -> None:
+def test_a8_status_counter_request_itself_increments(client: _Client, coordinator) -> None:
     """A /status call counts itself — the increment fires before the
     handler runs."""
     _, b1 = client.get("/status")
@@ -1508,7 +1516,7 @@ def test_j2_status_counter_request_itself_increments(client: _Client, coordinato
     )
 
 
-def test_j3_counters_reset_to_zero_on_fresh_coordinator(tmp_path: Path) -> None:
+def test_a8_counters_reset_to_zero_on_fresh_coordinator(tmp_path: Path) -> None:
     """Counters are CACHE, not persistent state. A fresh coordinator
     instance starts with zeros even when state.db already exists."""
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="j3")
@@ -1522,7 +1530,7 @@ def test_j3_counters_reset_to_zero_on_fresh_coordinator(tmp_path: Path) -> None:
         srv.shutdown()
 
 
-def test_j4_stale_emitted_and_reread_counters_track_warning_cycle(
+def test_a8_stale_emitted_and_reread_counters_track_warning_cycle(
     client: _Client, coordinator,
 ) -> None:
     """Two-session stale scenario: A reads, B writes, A re-reads → stale
@@ -1547,7 +1555,7 @@ def test_j4_stale_emitted_and_reread_counters_track_warning_cycle(
     assert status_body["stale_warning_reread_total"] >= 1
 
 
-def test_j5_intra_task_acquire_release_increments_on_successful_post_edit(
+def test_a8_intra_task_acquire_release_increments_on_successful_post_edit(
     client: _Client, coordinator,
 ) -> None:
     """A pre-edit followed by a successful post-edit on a tracked path
@@ -1565,7 +1573,7 @@ def test_j5_intra_task_acquire_release_increments_on_successful_post_edit(
     assert coordinator._intra_task_acquire_release_total == before + 1
 
 
-def test_j6_failed_post_edit_does_not_increment_acquire_release(
+def test_a8_failed_post_edit_does_not_increment_acquire_release(
     client: _Client, coordinator,
 ) -> None:
     """If post-edit reports failure, the counter does NOT increment —
@@ -1580,7 +1588,7 @@ def test_j6_failed_post_edit_does_not_increment_acquire_release(
     assert coordinator._intra_task_acquire_release_total == before
 
 
-def test_j7_status_exposes_coordinator_backend_and_version(client: _Client) -> None:
+def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> None:
     """KTD-J: /status shape includes coordinator_backend + coordinator_version
     for cross-implementation operator observability."""
     _, b = client.get("/status?detail=metrics")
@@ -1589,7 +1597,7 @@ def test_j7_status_exposes_coordinator_backend_and_version(client: _Client) -> N
     assert b["coordinator_version"]  # non-empty
 
 
-def test_j8_counters_increment_even_when_handler_raises(
+def test_a8_counters_increment_even_when_handler_raises(
     client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Contract per the plan: per-endpoint counters count ATTEMPTED
@@ -1618,12 +1626,15 @@ def test_j8_counters_increment_even_when_handler_raises(
 # ----------------------------------------------------------------------
 
 
-def test_r10_agent_names_lock_serializes_concurrent_registration(
+def test_a4_agent_names_mutation_under_concurrent_status(
     coordinator,
 ) -> None:
-    """Eight threads concurrently call register_session with distinct
-    session ids; the resulting dict must contain exactly the union with
-    no torn entries (no missing keys, no overwrites)."""
+    """A4 — agent-names map concurrency (plan §'Cross-cutting test discipline').
+
+    Eight threads concurrently call register_session with distinct session ids;
+    the resulting dict must contain exactly the union with no torn entries (no
+    missing keys, no overwrites). Canonical a4_ prefix for risk-code triage.
+    """
     expected: set[str] = set()
     barrier = threading.Barrier(8)
     lock = threading.Lock()
@@ -1647,6 +1658,12 @@ def test_r10_agent_names_lock_serializes_concurrent_registration(
         assert f"claude-session-{sid}" in names, (
             f"session {sid} missing from snapshot (lock failed to serialize)"
         )
+
+
+# Backward triage alias: pytest -k r10 still resolves.
+test_r10_agent_names_lock_serializes_concurrent_registration = (
+    test_a4_agent_names_mutation_under_concurrent_status
+)
 
 
 def test_r10_status_snapshot_consistent_under_churn(
