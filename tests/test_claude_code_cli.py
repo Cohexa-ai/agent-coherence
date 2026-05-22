@@ -285,10 +285,13 @@ def test_status_detail_metrics_renders_counter_block(
     assert "Sessions:" not in captured.out
 
 
-def test_status_detail_minimal_redacts_pid(
+def test_status_detail_minimal_includes_pid_redacts_abs_root(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """--detail minimal must not surface pid in the rendered output."""
+    """--detail minimal shows coordinator_pid (P1 #7: pid is public on
+    POSIX and operators rely on it). The absolute workspace root stays
+    sentinel'd to ``.`` so $HOME / directory layout never leaks at this
+    tier."""
     workspace, port = live_coordinator
     rc = coherence_status.main([
         "--root", str(workspace), "--detail", "minimal",
@@ -296,8 +299,10 @@ def test_status_detail_minimal_redacts_pid(
     captured = capsys.readouterr()
     assert rc == 0
     assert "Coordinator:" in captured.out
-    # pid is not in the minimal tier so the header omits it.
-    assert f"pid={os.getpid()}" not in captured.out
+    # P1 #7: pid IS in the minimal tier header.
+    assert f"pid={os.getpid()}" in captured.out
+    # Absolute root must NOT leak at this tier.
+    assert str(workspace) not in captured.out
 
 
 def test_status_full_default_includes_counters_below_sessions(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 import uuid
@@ -416,9 +417,15 @@ def test_policy_untrack_persists_to_ignored_yaml(coordinator, client: _Client) -
 
 
 def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None:
-    """Default (minimal) tier still surfaces tracked artifacts + sessions +
-    counters; operator-level fields (coordinator_pid, absolute root) move
-    to ``?detail=full`` per R12."""
+    """Default (minimal) tier surfaces tracked artifacts + sessions +
+    counters + coordinator_pid; the absolute workspace root stays gated
+    behind ``?detail=full`` per R12.
+
+    P1 #7: coordinator_pid was moved out of minimal in Unit 6 R12 and
+    restored here — pid is public on POSIX (any `ps` invocation lists
+    it) so it does not exceed the threat model's accepted disclosure,
+    and operators rely on it to verify "is the coordinator I think is
+    running actually mine"."""
     a_sid = _sid("A")
     client.post("/hooks/pre-read", {"session_id": a_sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": a_sid, "path": "spec.md"})
@@ -431,10 +438,10 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     assert f"claude-session-{a_sid}" in sessions
     assert b["coordinator_uptime_s"] > 0
     assert "policy_summary" in b
-    # R12: minimal tier never leaks coordinator_pid or absolute root.
+    # Minimal tier: absolute root sentinel'd; pid is present (P1 #7 reversion).
     assert b.get("detail") == "minimal"
     assert b.get("coordinator_root") == "."
-    assert "coordinator_pid" not in b
+    assert b.get("coordinator_pid") == os.getpid()
 
 
 # ----------------------------------------------------------------------
@@ -1835,16 +1842,21 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
 # ----------------------------------------------------------------------
 
 
-def test_r12_status_minimal_default_hides_coordinator_root_and_pid(
+def test_r12_status_minimal_default_hides_coordinator_root(
     client: _Client,
 ) -> None:
     """The default (no query) response is the minimal tier — coordinator_root
-    is the sentinel "." and coordinator_pid is absent."""
+    is the sentinel "." so $HOME / directory layout never leaks.
+
+    P1 #7 (revision to R12): coordinator_pid IS included in minimal —
+    pid is public on POSIX and operators rely on it. Only the absolute
+    workspace root stays behind the operator-header gate at this tier."""
     s, b = client.get("/status")
     assert s == 200
     assert b["detail"] == "minimal"
     assert b["coordinator_root"] == "."
-    assert "coordinator_pid" not in b
+    # P1 #7: pid is in minimal tier (reversion of R12 over-redaction).
+    assert b.get("coordinator_pid") == os.getpid()
 
 
 def test_r12_status_full_requires_operator_header(client: _Client) -> None:
@@ -1896,11 +1908,14 @@ def test_r12_status_metrics_returns_counters_only(client: _Client) -> None:
 
 def test_r12_status_unknown_detail_falls_back_to_minimal(client: _Client) -> None:
     """A typo'd ?detail=value must NOT silently grant more access — it
-    falls back to minimal, never to full."""
+    falls back to minimal, never to full. P1 #7: pid is in minimal
+    so we assert the absolute root is sentinel'd as the actual
+    confidentiality signal instead."""
     s, b = client.get("/status?detail=fully")
     assert s == 200
     assert b["detail"] == "minimal"
-    assert "coordinator_pid" not in b
+    # The fall-back is "minimal" not "full" — absolute root must NOT leak.
+    assert b["coordinator_root"] == "."
 
 
 def test_r11_ensure_secret_concurrent_threads_return_identical(
