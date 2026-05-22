@@ -298,8 +298,21 @@ class CoordinatorHTTPServer:
         # rather than letting it stay silent. Counters are read by
         # _handle_status; incremented in _run_or_degrade (timeouts +
         # queue overflows) and _ThreadingHTTPServer.process_request
-        # (handler concurrency overflows). Plain ints — CPython GIL
-        # guarantees atomicity for the single-attribute increment idiom.
+        # (handler concurrency overflows).
+        #
+        # REL-03 (free-threading-safe): under CPython's traditional
+        # build, ``x += 1`` on an int attribute is effectively atomic
+        # because the GIL serializes bytecode execution. Under Python
+        # 3.13+ free-threaded builds (PEP 703) and on PyPy, that
+        # guarantee is gone — concurrent threads can read-modify-write
+        # the same counter and tear increments. These three counters
+        # are operator-facing reliability signals (a missed bump means
+        # an under-reported degradation event in a bug report), so
+        # protect their mutation with a lock. Product-signal counters
+        # (intra_task_acquire_release_total, stale_warning_*_total)
+        # stay GIL-reliant per the reviewer's recommendation: they're
+        # advisory ratios, not absolute counts.
+        self._reliability_counter_lock = threading.Lock()
         self._watchdog_timeouts_total: int = 0
         self._watchdog_queue_overflows_total: int = 0
         # P1 #6: silent 401 surface. If hook.secret is deleted out from
@@ -654,12 +667,16 @@ class CoordinatorHTTPServer:
 
     def increment_watchdog_timeout(self) -> None:
         """M-03 / finding #31: increment the watchdog-timeout operator counter.
-        Mirrors the increment_* pattern for product-signal counters."""
-        self._watchdog_timeouts_total += 1
+        Mirrors the increment_* pattern for product-signal counters.
+        REL-03: locked so free-threading Py 3.13+ and PyPy don't tear."""
+        with self._reliability_counter_lock:
+            self._watchdog_timeouts_total += 1
 
     def increment_watchdog_queue_overflow(self) -> None:
-        """M-03 / finding #31: increment the watchdog queue-overflow counter."""
-        self._watchdog_queue_overflows_total += 1
+        """M-03 / finding #31: increment the watchdog queue-overflow counter.
+        REL-03: locked."""
+        with self._reliability_counter_lock:
+            self._watchdog_queue_overflows_total += 1
 
     def increment_watchdog_late_completion(self) -> None:
         """P1 #5: a watchdog-timed-out future eventually completed
@@ -819,15 +836,21 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     ) -> None:
         super().__init__(server_address, RequestHandlerClass)
         self._concurrency_sem = threading.BoundedSemaphore(concurrency_limit)
-        # KTD-G item 3: surfaced in /status. Plain int + GIL-atomic increment.
+        # KTD-G item 3: surfaced in /status. REL-03 (free-threading-safe):
+        # increment under a lock so concurrent process_request calls
+        # don't tear the counter on Py 3.13+ free-threaded builds or
+        # PyPy. The lock is on the hot path — but only the over-limit
+        # case fires it (cold path), so the overhead is negligible.
         self.handler_concurrency_overflows_total: int = 0
+        self._overflow_counter_lock = threading.Lock()
 
     def process_request(self, request: Any, client_address: Any) -> None:
         """Override ThreadingMixIn.process_request to gate handler spawn
         on the concurrency semaphore. If at limit, send 503 directly
         without spawning a thread."""
         if not self._concurrency_sem.acquire(blocking=False):
-            self.handler_concurrency_overflows_total += 1
+            with self._overflow_counter_lock:
+                self.handler_concurrency_overflows_total += 1
             self._send_concurrency_503(request)
             self.shutdown_request(request)
             return
