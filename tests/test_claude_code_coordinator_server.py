@@ -2137,3 +2137,75 @@ def test_p1_5_status_metrics_exposes_late_completion_counter(
     assert status == 200
     assert "watchdog_late_completion_total" in body
     assert isinstance(body["watchdog_late_completion_total"], int)
+
+
+# ----------------------------------------------------------------------
+# P1 #6 — 401 visibility (hook.secret deletion / bearer mismatch)
+# ----------------------------------------------------------------------
+
+
+def test_p1_6_401_increments_auth_counter(coordinator) -> None:
+    """A request with a wrong bearer must bump auth_401_total so
+    operators can spot a hook.secret deletion via /status."""
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/pre-read"
+    req = urlrequest.Request(
+        url, data=b"{}", method="POST",
+        headers={
+            "Authorization": "Bearer wrong-secret",
+            "Host": "127.0.0.1",
+            "Content-Type": "application/json",
+        },
+    )
+    before = coordinator._auth_401_total
+    try:
+        urlrequest.urlopen(req, timeout=5)
+        pytest.fail("expected 401")
+    except urlerror.HTTPError as e:
+        assert e.code == 401
+    assert coordinator._auth_401_total == before + 1
+
+
+def test_p1_6_repeated_401s_dedupe_warning_logs(
+    coordinator, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Counter bumps every 401; WARNING log dedupes to once per 60s so
+    a burst of bad requests doesn't drown the log."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="ccs.adapters.claude_code.coordinator_server")
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/pre-read"
+    def fire_bad() -> None:
+        req = urlrequest.Request(
+            url, data=b"{}", method="POST",
+            headers={
+                "Authorization": "Bearer wrong-secret",
+                "Host": "127.0.0.1",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            urlrequest.urlopen(req, timeout=5)
+        except urlerror.HTTPError:
+            pass
+
+    before_total = coordinator._auth_401_total
+    fire_bad()
+    fire_bad()
+    fire_bad()
+    assert coordinator._auth_401_total == before_total + 3
+    auth_warnings = [
+        r for r in caplog.records
+        if "auth: 401" in r.getMessage()
+    ]
+    # First call emits the warning; next two are deduped.
+    assert len(auth_warnings) == 1, (
+        f"expected exactly one 401 WARNING per dedupe window; got {len(auth_warnings)}: "
+        f"{[r.getMessage() for r in auth_warnings]}"
+    )
+
+
+def test_p1_6_status_metrics_exposes_auth_401_counter(client: _Client) -> None:
+    """auth_401_total visible in /status?detail=metrics."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "auth_401_total" in body
+    assert isinstance(body["auth_401_total"], int)
