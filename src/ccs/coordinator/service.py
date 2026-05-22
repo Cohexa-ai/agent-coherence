@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
+from typing import Callable, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -377,6 +378,7 @@ class CoordinatorService:
         current_tick: int,
         heartbeat_timeout_ticks: int,
         max_hold_ticks: int,
+        on_reclaim: Optional[Callable[[UUID, UUID, str], None]] = None,
     ) -> int:
         """Reclaim stale stable-state (M∪E) grants whose holders are gone or over-held.
 
@@ -388,6 +390,14 @@ class CoordinatorService:
 
         Pairs with a non-empty transient slot are skipped so the transient sweep
         (which must run first) owns those entries — preserves R4 sweep ordering.
+
+        ADV-004: ``on_reclaim`` is a per-reclamation callback the adapter
+        uses to record a preemption notice for the victim agent — so when
+        the victim's post-edit later arrives and fails CoherenceError, the
+        F4 enrichment path can pop the notice and emit a "reclaimed by
+        sweep" message rather than a generic error with no context.
+        Library code remains preemption-notice-agnostic; the registry
+        method is adapter-only (SqliteArtifactRegistry).
 
         Returns the number of grants reclaimed.
         """
@@ -447,6 +457,16 @@ class CoordinatorService:
             )
             self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
             self._validate_single_writer(artifact_id)
+            if on_reclaim is not None:
+                # Best-effort: a notice-recording failure must not stop the sweep
+                # (the reclamation itself already landed in the registry).
+                try:
+                    on_reclaim(artifact_id, agent_id, trigger)
+                except Exception:  # noqa: BLE001 — telemetry surface, best-effort
+                    logger.exception(
+                        "on_reclaim callback raised for agent=%s artifact=%s trigger=%s",
+                        agent_id, artifact_id, trigger,
+                    )
             reclaimed += 1
 
         return reclaimed

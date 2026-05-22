@@ -2224,3 +2224,137 @@ def test_p1_6_status_metrics_exposes_auth_401_counter(client: _Client) -> None:
     assert status == 200
     assert "auth_401_total" in body
     assert isinstance(body["auth_401_total"], int)
+
+
+# ----------------------------------------------------------------------
+# ADV-004 — stable-grant sweep records preemption notice on reclamation
+# ----------------------------------------------------------------------
+
+
+def test_adv004_sweep_reclamation_records_preemption_notice(
+    coordinator, client: _Client,
+) -> None:
+    """ADV-004: the stable-grant sweep must record a preemption notice
+    for the reclaimed victim — otherwise the victim's eventual
+    post-edit fails CoherenceError with no F4 context."""
+    from ccs.adapters.claude_code.coordinator_server import (
+        SWEEP_RECLAMATION_PREEMPTER_ID,
+        session_to_agent_id,
+    )
+
+    sid = _sid("adv004-A")
+    agent_id = session_to_agent_id(sid)
+    # Acquire EXCLUSIVE via pre-edit on a tracked artifact.
+    s, _ = client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert s == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert artifact_id is not None
+
+    # Drive the sweep manually so the heartbeat-stale path fires
+    # immediately. heartbeat_timeout_ticks=1 + current_tick well past
+    # the agent's last heartbeat triggers reclaim_heartbeat.
+    reclaimed_n = coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+        on_reclaim=lambda artifact_id, agent_id, trigger: (
+            coordinator.registry.record_preemption_notice(
+                victim_agent_id=agent_id,
+                artifact_id=artifact_id,
+                preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
+                preempted_at_unix_ts=time.time(),
+            )
+        ),
+    )
+    assert reclaimed_n == 1, "sweep should have reclaimed exactly one M/E grant"
+
+    # The preemption notice for the victim must be present and tagged
+    # with the sweep-sentinel preempter.
+    popped = coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
+    assert popped is not None
+    preempter_id, _preempted_at = popped
+    assert preempter_id == SWEEP_RECLAMATION_PREEMPTER_ID
+
+
+def test_adv004_post_edit_after_reclamation_returns_reclaimed_message(
+    coordinator, client: _Client,
+) -> None:
+    """End-to-end: pre-edit → sweep reclaims → post-edit gets the F4
+    'reclaimed by coordinator sweep' message (NOT the generic
+    CoherenceError) and the response carries reclaimed=True instead of
+    preempted=True."""
+    from ccs.adapters.claude_code.coordinator_server import (
+        SWEEP_RECLAMATION_PREEMPTER_ID,
+        session_to_agent_id,
+    )
+
+    sid = _sid("adv004-B")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+
+    # Sweep reclaims agent's grant + records notice via the on_reclaim
+    # callback (same wiring the real adapter sweep uses).
+    coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+        on_reclaim=lambda aid, sid_, trigger: coordinator.registry.record_preemption_notice(
+            victim_agent_id=sid_,
+            artifact_id=aid,
+            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
+            preempted_at_unix_ts=time.time(),
+        ),
+    )
+
+    # Now post-edit fires — should fail with the reclaimed-message.
+    s, body = client.post("/hooks/post-edit", {
+        "session_id": sid,
+        "path": "plan.md",
+        "content_hash": _hash("adv004-B-late"),
+        "success": True,
+    })
+    assert s == 200, body
+    assert body.get("ok") is False
+    assert body.get("reclaimed") is True, (
+        f"expected reclaimed=True in F4 response; got {body!r}"
+    )
+    assert "reclaimed by the coordinator sweep" in body.get("reason", "")
+    assert "plan.md" in body.get("reason", "")
+    # And NOT the peer-preemption message
+    assert "preempted by session" not in body.get("reason", "")
+
+
+def test_adv004_sweep_on_reclaim_callback_exception_does_not_break_sweep(
+    coordinator,
+) -> None:
+    """Defensive: if the on_reclaim callback raises, the sweep continues
+    and the reclamation itself still lands. The callback is telemetry
+    surface; its failure must not block coherence guarantees."""
+    from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+
+    sid = _sid("adv004-C")
+    agent_id = session_to_agent_id(sid)
+    # Acquire EXCLUSIVE.
+    coordinator.register_session(sid)
+    artifact_id = coordinator.registry.resolve_or_register("plan.md", content_hash="")
+    coordinator.registry.set_agent_state(
+        artifact_id, agent_id, MESIState.EXCLUSIVE,
+        trigger="test_setup", tick=0, content_hash=None,
+    )
+
+    raises_counter = {"n": 0}
+    def raising_callback(*_a, **_kw) -> None:
+        raises_counter["n"] += 1
+        raise RuntimeError("simulated telemetry failure")
+
+    reclaimed_n = coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+        on_reclaim=raising_callback,
+    )
+    assert reclaimed_n == 1, "reclamation must still land despite callback failure"
+    assert raises_counter["n"] == 1
+    # The agent's state is invalid (the reclamation itself succeeded).
+    assert coordinator.registry.get_agent_state(artifact_id, agent_id) == MESIState.INVALID

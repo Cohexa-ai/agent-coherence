@@ -108,6 +108,18 @@ the deadline, any still-running handlers are abandoned — they may raise
 ``sqlite3.ProgrammingError`` and return HTTP 500 to their clients. Better
 a 500 than a wedged shutdown (silent hang vs observable failure)."""
 
+# ADV-004: a sentinel preempter UUID the stable-grant sweep uses when
+# recording a preemption notice for an agent whose M/E grant it just
+# reclaimed. The F4 enrichment in ``_handle_post_edit`` compares against
+# this constant to distinguish "your grant was reclaimed by the sweep"
+# from "your grant was preempted by another session" — both surface via
+# the same notice table but communicate distinct failure modes to the
+# model. UUID derived from a stable namespace string so it stays the
+# same across processes, restarts, and instances.
+SWEEP_RECLAMATION_PREEMPTER_ID: UUID = uuid5(
+    NAMESPACE_URL, "ccs-coordinator-sweep:stable-grant-reclamation"
+)
+
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
 in one request body (security-lens P1)."""
@@ -1325,6 +1337,22 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             popped = coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
             if popped is not None:
                 preempter_id, preempted_at = popped
+                # ADV-004: distinguish sweep reclamation from peer preemption.
+                # The sweep uses SWEEP_RECLAMATION_PREEMPTER_ID; matching it
+                # means "your heartbeat went stale (or you held the grant past
+                # max-hold) and the coordinator pulled the grant back" — a
+                # different failure mode than "another session committed".
+                if preempter_id == SWEEP_RECLAMATION_PREEMPTER_ID:
+                    reason = (
+                        f"commit_not_allowed: your M/E grant on {path} was "
+                        f"reclaimed by the coordinator sweep (heartbeat "
+                        f"timeout or max-hold ceiling) at "
+                        f"{_iso_utc(preempted_at)}. Your edit landed in your "
+                        f"local worktree but the coordinator's version was "
+                        f"not bumped. Re-fetch the latest via pre-read and "
+                        f"retry. Underlying coordinator error: {exc}"
+                    )
+                    return {"ok": False, "reason": reason, "reclaimed": True}
                 preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
@@ -2194,6 +2222,17 @@ def _build_preemption_text(
     for artifact_id, preempter_id, ts in verbatim:
         artifact = coordinator.registry.get_artifact(artifact_id)
         path = artifact.name if artifact else "<unknown-artifact>"
+        # ADV-004: render sweep-reclaimed notices with a clear cause rather
+        # than the awkward truncated sentinel UUID.
+        if preempter_id == SWEEP_RECLAMATION_PREEMPTER_ID:
+            lines.append(
+                f"  • {path} — reclaimed by the coordinator sweep "
+                f"(heartbeat timeout or max-hold ceiling) at {_iso_utc(ts)}. "
+                f"Any local edit you made to this file will land in your "
+                f"worktree but is NOT reflected in the coordinator's version. "
+                f"Re-fetch via pre-read and retry."
+            )
+            continue
         preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
         lines.append(
             f"  • {path} — preempted/revoked by session {preempter_session[:8]} "

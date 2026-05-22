@@ -617,8 +617,33 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     Order matters per R4: transient sweep first so the stable sweep does
     not race entries that are mid-protocol. F2 notice eviction last —
     it's a pure storage reclaim and doesn't interact with grants.
+
+    ADV-004: stable-grant reclamation records a preemption notice for
+    the reclaimed victim so the victim's eventual post-edit gets an
+    enriched "reclaimed by coordinator sweep" error instead of a
+    generic CoherenceError with no context. The sentinel preempter
+    UUID is ``SWEEP_RECLAMATION_PREEMPTER_ID`` (imported lazily to
+    avoid an import cycle at module load).
     """
+    # Lazy import — coordinator_server imports lifecycle's
+    # CoordinatorHTTPServer; importing back at module load would cycle.
+    from ccs.adapters.claude_code.coordinator_server import (
+        SWEEP_RECLAMATION_PREEMPTER_ID,
+    )
+
     coordinator = entry.coordinator
+
+    def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
+        """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
+        Uses wall-clock time (the notice timestamp is operator-visible
+        via the F4 prose) rather than the monotonic sweep tick."""
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id,
+            artifact_id=artifact_id,
+            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
+            preempted_at_unix_ts=time.time(),
+        )
+
     while not coordinator.shutting_down:
         time.sleep(cfg.sweep_interval_sec)
         if coordinator.shutting_down:
@@ -633,6 +658,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
                 current_tick=now_tick,
                 heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
                 max_hold_ticks=cfg.grant_max_hold_sec,
+                on_reclaim=_record_reclamation_notice,
             )
             evicted = coordinator.registry.evict_stale_notices(
                 max_age_sec=cfg.notice_evict_max_age_sec,
