@@ -1033,7 +1033,37 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
 
 
 def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
-    """POST /hooks/pre-read — stale-read check + KTD-9 first-observation seeding."""
+    """POST /hooks/pre-read — stale-read check + KTD-9 first-observation seeding.
+
+    Notice-drain contract (COR-03 — fragile but correct; documented here
+    so future refactors don't break the two-path discipline):
+
+    A pre-read response can shape one of three ways:
+
+    1. **Fresh (first observation OR already-seen valid grant)** —
+       returns ``{"status": "fresh"}`` (no ``hookSpecificOutput``).
+       The ``work_with_notice_surfacing`` wrapper at the bottom of
+       this handler pops pending notices on this exact shape and
+       attaches ``hookSpecificOutput.additionalContext`` if any
+       notices were pending. Fresh response → wrapper drains.
+
+    2. **Stale (peer commit invalidated us)** — the stale branch
+       inside ``work()`` builds a ``hookSpecificOutput`` envelope
+       AND pops + prepends pending notices itself (line ~890). The
+       wrapper sees ``hookSpecificOutput`` present and SKIPS its own
+       notice drain — single-consumer semantics, no double-pop.
+
+    3. **Fresh with already-drained notices** — if ``work()`` itself
+       drained (the stale path's behaviour), the wrapper's
+       ``status == 'fresh' and 'hookSpecificOutput' not in result``
+       check is False (hookSpecificOutput present) so no re-pop.
+
+    The KTD-J ``consume_stale_marker`` call (re-read counter) fires
+    BEFORE the fresh-path short-circuit so a re-read that returns
+    fresh still bumps ``stale_warning_reread_total``. Moving the
+    marker check after the short-circuit would silently break the
+    counter; do not refactor without preserving this ordering.
+    """
     body = req._read_json()
     if body is None:
         return
