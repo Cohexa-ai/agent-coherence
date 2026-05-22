@@ -405,3 +405,64 @@ def test_concurrent_state_changes_no_deadlock(db_path: Path) -> None:
         state_map = reg.get_state_map(art.id)
         assert len(state_map) == 10
         assert all(s == MESIState.SHARED for s in state_map.values())
+
+
+# ----------------------------------------------------------------------
+# COR-04 — resolve_or_register re-fetch race produces informative error
+# ----------------------------------------------------------------------
+
+
+def test_cor04_resolve_or_register_post_rollback_delete_raises_runtime_error(
+    tmp_path
+):
+    """COR-04: when a concurrent remove_artifact deletes the winning
+    racer's row between our ROLLBACK and re-fetch, the function must
+    raise an informative RuntimeError explaining the race rather than
+    re-raising the original sqlite3.IntegrityError with no context.
+
+    Wraps reg._conn in a proxy that forces INSERT to raise IntegrityError
+    and the post-ROLLBACK SELECT to return None.
+    """
+    import sqlite3
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    reg = SqliteArtifactRegistry(tmp_path / "state.db")
+    try:
+        real_conn = reg._conn
+        call_state = {"insert_seen": False, "post_rollback_select_seen": False}
+
+        class _ConnProxy:
+            def execute(self, sql, *args):
+                sql_lower = sql.strip().lower()
+                if sql_lower.startswith("insert into artifacts"):
+                    call_state["insert_seen"] = True
+                    raise sqlite3.IntegrityError("simulated UNIQUE collision")
+                if (
+                    call_state["insert_seen"]
+                    and not call_state["post_rollback_select_seen"]
+                    and sql_lower.startswith("select id from artifacts where name")
+                ):
+                    call_state["post_rollback_select_seen"] = True
+
+                    class _Empty:
+                        def fetchone(self_inner):
+                            return None
+
+                    return _Empty()
+                return real_conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+        reg._conn = _ConnProxy()
+        try:
+            import pytest as _pytest
+            with _pytest.raises(RuntimeError) as excinfo:
+                reg.resolve_or_register("plan.md", content_hash="abc")
+            assert "lost INSERT race" in str(excinfo.value)
+            assert "plan.md" in str(excinfo.value)
+            assert isinstance(excinfo.value.__cause__, sqlite3.IntegrityError)
+        finally:
+            reg._conn = real_conn
+    finally:
+        reg.close()
