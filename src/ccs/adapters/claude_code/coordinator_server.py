@@ -265,6 +265,15 @@ class CoordinatorHTTPServer:
         self._started_at = time.time()
         self._last_request_at = self._started_at
         self._shutting_down = False
+        # ADV-001 (fix): "migration draining" is a halfway state between
+        # serving and shutting_down. While true, new pre-edit requests are
+        # rejected (would mint an EXCLUSIVE that the agent can never
+        # post-edit since shutdown is imminent). All other endpoints —
+        # pre-read, post-edit, session-stop, status — continue to be
+        # served so in-flight pre-edit→post-edit chains can complete
+        # naturally. Set by /admin/prepare-for-migration; cleared only
+        # at process exit (no rollback path).
+        self._migration_draining = False
         self._agent_names: dict[UUID, str] = dict(agent_names or {})
         # R10 (Unit 6): explicit lock around _agent_names mutation. CPython's
         # GIL makes single-key dict assignment effectively atomic today, but
@@ -525,6 +534,14 @@ class CoordinatorHTTPServer:
     def idle_seconds(self) -> float:
         """Wall-clock seconds since the most recent request."""
         return time.time() - self._last_request_at
+
+    @property
+    def migration_draining(self) -> bool:
+        """ADV-001: True between the prepare-for-migration trigger and the
+        scheduled shutdown. The dispatcher uses this to reject NEW write
+        initiations (pre-edit) while still serving in-flight chains'
+        completions (post-edit) and all read/observability endpoints."""
+        return self._migration_draining
 
     @property
     def shutting_down(self) -> bool:
@@ -804,6 +821,25 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     handler = _ROUTES.get((method, route_path))
                     if handler is None:
                         self._json(404, {"error": f"unknown route {method} {route_path}"})
+                        return
+                    # ADV-001: while the coordinator is draining for migration,
+                    # reject NEW write-initiation requests (pre-edit) with a
+                    # structured error the agent can see. Existing in-flight
+                    # pre-edit→post-edit chains are allowed to complete (the
+                    # post-edit endpoint is NOT in this set), and all read +
+                    # observability endpoints continue to serve. Without this
+                    # gate, a pre-edit landing mid-migration mints an
+                    # EXCLUSIVE grant that gets immediately invalidated by
+                    # the migration handler, and the agent's matching
+                    # post-edit hits a dead coordinator (silent failure).
+                    if coordinator.migration_draining and (method, route_path) in _MIGRATION_REJECTED_ROUTES:
+                        self._json(503, {
+                            "error": (
+                                "coordinator is draining for backend migration; "
+                                "this write was rejected. Retry after the migration "
+                                "completes and the coordinator restarts."
+                            ),
+                        })
                         return
                     # KTD-J (Unit 8): bump the per-endpoint counter BEFORE
                     # invoking the handler so timeouts/exceptions still
@@ -1700,33 +1736,63 @@ def _parse_detail_query(query: str) -> str:
     return "minimal"
 
 
+MIGRATION_DRAIN_TIMEOUT_SEC = 5.0
+"""ADV-001: how long the migration handler waits for in-flight non-pre-edit
+handlers (post-edit, pre-read, etc.) to complete before invalidating
+remaining grants + scheduling shutdown. Same magnitude as
+``IN_FLIGHT_DRAIN_TIMEOUT_SEC`` since the drain semantics are the same;
+keeping them as separate constants documents intent."""
+
+
 def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
-    """POST /admin/prepare-for-migration — release-all-grants then schedule shutdown.
+    """POST /admin/prepare-for-migration — drain → release-all-grants → shutdown.
 
     Unit 8 (Decision 1, locked 2026-05-18): operator runs
     ``agent-coherence-coordinator --prepare-for-migration`` before
-    switching the Python/Node backend. This endpoint backs the CLI:
+    switching the Python/Node backend.
 
-    1. Snapshot every (agent, artifact) pair currently in MODIFIED or
-       EXCLUSIVE state.
-    2. Invalidate each — agents lose their write grants cleanly so the
-       new backend cannot inherit silent stale-grant state.
-    3. Schedule shutdown via a background thread (a small delay so this
-       response can flush to the CLI before the serve loop tears down).
-    4. Return {released, errors, shutdown_scheduled_in_ms}.
+    ADV-001 (fix): the prior implementation invalidated grants
+    synchronously then scheduled shutdown 100ms later. That race let a
+    pre-edit landing at T=50ms mint an EXCLUSIVE grant that the
+    invalidation step at T=51ms revoked — and the agent's matching
+    post-edit at T=150ms hit a dead coordinator (silent failure).
+
+    New sequence:
+
+    1. Flip ``coordinator._migration_draining = True``. Dispatcher
+       starts rejecting NEW pre-edit requests with HTTP 503 + a
+       structured "migration in progress" error visible to the model.
+       Other endpoints (post-edit, pre-read, session-stop, /status,
+       policy mutations) continue to serve so in-flight chains can
+       finish naturally.
+    2. Background thread waits up to ``MIGRATION_DRAIN_TIMEOUT_SEC``
+       for the in-flight handler counter to reach zero. In-flight
+       pre-edit→post-edit pairs complete normally during this window.
+    3. After drain, snapshot every (agent, artifact) pair still in
+       MODIFIED or EXCLUSIVE state — these are orphaned grants from
+       sessions that pre-edited but never post-edited (already broken).
+       Invalidate each so the new backend doesn't inherit them.
+    4. Schedule ``coordinator.shutdown()`` ~100ms later (kernel send
+       buffer flush window for the response).
+
+    Returns immediately with ``{ok:true, draining:true,
+    drain_timeout_ms}``. The CLI polls /status until the coordinator
+    becomes TCP-unreachable; counts/errors land in the coordinator log
+    rather than the HTTP response (the response goes out before the
+    drain completes).
 
     Requires the same elevated-tier signal as /status?detail=full:
-    Bearer + ``Coherence-Local-Operator: true`` header. The CLI sets
-    both automatically.
+    Bearer + ``Coherence-Local-Operator: true`` header.
 
-    Security note (SEC-01): the ``Coherence-Local-Operator: true`` header
-    value is a static, well-known string embedded in public source — it does
-    NOT constitute a second factor against Adversary 1 (same OS user who can
-    read the 0600 hook.secret file). This endpoint is a DoS surface within
-    the Adversary 1 boundary: a same-UID process with hook.secret access can
-    force coordinator shutdown and grant release. This is accepted per the
-    v0.1 threat model. The header serves as an explicit opt-in signal for
-    operator-automation tooling, not as a security gate.
+    Security note (SEC-01): the ``Coherence-Local-Operator: true``
+    header value is a static, well-known string embedded in public
+    source — it does NOT constitute a second factor against Adversary
+    1 (same OS user who can read the 0600 hook.secret file). This
+    endpoint is a DoS surface within the Adversary 1 boundary: a
+    same-UID process with hook.secret access can force coordinator
+    shutdown. Accepted per the v0.1 threat model. The header serves as
+    an explicit opt-in signal for operator-automation tooling, not as
+    a security gate.
     """
     if req.headers.get("Coherence-Local-Operator", "").lower() != "true":
         req._json(403, {
@@ -1737,46 +1803,77 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
         })
         return
 
-    now = monotonic_seconds()
-    released = 0
-    errors: list[dict[str, str]] = []
+    # Idempotent: a second call while already draining returns the same
+    # accepted-but-already-running envelope.
+    if coordinator.migration_draining:
+        req._json(200, {
+            "ok": True,
+            "draining": True,
+            "already_in_progress": True,
+        })
+        return
 
-    # Snapshot artifacts + per-artifact state maps under the registry's
-    # own consistency guarantees, then invalidate each M/E grant. We do
-    # NOT hold any lock across invalidations — service.invalidate is
-    # designed for one-at-a-time use, and the per-artifact write
-    # serialization in the registry is sufficient.
-    for artifact_id in list(coordinator.registry.artifact_ids()):
-        state_map = coordinator.registry.get_state_map(artifact_id)
-        for agent_id, state in list(state_map.items()):
-            if state not in (MESIState.MODIFIED, MESIState.EXCLUSIVE):
-                continue
-            artifact = coordinator.registry.get_artifact(artifact_id)
-            if artifact is None:
-                continue
-            try:
-                coordinator.service.invalidate(
-                    agent_id=agent_id,
-                    artifact_id=artifact_id,
-                    new_version=artifact.version,
-                    issuer_agent_id=agent_id,
-                    issued_at_tick=now,
-                )
-                released += 1
-            except CoherenceError as exc:
-                errors.append({
-                    "artifact_id": str(artifact_id),
-                    "agent_id": str(agent_id),
-                    "reason": str(exc),
-                })
-
-    # Schedule shutdown. Background thread gives this response time to
-    # flush before serve_forever exits. 100ms is enough for the kernel
-    # to drain the response socket but short enough that the CLI's poll
-    # observes the port-down transition without long idle waits.
+    coordinator._migration_draining = True
     SHUTDOWN_DELAY_MS = 100
 
-    def _scheduled_shutdown() -> None:
+    def _drain_invalidate_and_shutdown() -> None:
+        """Background sequence: drain in-flight handlers (during which
+        pre-edit→post-edit pairs complete naturally), invalidate any
+        remaining M/E grants (orphans from sessions that pre-edited
+        but never post-edited), schedule shutdown.
+        """
+        # Step 1: wait for in-flight handlers to drain. The current
+        # handler holds one slot itself, so account for that by
+        # comparing against 1 rather than 0. After this handler
+        # returns, the counter drops to its true in-flight value
+        # which the second pass observes.
+        deadline = time.monotonic() + MIGRATION_DRAIN_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            with coordinator._in_flight_lock:
+                # Strictly less than 2 means: just this handler still
+                # in flight (1), or fewer (handler already returned).
+                if coordinator._in_flight <= 1:
+                    break
+            time.sleep(0.020)
+
+        # Step 2: invalidate any remaining M/E grants (orphans).
+        now = monotonic_seconds()
+        released = 0
+        errors: list[dict[str, str]] = []
+        for artifact_id in list(coordinator.registry.artifact_ids()):
+            state_map = coordinator.registry.get_state_map(artifact_id)
+            for agent_id, state in list(state_map.items()):
+                if state not in (MESIState.MODIFIED, MESIState.EXCLUSIVE):
+                    continue
+                artifact = coordinator.registry.get_artifact(artifact_id)
+                if artifact is None:
+                    continue
+                try:
+                    coordinator.service.invalidate(
+                        agent_id=agent_id,
+                        artifact_id=artifact_id,
+                        new_version=artifact.version,
+                        issuer_agent_id=agent_id,
+                        issued_at_tick=now,
+                    )
+                    released += 1
+                except CoherenceError as exc:
+                    errors.append({
+                        "artifact_id": str(artifact_id),
+                        "agent_id": str(agent_id),
+                        "reason": str(exc),
+                    })
+        logger.info(
+            "prepare-for-migration drained: released=%d errors=%d",
+            released, len(errors),
+        )
+        if errors:
+            for e in errors:
+                logger.warning("prepare-for-migration invalidate error: %s", e)
+
+        # Step 3: schedule shutdown ~100ms later so any further status
+        # polls from the CLI see the draining state once before TCP
+        # becomes unreachable.
         time.sleep(SHUTDOWN_DELAY_MS / 1000.0)
         try:
             coordinator.shutdown()
@@ -1784,16 +1881,16 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
             logger.exception("scheduled shutdown after prepare-for-migration failed")
 
     threading.Thread(
-        target=_scheduled_shutdown,
-        name="prepare-for-migration-shutdown",
+        target=_drain_invalidate_and_shutdown,
+        name="prepare-for-migration-drain",
         daemon=True,
     ).start()
 
     req._json(200, {
         "ok": True,
-        "released": released,
-        "errors": errors,
-        "shutdown_scheduled_in_ms": SHUTDOWN_DELAY_MS,
+        "draining": True,
+        "drain_timeout_ms": int(MIGRATION_DRAIN_TIMEOUT_SEC * 1000),
+        "shutdown_scheduled_in_ms": int(MIGRATION_DRAIN_TIMEOUT_SEC * 1000) + SHUTDOWN_DELAY_MS,
     })
 
 
@@ -1812,6 +1909,18 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/policy/untrack"): _handle_policy_untrack,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
+}
+
+
+# ADV-001: routes the dispatcher rejects with 503 while
+# ``coordinator.migration_draining`` is True. Only NEW write-initiation
+# requests belong here — post-edit must still serve (so in-flight chains
+# can complete), policy mutations must still serve (operator may be
+# clearing tracked artifacts as part of migration prep), and all reads
+# + observability always serve. pre-bash / pre-grep don't initiate
+# writes, so they stay out of this set.
+_MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
+    ("POST", "/hooks/pre-edit"),
 }
 
 

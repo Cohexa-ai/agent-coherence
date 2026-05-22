@@ -1928,3 +1928,116 @@ def test_r11_ensure_secret_concurrent_threads_return_identical(
     assert len(set(tokens)) == 1, (
         f"concurrent ensure_secret returned different tokens: {set(tokens)}"
     )
+
+
+# ----------------------------------------------------------------------
+# ADV-001 — prepare-for-migration drain semantics
+# ----------------------------------------------------------------------
+
+
+def test_adv001_pre_edit_rejected_during_migration_drain(
+    coordinator, client: _Client
+) -> None:
+    """ADV-001: after prepare-for-migration sets the draining flag, a new
+    pre-edit on a tracked artifact must be rejected with 503 + a
+    structured error rather than minting an EXCLUSIVE that the agent
+    can never post-edit."""
+    # Flip the flag directly so we don't have to wait for the full
+    # drain → invalidate → shutdown sequence in this unit test.
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(
+            "/hooks/pre-edit",
+            {"session_id": _sid("adv001-A"), "path": "plan.md"},
+        )
+        assert status == 503
+        assert "migration" in body.get("error", "").lower()
+        assert "draining" in body.get("error", "").lower()
+    finally:
+        coordinator._migration_draining = False
+
+
+def test_adv001_post_edit_continues_during_migration_drain(
+    coordinator, client: _Client
+) -> None:
+    """ADV-001: post-edit must still serve while draining so in-flight
+    pre-edit→post-edit chains can complete naturally. This is the whole
+    point of the draining-flag fix vs. an immediate hard shutdown."""
+    sid = _sid("adv001-B")
+    # Acquire an EXCLUSIVE before flipping the flag (the in-flight
+    # request whose post-edit we want to allow through).
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(
+            "/hooks/post-edit",
+            {
+                "session_id": sid,
+                "path": "plan.md",
+                "content_hash": _hash("adv001-B"),
+                "success": True,
+            },
+        )
+        assert status == 200, (
+            f"post-edit must complete during drain; got {status}: {body!r}"
+        )
+        assert body.get("ok") is True
+    finally:
+        coordinator._migration_draining = False
+
+
+def test_adv001_pre_read_continues_during_migration_drain(
+    coordinator, client: _Client
+) -> None:
+    """ADV-001: pre-read is a non-mutating endpoint and must keep
+    serving during the migration drain window."""
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid("adv001-C"), "path": "plan.md"},
+        )
+        assert status == 200
+    finally:
+        coordinator._migration_draining = False
+
+
+def test_adv001_prepare_for_migration_returns_immediately_with_draining_flag(
+    coordinator, client: _Client
+) -> None:
+    """The handler now returns {ok, draining:true, drain_timeout_ms} as
+    soon as it flips the flag. The drain + invalidate + shutdown
+    sequence runs in a background thread; the CLI polls /status to
+    observe the coordinator becoming unreachable."""
+    status, body = client.post(
+        "/admin/prepare-for-migration", {},
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["draining"] is True
+    assert body["drain_timeout_ms"] > 0
+    assert body["shutdown_scheduled_in_ms"] >= body["drain_timeout_ms"]
+    # Background thread will close the coordinator; the fixture's
+    # shutdown is idempotent so cleanup still works.
+
+
+def test_adv001_repeated_prepare_for_migration_is_idempotent(
+    coordinator, client: _Client
+) -> None:
+    """A second prepare-for-migration call while already draining must
+    not start a second drain sequence — it returns the already_in_progress
+    envelope."""
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(
+            "/admin/prepare-for-migration", {},
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert body["draining"] is True
+        assert body.get("already_in_progress") is True
+    finally:
+        coordinator._migration_draining = False
