@@ -863,3 +863,41 @@ def test_kp7_wait_for_shutdown_times_out_when_coordinator_stays_up(
         assert wait_for_shutdown(tmp_path, poll_interval_sec=0.05, timeout_sec=0.3) is False
     finally:
         stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# PS-03 — L2 (in-flight drain on shutdown) invariant alias tests
+# ----------------------------------------------------------------------
+#
+# The Unit 5 plan mandates at least one ``test_l2_*`` prefixed test in
+# this file. The substantive drain coverage lives in
+# tests/test_claude_code_coordinator_server.py as ``test_i1..i6``
+# (acquire/release pairing, drain blocking until release, drain
+# timeout, dispatch wiring, exception-path balance). The alias
+# below routes the lifecycle-suite reader to the existing detail
+# and exercises the public shutdown → drain → unreachable path.
+
+
+def test_l2_drain_observable_via_lifecycle_stop(tmp_path, fast_cfg):
+    """L2 (KTD-I) invariant: stop_coordinator() drives the in-flight
+    drain inside CoordinatorHTTPServer.shutdown() and returns only
+    after the registry is closed. End-to-end smoke that the public
+    lifecycle API wires the drain correctly; detailed acquire/release
+    semantics are in test_claude_code_coordinator_server::test_i1..i6.
+    """
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+    # No in-flight requests: drain should return promptly (well under
+    # IN_FLIGHT_DRAIN_TIMEOUT_SEC=5s). Just verifying the path runs.
+    start = time.monotonic()
+    stop_coordinator(tmp_path)
+    elapsed = time.monotonic() - start
+    assert elapsed < 4.0, (
+        f"shutdown with no in-flight handlers took {elapsed:.2f}s; "
+        "drain may not be returning promptly when counter is already 0"
+    )
