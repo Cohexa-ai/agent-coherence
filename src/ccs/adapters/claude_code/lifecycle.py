@@ -368,6 +368,41 @@ def stop_coordinator(coordinator_root: Path) -> bool:
     return ran
 
 
+def wait_for_shutdown(
+    coordinator_root: Path,
+    *,
+    poll_interval_sec: float = 1.0,
+    timeout_sec: float | None = None,
+) -> bool:
+    """KP-7 public API. Block until the coordinator at ``coordinator_root``
+    has reached shutdown_done (idle-shutdown completed, stop_coordinator
+    called, or shutdown raised). Returns True if shutdown completed, False
+    if ``timeout_sec`` elapsed first or no in-process coordinator entry
+    exists for this root.
+
+    Designed for the ``agent-coherence-coordinator --_daemonized`` worker
+    that needs to keep the main thread alive until daemon threads have
+    cleanly torn down. Replaces direct reach-into ``_SPAWNED_REGISTRY``
+    + ``entry.shutdown_done.is_set()`` polling.
+
+    KeyboardInterrupt during the wait raises through to the caller so a
+    SIGINT can trigger the caller's own ``stop_coordinator`` shutdown
+    path (the wait itself never initiates shutdown — it only observes).
+    """
+    key = str(Path(coordinator_root).resolve())
+    entry = _SPAWNED_REGISTRY.get(key)
+    if entry is None:
+        return False
+    deadline: float | None = None
+    if timeout_sec is not None:
+        deadline = time.monotonic() + timeout_sec
+    while not entry.shutdown_done.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_sec)
+    return True
+
+
 # ----------------------------------------------------------------------
 # Internals — pid file, port file, sockets
 # ----------------------------------------------------------------------

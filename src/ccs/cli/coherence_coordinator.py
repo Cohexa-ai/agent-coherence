@@ -244,20 +244,18 @@ def _run_daemonized(root: Path) -> int:
         return 2
 
     # Block the main thread so the daemon HTTP/sweep/idle threads stay
-    # alive. Exit when the coordinator transitions to shutting_down (e.g.
-    # via the idle-shutdown loop).
-    from ccs.adapters.claude_code import lifecycle as _lc
-    entry = _lc._SPAWNED_REGISTRY.get(str(root.resolve()))
-    if entry is None:
-        # Should not happen — ensure_coordinator just populated this.
-        return 2
-    while not entry.shutdown_done.is_set():
-        try:
-            time.sleep(1.0)
-        except KeyboardInterrupt:
-            from ccs.adapters.claude_code.lifecycle import stop_coordinator
-            stop_coordinator(root)
-            break
+    # alive. KP-7: use the public wait_for_shutdown API rather than
+    # reaching into lifecycle._SPAWNED_REGISTRY + entry.shutdown_done.
+    # The wait blocks until idle-shutdown completes, stop_coordinator
+    # fires, or the shutdown sequence aborts.
+    from ccs.adapters.claude_code.lifecycle import (
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+    try:
+        wait_for_shutdown(root)
+    except KeyboardInterrupt:
+        stop_coordinator(root)
     return 0
 
 
