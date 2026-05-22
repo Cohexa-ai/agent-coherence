@@ -1814,11 +1814,22 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         "tracked_artifacts": tracked,
         "sessions": sessions,
         "policy_summary": coordinator.policy.summary(),
+        # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
+        # are public on POSIX (anyone with `ps` sees them) so this is
+        # not a disclosure beyond the trust boundary the threat model
+        # already accepts. Operators use this field to verify "is the
+        # coordinator I think is running actually mine" — restoring it
+        # closes the regression Unit 6 R12 introduced when it moved pid
+        # behind the operator-header gate. The contract is also
+        # documented in CLAUDE.md and used by status-rendering CLIs.
+        "coordinator_pid": os.getpid(),
         **counters,
     }
     if detail == "full":
+        # Full tier still adds the absolute workspace root — that DOES
+        # leak $HOME / directory layout and stays gated behind the
+        # Coherence-Local-Operator: true header.
         base["coordinator_root"] = str(coordinator.coordinator_root)
-        base["coordinator_pid"] = os.getpid()
     else:
         # Minimal: replace absolute workspace path with sentinel "." so the
         # default tier never leaks $HOME or directory layout.
