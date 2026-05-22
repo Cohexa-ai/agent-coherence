@@ -208,11 +208,22 @@ def validate_session_id(
 
 
 def validate_path(path: Any) -> str | None:
-    """Return reason if invalid, None if valid. The coordinator stores paths
-    as parent-repo-relative — KTD-7 normalization happens client-side (the
-    hook script must compute repo-relative from CC's absolute tool_input.
-    file_path). The boundary validation here is defense-in-depth against
-    bad hook clients AND prose-injection abuse (Adv #4 + Adv #11)."""
+    """Server-side authoritative path check. Return reason if invalid,
+    None if valid. The coordinator stores paths as parent-repo-relative
+    — KTD-7 normalization happens client-side (the hook script must
+    compute repo-relative from CC's absolute tool_input.file_path).
+    The boundary validation here is defense-in-depth against bad hook
+    clients AND prose-injection abuse (Adv #4 + Adv #11).
+
+    M-02 layer-distinction note: this is the STRICTER server-side check
+    (rejects non-string types, leading backslash, control characters,
+    paths longer than MAX_PATH_LEN). The CLI-side counterpart is
+    :func:`ccs.cli._coherence_client.validate_relative_path` — lighter
+    (string-typed-input assumed, just empty/leading-slash/`..` checks),
+    runs before the HTTP request is built for fast operator feedback.
+    This function is the authoritative gate; do NOT remove either —
+    they live at different layers of the trust boundary.
+    """
     if not isinstance(path, str):
         return "path must be a string"
     if not path:
