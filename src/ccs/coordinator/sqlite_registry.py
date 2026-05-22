@@ -503,6 +503,47 @@ class SqliteArtifactRegistry:
             ).fetchall()
         return {UUID(hex=r[0]): MESIState[r[1]] for r in rows}
 
+    def status_snapshot(
+        self,
+    ) -> tuple[
+        dict[UUID, dict[str, Any]],
+        dict[UUID, dict[UUID, MESIState]],
+    ]:
+        """PERF-1 single-query batch for /status. Returns:
+
+        - ``artifact_by_id``: ``{artifact_id: {"name", "version"}}`` — every
+          known artifact, one entry per row.
+        - ``state_by_artifact``: ``{artifact_id: {agent_id: MESIState}}`` —
+          the per-artifact state map for every artifact (empty inner dict
+          for artifacts no agent has ever held).
+
+        Two queries (artifacts + agent_states joined by artifact_id), held
+        under one lock so the snapshot is consistent. Replaces the old
+        per-artifact loop that issued ``2 * N`` separate SELECTs
+        (``get_artifact`` + ``get_state_map`` for each id) — eliminates
+        the N+1 hot path in ``_handle_status``.
+        """
+        artifact_by_id: dict[UUID, dict[str, Any]] = {}
+        state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        with self._lock:
+            for row in self._conn.execute(
+                "SELECT id, name, version FROM artifacts"
+            ).fetchall():
+                aid = UUID(hex=row[0])
+                artifact_by_id[aid] = {"name": row[1], "version": row[2]}
+                state_by_artifact[aid] = {}
+            for row in self._conn.execute(
+                "SELECT artifact_id, agent_id, state FROM agent_states"
+            ).fetchall():
+                aid = UUID(hex=row[0])
+                gid = UUID(hex=row[1])
+                # Only artifacts present in artifact_by_id get state rows.
+                # Defensive: skip orphans from race with concurrent delete.
+                if aid not in state_by_artifact:
+                    continue
+                state_by_artifact[aid][gid] = MESIState[row[2]]
+        return artifact_by_id, state_by_artifact
+
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
         with self._lock:

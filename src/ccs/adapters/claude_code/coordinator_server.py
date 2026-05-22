@@ -1949,31 +1949,23 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         req._json(200, {"detail": "metrics", **counters})
         return
 
-    # Artifacts + sessions — needed for minimal AND full tiers. Keep the
-    # P2 ce-review fix #18 batched-query pattern.
-    artifact_ids_snapshot = list(coordinator.registry.artifact_ids())
+    # PERF-1: single batched snapshot — replaces 2N SELECTs (one
+    # get_artifact + one get_state_map per artifact) with 2 SELECTs total
+    # held under one registry lock so the view is consistent.
+    artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
     agent_names_snapshot = coordinator.agent_names_snapshot()
-    artifact_by_id = {}
-    for artifact_id in artifact_ids_snapshot:
-        art = coordinator.registry.get_artifact(artifact_id)
-        if art is not None:
-            artifact_by_id[artifact_id] = art
 
     tracked: list[dict] = [
-        {"path": art.name, "version": art.version, "id": str(artifact_id)}
-        for artifact_id, art in artifact_by_id.items()
+        {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
+        for artifact_id, meta in artifact_by_id.items()
     ]
-    state_by_artifact = {
-        artifact_id: coordinator.registry.get_state_map(artifact_id)
-        for artifact_id in artifact_by_id
-    }
     sessions: list[dict] = []
     for agent_id, name in agent_names_snapshot:
         per_artifact: dict[str, str] = {}
-        for artifact_id, art in artifact_by_id.items():
+        for artifact_id, meta in artifact_by_id.items():
             state = state_by_artifact[artifact_id].get(agent_id)
             if state is not None and state != MESIState.INVALID:
-                per_artifact[art.name] = state.name
+                per_artifact[meta["name"]] = state.name
         sessions.append({
             "agent_name": name,
             "agent_id": str(agent_id),
