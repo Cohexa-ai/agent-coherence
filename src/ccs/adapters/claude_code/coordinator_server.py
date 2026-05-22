@@ -290,6 +290,18 @@ class CoordinatorHTTPServer:
         # guarantees atomicity for the single-attribute increment idiom.
         self._watchdog_timeouts_total: int = 0
         self._watchdog_queue_overflows_total: int = 0
+        # P1 #6: silent 401 surface. If hook.secret is deleted out from
+        # under a running coordinator (operator misclick, accidental
+        # rm in .coherence), every subsequent hook request from any
+        # session 401s. The client treats 401 as "no coordinator
+        # available" and degrades silently — agents lose the coherence
+        # layer with zero operator signal. Counter + WARNING log
+        # surface the symptom; 60s dedupe avoids spamming the log when
+        # a real burst hits. ``self._last_401_warn_at`` is the
+        # monotonic timestamp of the last warning emission.
+        self._auth_401_total: int = 0
+        self._last_401_warn_at: float = 0.0
+        self._auth_401_warn_lock = threading.Lock()
         # P1 #5 detection-only: when ``run_with_watchdog`` raises
         # FuturesTimeout, the handler returns degraded — but the
         # underlying ``work()`` future is left running in the pool
@@ -647,6 +659,32 @@ class CoordinatorHTTPServer:
         diagnosable from a bug report."""
         self._watchdog_late_completion_total += 1
 
+    def record_401(self) -> None:
+        """P1 #6: bump ``auth_401_total`` and (deduped to once per 60s)
+        emit a WARNING log explaining the most common cause — operator
+        deleted ``hook.secret`` while the coordinator was running, so
+        every hook request from every session now 401s and the client
+        treats it as a coordinator-unavailable degrade. Without this
+        signal an operator sees no symptom except "coherence stopped
+        working" with no log line to point at. We deliberately do NOT
+        shut down the coordinator on 401 — the secret may be restored,
+        or this may be a single bad request rather than a system
+        misconfig."""
+        self._auth_401_total += 1
+        now = time.monotonic()
+        with self._auth_401_warn_lock:
+            if now - self._last_401_warn_at < 60.0:
+                return
+            self._last_401_warn_at = now
+        logger.warning(
+            "auth: 401 on request — bearer mismatch or hook.secret missing. "
+            "If this is the first 401 after a healthy period, check that "
+            "%s/.coherence/hook.secret exists and matches the client's "
+            "bearer. Subsequent 401s within 60s suppressed; total: %d.",
+            self.coordinator_root,
+            self._auth_401_total,
+        )
+
     def counters_snapshot(self) -> dict[str, Any]:
         """M-03 / finding #31: stable snapshot of ALL coordinator counters
         (per-endpoint + product-signal + infrastructure + watchdog).
@@ -668,6 +706,7 @@ class CoordinatorHTTPServer:
             "intra_task_acquire_release_total": self._intra_task_acquire_release_total,
             "stale_warning_emitted_total": self._stale_warning_emitted_total,
             "stale_warning_reread_total": self._stale_warning_reread_total,
+            "auth_401_total": self._auth_401_total,
         }
 
     def mark_stale_warned(self, agent_id: UUID, artifact_id: UUID) -> None:
@@ -872,6 +911,7 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     )
                     return
                 if not verify_bearer(self.headers.get("Authorization"), coordinator.secret):
+                    coordinator.record_401()
                     self._json(401, {"error": "missing or invalid bearer token"})
                     return
 
