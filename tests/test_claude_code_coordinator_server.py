@@ -2361,3 +2361,120 @@ def test_adv004_sweep_on_reclaim_callback_exception_does_not_break_sweep(
     assert raises_counter["n"] == 1
     # The agent's state is invalid (the reclamation itself succeeded).
     assert coordinator.registry.get_agent_state(artifact_id, agent_id) == MESIState.INVALID
+
+
+# ----------------------------------------------------------------------
+# REL-01 — shutdown drain deadlock (suppressed false positive; locked by test)
+# ----------------------------------------------------------------------
+
+
+def test_rel01_drain_no_deadlock_under_concurrent_dispatch(tmp_path: Path) -> None:
+    """REL-01: the reviewer's deeper trace suppressed this as a false
+    positive — Condition.wait() releases _in_flight_lock during the
+    drain, and acquire_handler_slot's atomic shutting_down check
+    prevents new in-flight bumps after shutdown begins. Stress-test
+    the invariant: 50 concurrent dispatches racing against shutdown()
+    must not deadlock the drain. If REL-01 ever becomes real again
+    (e.g., a refactor introduces a non-Condition lock ordering), this
+    test will hang and pytest will time out — making the regression
+    loud."""
+    import threading as _t
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="rel01")
+    srv.serve_in_thread()
+    time.sleep(0.05)
+    secret = load_secret(srv.coordinator_root)
+    assert secret is not None
+    client = _Client("127.0.0.1", srv.port, secret)
+
+    fire_results: list[int] = []
+    def fire(i: int) -> None:
+        try:
+            s, _ = client.post(
+                "/hooks/pre-read",
+                {"session_id": _sid(f"rel01-{i}"), "path": "CLAUDE.md"},
+            )
+            fire_results.append(s)
+        except Exception:
+            fire_results.append(-1)
+
+    # 50 dispatch threads racing against a delayed shutdown.
+    threads = [_t.Thread(target=fire, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+
+    # Brief pause so some requests are mid-flight when shutdown fires.
+    time.sleep(0.020)
+
+    shutdown_done = _t.Event()
+    def call_shutdown() -> None:
+        srv.shutdown()
+        shutdown_done.set()
+    _t.Thread(target=call_shutdown, daemon=True).start()
+
+    # The shutdown MUST complete within IN_FLIGHT_DRAIN_TIMEOUT_SEC + a
+    # small margin (handlers in-flight when drain started should
+    # complete quickly; new ones after shutting_down=True are denied).
+    assert shutdown_done.wait(timeout=10.0), (
+        "shutdown deadlocked (REL-01 regression — drain never completed)"
+    )
+    for t in threads:
+        t.join(timeout=2.0)
+    # All responses are either 200 (handled) or 503 (post-shutdown) or
+    # -1 (connection lost during shutdown). No 500s or hangs.
+    assert all(r in (200, 503, -1) for r in fire_results), (
+        f"unexpected status codes during shutdown race: {fire_results}"
+    )
+
+
+# ----------------------------------------------------------------------
+# REL-03 — free-threading-safe reliability counters
+# ----------------------------------------------------------------------
+
+
+def test_rel03_watchdog_timeouts_counter_under_concurrent_increment(
+    tmp_path: Path,
+) -> None:
+    """REL-03: under free-threading Py 3.13+ or PyPy, ``x += 1`` on a
+    plain int is NOT atomic — concurrent threads can tear the increment
+    and lose counts. Reliability counters protect with a lock; this
+    test verifies that 1000 concurrent increments from 50 threads land
+    as exactly 1000 (no torn writes)."""
+    import threading as _t
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="rel03")
+    try:
+        N_THREADS = 50
+        N_PER_THREAD = 20  # 1000 total
+        def bump_many() -> None:
+            for _ in range(N_PER_THREAD):
+                srv.increment_watchdog_timeout()
+        threads = [_t.Thread(target=bump_many) for _ in range(N_THREADS)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        expected = N_THREADS * N_PER_THREAD
+        assert srv._watchdog_timeouts_total == expected, (
+            f"counter torn under concurrent increment: "
+            f"expected {expected}, got {srv._watchdog_timeouts_total}"
+        )
+    finally:
+        srv.shutdown()
+
+
+def test_rel03_watchdog_queue_overflow_counter_under_concurrent_increment(
+    tmp_path: Path,
+) -> None:
+    """Same contract for the queue-overflow counter."""
+    import threading as _t
+    srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="rel03b")
+    try:
+        N_THREADS = 50
+        N_PER_THREAD = 20
+        def bump_many() -> None:
+            for _ in range(N_PER_THREAD):
+                srv.increment_watchdog_queue_overflow()
+        threads = [_t.Thread(target=bump_many) for _ in range(N_THREADS)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        expected = N_THREADS * N_PER_THREAD
+        assert srv._watchdog_queue_overflows_total == expected
+    finally:
+        srv.shutdown()
