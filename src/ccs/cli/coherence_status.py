@@ -267,7 +267,12 @@ def _render_table(payload: dict[str, Any]) -> None:
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
     policy = payload.get("policy_summary", {})
-    uptime = payload.get("coordinator_uptime_s", 0.0)
+    # AC-02 cross-backend parity: prefer canonical ``coordinator_uptime_seconds``
+    # (KTD-J _seconds convention), fall back to deprecated ``coordinator_uptime_s``
+    # so we keep working against pre-rename coordinators during the
+    # deprecation window.
+    uptime = payload.get("coordinator_uptime_seconds",
+                         payload.get("coordinator_uptime_s", 0.0))
     pid = payload.get("coordinator_pid", 0)
     backend = payload.get("coordinator_backend", "python")
     version = payload.get("coordinator_version", "")
