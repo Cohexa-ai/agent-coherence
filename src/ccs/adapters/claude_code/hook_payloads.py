@@ -89,7 +89,19 @@ class StaleSummary(TypedDict):
 
 
 class FreshResponse(TypedDict):
+    """Fresh-read response shape.
+
+    AC-08: ``hookSpecificOutput`` is OPTIONAL and present when the
+    session has pending preemption notices that the wrapper at
+    ``_handle_pre_read.work_with_notice_surfacing`` attaches. Typed
+    consumers should treat ``hookSpecificOutput`` as ``NotRequired``
+    on every endpoint that returns a fresh envelope (pre-read,
+    pre-bash, pre-grep).
+    """
     status: Literal["fresh"]
+    hookSpecificOutput: NotRequired["PreToolUseHookOutput"]
+    # AC-05: also present on watchdog-timeout degraded responses.
+    degraded: NotRequired[bool]
 
 
 class StaleResponse(TypedDict):
