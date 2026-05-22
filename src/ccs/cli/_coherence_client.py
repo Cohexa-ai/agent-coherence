@@ -48,8 +48,20 @@ def err(message: str) -> None:
 
 
 def validate_relative_path(p: str) -> str | None:
-    """Reject absolute paths, ``..`` traversal, and empty input. Returns
+    """Client-side path pre-check before sending to the coordinator.
+
+    Reject absolute paths, ``..`` traversal, and empty input. Returns
     None on valid, a reason string on invalid.
+
+    M-02 layer-distinction note: this is the CLI-side check (light;
+    designed for friendly operator error messages before the request
+    is built). The server-side check is
+    :func:`ccs.adapters.claude_code.coordinator_server.validate_path`
+    — STRICTER (also rejects backslash-leading paths, control characters,
+    paths longer than MAX_PATH_LEN, non-string types). The server-side
+    check is the authoritative gate; this CLI check is for fast feedback
+    without a coordinator round-trip. Do NOT remove either — they live
+    at different layers of the trust boundary.
 
     P2 ce-review fix #6 (maintainability): consolidates the
     ``_validate_path`` helper that previously existed byte-for-byte in
