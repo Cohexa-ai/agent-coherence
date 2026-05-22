@@ -2552,3 +2552,99 @@ def test_adv005_missing_content_length_returns_400(coordinator) -> None:
         assert "400" in first_line, f"expected 400, got: {first_line}"
     finally:
         sock.close()
+
+
+# ----------------------------------------------------------------------
+# AC-05 — degraded response shape varies by endpoint contract
+# ----------------------------------------------------------------------
+
+
+def test_ac05_pre_edit_degraded_response_returns_ok_shape(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pre-edit's wire contract is {ok: bool}; degraded envelope on
+    watchdog timeout must include ok=True so clients reading
+    result.get('ok') don't see None. AC-05 fix."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/pre-edit",
+        {"session_id": _sid("ac05-pre-edit"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body.get("ok") is True, (
+        f"pre-edit degraded envelope must include ok=True; got {body!r}"
+    )
+    assert body.get("degraded") is True
+
+
+def test_ac05_post_edit_degraded_response_returns_ok_shape(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """post-edit's wire contract is {ok: bool}; degraded envelope must
+    include ok=True. AC-05 fix."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/post-edit",
+        {
+            "session_id": _sid("ac05-post-edit"),
+            "path": "plan.md",
+            "content_hash": _hash("ac05"),
+            "success": True,
+        },
+    )
+    assert status == 200
+    assert body.get("ok") is True
+    assert body.get("degraded") is True
+
+
+def test_ac05_session_stop_degraded_response_returns_ok_shape(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """session-stop's wire contract is {ok: bool}; degraded envelope
+    must include ok=True. AC-05 fix."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": _sid("ac05-session-stop")}
+    )
+    assert status == 200
+    assert body.get("ok") is True
+    assert body.get("degraded") is True
+
+
+def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pre-read's wire contract is {status: ...}; degraded envelope
+    keeps the fresh-shape envelope so clients checking status
+    don't see ok=None. AC-05 contract preservation."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("ac05-pre-read"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body.get("status") == "fresh"
+    assert body.get("degraded") is True
+    # Crucially, pre-read's degraded envelope does NOT include ok.
+    assert "ok" not in body

@@ -1318,7 +1318,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             }
         return {"ok": True}
 
-    _run_or_degrade(req, coordinator, work)
+    # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
+    # On watchdog timeout, return the ok-shape degraded envelope so a
+    # client doing result.get("ok") sees True rather than None.
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1429,7 +1432,9 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True}
 
-    _run_or_degrade(req, coordinator, work)
+    # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
+    # envelope keeps clients reading result.get("ok") safe on timeout.
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1500,7 +1505,9 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             }
         return response
 
-    _run_or_degrade(req, coordinator, work)
+    # AC-05: session-stop's wire contract is {ok: bool}; ok-shape degraded
+    # envelope keeps clients reading result.get("ok") safe on timeout.
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
 def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1838,6 +1845,32 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     the operator's home-directory path. Bearer auth is enforced by the
     dispatcher; the header is a SECOND factor specifically for the
     elevated tier.
+
+    AC-07 — metrics-tier stability contract (operator-facing):
+
+      Fields PRESENT in the metrics tier are stable within a major
+      version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
+      ``coordinator_version``, ``watchdog_timeouts_total``,
+      ``watchdog_queue_overflows_total``,
+      ``handler_concurrency_overflows_total``,
+      ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
+      ``endpoint_counters``, ``intra_task_acquire_release_total``,
+      ``stale_warning_emitted_total``, ``stale_warning_reread_total``.
+
+      Fields may be ADDED in minor versions (additive change is
+      non-breaking for dashboards using selective key access).
+
+      Fields are REMOVED only in major versions and only after at
+      least one minor-version release where the field is emitted
+      ALONGSIDE its replacement as a deprecated alias (see AC-02
+      for the ``coordinator_uptime_s`` → ``coordinator_uptime_seconds``
+      precedent — alias ships through v0.1.x; remove at v0.2.0).
+
+      Fields EXPLICITLY OMITTED from metrics tier vs. full tier:
+      ``tracked_artifacts``, ``sessions``, ``policy_summary``,
+      ``coordinator_root``, ``coordinator_pid``. Operators wanting
+      these for a dashboard must call ``?detail=full`` with the
+      ``Coherence-Local-Operator: true`` header.
     """
     detail = _parse_detail_query(getattr(req, "_query_string", ""))
     if detail == "full":
@@ -2165,9 +2198,34 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
 # ----------------------------------------------------------------------
 
 
-def _run_or_degrade(req: _RequestProtocol, coordinator: CoordinatorHTTPServer, work: Callable[[], dict]) -> None:
+_DEFAULT_DEGRADED_RESPONSE: dict = {"status": "fresh", "degraded": True}
+"""AC-05: pre-read / pre-bash / pre-grep degrade to a fresh-shape envelope
+because their wire contract uses ``{status: "fresh"|"stale"}``. Endpoints
+whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop) pass
+``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
+``result.get("ok")``."""
+
+_OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
+"""AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
+post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+
+
+def _run_or_degrade(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    work: Callable[[], dict],
+    *,
+    degraded_response: dict | None = None,
+) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
-    and return 200 {status:"fresh"} so the user's tool call proceeds.
+    and return 200 with ``degraded_response`` (or the default fresh-shape
+    envelope) so the user's tool call proceeds.
+
+    AC-05: callers from ``{ok: bool}``-shape endpoints (pre-edit,
+    post-edit, session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE``
+    so clients reading ``result.get("ok")`` see ``True`` rather than
+    ``None``. Callers from ``{status: ...}``-shape endpoints (pre-read,
+    pre-bash, pre-grep) accept the default fresh-shape envelope.
 
     v0.1.1 KTD-G:
       - Item 1: queue-depth gate. Reject with HTTP 503 if the watchdog
@@ -2205,8 +2263,8 @@ def _run_or_degrade(req: _RequestProtocol, coordinator: CoordinatorHTTPServer, w
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
         coordinator.increment_watchdog_timeout()  # finding #31
-        logger.warning("handler watchdog timeout after %ss; degrading to fresh", HANDLER_TIMEOUT_SEC)
-        req._json(200, {"status": "fresh", "degraded": True})
+        logger.warning("handler watchdog timeout after %ss; degrading", HANDLER_TIMEOUT_SEC)
+        req._json(200, degraded_response if degraded_response is not None else _DEFAULT_DEGRADED_RESPONSE)
         return
     except Exception as exc:
         logger.exception("handler work failed: %s", exc)
