@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -394,66 +395,118 @@ def _apply_entries(
             return 2
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    if settings_path.is_file():
-        try:
-            data = json.loads(settings_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            print(
-                f"agent-coherence-migrate-rules: existing {settings_path} is not valid JSON ({exc}); "
-                "refusing to overwrite.",
-                file=sys.stderr,
-            )
-            return 2
-        if not isinstance(data, dict):
-            print(
-                f"agent-coherence-migrate-rules: existing {settings_path} root is not an object; "
-                "refusing to overwrite.",
-                file=sys.stderr,
-            )
-            return 2
-    else:
-        data = {}
 
-    permissions = data.setdefault("permissions", {})
-    if not isinstance(permissions, dict):
-        print(
-            f"agent-coherence-migrate-rules: existing permissions key in {settings_path} "
-            "is not an object; refusing to overwrite.",
-            file=sys.stderr,
-        )
-        return 2
-    deny = permissions.setdefault("deny", [])
-    if not isinstance(deny, list):
-        print(
-            f"agent-coherence-migrate-rules: existing permissions.deny in {settings_path} "
-            "is not a list; refusing to overwrite.",
-            file=sys.stderr,
-        )
-        return 2
-    seen = {x for x in deny if isinstance(x, str)}
-    appended = 0
-    for entry in proposed:
-        if entry not in seen:
-            deny.append(entry)
-            seen.add(entry)
-            appended += 1
+    # ADV-007: two operators (or two CI runs) invoking --apply concurrently
+    # both read settings.local.json, both build the same proposed list,
+    # both write — last write wins. With identical proposed lists the
+    # outcome is functionally correct, but ANY concurrent unrelated edit
+    # to settings.local.json during the window gets clobbered. Wrap the
+    # read-modify-write in fcntl.flock on a sidecar lock file so two
+    # --apply runs serialize.
+    #
+    # POSIX-only (matches the rest of the codebase per lifecycle.py
+    # _FCNTL_AVAILABLE guard). On Windows the call is a no-op — the race
+    # is wider but the broader Windows story is deferred to v0.1.1+ per
+    # CLAUDE.md.
+    try:
+        import fcntl  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover — exercised only on Windows
+        fcntl = None  # type: ignore[assignment]
+
+    lock_path = settings_path.with_suffix(settings_path.suffix + ".lock")
+    lock_fd: int | None = None
+    if fcntl is not None:
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            print(
+                f"agent-coherence-migrate-rules: could not acquire lock on "
+                f"{lock_path}: {exc}; proceeding without it (race window present).",
+                file=sys.stderr,
+            )
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                lock_fd = None
 
     try:
-        settings_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
+        if settings_path.is_file():
+            try:
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                print(
+                    f"agent-coherence-migrate-rules: existing {settings_path} is not valid JSON ({exc}); "
+                    "refusing to overwrite.",
+                    file=sys.stderr,
+                )
+                return 2
+            if not isinstance(data, dict):
+                print(
+                    f"agent-coherence-migrate-rules: existing {settings_path} root is not an object; "
+                    "refusing to overwrite.",
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            data = {}
+
+        permissions = data.setdefault("permissions", {})
+        if not isinstance(permissions, dict):
+            print(
+                f"agent-coherence-migrate-rules: existing permissions key in {settings_path} "
+                "is not an object; refusing to overwrite.",
+                file=sys.stderr,
+            )
+            return 2
+        deny = permissions.setdefault("deny", [])
+        if not isinstance(deny, list):
+            print(
+                f"agent-coherence-migrate-rules: existing permissions.deny in {settings_path} "
+                "is not a list; refusing to overwrite.",
+                file=sys.stderr,
+            )
+            return 2
+        seen = {x for x in deny if isinstance(x, str)}
+        appended = 0
+        for entry in proposed:
+            if entry not in seen:
+                deny.append(entry)
+                seen.add(entry)
+                appended += 1
+
+        try:
+            settings_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(
+                f"agent-coherence-migrate-rules: could not write {settings_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         print(
-            f"agent-coherence-migrate-rules: could not write {settings_path}: {exc}",
-            file=sys.stderr,
+            f"agent-coherence-migrate-rules: appended {appended} entry/ies to {settings_path}",
+            flush=True,
         )
-        return 2
-    print(
-        f"agent-coherence-migrate-rules: appended {appended} entry/ies to {settings_path}",
-        flush=True,
-    )
-    return 0
+        return 0
+    finally:
+        # Release the lock + drop the fd. Leave the sidecar .lock file on
+        # disk (it's an empty marker; cheaper to keep than to race a
+        # cleanup with the next operator).
+        if lock_fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

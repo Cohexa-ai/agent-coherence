@@ -1008,8 +1008,15 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
             except ValueError:
                 self._json(400, {"error": "invalid Content-Length"})
                 return None
+            # ADV-005 (defensive): reject Content-Length:0 or missing with
+            # an explicit 400 rather than silently returning {}. Every POST
+            # endpoint expects a body with required fields; a missing body
+            # used to fall through to per-field validate_* errors ("missing
+            # session_id" etc.) which mask the actual cause. Loud-at-the-
+            # right-layer fails fast for hook-client serialization bugs.
             if n <= 0:
-                return {}
+                self._json(400, {"error": "missing or empty body (Content-Length:0)"})
+                return None
             # R21 (Unit 6): cap the body BEFORE rfile.read so a hostile or
             # buggy client cannot allocate an oversized buffer in the
             # coordinator process. Validates Content-Length only — chunked
