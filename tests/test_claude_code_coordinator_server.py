@@ -1354,15 +1354,30 @@ def test_i4_shutdown_drain_timeout_records_flag(
 
 def test_i5_dispatch_pairs_acquire_with_release(client: _Client, coordinator) -> None:
     """Integration: a normal pre-read request increments and decrements
-    the in-flight counter exactly once, leaving it at zero on return."""
+    the in-flight counter exactly once, leaving it at zero on return.
+
+    Polling rationale: client.post returns once the response body is read,
+    but ``release_handler_slot`` runs in the dispatcher's finally block
+    AFTER the response is sent. There's a microseconds-to-milliseconds
+    window where the counter is still 1 from the client's POV. Poll
+    briefly (up to 1s) instead of asserting immediately — the contract
+    is "eventually zero", not "zero by the next bytecode op". REL-03's
+    lock around watchdog counters widens this window slightly on slow
+    CI, surfacing the pre-existing race."""
     assert coordinator._in_flight == 0
     status, _ = client.post(
         "/hooks/pre-read",
         {"session_id": _sid("i5"), "path": "CLAUDE.md"},
     )
     assert status == 200
-    assert coordinator._in_flight == 0, (
-        f"in-flight counter leaked: expected 0, got {coordinator._in_flight}"
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if coordinator._in_flight == 0:
+            return
+        time.sleep(0.010)
+    pytest.fail(
+        f"in-flight counter never drained: expected 0 within 1s, "
+        f"still at {coordinator._in_flight}"
     )
 
 
