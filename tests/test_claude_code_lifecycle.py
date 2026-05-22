@@ -809,3 +809,57 @@ def test_l3_cold_start_duration_populated_on_winner_path(
         )
     finally:
         stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# KP-7 — wait_for_shutdown public API
+# ----------------------------------------------------------------------
+
+
+def test_kp7_wait_for_shutdown_returns_false_when_no_entry(tmp_path):
+    """wait_for_shutdown returns False when no in-process coordinator
+    entry exists for the given root (idempotent observer; no spawn)."""
+    from ccs.adapters.claude_code.lifecycle import wait_for_shutdown
+    assert wait_for_shutdown(tmp_path, timeout_sec=0.1) is False
+
+
+def test_kp7_wait_for_shutdown_returns_true_after_stop(tmp_path, fast_cfg):
+    """End-to-end: spawn → stop in background → wait_for_shutdown
+    returns True once shutdown_done flips."""
+    import threading as _t
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+
+    # Stop in a background thread; main waits.
+    def trigger_stop():
+        time.sleep(0.1)
+        stop_coordinator(tmp_path)
+
+    _t.Thread(target=trigger_stop, daemon=True).start()
+    assert wait_for_shutdown(tmp_path, poll_interval_sec=0.05, timeout_sec=3.0) is True
+
+
+def test_kp7_wait_for_shutdown_times_out_when_coordinator_stays_up(
+    tmp_path, fast_cfg
+):
+    """timeout_sec elapsed without shutdown → returns False, leaves the
+    coordinator running so the caller can react."""
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+    try:
+        # Coordinator is up; wait_for_shutdown must time out.
+        assert wait_for_shutdown(tmp_path, poll_interval_sec=0.05, timeout_sec=0.3) is False
+    finally:
+        stop_coordinator(tmp_path)
