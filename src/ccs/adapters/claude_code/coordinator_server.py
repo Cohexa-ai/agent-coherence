@@ -472,6 +472,18 @@ class CoordinatorHTTPServer:
         raise ``sqlite3.ProgrammingError`` (becoming HTTP 500 to clients),
         which is observable. The alternative — wedging shutdown waiting
         for a stuck handler — is silent and worse.
+
+        COR-07: actual wall-clock shutdown time can EXCEED
+        ``IN_FLIGHT_DRAIN_TIMEOUT_SEC`` when watchdog timeouts have
+        fired. The in-flight counter decrements when the handler
+        thread returns (after FuturesTimeout), but the corresponding
+        watchdog-pool future may still be running. The subsequent
+        ``self._watchdog.shutdown(wait=True, cancel_futures=False)``
+        waits for those orphaned futures to complete. Worst-case
+        addition: one extra ``HANDLER_TIMEOUT_SEC`` (4s) per orphaned
+        future. ``cancel_futures=True`` would shorten shutdown but
+        risk aborting a SQLite write mid-transaction; documented
+        trade-off, not a bug.
         """
         # REL-05 / finding #42: protect the check-then-set with a lock so
         # concurrent callers (idle thread + stop_coordinator) cannot both
@@ -1213,6 +1225,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # Wrap _run_or_degrade so we can also pop notices for the FRESH-response
     # path (work() returned {status: "fresh"} without going through stale logic).
+    #
+    # COR-08: graceful-degradation note — if work() raises before this
+    # wrapper can drain notices, pop_pending_notices never runs and the
+    # notice stays in the DB. That's intentional: the notice will surface
+    # on the next successful pre-read for the same (agent, artifact) OR
+    # on session-stop OR via the F2 sweep eviction at
+    # notice_evict_max_age_sec. A transient SQLite error delays — but
+    # does not lose — the notice surface.
     def work_with_notice_surfacing() -> dict:
         result = work()
         if result.get("status") == "fresh" and "hookSpecificOutput" not in result:
@@ -1553,7 +1573,17 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": str(exc)})
         return
     # Reload the live policy so subsequent hook calls see the additions.
-    coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    #
+    # COR-05: this is an atomic-swap-via-local-variable pattern. The RHS
+    # evaluates fully (TrackedArtifactPolicy.load returns a new object)
+    # before the attribute assignment fires. Single PyObject* write is
+    # atomic on CPython, and even on free-threading builds the per-object
+    # lock makes the swap visible to other threads as a single edge.
+    # Handlers reading coordinator.policy bind it to a local at entry
+    # (see pre-read / pre-edit / pre-bash / pre-grep) so a mid-handler
+    # swap can't change which policy object the handler reasons about.
+    new_policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    coordinator.policy = new_policy
     req._json(200, {
         "ok": True, "added": added, "rejected": rejected + pre_rejected,
     })
@@ -2442,10 +2472,23 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     pre-state, both compute "previous + my_paths", second write loses the
     first writer's additions). fcntl is POSIX-only; on the deferred
     Windows path this is a no-op (lifecycle already disables the
-    coordinator on Windows per _FCNTL_AVAILABLE)."""
+    coordinator on Windows per _FCNTL_AVAILABLE).
+
+    COR-06: callers pre-validate via ``validate_path`` (or equivalent)
+    and pass only safe paths. The local re-check below is a defensive
+    second pass that catches accidentally-bypassed validation BUT in
+    the normal flow the ``rejected`` list it returns from this branch
+    is always empty (everything passes the caller's check already).
+    Kept as defense-in-depth — removing it would couple this helper to
+    the caller's validation discipline, which is a tighter contract
+    than the function's current "self-contained validate-and-write"
+    behaviour. Tests should assert callers reject before reaching here.
+    """
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
     # Validate each path the same way TrackedArtifactPolicy does. This
     # validation is pure (no I/O) so it lives outside the lock window.
+    # Defense-in-depth per COR-06: callers pre-validate, but this loop
+    # ensures the YAML write is never reached with traversal patterns.
     added: list[str] = []
     rejected: list[dict] = []
     for p in new_paths:

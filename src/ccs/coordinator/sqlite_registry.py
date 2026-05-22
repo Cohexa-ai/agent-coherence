@@ -891,15 +891,29 @@ class SqliteArtifactRegistry:
                 )
                 self._conn.execute("COMMIT")
                 return new_id
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
                 # Lost the UNIQUE-on-name race; another caller inserted between
                 # our SELECT and INSERT. ROLLBACK and re-fetch.
+                #
+                # COR-04: a concurrent remove_artifact between ROLLBACK and
+                # re-fetch can leave the row absent. Old behaviour: re-raise
+                # the original IntegrityError with no context — operator sees
+                # a confusing "UNIQUE constraint failed" trace for what's
+                # really a delete race. New behaviour: raise an explicit
+                # informative RuntimeError so the operator knows exactly
+                # what happened.
                 self._conn.execute("ROLLBACK")
                 row = self._conn.execute(
                     "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
                 ).fetchone()
                 if row is None:
-                    raise  # genuine integrity error, not the race
+                    raise RuntimeError(
+                        f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
+                        "but the winning row was deleted before re-fetch. This "
+                        "indicates a concurrent remove_artifact running against the "
+                        "same name — caller should retry or treat the artifact as "
+                        f"absent. Original IntegrityError: {exc}"
+                    ) from exc
                 return UUID(hex=row[0])
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
