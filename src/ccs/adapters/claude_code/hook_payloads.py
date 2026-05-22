@@ -141,6 +141,11 @@ class PolicyUntrackResponse(TypedDict):
 class StatusResponse(TypedDict):
     tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "last_writer": "..."}, ...]
     sessions: list[dict]  # [{"session_id": "...", "states": {path: state_name}}, ...]
+    # AC-02: canonical name follows KTD-J convention (full-word _seconds
+    # suffix). ``coordinator_uptime_s`` is emitted alongside as a
+    # deprecated alias for one release; consumers should migrate to the
+    # canonical name. Removed in v0.2.
+    coordinator_uptime_seconds: float
     coordinator_uptime_s: float
     coordinator_pid: int
 

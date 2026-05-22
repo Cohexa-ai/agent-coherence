@@ -1796,8 +1796,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # alongside the existing watchdog/concurrency counters.
     # M-03 / finding #31: use counters_snapshot() instead of reaching into
     # private attrs directly — single source of truth for the counter set.
+    # AC-02 cross-backend parity: KTD-J naming convention locks the
+    # full-word ``_seconds`` suffix for duration fields. Node emits
+    # ``coordinator_uptime_seconds``; Python now matches. The old
+    # ``coordinator_uptime_s`` field is emitted ALONGSIDE the new one
+    # for one release as a backward-compat alias (consumers can detect
+    # which field to read by checking which is present, or just read
+    # the canonical name). Deprecation note in docs/metrics.md (TODO).
+    _uptime = coordinator.uptime_s
     counters = {
-        "coordinator_uptime_s": coordinator.uptime_s,
+        "coordinator_uptime_seconds": _uptime,
+        "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
         "coordinator_backend": "python",
         "coordinator_version": _COORDINATOR_VERSION,
         **coordinator.counters_snapshot(),

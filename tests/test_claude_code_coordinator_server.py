@@ -436,7 +436,9 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     assert "spec.md" in tracked_paths
     sessions = {sess["agent_name"] for sess in b["sessions"]}
     assert f"claude-session-{a_sid}" in sessions
-    assert b["coordinator_uptime_s"] > 0
+    # AC-02: canonical field; old _s alias also present for one release.
+    assert b["coordinator_uptime_seconds"] > 0
+    assert b["coordinator_uptime_s"] == b["coordinator_uptime_seconds"]
     assert "policy_summary" in b
     # Minimal tier: absolute root sentinel'd; pid is present (P1 #7 reversion).
     assert b.get("detail") == "minimal"
@@ -1897,7 +1899,8 @@ def test_r12_status_metrics_returns_counters_only(client: _Client) -> None:
     assert "policy_summary" not in b
     # Counters must be present.
     for k in (
-        "coordinator_uptime_s",
+        "coordinator_uptime_seconds",  # AC-02 canonical field
+        "coordinator_uptime_s",  # AC-02 deprecated alias (one release)
         "watchdog_timeouts_total",
         "handler_concurrency_overflows_total",
         "in_flight_drain_timed_out",
