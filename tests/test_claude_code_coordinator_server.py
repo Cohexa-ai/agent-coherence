@@ -2041,3 +2041,99 @@ def test_adv001_repeated_prepare_for_migration_is_idempotent(
         assert body.get("already_in_progress") is True
     finally:
         coordinator._migration_draining = False
+
+
+# ----------------------------------------------------------------------
+# P1 #5 — watchdog late-completion detector
+# ----------------------------------------------------------------------
+
+
+def test_p1_5_watchdog_late_completion_increments_counter(
+    coordinator,
+) -> None:
+    """When run_with_watchdog times out and the underlying future
+    later completes successfully, the late-completion counter must
+    increment and a CRITICAL log line fires."""
+    import threading as _t
+    from concurrent.futures import TimeoutError as _FuturesTimeout
+
+    # Replace HANDLER_TIMEOUT_SEC for the duration of the test so we
+    # don't have to wait 4s. The work function blocks until the test
+    # releases it, then returns a successful payload.
+    release = _t.Event()
+    def slow_work() -> dict:
+        release.wait(timeout=5.0)
+        return {"ok": True, "late": True}
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+    original_timeout = mod.HANDLER_TIMEOUT_SEC
+    try:
+        mod.HANDLER_TIMEOUT_SEC = 0.05  # 50ms — fire timeout fast
+        before = coordinator._watchdog_late_completion_total
+        try:
+            coordinator.run_with_watchdog(slow_work)
+        except _FuturesTimeout:
+            pass
+        else:
+            pytest.fail("expected FuturesTimeout")
+        # Now release the work; the future completes successfully and
+        # the done_callback fires (asynchronously — give the pool a
+        # moment to schedule the callback).
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if coordinator._watchdog_late_completion_total > before:
+                break
+            time.sleep(0.020)
+        assert coordinator._watchdog_late_completion_total == before + 1, (
+            f"expected late-completion counter to increment by 1; "
+            f"before={before} after={coordinator._watchdog_late_completion_total}"
+        )
+    finally:
+        mod.HANDLER_TIMEOUT_SEC = original_timeout
+        release.set()
+
+
+def test_p1_5_late_failure_does_not_increment_counter(
+    coordinator,
+) -> None:
+    """If a timed-out future later RAISES rather than completing, no
+    phantom state landed in the registry — counter must NOT increment."""
+    import threading as _t
+    from concurrent.futures import TimeoutError as _FuturesTimeout
+
+    release = _t.Event()
+    def slow_failing_work() -> dict:
+        release.wait(timeout=5.0)
+        raise RuntimeError("late failure")
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+    original_timeout = mod.HANDLER_TIMEOUT_SEC
+    try:
+        mod.HANDLER_TIMEOUT_SEC = 0.05
+        before = coordinator._watchdog_late_completion_total
+        try:
+            coordinator.run_with_watchdog(slow_failing_work)
+        except _FuturesTimeout:
+            pass
+        # Release; future fails late; counter should NOT increment.
+        release.set()
+        time.sleep(0.3)
+        assert coordinator._watchdog_late_completion_total == before, (
+            f"late-failure path must not bump phantom-grant counter; "
+            f"before={before} after={coordinator._watchdog_late_completion_total}"
+        )
+    finally:
+        mod.HANDLER_TIMEOUT_SEC = original_timeout
+        release.set()
+
+
+def test_p1_5_status_metrics_exposes_late_completion_counter(
+    client: _Client, coordinator,
+) -> None:
+    """The new counter must show up in /status?detail=metrics so
+    operators can spot a phantom-grant cluster in a bug report."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "watchdog_late_completion_total" in body
+    assert isinstance(body["watchdog_late_completion_total"], int)

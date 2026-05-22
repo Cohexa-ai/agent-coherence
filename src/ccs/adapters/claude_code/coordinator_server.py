@@ -290,6 +290,22 @@ class CoordinatorHTTPServer:
         # guarantees atomicity for the single-attribute increment idiom.
         self._watchdog_timeouts_total: int = 0
         self._watchdog_queue_overflows_total: int = 0
+        # P1 #5 detection-only: when ``run_with_watchdog`` raises
+        # FuturesTimeout, the handler returns degraded — but the
+        # underlying ``work()`` future is left running in the pool
+        # (cancel_futures=False). If it eventually completes
+        # successfully, any state it mutated (EXCLUSIVE grant from
+        # ``service.write``, for instance) lands in the registry AFTER
+        # the agent received a degraded response — a phantom grant the
+        # agent will never post-edit. We can't cancel the future
+        # without invasive cancel-token plumbing through service.write,
+        # but we CAN detect it: every timed-out future gets a
+        # done_callback that bumps this counter + logs CRITICAL if the
+        # future eventually finished without exception. Operators see
+        # the symptom via ``/status?detail=metrics`` even when the
+        # cause is rare (4s deadline + 1.5s busy_timeout = real-world
+        # only hits with a wedged SQLite or contended drive).
+        self._watchdog_late_completion_total: int = 0
 
         # KTD-I (Unit 5 L2) — in-flight handler counter. Incremented at
         # dispatch entry via :meth:`acquire_handler_slot`, decremented in
@@ -621,6 +637,16 @@ class CoordinatorHTTPServer:
         """M-03 / finding #31: increment the watchdog queue-overflow counter."""
         self._watchdog_queue_overflows_total += 1
 
+    def increment_watchdog_late_completion(self) -> None:
+        """P1 #5: a watchdog-timed-out future eventually completed
+        successfully — any state it mutated (e.g., an EXCLUSIVE grant
+        from ``service.write``) is now in the registry without the
+        agent's knowledge, since the handler had already returned a
+        degraded response. Operator-visible via
+        ``/status?detail=metrics`` so a phantom-grant cluster is
+        diagnosable from a bug report."""
+        self._watchdog_late_completion_total += 1
+
     def counters_snapshot(self) -> dict[str, Any]:
         """M-03 / finding #31: stable snapshot of ALL coordinator counters
         (per-endpoint + product-signal + infrastructure + watchdog).
@@ -631,6 +657,7 @@ class CoordinatorHTTPServer:
         return {
             "watchdog_timeouts_total": self._watchdog_timeouts_total,
             "watchdog_queue_overflows_total": self._watchdog_queue_overflows_total,
+            "watchdog_late_completion_total": self._watchdog_late_completion_total,
             "handler_concurrency_overflows_total": (
                 self._server.handler_concurrency_overflows_total
                 if self._server is not None else 0
@@ -665,9 +692,50 @@ class CoordinatorHTTPServer:
 
     def run_with_watchdog(self, fn: Callable[[], Any]) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
-        :class:`FuturesTimeout` on timeout (caller decides degradation)."""
+        :class:`FuturesTimeout` on timeout (caller decides degradation).
+
+        P1 #5 (detection-only): when the future times out, ``cancel_futures``
+        is not set so the underlying work continues running in the pool.
+        Attach a done_callback that fires when that runaway work
+        eventually finishes — if it completed successfully, the
+        registry now holds state the agent never saw (phantom EXCLUSIVE
+        grant being the canonical worry). The callback bumps
+        ``watchdog_late_completion_total`` and logs CRITICAL so the
+        operator can correlate a phantom-grant cluster in a bug report
+        with the rate at which late completions are firing.
+        """
         future = self._watchdog.submit(fn)
-        return future.result(timeout=HANDLER_TIMEOUT_SEC)
+        try:
+            return future.result(timeout=HANDLER_TIMEOUT_SEC)
+        except FuturesTimeout:
+            future.add_done_callback(self._on_watchdog_future_done_after_timeout)
+            raise
+
+    def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
+        """Callback wired by :meth:`run_with_watchdog` when its future
+        timed out. Fires later (microseconds to many seconds) when the
+        underlying work actually completes. We only count + log when
+        the late completion produced state — i.e., the future finished
+        without raising. A future that ultimately raised was a no-op
+        in the registry; nothing phantom there."""
+        if future.cancelled():
+            return
+        try:
+            future.result(timeout=0)
+        except Exception:
+            # Late failure — no phantom state landed in the registry.
+            return
+        self.increment_watchdog_late_completion()
+        logger.critical(
+            "watchdog late completion: a handler future timed out but the "
+            "underlying work completed successfully afterwards. Any state "
+            "it mutated (e.g., an EXCLUSIVE grant) is in the registry "
+            "without the agent's knowledge. Check /status?detail=metrics "
+            "for watchdog_late_completion_total and consider running "
+            "agent-coherence-status --detail=full to inspect orphaned "
+            "M/E grants. Counter total now: %d.",
+            self._watchdog_late_completion_total,
+        )
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
