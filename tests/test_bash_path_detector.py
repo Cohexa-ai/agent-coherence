@@ -196,3 +196,47 @@ def test_h4_bash_short_flag_with_value() -> None:
     # `head -n 20 plan.md` — `-n` is a flag; `20` should NOT be claimed
     # as a path (is_tracked("20") = False); plan.md detected.
     assert detect_tracked_paths("head -n 20 plan.md", _is_tracked) == ["plan.md"]
+
+
+# ----------------------------------------------------------------------
+# ADV-006 — wrapper command pass-through (eval, command, exec, builtin)
+# ----------------------------------------------------------------------
+
+
+def test_adv006_eval_wrapper_pass_through() -> None:
+    """ADV-006: `eval cat plan.md` was previously NOT detected — first
+    token 'eval' isn't a tracked command, detector broke immediately.
+    Now: skip the wrapper, re-evaluate the next position."""
+    assert detect_tracked_paths("eval cat plan.md", _is_tracked) == ["plan.md"]
+
+
+def test_adv006_command_wrapper_pass_through() -> None:
+    """`command cat plan.md` — `command` is a POSIX wrapper that
+    bypasses shell function lookup; pass through to `cat`."""
+    assert detect_tracked_paths("command cat plan.md", _is_tracked) == ["plan.md"]
+
+
+def test_adv006_exec_wrapper_pass_through() -> None:
+    """`exec cat plan.md` — `exec` replaces the shell process."""
+    assert detect_tracked_paths("exec cat plan.md", _is_tracked) == ["plan.md"]
+
+
+def test_adv006_builtin_wrapper_pass_through() -> None:
+    """`builtin cat plan.md` — bash builtin keyword (rare in practice)."""
+    assert detect_tracked_paths("builtin cat plan.md", _is_tracked) == ["plan.md"]
+
+
+def test_adv006_nested_wrappers_capped_at_max_depth() -> None:
+    """A pathological `eval eval eval eval eval cat plan.md` (5 wrappers)
+    exceeds the MAX_WRAPPERS=4 cap; the bash detector stops walking
+    after 4 wrappers + an unrecognized token. Defensive bound."""
+    # 4 wrappers + cat → still detected
+    assert detect_tracked_paths("eval eval eval eval cat plan.md", _is_tracked) == ["plan.md"]
+    # 5 wrappers + cat → stops at the 5th 'eval' (now treated as command), no match
+    assert detect_tracked_paths("eval eval eval eval eval cat plan.md", _is_tracked) == []
+
+
+def test_adv006_wrapper_without_tracked_command_returns_empty() -> None:
+    """`eval ls -la` — wrapper skipped, but `ls` isn't a tracked
+    command. No false positive."""
+    assert detect_tracked_paths("eval ls -la", _is_tracked) == []

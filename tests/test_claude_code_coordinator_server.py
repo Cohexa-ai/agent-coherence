@@ -2493,3 +2493,62 @@ def test_rel03_watchdog_queue_overflow_counter_under_concurrent_increment(
         assert srv._watchdog_queue_overflows_total == expected
     finally:
         srv.shutdown()
+
+
+# ----------------------------------------------------------------------
+# ADV-005 — empty/missing body rejected with explicit 400
+# ----------------------------------------------------------------------
+
+
+def test_adv005_content_length_zero_returns_explicit_400(coordinator) -> None:
+    """ADV-005: a POST with Content-Length:0 must produce an explicit
+    'missing or empty body' 400, not fall through to per-field
+    validation errors that mask the real cause."""
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/pre-read"
+    secret = load_secret(coordinator.coordinator_root)
+    req = urlrequest.Request(
+        url, data=b"", method="POST",
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Host": "127.0.0.1",
+            "Content-Type": "application/json",
+            "Content-Length": "0",
+        },
+    )
+    try:
+        urlrequest.urlopen(req, timeout=5)
+        pytest.fail("expected 400")
+    except urlerror.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read().decode())
+        assert "empty body" in body["error"].lower() or "missing" in body["error"].lower()
+
+
+def test_adv005_missing_content_length_returns_400(coordinator) -> None:
+    """A POST with no Content-Length header at all should also reject
+    with the same explicit error (Content-Length defaults to 0 in
+    _read_json on missing)."""
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/pre-read"
+    secret = load_secret(coordinator.coordinator_root)
+    # Build via raw socket to omit Content-Length entirely (urllib auto-adds it).
+    import socket as _socket
+    sock = _socket.create_connection(("127.0.0.1", coordinator.port))
+    try:
+        sock.sendall(
+            f"POST /hooks/pre-read HTTP/1.0\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {secret}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"\r\n".encode()
+        )
+        resp = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        # The status line is the first line of the response.
+        first_line = resp.split(b"\r\n", 1)[0].decode()
+        assert "400" in first_line, f"expected 400, got: {first_line}"
+    finally:
+        sock.close()

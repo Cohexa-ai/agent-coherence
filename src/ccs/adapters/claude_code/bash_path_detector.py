@@ -126,6 +126,20 @@ def _split_pipeline(command: str) -> Iterable[str]:
             yield segment
 
 
+_BASH_WRAPPER_COMMANDS: frozenset[str] = frozenset({
+    # ADV-006: wrappers that pass-through to a subcommand. We skip the
+    # wrapper word and re-evaluate the next position. False-negative
+    # bias preserved — the detector won't recurse into `bash -c '...'`
+    # body strings (that's a separate eval surface) and won't try to
+    # decode command substitutions like ``$(...)``. Just the common
+    # `eval cat plan.md` and `command cat plan.md` cases.
+    "eval",
+    "command",
+    "exec",
+    "builtin",
+})
+
+
 def _detect_in_segment(
     segment: str,
     is_tracked: Callable[[str], bool],
@@ -144,10 +158,21 @@ def _detect_in_segment(
     # bare value following a tracked command as a file-path candidate.
     i = 0
     n = len(tokens)
+    # ADV-006: bound the wrapper-skip loop so a pathological
+    # ``eval eval eval ... cat plan.md`` cannot consume unbounded
+    # iterations. 4 wrappers is generous (typical depth is 1).
+    wrappers_skipped = 0
+    MAX_WRAPPERS = 4
     while i < n:
         tok = tokens[i]
         # Skip leading env-var assignments like FOO=bar
         if "=" in tok and i == 0 and re.match(r"^[A-Z_][A-Z0-9_]*=", tok):
+            i += 1
+            continue
+        # ADV-006: skip pass-through wrappers (`eval`, `command`, etc.)
+        # and re-evaluate the next position as the actual command.
+        if tok in _BASH_WRAPPER_COMMANDS and wrappers_skipped < MAX_WRAPPERS:
+            wrappers_skipped += 1
             i += 1
             continue
         # Command word reached.
@@ -163,9 +188,9 @@ def _detect_in_segment(
                     break
                 if is_tracked(arg):
                     yield arg
-        # Always break after the first non-assignment token — we don't
-        # walk through nested commands ourselves; the pipeline split
-        # already separated those.
+        # Always break after the first non-assignment, non-wrapper token —
+        # we don't walk through nested commands ourselves; the pipeline
+        # split already separated those.
         break
 
 
