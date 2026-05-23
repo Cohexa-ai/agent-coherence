@@ -63,7 +63,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-`v0.7.1` released — refactor demo for write-side coherence + CI Node toolchain for real `tsc` validation. See [CHANGELOG.md](CHANGELOG.md) for the version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
+`v0.8.0` released — full Claude Code plugin coordinator (Python backend) plus the ce-review remediation pass. Adds six console scripts (`agent-coherence-coordinator`, `-status`, `-track`, `-untrack`, `-hook-client`, `-migrate-rules`); ships KTD-J telemetry, `/status` three-tier disclosure, `--self-test`, and `--prepare-for-migration` for safe Python↔Node coordinator backend switching. The companion [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin) ships `v0.1.1` of the marketplace plugin against this library. See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
 ## Paper
 
