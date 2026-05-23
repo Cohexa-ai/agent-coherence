@@ -6,6 +6,66 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+Unreleased work targets `v0.9.0`. Breaks the `coordinator_uptime_s`
+deprecation contract (alias removed per the `0.8.0` AC-02 plan) AND
+introduces new wire fields for v0.2 strict mode, so a minor bump is
+required.
+
+### Added — v0.2 strict mode (Python coordinator)
+
+- **Per-artifact strict-mode opt-in** via `.coherence/strict_mode.yaml`
+  (KTD-O). An artifact is strict iff its path matches both the
+  `tracked_paths` set AND the new `strict_mode_paths` globs. Empty
+  strict_mode_paths preserves v0.1.1 warn-mode for every artifact.
+- **Handler decision-flip in all 4 PreToolUse handlers** (Read,
+  Edit/Write, Bash, Grep) — `permissionDecision: "deny"` with the
+  static reason template `STRICT_MODE_DENY_REASON_TEMPLATE` (KTD-P)
+  fires when (strict + tracked + invalidated). First-time observers
+  (state None on existing artifact) fall through to warn-mode allow
+  per the semantic refinement during implementation.
+- **`TERMINAL_DENIAL_CLASSES` security invariant** (KTD-U) — module-
+  level `frozenset` enumerating denial classes that must never be
+  converted to `permissionDecision: "allow"`. All 6 allow-emission
+  call sites route through `emit_allow()` which asserts the invariant;
+  AST-based meta-test grep-counts call sites in `coordinator_server.py`
+  + `hook_payloads.py` so a future contributor adding a new allow
+  path is forced to extend the parameter list.
+- **`agent-coherence-migrate-deny` CLI** (KTD-R) — stricter sibling
+  to `agent-coherence-migrate-rules`. STDOUT-only (never writes to
+  settings.json), symlink-contained (canonical-path containment check),
+  never invokes an LLM, never reads files outside resolved workspace
+  root. Under-emit bias: only canonical phrasings trigger.
+- **Strict-mode telemetry** (KTD-V minimal + KTD-J extension) —
+  `strict_mode_denials_total`, `strict_mode_routed_around_via_bash_total`
+  (Phase 0 H4 routing pattern detector with 30s window),
+  `audit_log_mode_drift_total` counters surfaced via
+  `/status?detail=metrics`. Minimal deny-only audit log appended as
+  JSONL to `.coherence/audit.log` (mode 0o600, no schema_version, no
+  command bodies, no user content).
+- **Cross-implementation protocol corpus** (Unit 7) —
+  `tests/protocol_corpus/` harness + 12 warn-mode + 8 strict-mode
+  fixtures + opt-in `protocol_corpus` pytest marker + new
+  `protocol-corpus` CI job. Catches Python ↔ Node coordinator
+  wire-shape drift before it ships. Strict-mode fixtures are
+  python-only (Node coordinator doesn't ship strict mode in v0.2).
+
+### Changed
+
+- **Hook payload builders** (`build_stale_response`,
+  `build_collision_response`) now route through `emit_allow()` per
+  the KTD-U structural invariant.
+- **Static deny-reason text** for strict-mode replaces v0.1.1's
+  per-invocation-varying warn-mode prose. Phase 0 H1 falsification
+  inverted the original "varied text bounds retries" hypothesis on
+  opus; static text byte-identical across retries is the right shape.
+
+### Plugin compatibility
+
+- v0.2 of the [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin)
+  consumes this library via its broad-beta launch package (plan Units
+  8-11). The Node coordinator does NOT ship strict mode in v0.2 —
+  strict-mode workspaces must use `coherence.coordinator_backend = "python"`.
+
 ## [0.8.0] — 2026-05-23
 
 **Stable release of the Claude Code plugin coordinator backend.** Promotes the `0.8.0a1` alpha pre-release to a final `0.8.0` after the v0.1.1 marketplace cohort + full ce-review remediation pass landed. Both the coordinator HTTP surface and the wire contract are now considered stable through the `0.8.x` minor line; breaking changes will bump to `0.9.0` per SemVer.
