@@ -36,6 +36,17 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+STRICT_MODE_PATH_WARN_THRESHOLD: int = 50
+"""v0.2 KTD-O footgun guard: if ``strict_mode_paths`` matches more than this
+many tracked artifacts, the policy emits a one-shot WARNING via
+:meth:`TrackedArtifactPolicy.warn_if_strict_threshold_exceeded`. The caller
+(coordinator service after artifact registration / status snapshot) invokes
+the check at runtime — the policy module itself cannot enumerate tracked
+artifacts at load time because the artifact set lives in SQLite, not on disk
+as concrete paths. Guards against an operator typing ``**`` in
+``strict_mode.yaml`` and silently locking down the whole workspace."""
+
+
 DEFAULT_TRACKED_PATTERNS: tuple[str, ...] = (
     # Repo-root coordination files
     "CLAUDE.md",
@@ -94,6 +105,14 @@ class TrackedArtifactPolicy:
     tracked_patterns: tuple[str, ...] = DEFAULT_TRACKED_PATTERNS
     ignored_patterns: tuple[str, ...] = ()
     user_added_patterns: tuple[str, ...] = field(default_factory=tuple)
+    strict_mode_paths: tuple[str, ...] = field(default_factory=tuple)
+    """v0.2 KTD-O: glob patterns that opt selected tracked artifacts into
+    strict mode. An artifact is in strict mode iff it is in the tracked set
+    AND matches at least one strict_mode_paths glob. Empty tuple → no
+    artifacts in strict mode (back-compatible with v0.1 / v0.1.1, where
+    every tracked artifact is warn-mode by default). Loaded from
+    ``.coherence/strict_mode.yaml`` (parallel to tracked.yaml /
+    ignored.yaml); same path-traversal guard applies."""
     rejected_patterns: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     """Patterns rejected by the path-traversal guard, with reason. Surfaced
     by :meth:`rejected` for status/debug visibility."""
@@ -103,6 +122,12 @@ class TrackedArtifactPolicy:
     _compiled_patterns: dict[str, re.Pattern[str]] = field(
         default_factory=dict, repr=False, compare=False
     )
+    # KTD-O one-shot threshold-warning guard. Reset on every reload() so a
+    # post-track policy swap can re-emit the warning if the operator widened
+    # the strict-mode glob in a hot-reload path.
+    _strict_threshold_warning_emitted: bool = field(
+        default=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Pre-compile all ``**``-containing patterns across all pattern sets."""
@@ -110,6 +135,7 @@ class TrackedArtifactPolicy:
             self.tracked_patterns,
             self.ignored_patterns,
             self.user_added_patterns,
+            self.strict_mode_paths,
         ):
             for p in patterns:
                 if p not in self._compiled_patterns:
@@ -120,18 +146,21 @@ class TrackedArtifactPolicy:
     @classmethod
     def load(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
         """Load policy: defaults + ``.coherence/tracked.yaml`` opt-in +
-        ``.coherence/ignored.yaml`` opt-out. YAML files are optional.
-        Patterns failing the path-traversal guard are rejected with WARNING."""
+        ``.coherence/ignored.yaml`` opt-out + ``.coherence/strict_mode.yaml``
+        v0.2 opt-in (KTD-O). All YAML files are optional. Patterns failing
+        the path-traversal guard are rejected with WARNING."""
         root = Path(coordinator_root).resolve()
         rejected: list[tuple[str, str]] = []
 
         added = _load_yaml_patterns(root / ".coherence" / "tracked.yaml", rejected)
         ignored = _load_yaml_patterns(root / ".coherence" / "ignored.yaml", rejected)
+        strict = _load_yaml_patterns(root / ".coherence" / "strict_mode.yaml", rejected)
         return cls(
             coordinator_root=root,
             tracked_patterns=DEFAULT_TRACKED_PATTERNS,
             ignored_patterns=tuple(ignored),
             user_added_patterns=tuple(added),
+            strict_mode_paths=tuple(strict),
             rejected_patterns=tuple(rejected),
         )
 
@@ -159,6 +188,65 @@ class TrackedArtifactPolicy:
             return False
         return True
 
+    def is_strict_mode(self, parent_relative_path: str) -> bool:
+        """v0.2 KTD-O: return True iff the path is in strict mode.
+
+        Strict-mode contract: a path is in strict mode iff it is in the
+        tracked set AND matches at least one strict_mode_paths glob.
+        Intersection semantics — never applies to untracked paths even when
+        a strict_mode pattern would match them. Empty strict_mode_paths
+        short-circuits to False (back-compat with v0.1.1).
+
+        Hooks gate strict-mode behavior (``permissionDecision: "deny"``) on
+        this method only; the v0.1.1 warn-mode allow path is preserved for
+        every artifact that returns False here."""
+        if not self.strict_mode_paths:
+            # Fast path — no strict-mode opt-in; v0.1.1 behavior preserved.
+            return False
+        if not self.is_tracked(parent_relative_path):
+            # Intersection: strict mode never applies to untracked paths.
+            return False
+        normalized = _normalize_relative(parent_relative_path)
+        if normalized is None:
+            return False
+        return _matches_any(normalized, self.strict_mode_paths, self._compiled_patterns)
+
+    def count_strict_mode_matches(self, candidate_paths: Iterable[str]) -> int:
+        """Count how many of ``candidate_paths`` are in strict mode.
+
+        Used by the coordinator service (after registry status snapshot) to
+        feed :meth:`warn_if_strict_threshold_exceeded` without forcing the
+        policy module to know about the registry."""
+        return sum(1 for p in candidate_paths if self.is_strict_mode(p))
+
+    def warn_if_strict_threshold_exceeded(
+        self,
+        candidate_paths: Iterable[str],
+        threshold: int = STRICT_MODE_PATH_WARN_THRESHOLD,
+    ) -> bool:
+        """v0.2 KTD-O footgun guard. One-shot WARNING emitter.
+
+        Returns True if a warning was emitted (count > threshold) on this
+        invocation. Subsequent calls return False until policy reload —
+        guards against log-spam under repeated /status calls. The caller is
+        the coordinator service; it invokes this after enumerating tracked
+        artifacts so the count is concrete rather than glob-derived."""
+        if self._strict_threshold_warning_emitted:
+            return False
+        count = self.count_strict_mode_matches(candidate_paths)
+        if count > threshold:
+            logger.warning(
+                "strict_mode_paths matches %d tracked artifacts (> threshold %d). "
+                "Verify .coherence/strict_mode.yaml is not over-broad — e.g., "
+                "a literal '**' pattern silently opts the entire workspace into "
+                "strict mode (permissionDecision: 'deny' on stale reads).",
+                count,
+                threshold,
+            )
+            self._strict_threshold_warning_emitted = True
+            return True
+        return False
+
     def rejected(self) -> Sequence[tuple[str, str]]:
         """Return (pattern, reason) pairs rejected by the path-traversal guard."""
         return self.rejected_patterns
@@ -170,6 +258,7 @@ class TrackedArtifactPolicy:
             "default_pattern_count": len(self.tracked_patterns),
             "user_added_pattern_count": len(self.user_added_patterns),
             "ignored_pattern_count": len(self.ignored_patterns),
+            "strict_mode_pattern_count": len(self.strict_mode_paths),
             "rejected_pattern_count": len(self.rejected_patterns),
         }
 
