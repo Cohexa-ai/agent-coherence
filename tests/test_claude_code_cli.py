@@ -262,6 +262,154 @@ def test_status_json_mode_emits_raw_payload(
     assert data["coordinator_pid"] == os.getpid()
 
 
+def test_status_detail_metrics_renders_counter_block(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """KTD-J (Unit 8): --detail metrics returns the counter block only —
+    no artifact/session walk in the output."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main([
+        "--root", str(workspace), "--detail", "metrics",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Coordinator metrics:" in captured.out
+    assert "backend=python" in captured.out
+    # Endpoint counter block must be present (zero-valued is fine on a
+    # fresh coordinator with no hook traffic yet).
+    assert "Counters:" in captured.out
+    assert "pre_read_total" in captured.out
+    assert "intra_task_acquire_release_total" in captured.out
+    # No artifact/session block in metrics mode.
+    assert "Observed artifacts" not in captured.out
+    assert "Sessions:" not in captured.out
+
+
+def test_status_detail_minimal_includes_pid_redacts_abs_root(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--detail minimal shows coordinator_pid (P1 #7: pid is public on
+    POSIX and operators rely on it). The absolute workspace root stays
+    sentinel'd to ``.`` so $HOME / directory layout never leaks at this
+    tier."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main([
+        "--root", str(workspace), "--detail", "minimal",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Coordinator:" in captured.out
+    # P1 #7: pid IS in the minimal tier header.
+    assert f"pid={os.getpid()}" in captured.out
+    # Absolute root must NOT leak at this tier.
+    assert str(workspace) not in captured.out
+
+
+def test_status_full_default_includes_counters_below_sessions(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default --detail=full table rendering now includes a Counters
+    section after the artifacts/sessions block."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main(["--root", str(workspace)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Counters:" in captured.out
+    assert "pre_read_total" in captured.out
+
+
+def test_self_test_passes_against_live_coordinator(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """KTD-J --self-test smoke: full pre-read → pre-edit → post-edit →
+    stale pre-read chain must report OK against a healthy coordinator."""
+    workspace, port = live_coordinator
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+    captured = capsys.readouterr()
+    assert rc == 0, (
+        f"--self-test failed unexpectedly: stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    assert "OK" in captured.out
+    assert "pre-read STALE" in captured.out
+
+
+def test_self_test_returns_3_when_no_coordinator_running(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If the coordinator isn't running, --self-test exits 3 with an
+    actionable diagnostic — operators can distinguish 'no coordinator'
+    from 'coordinator broken'."""
+    rc = coherence_status.main([
+        "--root", str(git_workspace), "--self-test",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "coordinator unreachable" in captured.err or "coordinator" in captured.err
+
+
+# ----------------------------------------------------------------------
+# Unit 8 — agent-coherence-coordinator --prepare-for-migration
+# ----------------------------------------------------------------------
+
+
+def test_prepare_for_migration_no_coordinator_running_is_noop(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Idempotent: --prepare-for-migration on a workspace with no
+    .coherence/server.pid is a no-op exit 0 so it's safe to script
+    as a pre-switch step that may not always find a live coordinator."""
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "no coordinator running" in captured.out
+
+
+def test_prepare_for_migration_releases_grants_and_shuts_down(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decision 1 contract: with an EXCLUSIVE grant held by some agent
+    on some tracked artifact, --prepare-for-migration releases the
+    grant (state transitions away from M/E) and the coordinator's HTTP
+    server is no longer reachable when the command returns."""
+    import socket
+    workspace, port = live_coordinator
+
+    # Set up an EXCLUSIVE grant via the real HTTP path so registry
+    # state matches what a real client would have written.
+    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    endpoint = resolve_endpoint(workspace)
+    sid = "11111111-2222-4111-8111-aaaaaaaaaaaa"
+    _post(endpoint, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    # Now drive the migration helper.
+    rc = coherence_coordinator.main([
+        "--root", str(workspace), "--prepare-for-migration",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0, (
+        f"prepare-for-migration failed: stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    # Output should report at least one released grant.
+    assert "released" in captured.out
+
+    # Coordinator must no longer be TCP-reachable.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sock.close()
+        pytest.fail(
+            f"coordinator at port={port} still accepting connections after "
+            "--prepare-for-migration"
+        )
+    except OSError:
+        pass  # expected — connection refused after shutdown
+
+
 # ----------------------------------------------------------------------
 # coherence_track + coherence_untrack — validation + happy path
 # ----------------------------------------------------------------------

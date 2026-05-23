@@ -26,7 +26,7 @@ import pytest
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
-    _read_port_from_file,
+    read_port_from_file as _read_port_from_file,
     connect_or_spawn,
     ensure_coordinator,
     stop_coordinator,
@@ -645,3 +645,259 @@ def test_g4_shutdown_raise_aborts_without_releasing_lock(
     # Manual cleanup for the test (otherwise we'd leak the lock_fd).
     monkeypatch.undo()
     stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# KTD-H (Unit 5 L1) — inode revalidation per retry iteration
+# ----------------------------------------------------------------------
+
+
+def test_l1_inode_match_helper_detects_unlink_recreate(workspace: Path) -> None:
+    """L1 invariant: ``_inode_matches`` returns True when fd and path point
+    at the same inode, and False after an external unlink + recreate.
+    Canonical l1_ prefix per plan §'Cross-cutting test discipline' line 789."""
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pid_file = coherence_dir / "server.pid"
+    pid_file.write_text("", encoding="utf-8")
+    fd = os.open(pid_file, os.O_RDWR)
+    try:
+        # Same inode → match.
+        assert lifecycle._inode_matches(fd, pid_file) is True
+
+        # Unlink + recreate → mismatch.
+        pid_file.unlink()
+        pid_file.write_text("", encoding="utf-8")
+        assert lifecycle._inode_matches(fd, pid_file) is False
+    finally:
+        os.close(fd)
+
+
+def test_h1_inode_matches_helper_detects_unlink_recreate(workspace: Path) -> None:  # backward alias
+    return test_l1_inode_match_helper_detects_unlink_recreate(workspace)
+
+
+def test_h2_inode_matches_returns_false_when_path_absent(workspace: Path) -> None:
+    """If the path is unlinked entirely (no recreate), the helper still
+    returns False rather than raising — caller treats as 'revalidate'."""
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pid_file = coherence_dir / "server.pid"
+    pid_file.write_text("", encoding="utf-8")
+    fd = os.open(pid_file, os.O_RDWR)
+    try:
+        pid_file.unlink()
+        assert lifecycle._inode_matches(fd, pid_file) is False
+    finally:
+        os.close(fd)
+
+
+def test_h3_ensure_coordinator_recovers_after_rm_rf_race(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KTD-H end-to-end: simulate an external ``rm -rf .coherence/`` between
+    the pid-file open and the first retry iteration. ``ensure_coordinator``
+    must detect the inode mismatch, re-open, and still bind a coordinator
+    on a fresh inode rather than holding an orphan fd."""
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.02,
+        inode_revalidation_budget=3,
+        spawn_self_probe_attempts=20,
+        spawn_self_probe_interval_sec=0.05,
+    )
+
+    # Monkey-patch _open_pidfile so the FIRST call performs the open AND
+    # immediately wipes the directory (simulating `rm -rf .coherence`
+    # racing in just after open). Subsequent calls open normally.
+    real_open = lifecycle._open_pidfile
+    call_count = {"n": 0}
+
+    def open_then_wipe(pid_file: Path) -> Optional[int]:
+        call_count["n"] += 1
+        fd = real_open(pid_file)
+        if fd is None:
+            return None
+        if call_count["n"] == 1:
+            # Simulate the race: external rm -rf wipes .coherence/ AFTER
+            # we got our fd. Our fd now refers to an orphaned inode.
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+        return fd
+
+    monkeypatch.setattr(lifecycle, "_open_pidfile", open_then_wipe)
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port > 0, (
+            f"expected ensure_coordinator to recover via inode revalidation; got {port}"
+        )
+        # The live pid file should match the bound port.
+        pid_file = workspace / ".coherence" / "server.pid"
+        live_port = _read_port_from_file(pid_file)
+        assert live_port == port, (
+            f"pid file ({live_port}) does not reflect bound port ({port}) — "
+            "winner may have written to an orphaned inode"
+        )
+        # At least one revalidation must have occurred.
+        assert call_count["n"] >= 2, (
+            f"_open_pidfile called only {call_count['n']} time(s); "
+            "expected at least 2 (initial + revalidation re-open)"
+        )
+    finally:
+        monkeypatch.undo()
+        stop_coordinator(workspace)
+
+
+def test_h4_revalidation_budget_exhaustion_returns_minus_one(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological churn: every iteration sees a fresh inode mismatch.
+    The revalidation budget caps the recovery work and returns -1 cleanly
+    rather than spinning forever."""
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=5,
+        port_file_retry_interval_sec=0.01,
+        inode_revalidation_budget=2,
+    )
+
+    # Force _inode_matches to always report mismatch — simulates an
+    # adversary unlinking the pid file every iteration.
+    monkeypatch.setattr(lifecycle, "_inode_matches", lambda _fd, _path: False)
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port == -1, (
+            f"expected -1 after revalidation budget exhausted; got {port}"
+        )
+    finally:
+        monkeypatch.undo()
+
+
+# ----------------------------------------------------------------------
+# Unit 5 L3 — cold-start instrumentation (telemetry only)
+# ----------------------------------------------------------------------
+
+
+def test_l3_cold_start_duration_populated_on_winner_path(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """L3 instrumentation: the lifecycle winner path measures the wall-clock
+    time from CoordinatorHTTPServer construction through self-probe success
+    and stores it on the coordinator for the future /status endpoint."""
+    port = ensure_coordinator(workspace, config=fast_cfg)
+    assert port > 0
+    try:
+        entry = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())]
+        # Some time must have been recorded — fast hardware can finish under
+        # 50ms but never zero.
+        assert entry.coordinator.cold_start_duration_ms > 0.0
+        # Sanity ceiling: even on a slow CI runner, cold start under the
+        # spawn self-probe budget plus a generous margin.
+        ceiling_ms = (
+            fast_cfg.spawn_self_probe_attempts
+            * fast_cfg.spawn_self_probe_interval_sec
+            * 1000.0
+        ) + 1000.0
+        assert entry.coordinator.cold_start_duration_ms < ceiling_ms, (
+            f"cold_start_duration_ms={entry.coordinator.cold_start_duration_ms:.1f} "
+            f"exceeded ceiling {ceiling_ms:.1f}ms"
+        )
+    finally:
+        stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# KP-7 — wait_for_shutdown public API
+# ----------------------------------------------------------------------
+
+
+def test_kp7_wait_for_shutdown_returns_false_when_no_entry(tmp_path):
+    """wait_for_shutdown returns False when no in-process coordinator
+    entry exists for the given root (idempotent observer; no spawn)."""
+    from ccs.adapters.claude_code.lifecycle import wait_for_shutdown
+    assert wait_for_shutdown(tmp_path, timeout_sec=0.1) is False
+
+
+def test_kp7_wait_for_shutdown_returns_true_after_stop(tmp_path, fast_cfg):
+    """End-to-end: spawn → stop in background → wait_for_shutdown
+    returns True once shutdown_done flips."""
+    import threading as _t
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+
+    # Stop in a background thread; main waits.
+    def trigger_stop():
+        time.sleep(0.1)
+        stop_coordinator(tmp_path)
+
+    _t.Thread(target=trigger_stop, daemon=True).start()
+    assert wait_for_shutdown(tmp_path, poll_interval_sec=0.05, timeout_sec=3.0) is True
+
+
+def test_kp7_wait_for_shutdown_times_out_when_coordinator_stays_up(
+    tmp_path, fast_cfg
+):
+    """timeout_sec elapsed without shutdown → returns False, leaves the
+    coordinator running so the caller can react."""
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+    try:
+        # Coordinator is up; wait_for_shutdown must time out.
+        assert wait_for_shutdown(tmp_path, poll_interval_sec=0.05, timeout_sec=0.3) is False
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# PS-03 — L2 (in-flight drain on shutdown) invariant alias tests
+# ----------------------------------------------------------------------
+#
+# The Unit 5 plan mandates at least one ``test_l2_*`` prefixed test in
+# this file. The substantive drain coverage lives in
+# tests/test_claude_code_coordinator_server.py as ``test_i1..i6``
+# (acquire/release pairing, drain blocking until release, drain
+# timeout, dispatch wiring, exception-path balance). The alias
+# below routes the lifecycle-suite reader to the existing detail
+# and exercises the public shutdown → drain → unreachable path.
+
+
+def test_l2_drain_observable_via_lifecycle_stop(tmp_path, fast_cfg):
+    """L2 (KTD-I) invariant: stop_coordinator() drives the in-flight
+    drain inside CoordinatorHTTPServer.shutdown() and returns only
+    after the registry is closed. End-to-end smoke that the public
+    lifecycle API wires the drain correctly; detailed acquire/release
+    semantics are in test_claude_code_coordinator_server::test_i1..i6.
+    """
+    from ccs.adapters.claude_code.lifecycle import (
+        ensure_coordinator,
+        stop_coordinator,
+    )
+
+    port = ensure_coordinator(tmp_path, config=fast_cfg)
+    assert port > 0
+    # No in-flight requests: drain should return promptly (well under
+    # IN_FLIGHT_DRAIN_TIMEOUT_SEC=5s). Just verifying the path runs.
+    start = time.monotonic()
+    stop_coordinator(tmp_path)
+    elapsed = time.monotonic() - start
+    assert elapsed < 4.0, (
+        f"shutdown with no in-flight handlers took {elapsed:.2f}s; "
+        "drain may not be returning promptly when counter is already 0"
+    )

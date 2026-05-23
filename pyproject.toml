@@ -35,6 +35,11 @@ agent-coherence-coordinator = "ccs.cli.coherence_coordinator:main"
 agent-coherence-status = "ccs.cli.coherence_status:main"
 agent-coherence-track = "ccs.cli.coherence_track:main"
 agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
+# Unit 9 (R19): scans workspace CLAUDE.md for prose tool-class rules
+# ("use rg, not grep", "never sudo") and proposes permissions.deny
+# entries. Flag-only by default; --apply writes to settings.local.json
+# after a confirmation prompt.
+agent-coherence-migrate-rules = "ccs.cli.coherence_migrate_rules:main"
 # Phase E.0 probe 2A surfaced that CC v2.1.131 rejects hooks.json URLs
 # containing ${COHERENCE_PORT} at LOAD TIME. HTTP-type hooks are not viable;
 # the plugin uses command-type hooks that invoke this client, which reads

@@ -161,8 +161,23 @@ class SqliteArtifactRegistry:
         )
         # WAL for concurrent readers + bounded busy_timeout for write contention.
         # synchronous=NORMAL is durable enough for non-financial use.
+        #
+        # busy_timeout=1500ms per v0.1.1 KTD-K REVISED ordering rule (lowered
+        # from 2000ms). SQLite's busy_timeout is per-LOCK-ACQUISITION retry
+        # budget, NOT per-transaction. A `write` transaction issues two lock
+        # acquisitions (BEGIN IMMEDIATE acquires RESERVED + COMMIT promotes to
+        # EXCLUSIVE), each consuming up to busy_timeout. Under sustained
+        # contention, the prior 2000ms could compose to 4000ms cumulative —
+        # equal to or above the 4s handler watchdog ceiling, racing the
+        # SQLITE_BUSY return against the FuturesTimeout. The corrected formula
+        # `busy_timeout ≤ (HANDLER_DEADLINE_SEC − safety) / max_lock_acquisitions`
+        # gives `(4s − 0.5s safety) / 2 = 1.75s`; round down to 1500ms with
+        # additional safety margin against multi-statement transactions that
+        # may carry >2 lock acquisitions. See v0.1.1 plan KTD-K + the prior
+        # version of this constant; do NOT raise without re-deriving against
+        # the worst-case-lock-acquisition count for the hot path.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=2000")
+        self._conn.execute("PRAGMA busy_timeout=1500")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
@@ -488,6 +503,47 @@ class SqliteArtifactRegistry:
             ).fetchall()
         return {UUID(hex=r[0]): MESIState[r[1]] for r in rows}
 
+    def status_snapshot(
+        self,
+    ) -> tuple[
+        dict[UUID, dict[str, Any]],
+        dict[UUID, dict[UUID, MESIState]],
+    ]:
+        """PERF-1 single-query batch for /status. Returns:
+
+        - ``artifact_by_id``: ``{artifact_id: {"name", "version"}}`` — every
+          known artifact, one entry per row.
+        - ``state_by_artifact``: ``{artifact_id: {agent_id: MESIState}}`` —
+          the per-artifact state map for every artifact (empty inner dict
+          for artifacts no agent has ever held).
+
+        Two queries (artifacts + agent_states joined by artifact_id), held
+        under one lock so the snapshot is consistent. Replaces the old
+        per-artifact loop that issued ``2 * N`` separate SELECTs
+        (``get_artifact`` + ``get_state_map`` for each id) — eliminates
+        the N+1 hot path in ``_handle_status``.
+        """
+        artifact_by_id: dict[UUID, dict[str, Any]] = {}
+        state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        with self._lock:
+            for row in self._conn.execute(
+                "SELECT id, name, version FROM artifacts"
+            ).fetchall():
+                aid = UUID(hex=row[0])
+                artifact_by_id[aid] = {"name": row[1], "version": row[2]}
+                state_by_artifact[aid] = {}
+            for row in self._conn.execute(
+                "SELECT artifact_id, agent_id, state FROM agent_states"
+            ).fetchall():
+                aid = UUID(hex=row[0])
+                gid = UUID(hex=row[1])
+                # Only artifacts present in artifact_by_id get state rows.
+                # Defensive: skip orphans from race with concurrent delete.
+                if aid not in state_by_artifact:
+                    continue
+                state_by_artifact[aid][gid] = MESIState[row[2]]
+        return artifact_by_id, state_by_artifact
+
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
         with self._lock:
@@ -515,6 +571,9 @@ class SqliteArtifactRegistry:
         does not create a phantom gap.
         """
         with self._lock:
+            # COR-02: initialised outside the try so the except handler can
+            # check it even if BEGIN IMMEDIATE or any pre-_seq SQL raises.
+            seq_incremented_in_iteration = False
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 # Fetch prior state for the from→to log entry + bookkeeping decisions.
@@ -587,8 +646,16 @@ class SqliteArtifactRegistry:
                 # Mutation-then-log: emit state_log BEFORE commit. If the callback
                 # raises, ROLLBACK undoes the agent_states change AND we decrement
                 # _seq so gap detection stays consistent.
+                #
+                # COR-02: track _seq mutation in this iteration so the outer
+                # BaseException handler can also roll it back. Without this, a
+                # COMMIT failure leaves in-memory _seq ahead of persisted
+                # registry_meta.sequence_number — subsequent successful emissions
+                # produce a phantom gap. The inner Exception-during-state_log
+                # path already decrements; the outer ROLLBACK path now does too.
                 if self._state_log is not None:
                     self._seq += 1
+                    seq_incremented_in_iteration = True
                     entry = {
                         "tick": tick,
                         "artifact_id": str(artifact_id),
@@ -607,6 +674,7 @@ class SqliteArtifactRegistry:
                         self._state_log(entry)
                     except Exception:
                         self._seq -= 1
+                        seq_incremented_in_iteration = False
                         raise
                     # Persist new _seq value so cross-restart consumers see continuity.
                     self._conn.execute(
@@ -615,12 +683,18 @@ class SqliteArtifactRegistry:
                     )
 
                 self._conn.execute("COMMIT")
+                # COMMIT succeeded — _seq is durably persisted; no rollback needed.
+                seq_incremented_in_iteration = False
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
                 # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
                 # before propagation — otherwise the connection is left with an
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
+                # COR-02: if _seq was bumped in this iteration but COMMIT (or any
+                # later step) failed, decrement to match the rolled-back DB state.
+                if seq_incremented_in_iteration:
+                    self._seq -= 1
                 raise
 
     # ------------------------------------------------------------------
@@ -858,15 +932,29 @@ class SqliteArtifactRegistry:
                 )
                 self._conn.execute("COMMIT")
                 return new_id
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
                 # Lost the UNIQUE-on-name race; another caller inserted between
                 # our SELECT and INSERT. ROLLBACK and re-fetch.
+                #
+                # COR-04: a concurrent remove_artifact between ROLLBACK and
+                # re-fetch can leave the row absent. Old behaviour: re-raise
+                # the original IntegrityError with no context — operator sees
+                # a confusing "UNIQUE constraint failed" trace for what's
+                # really a delete race. New behaviour: raise an explicit
+                # informative RuntimeError so the operator knows exactly
+                # what happened.
                 self._conn.execute("ROLLBACK")
                 row = self._conn.execute(
                     "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
                 ).fetchone()
                 if row is None:
-                    raise  # genuine integrity error, not the race
+                    raise RuntimeError(
+                        f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
+                        "but the winning row was deleted before re-fetch. This "
+                        "indicates a concurrent remove_artifact running against the "
+                        "same name — caller should retry or treat the artifact as "
+                        f"absent. Original IntegrityError: {exc}"
+                    ) from exc
                 return UUID(hex=row[0])
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
@@ -904,6 +992,44 @@ class SqliteArtifactRegistry:
                 "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
             ).fetchone()
         return UUID(hex=row[0]) if row else None
+
+    def artifact_names_under_prefix(self, prefix: str) -> list[str]:
+        """Return tracked-artifact paths registered under a directory prefix.
+
+        Used by ``/hooks/pre-grep`` (v0.1.1 KTD-N) to find tracked artifacts
+        a Grep operation would scan. Prefix matching uses SQL ``LIKE`` with
+        ``escape`` to defang any ``%``/``_`` wildcards in the operator-
+        supplied search root. Empty/``.``/``./`` prefix returns all
+        registered artifacts (Grep over workspace root).
+        """
+        # Normalize prefix. Treat empty / "." / "./" as "all artifacts".
+        if prefix in ("", ".", "./"):
+            with self._lock:
+                rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
+            return [r[0] for r in rows]
+        # Strip trailing slash; ensure we don't accidentally claim
+        # "docs/specs-internal/" as a child of "docs/specs/".
+        normalized = prefix.rstrip("/") + "/"
+        # Escape SQL LIKE wildcards.
+        escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = escaped + "%"
+        exact_match = prefix.rstrip("/")
+        # REL-08: combine the LIKE-prefix query and the exact-match query
+        # into a single UNION under one lock acquisition. The prior
+        # two-step pattern released the lock between queries — a
+        # concurrent delete or rename could remove an artifact between
+        # them, producing a torn result set (LIKE row gone but exact-
+        # match row appears, or vice versa). Single query closes the gap.
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
+                UNION
+                SELECT name FROM artifacts WHERE name = ?
+                """,
+                (pattern, exact_match),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # A1 — Preemption notices (silent-grant-revocation surfacing)
@@ -1099,6 +1225,25 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def last_writer_for(self, artifact_id: UUID) -> Optional[UUID]:
+        """COR-09: return the agent UUID that most recently committed to
+        ``artifact_id``, or None if the artifact has no committed writer
+        (first-observation-only, no successful post-edit yet).
+
+        Reads ``artifacts.last_writer_id`` directly so the answer reflects
+        actual commit history rather than current in-memory state. Closes
+        the COR-09 gap where the state-map fallback could attribute the
+        write to the very session receiving the stale-read warning.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_writer_id FROM artifacts WHERE id = ?",
+                (artifact_id.hex,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return UUID(hex=row[0])
 
     def _fetch_artifact_row(self, artifact_id: UUID) -> Optional[_ArtifactRow]:
         with self._lock:

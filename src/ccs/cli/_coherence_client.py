@@ -24,9 +24,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from ccs.adapters.claude_code.lifecycle import _read_port_from_file
+from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +47,21 @@ def err(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def validate_relative_path(p: str) -> Optional[str]:
-    """Reject absolute paths, ``..`` traversal, and empty input. Returns
+def validate_relative_path(p: str) -> str | None:
+    """Client-side path pre-check before sending to the coordinator.
+
+    Reject absolute paths, ``..`` traversal, and empty input. Returns
     None on valid, a reason string on invalid.
+
+    M-02 layer-distinction note: this is the CLI-side check (light;
+    designed for friendly operator error messages before the request
+    is built). The server-side check is
+    :func:`ccs.adapters.claude_code.coordinator_server.validate_path`
+    — STRICTER (also rejects backslash-leading paths, control characters,
+    paths longer than MAX_PATH_LEN, non-string types). The server-side
+    check is the authoritative gate; this CLI check is for fast feedback
+    without a coordinator round-trip. Do NOT remove either — they live
+    at different layers of the trust boundary.
 
     P2 ce-review fix #6 (maintainability): consolidates the
     ``_validate_path`` helper that previously existed byte-for-byte in
@@ -118,33 +130,60 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     return CoordinatorEndpoint(port=port, bearer=bearer)
 
 
-def get(endpoint: CoordinatorEndpoint, path: str) -> dict[str, Any]:
+def get(
+    endpoint: CoordinatorEndpoint,
+    path: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Authenticated GET. Raises :class:`CoordinatorUnavailable` on network
     error; raises :class:`urllib.error.HTTPError` for non-2xx so the caller
-    can format status codes explicitly."""
+    can format status codes explicitly.
+
+    R12 (Unit 6): ``extra_headers`` lets local-operator CLIs (e.g.,
+    ``agent-coherence-status``) add ``Coherence-Local-Operator: true``
+    for the elevated ``/status?detail=full`` tier without hard-coding
+    that header here."""
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {endpoint.bearer}",
+        "Host": "127.0.0.1",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url=f"{endpoint.base_url}{path}",
         method="GET",
-        headers={
-            "Authorization": f"Bearer {endpoint.bearer}",
-            "Host": "127.0.0.1",
-        },
+        headers=headers,
     )
     return _execute(req)
 
 
-def post(endpoint: CoordinatorEndpoint, path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Authenticated POST with JSON body."""
+def post(
+    endpoint: CoordinatorEndpoint,
+    path: str,
+    body: dict[str, Any],
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Authenticated POST with JSON body.
+
+    M-04 / finding #28: ``extra_headers`` mirrors the pattern on ``get()``
+    so callers can add e.g. ``Coherence-Local-Operator: true`` without
+    reimplementing the urllib transport layer.
+    """
     payload = json.dumps(body).encode("utf-8")
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {endpoint.bearer}",
+        "Host": "127.0.0.1",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url=f"{endpoint.base_url}{path}",
         data=payload,
         method="POST",
-        headers={
-            "Authorization": f"Bearer {endpoint.bearer}",
-            "Host": "127.0.0.1",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     return _execute(req)
 
@@ -175,7 +214,7 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         ) from exc
 
 
-def http_status_from_error(exc: urllib.error.HTTPError) -> Optional[dict[str, Any]]:
+def http_status_from_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
     """Best-effort JSON decode of an HTTPError body, for one-line user output."""
     try:
         raw = exc.read()

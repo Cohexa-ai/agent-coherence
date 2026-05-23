@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Literal, NotRequired, Optional, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 
 # ----------------------------------------------------------------------
@@ -81,7 +81,7 @@ class StaleSummary(TypedDict):
     """
     path: str
     current_version: int
-    prior_version_seen_by_session: Optional[int]
+    prior_version_seen_by_session: int | None
     last_writer_session_id: str
     last_writer_at_unix_ts: float
     warning_generated_at_unix_ts: float
@@ -89,13 +89,31 @@ class StaleSummary(TypedDict):
 
 
 class FreshResponse(TypedDict):
+    """Fresh-read response shape.
+
+    AC-08: ``hookSpecificOutput`` is OPTIONAL and present when the
+    session has pending preemption notices that the wrapper at
+    ``_handle_pre_read.work_with_notice_surfacing`` attaches. Typed
+    consumers should treat ``hookSpecificOutput`` as ``NotRequired``
+    on every endpoint that returns a fresh envelope (pre-read,
+    pre-bash, pre-grep).
+    """
     status: Literal["fresh"]
+    hookSpecificOutput: NotRequired["PreToolUseHookOutput"]
+    # AC-05: also present on watchdog-timeout degraded responses.
+    degraded: NotRequired[bool]
 
 
 class StaleResponse(TypedDict):
-    """The complete hookSpecificOutput Claude Code will use to inject the
-    stale-read warning into the agent's context."""
+    """The complete wire shape for a stale-read response (AC-04 / finding #25).
+
+    ``build_stale_response`` emits all three fields; tests access
+    ``body['status']`` and ``body['summary']['path']`` directly.
+    Document the full shape so typed consumers have an accurate contract.
+    """
     hookSpecificOutput: "PreToolUseHookOutput"
+    status: Literal["stale"]
+    summary: StaleSummary
 
 
 class PreToolUseHookOutput(TypedDict):
@@ -129,11 +147,17 @@ class PolicyTrackResponse(TypedDict):
 class PolicyUntrackResponse(TypedDict):
     ok: Literal[True]
     removed: list[str]
+    rejected: list[dict]  # [{"path": "...", "reason": "..."}, ...] — AC-06 / finding #27
 
 
 class StatusResponse(TypedDict):
     tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "last_writer": "..."}, ...]
     sessions: list[dict]  # [{"session_id": "...", "states": {path: state_name}}, ...]
+    # AC-02: canonical name follows KTD-J convention (full-word _seconds
+    # suffix). ``coordinator_uptime_s`` is emitted alongside as a
+    # deprecated alias for one release; consumers should migrate to the
+    # canonical name. Removed in v0.2.
+    coordinator_uptime_seconds: float
     coordinator_uptime_s: float
     coordinator_pid: int
 

@@ -97,9 +97,20 @@ def test_pre_read_against_live_coordinator(
     rc, out = _drive("pre-read", cc_payload, workspace, monkeypatch, capsys)
     assert rc == 0
     response = json.loads(out)
-    # Untracked path returns fresh (policy default may not match docs/plan.md).
-    # Either way, the call should produce a JSON response that CC accepts.
+    # T-02 / ce-review: tightened from isinstance(response, dict) to a
+    # specific shape check. pre-read returns either {status: "fresh"|"stale"}
+    # or the fast-path empty {} for untracked paths (handler returns 200 +
+    # {ok: true} before fresh-shape logic). Either is acceptable.
     assert isinstance(response, dict)
+    if "status" in response:
+        assert response["status"] in ("fresh", "stale"), (
+            f"pre-read status must be fresh or stale; got {response['status']!r}"
+        )
+    else:
+        # Untracked fast-path → either {} or {ok: True}
+        assert response.get("ok") is True or response == {}, (
+            f"pre-read without status must be empty or {{ok:True}}; got {response!r}"
+        )
 
 
 def test_pre_edit_translates_correctly(
@@ -120,7 +131,14 @@ def test_pre_edit_translates_correctly(
     rc, out = _drive("pre-edit", cc_payload, workspace, monkeypatch, capsys)
     assert rc == 0
     response = json.loads(out)
+    # T-03 / ce-review: tightened to assert the {ok: bool} contract.
+    # pre-edit's wire shape always includes ok (true on success, false on
+    # collision-rejected; never absent). On collision, the response also
+    # carries hookSpecificOutput per the CollisionResponse TypedDict.
     assert isinstance(response, dict)
+    assert "ok" in response or "hookSpecificOutput" in response, (
+        f"pre-edit response must carry 'ok' or 'hookSpecificOutput'; got {response!r}"
+    )
 
 
 def test_post_edit_hashes_file_on_disk_when_response_missing_hash(

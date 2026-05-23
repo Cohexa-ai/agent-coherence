@@ -48,8 +48,8 @@ from pathlib import Path
 from typing import Sequence
 
 from ccs.adapters.claude_code.lifecycle import (
-    _read_port_from_file,
-    _tcp_probe,
+    read_port_from_file as _read_port_from_file,
+    tcp_probe as _tcp_probe,
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
@@ -84,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Suppress the 'port=N' line on stdout (still exits 0 on success).",
     )
     parser.add_argument(
+        "--prepare-for-migration",
+        action="store_true",
+        help=(
+            "Atomically release all EXCLUSIVE/MODIFIED grants and shut "
+            "down the coordinator for this workspace. RUN THIS before "
+            "switching the coherence backend between Python and Node — "
+            "see the v0.1.1 migration runbook."
+        ),
+    )
+    parser.add_argument(
         "--_daemonized",
         action="store_true",
         help=argparse.SUPPRESS,  # hidden — internal detached-worker flag
@@ -110,6 +120,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args._daemonized:
         return _run_daemonized(root)
 
+    # Unit 8 (Decision 1): release-all-grants + shutdown for backend
+    # switch safety. Routed through the running coordinator so we
+    # invalidate every M/E grant from the same process that owns the
+    # SQLite registry (the operator's CLI invocation may not be that
+    # process when the coordinator was detached on a prior session).
+    if args.prepare_for_migration:
+        return _run_prepare_for_migration(root, quiet=args.quiet)
+
     # Test mode: keep the legacy in-process behavior so test_claude_code_cli
     # can spawn + assert in the same Python process. Not for users.
     if args.no_detach:
@@ -134,6 +152,88 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _spawn_detached(root, quiet=args.quiet)
 
 
+def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
+    """Unit 8: backend-switch safety entry point.
+
+    Connects to the running coordinator, posts /admin/prepare-for-migration
+    with the operator opt-in header, then polls the pid file + TCP probe
+    until the coordinator is genuinely gone. Returns 0 on clean
+    shutdown, 0 also when no coordinator was running (idempotent — safe
+    to script as a pre-switch step that may or may not find a live
+    coordinator), 2 on any error reaching the coordinator.
+    """
+    from ccs.cli._coherence_client import (
+        CoordinatorUnavailable,
+        post as _post,
+        resolve_endpoint,
+    )
+    import urllib.error as _urlerr
+
+    pid_file = root / ".coherence" / "server.pid"
+    if not pid_file.exists():
+        if not quiet:
+            print("prepare-for-migration: no coordinator running (idempotent no-op)", flush=True)
+        return 0
+
+    try:
+        endpoint = resolve_endpoint(root)
+    except CoordinatorUnavailable as exc:
+        # The pid file existed but the coordinator isn't reachable — it
+        # may have died uncleanly. Nothing to release in the registry
+        # via HTTP; idempotent no-op.
+        if not quiet:
+            print(
+                f"prepare-for-migration: coordinator not reachable ({exc}); "
+                "treating as clean — nothing to release.",
+                flush=True,
+            )
+        return 0
+
+    try:
+        # M-04 / finding #28: use the shared _coherence_client.post() with
+        # extra_headers instead of the now-deleted _post_with_operator_header().
+        # Uses CLI_HTTP_TIMEOUT_SEC (6.0s) instead of the old hardcoded 5s.
+        resp = _post(endpoint, "/admin/prepare-for-migration", {},
+                     extra_headers={"Coherence-Local-Operator": "true"})
+    except _urlerr.HTTPError as exc:
+        err(f"agent-coherence-coordinator: prepare-for-migration HTTP {exc.code}")
+        return 2
+
+    if not resp.get("ok"):
+        err(f"agent-coherence-coordinator: prepare-for-migration returned {resp!r}")
+        return 2
+
+    released = int(resp.get("released", 0))
+    errors = resp.get("errors") or []
+
+    # Poll until the coordinator is no longer TCP-reachable. The server-
+    # side schedules shutdown ~100ms after responding, then the in-flight
+    # drain + serve_forever exit add a bit more — 5s budget is generous.
+    cfg = LifecycleConfig()
+    poll_deadline = time.monotonic() + 5.0
+    while time.monotonic() < poll_deadline:
+        port = _read_port_from_file(pid_file)
+        if port is None or not _tcp_probe(port, cfg):
+            break
+        time.sleep(0.1)
+    else:
+        err(
+            "agent-coherence-coordinator: prepare-for-migration: "
+            "coordinator failed to shut down within 5s after release"
+        )
+        return 2
+
+    if not quiet:
+        print(
+            f"prepare-for-migration: released {released} grant(s); "
+            f"coordinator shutdown clean.",
+            flush=True,
+        )
+        if errors:
+            print(f"  errors: {errors}", flush=True)
+    return 0
+
+
 def _run_daemonized(root: Path) -> int:
     """Internal worker — called via ``--_daemonized``. Run the coordinator
     and block indefinitely. Exits on SIGTERM (sent by stop_coordinator)
@@ -144,20 +244,18 @@ def _run_daemonized(root: Path) -> int:
         return 2
 
     # Block the main thread so the daemon HTTP/sweep/idle threads stay
-    # alive. Exit when the coordinator transitions to shutting_down (e.g.
-    # via the idle-shutdown loop).
-    from ccs.adapters.claude_code import lifecycle as _lc
-    entry = _lc._SPAWNED_REGISTRY.get(str(root.resolve()))
-    if entry is None:
-        # Should not happen — ensure_coordinator just populated this.
-        return 2
-    while not entry.shutdown_done.is_set():
-        try:
-            time.sleep(1.0)
-        except KeyboardInterrupt:
-            from ccs.adapters.claude_code.lifecycle import stop_coordinator
-            stop_coordinator(root)
-            break
+    # alive. KP-7: use the public wait_for_shutdown API rather than
+    # reaching into lifecycle._SPAWNED_REGISTRY + entry.shutdown_done.
+    # The wait blocks until idle-shutdown completes, stop_coordinator
+    # fires, or the shutdown sequence aborts.
+    from ccs.adapters.claude_code.lifecycle import (
+        stop_coordinator,
+        wait_for_shutdown,
+    )
+    try:
+        wait_for_shutdown(root)
+    except KeyboardInterrupt:
+        stop_coordinator(root)
     return 0
 
 

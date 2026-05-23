@@ -30,12 +30,11 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def find_coordinator_root(start: str | os.PathLike[str] | None = None) -> Optional[Path]:
+def find_coordinator_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     """Return the parent repo root from any path inside it.
 
     Behavior:
@@ -100,7 +99,7 @@ class _GitInvocationError(RuntimeError):
     """Internal: a non-zero git exit that callers should map to None."""
 
 
-def _git(cwd: Path, *args: str) -> Optional[str]:
+def _git(cwd: Path, *args: str) -> str | None:
     """Run ``git -C <cwd> <args>`` and return stdout stripped, or None on
     a clean non-zero exit (e.g., "not in a git repo"). Raises
     :class:`_GitInvocationError` for unexpected failures (e.g., crash)

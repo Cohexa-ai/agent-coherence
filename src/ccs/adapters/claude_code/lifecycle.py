@@ -36,7 +36,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
@@ -117,6 +116,12 @@ class LifecycleConfig:
     #: Transient-state timeout (fail-safe for unfinished M↔E protocol steps).
     transient_timeout_sec: int = 60
 
+    #: KTD-H — Unit 5 L1: cap on inode re-opens during one ``ensure_coordinator``
+    #: call. Each external ``rm -rf .coherence/ && recreate`` consumes one
+    #: revalidation. Churn beyond this budget indicates a runaway external
+    #: process; the coordinator returns -1 and lets the hook degrade.
+    inode_revalidation_budget: int = 5
+
 
 _DEFAULT_CONFIG = LifecycleConfig()
 
@@ -129,7 +134,7 @@ _DEFAULT_CONFIG = LifecycleConfig()
 def ensure_coordinator(
     coordinator_root: Path,
     *,
-    config: Optional[LifecycleConfig] = None,
+    config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> int:
     """Lazy-spawn entry point.
@@ -160,7 +165,7 @@ def ensure_coordinator(
     existing = _SPAWNED_REGISTRY.get(resolved_key)
     if existing is not None and not existing.shutdown_done.is_set():
         existing_port = existing.coordinator.port
-        if _tcp_probe(existing_port, cfg, bind_host=bind_host):
+        if tcp_probe(existing_port, cfg, bind_host=bind_host):
             return existing_port
         # Existing entry not actually reachable — fall through to respawn.
         logger.warning(
@@ -175,6 +180,12 @@ def ensure_coordinator(
 
     # Unified spawn-or-join loop (G1 fix per Unit 5 §5.654 — the
     # idle-shutdown-vs-spawn race). On each attempt:
+    #   0. KTD-H (Unit 5 L1): revalidate fd's inode against the on-disk
+    #      path. If an external process unlinked `.coherence/` and
+    #      recreated it mid-retry, our fd points at the orphaned inode
+    #      and any flock/write happens invisibly. Re-open and restart
+    #      the retry counter on mismatch (bounded by the revalidation
+    #      budget to defend against pathological churn).
     #   1. Try to acquire the flock (non-blocking). If acquired, we're
     #      the winner — bind, write port, serve, return.
     #   2. If contended, try to read a valid port from the file. If
@@ -185,27 +196,69 @@ def ensure_coordinator(
     #
     # This handles both the cold-start thundering herd (holder is
     # mid-bind; port appears) and the idle-shutdown race (holder is
-    # mid-shutdown; flock releases) without baking in an order.
-    for attempt in range(cfg.port_file_retry_attempts):
+    # mid-shutdown; flock releases) without baking in an order, plus
+    # the rm -rf race that KTD-H closes.
+    revalidations_remaining = cfg.inode_revalidation_budget
+    attempt = 0
+    while attempt < cfg.port_file_retry_attempts:
+        # KTD-H: per-iteration inode revalidation. Cheap (~50μs) — st_dev
+        # + st_ino comparison detects unlink-and-recreate races before the
+        # flock attempt commits us to an orphan.
+        if not _inode_matches(fd, pid_file):
+            if revalidations_remaining <= 0:
+                logger.warning(
+                    "ensure_coordinator: inode revalidation budget exhausted "
+                    "(%d revalidations); external churn on .coherence/ — giving up",
+                    cfg.inode_revalidation_budget,
+                )
+                _close_quiet(fd)
+                return -1
+            revalidations_remaining -= 1
+            logger.info(
+                "ensure_coordinator: server.pid inode mismatch (rm -rf race?); "
+                "re-opening (%d revalidations remaining)",
+                revalidations_remaining,
+            )
+            _close_quiet(fd)
+            # Re-create the .coherence dir in case the rm -rf removed it too.
+            new_coherence_dir = _ensure_coherence_dir(coordinator_root)
+            if new_coherence_dir is None:
+                return -1
+            coherence_dir = new_coherence_dir
+            pid_file = coherence_dir / "server.pid"
+            new_fd = _open_pidfile(pid_file)
+            if new_fd is None:
+                return -1
+            fd = new_fd
+            attempt = 0  # KTD-H: restart the retry counter on re-open
+            continue
+
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno not in (errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN):
-                os.close(fd)
+                _close_quiet(fd)
                 raise
             # Contended — try to read the port.
-            port = _read_port_from_file(pid_file)
+            port = read_port_from_file(pid_file)
             if port is not None:
-                os.close(fd)
+                _close_quiet(fd)
                 return port
             # Port file empty (holder mid-bind or mid-shutdown). Wait
             # and try the whole loop again — on the next iteration we
             # may either see the port populated OR acquire the released
             # lock ourselves.
             time.sleep(cfg.port_file_retry_interval_sec)
+            attempt += 1
             continue
 
         # Winner — we hold the lock. Bind, write port, serve.
+        # KTD-H/I/L3 (Unit 5 L3): time the winner path so operators have a
+        # signal for cold-start regressions. Telemetry-only — no default
+        # behavior change. Surfaced via the coordinator's
+        # ``cold_start_duration_ms`` attribute for the future /status
+        # endpoint (Unit 8).
+        cold_start_start = time.monotonic()
         try:
             coordinator = CoordinatorHTTPServer(coordinator_root, port=0, bind_host=bind_host)
             port = coordinator.port
@@ -225,22 +278,25 @@ def ensure_coordinator(
             # is actually accepting. Cold-start (Python interpreter +
             # SQLite WAL rehydration) can take well past the loser-side
             # connect_retry budget.
-            if not _self_probe(port, cfg, bind_host=bind_host):
+            probe_ok = _self_probe(port, cfg, bind_host=bind_host)
+            cold_start_ms = (time.monotonic() - cold_start_start) * 1000.0
+            coordinator.cold_start_duration_ms = cold_start_ms
+            if not probe_ok:
                 logger.warning(
                     "coordinator bound port=%d but self-probe exhausted after %dms; returning anyway",
                     port,
                     int(cfg.spawn_self_probe_attempts * cfg.spawn_self_probe_interval_sec * 1000),
                 )
             logger.info(
-                "coordinator spawned: pid=%d port=%d root=%s",
-                os.getpid(), port, coordinator_root,
+                "coordinator spawned: pid=%d port=%d root=%s cold_start=%.1fms",
+                os.getpid(), port, coordinator_root, cold_start_ms,
             )
             return port
         except Exception:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
-                os.close(fd)
+                _close_quiet(fd)
             raise
 
     # Retry budget exhausted without acquiring the lock or seeing a
@@ -249,7 +305,7 @@ def ensure_coordinator(
     # which would itself be a bug in this module — OR the holder is
     # mid-shutdown for longer than the retry budget. Either way, return
     # -1 so the caller degrades gracefully.
-    os.close(fd)
+    _close_quiet(fd)
     logger.warning(
         "ensure_coordinator: %d attempts exhausted without acquiring lock or reading port",
         cfg.port_file_retry_attempts,
@@ -260,7 +316,7 @@ def ensure_coordinator(
 def connect_or_spawn(
     coordinator_root: Path,
     *,
-    config: Optional[LifecycleConfig] = None,
+    config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> int:
     """Hook-handler entry point.
@@ -273,8 +329,8 @@ def connect_or_spawn(
 
     cfg = config or _DEFAULT_CONFIG
     pid_file = coordinator_root / ".coherence" / "server.pid"
-    port = _read_port_from_file(pid_file)
-    if port is not None and _tcp_probe(port, cfg, bind_host=bind_host):
+    port = read_port_from_file(pid_file)
+    if port is not None and tcp_probe(port, cfg, bind_host=bind_host):
         return port
 
     # Stale or absent — spawn (or join existing holder via fcntl race).
@@ -284,7 +340,7 @@ def connect_or_spawn(
     # ensure_coordinator already self-probes on the spawn path; here we
     # only re-probe if the caller landed in the loser-read path (where
     # the just-read port may belong to a coordinator mid-shutdown).
-    if not _tcp_probe(port, cfg, bind_host=bind_host):
+    if not tcp_probe(port, cfg, bind_host=bind_host):
         logger.warning("coordinator spawned at port=%d but TCP probe failed", port)
         return -1
     return port
@@ -312,9 +368,55 @@ def stop_coordinator(coordinator_root: Path) -> bool:
     return ran
 
 
+def wait_for_shutdown(
+    coordinator_root: Path,
+    *,
+    poll_interval_sec: float = 1.0,
+    timeout_sec: float | None = None,
+) -> bool:
+    """KP-7 public API. Block until the coordinator at ``coordinator_root``
+    has reached shutdown_done (idle-shutdown completed, stop_coordinator
+    called, or shutdown raised). Returns True if shutdown completed, False
+    if ``timeout_sec`` elapsed first or no in-process coordinator entry
+    exists for this root.
+
+    Designed for the ``agent-coherence-coordinator --_daemonized`` worker
+    that needs to keep the main thread alive until daemon threads have
+    cleanly torn down. Replaces direct reach-into ``_SPAWNED_REGISTRY``
+    + ``entry.shutdown_done.is_set()`` polling.
+
+    KeyboardInterrupt during the wait raises through to the caller so a
+    SIGINT can trigger the caller's own ``stop_coordinator`` shutdown
+    path (the wait itself never initiates shutdown — it only observes).
+    """
+    key = str(Path(coordinator_root).resolve())
+    entry = _SPAWNED_REGISTRY.get(key)
+    if entry is None:
+        return False
+    deadline: float | None = None
+    if timeout_sec is not None:
+        deadline = time.monotonic() + timeout_sec
+    while not entry.shutdown_done.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_sec)
+    return True
+
+
 # ----------------------------------------------------------------------
 # Internals — pid file, port file, sockets
 # ----------------------------------------------------------------------
+
+
+#: REL-06: cap on consecutive G4 aborts (coordinator.shutdown() raises)
+#: before the lifecycle gives up on a clean teardown and force-closes the
+#: flock so a fresh ensure_coordinator can re-spawn. The current G4
+#: behaviour holds the flock indefinitely on every abort — that protects
+#: in-flight handler state but means a wedged shutdown blocks all future
+#: spawns for the workspace. Capping at 3 attempts (≈3 sweep ticks) gives
+#: the coordinator a real chance to drain before we trade safety for
+#: liveness.
+_MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION = 3
 
 
 @dataclass
@@ -327,6 +429,10 @@ class _SpawnedEntry:
     the lock_fd. The first caller acquires the lock, runs the sequence,
     sets shutdown_done; subsequent callers acquire the lock, see done=True,
     return immediately.
+
+    REL-06: ``shutdown_abort_count`` tracks consecutive G4 aborts so the
+    idle loop can escalate after a bounded number of failures rather than
+    holding the flock indefinitely on a wedged shutdown.
     """
 
     coordinator: CoordinatorHTTPServer
@@ -334,6 +440,7 @@ class _SpawnedEntry:
     coherence_dir: Path
     shutdown_lock: threading.Lock
     shutdown_done: threading.Event
+    shutdown_abort_count: int = 0
 
 
 #: Maps coordinator_root → _SpawnedEntry. Only the spawn-side ever populates
@@ -342,7 +449,7 @@ class _SpawnedEntry:
 _SPAWNED_REGISTRY: dict[str, _SpawnedEntry] = {}
 
 
-def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
+def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     """Create ``<root>/.coherence/`` with mode 0700 if missing. Returns
     the dir path, or None if the parent repo is read-only.
 
@@ -375,7 +482,7 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Optional[Path]:
     return coherence_dir
 
 
-def _open_pidfile(pid_file: Path) -> Optional[int]:
+def _open_pidfile(pid_file: Path) -> int | None:
     """Open (creating if needed) the pid file with mode 0600 for fcntl use."""
     try:
         fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o600)
@@ -383,6 +490,38 @@ def _open_pidfile(pid_file: Path) -> Optional[int]:
         logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd
+
+
+def _close_quiet(fd: int) -> None:
+    """Best-effort close. Swallows OSError so cleanup paths can chain
+    without separate try/except blocks — closing an already-bad fd just
+    means the underlying file was already gone."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _inode_matches(fd: int, path: Path) -> bool:
+    """KTD-H Unit 5 L1 helper. Returns True iff the file currently at
+    ``path`` shares (st_dev, st_ino) with the open ``fd``. Used to detect
+    the unlink-and-recreate race where an external ``rm -rf .coherence/``
+    leaves our fd orphaned on a no-longer-reachable inode.
+
+    Returns False on any stat/fstat failure or mismatch — caller treats
+    that as "revalidate" rather than trying to disambiguate. Cost is
+    roughly two syscalls (~50μs) per call, executed once per retry
+    iteration."""
+    try:
+        fd_stat = os.fstat(fd)
+    except OSError:
+        return False
+    try:
+        path_stat = os.stat(path)
+    except OSError:
+        # Path was unlinked, or its parent dir was. Definitely mismatch.
+        return False
+    return (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
 def _write_pidfile(fd: int, pid: int, port: int) -> None:
@@ -410,11 +549,11 @@ def _rewrite_pidfile_drop_port(fd: int, pid: int) -> None:
     os.fsync(fd)
 
 
-def read_port_from_file(pid_file: Path) -> Optional[int]:
+def read_port_from_file(pid_file: Path) -> int | None:
     """Read the port line from the pid file. Returns None if absent,
     empty, malformed, or the file doesn't exist.
 
-    Public API (promoted from the private ``_read_port_from_file`` per
+    Public API (promoted from the private ``read_port_from_file`` per
     P2 ce-review fix #17 / maintainability + kieran-python). CLI scripts
     and external callers should use this function rather than reaching
     into the underscore-prefixed name."""
@@ -447,7 +586,7 @@ def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:
     production code paths — the inlined version covers both port-read
     and lock-acquire retries simultaneously."""
     for _ in range(cfg.port_file_retry_attempts):
-        port = _read_port_from_file(pid_file)
+        port = read_port_from_file(pid_file)
         if port is not None:
             return port
         time.sleep(cfg.port_file_retry_interval_sec)
@@ -463,7 +602,7 @@ def tcp_probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") 
     """Loser-side / generic TCP probe with the connect_retry budget. Used
     by hook-handler-style callers that have already paid a port-read.
 
-    Public API (promoted from the private ``_tcp_probe`` per P2 ce-review
+    Public API (promoted from the private ``tcp_probe`` per P2 ce-review
     fix #17). The underscore-prefixed alias is retained for backward
     compatibility with internal callers."""
     return _probe_with_budget(
@@ -529,8 +668,33 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     Order matters per R4: transient sweep first so the stable sweep does
     not race entries that are mid-protocol. F2 notice eviction last —
     it's a pure storage reclaim and doesn't interact with grants.
+
+    ADV-004: stable-grant reclamation records a preemption notice for
+    the reclaimed victim so the victim's eventual post-edit gets an
+    enriched "reclaimed by coordinator sweep" error instead of a
+    generic CoherenceError with no context. The sentinel preempter
+    UUID is ``SWEEP_RECLAMATION_PREEMPTER_ID`` (imported lazily to
+    avoid an import cycle at module load).
     """
+    # Lazy import — coordinator_server imports lifecycle's
+    # CoordinatorHTTPServer; importing back at module load would cycle.
+    from ccs.adapters.claude_code.coordinator_server import (
+        SWEEP_RECLAMATION_PREEMPTER_ID,
+    )
+
     coordinator = entry.coordinator
+
+    def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
+        """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
+        Uses wall-clock time (the notice timestamp is operator-visible
+        via the F4 prose) rather than the monotonic sweep tick."""
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id,
+            artifact_id=artifact_id,
+            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
+            preempted_at_unix_ts=time.time(),
+        )
+
     while not coordinator.shutting_down:
         time.sleep(cfg.sweep_interval_sec)
         if coordinator.shutting_down:
@@ -545,6 +709,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
                 current_tick=now_tick,
                 heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
                 max_hold_ticks=cfg.grant_max_hold_sec,
+                on_reclaim=_record_reclamation_notice,
             )
             evicted = coordinator.registry.evict_stale_notices(
                 max_age_sec=cfg.notice_evict_max_age_sec,
@@ -648,12 +813,43 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
         try:
             coordinator.shutdown()
         except Exception as exc:
+            entry.shutdown_abort_count += 1
+            # REL-06: after N consecutive G4 aborts the operator's only
+            # recovery path was "kill the process and let stable-grant
+            # reclamation eventually clear the M/E slots, then ensure
+            # a fresh spawn". That's a load-bearing safety net but it's
+            # ~1800s in the worst case (max_hold_ticks default). Once
+            # we've exhausted our patience for the coordinator to drain
+            # cleanly, ESCALATE: release the flock + mark shutdown_done
+            # so a fresh ensure_coordinator can re-spawn immediately.
+            # Logged at CRITICAL with the escalation reason — operator
+            # can correlate with any in-flight handler state in their
+            # diagnostic surface.
+            if entry.shutdown_abort_count >= _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION:
+                logger.critical(
+                    "coordinator.shutdown failed %d consecutive times "
+                    "(>= escalation threshold %d). ESCALATING: releasing "
+                    "flock + marking shutdown_done so a fresh spawn can "
+                    "proceed. In-flight handler state may be inconsistent. "
+                    "Underlying error: %s",
+                    entry.shutdown_abort_count,
+                    _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION,
+                    exc,
+                )
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                _close_quiet(lock_fd)
+                entry.shutdown_done.set()
+                return True
             logger.critical(
-                "coordinator.shutdown failed; aborting shutdown sequence with "
-                "lock still held. Stable-grant reclamation (max_hold_ticks=%d) "
-                "is the recovery path. Underlying error: %s",
-                # config thresholds not on entry; using a generic mention
-                1800, exc,
+                "coordinator.shutdown failed (attempt %d/%d); aborting "
+                "shutdown sequence with lock still held. Stable-grant "
+                "reclamation is the recovery path. Underlying error: %s",
+                entry.shutdown_abort_count,
+                _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION,
+                exc,
             )
             # shutdown_done remains UNSET so a retry is possible. Return
             # True because this invocation DID run the sequence body
@@ -678,13 +874,6 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
 
 
 # ----------------------------------------------------------------------
-# Backward-compat aliases (P2 ce-review fix #17)
-# ----------------------------------------------------------------------
-# The names below were promoted to public API (read_port_from_file,
-# tcp_probe) but the underscore-prefixed forms are imported by other
-# library modules (_coherence_client.py, coherence_coordinator.py).
-# Keep the aliases so internal call sites don't have to flip in lockstep.
-# New code should prefer the public names.
-
-_read_port_from_file = read_port_from_file
-_tcp_probe = tcp_probe
+# Backward-compat aliases removed (finding #46: all internal callers now
+# import the public names directly via `read_port_from_file as read_port_from_file`
+# or `tcp_probe as tcp_probe`). No alias needed.
