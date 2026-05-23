@@ -6,6 +6,53 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-23
+
+**Stable release of the Claude Code plugin coordinator backend.** Promotes the `0.8.0a1` alpha pre-release to a final `0.8.0` after the v0.1.1 marketplace cohort + full ce-review remediation pass landed. Both the coordinator HTTP surface and the wire contract are now considered stable through the `0.8.x` minor line; breaking changes will bump to `0.9.0` per SemVer.
+
+### Added — Marketplace cohort (Phase A–C of v0.1.1 plan)
+
+- **Unit 4 watchdog hardening** — KTD-K `busy_timeout=1500ms` per multi-statement transaction analysis; KTD-N `/hooks/pre-bash` + `/hooks/pre-grep` with shlex-based path detection (closes the model-routing-around-Read H4 finding); KTD-G handler concurrency semaphore + queue-depth gate + three saturation counters.
+- **Unit 5 lifecycle hardening** — KTD-H inode revalidation per retry (handles `rm -rf .coherence/ && recreate` mid-spawn races); KTD-I in-flight handler drain on `shutdown()` (5s deadline before SQLite close); KTD-L3 cold-start instrumentation surfaced via `coordinator.cold_start_duration_ms`.
+- **Unit 6 residual risk fixes** — R10 `_agent_names` lock + public accessors; R11 `ensure_secret` bounded `O_EXCL` retry (fail-closed); R12 `/status` three-tier disclosure (`minimal` / `metrics` / `full` with `Coherence-Local-Operator: true` opt-in for the elevated tier); R14 `_append_policy_yaml` `fcntl.flock` discipline; R21 `MAX_REQUEST_BODY_BYTES = 64 KB` cap.
+- **Unit 8 KTD-J telemetry** — per-endpoint counters (pre_read/pre_edit/post_edit/session_stop/pre_bash/pre_grep/policy_track/policy_untrack/status_total); product-signal counters (`intra_task_acquire_release_total`, `stale_warning_emitted_total`, `stale_warning_reread_total`); free-threading-safe via `threading.Lock`. New `coordinator_uptime_seconds` field (canonical) + `coordinator_uptime_s` deprecated alias for one release. `coordinator_backend` + `coordinator_version` fields for cross-backend dashboards.
+- **Unit 8 `--self-test` smoke** — `agent-coherence-status --self-test` runs a four-step pre-read → pre-edit → post-edit → stale pre-read scenario against a live coordinator. Exit 0 on pass, 3 with actionable diagnostic on fail. Documented as the post-install validation step.
+- **Unit 8 `--prepare-for-migration`** — `agent-coherence-coordinator --prepare-for-migration` enters a draining state that rejects new pre-edit (HTTP 503 with structured `migration in progress` error visible to the model), waits up to 5s for in-flight chains to complete, invalidates remaining M/E grants, then schedules shutdown. Eliminates the silent data-loss race when switching Python↔Node backends.
+- **Unit 9 `agent-coherence-migrate-rules`** — scans CLAUDE.md for prose tool-class rules ("use rg, not grep", "never sudo") and proposes `permissions.deny` entries. Flag-only by default; `--apply` writes to `.claude/settings.local.json` after confirmation.
+
+### Added — Stable-grant sweep preemption notice (ADV-004)
+
+`enforce_stable_grant_timeouts` now records a preemption notice for every reclaimed agent (using a sentinel `SWEEP_RECLAMATION_PREEMPTER_ID`). When the victim's post-edit eventually arrives, the F4 enrichment path emits "your M/E grant was reclaimed by the coordinator sweep (heartbeat timeout or max-hold ceiling)" instead of a generic `CoherenceError` — eliminates a silent data-loss class for the alpha cohort's interactive workflows.
+
+### Changed
+
+- **`/status?detail=metrics`** is now the canonical surface for dashboard scrapers. The metrics-tier stability contract (additive in minor, removed only in major after one-release deprecation alias) is documented on `_handle_status`.
+- **`StaleResponse` / `FreshResponse` / `PolicyUntrackResponse` TypedDicts** now match the actual wire shapes (AC-04/06/08 alignment).
+- **`_run_or_degrade` accepts `degraded_response`** so `{ok:bool}`-shape endpoints (pre-edit, post-edit, session-stop) return `{ok:True, degraded:True}` on watchdog timeout instead of the `{status:fresh}` envelope used by pre-read shapes (AC-05).
+- **`coordinator_uptime_s` field renamed to `coordinator_uptime_seconds`** per KTD-J `_seconds` convention. Old name kept as a deprecated alias through `0.8.x`; removal targeted for `0.9.0`.
+- **Shutdown ordering** — `_drain_in_flight` now runs BEFORE `_server.server_close()` (COR-01); `_seq` rollback now fires on COMMIT failure (COR-02); shutdown wall-clock can exceed `IN_FLIGHT_DRAIN_TIMEOUT_SEC` when watchdog timeouts fire (COR-07; documented bound).
+
+### Fixed
+
+- **`resolve_or_register` re-fetch race** (COR-04) — concurrent `remove_artifact` between ROLLBACK and re-fetch now raises an informative `RuntimeError` chained from the original `IntegrityError` instead of an opaque "UNIQUE constraint failed" trace.
+- **`artifact_names_under_prefix` TOCTOU** (REL-08) — combined the LIKE-prefix and exact-match queries into a single UNION under one lock.
+- **G4 abort wedge** (REL-06) — added `shutdown_abort_count` on `_SpawnedEntry`; after 3 consecutive `coordinator.shutdown()` raises, escalate by releasing the flock + marking shutdown_done so a fresh spawn can proceed.
+- **Hook secret rotation race** (ADV-003) — coordinator emits operator-visible WARNING on every 401 (with 60s dedupe) plus a new `auth_401_total` counter so silent auth failures become observable.
+- **Plugin `hooks.json` Bash + Grep matchers** (cross-repo P0) — the plugin now actually invokes `/hooks/pre-bash` and `/hooks/pre-grep` rather than leaving the endpoints runtime-inert (companion plugin `v0.1.1`).
+
+### Security
+
+- **R12 `/status` disclosure tiers** make pasting `?detail=metrics` into bug reports safe — no absolute paths, no PIDs, no session identifiers. The `full` tier still exposes those but only with the `Coherence-Local-Operator: true` opt-in header (defense-in-depth within the Adversary 1 boundary).
+- **`MAX_REQUEST_BODY_BYTES` cap** (R21) — coordinator rejects oversized request bodies before `rfile.read` so a hostile or buggy client cannot OOM the coordinator with a single oversized POST.
+- **`ensure_secret` bounded retry** (R11) — fail-closed if the empty-file recovery branch can't acquire `O_EXCL` within 5 attempts, instead of silently `O_TRUNC`-overwriting a concurrent racer's valid secret.
+- **`MIGRATION_DRAIN_TIMEOUT_SEC = 5.0`** — backend-switch operator path now refuses new writes during drain instead of relying on the prior 100ms scheduled-shutdown race.
+
+### Internal
+
+- **78 ce-review findings remediated** across 12 reviewer categories (adversarial, correctness, api-contract, reliability, kieran-python, maintainability, performance, project-standards, security, testing, agent-native, learnings). KP-3/KP-11/M-01/M-06 (large handler / file extractions) explicitly deferred with rationale documented in PR bodies.
+- **PERF-1 `/status` batched snapshot** — `SqliteArtifactRegistry.status_snapshot()` collapses the per-artifact `2N` SELECTs into 2 SQL queries held under one lock.
+- **PS-01..PS-04 risk-code test prefix audit** — `test_a4_*`, `test_a6_*`, `test_a7_*`, `test_a8_*`, `test_l1_*`, `test_l2_*` all present per the v0.1.1 plan's invariant naming policy.
+
 ## [0.8.0a1] — 2026-05-17
 
 **Alpha pre-release.** This is the first release containing the Claude Code
