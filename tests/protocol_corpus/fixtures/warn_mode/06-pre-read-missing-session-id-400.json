@@ -1,0 +1,18 @@
+{
+  "name": "pre-read-missing-session-id-400",
+  "description": "Missing session_id in /hooks/pre-read body returns 400 with the same error-envelope shape on both coordinators. The exact error string is the AC-04 wire-shape contract: 'missing session_id'.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "path": "docs/plans/x.md"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing session_id"
+    }
+  }
+}

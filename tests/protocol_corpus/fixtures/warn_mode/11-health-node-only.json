@@ -1,0 +1,21 @@
+{
+  "name": "health-node-only",
+  "description": "GET /health is Node-only in v0.1.1. The Node /health envelope is {backend, status, uptime_seconds, version} — NOT the {healthy, version, started_at_ms, uptime_ms} shape the server.ts top-of-file docstring suggests. Documents the actual shape so a future Unit 2 addition of /health to Python doesn't accidentally drift, and so any change to the Node /health response surfaces in the corpus.",
+  "setup": {},
+  "request": {
+    "method": "GET",
+    "path": "/health"
+  },
+  "ignore_keys": ["version"],
+  "expected": {
+    "status": 200,
+    "body": {
+      "backend": "node",
+      "status": "ok",
+      "uptime_seconds": "<UPTIME>",
+      "version": "<IGNORED>"
+    }
+  },
+  "_comment": "version is ignored because it tracks the plugin's hardcoded VERSION constant which bumps per release; the contract is the field's PRESENCE, not its value.",
+  "backends": ["node"]
+}

@@ -72,9 +72,12 @@ pythonpath = ["src", "."]
 markers = [
     "launch_gate: Unit 9 hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
     "launch_gate_pilot: Unit 9 pilot run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
+    "protocol_corpus: v0.2 Unit 7 cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
 ]
-# Skip launch_gate markers in default unit test runs.
-addopts = "-m 'not launch_gate and not launch_gate_pilot'"
+# Skip launch_gate + protocol_corpus markers in default unit test runs. The
+# protocol corpus has a Node-build prerequisite and a multi-second spawn cost
+# per fixture; keep it opt-in to avoid penalizing the normal `pytest -q` loop.
+addopts = "-m 'not launch_gate and not launch_gate_pilot and not protocol_corpus'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -1,0 +1,18 @@
+{
+  "name": "status-full-tier-without-opt-in-header-403",
+  "description": "GET /status?detail=full WITHOUT the Coherence-Local-Operator opt-in header returns 403. R12 three-tier disclosure model — the full tier requires the second-factor header even when Bearer auth passed.",
+  "setup": {},
+  "request": {
+    "method": "GET",
+    "path": "/status?detail=full"
+  },
+  "ignore_keys": ["error"],
+  "expected": {
+    "status": 403,
+    "body": {
+      "error": "<IGNORED>"
+    }
+  },
+  "_comment": "The error string is Python-specific ('detail=full requires the Coherence-Local-Operator: true opt-in header...') and may not match Node verbatim if Node implements the full tier with its own phrasing. This fixture asserts STATUS-CODE parity (403 for the missing-header case); message-level parity is a stretch goal for AC-09.",
+  "backends": ["python"]
+}

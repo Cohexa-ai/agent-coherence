@@ -1,0 +1,19 @@
+{
+  "name": "session-stop-no-grants",
+  "description": "Session-stop for a session that never acquired any grants returns {ok: true, released_artifacts: []}. Establishes baseline parity for the clean-shutdown wire shape that v0.1.1 KTD-11 ships.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "55555555-5555-4555-8555-555555555555"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": []
+    }
+  }
+}

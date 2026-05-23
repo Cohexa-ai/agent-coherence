@@ -1,0 +1,18 @@
+{
+  "name": "pre-read-missing-path-400",
+  "description": "Missing path in /hooks/pre-read body returns 400 with the canonical 'missing or empty path' error envelope. Both coordinators must remap their internal path-validator messages to this exact string per the AC-04 wire-shape contract.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing or empty path"
+    }
+  }
+}
