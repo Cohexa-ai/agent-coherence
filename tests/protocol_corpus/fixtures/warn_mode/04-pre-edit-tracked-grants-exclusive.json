@@ -1,0 +1,24 @@
+{
+  "name": "pre-edit-tracked-grants-exclusive",
+  "description": "Tracked path with no prior holder — pre-edit acquires EXCLUSIVE (KTD-1 single-writer) and returns {ok: true}. No hookSpecificOutput since there is no collision and no pending preemption notices.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "44444444-4444-4444-8444-444444444444",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

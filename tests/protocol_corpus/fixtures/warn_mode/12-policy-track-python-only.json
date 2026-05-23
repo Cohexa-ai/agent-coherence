@@ -1,0 +1,21 @@
+{
+  "name": "policy-track-python-only",
+  "description": "POST /policy/track is Python-only in v0.1.1 — the Node coordinator returns 404 because it doesn't implement the policy-management surface (operators on the Node backend edit tracked.yaml by hand). Wire-shape parity for /policy/track lands in v0.3 when the Node coordinator gets the policy surface.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/policy/track",
+    "body": {
+      "paths": ["docs/plans/feature-y.md"]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "added": ["docs/plans/feature-y.md"],
+      "rejected": []
+    }
+  },
+  "backends": ["python"]
+}

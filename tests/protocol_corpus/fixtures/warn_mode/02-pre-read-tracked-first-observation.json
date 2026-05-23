@@ -1,0 +1,25 @@
+{
+  "name": "pre-read-tracked-first-observation",
+  "description": "Tracked path with no prior MESI state — KTD-9 first-observation seeds SHARED for the reader and returns {status: fresh}. Validates the first-observation fast-path parity that the v0.1.1 baseline depends on.",
+  "setup": {
+    "tracked": ["docs/plans/feature-x.md"],
+    "files": {
+      "docs/plans/feature-x.md": "# Feature X\n\nv1 content\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "path": "docs/plans/feature-x.md",
+      "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  }
+}

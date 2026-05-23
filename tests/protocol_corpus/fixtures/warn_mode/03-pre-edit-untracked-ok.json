@@ -1,0 +1,23 @@
+{
+  "name": "pre-edit-untracked-ok",
+  "description": "Untracked path bypasses EXCLUSIVE acquisition and returns {ok: true} from both coordinators. The untracked fast-path on /hooks/pre-edit must remain wire-shape-stable through any Unit 2 strict-mode handler refactor.",
+  "setup": {
+    "files": {
+      "untracked.txt": "hello\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "33333333-3333-4333-8333-333333333333",
+      "path": "untracked.txt"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}
