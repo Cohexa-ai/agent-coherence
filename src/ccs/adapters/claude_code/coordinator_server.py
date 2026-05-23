@@ -1213,6 +1213,44 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             "hash_differs": hash_differs,
         }
 
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch. If the artifact is
+        # opted into strict mode via .coherence/strict_mode.yaml AND the
+        # session was previously invalidated (preempted by a peer commit),
+        # return permissionDecision:"deny" with the static reason template.
+        # Otherwise fall through to v0.1.1 warn-mode allow path unchanged.
+        #
+        # Semantic guard: strict-deny fires only on agent_state == INVALID
+        # (true preemption). A first-time observer (agent_state is None on
+        # an existing artifact) gets warn-mode allow + additionalContext
+        # because they have not "acted on stale" — they have never seen
+        # the artifact before. The operator's intent for strict mode is
+        # "must re-read after invalidation," not "must read before any
+        # cross-session activity exists."
+        #
+        # KTD-Q: this is the Read surface; the same gate fires on
+        # pre-edit / pre-bash / pre-grep for Edit|Write / Bash / Grep.
+        #
+        # KTD-T: do NOT re-grant SHARED on deny. The MESI state stays
+        # INVALID across the model's retry loop so every retry produces
+        # the same byte-stable deny reason text. Per Phase 0 finding the
+        # model exits the retry loop after 2-5 attempts and routes to
+        # alternative behavior; the deny IS the signal. Re-granting
+        # would let the second retry get fresh and silently downgrade
+        # the operator's hard guardrail.
+        if (
+            agent_state == MESIState.INVALID
+            and coordinator.policy.is_strict_mode(path)
+        ):
+            coordinator.increment_stale_warning_emitted()
+            coordinator.mark_stale_warned(agent_id, artifact_id)
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_read_strict_deny", summary=summary,
+                ),
+                "status": "stale",
+                "summary": summary,
+            }
+
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
         coordinator.registry.set_agent_state(
             artifact_id, agent_id, MESIState.SHARED,
@@ -1252,11 +1290,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 notice_text = _build_preemption_text(coordinator, notices)
                 return {
                     "status": "fresh",
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "additionalContext": notice_text,
-                    },
+                    "hookSpecificOutput": _payloads.emit_allow(
+                        source="pre_read_fresh_with_notice",
+                        additional_context=notice_text,
+                    ),
                 }
         return result
 
@@ -1291,6 +1328,51 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+
+        # v0.2 KTD-O / KTD-P: strict-mode stale-edit deny branch. If the
+        # artifact is opted into strict mode AND the editor's prior state
+        # is INVALID (preempted by a peer commit), deny before acquiring
+        # EXCLUSIVE. The editor must re-read first to take a fresh
+        # SHARED grant.
+        #
+        # Semantic guard (matches pre-read): strict-deny fires only on
+        # editor_state == INVALID. A first-time editor (state is None on
+        # an existing artifact) falls through to the normal acquire flow
+        # — they have not acted on stale state, they're establishing a
+        # new write claim. The strict-mode intent is "must re-read after
+        # preemption," not "must read before any write."
+        #
+        # This is the Edit/Write surface of KTD-Q (the hooks.json matcher
+        # routes both tools through /hooks/pre-edit).
+        if coordinator.policy.is_strict_mode(path):
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            editor_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+            editor_stale = editor_state == MESIState.INVALID
+            if artifact is not None and artifact.version > 0 and editor_stale:
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                summary: _payloads.StaleSummary = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if editor_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,  # pre-edit doesn't carry content_hash
+                }
+                coordinator.increment_stale_warning_emitted()
+                return {
+                    "ok": False,
+                    "hookSpecificOutput": _payloads.emit_strict_deny(
+                        source="pre_edit_strict_deny", summary=summary,
+                    ),
+                    "status": "stale",
+                    "summary": summary,
+                }
 
         # A1: snapshot peers in M∪E BEFORE write so we can record preemption
         # notices for victims after the side-effecting invalidation.
@@ -1341,11 +1423,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # promote {ok: true} into a hookSpecificOutput.
             return {
                 "ok": True,
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "additionalContext": notice_text,
-                },
+                "hookSpecificOutput": _payloads.emit_allow(
+                    source="pre_edit_notice_only",
+                    additional_context=notice_text,
+                ),
             }
         return {"ok": True}
 
@@ -1696,6 +1777,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         stale_summaries: list[dict] = []
+        # v0.2 KTD-Q: track the first strict + stale path encountered so we
+        # can emit a strict-mode deny on the whole bash command. ANY strict-
+        # stale match in the path set triggers deny per the plan's edge-case
+        # contract (cat a.md b.md where a.md is strict → deny).
+        strict_stale_first: dict | None = None
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -1718,10 +1804,46 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
+            if (
+                strict_stale_first is None
+                and coordinator.policy.is_strict_mode(path)
+            ):
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                strict_stale_first = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,
+                }
             coordinator.registry.set_agent_state(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger="post_stale_bash", tick=now,
             )
+
+        # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
+        # the bash command is strict + stale, deny the whole command. The
+        # reason references the first strict-stale path; multi-path bash
+        # commands with multiple strict-stale paths re-deny on retry with
+        # the next path's reason as the model resolves them one by one
+        # (bounded by the model's own retry-loop per Phase 0 finding).
+        if strict_stale_first is not None:
+            coordinator.increment_stale_warning_emitted()
+            summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_bash_strict_deny", summary=summary_typed,
+                ),
+                "status": "stale",
+                "stale_paths": [s["path"] for s in stale_summaries],
+            }
 
         notices = coordinator.registry.pop_pending_notices(agent_id)
 
@@ -1747,11 +1869,10 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
 
         resp: dict[str, Any] = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",  # v0.1.1 warn-only per KTD-E
-                "additionalContext": "\n\n".join(parts),
-            },
+            "hookSpecificOutput": _payloads.emit_allow(
+                source="pre_bash_stale_warn",
+                additional_context="\n\n".join(parts),
+            ),
         }
         if stale_summaries:
             resp["status"] = "stale"
@@ -1809,6 +1930,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         stale_summaries: list[dict] = []
+        # v0.2 KTD-Q: track the first strict + stale path encountered so we
+        # can emit strict-mode deny on the whole grep command. Mirrors pre-bash.
+        strict_stale_first: dict | None = None
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -1821,10 +1945,41 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
+            if (
+                strict_stale_first is None
+                and coordinator.policy.is_strict_mode(path)
+            ):
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                strict_stale_first = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,
+                }
             coordinator.registry.set_agent_state(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger="post_stale_grep", tick=now,
             )
+
+        # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
+        if strict_stale_first is not None:
+            coordinator.increment_stale_warning_emitted()
+            summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_grep_strict_deny", summary=summary_typed,
+                ),
+                "status": "stale",
+                "stale_paths": [s["path"] for s in stale_summaries],
+            }
 
         notices = coordinator.registry.pop_pending_notices(agent_id)
 
@@ -1847,11 +2002,10 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
 
         resp: dict[str, Any] = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "additionalContext": "\n\n".join(parts),
-            },
+            "hookSpecificOutput": _payloads.emit_allow(
+                source="pre_grep_stale_warn",
+                additional_context="\n\n".join(parts),
+            ),
         }
         if stale_summaries:
             resp["status"] = "stale"
