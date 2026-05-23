@@ -1226,6 +1226,25 @@ class SqliteArtifactRegistry:
     # Internals
     # ------------------------------------------------------------------
 
+    def last_writer_for(self, artifact_id: UUID) -> Optional[UUID]:
+        """COR-09: return the agent UUID that most recently committed to
+        ``artifact_id``, or None if the artifact has no committed writer
+        (first-observation-only, no successful post-edit yet).
+
+        Reads ``artifacts.last_writer_id`` directly so the answer reflects
+        actual commit history rather than current in-memory state. Closes
+        the COR-09 gap where the state-map fallback could attribute the
+        write to the very session receiving the stale-read warning.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_writer_id FROM artifacts WHERE id = ?",
+                (artifact_id.hex,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return UUID(hex=row[0])
+
     def _fetch_artifact_row(self, artifact_id: UUID) -> Optional[_ArtifactRow]:
         with self._lock:
             row = self._conn.execute(
