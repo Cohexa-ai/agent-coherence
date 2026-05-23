@@ -1013,21 +1013,23 @@ class SqliteArtifactRegistry:
         # Escape SQL LIKE wildcards.
         escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = escaped + "%"
+        exact_match = prefix.rstrip("/")
+        # REL-08: combine the LIKE-prefix query and the exact-match query
+        # into a single UNION under one lock acquisition. The prior
+        # two-step pattern released the lock between queries — a
+        # concurrent delete or rename could remove an artifact between
+        # them, producing a torn result set (LIKE row gone but exact-
+        # match row appears, or vice versa). Single query closes the gap.
         with self._lock:
             rows = self._conn.execute(
-                "SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'",
-                (pattern,),
+                """
+                SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
+                UNION
+                SELECT name FROM artifacts WHERE name = ?
+                """,
+                (pattern, exact_match),
             ).fetchall()
-        # Also include the prefix itself if it's a tracked file (e.g.,
-        # `grep PATTERN plan.md` where path == "plan.md" exact).
-        with self._lock:
-            exact = self._conn.execute(
-                "SELECT name FROM artifacts WHERE name = ?", (prefix.rstrip("/"),)
-            ).fetchone()
-        names = [r[0] for r in rows]
-        if exact is not None and exact[0] not in names:
-            names.append(exact[0])
-        return names
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # A1 — Preemption notices (silent-grant-revocation surfacing)

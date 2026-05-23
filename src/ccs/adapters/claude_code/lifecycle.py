@@ -408,6 +408,17 @@ def wait_for_shutdown(
 # ----------------------------------------------------------------------
 
 
+#: REL-06: cap on consecutive G4 aborts (coordinator.shutdown() raises)
+#: before the lifecycle gives up on a clean teardown and force-closes the
+#: flock so a fresh ensure_coordinator can re-spawn. The current G4
+#: behaviour holds the flock indefinitely on every abort — that protects
+#: in-flight handler state but means a wedged shutdown blocks all future
+#: spawns for the workspace. Capping at 3 attempts (≈3 sweep ticks) gives
+#: the coordinator a real chance to drain before we trade safety for
+#: liveness.
+_MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION = 3
+
+
 @dataclass
 class _SpawnedEntry:
     """Per-spawn state kept by the spawn-side process.
@@ -418,6 +429,10 @@ class _SpawnedEntry:
     the lock_fd. The first caller acquires the lock, runs the sequence,
     sets shutdown_done; subsequent callers acquire the lock, see done=True,
     return immediately.
+
+    REL-06: ``shutdown_abort_count`` tracks consecutive G4 aborts so the
+    idle loop can escalate after a bounded number of failures rather than
+    holding the flock indefinitely on a wedged shutdown.
     """
 
     coordinator: CoordinatorHTTPServer
@@ -425,6 +440,7 @@ class _SpawnedEntry:
     coherence_dir: Path
     shutdown_lock: threading.Lock
     shutdown_done: threading.Event
+    shutdown_abort_count: int = 0
 
 
 #: Maps coordinator_root → _SpawnedEntry. Only the spawn-side ever populates
@@ -797,12 +813,43 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
         try:
             coordinator.shutdown()
         except Exception as exc:
+            entry.shutdown_abort_count += 1
+            # REL-06: after N consecutive G4 aborts the operator's only
+            # recovery path was "kill the process and let stable-grant
+            # reclamation eventually clear the M/E slots, then ensure
+            # a fresh spawn". That's a load-bearing safety net but it's
+            # ~1800s in the worst case (max_hold_ticks default). Once
+            # we've exhausted our patience for the coordinator to drain
+            # cleanly, ESCALATE: release the flock + mark shutdown_done
+            # so a fresh ensure_coordinator can re-spawn immediately.
+            # Logged at CRITICAL with the escalation reason — operator
+            # can correlate with any in-flight handler state in their
+            # diagnostic surface.
+            if entry.shutdown_abort_count >= _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION:
+                logger.critical(
+                    "coordinator.shutdown failed %d consecutive times "
+                    "(>= escalation threshold %d). ESCALATING: releasing "
+                    "flock + marking shutdown_done so a fresh spawn can "
+                    "proceed. In-flight handler state may be inconsistent. "
+                    "Underlying error: %s",
+                    entry.shutdown_abort_count,
+                    _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION,
+                    exc,
+                )
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                _close_quiet(lock_fd)
+                entry.shutdown_done.set()
+                return True
             logger.critical(
-                "coordinator.shutdown failed; aborting shutdown sequence with "
-                "lock still held. Stable-grant reclamation (max_hold_ticks=%d) "
-                "is the recovery path. Underlying error: %s",
-                # config thresholds not on entry; using a generic mention
-                1800, exc,
+                "coordinator.shutdown failed (attempt %d/%d); aborting "
+                "shutdown sequence with lock still held. Stable-grant "
+                "reclamation is the recovery path. Underlying error: %s",
+                entry.shutdown_abort_count,
+                _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION,
+                exc,
             )
             # shutdown_done remains UNSET so a retry is possible. Return
             # True because this invocation DID run the sequence body
