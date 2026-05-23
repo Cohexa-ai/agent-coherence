@@ -65,6 +65,8 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 `v0.8.0` released — full Claude Code plugin coordinator (Python backend) plus the ce-review remediation pass. Adds six console scripts (`agent-coherence-coordinator`, `-status`, `-track`, `-untrack`, `-hook-client`, `-migrate-rules`); ships KTD-J telemetry, `/status` three-tier disclosure, `--self-test`, and `--prepare-for-migration` for safe Python↔Node coordinator backend switching. The companion [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin) ships `v0.1.1` of the marketplace plugin against this library. See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
+**v0.9.0 unreleased — v0.2 strict mode.** Phase A+B of the v0.2 plan have landed on `dev`: per-artifact `strict_mode_paths` opt-in via `.coherence/strict_mode.yaml`, all 4 PreToolUse handlers flip to `permissionDecision: "deny"` when (strict + tracked + invalidated), `TERMINAL_DENIAL_CLASSES` structural invariant guarding allow-emission paths, new `agent-coherence-migrate-deny` console script (STDOUT-only sibling to `-migrate-rules` with symlink containment), strict-mode telemetry counters + deny-only `.coherence/audit.log` JSONL surface. Strict mode is Python-coordinator-only in v0.2; the Node coordinator backend stays warn-mode. Plugin-side broad-beta launch package (Units 8-11) lands separately. See [CHANGELOG.md](CHANGELOG.md) `[Unreleased]` for the full scope.
+
 ## Paper
 
 **Token Coherence: Adapting MESI Cache Protocols to Minimize Synchronization Overhead in Multi-Agent LLM Systems**
