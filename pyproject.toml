@@ -40,6 +40,12 @@ agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
 # entries. Flag-only by default; --apply writes to settings.local.json
 # after a confirmation prompt.
 agent-coherence-migrate-rules = "ccs.cli.coherence_migrate_rules:main"
+# v0.2 plan Unit 3 (KTD-R): stricter sibling to migrate-rules. STDOUT only
+# (never writes), symlink-contained (canonical-path containment check),
+# never invokes an LLM, never scans files outside the workspace root.
+# Intended for security-sensitive operators who want the helper output
+# but not the auto-apply surface.
+agent-coherence-migrate-deny = "ccs.adapters.claude_code.migrate_deny:main"
 # Phase E.0 probe 2A surfaced that CC v2.1.131 rejects hooks.json URLs
 # containing ${COHERENCE_PORT} at LOAD TIME. HTTP-type hooks are not viable;
 # the plugin uses command-type hooks that invoke this client, which reads
