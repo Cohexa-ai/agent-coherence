@@ -477,12 +477,23 @@ def _apply_entries(
                 seen.add(entry)
                 appended += 1
 
+        # SEC-03: write-to-tmpfile + atomic rename. Plain write_text()
+        # truncates the destination first; a crash mid-write leaves the
+        # file partially-truncated and the next claude session sees a
+        # JSONDecodeError on parse + falls back to defaults — silently
+        # losing previously-applied entries. Atomic rename keeps the old
+        # file intact until the new file is fully written.
         try:
-            settings_path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            tmp_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(str(tmp_path), str(settings_path))
         except OSError as exc:
+            # Best-effort cleanup of the tmp file if rename failed.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             print(
                 f"agent-coherence-migrate-rules: could not write {settings_path}: {exc}",
                 file=sys.stderr,

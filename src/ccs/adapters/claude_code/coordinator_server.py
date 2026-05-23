@@ -2416,28 +2416,31 @@ def _build_preemption_text(
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
     """Return the session_id (not agent UUID) of the artifact's last writer, if any.
 
-    Best signal: an agent currently in MODIFIED state (they are the current writer).
-
-    Fallback caveat (COR-09): if no agent holds MODIFIED, we fall back to the
-    first entry in the state_map by insertion order. This agent may be in SHARED
-    or EXCLUSIVE state — it is not necessarily the actual last writer. In the
-    common case the querying agent itself may be in state_map (e.g. in SHARED),
-    meaning the stale-read warning could attribute the file to the very session
-    receiving the warning. This is a known limitation of the in-memory fallback;
-    a future improvement should use ``artifacts.last_writer_id`` from the DB
-    (via ``_fetch_artifact_row``) instead of the state_map fallback.
+    COR-09 (fixed): authoritative source is ``artifacts.last_writer_id``
+    in the registry — set by the commit path on successful post-edit and
+    NOT touched by reads or invalidations. Falls back to the state-map
+    only when the registry doesn't have a recorded writer (e.g.,
+    artifact created via first-observation seeding with no subsequent
+    successful commit). The previous state-map fallback could attribute
+    the write to the very session receiving the warning (agent appears
+    in state_map as SHARED, becomes the "first known agent").
     """
-    # The registry's _fetch_artifact_row returns last_writer_id; we expose it
-    # via lookup. For now derive from agent_names cache.
+    # COR-09 primary path: authoritative last_writer_id from the registry.
+    committed_writer = coordinator.registry.last_writer_for(artifact_id)
+    if committed_writer is not None:
+        return _agent_id_to_session(coordinator, committed_writer)
+    # Fallback for artifacts that exist but never had a successful commit
+    # (first-observation seeding with no post-edit yet). Best signal: an
+    # agent currently in MODIFIED state (mid-commit, in case the write
+    # is still in-flight).
     state_map = coordinator.registry.get_state_map(artifact_id)
-    # Best signal: an agent currently in MODIFIED state.
     for agent_id, state in state_map.items():
         if state == MESIState.MODIFIED:
             return _agent_id_to_session(coordinator, agent_id)
-    # Fallback: first known agent by insertion order (see docstring caveat).
-    if state_map:
-        first_agent = next(iter(state_map))
-        return _agent_id_to_session(coordinator, first_agent)
+    # No committed writer + no MODIFIED holder → genuinely unknown.
+    # Return None rather than the misleading "first state-map entry"
+    # which could be the querying agent itself.
+    return None
     return None
 
 
