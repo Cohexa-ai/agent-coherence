@@ -273,8 +273,15 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
 
     - ``files``: writes named files relative to the workspace root.
     - ``tracked``: writes ``.coherence/tracked.yaml`` with one path per line.
-    - ``policy``: NOT IMPLEMENTED yet — strict-mode-fixture-only; lands in
-      Unit 7b alongside Unit 2's strict-mode wire shape additions."""
+    - ``ignored``: writes ``.coherence/ignored.yaml`` with one path per line.
+    - ``strict_mode``: writes ``.coherence/strict_mode.yaml`` with one path
+      per line (Unit 7b — strict-mode-fixture support; the Node coordinator
+      doesn't ship strict_mode.yaml loading in v0.2 so strict fixtures are
+      python-only).
+    - ``preflight_requests``: list of request dicts fired BEFORE the main
+      test request; responses ignored. Used to drive multi-step setup like
+      "session A reads → session B preempts → A re-reads (the test request)".
+      Schema mirrors the top-level ``request``: ``{method, path, body, headers}``."""
     coherence_dir = workspace / ".coherence"
     coherence_dir.mkdir(exist_ok=True, mode=0o700)
 
@@ -284,16 +291,37 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(contents)
 
-    tracked = setup.get("tracked") or []
-    if tracked:
-        # Match TrackedArtifactPolicy.load expectations — YAML list form. We
-        # write the minimal valid shape that the policy loader accepts; if
-        # the policy loader's API changes, this stays the only place to
-        # adapt.
-        lines = ["tracked:"]
-        for pat in tracked:
-            lines.append(f"  - {pat}")
-        (coherence_dir / "tracked.yaml").write_text("\n".join(lines) + "\n")
+    # YAML loaders for tracked/ignored/strict_mode all accept a top-level
+    # list of patterns. Write the simplest valid shape that
+    # TrackedArtifactPolicy.load accepts.
+    for setup_key, yaml_file in (
+        ("tracked", "tracked.yaml"),
+        ("ignored", "ignored.yaml"),
+        ("strict_mode", "strict_mode.yaml"),
+    ):
+        patterns = setup.get(setup_key) or []
+        if patterns:
+            (coherence_dir / yaml_file).write_text(
+                "\n".join(f"- {p}" for p in patterns) + "\n"
+            )
+
+
+def apply_preflight_requests(
+    backend: CoordinatorBackend,
+    preflight: list[dict[str, Any]],
+) -> None:
+    """Fire each preflight request against ``backend``, ignoring responses.
+    Status-code mismatches in preflight are reported as RuntimeError so a
+    broken setup surfaces early instead of corrupting the main assertion."""
+    for i, req in enumerate(preflight):
+        status, body = execute_request(backend, req)
+        # Allow 200, 400 (preflight that expects validation errors), 404.
+        # Anything in the 500s indicates a coordinator bug — fail loud.
+        if status >= 500:
+            raise RuntimeError(
+                f"Preflight request #{i} ({req.get('method', 'POST')} "
+                f"{req.get('path')!r}) returned 5xx: status={status}, body={body!r}"
+            )
 
 
 # ----------------------------------------------------------------------
@@ -574,10 +602,18 @@ def run_scenario(
     workspace: Path,
     node_dist_path: Optional[Path] = None,
 ) -> tuple[int, dict[str, Any]]:
-    """End-to-end: setup workspace → spawn backend → POST → normalize → return.
+    """End-to-end: setup workspace → spawn backend → preflight requests →
+    main request → normalize → return.
 
-    Returns the normalized (status, body) for assertion by the caller."""
+    Returns the normalized (status, body) for assertion by the caller. The
+    preflight_requests list in fixture.setup is fired against the same live
+    coordinator BEFORE the main request — used by strict-mode fixtures to
+    drive the multi-step "A reads → B preempts → A re-reads (test)" setup
+    without requiring a separate fixture per step."""
     apply_setup(workspace, fixture.setup)
     with coordinator_running(backend_id, workspace, node_dist_path) as backend:
+        preflight = fixture.setup.get("preflight_requests") or []
+        if preflight:
+            apply_preflight_requests(backend, preflight)
         status, body = execute_request(backend, fixture.request)
     return status, normalize_response(body, ignore_keys=fixture.ignore_keys)
