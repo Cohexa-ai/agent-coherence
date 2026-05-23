@@ -47,6 +47,7 @@ from typing import Any, Callable, Literal, Protocol
 from typing import runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.auth import (
@@ -85,6 +86,13 @@ class _RequestProtocol(Protocol):
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+# v0.2 Unit 4: window for the "Read strict-deny → Bash cat strict-deny on
+# same (session, path)" route-around detector. Phase 0 saw the model
+# retry-loop and route-around behaviors complete within ~10s; 30s
+# accommodates slow runners + provides a margin for the operator-visible
+# strict_mode_routed_around_via_bash_total counter to remain accurate.
+STRICT_DENY_ROUTE_AROUND_WINDOW_SEC = 30.0
 
 # v0.1.1 KTD-G concurrency limits per plugin docs/known-issues/
 # 2026-05-17-watchdog-races.md A7 fix. Watchdog pool size × 2 is the
@@ -418,6 +426,31 @@ class CoordinatorHTTPServer:
         self._stale_warning_emitted_total: int = 0
         self._stale_warning_reread_total: int = 0
 
+        # v0.2 Unit 4 (KTD-V minimal + KTD-J extension): strict-mode
+        # telemetry counters surfaced via /status?detail=metrics. Three
+        # counters:
+        # - strict_mode_denials_total: bumped on every strict-mode deny
+        #   emission across all 4 handlers (Read / Edit/Write / Bash /
+        #   Grep). Operator-visible measure of strict mode's active
+        #   workload.
+        # - strict_mode_routed_around_via_bash_total: bumped in
+        #   _handle_pre_bash when a strict-deny fires AND a prior Read
+        #   strict-deny was logged for the same (session, path) within
+        #   STRICT_DENY_ROUTE_AROUND_WINDOW_SEC (default 30). Measures
+        #   the Phase 0 H4 routing pattern in live operation.
+        # - audit_log_mode_drift_total: bumped when audit.log mode
+        #   differs from 0o600 at append time. Operator chmod drift
+        #   surfaces here without refusing the append.
+        self._strict_mode_denials_total: int = 0
+        self._strict_mode_routed_around_via_bash_total: int = 0
+        self._audit_log_mode_drift_total: int = 0
+        # Per-(session, path) "recent strict-deny" memory for route-around
+        # detection. Bounded by the registry's own (session, artifact)
+        # cardinality at worst — same upper bound as _stale_warned_pairs.
+        # GC happens lazily on every check_strict_deny_route_around call.
+        self._recent_strict_denies: dict[tuple[str, str], float] = {}
+        self._recent_strict_denies_lock = threading.Lock()
+
         # KTD-J re-read detection: a stale warning marks an (agent, artifact)
         # pair as "warned"; the next pre-read on that pair consumes the
         # marker and bumps :attr:`_stale_warning_reread_total`. The set
@@ -701,6 +734,56 @@ class CoordinatorHTTPServer:
         with self._reliability_counter_lock:
             self._watchdog_queue_overflows_total += 1
 
+    def increment_strict_mode_denial(self) -> None:
+        """v0.2 Unit 4 (KTD-V minimal): increment the strict-mode denial
+        counter. Called from every strict-deny branch in the 4 PreToolUse
+        handlers. CPython GIL serializes ``x += 1`` on int attrs; counter
+        is advisory so we don't lock for free-threading Py 3.13+ either —
+        an undercount in a pathological race is acceptable given the
+        denials-only nature of the metric."""
+        self._strict_mode_denials_total += 1
+
+    def increment_strict_mode_routed_around_via_bash(self) -> None:
+        """v0.2 Unit 4: bumped only in _handle_pre_bash when the strict-
+        deny fires AND a prior Read strict-deny was logged for the same
+        (session, path) within the route-around window. Measures the
+        Phase 0 H4 routing pattern live; the ratio against
+        strict_mode_denials_total tells the operator whether their model
+        is exhibiting the bypass behavior in production."""
+        self._strict_mode_routed_around_via_bash_total += 1
+
+    def increment_audit_log_mode_drift(self) -> None:
+        """v0.2 Unit 4: bumped when audit_log.append_strict_deny detects
+        mode drift on the existing audit.log (operator chmod changed
+        away from 0o600). The append still proceeds — the counter is the
+        operator-visible signal to fix the mode."""
+        self._audit_log_mode_drift_total += 1
+
+    def record_strict_deny(self, session_id: str, path: str) -> None:
+        """v0.2 Unit 4 route-around tracker — store the (session, path)
+        pair with monotonic timestamp so a subsequent pre-bash deny on
+        the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
+        recognized as a route-around."""
+        with self._recent_strict_denies_lock:
+            self._recent_strict_denies[(session_id, path)] = time.monotonic()
+
+    def check_strict_deny_route_around(self, session_id: str, path: str) -> bool:
+        """v0.2 Unit 4: return True iff a prior strict-deny on (session,
+        path) was recorded within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC.
+        Lazy GC: entries older than the window are evicted on every call
+        so the dict's worst-case footprint stays bounded by active
+        (session × path) cardinality within the window."""
+        now = time.monotonic()
+        cutoff = now - STRICT_DENY_ROUTE_AROUND_WINDOW_SEC
+        with self._recent_strict_denies_lock:
+            # Lazy GC.
+            stale_keys = [
+                k for k, ts in self._recent_strict_denies.items() if ts < cutoff
+            ]
+            for k in stale_keys:
+                del self._recent_strict_denies[k]
+            return (session_id, path) in self._recent_strict_denies
+
     def increment_watchdog_late_completion(self) -> None:
         """P1 #5: a watchdog-timed-out future eventually completed
         successfully — any state it mutated (e.g., an EXCLUSIVE grant
@@ -757,6 +840,9 @@ class CoordinatorHTTPServer:
             "endpoint_counters": self.endpoint_counters_snapshot(),
             "intra_task_acquire_release_total": self._intra_task_acquire_release_total,
             "stale_warning_emitted_total": self._stale_warning_emitted_total,
+            "strict_mode_denials_total": self._strict_mode_denials_total,
+            "strict_mode_routed_around_via_bash_total": self._strict_mode_routed_around_via_bash_total,
+            "audit_log_mode_drift_total": self._audit_log_mode_drift_total,
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "auth_401_total": self._auth_401_total,
         }
@@ -1243,6 +1329,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         ):
             coordinator.increment_stale_warning_emitted()
             coordinator.mark_stale_warned(agent_id, artifact_id)
+            # v0.2 Unit 4 telemetry: counter + audit-log append + record
+            # session/path for route-around detection in pre-bash/pre-grep.
+            coordinator.increment_strict_mode_denial()
+            coordinator.record_strict_deny(session_id, path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=path, tool="Read",
+            ):
+                coordinator.increment_audit_log_mode_drift()
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
                     source="pre_read_strict_deny", summary=summary,
@@ -1365,6 +1460,14 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "hash_differs": False,  # pre-edit doesn't carry content_hash
                 }
                 coordinator.increment_stale_warning_emitted()
+                # v0.2 Unit 4 telemetry.
+                coordinator.increment_strict_mode_denial()
+                coordinator.record_strict_deny(session_id, path)
+                if not _audit_log.append_strict_deny(
+                    coordinator.coordinator_root,
+                    agent_id=session_id, path=path, tool="Edit",
+                ):
+                    coordinator.increment_audit_log_mode_drift()
                 return {
                     "ok": False,
                     "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -1836,6 +1939,21 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # (bounded by the model's own retry-loop per Phase 0 finding).
         if strict_stale_first is not None:
             coordinator.increment_stale_warning_emitted()
+            # v0.2 Unit 4 telemetry: count the deny, check for route-around,
+            # append audit-log line.
+            coordinator.increment_strict_mode_denial()
+            denied_path = strict_stale_first["path"]
+            if coordinator.check_strict_deny_route_around(session_id, denied_path):
+                # H4 routing pattern observed in live operation — Read got
+                # strict-denied earlier on this (session, path), and now
+                # Bash is hitting the same artifact within the window.
+                coordinator.increment_strict_mode_routed_around_via_bash()
+            coordinator.record_strict_deny(session_id, denied_path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=denied_path, tool="Bash",
+            ):
+                coordinator.increment_audit_log_mode_drift()
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -1972,6 +2090,17 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
         if strict_stale_first is not None:
             coordinator.increment_stale_warning_emitted()
+            # v0.2 Unit 4 telemetry — Grep does NOT contribute to the
+            # route-around-via-bash counter (that's bash-specific by the
+            # plan's KTD-J extension; Grep is a separate H4 surface).
+            coordinator.increment_strict_mode_denial()
+            denied_path = strict_stale_first["path"]
+            coordinator.record_strict_deny(session_id, denied_path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=denied_path, tool="Grep",
+            ):
+                coordinator.increment_audit_log_mode_drift()
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
