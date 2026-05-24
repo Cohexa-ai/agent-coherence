@@ -250,7 +250,23 @@ def _build_pre_read(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     session_id = _require_session_id(cc)
     file_path = _require_file_path(cc)
     rel = _to_workspace_relative(file_path, root)
-    return {"session_id": session_id, "path": rel}
+    body: dict[str, Any] = {"session_id": session_id, "path": rel}
+    # v0.2 KTD-O: compute content_hash from disk so the coordinator's
+    # strict-mode gate can disambiguate "session sees stale bytes"
+    # (first-observer reading a peer-updated file → strict-deny) from
+    # "session sees current bytes" (first-observer with content matching
+    # what the registry recorded → warn-mode allow). Without this,
+    # PreToolUse:Read carries no hash (Claude Code's Read tool reads
+    # AFTER the hook fires, so tool_response.content_hash is undefined
+    # at hook time), and the strict-deny gate's hash_differs branch is
+    # unreachable. Best-effort: _hash_file returns None on OSError
+    # (file missing, permission denied) — coordinator then falls back
+    # to the INVALID-only branch of the strict-deny gate, preserving
+    # v0.1.1 warn-mode behavior for non-strict workspaces.
+    content_hash = _hash_file(Path(file_path))
+    if content_hash is not None:
+        body["content_hash"] = content_hash
+    return body
 
 
 def _build_pre_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
