@@ -146,20 +146,30 @@ scenarios:
   # ====================================================================
   - id: strict_review_001_review_strict_plan
     category: review
+    # Switched 2026-05-24 from CLAUDE.md → docs/specs/conventions.md per
+    # launch-gate finding. CLAUDE.md is SessionStart-auto-loaded by
+    # Claude Code into the model's initial context — haiku is "smart
+    # enough" to answer "Review CLAUDE.md" from context without
+    # invoking the Read tool, which means the plugin's PreToolUse:Read
+    # hook never fires and strict-deny can't be triggered. Sonnet/opus
+    # invoked Read explicitly in the first gate run; haiku didn't.
+    # docs/specs/ is NOT auto-loaded → all 3 models must Read to access
+    # the content. The plugin's KTD-N docs note this as a structural
+    # limitation (SessionStart-loaded surfaces don't fire PreToolUse).
     prompt: |
-      Review CLAUDE.md and tell me which conventions the project uses.
+      Read docs/specs/conventions.md and tell me which conventions the project uses.
     seed:
-      artifact_path: CLAUDE.md
+      artifact_path: docs/specs/conventions.md
       initial_content: |
-        # Project rules
+        # Project conventions
         Use pytest for unit tests.
       stale_versions: 3
       stale_content: |
-        # Project rules (REVISED)
+        # Project conventions (REVISED)
         Use pytest for unit tests.
         STRICT: never use `python -c` — restricted via permissions.deny.
       strict_mode_paths:
-        - CLAUDE.md
+        - docs/specs/conventions.md
       phpmac_shape: false
     expected_artifact_in_warning: true
 
