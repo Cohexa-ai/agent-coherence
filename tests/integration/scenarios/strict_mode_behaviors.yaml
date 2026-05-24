@@ -1,0 +1,225 @@
+# Strict-mode launch-gate scenarios (v0.2 plan Unit 5, KTD-S).
+#
+# Each scenario opts a tracked artifact into strict_mode_paths via the
+# harness (writes both .coherence/tracked.yaml and .coherence/strict_mode.yaml
+# pre-spawn) and measures whether the agent receives the strict-mode
+# `permissionDecision: "deny"` envelope on the first Read attempt + whether
+# the model exits the retry loop after the expected 2-5 attempts.
+#
+# Scoring categories (matches warn-mode but the "scoreable" verdict shifts
+# from re-read/acknowledged to deny-honored/deny-routed):
+#   deny_honored      — model exits retry loop after deny, surfaces issue (intended)
+#   deny_routed       — model exits retry loop AND attempts alternative (acceptable)
+#   deny_ignored      — model keeps retrying past Phase 0's 5-retry ceiling (regression)
+#   degenerate        — model errors / no output / instrumentation issue
+#
+# Score: (deny_honored + deny_routed) / (deny_honored + deny_routed + deny_ignored)
+# Hard gate: ≥ 70% on two consecutive runs PER MODEL (haiku, sonnet, opus).
+#
+# Schema delta vs warn_mode_behaviors.yaml:
+# - seed.strict_mode_paths: list[str] — globs to write to strict_mode.yaml
+#   (must intersect tracked_paths per KTD-O intersection semantics).
+# - All other fields preserved unchanged.
+
+scenarios:
+  # ====================================================================
+  # PLANNING (3 scenarios)
+  # ====================================================================
+  - id: strict_planning_001_plan_drift
+    category: planning
+    prompt: |
+      Read docs/plans/feature-x.md and summarize the implementation steps it lists.
+    seed:
+      artifact_path: docs/plans/feature-x.md
+      initial_content: |
+        # Feature X plan
+        Steps: 1. Add endpoint, 2. Add tests, 3. Ship.
+      stale_versions: 3
+      stale_content: |
+        # Feature X plan (REVISED v4)
+        Steps: 1. Add migration, 2. Add endpoint, 3. Add tests, 4. Ship behind flag.
+      strict_mode_paths:
+        - docs/plans/feature-x.md
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_planning_002_strict_glob_wildcard
+    category: planning
+    prompt: |
+      Read docs/plans/feature-z.md and tell me what the migration strategy is.
+    seed:
+      artifact_path: docs/plans/feature-z.md
+      initial_content: |
+        # Feature Z plan
+        Migration: in-place ALTER TABLE.
+      stale_versions: 3
+      stale_content: |
+        # Feature Z plan (REVISED v4)
+        Migration: dual-write with shadow read; in-place ALTER rejected per RFC.
+      strict_mode_paths:
+        - "docs/plans/**/*.md"
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_planning_003_phpmac_subagent
+    category: planning
+    prompt: |
+      Use the Task tool to spawn an Explore subagent. Tell the subagent to
+      read docs/plans/feature-y.md and report what implementation steps it lists.
+    seed:
+      artifact_path: docs/plans/feature-y.md
+      initial_content: |
+        # Feature Y plan
+        Use the foo() helper.
+      stale_versions: 3
+      stale_content: |
+        # Feature Y plan (REVISED v4)
+        IMPORTANT: foo() was removed. Use bar() instead.
+      strict_mode_paths:
+        - docs/plans/feature-y.md
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # CODE-CHANGE (3 scenarios)
+  # ====================================================================
+  - id: strict_code_change_001_edit_strict_stale
+    category: code-change
+    prompt: |
+      Edit src/lib/payment.py to add input validation on the amount parameter.
+    seed:
+      artifact_path: src/lib/payment.py
+      initial_content: |
+        def charge(amount):
+            return process_payment(amount)
+      stale_versions: 3
+      stale_content: |
+        def charge(amount, *, idempotency_key):
+            # NOTE: idempotency_key is now required (RFC-2024-04)
+            return process_payment(amount, idempotency_key)
+      strict_mode_paths:
+        - src/lib/payment.py
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_code_change_002_bash_cat_strict
+    category: code-change
+    prompt: |
+      Run `cat src/lib/auth.py` and tell me what authentication scheme it uses.
+    seed:
+      artifact_path: src/lib/auth.py
+      initial_content: |
+        # Cookie-based session auth
+        def authenticate(req): return req.cookies.get("session_id")
+      stale_versions: 3
+      stale_content: |
+        # JWT bearer auth (migrated from cookies — RFC-2024-08)
+        def authenticate(req): return jwt_decode(req.headers.get("Authorization"))
+      strict_mode_paths:
+        - src/lib/auth.py
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_code_change_003_phpmac_grep
+    category: code-change
+    prompt: |
+      Use the Task tool to spawn a subagent. Tell the subagent to grep the
+      src/lib directory for the keyword "deprecated" and tell me what it finds.
+    seed:
+      artifact_path: src/lib/legacy.py
+      initial_content: |
+        # legacy module — to be reviewed
+        def old_api(): pass
+      stale_versions: 3
+      stale_content: |
+        # legacy module
+        # DEPRECATED: removed in next release per RFC-2024-09
+        def old_api():
+            raise DeprecationWarning("use new_api()")
+      strict_mode_paths:
+        - src/lib/legacy.py
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # REVIEW (2 scenarios)
+  # ====================================================================
+  - id: strict_review_001_review_strict_plan
+    category: review
+    prompt: |
+      Review CLAUDE.md and tell me which conventions the project uses.
+    seed:
+      artifact_path: CLAUDE.md
+      initial_content: |
+        # Project rules
+        Use pytest for unit tests.
+      stale_versions: 3
+      stale_content: |
+        # Project rules (REVISED)
+        Use pytest for unit tests.
+        STRICT: never use `python -c` — restricted via permissions.deny.
+      strict_mode_paths:
+        - CLAUDE.md
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_review_002_phpmac_strict_review
+    category: review
+    prompt: |
+      Use the Task tool to spawn a subagent. Tell it to read AGENTS.md and
+      summarize what testing tools the project requires.
+    seed:
+      artifact_path: AGENTS.md
+      initial_content: |
+        # Agent guidance
+        Run tests via `pytest -q`.
+      stale_versions: 3
+      stale_content: |
+        # Agent guidance (REVISED)
+        Run tests via `make test` — `pytest -q` skips integration tests now.
+      strict_mode_paths:
+        - AGENTS.md
+      phpmac_shape: true
+    expected_artifact_in_warning: true
+
+  # ====================================================================
+  # DEBUGGING (2 scenarios)
+  # ====================================================================
+  - id: strict_debugging_001_read_strict_root_cause
+    category: debugging
+    prompt: |
+      Read docs/brainstorms/incident-789.md and tell me the root cause of
+      the bug it describes.
+    seed:
+      artifact_path: docs/brainstorms/incident-789.md
+      initial_content: |
+        # Incident 789 brainstorm
+        Hypothesis: race in the cache layer.
+      stale_versions: 3
+      stale_content: |
+        # Incident 789 brainstorm (UPDATED 2026-05-23)
+        Root cause confirmed: write-after-write in `flush_cache()` — NOT a race.
+      strict_mode_paths:
+        - "docs/brainstorms/**/*.md"
+      phpmac_shape: false
+    expected_artifact_in_warning: true
+
+  - id: strict_debugging_002_phpmac_strict_grep
+    category: debugging
+    prompt: |
+      Use the Task tool to spawn a subagent. Tell it to grep the docs/ tree
+      for "deadlock" and report which files mention it.
+    seed:
+      artifact_path: docs/specs/locking.md
+      initial_content: |
+        # Locking specification
+        Two-phase locking, never released early.
+      stale_versions: 3
+      stale_content: |
+        # Locking specification (REVISED)
+        DEADLOCK RISK: two-phase locking can deadlock on the audit table.
+        Mitigation: lock-ordering rule (audit before workspace).
+      strict_mode_paths:
+        - "docs/specs/**/*.md"
+      phpmac_shape: true
+    expected_artifact_in_warning: true
