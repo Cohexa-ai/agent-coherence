@@ -198,7 +198,14 @@ def _seed_coordinator_state(workspace: Path, scenario: dict[str, Any], port: int
     Uses agent-coherence-track to register the artifact in the policy,
     then writes directly to SQLite to bump the version (simulating a
     peer session having committed updates)."""
-    from ccs.adapters.claude_code.lifecycle import _read_port_from_file
+    # Drive-by fix surfaced by Unit 5: this dead import (kept from an
+    # earlier draft) no longer resolves on current lifecycle.py — the
+    # private alias `_read_port_from_file` was renamed to the public
+    # `read_port_from_file`. The import was unused; removing it
+    # eliminates the ImportError that fires when ANY caller of
+    # _seed_coordinator_state runs on a machine with `claude` installed.
+    # See tests/integration/test_strict_mode_launch_gate.py for the
+    # Unit 5 caller that surfaced this.
     import sqlite3
 
     seed = scenario["seed"]
