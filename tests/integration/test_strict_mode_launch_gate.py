@@ -176,10 +176,19 @@ def _run_strict_scenario(
                 notes="coordinator failed to spawn",
             )
         try:
-            # Seed in the order: registered-in-policy (warn-mode helper)
-            # then promoted-to-strict-mode (our extension).
-            _seed_coordinator_state(workspace, scenario, port)
+            # Seeding order (FIXED 2026-05-24 per launch-gate finding):
+            # _seed_strict_mode writes strict_mode.yaml to disk BEFORE
+            # _seed_coordinator_state triggers a policy reload via the
+            # /policy/track HTTP call. The reload reads tracked.yaml +
+            # ignored.yaml + strict_mode.yaml in one shot — so strict
+            # mode is active by the time the test agent runs. Earlier
+            # implementation reversed this order; strict_mode.yaml was
+            # written AFTER the only policy-reload trigger, so
+            # is_strict_mode() returned False forever and every
+            # scenario degraded to warn-mode (which the strict-only
+            # classifier reads as "no denies → DEGENERATE").
             _seed_strict_mode(workspace, scenario)
+            _seed_coordinator_state(workspace, scenario, port)
 
             transcript_dir = Path(tempfile.mkdtemp(prefix="strict-transcript-"))
             try:
@@ -214,12 +223,26 @@ def _run_strict_scenario(
                 verdict, deny_seen, deny_count = _classify_strict(
                     proc.stdout, scenario["seed"]["artifact_path"]
                 )
+                # Diagnostic preservation: on DEGENERATE, persist the full
+                # claude transcript + stderr to /tmp so the operator can
+                # inspect what actually happened (was the plugin loaded?
+                # did the hook fire? did is_strict_mode return False?).
+                # Default temp transcript_dir is rm'd in the finally
+                # block, so we explicitly copy out before that.
+                notes_extra = ""
+                if verdict == StrictVerdict.DEGENERATE:
+                    debug_dir = Path("/tmp") / f"strict-mode-degenerate-{scenario['id']}-{model}-{int(time.time())}"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    (debug_dir / "stream.jsonl").write_text(proc.stdout or "")
+                    (debug_dir / "stderr.log").write_text(proc.stderr or "")
+                    (debug_dir / "scenario.json").write_text(json.dumps(scenario, indent=2))
+                    notes_extra = f"; transcript preserved at {debug_dir}"
                 return StrictScenarioResult(
                     **common_kw,
                     verdict=verdict,
                     deny_seen=deny_seen,
                     deny_count=deny_count,
-                    notes="" if proc.returncode == 0 else f"claude exit={proc.returncode}",
+                    notes=(("" if proc.returncode == 0 else f"claude exit={proc.returncode}") + notes_extra),
                 )
             finally:
                 shutil.rmtree(transcript_dir, ignore_errors=True)
