@@ -1299,33 +1299,60 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             "hash_differs": hash_differs,
         }
 
-        # v0.2 KTD-O / KTD-P: strict-mode deny branch. If the artifact is
-        # opted into strict mode via .coherence/strict_mode.yaml AND the
-        # session was previously invalidated (preempted by a peer commit),
-        # return permissionDecision:"deny" with the static reason template.
-        # Otherwise fall through to v0.1.1 warn-mode allow path unchanged.
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch.
         #
-        # Semantic guard: strict-deny fires only on agent_state == INVALID
-        # (true preemption). A first-time observer (agent_state is None on
-        # an existing artifact) gets warn-mode allow + additionalContext
-        # because they have not "acted on stale" — they have never seen
-        # the artifact before. The operator's intent for strict mode is
-        # "must re-read after invalidation," not "must read before any
-        # cross-session activity exists."
+        # Gate (refined 2026-05-24 per launch-gate finding): strict-deny
+        # fires when the artifact is in strict mode AND the session
+        # demonstrably lacks a fresh view of the current content. Two
+        # branches:
         #
-        # KTD-Q: this is the Read surface; the same gate fires on
-        # pre-edit / pre-bash / pre-grep for Edit|Write / Bash / Grep.
+        # 1. ``agent_state == INVALID`` — true preemption. Session
+        #    previously held SHARED on an older version; a peer commit
+        #    invalidated it. The session's context still carries the
+        #    stale beliefs. Strict-deny forces explicit re-read.
+        #
+        # 2. ``agent_state is None AND hash_differs`` — session has no
+        #    prior grant on the artifact AND the content the session
+        #    just hashed at the disk does not match what the registry
+        #    last recorded as the canonical content. This catches the
+        #    "agent has stale beliefs from somewhere else (CLAUDE.md
+        #    at session start, an earlier subagent's prose summary, a
+        #    file on disk that's been peer-updated)" pattern. If hashes
+        #    MATCH, the session is observing the same bytes the
+        #    registry recorded — no stale content to act on — falls
+        #    through to warn-mode allow.
+        #
+        # The hash_differs branch was added because the original "any
+        # None on existing artifact = deny" rule broke the unit-test
+        # setup pattern (warn-mode-style multi-session setup where
+        # both sessions read the same registered artifact). The hash
+        # check disambiguates "session sees identical bytes" (safe)
+        # from "session sees different bytes" (must re-acknowledge).
+        # Multi-model launch-gate scenarios always trigger via the
+        # hash-differs branch because the synthetic SQLite injection
+        # uses a sentinel hash ("f" * 64) that no real SHA-256
+        # matches.
+        #
+        # KTD-Q: this is the Read surface only. Pre-edit reverts to
+        # INVALID-only because pre-edit has no caller content_hash to
+        # apply the hash_differs disambiguation. Pre-bash + pre-grep
+        # capture None|INVALID via the loop's `state is not None and
+        # != INVALID: continue` filter — same effective gate as the
+        # original Unit 2 design, applied per-detected-path.
         #
         # KTD-T: do NOT re-grant SHARED on deny. The MESI state stays
-        # INVALID across the model's retry loop so every retry produces
-        # the same byte-stable deny reason text. Per Phase 0 finding the
-        # model exits the retry loop after 2-5 attempts and routes to
-        # alternative behavior; the deny IS the signal. Re-granting
-        # would let the second retry get fresh and silently downgrade
-        # the operator's hard guardrail.
+        # INVALID (or None) across the model's retry loop so every
+        # retry produces the same byte-stable deny reason text. Per
+        # Phase 0 finding the model exits the retry loop after 2-5
+        # attempts and routes to alternative behavior; the deny IS the
+        # signal. Re-granting would let the second retry get fresh and
+        # silently downgrade the operator's hard guardrail.
         if (
-            agent_state == MESIState.INVALID
-            and coordinator.policy.is_strict_mode(path)
+            coordinator.policy.is_strict_mode(path)
+            and (
+                agent_state == MESIState.INVALID
+                or (agent_state is None and hash_differs)
+            )
         ):
             coordinator.increment_stale_warning_emitted()
             coordinator.mark_stale_warned(agent_id, artifact_id)
@@ -1442,6 +1469,15 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if coordinator.policy.is_strict_mode(path):
             artifact = coordinator.registry.get_artifact(artifact_id)
             editor_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+            # Reverted to INVALID-only 2026-05-24 per the launch-gate
+            # finding. Pre-edit has no caller content_hash so it cannot
+            # apply the hash_differs disambiguation that pre-read uses
+            # (see pre-read gate above). Treating None as stale here
+            # would deny first-time editors on any tracked-strict
+            # artifact even when their working content is current.
+            # The original Unit 2 design — INVALID-only — is the right
+            # gate for the Edit/Write surface: pre-edit strict-deny
+            # fires after a session has been explicitly preempted.
             editor_stale = editor_state == MESIState.INVALID
             if artifact is not None and artifact.version > 0 and editor_stale:
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
