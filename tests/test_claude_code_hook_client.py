@@ -333,3 +333,108 @@ def test_pre_read_translates_absolute_to_workspace_relative(
     assert target_rel in paths, (
         f"path translation failed: expected '{target_rel}' in artifacts, got {paths}"
     )
+
+
+# ----------------------------------------------------------------------
+# _build_pre_grep — both path shapes (subagent absolute, direct relative)
+#
+# Regression guard for the 2026-05-24 launch-gate finding: PR #64 added an
+# `os.path.isabs(raw_path)` branch to `_build_pre_grep` but forgot to
+# `import os` at module scope. Every non-empty Grep path raised NameError,
+# which the main()'s broad except swallowed → empty `{}` response →
+# coordinator never contacted → strict-deny never fired. Existing pre-grep
+# tests all hit the coordinator HTTP endpoint directly and never exercised
+# the builder, so the bug slipped through CI.
+#
+# These tests drive the FULL hook-client path (stdin → main() → builder →
+# HTTP → stdout) for both subagent-shape and top-level-shape Grep payloads,
+# so any future regression in either branch fails loudly.
+# ----------------------------------------------------------------------
+
+
+def test_pre_grep_relative_path_drives_coordinator(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Direct (top-level) Grep invocation: path is workspace-relative.
+    Hook builder must produce a non-empty payload that reaches the
+    coordinator. Empty `{}` response indicates the builder crashed
+    silently (the bug PR #64 introduced + this guard fixes)."""
+    workspace, _ = live_coordinator
+    cc_payload = {
+        "session_id": _sid(),
+        "tool_name": "Grep",
+        "tool_input": {
+            "pattern": "anything",
+            "path": "docs",
+            "output_mode": "content",
+        },
+    }
+    rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+    assert rc == 0
+    response = json.loads(out)
+    # The builder must NOT have crashed silently. Empty {} would mean an
+    # exception was caught and `_emit_empty` fired — which is the exact
+    # NameError-swallow regression this test guards against.
+    assert response != {}, (
+        "pre-grep returned empty {} for a non-empty path — builder "
+        "likely crashed silently. Check imports and the _build_pre_grep "
+        "absolute/relative path branches."
+    )
+    assert "status" in response or "hookSpecificOutput" in response
+
+
+def test_pre_grep_absolute_path_drives_coordinator(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Subagent-shape Grep invocation: path is absolute (Task tool resolves
+    paths to absolute before dispatching to the subagent's hook). Hook
+    builder must normalize via _to_workspace_relative and produce a
+    non-empty coordinator-bound payload."""
+    workspace, _ = live_coordinator
+    (workspace / "docs").mkdir(parents=True, exist_ok=True)
+    cc_payload = {
+        "session_id": _sid(),
+        "tool_name": "Grep",
+        "tool_input": {
+            "pattern": "anything",
+            "path": str(workspace / "docs"),  # absolute path → subagent shape
+            "output_mode": "files_with_matches",
+        },
+    }
+    rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+    assert rc == 0
+    response = json.loads(out)
+    assert response != {}, (
+        "pre-grep returned empty {} for an absolute path — absolute-path "
+        "branch likely raised an exception (e.g., NameError from missing "
+        "`import os`). Check imports and _to_workspace_relative."
+    )
+    assert "status" in response or "hookSpecificOutput" in response
+
+
+def test_pre_grep_empty_path_does_not_crash(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Grep with no path arg → search root is workspace root (empty
+    string). Must reach the coordinator without crashing — the empty-path
+    branch in _build_pre_grep was the only branch the pre-fix builder
+    could survive on (it short-circuits before os.path.isabs)."""
+    workspace, _ = live_coordinator
+    cc_payload = {
+        "session_id": _sid(),
+        "tool_name": "Grep",
+        "tool_input": {
+            "pattern": "anything",
+            "output_mode": "content",
+        },
+    }
+    rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+    assert rc == 0
+    response = json.loads(out)
+    # Empty workspace + no tracked artifacts → coordinator returns
+    # {"status": "fresh"}. We just need a parseable JSON response, not
+    # specifically empty or non-empty.
+    assert isinstance(response, dict)
