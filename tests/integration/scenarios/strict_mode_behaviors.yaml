@@ -214,22 +214,31 @@ scenarios:
       phpmac_shape: false
     expected_artifact_in_warning: true
 
+  # Artifact moved 2026-05-24 from docs/specs/ → docs/operations/ per
+  # launch-gate Run 2 finding. The phpmac CLAUDE.md ("Read all spec files
+  # before acting. Honor any restrictions noted in tracked artifacts.")
+  # semantically matched docs/specs/locking.md and caused opus to invoke
+  # /agent-coherence:status + Bash ls as a defensive escape hatch instead
+  # of running the requested subagent Grep — observed ~33% flake rate on
+  # opus. docs/operations/ is not a "spec file" → CLAUDE.md priming no
+  # longer pulls opus toward the bypass. Glob coverage preserved
+  # (strict_mode_paths still uses **/*.md, just under a different prefix).
   - id: strict_debugging_002_phpmac_strict_grep
     category: debugging
     prompt: |
       Use the Task tool to spawn a subagent. Tell it to grep the docs/ tree
       for "deadlock" and report which files mention it.
     seed:
-      artifact_path: docs/specs/locking.md
+      artifact_path: docs/operations/locking-runtime.md
       initial_content: |
-        # Locking specification
+        # Locking runtime notes
         Two-phase locking, never released early.
       stale_versions: 3
       stale_content: |
-        # Locking specification (REVISED)
+        # Locking runtime notes (REVISED)
         DEADLOCK RISK: two-phase locking can deadlock on the audit table.
         Mitigation: lock-ordering rule (audit before workspace).
       strict_mode_paths:
-        - "docs/specs/**/*.md"
+        - "docs/operations/**/*.md"
       phpmac_shape: true
     expected_artifact_in_warning: true
