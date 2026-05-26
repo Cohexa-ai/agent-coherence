@@ -41,6 +41,10 @@ from ccs.replay.predicates import (
     SummaryFinding,
     run_predicates,
 )
+from ccs.replay.formatters import (
+    emit_human,
+    emit_json,
+)
 from ccs.replay.recorder import (
     UnverifiedAdapterCaptureError,
     record_callbacks,
@@ -60,6 +64,8 @@ __all__ = [
     "SummaryFinding",
     "TraceCorruptionError",
     "UnverifiedAdapterCaptureError",
+    "emit_human",
+    "emit_json",
     "load",
     "record_callbacks",
     "run_predicates",
