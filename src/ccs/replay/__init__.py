@@ -30,17 +30,37 @@ from ccs.replay.loader import (
     TraceCorruptionError,
     load,
 )
+from ccs.replay.predicates import (
+    CORE_PREDICATES,
+    Finding,
+    LostWritePredicate,
+    MonotonicVersionPredicate,
+    Predicate,
+    SingleWriterPredicate,
+    StaleReadPredicate,
+    SummaryFinding,
+    run_predicates,
+)
 from ccs.replay.recorder import (
     UnverifiedAdapterCaptureError,
     record_callbacks,
 )
 
 __all__ = [
+    "CORE_PREDICATES",
+    "Finding",
     "LoadedTrace",
+    "LostWritePredicate",
     "ManifestMissingOrUnreadableError",
+    "MonotonicVersionPredicate",
     "MultiInstanceTraceError",
+    "Predicate",
+    "SingleWriterPredicate",
+    "StaleReadPredicate",
+    "SummaryFinding",
     "TraceCorruptionError",
     "UnverifiedAdapterCaptureError",
     "load",
     "record_callbacks",
+    "run_predicates",
 ]
