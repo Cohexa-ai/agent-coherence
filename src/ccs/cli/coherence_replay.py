@@ -70,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
             "breaches. Consumes the trace format documented in "
             "docs/proposals/replay_trace_format.md."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            "  0  Clean OR all SKIPPED reasons opted out via manifest streams=\n"
+            "  1  >=1 CONFIRMED invariant breach\n"
+            "  2  >=1 SKIPPED for a stream declared but absent on disk "
+            "(capture bug)\n"
+            "  3  Trace error (manifest missing, MULTI_INSTANCE_TRACE, "
+            "TRACE_CORRUPTION_DUPLICATE_SEQ)\n"
+        ),
     )
     parser.add_argument(
         "session_dir",
@@ -118,9 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help=(
-            "Threshold for the AMBIGUOUS summary callout (default: 10). "
-            "When the count exceeds the threshold, the summary block "
-            "names both remedies (--include-ambiguous + D+1 global-seq)."
+            "Raw AMBIGUOUS count above which a summary callout is emitted "
+            "(default: 10, strict >). In --json mode, surfaces as the "
+            "nullable `ambiguous_callout` field. Does not affect exit code."
         ),
     )
     return parser

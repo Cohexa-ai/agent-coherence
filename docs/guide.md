@@ -710,6 +710,36 @@ agent-coherence-replay /tmp/coherence-session
 agent-coherence-replay /tmp/coherence-session --json | jq .
 ```
 
+#### `--json` schema
+
+The `--json` mode emits newline-delimited JSON: zero or more per-finding
+lines followed by exactly one summary line.
+
+Per-finding objects (`kind="finding"`):
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | string | Always `"finding"` |
+| `severity` | string | `"CONFIRMED"` or `"AMBIGUOUS"` |
+| `invariant` | string | One of `single-writer`, `monotonic-version`, `stale-read`, `lost-write` |
+| `agents` | list[string] | Agents involved in the breach |
+| `artifacts` | list[string] | Artifacts involved in the breach |
+| `tick_range` | object | `{"start": int, "end": int}` (inclusive) |
+| `context` | object | `{"stream": string, "sequence_number": int}` |
+| `details` | object | `{"expected": string, "observed": string}` |
+
+Summary object (`kind="summary"`, always the final line):
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | string | Always `"summary"` |
+| `counts` | object | `{"CONFIRMED": int, "AMBIGUOUS": int, "SKIPPED": int}` |
+| `counts_by_invariant` | object | Per-invariant breakdown: `{<name>: {"CONFIRMED": int, "AMBIGUOUS": int, "SKIPPED": int}}` |
+| `skipped_reasons` | list[object] | Per skip: `{"invariant": string, "reason": string, "stream_required": string, "opted_out": bool}` |
+| `ambiguous_threshold` | int | Threshold passed to `--ambiguous-threshold` (default 10) |
+| `ambiguous_callout` | string \| null | Non-null when AMBIGUOUS count strictly exceeds threshold |
+| `trace_metadata` | object | `{"adapter_type": string, "start_tick": int, "end_tick": int, "instance_id": string, "streams_present": list[string]}` |
+
 ### Exit codes
 
 | Exit code | Meaning |

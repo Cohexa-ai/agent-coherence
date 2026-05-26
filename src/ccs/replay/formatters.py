@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Iterable, TextIO
+from typing import Any, Iterable, TextIO, TypedDict
 
 from ccs.replay.predicates import Finding, SummaryFinding
 
@@ -40,6 +40,15 @@ __all__ = [
     "emit_human",
     "emit_json",
 ]
+
+
+class _Counts(TypedDict):
+    """Aggregated counts shared between the human and JSON formatters."""
+
+    CONFIRMED: int
+    AMBIGUOUS: int
+    SKIPPED: int
+    by_invariant: dict[str, dict[str, int]]
 
 
 # Stable iteration order across both formatters so per-invariant
@@ -122,7 +131,7 @@ def _write_finding_block(writer: TextIO, finding: Finding) -> None:
 def _write_summary_section(
     writer: TextIO,
     *,
-    counts: dict[str, int],
+    counts: _Counts,
     summary_list: list[SummaryFinding],
     include_ambiguous: bool,
     ambiguous_threshold: int,
@@ -189,7 +198,7 @@ def emit_json(
     for finding in findings_list:
         if finding.severity == "AMBIGUOUS" and not include_ambiguous:
             continue
-        writer.write(json.dumps(_finding_to_obj(finding), sort_keys=False))
+        writer.write(json.dumps(_finding_to_obj(finding), sort_keys=True))
         writer.write("\n")
 
     summary_obj = _build_summary_obj(
@@ -199,7 +208,7 @@ def emit_json(
         manifest=manifest or {},
         streams_present=list(streams_present or []),
     )
-    writer.write(json.dumps(summary_obj, sort_keys=False))
+    writer.write(json.dumps(summary_obj, sort_keys=True))
     writer.write("\n")
 
 
@@ -279,7 +288,7 @@ def _build_summary_obj(
 def _count_findings(
     findings: list[Finding],
     summary: list[SummaryFinding],
-) -> dict[str, Any]:
+) -> _Counts:
     """Aggregate counts shared by human + JSON paths."""
     by_inv: dict[str, dict[str, int]] = {
         name: {"CONFIRMED": 0, "AMBIGUOUS": 0, "SKIPPED": 0}

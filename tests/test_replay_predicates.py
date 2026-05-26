@@ -23,7 +23,6 @@ Unit 4:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -35,101 +34,25 @@ from ccs.replay import (
     load,
     run_predicates,
 )
+from replay_fixtures import (
+    audit_entry as _audit_line,
+    state_log_entry as _state_log_line,
+    write_jsonl,
+    write_manifest as _write_manifest,
+)
 
 
 # ---------------------------------------------------------------------------
-# On-disk fixture builders
+# Thin wrappers — call the hoisted helpers in tests/replay_fixtures.py
 # ---------------------------------------------------------------------------
-
-
-def _write_manifest(
-    session_dir: Path,
-    *,
-    streams: list[str],
-    instance_id: str | None = "instance-A",
-) -> None:
-    session_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "schema_version": 0,
-        "schema_note": "test fixture",
-        "adapter_type": "test-fixture",
-        "start_tick": 0,
-        "end_tick": 0,
-        "instance_id": instance_id,
-        "streams": streams,
-        "agents": {},
-        "artifacts": {},
-    }
-    (session_dir / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
-
-
-def _state_log_line(
-    *,
-    tick: int,
-    sequence_number: int,
-    agent_id: str = "agent-1",
-    artifact_id: str = "art-1",
-    from_state: str = "INVALID",
-    to_state: str = "EXCLUSIVE",
-    trigger: str = "write",
-    version: int = 1,
-    instance_id: str = "instance-A",
-) -> dict:
-    return {
-        "tick": tick,
-        "artifact_id": artifact_id,
-        "agent_id": agent_id,
-        "agent_name": agent_id,
-        "from_state": from_state,
-        "to_state": to_state,
-        "trigger": trigger,
-        "version": version,
-        "content_hash": "abc",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.state_log.v2",
-    }
-
-
-def _audit_line(
-    *,
-    tick: int,
-    sequence_number: int,
-    agent_id: str | None = "agent-1",
-    artifact_id: str = "art-1",
-    version: int | None = 1,
-    outcome: str = "content",
-    instance_id: str = "instance-A",
-) -> dict:
-    return {
-        "tick": tick,
-        "agent_id": agent_id,
-        "agent_name": agent_id if agent_id else None,
-        "artifact_id": artifact_id,
-        "version": version,
-        "content_hash": "abc",
-        "source": "fetch",
-        "outcome": outcome,
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.content_audit.v1",
-    }
 
 
 def _write_state_log(session_dir: Path, entries: list[dict]) -> None:
-    path = session_dir / "state_log.jsonl"
-    with path.open("w", encoding="utf-8") as fh:
-        for entry in entries:
-            fh.write(json.dumps(entry) + "\n")
+    write_jsonl(session_dir / "state_log.jsonl", entries)
 
 
 def _write_audit_log(session_dir: Path, entries: list[dict]) -> None:
-    path = session_dir / "content_audit_log.jsonl"
-    with path.open("w", encoding="utf-8") as fh:
-        for entry in entries:
-            fh.write(json.dumps(entry) + "\n")
+    write_jsonl(session_dir / "content_audit_log.jsonl", entries)
 
 
 def _make_session(
@@ -400,6 +323,33 @@ class TestStaleRead:
         audit_entries = [
             _audit_line(
                 tick=5, sequence_number=1, agent_id=None, version=1,
+            ),
+        ]
+        loaded = _make_session(
+            tmp_path, streams=["state_log", "content_audit_log"],
+            state_entries=state_entries, audit_entries=audit_entries,
+        )
+        findings, _ = run_predicates(loaded, invariants=["stale-read"])
+        assert findings == []
+
+    def test_outcome_not_content_skipped_silently(self, tmp_path: Path) -> None:
+        """Non-content outcomes (cache miss, error) early-return.
+
+        ``_classify_stale_read`` is only reached for ``outcome="content"``
+        entries; anything else (e.g. ``"empty"``, ``"error"``) is dropped
+        before stale comparison even with a stale version field.
+        """
+        state_entries = [
+            _state_log_line(
+                tick=2, sequence_number=1,
+                from_state="INVALID", to_state="MODIFIED",
+                trigger="commit", version=2,
+            ),
+        ]
+        audit_entries = [
+            _audit_line(
+                tick=5, sequence_number=1, agent_id="reader",
+                version=1, outcome="empty",
             ),
         ]
         loaded = _make_session(
@@ -725,6 +675,20 @@ def test_finding_is_frozen() -> None:
     )
     with pytest.raises(Exception):
         f.severity = "AMBIGUOUS"  # type: ignore[misc]
+
+
+def test_unknown_invariant_name_raises_value_error(tmp_path: Path) -> None:
+    """Programmatic callers passing a typo'd predicate name fail loudly.
+
+    The CLI guards via argparse ``choices=`` — but library callers don't,
+    and a silent empty result is the worst possible failure mode.
+    """
+    loaded = _make_session(tmp_path, streams=["state_log"], state_entries=[])
+    with pytest.raises(ValueError) as exc_info:
+        run_predicates(loaded, invariants=["misspelled-name"])
+    message = str(exc_info.value)
+    assert "misspelled-name" in message
+    assert "valid" in message
 
 
 def test_summary_finding_is_frozen() -> None:

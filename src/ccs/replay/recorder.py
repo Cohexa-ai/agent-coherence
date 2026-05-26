@@ -27,6 +27,7 @@ the file write, not the callback wiring.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
@@ -198,9 +200,20 @@ def _atomic_write_manifest(session_dir: Path, manifest: dict[str, Any]) -> None:
         prefix="manifest.", suffix=".json.tmp", dir=str(session_dir)
     )
     try:
-        payload = json.dumps(manifest, indent=2, sort_keys=False).encode("utf-8")
-        os.write(fd, payload)
-        os.fsync(fd)
+        try:
+            payload = json.dumps(manifest, indent=2, sort_keys=False).encode("utf-8")
+            os.write(fd, payload)
+            os.fsync(fd)
+        except BaseException:
+            # write/fsync failed before os.replace can move the file —
+            # unlink the orphan tempfile so the session_dir doesn't
+            # accumulate stale "manifest.*.json.tmp" entries.
+            try:
+                os.unlink(tmp_path)
+            except OSError as cleanup_exc:
+                if cleanup_exc.errno != errno.ENOENT:
+                    raise
+            raise
     finally:
         os.close(fd)
     os.replace(tmp_path, target)
@@ -272,7 +285,12 @@ class RecordingSession:
         )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         try:
             self._finalize_manifest()
         finally:

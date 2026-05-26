@@ -31,97 +31,21 @@ from typing import Any
 import pytest
 
 from ccs.cli.coherence_replay import build_parser, main
+from replay_fixtures import (
+    audit_entry as _audit_entry,
+    state_log_entry as _state_log_entry,
+    write_jsonl,
+    write_manifest as _write_manifest,
+)
 
 
 # ---------------------------------------------------------------------------
-# Fixture builders
+# Thin wrapper — CLI tests organize per-stream writes by short name
 # ---------------------------------------------------------------------------
-
-
-def _write_manifest(
-    session_dir: Path,
-    *,
-    streams: list[str],
-    instance_id: str | None = "instance-A",
-    adapter_type: str = "test-fixture",
-    start_tick: int = 0,
-    end_tick: int = 10,
-) -> None:
-    session_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "schema_version": 0,
-        "schema_note": "test fixture",
-        "adapter_type": adapter_type,
-        "start_tick": start_tick,
-        "end_tick": end_tick,
-        "instance_id": instance_id,
-        "streams": streams,
-        "agents": {},
-        "artifacts": {},
-    }
-    (session_dir / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
-
-
-def _state_log_entry(
-    *,
-    tick: int,
-    sequence_number: int,
-    agent_id: str = "agent-1",
-    artifact_id: str = "art-1",
-    from_state: str = "INVALID",
-    to_state: str = "EXCLUSIVE",
-    trigger: str = "write",
-    version: int = 1,
-    instance_id: str = "instance-A",
-) -> dict[str, Any]:
-    return {
-        "tick": tick,
-        "artifact_id": artifact_id,
-        "agent_id": agent_id,
-        "agent_name": agent_id,
-        "from_state": from_state,
-        "to_state": to_state,
-        "trigger": trigger,
-        "version": version,
-        "content_hash": "abc",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.state_log.v2",
-    }
-
-
-def _audit_entry(
-    *,
-    tick: int,
-    sequence_number: int,
-    agent_id: str | None = "agent-1",
-    artifact_id: str = "art-1",
-    version: int = 1,
-    outcome: str = "content",
-    instance_id: str = "instance-A",
-) -> dict[str, Any]:
-    return {
-        "tick": tick,
-        "agent_id": agent_id,
-        "agent_name": agent_id,
-        "artifact_id": artifact_id,
-        "version": version,
-        "content_hash": "abc",
-        "source": "fetch",
-        "outcome": outcome,
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.content_audit.v1",
-    }
 
 
 def _write_jsonl(session_dir: Path, name: str, entries: list[dict]) -> None:
-    path = session_dir / f"{name}.jsonl"
-    with path.open("w", encoding="utf-8") as fh:
-        for entry in entries:
-            fh.write(json.dumps(entry) + "\n")
+    write_jsonl(session_dir / f"{name}.jsonl", entries)
 
 
 def _clean_session(tmp_path: Path) -> Path:

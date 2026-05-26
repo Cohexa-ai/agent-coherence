@@ -9,9 +9,12 @@ stream from :class:`ccs.replay.loader.LoadedTrace` exactly once and
 emits structured findings for breaches of the four v1 invariants:
 
 - ``single-writer`` — at most one agent in MODIFIED or EXCLUSIVE per
-  artifact (reuses :func:`ccs.core.invariants.check_single_writer`).
+  artifact (mirrors :func:`ccs.core.invariants.check_single_writer` as
+  a direct boolean check; no raise-then-catch indirection).
 - ``monotonic-version`` — committed versions strictly increase per
-  artifact (reuses :func:`ccs.core.invariants.check_monotonic_version`).
+  artifact. Equal-version commits (idempotent partner retries) do NOT
+  fire — only strict regressions (``version < previous_max``) emit
+  findings.
 - ``stale-read`` — content-audit reads of versions older than the
   latest committed version, with AMBIGUOUS carve-out for same-tick
   collisions (intra-tick ordering undetermined per §5.2).
@@ -51,10 +54,8 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, ClassVar, Iterable, Iterator
 
-from ccs.core.invariants import check_monotonic_version, check_single_writer
-from ccs.core.exceptions import InvariantViolationError
 from ccs.core.states import MESIState
 from ccs.replay.loader import LoadedTrace
 
@@ -170,8 +171,8 @@ class Predicate(abc.ABC):
     whether to dispatch or skip.
     """
 
-    name: str
-    required_streams: set[str]
+    name: ClassVar[str]
+    required_streams: ClassVar[frozenset[str]]
 
     @abc.abstractmethod
     def process(
@@ -208,16 +209,14 @@ class SingleWriterPredicate(Predicate):
 
     Walks state_log entries; after the engine applies the entry to the
     shared fold, this predicate scans the per-artifact state map for
-    M∪E owners and emits CONFIRMED on overlap. The check delegates the
-    "any owners overlap?" decision to
-    :func:`ccs.core.invariants.check_single_writer` (it raises on
-    overlap; we translate that into a Finding rather than re-running
-    the count locally — the runtime helper is the canonical predicate
-    definition).
+    M∪E owners and emits CONFIRMED on overlap. Mirrors the runtime
+    helper :func:`ccs.core.invariants.check_single_writer` semantics
+    as a direct ``len(owners) > 1`` check — no raise-then-catch
+    indirection.
     """
 
     name = "single-writer"
-    required_streams = {_STATE_LOG}
+    required_streams = frozenset({_STATE_LOG})
 
     def process(
         self,
@@ -233,14 +232,12 @@ class SingleWriterPredicate(Predicate):
         state_by_agent = _collect_agents_for_artifact(
             shared.state_by_agent_artifact, artifact_id
         )
-        try:
-            check_single_writer(state_by_agent)
-        except InvariantViolationError:
-            owners = sorted(
-                agent_id
-                for agent_id, state in state_by_agent.items()
-                if state in _OWNER_STATES
-            )
+        owners = sorted(
+            agent_id
+            for agent_id, state in state_by_agent.items()
+            if state in _OWNER_STATES
+        )
+        if len(owners) > 1:
             return [_make_single_writer_finding(entry, artifact_id, owners)]
         return ()
 
@@ -297,15 +294,15 @@ class MonotonicVersionPredicate(Predicate):
     spuriously fire the predicate when a peer is invalidated at the
     same version.
 
-    Delegates the comparison to
-    :func:`ccs.core.invariants.check_monotonic_version`. Note that
-    helper checks ``current < previous``; the spec asks for *strict*
-    increase (``current > previous``), so we shift previous by +1
-    before calling — keeps the runtime predicate as canonical.
+    Strict-greater-than: ``version > previous_max`` per the spec. Equal
+    versions (e.g., partner retry logic re-emitting the same committed
+    version) do NOT fire — this matches the idempotent-commit semantics
+    the coordinator already preserves and avoids spurious findings on
+    safe replay-of-the-same-write.
     """
 
     name = "monotonic-version"
-    required_streams = {_STATE_LOG}
+    required_streams = frozenset({_STATE_LOG})
 
     def process(
         self,
@@ -322,13 +319,10 @@ class MonotonicVersionPredicate(Predicate):
         # -1 sentinel: any non-negative version satisfies strict increase
         # from the initial empty state.
         previous = shared.latest_committed_version.get(artifact_id, -1)
-        try:
-            # Spec asks for STRICT increase. The runtime helper raises only
-            # on regression (current < previous); shifting previous by +1
-            # turns the runtime check into a strict-monotonic check
-            # without re-implementing it.
-            check_monotonic_version(previous + 1, version)
-        except InvariantViolationError:
+        # Regression only — equal versions (idempotent commits / partner
+        # retry logic re-emitting the same version) do NOT fire, matching
+        # the coordinator's idempotent-commit semantics.
+        if version < previous:
             return [_make_monotonic_version_finding(entry, artifact_id, previous, version)]
         return ()
 
@@ -395,7 +389,7 @@ class StaleReadPredicate(Predicate):
     """
 
     name = "stale-read"
-    required_streams = {_STATE_LOG, _CONTENT_AUDIT_LOG}
+    required_streams = frozenset({_STATE_LOG, _CONTENT_AUDIT_LOG})
 
     def process(
         self,
@@ -487,7 +481,7 @@ class LostWritePredicate(Predicate):
     """
 
     name = "lost-write"
-    required_streams = {_STATE_LOG}
+    required_streams = frozenset({_STATE_LOG})
 
     def process(
         self,
@@ -567,17 +561,31 @@ def run_predicates(
     """
     selected = _select_predicates(invariants)
     active, summary = _partition_active(selected, loaded_trace)
-    findings = _walk(loaded_trace, active)
+    findings = list(_walk(loaded_trace, active))
     return findings, summary
 
 
 def _select_predicates(
     invariants: Iterable[str] | None,
 ) -> list[Predicate]:
-    """Instantiate the predicates the caller asked for (or all four)."""
+    """Instantiate the predicates the caller asked for (or all four).
+
+    Programmatic callers that pass an unknown name get a ValueError with
+    the valid set — argparse already guards CLI use via ``choices=``, but
+    library callers have no such guard and a silent empty result is the
+    worst possible failure mode.
+    """
     if invariants is None:
         return [cls() for cls in CORE_PREDICATES]
+    known_names = {cls.name for cls in CORE_PREDICATES}
     wanted = set(invariants)
+    unknown = wanted - known_names
+    if unknown:
+        bad_name = sorted(unknown)[0]
+        raise ValueError(
+            f"unknown invariant name: {bad_name!r}; "
+            f"valid: {sorted(known_names)}"
+        )
     return [cls() for cls in CORE_PREDICATES if cls.name in wanted]
 
 
@@ -644,8 +652,13 @@ def _make_skipped(
 def _walk(
     loaded_trace: LoadedTrace,
     active: list[Predicate],
-) -> list[Finding]:
+) -> Iterator[Finding]:
     """Walk the merged stream once, dispatching to active predicates.
+
+    Yields findings lazily so streaming consumers (e.g., progressive
+    emitters) can avoid fully materializing the list. ``run_predicates``
+    consumes the iterator at the boundary for the public list-typed
+    return contract.
 
     Per-entry sequence is load-bearing:
 
@@ -660,18 +673,16 @@ def _walk(
        split is the only way to keep all four predicates correct with
        a single-pass walk.
     """
-    findings: list[Finding] = []
     shared = _SharedState()
     for stream_kind, entry in loaded_trace.merged():
         if stream_kind == _STATE_LOG:
             _apply_state_map(entry, shared)
         for predicate in active:
-            findings.extend(predicate.process(entry, stream_kind, shared))
+            yield from predicate.process(entry, stream_kind, shared)
         if stream_kind == _STATE_LOG and _is_writer_commit(entry):
             _apply_version_fold(entry, shared)
     for predicate in active:
-        findings.extend(predicate.finalize())
-    return findings
+        yield from predicate.finalize()
 
 
 def _apply_state_map(entry: dict[str, Any], shared: _SharedState) -> None:

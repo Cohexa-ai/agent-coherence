@@ -31,10 +31,13 @@ from ccs.replay.recorder import (
     SCHEMA_VERSION,
     _STATE_LOG,
 )
+from replay_fixtures import audit_entry, state_log_entry
 
 
 # ---------------------------------------------------------------------------
-# Test fixtures
+# Recorder-test wrappers — keep tick / sequence_number defaults the
+# recorder tests assumed before hoisting (other tests always pass these
+# explicitly so the canonical helpers don't default them).
 # ---------------------------------------------------------------------------
 
 
@@ -44,21 +47,11 @@ def _state_log_entry(
     instance_id: str = "instance-A",
     sequence_number: int = 1,
 ) -> dict:
-    """Synthetic state_log entry shaped per replay_trace_format §3."""
-    return {
-        "tick": tick,
-        "artifact_id": "art-1",
-        "agent_id": "agent-1",
-        "agent_name": "researcher",
-        "from_state": "INVALID",
-        "to_state": "EXCLUSIVE",
-        "trigger": "write",
-        "version": 1,
-        "content_hash": "abc",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.state_log.v2",
-    }
+    return state_log_entry(
+        tick=tick,
+        sequence_number=sequence_number,
+        instance_id=instance_id,
+    )
 
 
 def _audit_entry(
@@ -67,20 +60,11 @@ def _audit_entry(
     instance_id: str = "instance-A",
     sequence_number: int = 1,
 ) -> dict:
-    """Synthetic content_audit_log entry shaped per replay_trace_format §4."""
-    return {
-        "tick": tick,
-        "agent_id": "agent-1",
-        "agent_name": "researcher",
-        "artifact_id": "art-1",
-        "version": 1,
-        "content_hash": "abc",
-        "source": "fetch",
-        "outcome": "content",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.content_audit.v1",
-    }
+    return audit_entry(
+        tick=tick,
+        sequence_number=sequence_number,
+        instance_id=instance_id,
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -389,6 +373,40 @@ class TestRollbackDurability:
 # ---------------------------------------------------------------------------
 # CCSStore.record_to thin wrapper
 # ---------------------------------------------------------------------------
+
+
+class TestBodyExceptionPropagation:
+    """An exception raised inside the with-block must propagate while
+    still finalizing the manifest and closing all file handles."""
+
+    def test_body_exception_finalizes_manifest_and_propagates(
+        self, tmp_path: Path,
+    ) -> None:
+        session_dir = tmp_path / "session"
+
+        class _UserCodeError(RuntimeError):
+            pass
+
+        with pytest.raises(_UserCodeError, match="user code crashed"):
+            with record_callbacks(
+                session_dir, accept_unverified=True
+            ) as (state_cb, _audit_cb):
+                state_cb(_state_log_entry(tick=3, sequence_number=1))
+                raise _UserCodeError("user code crashed")
+
+        # Manifest finalize ran: end_tick was updated from the entry.
+        manifest_path = session_dir / "manifest.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["end_tick"] == 3
+
+        # JSONL files are closed — reopening for read must succeed and
+        # the recorded entry must be intact (durable per fsync contract).
+        state_log_path = session_dir / "state_log.jsonl"
+        with state_log_path.open("r", encoding="utf-8") as fh:
+            lines = [line for line in fh if line.strip()]
+        assert len(lines) == 1
+        assert json.loads(lines[0])["sequence_number"] == 1
 
 
 class TestCCSStoreRecordTo:

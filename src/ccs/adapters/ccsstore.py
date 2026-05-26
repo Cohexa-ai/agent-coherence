@@ -158,14 +158,16 @@ class CCSStore(BaseStore):
         # If a caller passes it here, drop it — the wrapper owns the flag.
         ccsstore_kwargs.pop("accept_unverified", None)
 
-        # Mutable cell so the drain closure can see the store that
-        # only exists after record_callbacks has opened the session.
-        store_cell: list["CCSStore"] = []
+        # Late-bound reference; populated by the caller after CCSStore
+        # construction. A simple holder reads more clearly than a
+        # one-element list pretending to be a cell.
+        class _StoreRef:
+            store: "CCSStore | None" = None
 
         def _drain() -> tuple[dict[str, str], dict[str, str]]:
-            if not store_cell:
+            if _StoreRef.store is None:
                 return {}, {}
-            return _drain_store_registries(store_cell[0])
+            return _drain_store_registries(_StoreRef.store)
 
         with record_callbacks(
             path,
@@ -182,7 +184,7 @@ class CCSStore(BaseStore):
                 content_audit_log=audit_cb,
                 **ccsstore_kwargs,
             )
-            store_cell.append(store)
+            _StoreRef.store = store
             yield store
 
     # ------------------------------------------------------------------

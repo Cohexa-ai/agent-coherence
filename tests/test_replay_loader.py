@@ -34,93 +34,12 @@ from ccs.replay import (
     TraceCorruptionError,
     load,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fixture builders — hand-craft on-disk session directories
-# ---------------------------------------------------------------------------
-
-
-def _write_manifest(
-    session_dir: Path,
-    *,
-    streams: list[str],
-    instance_id: str | None = "instance-A",
-    start_tick: int = 0,
-    end_tick: int = 0,
-) -> None:
-    session_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "schema_version": 0,
-        "schema_note": "test fixture",
-        "adapter_type": "test-fixture",
-        "start_tick": start_tick,
-        "end_tick": end_tick,
-        "instance_id": instance_id,
-        "streams": streams,
-        "agents": {},
-        "artifacts": {},
-    }
-    (session_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-
-
-def _state_log_entry(
-    *,
-    tick: int,
-    sequence_number: int,
-    instance_id: str = "instance-A",
-    artifact_id: str = "art-1",
-    agent_id: str = "agent-1",
-    from_state: str = "INVALID",
-    to_state: str = "EXCLUSIVE",
-    trigger: str = "write",
-    version: int = 1,
-) -> dict:
-    return {
-        "tick": tick,
-        "artifact_id": artifact_id,
-        "agent_id": agent_id,
-        "agent_name": "researcher",
-        "from_state": from_state,
-        "to_state": to_state,
-        "trigger": trigger,
-        "version": version,
-        "content_hash": "abc",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.state_log.v2",
-    }
-
-
-def _audit_entry(
-    *,
-    tick: int,
-    sequence_number: int,
-    instance_id: str = "instance-A",
-    artifact_id: str = "art-1",
-    agent_id: str = "agent-1",
-    version: int = 1,
-) -> dict:
-    return {
-        "tick": tick,
-        "agent_id": agent_id,
-        "agent_name": "researcher",
-        "artifact_id": artifact_id,
-        "version": version,
-        "content_hash": "abc",
-        "source": "fetch",
-        "outcome": "content",
-        "sequence_number": sequence_number,
-        "instance_id": instance_id,
-        "schema_version": "ccs.content_audit.v1",
-    }
-
-
-def _write_jsonl(path: Path, entries: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        for entry in entries:
-            fh.write(json.dumps(entry) + "\n")
+from replay_fixtures import (
+    audit_entry as _audit_entry,
+    state_log_entry as _state_log_entry,
+    write_jsonl as _write_jsonl,
+    write_manifest as _write_manifest,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +209,33 @@ class TestMultiInstanceDetection:
 # ---------------------------------------------------------------------------
 # Lazy duplicate-seq detection
 # ---------------------------------------------------------------------------
+
+
+class TestMalformedJsonDetection:
+    """A malformed JSON line mid-stream raises TraceCorruptionError lazily."""
+
+    def test_malformed_json_in_stream_raises_corruption_error(
+        self, tmp_path: Path,
+    ) -> None:
+        session = tmp_path / "session"
+        _write_manifest(session, streams=["state_log"])
+        state_log_path = session / "state_log.jsonl"
+        # First line valid JSON; second line garbage. Walker must reject
+        # the file with a TraceCorruptionError that names the path AND
+        # the offending line number so partners can find the bad row.
+        state_log_path.write_text(
+            json.dumps(_state_log_entry(tick=1, sequence_number=1))
+            + "\n{not json at all}\n",
+            encoding="utf-8",
+        )
+
+        loaded = load(session)
+        with pytest.raises(TraceCorruptionError) as exc_info:
+            list(loaded.merged())
+        message = str(exc_info.value)
+        assert str(state_log_path) in message
+        # Garbage line is line 2.
+        assert ":2" in message
 
 
 class TestDuplicateSequenceDetection:
