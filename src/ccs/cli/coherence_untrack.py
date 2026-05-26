@@ -26,21 +26,27 @@ from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
     err,
     http_status_from_error,
+    normalize_workspace_path,
     post,
     resolve_endpoint,
-    validate_relative_path,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-coherence-untrack",
-        description="Append one or more workspace-relative paths to the coordinator's ignored set.",
+        description="Append one or more paths to the coordinator's ignored set.",
     )
     parser.add_argument(
         "paths",
         nargs="+",
-        help="One or more workspace-relative paths to ignore (no leading '/' or '..').",
+        help=(
+            "One or more paths to ignore. Accepts workspace-relative paths "
+            "(e.g. 'docs/draft.md') OR absolute paths inside the workspace "
+            "root (auto-normalized to workspace-relative before send). "
+            "Absolute paths outside the workspace are rejected. No '..' "
+            "traversal."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -59,14 +65,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         err("agent-coherence-untrack: not in a git repository")
         return 1
 
+    # See coherence_track.py for rationale: normalize_workspace_path lets
+    # the operator pass absolute paths inside the workspace and the CLI
+    # auto-strips to workspace-relative before send. Matches the
+    # /agent-coherence:untrack skill template UX (which substitutes
+    # $ARGUMENTS verbatim).
     invalid: list[tuple[str, str]] = []
     valid: list[str] = []
     for p in args.paths:
-        reason = validate_relative_path(p)
+        normalized, reason = normalize_workspace_path(p, Path(root))
         if reason is not None:
             invalid.append((p, reason))
         else:
-            valid.append(p)
+            valid.append(normalized)
 
     if not valid:
         for p, reason in invalid:
