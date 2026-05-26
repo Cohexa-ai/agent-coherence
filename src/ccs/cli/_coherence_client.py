@@ -66,7 +66,14 @@ def validate_relative_path(p: str) -> str | None:
     P2 ce-review fix #6 (maintainability): consolidates the
     ``_validate_path`` helper that previously existed byte-for-byte in
     both coherence_track.py and coherence_untrack.py — divergence risk
-    eliminated. Both scripts now import this single source of truth."""
+    eliminated. Both scripts now import this single source of truth.
+
+    Note: this is a PURE-STRING validator. Callers that want to accept
+    absolute paths inside the workspace (operator-UX path, exposed via
+    ``/agent-coherence:track`` skill template that passes ``$ARGUMENTS``
+    verbatim) should call :func:`normalize_workspace_path` instead, which
+    handles absolute-vs-relative + workspace-containment before delegating
+    to this function."""
     if not p:
         return "empty"
     if p.startswith("/"):
@@ -74,6 +81,57 @@ def validate_relative_path(p: str) -> str | None:
     if ".." in Path(p).parts:
         return "path must not contain '..' traversal"
     return None
+
+
+def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
+    """Normalize a CLI path argument to workspace-relative form.
+
+    Returns ``(normalized_path, None)`` if the path is valid; returns
+    ``(original_path, reason_string)`` if invalid. Accepts both relative
+    and absolute paths:
+
+    - **Empty** → ``("", "empty")``
+    - **Relative** (e.g., ``"docs/plan.md"``) → validated as-is via
+      :func:`validate_relative_path`; returned unchanged on success.
+    - **Absolute and inside workspace root** (e.g.,
+      ``"/Users/x/repo/docs/plan.md"`` with ``root=/Users/x/repo``) →
+      stripped to workspace-relative (``"docs/plan.md"``); re-validated
+      for ``..`` traversal defense.
+    - **Absolute and outside workspace root** (e.g., ``"/etc/passwd"``)
+      → rejected with ``"path outside workspace root"``.
+
+    This helper exists because the Claude Code plugin's
+    ``/agent-coherence:track`` skill template substitutes ``$ARGUMENTS``
+    verbatim — operators routinely type absolute paths (autocomplete from
+    their shell or IDE). Pre-2026-05-26 the CLI rejected those outright;
+    this helper normalizes them so the operator UX matches the skill UX.
+
+    The normalized form is what gets written to ``tracked.yaml`` /
+    ``ignored.yaml`` — absolute paths must NEVER leak into those files
+    because they're per-machine / per-worktree and would break cross-host
+    state sharing if the coordinator-backed state.db is ever migrated.
+
+    M-02 trust-boundary note: the server-side validator
+    (:func:`ccs.adapters.claude_code.coordinator_server.validate_path`)
+    still independently rejects absolute paths in the coordinator
+    request body. This client-side normalization happens BEFORE the
+    request is built — by the time the request hits the wire, the path
+    is workspace-relative. The server check remains the authoritative
+    gate against malformed direct-HTTP calls that bypass this CLI.
+    """
+    if not p:
+        return p, "empty"
+    if Path(p).is_absolute():
+        try:
+            normalized = str(Path(p).resolve().relative_to(root.resolve()))
+        except ValueError:
+            return p, "path outside workspace root"
+        # Re-validate the normalized form against the pure-string rules
+        # (catches e.g. a resolved path that still contains '..' — defensive)
+        reason = validate_relative_path(normalized)
+        return (normalized, None) if reason is None else (p, reason)
+    reason = validate_relative_path(p)
+    return (p, None) if reason is None else (p, reason)
 
 
 @dataclass(frozen=True)

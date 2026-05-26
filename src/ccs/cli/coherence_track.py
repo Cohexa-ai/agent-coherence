@@ -26,21 +26,27 @@ from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
     err,
     http_status_from_error,
+    normalize_workspace_path,
     post,
     resolve_endpoint,
-    validate_relative_path,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-coherence-track",
-        description="Add one or more workspace-relative paths to the coordinator's tracked set.",
+        description="Add one or more paths to the coordinator's tracked set.",
     )
     parser.add_argument(
         "paths",
         nargs="+",
-        help="One or more workspace-relative paths to track (no leading '/' or '..').",
+        help=(
+            "One or more paths to track. Accepts workspace-relative paths "
+            "(e.g. 'docs/plan.md') OR absolute paths inside the workspace "
+            "root (auto-normalized to workspace-relative before send). "
+            "Absolute paths outside the workspace are rejected. No '..' "
+            "traversal."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -59,15 +65,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         err("agent-coherence-track: not in a git repository")
         return 1
 
-    # Local pre-validation so we can fail fast without a network round-trip.
+    # Local pre-validation + normalization so we can fail fast without a
+    # network round-trip. normalize_workspace_path accepts both relative
+    # paths (e.g. "docs/plan.md") and absolute paths inside the workspace
+    # root (e.g. "/Users/x/repo/docs/plan.md") — the latter auto-strips to
+    # workspace-relative before send. Absolute paths outside root are
+    # rejected. This matches the operator UX expectation when the path is
+    # passed verbatim from the /agent-coherence:track skill template.
     invalid: list[tuple[str, str]] = []
     valid: list[str] = []
     for p in args.paths:
-        reason = validate_relative_path(p)
+        normalized, reason = normalize_workspace_path(p, Path(root))
         if reason is not None:
-            invalid.append((p, reason))
+            invalid.append((p, reason))  # original input in error for clarity
         else:
-            valid.append(p)
+            valid.append(normalized)  # normalized form to coordinator
 
     if not valid:
         for p, reason in invalid:
