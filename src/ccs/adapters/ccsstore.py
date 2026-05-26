@@ -11,8 +11,10 @@ import logging
 import threading
 import uuid
 import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
 
 from langgraph.store.base import (
     BaseStore,
@@ -110,6 +112,78 @@ class CCSStore(BaseStore):
         self._bm_actual: int | None = 0 if benchmark else None
         self._bm_ops: int | None = 0 if benchmark else None
         self._bm_hits: int | None = 0 if benchmark else None
+
+    # ------------------------------------------------------------------
+    # Replay capture — thin wrapper over ccs.replay.record_callbacks
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @contextmanager
+    def record_to(
+        cls,
+        path: str | Path,
+        *,
+        streams: set[str] | frozenset[str] | None = None,
+        **ccsstore_kwargs: Any,
+    ) -> Iterator["CCSStore"]:
+        """LangGraph-shaped capture context manager.
+
+        ``with CCSStore.record_to(path) as store: ...`` produces an
+        invariant-replay trace on disk per
+        ``docs/proposals/replay_trace_format.md``.
+
+        Composes any caller-supplied ``state_log`` / ``content_audit_log``
+        callbacks with the file-writing callbacks; never overrides them.
+
+        ``content_audit_log`` is ALWAYS passed to ``CCSStore.__init__``
+        (even when ``streams={'state_log'}``) because
+        ``retain_versions=content_audit_log is not None`` (init line 88)
+        is required by the other three invariants. The opt-out only
+        suppresses the on-disk JSONL writer.
+
+        CCSStore is the verified adapter in v1, so this wrapper sets
+        ``accept_unverified=True`` automatically — no
+        ``UnverifiedAdapterCaptureError`` and no stderr warning. The
+        opt-in gate is on ``record_callbacks`` for direct (CrewAI /
+        AutoGen) callers.
+        """
+        # Import inside the method body — keeps the optional replay
+        # surface out of the CCSStore import path for installs that
+        # don't use it. (Same-layer import; no architecture violation.)
+        from ccs.replay.recorder import record_callbacks
+
+        caller_state_log = ccsstore_kwargs.pop("state_log", None)
+        caller_audit_log = ccsstore_kwargs.pop("content_audit_log", None)
+        # accept_unverified is enforced by CCSStore (verified adapter).
+        # If a caller passes it here, drop it — the wrapper owns the flag.
+        ccsstore_kwargs.pop("accept_unverified", None)
+
+        # Mutable cell so the drain closure can see the store that
+        # only exists after record_callbacks has opened the session.
+        store_cell: list["CCSStore"] = []
+
+        def _drain() -> tuple[dict[str, str], dict[str, str]]:
+            if not store_cell:
+                return {}, {}
+            return _drain_store_registries(store_cell[0])
+
+        with record_callbacks(
+            path,
+            streams=streams,
+            accept_unverified=True,
+            state_log=caller_state_log,
+            content_audit_log=caller_audit_log,
+            adapter_type="langgraph-ccsstore",
+            drain_registries=_drain,
+            _verified_caller=True,
+        ) as (state_cb, audit_cb):
+            store = cls(
+                state_log=state_cb,
+                content_audit_log=audit_cb,
+                **ccsstore_kwargs,
+            )
+            store_cell.append(store)
+            yield store
 
     # ------------------------------------------------------------------
     # BaseStore interface — batch is the single implementation point
@@ -549,6 +623,26 @@ class CCSStore(BaseStore):
         if "__ccs_size_tokens__" in value:
             return int(value["__ccs_size_tokens__"])
         return max(1, len(json.dumps(value, sort_keys=True, separators=(",", ":"))) // 4)
+
+
+def _drain_store_registries(store: CCSStore) -> tuple[dict[str, str], dict[str, str]]:
+    """Snapshot agents + artifacts from a CCSStore for manifest finalization.
+
+    Called by ``CCSStore.record_to``'s drain closure on session
+    ``__exit__``. Returns ``(agents_by_uuid, artifacts_by_uuid)`` —
+    UUID strings to display names. Empty dicts when no MESI activity
+    has fired.
+    """
+    core = store.core
+    # agent_id (UUID) → name; sourced from the same dict that ArtifactRegistry
+    # uses for state_log entry naming.
+    agents = {str(uid): name for uid, name in core._agent_names.items()}
+    artifacts: dict[str, str] = {}
+    for artifact_id in core.registry.artifact_ids():
+        meta = core.registry.get_artifact(artifact_id)
+        if meta is not None:
+            artifacts[str(artifact_id)] = meta.name
+    return agents, artifacts
 
 
 def _ns_starts_with(ns: tuple[str, ...], prefix: tuple[str, ...]) -> bool:

@@ -24,6 +24,7 @@ _LAYER_BY_NAMESPACE = {
     "adapters": "interface",
     "validation": "interface",
     "diagnose": "interface",
+    "replay": "interface",
 }
 
 _ALLOWED_LAYER_IMPORTS = {
