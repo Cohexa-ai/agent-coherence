@@ -23,12 +23,24 @@ Public API:
 :func:`record_callbacks` and lives on the adapter class itself.
 """
 
+from ccs.replay.loader import (
+    LoadedTrace,
+    ManifestMissingOrUnreadableError,
+    MultiInstanceTraceError,
+    TraceCorruptionError,
+    load,
+)
 from ccs.replay.recorder import (
     UnverifiedAdapterCaptureError,
     record_callbacks,
 )
 
 __all__ = [
+    "LoadedTrace",
+    "ManifestMissingOrUnreadableError",
+    "MultiInstanceTraceError",
+    "TraceCorruptionError",
     "UnverifiedAdapterCaptureError",
+    "load",
     "record_callbacks",
 ]
