@@ -648,6 +648,112 @@ See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags
 
 ---
 
+## Replay (v0.10.0+)
+
+`agent-coherence-replay` is an invariant-replay tool that walks a captured
+coordinator session and reports breaches of the four core MESI invariants —
+single-writer, monotonic-version, stale-read, lost-write — without re-executing
+any agents. Capture rides on the existing `state_log` and `content_audit_log`
+callback seams via `CCSStore.record_to(path)`.
+
+### Capture and replay (LangGraph quickstart)
+
+```python
+from langgraph.config import get_store as lg_get_store
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+from ccs.adapters.ccsstore import CCSStore
+
+
+class GraphState(TypedDict):
+    log: list[str]
+
+
+def planner_node(state: GraphState) -> dict:
+    store: CCSStore = lg_get_store()  # type: ignore[assignment]
+    store.put(("planner", "shared"), "plan", {"step": 1})
+    return {"log": [*state["log"], "planner: wrote plan"]}
+
+
+def reviewer_node(state: GraphState) -> dict:
+    store: CCSStore = lg_get_store()  # type: ignore[assignment]
+    item = store.get(("reviewer", "shared"), "plan")
+    assert item is not None
+    return {"log": [*state["log"], "reviewer: read plan"]}
+
+
+def build_graph(store: CCSStore):
+    builder = StateGraph(GraphState)
+    builder.add_node("planner", planner_node)
+    builder.add_node("reviewer", reviewer_node)
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "reviewer")
+    builder.add_edge("reviewer", END)
+    return builder.compile(store=store)
+
+
+# Wrap the store with record_to(...) for the duration of the run.
+with CCSStore.record_to("/tmp/coherence-session", strategy="lazy") as store:
+    graph = build_graph(store)
+    graph.invoke({"log": []})
+```
+
+The session directory now contains a `manifest.json` plus one JSONL file per
+captured stream (`state_log.jsonl`, `content_audit_log.jsonl`). Inspect it with:
+
+```bash
+# Human-readable findings + summary
+agent-coherence-replay /tmp/coherence-session
+
+# Machine-readable, one JSON object per line (per-finding + final summary)
+agent-coherence-replay /tmp/coherence-session --json | jq .
+```
+
+### Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Clean trace (or all SKIPPED entries are explicit compliance opt-outs) |
+| `1` | At least one CONFIRMED invariant breach |
+| `2` | Capture-side bug: a manifest-declared stream is missing from the directory |
+| `3` | Trace error (multi-instance, duplicate sequence number, missing manifest) |
+
+### Useful flags
+
+- `--invariant <name>` (repeatable) — restrict to a subset of `single-writer`, `monotonic-version`, `stale-read`, `lost-write`.
+- `--include-ambiguous` — show same-tick read/commit collisions as per-finding entries (suppressed from default output; always counted in summary).
+- `--quiet` — suppress non-breach output; cron-friendly.
+- `--json` — newline-delimited JSON conforming to the trace-format schema.
+
+### Capturing PII-constrained traces
+
+Pass `streams={"state_log"}` to opt out of the content-audit stream while
+keeping the other three invariants live:
+
+```python
+with CCSStore.record_to(
+    "/tmp/coherence-session",
+    streams={"state_log"},
+    strategy="lazy",
+) as store:
+    ...
+```
+
+Replay then reports stale-read as SKIPPED with `opted_out=True` and the run
+still exits 0.
+
+### Non-LangGraph adapters (CrewAI / AutoGen)
+
+CrewAI and AutoGen capture is wired through the same `CoherenceAdapterCore`
+seam via `ccs.replay.record_callbacks(...)`, but v1 only verifies the
+LangGraph path end-to-end. Direct callers must pass `accept_unverified=True`
+to acknowledge the v1 scope boundary — file an issue if the unverified path
+breaks for your stack. Ergonomic per-adapter wrappers (`record_to` mirrors)
+ship in the next release.
+
+---
+
 ## Command-line tools
 
 All bundled CLIs are installed as console scripts when you
@@ -660,6 +766,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-simulate` | — | Run a protocol-only simulation scenario from a YAML file |
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
+| `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
 
 Run any command with `--help` for the full option list.
 
