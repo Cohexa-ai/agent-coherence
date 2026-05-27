@@ -20,6 +20,14 @@ Exit-code mapping resolved in plan Open Question P1-A (mirrors
   exception's message is printed to stderr verbatim; tracebacks are
   caught so partners get the actionable next-step pointer instead of
   Python internals.
+- ``4`` — internal error (any other uncaught exception). Decouples
+  CLI bugs from CONFIRMED breach (exit 1) so agents triage cleanly.
+  The exception type + message land on stderr; Python tracebacks are
+  swallowed.
+
+Pipe-close handling: ``BrokenPipeError`` (e.g., from ``| head -5``)
+exits ``0`` — consumer-closed-pipe is not a failure mode and should
+not poison exit-code-driven CI pipelines.
 
 AMBIGUOUS suppression resolved in plan Open Question P1-B: per-finding
 output suppresses AMBIGUOUS by default; ``--include-ambiguous`` opts
@@ -66,6 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Replay a captured coordinator session and report invariant "
             "breaches. Consumes the trace format documented in "
             "docs/proposals/replay_trace_format.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            "  0  Clean OR all SKIPPED reasons opted out via manifest streams=\n"
+            "     (also: BrokenPipeError — consumer closed the pipe early)\n"
+            "  1  >=1 CONFIRMED invariant breach\n"
+            "  2  >=1 SKIPPED for a stream declared but absent on disk "
+            "(capture bug)\n"
+            "  3  Trace error (manifest missing, MULTI_INSTANCE_TRACE, "
+            "TRACE_CORRUPTION_DUPLICATE_SEQ)\n"
+            "  4  Internal error (uncaught exception; CLI bug — file an issue)\n"
         ),
     )
     parser.add_argument(
@@ -126,17 +146,46 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point — returns the exit code; never calls ``sys.exit``.
 
-    The full trace-error guard wraps load + walk + emit because the
-    loader's iterator is lazy: MultiInstance / TraceCorruption raise
-    mid-walk, not at ``load()`` time. Catching only ``load()`` would
-    leak a traceback when the corruption hides past the manifest.
+    Three guards in order of specificity:
+
+    - ``_TRACE_ERRORS + OSError`` (exit 3): the documented corrupted-
+      trace family + general read-time IO errors. The full guard wraps
+      load + walk + emit because the loader's iterator is lazy:
+      MultiInstance / TraceCorruption raise mid-walk, not at ``load()``
+      time. Catching only ``load()`` would leak a traceback when the
+      corruption hides past the manifest.
+    - ``BrokenPipeError`` (exit 0): consumer closed the pipe (e.g.
+      ``| head -5``). Not a failure; exit cleanly so CI scripts that
+      compose us with pagers / line-limiters don't accumulate false
+      positives. The ``__main__`` wrapper also guards a residual
+      BrokenPipeError during interpreter shutdown when Python tries to
+      flush stdout to the already-torn-down pipe.
+    - ``Exception`` (exit 4): anything else uncaught. Surfaces the
+      exception type + message on stderr; the traceback is swallowed
+      so partners get an actionable signal instead of Python internals.
+      Distinct from exit 1 (CONFIRMED breach) so agents triage cleanly.
     """
     args = build_parser().parse_args(argv)
     try:
         return _run(args)
+    except BrokenPipeError:
+        # Specific catch FIRST — BrokenPipeError inherits from OSError,
+        # so the broader except below would otherwise swallow it into
+        # exit 3. Consumer closed the pipe (e.g. ``| head``). Return
+        # cleanly; do NOT call sys.stderr.close() — it breaks pytest
+        # capture. The __main__ wrapper handles the residual
+        # shutdown-time BrokenPipeError via os._exit.
+        return 0
     except (ReplayTraceError, OSError) as exc:
         print(f"agent-coherence-replay: {exc}", file=sys.stderr)
         return 3
+    except Exception as exc:  # noqa: BLE001 — intentional translate-and-return
+        print(
+            f"agent-coherence-replay: internal error: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 4
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -191,4 +240,14 @@ def _exit_code(
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Belt-and-suspenders for the entry point: a BrokenPipeError can
+    # still surface during interpreter shutdown if Python tries to flush
+    # stdout to a torn-down pipe after ``main()`` returns. Catching it
+    # here and exiting via ``os._exit`` skips the second flush attempt
+    # that would otherwise print "Exception ignored in: ..." to stderr.
+    import os
+
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        os._exit(0)
