@@ -588,6 +588,87 @@ class TestTraceErrors:
         assert "duplicate" in captured.err.lower() or "sequence_number" in captured.err
         assert "Traceback" not in captured.err
 
+    # ----- Gated #15: --json error envelope on exit 3 -----
+
+    def test_multi_instance_json_emits_error_envelope_on_stdout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        session = _multi_instance_session(tmp_path)
+        rc = main([str(session), "--json"])
+        captured = capsys.readouterr()
+        assert rc == 3
+        # stdout has exactly one JSON line — the error envelope.
+        stdout_lines = [line for line in captured.out.splitlines() if line.strip()]
+        assert len(stdout_lines) == 1
+        envelope = json.loads(stdout_lines[0])
+        assert envelope["kind"] == "error"
+        assert envelope["exit_code"] == 3
+        assert envelope["exception"] == "MultiInstanceTraceError"
+        assert isinstance(envelope["message"], str)
+        # Carries the actionable D+1 roadmap pointer surfaced by the loader.
+        assert "D+1" in envelope["message"]
+        # stderr prose retained for human log tailers.
+        assert "agent-coherence-replay" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_trace_corruption_json_emits_error_envelope_on_stdout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        session = _trace_corruption_session(tmp_path)
+        rc = main([str(session), "--json"])
+        captured = capsys.readouterr()
+        assert rc == 3
+        stdout_lines = [line for line in captured.out.splitlines() if line.strip()]
+        assert len(stdout_lines) == 1
+        envelope = json.loads(stdout_lines[0])
+        assert envelope["kind"] == "error"
+        assert envelope["exit_code"] == 3
+        assert envelope["exception"] == "TraceCorruptionError"
+        assert isinstance(envelope["message"], str)
+        assert "agent-coherence-replay" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_missing_session_dir_json_emits_error_envelope_on_stdout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        session = tmp_path / "nonexistent"
+        rc = main([str(session), "--json"])
+        captured = capsys.readouterr()
+        assert rc == 3
+        stdout_lines = [line for line in captured.out.splitlines() if line.strip()]
+        assert len(stdout_lines) == 1
+        envelope = json.loads(stdout_lines[0])
+        assert envelope["kind"] == "error"
+        assert envelope["exit_code"] == 3
+        # Route (a): pre-flight raises SessionDirectoryNotFoundError so
+        # the envelope class name is consistent with the trace-error catch.
+        assert envelope["exception"] == "SessionDirectoryNotFoundError"
+        assert "session directory not found" in envelope["message"]
+        assert "agent-coherence-replay" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_no_json_flag_keeps_stdout_empty_on_trace_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Regression guard: WITHOUT ``--json``, stdout stays empty on
+        exit 3 — the envelope is a ``--json``-only addition; no behavior
+        change for the default human path.
+        """
+        session = _multi_instance_session(tmp_path)
+        rc = main([str(session)])  # no --json
+        captured = capsys.readouterr()
+        assert rc == 3
+        assert captured.out.strip() == ""  # stdout still empty
+        assert "agent-coherence-replay" in captured.err  # prose still on stderr
+
+    def test_session_dir_not_found_is_replay_trace_error_subclass(self) -> None:
+        """``SessionDirectoryNotFoundError`` must inherit
+        ``ReplayTraceError`` so the outer catch and the JSON envelope
+        both fire (Gated #15 route (a) invariant).
+        """
+        from ccs.replay import ReplayTraceError, SessionDirectoryNotFoundError
+        assert issubclass(SessionDirectoryNotFoundError, ReplayTraceError)
+
 
 # ---------------------------------------------------------------------------
 # JSON schema conformance
