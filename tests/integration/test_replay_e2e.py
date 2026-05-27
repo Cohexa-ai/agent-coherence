@@ -27,7 +27,6 @@ from typing import Any
 
 import pytest
 
-from ccs.adapters.ccsstore import CCSStore
 from ccs.cli.coherence_replay import main as replay_main
 
 
@@ -133,6 +132,8 @@ def test_e2e_clean_trace(
     coordinator enforces them). Stale-read and lost-write predicates run
     against the captured streams and find no breaches.
     """
+    pytest.importorskip("langgraph")
+    from ccs.adapters.ccsstore import CCSStore
     session_dir = tmp_path / "clean-session"
     with CCSStore.record_to(session_dir, strategy="lazy") as store:
         store.put(("planner", "shared"), "plan", {"v": 1})
@@ -319,6 +320,7 @@ def test_e2e_real_langgraph_capture_and_replay(
     pytest.importorskip("langgraph.graph")
     pytest.importorskip("langgraph.config")
 
+    from ccs.adapters.ccsstore import CCSStore
     from langgraph.config import get_store as lg_get_store
     from langgraph.graph import END, START, StateGraph
     from typing import TypedDict
