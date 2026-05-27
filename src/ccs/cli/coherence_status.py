@@ -83,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
             "failure with an actionable diagnostic on stderr."
         ),
     )
+    parser.add_argument(
+        "--show-policy",
+        action="store_true",
+        help=(
+            "Show user-added tracked paths that have not yet been observed "
+            "(i.e., no pre-read hook has fired for them yet). These paths "
+            "are in the policy but absent from the artifact registry."
+        ),
+    )
     return parser
 
 
@@ -120,13 +129,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.json:
         import json as _json
+        if args.show_policy:
+            observed = {a.get("path", "") for a in payload.get("tracked_artifacts", [])}
+            payload["policy_pending_first_read"] = [
+                p for p in payload.get("policy_summary", {}).get("user_added_patterns", [])
+                if p not in observed
+            ]
         print(_json.dumps(payload, indent=2), flush=True)
         return 0
 
     if args.detail == "metrics":
         _render_metrics(payload)
     else:
-        _render_table(payload)
+        _render_table(payload, show_policy=args.show_policy)
     return 0
 
 
@@ -262,7 +277,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     return 0
 
 
-def _render_table(payload: dict[str, Any]) -> None:
+def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
     """Manual column alignment — stdlib only, no rich/tabulate."""
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
@@ -320,6 +335,20 @@ def _render_table(payload: dict[str, Any]) -> None:
         for a in tracked:
             print(f"  {a.get('path', ''):<{path_w}}  {a.get('version', 0):>7}")
     print()
+
+    if show_policy:
+        observed_paths = {a.get("path", "") for a in tracked}
+        pending = [
+            p for p in policy.get("user_added_patterns", [])
+            if p not in observed_paths
+        ]
+        if pending:
+            print("Tracked (pending first read):")
+            for p in pending:
+                print(f"  {p}")
+        else:
+            print("Tracked (pending first read): none")
+        print()
 
     if not sessions:
         print("No active sessions.")

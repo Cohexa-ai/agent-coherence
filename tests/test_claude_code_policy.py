@@ -256,3 +256,10 @@ def test_summary_includes_counts(root: Path) -> None:
     assert summary["user_added_pattern_count"] == 1  # runbook.md
     assert summary["ignored_pattern_count"] == 1  # docs/brainstorms/**/*.md
     assert summary["rejected_pattern_count"] == 1  # /etc/passwd
+    assert summary["user_added_patterns"] == ["runbook.md"]
+
+
+def test_summary_user_added_patterns_empty_by_default(root: Path) -> None:
+    policy = TrackedArtifactPolicy.load(root)
+    summary = policy.summary()
+    assert summary["user_added_patterns"] == []

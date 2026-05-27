@@ -28,6 +28,8 @@ store = CCSStore(strategy="lazy")
 
 `store.get()`, `store.put()`, `store.search()` keep working unchanged. Savings show up immediately on any workload where multiple agents read the same artifact more often than they write it.
 
+`agent-coherence-replay` — invariant-replay for any CoherenceAdapterCore-mediated agent system. LangGraph capture verified in v1 via `CCSStore.record_to(path)`; CrewAI / AutoGen wired through the same seam but unverified — file an issue if it breaks.
+
 | Workload | Agents | Reads:Writes | Hit rate | Savings |
 |---|---|---|---|---|
 | Planning (read-heavy) | 4 | 12:1 | 75% | **69%** |

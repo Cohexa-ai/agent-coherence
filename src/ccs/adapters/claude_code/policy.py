@@ -257,6 +257,7 @@ class TrackedArtifactPolicy:
             "coordinator_root": str(self.coordinator_root),
             "default_pattern_count": len(self.tracked_patterns),
             "user_added_pattern_count": len(self.user_added_patterns),
+            "user_added_patterns": list(self.user_added_patterns),
             "ignored_pattern_count": len(self.ignored_patterns),
             "strict_mode_pattern_count": len(self.strict_mode_paths),
             "rejected_pattern_count": len(self.rejected_patterns),
