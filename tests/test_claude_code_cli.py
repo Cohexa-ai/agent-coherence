@@ -416,7 +416,11 @@ def test_prepare_for_migration_releases_grants_and_shuts_down(
 
 
 @pytest.mark.parametrize("bad_path,reason_substr", [
-    ("/etc/passwd", "must be relative"),
+    # /etc/passwd is absolute AND outside the workspace — error message
+    # changed 2026-05-26 from "must be relative" to "outside workspace root"
+    # because absolute paths INSIDE the workspace are now auto-normalized
+    # (operator-UX fix: skill template passes absolute paths verbatim).
+    ("/etc/passwd", "outside workspace root"),
     ("../../../etc/passwd", "'..'"),
     ("", "empty"),
 ])
@@ -430,6 +434,51 @@ def test_track_rejects_invalid_paths_without_network(
     assert rc == 1
     # ce-review P2 fix #15: rejection messages go to stderr
     assert reason_substr in captured.err
+
+
+def test_track_accepts_absolute_path_inside_workspace(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Operator-UX fix 2026-05-26: skill template passes absolute paths verbatim
+    (`/agent-coherence:track /abs/path/file.md`); CLI must auto-normalize to
+    workspace-relative form before validation + before send-to-coordinator.
+    Tracked.yaml must contain the WORKSPACE-RELATIVE form, never the absolute
+    path — otherwise tracked.yaml drifts across machines / worktrees."""
+    workspace, port = live_coordinator
+    target = workspace / "docs" / "plan.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("plan v1")
+
+    rc = coherence_track.main(["--root", str(workspace), str(target)])
+    captured = capsys.readouterr()
+    assert rc == 0, f"expected 0, got {rc}; stderr: {captured.err}"
+    # Success message uses the workspace-relative form (operator sees clean output)
+    assert "tracked docs/plan.md" in captured.out
+    # tracked.yaml contains workspace-relative — NO absolute path leak
+    tracked_yaml = workspace / ".coherence" / "tracked.yaml"
+    content = tracked_yaml.read_text()
+    assert "docs/plan.md" in content
+    assert str(target) not in content, (
+        "absolute path leaked into tracked.yaml — file is now machine-specific. "
+        f"content: {content!r}"
+    )
+
+
+def test_untrack_accepts_absolute_path_inside_workspace(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same defense-in-depth fix for the sibling untrack CLI."""
+    workspace, port = live_coordinator
+    target = workspace / "docs" / "draft.md"
+
+    rc = coherence_untrack.main(["--root", str(workspace), str(target)])
+    captured = capsys.readouterr()
+    assert rc == 0, f"expected 0, got {rc}; stderr: {captured.err}"
+    assert "untracked docs/draft.md" in captured.out
+    ignored_yaml = workspace / ".coherence" / "ignored.yaml"
+    content = ignored_yaml.read_text()
+    assert "docs/draft.md" in content
+    assert str(target) not in content
 
 
 def test_track_no_coordinator_running_exits_2(
@@ -493,7 +542,10 @@ def test_untrack_against_live_coordinator(
 
 
 @pytest.mark.parametrize("bad_path,reason_substr", [
-    ("/etc/passwd", "must be relative"),
+    # See test_track_rejects_invalid_paths_without_network for rationale on
+    # the 2026-05-26 message change from "must be relative" to "outside
+    # workspace root" — sibling normalization fix applies to untrack too.
+    ("/etc/passwd", "outside workspace root"),
     ("../escape", "'..'"),
     ("", "empty"),
 ])
