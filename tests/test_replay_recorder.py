@@ -161,6 +161,64 @@ class TestManifestLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# __enter__ fd cleanup on manifest write failure (Gated #4)
+# ---------------------------------------------------------------------------
+
+
+class TestEnterFdCleanup:
+    """If _atomic_write_manifest raises during __enter__, opened stream
+    writers must be closed before re-raising. Python's context-manager
+    protocol does NOT call __exit__ when __enter__ raises, so without
+    explicit cleanup the file descriptors would leak.
+    """
+
+    def test_manifest_write_failure_closes_opened_writers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Patch _atomic_write_manifest to raise on the __enter__ call
+        # (after writers are opened). The fix must close every writer
+        # in self._writers before re-raising.
+        from ccs.replay import recorder as recorder_mod
+
+        opened_writers: list[object] = []
+        original_open_stream = recorder_mod._open_stream
+
+        def tracking_open_stream(*args: Any, **kwargs: Any) -> object:
+            writer = original_open_stream(*args, **kwargs)
+            opened_writers.append(writer)
+            return writer
+
+        monkeypatch.setattr(recorder_mod, "_open_stream", tracking_open_stream)
+
+        def raise_on_manifest(*_a: Any, **_kw: Any) -> None:
+            raise OSError("simulated disk full on manifest tempfile")
+
+        monkeypatch.setattr(
+            recorder_mod, "_atomic_write_manifest", raise_on_manifest
+        )
+
+        session_dir = tmp_path / "session"
+        try:
+            with record_callbacks(session_dir, accept_unverified=True):
+                pytest.fail("__enter__ should have raised before yielding")
+        except OSError as exc:
+            assert "simulated disk full" in str(exc)
+
+        # Writers were opened (the fixture proves __enter__ reached the
+        # _atomic_write_manifest call) AND every writer is now closed.
+        assert len(opened_writers) > 0, "no writers were opened — fixture bug"
+        for writer in opened_writers:
+            # _StreamWriter.close() is idempotent; we assert closed-state
+            # via the underlying file handle attribute (active writers
+            # carry a non-None handle; closed ones are None).
+            handle = getattr(writer, "_handle", None)
+            assert handle is None or handle.closed, (
+                f"writer {writer!r} left an open file descriptor after "
+                f"__enter__ failure — fd leak"
+            )
+
+
+# ---------------------------------------------------------------------------
 # fsync-per-line contract
 # ---------------------------------------------------------------------------
 

@@ -275,9 +275,24 @@ class RecordingSession:
             self._writers[stream_name] = _open_stream(
                 self.session_dir, stream_name, active=active
             )
-        _atomic_write_manifest(
-            self.session_dir, _header_manifest(self.streams, self.adapter_type)
-        )
+        # __exit__ is NOT called when __enter__ raises (Python context-
+        # manager protocol), so any failure between opening fds above and
+        # the manifest write below would leak the open fds. Guard the
+        # manifest write and close any already-opened writers before
+        # re-raising (Gated #4).
+        try:
+            _atomic_write_manifest(
+                self.session_dir,
+                _header_manifest(self.streams, self.adapter_type),
+            )
+        except Exception:
+            for writer in self._writers.values():
+                try:
+                    writer.close()
+                except OSError:
+                    pass  # best-effort cleanup; original exception is what matters
+            self._writers.clear()
+            raise
         return self
 
     def __exit__(
