@@ -35,9 +35,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ccs.replay import (
-    ManifestMissingOrUnreadableError,
-    MultiInstanceTraceError,
-    TraceCorruptionError,
+    ReplayTraceError,
     load,
     run_predicates,
 )
@@ -51,19 +49,14 @@ _VALID_INVARIANTS: tuple[str, ...] = (
     "lost-write",
 )
 
-# Trace-format spec maps these three loader/iterator errors to exit
-# code 3. Tuple lives at module scope so the except clause in main()
-# and any future helper share one definition (drift would silently
-# route a trace error to a Python traceback).
-_TRACE_ERRORS: tuple[
-    type[ManifestMissingOrUnreadableError],
-    type[MultiInstanceTraceError],
-    type[TraceCorruptionError],
-] = (
-    ManifestMissingOrUnreadableError,
-    MultiInstanceTraceError,
-    TraceCorruptionError,
-)
+# Trace-format spec maps every ``ReplayTraceError`` subclass
+# (ManifestMissingOrUnreadableError, MultiInstanceTraceError,
+# TraceCorruptionError, and any future trace-defect subclass) to exit
+# code 3. Catching the base class instead of an explicit tuple means a
+# new trace-error subclass auto-routes correctly without touching this
+# handler — the previous tuple-based shape needed to be edited each
+# time a new error class was added.
+_TRACE_ERRORS: tuple[type[ReplayTraceError], ...] = (ReplayTraceError,)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _run(args)
-    except (*_TRACE_ERRORS, OSError) as exc:
+    except (ReplayTraceError, OSError) as exc:
         print(f"agent-coherence-replay: {exc}", file=sys.stderr)
         return 3
 

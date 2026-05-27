@@ -21,10 +21,32 @@ Public API:
 
 ``CCSStore.record_to`` is the LangGraph-shaped thin wrapper over
 :func:`record_callbacks` and lives on the adapter class itself.
+
+Error hierarchy:
+
+All exceptions raised by ``ccs.replay`` inherit from
+:class:`ReplayError`, split into two semantic categories so callers
+can write a single ``except`` clause per intent:
+
+- :class:`ReplayConfigurationError` — API misuse / wrong-entry-point
+  errors. Currently: :class:`UnverifiedAdapterCaptureError`.
+- :class:`ReplayTraceError` — trace structural defects detected at
+  read time. Currently: :class:`ManifestMissingOrUnreadableError`,
+  :class:`MultiInstanceTraceError`, :class:`TraceCorruptionError`.
+  CLI maps the whole category to exit code 3.
+
+Base classes live in ``ccs.replay.errors`` so concrete subclasses in
+``recorder`` / ``loader`` can import them without forming an import
+cycle through this ``__init__``.
 """
 
 from __future__ import annotations
 
+from ccs.replay.errors import (
+    ReplayConfigurationError,
+    ReplayError,
+    ReplayTraceError,
+)
 from ccs.replay.loader import (
     LoadedTrace,
     ManifestMissingOrUnreadableError,
@@ -63,6 +85,9 @@ __all__ = [
     "MultiInstanceTraceError",
     "Predicate",
     "RecordingSession",
+    "ReplayConfigurationError",
+    "ReplayError",
+    "ReplayTraceError",
     "SingleWriterPredicate",
     "StaleReadPredicate",
     "SummaryFinding",
