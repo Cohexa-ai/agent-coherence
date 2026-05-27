@@ -6,6 +6,30 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+No unreleased work yet — `v0.8.1` patch shipped 2026-05-26; next minor `v0.9.0` is in flight on `dev` (strict-mode telemetry + launch-gate harness + audit log; targeting plugin v0.2.x compatibility).
+
+## [0.8.1] — 2026-05-26
+
+**Patch release — operator-UX fix for `agent-coherence-track` / `agent-coherence-untrack` CLIs.** Surfaced during the Claude Code plugin v0.2.0 broad-beta monitoring window (closes 2026-06-08); cherry-picked from `dev` rather than waiting for the full `v0.9.0` minor.
+
+### Fixed
+
+- **`agent-coherence-track` / `agent-coherence-untrack` accept absolute paths inside the workspace** (cherry-pick of PR #66, commit `10f1e16`). Previously the CLIs rejected any leading-`/` path with `path must be relative (no leading '/')`. The Claude Code plugin's `/agent-coherence:track` skill template substitutes `$ARGUMENTS` verbatim — operators routinely type absolute paths (autocomplete from shell or IDE), so the CLI was breaking on the most common operator input shape. New `normalize_workspace_path(p, root)` helper in `src/ccs/cli/_coherence_client.py` accepts both relative and absolute paths; absolute paths inside the workspace are auto-stripped to workspace-relative before send (the form that goes to `tracked.yaml` / `ignored.yaml` — absolute paths must NEVER leak into those files because they're per-machine). Absolute paths outside the workspace are rejected with a clearer `path outside workspace root` message. The server-side validator in `coordinator_server.py` still independently rejects absolute paths on the wire as a trust-boundary backstop.
+
+### Test coverage
+
+- 4 new/updated tests in `tests/test_claude_code_cli.py` (`test_track_accepts_absolute_path_inside_workspace`, sibling for untrack, plus parametrize updates on the existing `/etc/passwd` rejection cases). 1391 tests pass on the full broad sweep; architecture check clean.
+
+### Compatibility
+
+- Wire contract unchanged. Plugin v0.2.x continues to work against `agent-coherence>=0.8.0`; this patch adds the absolute-path normalization layer that operators benefit from when invoking the CLIs through the plugin's slash commands.
+- No breaking changes; `validate_relative_path` (the pure-string validator) stays unchanged and continues to be referenced by `coordinator_server`'s server-side check per the existing M-02 trust-boundary docstring. The new `normalize_workspace_path` composes above it.
+
+### Related
+
+- Surfaced in Phase E broad-beta monitoring screenshot 2026-05-26 alongside Bugs 8 (plugin permission allowlist — upstream-blocked, [anthropics/claude-code#62616](https://github.com/anthropics/claude-code/issues/62616)) and 10 (plugin `bin/` PATH-resolver shims — shipped in plugin v0.2.1)
+- Full diagnosis in `docs/solutions/best-practices/cli-skill-template-passes-args-verbatim-normalize-at-cli-2026-05-26.md` (Bug 9)
+
 ## [0.8.0] — 2026-05-23
 
 **Stable release of the Claude Code plugin coordinator backend.** Promotes the `0.8.0a1` alpha pre-release to a final `0.8.0` after the v0.1.1 marketplace cohort + full ce-review remediation pass landed. Both the coordinator HTTP surface and the wire contract are now considered stable through the `0.8.x` minor line; breaking changes will bump to `0.9.0` per SemVer.
