@@ -23,6 +23,8 @@ Public API:
 :func:`record_callbacks` and lives on the adapter class itself.
 """
 
+from __future__ import annotations
+
 from ccs.replay.loader import (
     LoadedTrace,
     ManifestMissingOrUnreadableError,
@@ -46,6 +48,7 @@ from ccs.replay.formatters import (
     emit_json,
 )
 from ccs.replay.recorder import (
+    RecordingSession,
     UnverifiedAdapterCaptureError,
     record_callbacks,
 )
@@ -59,6 +62,7 @@ __all__ = [
     "MonotonicVersionPredicate",
     "MultiInstanceTraceError",
     "Predicate",
+    "RecordingSession",
     "SingleWriterPredicate",
     "StaleReadPredicate",
     "SummaryFinding",

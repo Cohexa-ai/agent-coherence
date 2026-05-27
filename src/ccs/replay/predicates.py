@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, ClassVar, Iterable
 
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.exceptions import InvariantViolationError
@@ -170,8 +170,8 @@ class Predicate(abc.ABC):
     whether to dispatch or skip.
     """
 
-    name: str
-    required_streams: set[str]
+    name: ClassVar[str]
+    required_streams: ClassVar[set[str]]
 
     @abc.abstractmethod
     def process(
@@ -449,7 +449,7 @@ def _classify_stale_read(
         severity = "AMBIGUOUS"
         kind = "stale-read-ambiguous"
     else:
-        return ()
+        return []
     return [Finding(
         kind=kind,
         severity=severity,

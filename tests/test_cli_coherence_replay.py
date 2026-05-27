@@ -561,7 +561,8 @@ class TestTraceErrors:
         rc = main([str(session)])
         captured = capsys.readouterr()
         assert rc == 3
-        assert "manifest.json" in captured.err
+        # Pre-flight fires before the loader for a nonexistent directory.
+        assert "session directory not found" in captured.err or str(session) in captured.err
         # No Python traceback leakage to stderr.
         assert "Traceback" not in captured.err
 
@@ -688,3 +689,35 @@ def test_quiet_with_capture_bug_emits_skip_lines(
     # capture-bug skip is NOT silenced into a clean exit 0.
     assert rc == 2
     assert "Traceback" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# --quiet --json combination
+# ---------------------------------------------------------------------------
+
+
+def test_quiet_json_clean_trace_emits_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--quiet --json on a clean trace: no output (cron-friendly zero signal)."""
+    session = _clean_session(tmp_path)
+    rc = main([str(session), "--quiet", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out == "", "clean trace with --quiet --json must produce no output"
+
+
+def test_quiet_json_breach_emits_findings_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--quiet --json with CONFIRMED breach: full JSON output still emitted."""
+    session = _single_writer_breach_session(tmp_path)
+    rc = main([str(session), "--quiet", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    lines = [l for l in out.strip().split("\n") if l]
+    assert len(lines) >= 2, "expected at least one finding line + summary line"
+    objects = [json.loads(l) for l in lines]
+    kinds = {o.get("kind") for o in objects}
+    assert "finding" in kinds
+    assert "summary" in kinds

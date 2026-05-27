@@ -224,21 +224,22 @@ def _declared_streams(manifest: dict[str, Any]) -> list[str]:
 
 
 def _iter_stream_file(path: Path, stream_name: str) -> Iterator[tuple[
-    int, int, int, str, dict[str, Any], Path, int,
+    int, int, int, str, int, dict[str, Any], Path, int,
 ]]:
     """Yield merge-key + entry tuples for one open JSONL file.
 
     The key shape is ``(tick, stream_priority, sequence_number,
-    stream_name)`` — heapq.merge picks the smallest by lexicographic
-    comparison. ``stream_name`` is part of the key so heapq.merge has
-    a total order when two streams collide on (tick, priority, seq);
-    in practice the priority alone is sufficient because no two
-    streams share a priority, but defensive ordering avoids a
-    TypeError if the dict surfaces a duplicate priority by mistake.
+    stream_name, counter)`` — heapq.merge picks the smallest by
+    lexicographic comparison. ``counter`` is a per-stream monotonic
+    integer that guarantees total order without ever comparing the
+    ``dict`` entry at position 5, making the merge TypeError-safe even
+    if a future stream accidentally reuses a priority value.
     """
     priority = _STREAM_PRIORITY[stream_name]
     with path.open("r", encoding="utf-8") as fh:
-        for line_number, line in enumerate(fh, start=1):
+        for counter, (line_number, line) in enumerate(
+            enumerate(fh, start=1), start=0
+        ):
             line = line.strip()
             if not line:
                 continue
@@ -257,7 +258,7 @@ def _iter_stream_file(path: Path, stream_name: str) -> Iterator[tuple[
                     f"is missing required int field 'tick' or "
                     f"'sequence_number'"
                 )
-            yield (tick, priority, seq, stream_name, entry, path, line_number)
+            yield (tick, priority, seq, stream_name, counter, entry, path, line_number)
 
 
 def _iter_merged(
@@ -285,17 +286,22 @@ def _iter_merged(
     #
     # ``seen_seq`` is a dict keyed by ``(stream, instance_id, seq)`` →
     # ``(path, line)`` of first occurrence so the duplicate error can
-    # name both lines. Memory is O(unique seqs), not O(merged entries);
-    # the trace stream itself is still consumed lazily by heapq.merge.
+    # name both lines. Grows O(N) with the number of entries — every
+    # unique (stream, instance_id, seq) triple is retained to detect
+    # late-appearing duplicates anywhere in the trace walk.
     seen_instance_id: dict[str, str] = {}
     seen_seq: dict[tuple[str, str, int], tuple[Path, int]] = {}
 
-    for tick, _priority, seq, stream_name, entry, path, line_no in heapq.merge(
-        *per_stream_iters
-    ):
-        _check_instance_id(stream_name, entry, seen_instance_id)
-        _check_duplicate_seq(stream_name, entry, seq, path, line_no, seen_seq)
-        yield stream_name, entry
+    try:
+        for tick, _priority, seq, stream_name, _counter, entry, path, line_no in heapq.merge(
+            *per_stream_iters
+        ):
+            _check_instance_id(stream_name, entry, seen_instance_id)
+            _check_duplicate_seq(stream_name, entry, seq, path, line_no, seen_seq)
+            yield stream_name, entry
+    finally:
+        for it in per_stream_iters:
+            it.close()
 
 
 def _check_instance_id(

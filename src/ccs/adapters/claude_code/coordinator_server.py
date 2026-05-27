@@ -2291,11 +2291,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             "states": per_artifact,
         })
 
+    policy_summary = coordinator.policy.summary()
+    if detail != "full":
+        # user_added_patterns is a list of workspace-relative paths.
+        # Leaking it at minimal/metrics tiers would expose the operator's
+        # directory layout to non-operator callers — keep it full-tier only.
+        policy_summary = {k: v for k, v in policy_summary.items() if k != "user_added_patterns"}
     base = {
         "detail": detail,
         "tracked_artifacts": tracked,
         "sessions": sessions,
-        "policy_summary": coordinator.policy.summary(),
+        "policy_summary": policy_summary,
         # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
         # are public on POSIX (anyone with `ps` sees them) so this is
         # not a disclosure beyond the trust boundary the threat model
@@ -2785,6 +2791,26 @@ def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> 
     return None
 
 
+def _parse_yaml_pattern_lines(text: str) -> set[str]:
+    """Extract pattern strings already present in a YAML list file.
+
+    Used to detect already-present entries before appending, keeping
+    /policy/track idempotent. Uses yaml.safe_load so quoted values
+    (``- "plan.md"``) and inline comments are handled correctly.
+    Returns empty set on empty input or malformed YAML — the caller
+    re-appends, which is safe (MAX_POLICY_YAML_BYTES caps growth)."""
+    if not text.strip():
+        return set()
+    import yaml as _yaml
+    try:
+        parsed = _yaml.safe_load(text)
+    except _yaml.YAMLError:
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    return {item for item in parsed if isinstance(item, str)}
+
+
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Honors MAX_POLICY_YAML_BYTES — raises ValueError if the resulting file
@@ -2837,8 +2863,15 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         lock_fd: int | None = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-            existing = yaml_path.read_text() if yaml_path.is_file() else ""
-            new_lines = "\n".join(f"- {p}" for p in added)
+            try:
+                existing = yaml_path.read_text()
+            except FileNotFoundError:
+                existing = ""
+            already_present = _parse_yaml_pattern_lines(existing)
+            truly_new = [p for p in added if p not in already_present]
+            if not truly_new:
+                return [], rejected
+            new_lines = "\n".join(f"- {p}" for p in truly_new)
             new_content = (
                 (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
                 else (new_lines + "\n")
@@ -2848,7 +2881,7 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
                     f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
                 )
             yaml_path.write_text(new_content)
-            return added, rejected
+            return truly_new, rejected
         finally:
             try:
                 _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
@@ -2861,8 +2894,15 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     except ImportError:
         # Windows fallback: no fcntl. Lifecycle already disables the
         # coordinator on Windows, but degrade defensively if reached.
-        existing = yaml_path.read_text() if yaml_path.is_file() else ""
-        new_lines = "\n".join(f"- {p}" for p in added)
+        try:
+            existing = yaml_path.read_text()
+        except FileNotFoundError:
+            existing = ""
+        already_present = _parse_yaml_pattern_lines(existing)
+        truly_new = [p for p in added if p not in already_present]
+        if not truly_new:
+            return [], rejected
+        new_lines = "\n".join(f"- {p}" for p in truly_new)
         new_content = (
             (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
             else (new_lines + "\n")
@@ -2872,4 +2912,4 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
                 f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
             )
         yaml_path.write_text(new_content)
-        return added, rejected
+        return truly_new, rejected

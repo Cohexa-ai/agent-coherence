@@ -35,6 +35,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,14 @@ def _atomic_write_manifest(session_dir: Path, manifest: dict[str, Any]) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp_path, target)
+    try:
+        os.replace(tmp_path, target)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _header_manifest(streams: list[str], adapter_type: str) -> dict[str, Any]:
@@ -272,7 +280,12 @@ class RecordingSession:
         )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         try:
             self._finalize_manifest()
         finally:

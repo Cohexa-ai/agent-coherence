@@ -1775,6 +1775,74 @@ def test_r14_lock_file_created_next_to_yaml(coordinator, client: _Client) -> Non
     assert lock_path.is_file(), "tracked.yaml.lock sidecar was not created"
 
 
+def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Client) -> None:
+    """Tracking the same path twice must not produce duplicate lines in
+    tracked.yaml. The second call should still return 200 (idempotent) but
+    the path must appear exactly once in the YAML."""
+    path = "idempotent_test.md"
+    s1, b1 = client.post("/policy/track", {"paths": [path]})
+    s2, b2 = client.post("/policy/track", {"paths": [path]})
+    assert s1 == 200
+    assert s2 == 200
+    # Second call must report zero newly-added patterns \u2014 the path was already
+    # present and _append_policy_yaml must return ([], rejected), not (added, rejected).
+    assert b2.get("added") == [], (
+        f"second /policy/track returned 'added'={b2.get('added')!r}; "
+        "idempotent call must report no additions"
+    )
+
+    yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    text = yaml_path.read_text()
+    occurrences = text.count(f"- {path}")
+    assert occurrences == 1, (
+        f"path {path!r} appears {occurrences}\xd7 in tracked.yaml after two track calls "
+        f"(expected 1 \u2014 /policy/track must be idempotent)"
+    )
+
+
+# ----------------------------------------------------------------------
+# _parse_yaml_pattern_lines unit tests
+# ----------------------------------------------------------------------
+
+
+def test_parse_yaml_pattern_lines_plain_entries() -> None:
+    """Plain unquoted list items are extracted."""
+    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    text = "- plan.md\n- src/main.py\n"
+    result = _parse_yaml_pattern_lines(text)
+    assert result == {"plan.md", "src/main.py"}
+
+
+def test_parse_yaml_pattern_lines_quoted_entries() -> None:
+    """YAML-quoted values are extracted without the quotes."""
+    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    text = '- "plan.md"\n- \'src/main.py\'\n'
+    result = _parse_yaml_pattern_lines(text)
+    assert result == {"plan.md", "src/main.py"}
+
+
+def test_parse_yaml_pattern_lines_empty_input() -> None:
+    """Empty or whitespace-only input returns empty set."""
+    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    assert _parse_yaml_pattern_lines("") == set()
+    assert _parse_yaml_pattern_lines("   \n  ") == set()
+
+
+def test_parse_yaml_pattern_lines_non_string_items_ignored() -> None:
+    """Non-string items (numbers, null) are silently dropped."""
+    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    text = "- plan.md\n- 42\n- null\n"
+    result = _parse_yaml_pattern_lines(text)
+    assert result == {"plan.md"}
+
+
+def test_parse_yaml_pattern_lines_malformed_yaml_returns_empty() -> None:
+    """Malformed YAML falls back to empty set rather than raising."""
+    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    result = _parse_yaml_pattern_lines("{not: a list}")
+    assert result == set()
+
+
 # ----------------------------------------------------------------------
 # R11 (Unit 6) — ensure_secret bounded O_EXCL retry, fail-closed
 # ----------------------------------------------------------------------

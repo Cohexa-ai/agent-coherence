@@ -52,10 +52,14 @@ _VALID_INVARIANTS: tuple[str, ...] = (
 )
 
 # Trace-format spec maps these three loader/iterator errors to exit
-# code 3. Tuple lives at module scope so main() and _safe_load() share
-# one definition (drift between them would silently route a trace
-# error to a Python traceback).
-_TRACE_ERRORS = (
+# code 3. Tuple lives at module scope so the except clause in main()
+# and any future helper share one definition (drift would silently
+# route a trace error to a Python traceback).
+_TRACE_ERRORS: tuple[
+    type[ManifestMissingOrUnreadableError],
+    type[MultiInstanceTraceError],
+    type[TraceCorruptionError],
+] = (
     ManifestMissingOrUnreadableError,
     MultiInstanceTraceError,
     TraceCorruptionError,
@@ -137,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _run(args)
-    except _TRACE_ERRORS as exc:
+    except (*_TRACE_ERRORS, OSError) as exc:
         print(f"agent-coherence-replay: {exc}", file=sys.stderr)
         return 3
 
@@ -149,6 +153,13 @@ def _run(args: argparse.Namespace) -> int:
     try/except over the full pipeline without bloating ``main()`` past
     the style-guide line ceiling.
     """
+    if not args.session_dir.exists():
+        print(
+            f"agent-coherence-replay: session directory not found: "
+            f"{args.session_dir}",
+            file=sys.stderr,
+        )
+        return 3
     loaded = load(args.session_dir)
     findings, summary = run_predicates(loaded, invariants=args.invariant)
     if args.json:
@@ -157,6 +168,7 @@ def _run(args: argparse.Namespace) -> int:
             summary,
             include_ambiguous=args.include_ambiguous,
             ambiguous_threshold=args.ambiguous_threshold,
+            quiet=args.quiet,
             manifest=loaded.manifest,
             streams_present=loaded.streams_present,
         )

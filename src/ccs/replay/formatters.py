@@ -90,7 +90,9 @@ def emit_human(
         _write_finding_block(writer, finding)
 
     if quiet:
-        # Breaches/capture-bug-skips present but summary suppressed.
+        for s in summary_list:
+            if s.opted_out is False:
+                writer.write(f"[CAPTURE-BUG] {s.invariant}: {s.reason}\n")
         return
 
     _write_summary_section(
@@ -172,6 +174,7 @@ def emit_json(
     *,
     include_ambiguous: bool = False,
     ambiguous_threshold: int = 10,
+    quiet: bool = False,
     manifest: dict[str, Any] | None = None,
     streams_present: Iterable[str] | None = None,
     writer: TextIO | None = None,
@@ -181,10 +184,18 @@ def emit_json(
     Schema matches ``docs/proposals/replay_trace_format.md`` §7.1
     (per-finding) and §7.2 (summary) — downstream consumers (audit
     report template, future Visualizer) depend on field shape.
+
+    ``quiet`` mirrors the human formatter's cron-silent contract: when
+    there are no CONFIRMED findings AND no capture-bug SKIPs, emit
+    nothing so CI can treat any output as the failure signal.
     """
     writer = writer or sys.stdout
     findings_list = list(findings)
     summary_list = list(summary)
+    counts = _count_findings(findings_list, summary_list)
+
+    if quiet and counts["CONFIRMED"] == 0 and not _has_capture_bug(summary_list):
+        return
 
     for finding in findings_list:
         if finding.severity == "AMBIGUOUS" and not include_ambiguous:
