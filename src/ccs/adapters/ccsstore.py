@@ -632,16 +632,15 @@ def _drain_store_registries(store: CCSStore) -> tuple[dict[str, str], dict[str, 
     ``__exit__``. Returns ``(agents_by_uuid, artifacts_by_uuid)`` —
     UUID strings to display names. Empty dicts when no MESI activity
     has fired.
+
+    Routes through the public ``CoherenceAdapterCore`` snapshot accessors
+    (``agent_names_snapshot`` / ``artifact_names_snapshot``) so a rename
+    inside the coordinator surfaces at import time, not at manifest-
+    finalization time.
     """
     core = store.core
-    # agent_id (UUID) → name; sourced from the same dict that ArtifactRegistry
-    # uses for state_log entry naming.
-    agents = {str(uid): name for uid, name in core._agent_names.items()}
-    artifacts: dict[str, str] = {}
-    for artifact_id in core.registry.artifact_ids():
-        meta = core.registry.get_artifact(artifact_id)
-        if meta is not None:
-            artifacts[str(artifact_id)] = meta.name
+    agents = {str(uid): name for uid, name in core.agent_names_snapshot().items()}
+    artifacts = {str(uid): name for uid, name in core.artifact_names_snapshot().items()}
     return agents, artifacts
 
 
