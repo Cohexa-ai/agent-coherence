@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import urllib.error
 from pathlib import Path
@@ -189,7 +190,7 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
             payload = _build_pre_bash(cc_payload)
             response = _call(endpoint, "/hooks/pre-bash", payload)
         elif args.subcommand == "pre-grep":
-            payload = _build_pre_grep(cc_payload)
+            payload = _build_pre_grep(cc_payload, root_path)
             response = _call(endpoint, "/hooks/pre-grep", payload)
         else:  # pragma: no cover — argparse already validates
             _emit_empty()
@@ -250,7 +251,23 @@ def _build_pre_read(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     session_id = _require_session_id(cc)
     file_path = _require_file_path(cc)
     rel = _to_workspace_relative(file_path, root)
-    return {"session_id": session_id, "path": rel}
+    body: dict[str, Any] = {"session_id": session_id, "path": rel}
+    # v0.2 KTD-O: compute content_hash from disk so the coordinator's
+    # strict-mode gate can disambiguate "session sees stale bytes"
+    # (first-observer reading a peer-updated file → strict-deny) from
+    # "session sees current bytes" (first-observer with content matching
+    # what the registry recorded → warn-mode allow). Without this,
+    # PreToolUse:Read carries no hash (Claude Code's Read tool reads
+    # AFTER the hook fires, so tool_response.content_hash is undefined
+    # at hook time), and the strict-deny gate's hash_differs branch is
+    # unreachable. Best-effort: _hash_file returns None on OSError
+    # (file missing, permission denied) — coordinator then falls back
+    # to the INVALID-only branch of the strict-deny gate, preserving
+    # v0.1.1 warn-mode behavior for non-strict workspaces.
+    content_hash = _hash_file(Path(file_path))
+    if content_hash is not None:
+        body["content_hash"] = content_hash
+    return body
 
 
 def _build_pre_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -305,12 +322,24 @@ def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:
     return {"session_id": session_id, "command": command}
 
 
-def _build_pre_grep(cc: dict[str, Any]) -> dict[str, Any]:
+def _build_pre_grep(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     """v0.1.1 KTD-N — translate CC's Grep PreToolUse payload to the
     /hooks/pre-grep coordinator request shape.
 
-    CC's Grep tool takes a ``path`` arg (the search root, parent-repo-
-    relative). Empty/absent → workspace root.
+    CC's Grep tool takes a ``path`` arg (the search root). Empty/absent →
+    workspace root.
+
+    Path shapes observed in production (2026-05-24 launch-gate finding):
+    - **Direct invocation:** workspace-relative ("src/lib", "./docs").
+    - **Subagent (Task tool) invocation:** ABSOLUTE path
+      ("/private/var/.../workspace/src/lib"). Initial v0.1.1 assumption
+      that "Grep path is always workspace-relative" was incorrect —
+      subagents inherit the parent's CWD shape differently, and CC
+      resolves the path to absolute before passing to PreToolUse.
+
+    Fix: normalize absolute paths via _to_workspace_relative. Relative
+    paths pass through after stripping a leading "./" for parity with
+    the validator's normalization expectations.
     """
     session_id = _require_session_id(cc)
     tool_input = cc.get("tool_input") or {}
@@ -319,10 +348,10 @@ def _build_pre_grep(cc: dict[str, Any]) -> dict[str, Any]:
         raw_path = ""
     if not isinstance(raw_path, str):
         raise _SkipHook("tool_input.path must be a string")
-    # The Grep tool's path is already workspace-relative in CC's payload;
-    # no transformation needed beyond stripping a leading "./" for parity
-    # with the validator's normalization expectations.
-    search_root = raw_path[2:] if raw_path.startswith("./") else raw_path
+    if raw_path and os.path.isabs(raw_path):
+        search_root = _to_workspace_relative(raw_path, root)
+    else:
+        search_root = raw_path[2:] if raw_path.startswith("./") else raw_path
     return {"session_id": session_id, "search_root": search_root}
 
 

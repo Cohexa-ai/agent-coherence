@@ -40,11 +40,22 @@ agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
 # entries. Flag-only by default; --apply writes to settings.local.json
 # after a confirmation prompt.
 agent-coherence-migrate-rules = "ccs.cli.coherence_migrate_rules:main"
+# v0.2 plan Unit 3 (KTD-R): stricter sibling to migrate-rules. STDOUT only
+# (never writes), symlink-contained (canonical-path containment check),
+# never invokes an LLM, never scans files outside the workspace root.
+# Intended for security-sensitive operators who want the helper output
+# but not the auto-apply surface.
+agent-coherence-migrate-deny = "ccs.adapters.claude_code.migrate_deny:main"
 # Phase E.0 probe 2A surfaced that CC v2.1.131 rejects hooks.json URLs
 # containing ${COHERENCE_PORT} at LOAD TIME. HTTP-type hooks are not viable;
 # the plugin uses command-type hooks that invoke this client, which reads
 # .coherence/server.pid directly. See docs/probes/2026-05-17-*.md.
 agent-coherence-hook-client = "ccs.cli.coherence_hook_client:main"
+# D v1 Unit 5: invariant replay CLI. Walks a captured session directory
+# through the predicate engine (single-writer / monotonic-version /
+# stale-read / lost-write) and emits human or JSON findings. Exit-code
+# mapping per docs/proposals/replay_trace_format.md §7.3.
+agent-coherence-replay = "ccs.cli.coherence_replay:main"
 # Note: ccs-check-release is intentionally NOT exposed as a public console
 # script. It's a maintainer-only pre-tag-push verifier that queries this
 # repo's GitHub admin settings (hardcoded defaults to hipvlady/agent-coherence).
@@ -72,9 +83,14 @@ pythonpath = ["src", "."]
 markers = [
     "launch_gate: Unit 9 hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
     "launch_gate_pilot: Unit 9 pilot run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
+    "launch_gate_strict: v0.2 Unit 5 multi-model strict-mode launch gate (10 scenarios × {haiku, sonnet, opus} × 2 consecutive runs). Requires live claude CLI; ~$8-13/cycle × 2 = ~$16-26 per full gate run. Operator runs once consecutively before tagging v0.2.0. Run via `pytest -m launch_gate_strict`.",
+    "launch_gate_pilot_matrix: v0.2 Unit 5 per-PR cheap pilot (1 scenario × {haiku, sonnet, opus}). Requires live claude CLI; ~$0.50 per run. Run via `pytest -m launch_gate_pilot_matrix`.",
+    "protocol_corpus: v0.2 Unit 7 cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
 ]
-# Skip launch_gate markers in default unit test runs.
-addopts = "-m 'not launch_gate and not launch_gate_pilot'"
+# Skip launch_gate + protocol_corpus markers in default unit test runs. The
+# protocol corpus has a Node-build prerequisite and a multi-second spawn cost
+# per fixture; keep it opt-in to avoid penalizing the normal `pytest -q` loop.
+addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -47,6 +47,7 @@ from typing import Any, Callable, Literal, Protocol
 from typing import runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.auth import (
@@ -85,6 +86,13 @@ class _RequestProtocol(Protocol):
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+# v0.2 Unit 4: window for the "Read strict-deny → Bash cat strict-deny on
+# same (session, path)" route-around detector. Phase 0 saw the model
+# retry-loop and route-around behaviors complete within ~10s; 30s
+# accommodates slow runners + provides a margin for the operator-visible
+# strict_mode_routed_around_via_bash_total counter to remain accurate.
+STRICT_DENY_ROUTE_AROUND_WINDOW_SEC = 30.0
 
 # v0.1.1 KTD-G concurrency limits per plugin docs/known-issues/
 # 2026-05-17-watchdog-races.md A7 fix. Watchdog pool size × 2 is the
@@ -418,6 +426,31 @@ class CoordinatorHTTPServer:
         self._stale_warning_emitted_total: int = 0
         self._stale_warning_reread_total: int = 0
 
+        # v0.2 Unit 4 (KTD-V minimal + KTD-J extension): strict-mode
+        # telemetry counters surfaced via /status?detail=metrics. Three
+        # counters:
+        # - strict_mode_denials_total: bumped on every strict-mode deny
+        #   emission across all 4 handlers (Read / Edit/Write / Bash /
+        #   Grep). Operator-visible measure of strict mode's active
+        #   workload.
+        # - strict_mode_routed_around_via_bash_total: bumped in
+        #   _handle_pre_bash when a strict-deny fires AND a prior Read
+        #   strict-deny was logged for the same (session, path) within
+        #   STRICT_DENY_ROUTE_AROUND_WINDOW_SEC (default 30). Measures
+        #   the Phase 0 H4 routing pattern in live operation.
+        # - audit_log_mode_drift_total: bumped when audit.log mode
+        #   differs from 0o600 at append time. Operator chmod drift
+        #   surfaces here without refusing the append.
+        self._strict_mode_denials_total: int = 0
+        self._strict_mode_routed_around_via_bash_total: int = 0
+        self._audit_log_mode_drift_total: int = 0
+        # Per-(session, path) "recent strict-deny" memory for route-around
+        # detection. Bounded by the registry's own (session, artifact)
+        # cardinality at worst — same upper bound as _stale_warned_pairs.
+        # GC happens lazily on every check_strict_deny_route_around call.
+        self._recent_strict_denies: dict[tuple[str, str], float] = {}
+        self._recent_strict_denies_lock = threading.Lock()
+
         # KTD-J re-read detection: a stale warning marks an (agent, artifact)
         # pair as "warned"; the next pre-read on that pair consumes the
         # marker and bumps :attr:`_stale_warning_reread_total`. The set
@@ -701,6 +734,56 @@ class CoordinatorHTTPServer:
         with self._reliability_counter_lock:
             self._watchdog_queue_overflows_total += 1
 
+    def increment_strict_mode_denial(self) -> None:
+        """v0.2 Unit 4 (KTD-V minimal): increment the strict-mode denial
+        counter. Called from every strict-deny branch in the 4 PreToolUse
+        handlers. CPython GIL serializes ``x += 1`` on int attrs; counter
+        is advisory so we don't lock for free-threading Py 3.13+ either —
+        an undercount in a pathological race is acceptable given the
+        denials-only nature of the metric."""
+        self._strict_mode_denials_total += 1
+
+    def increment_strict_mode_routed_around_via_bash(self) -> None:
+        """v0.2 Unit 4: bumped only in _handle_pre_bash when the strict-
+        deny fires AND a prior Read strict-deny was logged for the same
+        (session, path) within the route-around window. Measures the
+        Phase 0 H4 routing pattern live; the ratio against
+        strict_mode_denials_total tells the operator whether their model
+        is exhibiting the bypass behavior in production."""
+        self._strict_mode_routed_around_via_bash_total += 1
+
+    def increment_audit_log_mode_drift(self) -> None:
+        """v0.2 Unit 4: bumped when audit_log.append_strict_deny detects
+        mode drift on the existing audit.log (operator chmod changed
+        away from 0o600). The append still proceeds — the counter is the
+        operator-visible signal to fix the mode."""
+        self._audit_log_mode_drift_total += 1
+
+    def record_strict_deny(self, session_id: str, path: str) -> None:
+        """v0.2 Unit 4 route-around tracker — store the (session, path)
+        pair with monotonic timestamp so a subsequent pre-bash deny on
+        the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
+        recognized as a route-around."""
+        with self._recent_strict_denies_lock:
+            self._recent_strict_denies[(session_id, path)] = time.monotonic()
+
+    def check_strict_deny_route_around(self, session_id: str, path: str) -> bool:
+        """v0.2 Unit 4: return True iff a prior strict-deny on (session,
+        path) was recorded within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC.
+        Lazy GC: entries older than the window are evicted on every call
+        so the dict's worst-case footprint stays bounded by active
+        (session × path) cardinality within the window."""
+        now = time.monotonic()
+        cutoff = now - STRICT_DENY_ROUTE_AROUND_WINDOW_SEC
+        with self._recent_strict_denies_lock:
+            # Lazy GC.
+            stale_keys = [
+                k for k, ts in self._recent_strict_denies.items() if ts < cutoff
+            ]
+            for k in stale_keys:
+                del self._recent_strict_denies[k]
+            return (session_id, path) in self._recent_strict_denies
+
     def increment_watchdog_late_completion(self) -> None:
         """P1 #5: a watchdog-timed-out future eventually completed
         successfully — any state it mutated (e.g., an EXCLUSIVE grant
@@ -757,6 +840,9 @@ class CoordinatorHTTPServer:
             "endpoint_counters": self.endpoint_counters_snapshot(),
             "intra_task_acquire_release_total": self._intra_task_acquire_release_total,
             "stale_warning_emitted_total": self._stale_warning_emitted_total,
+            "strict_mode_denials_total": self._strict_mode_denials_total,
+            "strict_mode_routed_around_via_bash_total": self._strict_mode_routed_around_via_bash_total,
+            "audit_log_mode_drift_total": self._audit_log_mode_drift_total,
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "auth_401_total": self._auth_401_total,
         }
@@ -1213,6 +1299,80 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             "hash_differs": hash_differs,
         }
 
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch.
+        #
+        # Gate (refined 2026-05-24 per launch-gate finding): strict-deny
+        # fires when the artifact is in strict mode AND the session
+        # demonstrably lacks a fresh view of the current content. Two
+        # branches:
+        #
+        # 1. ``agent_state == INVALID`` — true preemption. Session
+        #    previously held SHARED on an older version; a peer commit
+        #    invalidated it. The session's context still carries the
+        #    stale beliefs. Strict-deny forces explicit re-read.
+        #
+        # 2. ``agent_state is None AND hash_differs`` — session has no
+        #    prior grant on the artifact AND the content the session
+        #    just hashed at the disk does not match what the registry
+        #    last recorded as the canonical content. This catches the
+        #    "agent has stale beliefs from somewhere else (CLAUDE.md
+        #    at session start, an earlier subagent's prose summary, a
+        #    file on disk that's been peer-updated)" pattern. If hashes
+        #    MATCH, the session is observing the same bytes the
+        #    registry recorded — no stale content to act on — falls
+        #    through to warn-mode allow.
+        #
+        # The hash_differs branch was added because the original "any
+        # None on existing artifact = deny" rule broke the unit-test
+        # setup pattern (warn-mode-style multi-session setup where
+        # both sessions read the same registered artifact). The hash
+        # check disambiguates "session sees identical bytes" (safe)
+        # from "session sees different bytes" (must re-acknowledge).
+        # Multi-model launch-gate scenarios always trigger via the
+        # hash-differs branch because the synthetic SQLite injection
+        # uses a sentinel hash ("f" * 64) that no real SHA-256
+        # matches.
+        #
+        # KTD-Q: this is the Read surface only. Pre-edit reverts to
+        # INVALID-only because pre-edit has no caller content_hash to
+        # apply the hash_differs disambiguation. Pre-bash + pre-grep
+        # capture None|INVALID via the loop's `state is not None and
+        # != INVALID: continue` filter — same effective gate as the
+        # original Unit 2 design, applied per-detected-path.
+        #
+        # KTD-T: do NOT re-grant SHARED on deny. The MESI state stays
+        # INVALID (or None) across the model's retry loop so every
+        # retry produces the same byte-stable deny reason text. Per
+        # Phase 0 finding the model exits the retry loop after 2-5
+        # attempts and routes to alternative behavior; the deny IS the
+        # signal. Re-granting would let the second retry get fresh and
+        # silently downgrade the operator's hard guardrail.
+        if (
+            coordinator.policy.is_strict_mode(path)
+            and (
+                agent_state == MESIState.INVALID
+                or (agent_state is None and hash_differs)
+            )
+        ):
+            coordinator.increment_stale_warning_emitted()
+            coordinator.mark_stale_warned(agent_id, artifact_id)
+            # v0.2 Unit 4 telemetry: counter + audit-log append + record
+            # session/path for route-around detection in pre-bash/pre-grep.
+            coordinator.increment_strict_mode_denial()
+            coordinator.record_strict_deny(session_id, path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=path, tool="Read",
+            ):
+                coordinator.increment_audit_log_mode_drift()
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_read_strict_deny", summary=summary,
+                ),
+                "status": "stale",
+                "summary": summary,
+            }
+
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
         coordinator.registry.set_agent_state(
             artifact_id, agent_id, MESIState.SHARED,
@@ -1252,11 +1412,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 notice_text = _build_preemption_text(coordinator, notices)
                 return {
                     "status": "fresh",
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "additionalContext": notice_text,
-                    },
+                    "hookSpecificOutput": _payloads.emit_allow(
+                        source="pre_read_fresh_with_notice",
+                        additional_context=notice_text,
+                    ),
                 }
         return result
 
@@ -1291,6 +1450,68 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+
+        # v0.2 KTD-O / KTD-P: strict-mode stale-edit deny branch. If the
+        # artifact is opted into strict mode AND the editor's prior state
+        # is INVALID (preempted by a peer commit), deny before acquiring
+        # EXCLUSIVE. The editor must re-read first to take a fresh
+        # SHARED grant.
+        #
+        # Semantic guard (matches pre-read): strict-deny fires only on
+        # editor_state == INVALID. A first-time editor (state is None on
+        # an existing artifact) falls through to the normal acquire flow
+        # — they have not acted on stale state, they're establishing a
+        # new write claim. The strict-mode intent is "must re-read after
+        # preemption," not "must read before any write."
+        #
+        # This is the Edit/Write surface of KTD-Q (the hooks.json matcher
+        # routes both tools through /hooks/pre-edit).
+        if coordinator.policy.is_strict_mode(path):
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            editor_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
+            # Reverted to INVALID-only 2026-05-24 per the launch-gate
+            # finding. Pre-edit has no caller content_hash so it cannot
+            # apply the hash_differs disambiguation that pre-read uses
+            # (see pre-read gate above). Treating None as stale here
+            # would deny first-time editors on any tracked-strict
+            # artifact even when their working content is current.
+            # The original Unit 2 design — INVALID-only — is the right
+            # gate for the Edit/Write surface: pre-edit strict-deny
+            # fires after a session has been explicitly preempted.
+            editor_stale = editor_state == MESIState.INVALID
+            if artifact is not None and artifact.version > 0 and editor_stale:
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                summary: _payloads.StaleSummary = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if editor_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,  # pre-edit doesn't carry content_hash
+                }
+                coordinator.increment_stale_warning_emitted()
+                # v0.2 Unit 4 telemetry.
+                coordinator.increment_strict_mode_denial()
+                coordinator.record_strict_deny(session_id, path)
+                if not _audit_log.append_strict_deny(
+                    coordinator.coordinator_root,
+                    agent_id=session_id, path=path, tool="Edit",
+                ):
+                    coordinator.increment_audit_log_mode_drift()
+                return {
+                    "ok": False,
+                    "hookSpecificOutput": _payloads.emit_strict_deny(
+                        source="pre_edit_strict_deny", summary=summary,
+                    ),
+                    "status": "stale",
+                    "summary": summary,
+                }
 
         # A1: snapshot peers in M∪E BEFORE write so we can record preemption
         # notices for victims after the side-effecting invalidation.
@@ -1341,11 +1562,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # promote {ok: true} into a hookSpecificOutput.
             return {
                 "ok": True,
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "additionalContext": notice_text,
-                },
+                "hookSpecificOutput": _payloads.emit_allow(
+                    source="pre_edit_notice_only",
+                    additional_context=notice_text,
+                ),
             }
         return {"ok": True}
 
@@ -1696,6 +1916,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         stale_summaries: list[dict] = []
+        # v0.2 KTD-Q: track the first strict + stale path encountered so we
+        # can emit a strict-mode deny on the whole bash command. ANY strict-
+        # stale match in the path set triggers deny per the plan's edge-case
+        # contract (cat a.md b.md where a.md is strict → deny).
+        strict_stale_first: dict | None = None
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -1718,10 +1943,61 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
+            if (
+                strict_stale_first is None
+                and coordinator.policy.is_strict_mode(path)
+            ):
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                strict_stale_first = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,
+                }
             coordinator.registry.set_agent_state(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger="post_stale_bash", tick=now,
             )
+
+        # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
+        # the bash command is strict + stale, deny the whole command. The
+        # reason references the first strict-stale path; multi-path bash
+        # commands with multiple strict-stale paths re-deny on retry with
+        # the next path's reason as the model resolves them one by one
+        # (bounded by the model's own retry-loop per Phase 0 finding).
+        if strict_stale_first is not None:
+            coordinator.increment_stale_warning_emitted()
+            # v0.2 Unit 4 telemetry: count the deny, check for route-around,
+            # append audit-log line.
+            coordinator.increment_strict_mode_denial()
+            denied_path = strict_stale_first["path"]
+            if coordinator.check_strict_deny_route_around(session_id, denied_path):
+                # H4 routing pattern observed in live operation — Read got
+                # strict-denied earlier on this (session, path), and now
+                # Bash is hitting the same artifact within the window.
+                coordinator.increment_strict_mode_routed_around_via_bash()
+            coordinator.record_strict_deny(session_id, denied_path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=denied_path, tool="Bash",
+            ):
+                coordinator.increment_audit_log_mode_drift()
+            summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_bash_strict_deny", summary=summary_typed,
+                ),
+                "status": "stale",
+                "stale_paths": [s["path"] for s in stale_summaries],
+            }
 
         notices = coordinator.registry.pop_pending_notices(agent_id)
 
@@ -1747,11 +2023,10 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
 
         resp: dict[str, Any] = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",  # v0.1.1 warn-only per KTD-E
-                "additionalContext": "\n\n".join(parts),
-            },
+            "hookSpecificOutput": _payloads.emit_allow(
+                source="pre_bash_stale_warn",
+                additional_context="\n\n".join(parts),
+            ),
         }
         if stale_summaries:
             resp["status"] = "stale"
@@ -1809,6 +2084,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         stale_summaries: list[dict] = []
+        # v0.2 KTD-Q: track the first strict + stale path encountered so we
+        # can emit strict-mode deny on the whole grep command. Mirrors pre-bash.
+        strict_stale_first: dict | None = None
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -1821,10 +2099,52 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
+            if (
+                strict_stale_first is None
+                and coordinator.policy.is_strict_mode(path)
+            ):
+                last_writer_id = _last_writer_for(coordinator, artifact_id)
+                last_writer_ts = (
+                    _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
+                )
+                strict_stale_first = {
+                    "path": path,
+                    "current_version": artifact.version,
+                    "prior_version_seen_by_session": (
+                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    ),
+                    "last_writer_session_id": last_writer_id or "<unknown>",
+                    "last_writer_at_unix_ts": last_writer_ts,
+                    "warning_generated_at_unix_ts": _payloads.now_unix(),
+                    "hash_differs": False,
+                }
             coordinator.registry.set_agent_state(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger="post_stale_grep", tick=now,
             )
+
+        # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
+        if strict_stale_first is not None:
+            coordinator.increment_stale_warning_emitted()
+            # v0.2 Unit 4 telemetry — Grep does NOT contribute to the
+            # route-around-via-bash counter (that's bash-specific by the
+            # plan's KTD-J extension; Grep is a separate H4 surface).
+            coordinator.increment_strict_mode_denial()
+            denied_path = strict_stale_first["path"]
+            coordinator.record_strict_deny(session_id, denied_path)
+            if not _audit_log.append_strict_deny(
+                coordinator.coordinator_root,
+                agent_id=session_id, path=denied_path, tool="Grep",
+            ):
+                coordinator.increment_audit_log_mode_drift()
+            summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
+            return {
+                "hookSpecificOutput": _payloads.emit_strict_deny(
+                    source="pre_grep_strict_deny", summary=summary_typed,
+                ),
+                "status": "stale",
+                "stale_paths": [s["path"] for s in stale_summaries],
+            }
 
         notices = coordinator.registry.pop_pending_notices(agent_id)
 
@@ -1847,11 +2167,10 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
 
         resp: dict[str, Any] = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "additionalContext": "\n\n".join(parts),
-            },
+            "hookSpecificOutput": _payloads.emit_allow(
+                source="pre_grep_stale_warn",
+                additional_context="\n\n".join(parts),
+            ),
         }
         if stale_summaries:
             resp["status"] = "stale"
@@ -1972,11 +2291,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             "states": per_artifact,
         })
 
+    policy_summary = coordinator.policy.summary()
+    if detail != "full":
+        # user_added_patterns is a list of workspace-relative paths.
+        # Leaking it at minimal/metrics tiers would expose the operator's
+        # directory layout to non-operator callers — keep it full-tier only.
+        policy_summary = {k: v for k, v in policy_summary.items() if k != "user_added_patterns"}
     base = {
         "detail": detail,
         "tracked_artifacts": tracked,
         "sessions": sessions,
-        "policy_summary": coordinator.policy.summary(),
+        "policy_summary": policy_summary,
         # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
         # are public on POSIX (anyone with `ps` sees them) so this is
         # not a disclosure beyond the trust boundary the threat model
@@ -2466,6 +2791,26 @@ def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> 
     return None
 
 
+def _parse_yaml_pattern_lines(text: str) -> set[str]:
+    """Extract pattern strings already present in a YAML list file.
+
+    Used to detect already-present entries before appending, keeping
+    /policy/track idempotent. Uses yaml.safe_load so quoted values
+    (``- "plan.md"``) and inline comments are handled correctly.
+    Returns empty set on empty input or malformed YAML — the caller
+    re-appends, which is safe (MAX_POLICY_YAML_BYTES caps growth)."""
+    if not text.strip():
+        return set()
+    import yaml as _yaml
+    try:
+        parsed = _yaml.safe_load(text)
+    except _yaml.YAMLError:
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    return {item for item in parsed if isinstance(item, str)}
+
+
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Honors MAX_POLICY_YAML_BYTES — raises ValueError if the resulting file
@@ -2518,8 +2863,15 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         lock_fd: int | None = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-            existing = yaml_path.read_text() if yaml_path.is_file() else ""
-            new_lines = "\n".join(f"- {p}" for p in added)
+            try:
+                existing = yaml_path.read_text()
+            except FileNotFoundError:
+                existing = ""
+            already_present = _parse_yaml_pattern_lines(existing)
+            truly_new = [p for p in added if p not in already_present]
+            if not truly_new:
+                return [], rejected
+            new_lines = "\n".join(f"- {p}" for p in truly_new)
             new_content = (
                 (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
                 else (new_lines + "\n")
@@ -2529,7 +2881,7 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
                     f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
                 )
             yaml_path.write_text(new_content)
-            return added, rejected
+            return truly_new, rejected
         finally:
             try:
                 _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
@@ -2542,8 +2894,15 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     except ImportError:
         # Windows fallback: no fcntl. Lifecycle already disables the
         # coordinator on Windows, but degrade defensively if reached.
-        existing = yaml_path.read_text() if yaml_path.is_file() else ""
-        new_lines = "\n".join(f"- {p}" for p in added)
+        try:
+            existing = yaml_path.read_text()
+        except FileNotFoundError:
+            existing = ""
+        already_present = _parse_yaml_pattern_lines(existing)
+        truly_new = [p for p in added if p not in already_present]
+        if not truly_new:
+            return [], rejected
+        new_lines = "\n".join(f"- {p}" for p in truly_new)
         new_content = (
             (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
             else (new_lines + "\n")
@@ -2553,4 +2912,4 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
                 f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
             )
         yaml_path.write_text(new_content)
-        return added, rejected
+        return truly_new, rejected

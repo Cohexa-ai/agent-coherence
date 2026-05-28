@@ -1,0 +1,21 @@
+{
+  "name": "pre-read-strict-mode-set-but-untracked-path",
+  "description": "Workspace has strict_mode.yaml configured, but the requested path is not in the tracked set. The is_tracked policy fast-path fires BEFORE any strict-mode check (per KTD-O intersection semantics), returning fresh. This guards against the failure mode where strict_mode_paths leaks into untracked paths.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "strict_mode": ["CLAUDE.md"]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "untracked-file.txt"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {"status": "fresh"}
+  },
+  "backends": ["python"]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "pre-read-strict-tracked-fresh-allows",
+  "description": "Strict-mode artifact + first observation by a session = fresh allow (no deny). This is the negative-test counterpart to fixture 01 — strict mode only denies on TRUE preemption (state == INVALID), not on first observation. Documents the v0.2 semantic refinement: strict mode means 'must re-read after invalidation,' not 'must read before any cross-session activity.'",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "strict_mode": ["CLAUDE.md"],
+    "files": {"CLAUDE.md": "# Project rules\n"}
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {"status": "fresh"}
+  },
+  "backends": ["python"]
+}

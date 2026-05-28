@@ -6,29 +6,164 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-No unreleased work yet — `v0.8.1` patch shipped 2026-05-26; next minor `v0.9.0` is in flight on `dev` (strict-mode telemetry + launch-gate harness + audit log; targeting plugin v0.2.x compatibility).
+(No unreleased work at the moment — v0.8.2 was tagged 2026-05-28.)
 
-## [0.8.1] — 2026-05-26
+## [0.8.2] — 2026-05-28
 
-**Patch release — operator-UX fix for `agent-coherence-track` / `agent-coherence-untrack` CLIs.** Surfaced during the Claude Code plugin v0.2.0 broad-beta monitoring window (closes 2026-06-08); cherry-picked from `dev` rather than waiting for the full `v0.9.0` minor.
+Consolidated patch release covering both the v0.2 strict-mode track
+(landed earlier on dev) and the D v1 LangGraph cycle replay tooling +
+ce:review gated cluster (shipped to dev 2026-05-27 → 2026-05-28). Both
+tracks are additive: new wire fields for v0.2 strict mode AND a new
+CLI surface (`agent-coherence-replay`) + new module (`src/ccs/replay/`).
+The `coordinator_uptime_s` deprecation alias from the `0.8.0` AC-02
+plan stays in place through `0.8.x`; its removal continues to be
+targeted for a future minor bump per the original SemVer commitment.
+
+### Added — D v1 LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
+
+- **`agent-coherence-replay` console script** — invariant replay CLI
+  that walks a captured coordinator session and reports breaches of
+  the **Core 4 invariants** (single-writer, monotonic-version,
+  stale-read, lost-write). Five flags: `--json`, `--invariant <name>`
+  (repeatable, choices: `single-writer` / `monotonic-version` /
+  `stale-read` / `lost-write`), `--quiet`, `--include-ambiguous`,
+  `--ambiguous-threshold N` (default 10). Five exit codes:
+  - `0` — clean OR all SKIPPED reasons opted out via manifest `streams=`
+    (also: `BrokenPipeError` — consumer closed the pipe early)
+  - `1` — ≥1 CONFIRMED invariant breach
+  - `2` — ≥1 SKIPPED for a stream declared but absent on disk (capture-
+    side bug)
+  - `3` — trace error (`ManifestMissingOrUnreadableError`,
+    `MultiInstanceTraceError`, `TraceCorruptionError`,
+    `SessionDirectoryNotFoundError`)
+  - `4` — internal error (uncaught exception; CLI bug — file an issue)
+- **`CCSStore.record_to(path, *, streams=None, **kwargs)` classmethod
+  context manager** — one-line LangGraph capture. Writes
+  `manifest.json` + per-stream JSONL (`state_log.jsonl`,
+  `content_audit_log.jsonl`) to `path`. Mandatory `streams=` opt-out
+  for compliance-constrained partners
+  (`streams={'state_log'}` produces a state-log-only trace; stale-read
+  invariant emits `INVARIANT SKIPPED — content_audit_log not captured`
+  at replay). `manifest.json` carries `schema_version: 0` (explicitly
+  unstable until the 30-day partner-feedback retro).
+- **`record_callbacks(path, *, accept_unverified=False, ...)` helper**
+  in `ccs.replay.recorder` — low-level entry point for direct
+  `CoherenceAdapterCore` callback wiring (CrewAI / AutoGen). Raises
+  `UnverifiedAdapterCaptureError` unless `accept_unverified=True` is
+  passed; emits a stderr opt-in warning naming the D+1 smoke-test
+  roadmap item. `CCSStore.record_to` sets the flag automatically
+  (CCSStore is the verified adapter in v1).
+- **`src/ccs/replay/` module** — new package: `recorder` (capture
+  context manager + `RecordingSession`), `loader` (streaming JSONL
+  loader + heap-merge by `(tick, stream_kind, sequence_number)`,
+  detects `MULTI_INSTANCE_TRACE` and `TRACE_CORRUPTION_DUPLICATE_SEQ`),
+  `predicates` (Core 4 invariant checkers + AMBIGUOUS classification
+  for same-tick read/commit collisions + SKIPPED dispatch for missing
+  streams), `formatters` (human + JSON emit, NDJSON schema in
+  `--json` mode), and `errors` (`ReplayError` base with two-tier
+  semantic split: `ReplayConfigurationError` for API misuse,
+  `ReplayTraceError` for trace structural defects — `_TRACE_ERRORS`
+  tuple in the CLI handler is now `(ReplayTraceError, OSError)`).
+- **`CoherenceAdapterCore` public introspection** —
+  `agent_names_snapshot()` and `artifact_names_snapshot()` return
+  fresh `dict[UUID, str]` copies for downstream consumers
+  (replay-recorder manifest finalization uses these instead of
+  reaching into private attributes).
+- **Capture-time safety** — `RecordingSession.__enter__` refuses if
+  `session_dir/manifest.json` already exists
+  (`SessionDirectoryNotEmptyError`) to prevent silent
+  multi-coordinator-instance interleave; `__enter__` also wraps the
+  manifest write in try/except so opened stream writers don't leak
+  fds on disk-full / permission-error failures.
+- **AMBIGUOUS classification for stale-read** — same-tick
+  read/commit collisions emit `STALE_READ_AMBIGUOUS` (suppressed from
+  per-finding output by default; count always reported in summary).
+  `--include-ambiguous` opts in; `--ambiguous-threshold N` triggers a
+  prominent summary callout when exceeded.
+- **`--json` error envelope** — when `--json` is active and a
+  trace error fires (exit 3), stdout receives one final NDJSON line:
+  `{"kind":"error", "exit_code":3, "exception":"<ClassName>", "message":"..."}`.
+  Keeps stdout self-contained for `--json` consumers. Stderr prose
+  retained for human log tailing.
+- **`docs/guide.md` §Replay (v0.8.2+)** — LangGraph quickstart +
+  CLI surface reference + machine-readable output schema description.
+- **Tests** — 79 new tests across `tests/test_replay_recorder.py`,
+  `tests/test_replay_loader.py`, `tests/test_replay_predicates.py`,
+  `tests/test_replay_errors.py`, `tests/test_cli_coherence_replay.py`,
+  and `tests/integration/test_replay_e2e.py` (incl. a real-LangGraph
+  fixture e2e test). Suite at dev tip: 1451 passed, 2 skipped,
+  architecture check clean.
+
+### Added — v0.2 strict mode (Python coordinator)
+
+- **Per-artifact strict-mode opt-in** via `.coherence/strict_mode.yaml`
+  (KTD-O). An artifact is strict iff its path matches both the
+  `tracked_paths` set AND the new `strict_mode_paths` globs. Empty
+  strict_mode_paths preserves v0.1.1 warn-mode for every artifact.
+- **Handler decision-flip in all 4 PreToolUse handlers** (Read,
+  Edit/Write, Bash, Grep) — `permissionDecision: "deny"` with the
+  static reason template `STRICT_MODE_DENY_REASON_TEMPLATE` (KTD-P)
+  fires when (strict + tracked + invalidated). First-time observers
+  (state None on existing artifact) fall through to warn-mode allow
+  per the semantic refinement during implementation.
+- **`TERMINAL_DENIAL_CLASSES` security invariant** (KTD-U) — module-
+  level `frozenset` enumerating denial classes that must never be
+  converted to `permissionDecision: "allow"`. All 6 allow-emission
+  call sites route through `emit_allow()` which asserts the invariant;
+  AST-based meta-test grep-counts call sites in `coordinator_server.py`
+  + `hook_payloads.py` so a future contributor adding a new allow
+  path is forced to extend the parameter list.
+- **`agent-coherence-migrate-deny` CLI** (KTD-R) — stricter sibling
+  to `agent-coherence-migrate-rules`. STDOUT-only (never writes to
+  settings.json), symlink-contained (canonical-path containment check),
+  never invokes an LLM, never reads files outside resolved workspace
+  root. Under-emit bias: only canonical phrasings trigger.
+- **Strict-mode telemetry** (KTD-V minimal + KTD-J extension) —
+  `strict_mode_denials_total`, `strict_mode_routed_around_via_bash_total`
+  (Phase 0 H4 routing pattern detector with 30s window),
+  `audit_log_mode_drift_total` counters surfaced via
+  `/status?detail=metrics`. Minimal deny-only audit log appended as
+  JSONL to `.coherence/audit.log` (mode 0o600, no schema_version, no
+  command bodies, no user content).
+- **Cross-implementation protocol corpus** (Unit 7) —
+  `tests/protocol_corpus/` harness + 12 warn-mode + 8 strict-mode
+  fixtures + opt-in `protocol_corpus` pytest marker + new
+  `protocol-corpus` CI job. Catches Python ↔ Node coordinator
+  wire-shape drift before it ships. Strict-mode fixtures are
+  python-only (Node coordinator doesn't ship strict mode in v0.2).
+
+### Changed
+
+- **Hook payload builders** (`build_stale_response`,
+  `build_collision_response`) now route through `emit_allow()` per
+  the KTD-U structural invariant.
+- **Static deny-reason text** for strict-mode replaces v0.1.1's
+  per-invocation-varying warn-mode prose. Phase 0 H1 falsification
+  inverted the original "varied text bounds retries" hypothesis on
+  opus; static text byte-identical across retries is the right shape.
+
+### Plugin compatibility
+
+- v0.2 of the [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin)
+  consumes this library via its broad-beta launch package (plan Units
+  8-11). The Node coordinator does NOT ship strict mode in v0.2 —
+  strict-mode workspaces must use `coherence.coordinator_backend = "python"`.
+
+## [0.8.1] — 2026-05-27
+
+Single-fix patch.
 
 ### Fixed
 
-- **`agent-coherence-track` / `agent-coherence-untrack` accept absolute paths inside the workspace** (cherry-pick of PR #66, commit `10f1e16`). Previously the CLIs rejected any leading-`/` path with `path must be relative (no leading '/')`. The Claude Code plugin's `/agent-coherence:track` skill template substitutes `$ARGUMENTS` verbatim — operators routinely type absolute paths (autocomplete from shell or IDE), so the CLI was breaking on the most common operator input shape. New `normalize_workspace_path(p, root)` helper in `src/ccs/cli/_coherence_client.py` accepts both relative and absolute paths; absolute paths inside the workspace are auto-stripped to workspace-relative before send (the form that goes to `tracked.yaml` / `ignored.yaml` — absolute paths must NEVER leak into those files because they're per-machine). Absolute paths outside the workspace are rejected with a clearer `path outside workspace root` message. The server-side validator in `coordinator_server.py` still independently rejects absolute paths on the wire as a trust-boundary backstop.
-
-### Test coverage
-
-- 4 new/updated tests in `tests/test_claude_code_cli.py` (`test_track_accepts_absolute_path_inside_workspace`, sibling for untrack, plus parametrize updates on the existing `/etc/passwd` rejection cases). 1391 tests pass on the full broad sweep; architecture check clean.
-
-### Compatibility
-
-- Wire contract unchanged. Plugin v0.2.x continues to work against `agent-coherence>=0.8.0`; this patch adds the absolute-path normalization layer that operators benefit from when invoking the CLIs through the plugin's slash commands.
-- No breaking changes; `validate_relative_path` (the pure-string validator) stays unchanged and continues to be referenced by `coordinator_server`'s server-side check per the existing M-02 trust-boundary docstring. The new `normalize_workspace_path` composes above it.
-
-### Related
-
-- Surfaced in Phase E broad-beta monitoring screenshot 2026-05-26 alongside Bugs 8 (plugin permission allowlist — upstream-blocked, [anthropics/claude-code#62616](https://github.com/anthropics/claude-code/issues/62616)) and 10 (plugin `bin/` PATH-resolver shims — shipped in plugin v0.2.1)
-- Full diagnosis in `docs/solutions/best-practices/cli-skill-template-passes-args-verbatim-normalize-at-cli-2026-05-26.md` (Bug 9)
+- **`agent-coherence-track` / `-untrack` reject absolute paths.** The CLIs
+  now normalize absolute paths that fall inside the workspace root to
+  workspace-relative form before applying the server-side validator.
+  Previously the validator rejected absolute paths outright, requiring
+  callers to strip the workspace prefix manually even for paths the
+  workspace clearly owns. Tracking paths outside the workspace remains
+  rejected as before. (Equivalent fix landed on dev as commit `10f1e16`
+  during the v0.2 strict-mode track; this 0.8.1 release ships the
+  patch from main without dragging in the strict-mode work-in-flight.)
 
 ## [0.8.0] — 2026-05-23
 

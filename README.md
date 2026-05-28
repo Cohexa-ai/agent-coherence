@@ -28,6 +28,8 @@ store = CCSStore(strategy="lazy")
 
 `store.get()`, `store.put()`, `store.search()` keep working unchanged. Savings show up immediately on any workload where multiple agents read the same artifact more often than they write it.
 
+`agent-coherence-replay` — invariant-replay for any CoherenceAdapterCore-mediated agent system. LangGraph capture verified in v1 via `CCSStore.record_to(path)`; CrewAI / AutoGen wired through the same seam but unverified — file an issue if it breaks.
+
 | Workload | Agents | Reads:Writes | Hit rate | Savings |
 |---|---|---|---|---|
 | Planning (read-heavy) | 4 | 12:1 | 75% | **69%** |
@@ -63,7 +65,16 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-`v0.8.0` released — full Claude Code plugin coordinator (Python backend) plus the ce-review remediation pass. Adds six console scripts (`agent-coherence-coordinator`, `-status`, `-track`, `-untrack`, `-hook-client`, `-migrate-rules`); ships KTD-J telemetry, `/status` three-tier disclosure, `--self-test`, and `--prepare-for-migration` for safe Python↔Node coordinator backend switching. The companion [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin) ships `v0.1.1` of the marketplace plugin against this library. See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
+**`v0.8.2` released — v0.2 strict mode + D v1 LangGraph cycle replay tooling.** Consolidated patch release covering both tracks:
+
+- **v0.2 strict mode (Python coordinator).** Per-artifact `strict_mode_paths` opt-in via `.coherence/strict_mode.yaml`, all 4 PreToolUse handlers flip to `permissionDecision: "deny"` when (strict + tracked + invalidated), `TERMINAL_DENIAL_CLASSES` structural invariant guarding allow-emission paths, new `agent-coherence-migrate-deny` console script (STDOUT-only sibling to `-migrate-rules` with symlink containment), strict-mode telemetry counters + deny-only `.coherence/audit.log` JSONL surface. Strict mode is Python-coordinator-only; the Node coordinator backend stays warn-mode. Plugin-side broad-beta launch package (Units 8-11) lands separately.
+- **D v1 LangGraph cycle replay tooling.** Adds `agent-coherence-replay` — pure-inspection replay over captured MESI traces, checking the **Core 4 invariants** (single-writer, monotonic-version, stale-read, lost-write). New `CCSStore.record_to(path)` context manager captures a trace from any LangGraph pipeline; `record_callbacks(path, accept_unverified=True)` is the lower-level seam for direct CrewAI / AutoGen wiring. Five-tier exit-code scheme distinguishes compliance opt-outs from capture bugs from trace errors from CLI internal errors. AMBIGUOUS classification suppresses false positives on same-tick read/commit collisions; `--include-ambiguous` opts in. New `ReplayError` exception hierarchy (`ReplayConfigurationError` for API misuse, `ReplayTraceError` for trace defects). Quickstart in [docs/guide.md](docs/guide.md) §Replay. The validating partner pool (Individual-Bench4448, getstackfax, lastesthero) opens the 30-day per-partner first-touch window now that the v0.8.2 tag has shipped.
+
+**`v0.8.1` released** — single-fix patch: `agent-coherence-track` / `-untrack` normalize absolute workspace-relative paths instead of rejecting them.
+
+**`v0.8.0` released** — full Claude Code plugin coordinator (Python backend) plus the ce-review remediation pass. Adds six console scripts (`agent-coherence-coordinator`, `-status`, `-track`, `-untrack`, `-hook-client`, `-migrate-rules`); ships KTD-J telemetry, `/status` three-tier disclosure, `--self-test`, and `--prepare-for-migration` for safe Python↔Node coordinator backend switching. The companion [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin) ships `v0.1.1` of the marketplace plugin against this library.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
 ## Paper
 

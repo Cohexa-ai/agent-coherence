@@ -561,6 +561,88 @@ def test_untrack_rejects_invalid_paths_without_network(
 
 
 # ----------------------------------------------------------------------
+# coherence_status --show-policy
+# ----------------------------------------------------------------------
+
+
+def test_show_policy_renders_pending_section_when_path_not_yet_observed(
+    live_coordinator, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A user-added path that has never been pre-read must appear under
+    'Tracked (pending first read):' — it is in user_added_patterns but
+    not yet in tracked_artifacts."""
+    workspace, port = live_coordinator
+    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    endpoint = resolve_endpoint(workspace)
+
+    # Add a path via /policy/track so it enters user_added_patterns.
+    path = "pending_first_read_test.md"
+    resp = _post(endpoint, "/policy/track", {"paths": [path]})
+    assert path in resp.get("added", []), f"track failed: {resp}"
+
+    rc = coherence_status.main([
+        "--root", str(workspace), "--show-policy",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Tracked (pending first read):" in captured.out
+    assert path in captured.out
+
+
+def test_show_policy_renders_none_after_path_is_observed(
+    live_coordinator, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Once a pre-read fires for every user-added path, the pending list
+    is empty and the 'none' branch renders."""
+    workspace, port = live_coordinator
+    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    import uuid as _uuid
+    endpoint = resolve_endpoint(workspace)
+
+    path = "observed_test.md"
+    _post(endpoint, "/policy/track", {"paths": [path]})
+
+    # Fire a pre-read to seed the artifact into tracked_artifacts.
+    sid = str(_uuid.uuid4())
+    _post(endpoint, "/hooks/pre-read", {
+        "session_id": sid,
+        "path": path,
+        "content_hash": "a" * 64,
+    })
+
+    rc = coherence_status.main([
+        "--root", str(workspace), "--show-policy",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Tracked (pending first read): none" in captured.out
+
+
+def test_show_policy_json_injects_pending_first_read_key(
+    live_coordinator, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--show-policy --json injects 'policy_pending_first_read' into the
+    payload so agent callers get the same data as the table renderer."""
+    workspace, port = live_coordinator
+    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    endpoint = resolve_endpoint(workspace)
+
+    path = "json_pending_test.md"
+    _post(endpoint, "/policy/track", {"paths": [path]})
+
+    rc = coherence_status.main([
+        "--root", str(workspace), "--show-policy", "--json",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    data = json.loads(captured.out)
+    assert "policy_pending_first_read" in data, (
+        "--json --show-policy must inject 'policy_pending_first_read' key"
+    )
+    assert path in data["policy_pending_first_read"]
+
+
+# ----------------------------------------------------------------------
 # _coherence_client — endpoint resolution edge cases
 # ----------------------------------------------------------------------
 
