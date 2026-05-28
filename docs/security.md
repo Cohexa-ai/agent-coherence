@@ -57,6 +57,22 @@ Both directories are created with mode `0700`. Both fall back to `~/.config/...`
 and `~/.local/share/...` when the XDG vars are unset. Reset the consent token any
 time with `ccs-diagnose --reset-token`.
 
+`CCSStore.record_to(path)` (the v0.8.2+ replay capture API) writes to a
+caller-supplied directory. Files are mode `0o600`; the directory is created
+with `mkdir(parents=True, exist_ok=True)` so the caller controls the path
+and the surrounding-directory permissions.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Capture manifest | `<path>/manifest.json` | `0600` | `CCSStore.record_to.__enter__` (atomic write via tempfile + `os.replace`) |
+| MESI state log | `<path>/state_log.jsonl` | `0600` | First emitted event when `state_log` stream is enabled (default) |
+| Content audit log | `<path>/content_audit_log.jsonl` | `0600` | First emitted event when `content_audit_log` stream is enabled (default). Pass `streams={"state_log"}` to opt out — useful for PII-constrained partners. |
+
+The capture path **refuses to start** when `<path>/manifest.json` already
+exists (`SessionDirectoryNotEmptyError`) to prevent silent multi-instance
+trace interleave. No content is read by `agent-coherence-replay` from any
+location other than the explicit `session_dir` argument.
+
 ## Hash-pinned install for security-sensitive users
 
 For reproducible installs with full dependency-graph pinning:

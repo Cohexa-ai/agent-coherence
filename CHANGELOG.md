@@ -6,10 +6,90 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-Unreleased work targets `v0.9.0`. Breaks the `coordinator_uptime_s`
-deprecation contract (alias removed per the `0.8.0` AC-02 plan) AND
-introduces new wire fields for v0.2 strict mode, so a minor bump is
-required.
+Unreleased work targets **`v0.8.2`** — consolidated patch release
+covering both the v0.2 strict-mode track (landed earlier on dev) and
+the D v1 LangGraph cycle replay tooling + ce:review gated cluster
+(shipped to dev 2026-05-27 → 2026-05-28). Both tracks are additive: new
+wire fields for v0.2 strict mode AND a new CLI surface
+(`agent-coherence-replay`) + new module (`src/ccs/replay/`). The
+`coordinator_uptime_s` deprecation alias from the `0.8.0` AC-02 plan
+stays in place through `0.8.x`; its removal continues to be targeted
+for a future minor bump per the original SemVer commitment.
+
+### Added — v0.8.2 — D v1 LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
+
+- **`agent-coherence-replay` console script** — invariant replay CLI
+  that walks a captured coordinator session and reports breaches of
+  the **Core 4 invariants** (single-writer, monotonic-version,
+  stale-read, lost-write). Five flags: `--json`, `--invariant <name>`
+  (repeatable, choices: `single-writer` / `monotonic-version` /
+  `stale-read` / `lost-write`), `--quiet`, `--include-ambiguous`,
+  `--ambiguous-threshold N` (default 10). Five exit codes:
+  - `0` — clean OR all SKIPPED reasons opted out via manifest `streams=`
+    (also: `BrokenPipeError` — consumer closed the pipe early)
+  - `1` — ≥1 CONFIRMED invariant breach
+  - `2` — ≥1 SKIPPED for a stream declared but absent on disk (capture-
+    side bug)
+  - `3` — trace error (`ManifestMissingOrUnreadableError`,
+    `MultiInstanceTraceError`, `TraceCorruptionError`,
+    `SessionDirectoryNotFoundError`)
+  - `4` — internal error (uncaught exception; CLI bug — file an issue)
+- **`CCSStore.record_to(path, *, streams=None, **kwargs)` classmethod
+  context manager** — one-line LangGraph capture. Writes
+  `manifest.json` + per-stream JSONL (`state_log.jsonl`,
+  `content_audit_log.jsonl`) to `path`. Mandatory `streams=` opt-out
+  for compliance-constrained partners
+  (`streams={'state_log'}` produces a state-log-only trace; stale-read
+  invariant emits `INVARIANT SKIPPED — content_audit_log not captured`
+  at replay). `manifest.json` carries `schema_version: 0` (explicitly
+  unstable until the 30-day partner-feedback retro).
+- **`record_callbacks(path, *, accept_unverified=False, ...)` helper**
+  in `ccs.replay.recorder` — low-level entry point for direct
+  `CoherenceAdapterCore` callback wiring (CrewAI / AutoGen). Raises
+  `UnverifiedAdapterCaptureError` unless `accept_unverified=True` is
+  passed; emits a stderr opt-in warning naming the D+1 smoke-test
+  roadmap item. `CCSStore.record_to` sets the flag automatically
+  (CCSStore is the verified adapter in v1).
+- **`src/ccs/replay/` module** — new package: `recorder` (capture
+  context manager + `RecordingSession`), `loader` (streaming JSONL
+  loader + heap-merge by `(tick, stream_kind, sequence_number)`,
+  detects `MULTI_INSTANCE_TRACE` and `TRACE_CORRUPTION_DUPLICATE_SEQ`),
+  `predicates` (Core 4 invariant checkers + AMBIGUOUS classification
+  for same-tick read/commit collisions + SKIPPED dispatch for missing
+  streams), `formatters` (human + JSON emit, NDJSON schema in
+  `--json` mode), and `errors` (`ReplayError` base with two-tier
+  semantic split: `ReplayConfigurationError` for API misuse,
+  `ReplayTraceError` for trace structural defects — `_TRACE_ERRORS`
+  tuple in the CLI handler is now `(ReplayTraceError, OSError)`).
+- **`CoherenceAdapterCore` public introspection** —
+  `agent_names_snapshot()` and `artifact_names_snapshot()` return
+  fresh `dict[UUID, str]` copies for downstream consumers
+  (replay-recorder manifest finalization uses these instead of
+  reaching into private attributes).
+- **Capture-time safety** — `RecordingSession.__enter__` refuses if
+  `session_dir/manifest.json` already exists
+  (`SessionDirectoryNotEmptyError`) to prevent silent
+  multi-coordinator-instance interleave; `__enter__` also wraps the
+  manifest write in try/except so opened stream writers don't leak
+  fds on disk-full / permission-error failures.
+- **AMBIGUOUS classification for stale-read** — same-tick
+  read/commit collisions emit `STALE_READ_AMBIGUOUS` (suppressed from
+  per-finding output by default; count always reported in summary).
+  `--include-ambiguous` opts in; `--ambiguous-threshold N` triggers a
+  prominent summary callout when exceeded.
+- **`--json` error envelope** — when `--json` is active and a
+  trace error fires (exit 3), stdout receives one final NDJSON line:
+  `{"kind":"error", "exit_code":3, "exception":"<ClassName>", "message":"..."}`.
+  Keeps stdout self-contained for `--json` consumers. Stderr prose
+  retained for human log tailing.
+- **`docs/guide.md` §Replay (v0.8.2+)** — LangGraph quickstart +
+  CLI surface reference + machine-readable output schema description.
+- **Tests** — 79 new tests across `tests/test_replay_recorder.py`,
+  `tests/test_replay_loader.py`, `tests/test_replay_predicates.py`,
+  `tests/test_replay_errors.py`, `tests/test_cli_coherence_replay.py`,
+  and `tests/integration/test_replay_e2e.py` (incl. a real-LangGraph
+  fixture e2e test). Suite at dev tip: 1451 passed, 2 skipped,
+  architecture check clean.
 
 ### Added — v0.2 strict mode (Python coordinator)
 

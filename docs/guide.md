@@ -648,7 +648,7 @@ See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags
 
 ---
 
-## Replay (v0.10.0+)
+## Replay (v0.8.2+)
 
 `agent-coherence-replay` is an invariant-replay tool that walks a captured
 coordinator session and reports breaches of the four core MESI invariants —
@@ -714,17 +714,19 @@ agent-coherence-replay /tmp/coherence-session --json | jq .
 
 | Exit code | Meaning |
 |---|---|
-| `0` | Clean trace (or all SKIPPED entries are explicit compliance opt-outs) |
+| `0` | Clean trace (or all SKIPPED entries are explicit compliance opt-outs). Also: `BrokenPipeError` from a closing consumer (e.g. `\| head -5`) — pipe-close is not a failure. |
 | `1` | At least one CONFIRMED invariant breach |
 | `2` | Capture-side bug: a manifest-declared stream is missing from the directory |
-| `3` | Trace error (multi-instance, duplicate sequence number, missing manifest) |
+| `3` | Trace error (`MultiInstanceTraceError`, `TraceCorruptionError`, `ManifestMissingOrUnreadableError`, `SessionDirectoryNotFoundError`). Under `--json`, a final NDJSON line lands on stdout: `{"kind":"error","exit_code":3,"exception":"<ClassName>","message":"..."}` (in addition to the human-prose stderr line). |
+| `4` | Internal error (uncaught exception inside replay — CLI bug, please file an issue). Distinct from exit 1 so agents can triage "tool crashed" vs "real coordination defect found." |
 
 ### Useful flags
 
 - `--invariant <name>` (repeatable) — restrict to a subset of `single-writer`, `monotonic-version`, `stale-read`, `lost-write`.
 - `--include-ambiguous` — show same-tick read/commit collisions as per-finding entries (suppressed from default output; always counted in summary).
-- `--quiet` — suppress non-breach output; cron-friendly.
-- `--json` — newline-delimited JSON conforming to the trace-format schema.
+- `--ambiguous-threshold N` (default `10`) — when the AMBIGUOUS count exceeds the threshold, the summary block emits a prominent callout naming both remedies (`--include-ambiguous` now; D+1 global-sequence-number capture eventually). Strict `>`; does not affect exit code.
+- `--quiet` — suppress non-breach output; cron-friendly. Honored under both human and `--json` mode.
+- `--json` — newline-delimited JSON conforming to the trace-format schema. Per-finding lines + one summary object; under exit 3, an `{"kind":"error", ...}` line lands on stdout (see Exit codes above).
 
 ### Capturing PII-constrained traces
 
@@ -742,6 +744,50 @@ with CCSStore.record_to(
 
 Replay then reports stale-read as SKIPPED with `opted_out=True` and the run
 still exits 0.
+
+### Refuse-if-exists safety
+
+`CCSStore.record_to(path)` refuses to start when `path/manifest.json`
+already exists (raises `SessionDirectoryNotEmptyError`). Without this
+guard, a second capture against the same path would silently interleave
+JSONL entries from two coordinator instances; `TRACE_CORRUPTION_DUPLICATE_SEQ`
+would eventually fire at replay, but only AFTER findings from the mixed
+session had already been emitted. Delete the directory or choose a
+different path:
+
+```python
+import shutil
+shutil.rmtree("/tmp/coherence-session", ignore_errors=True)
+with CCSStore.record_to("/tmp/coherence-session", strategy="lazy") as store:
+    ...
+```
+
+### Exception hierarchy
+
+All replay-side exceptions inherit from `ccs.replay.ReplayError` with a
+two-tier semantic split:
+
+- `ReplayConfigurationError` — API misuse / wrong entry point
+  (`UnverifiedAdapterCaptureError`, `SessionDirectoryNotEmptyError`).
+- `ReplayTraceError` — trace structural defects (`ManifestMissingOrUnreadableError`,
+  `MultiInstanceTraceError`, `TraceCorruptionError`,
+  `SessionDirectoryNotFoundError`). The CLI catches this base class and
+  maps every subclass to exit code 3, so future trace-error subclasses
+  auto-route without touching the handler.
+
+Catch the base class in your own scripts:
+
+```python
+from ccs.replay import ReplayTraceError, load, run_predicates
+
+try:
+    loaded = load(session_dir)
+    findings, summary = run_predicates(loaded)
+except ReplayTraceError as exc:
+    # Manifest missing, multi-instance, duplicate seq, etc. — all caught here.
+    log.error("Trace defect: %s", exc)
+    raise
+```
 
 ### Non-LangGraph adapters (CrewAI / AutoGen)
 
