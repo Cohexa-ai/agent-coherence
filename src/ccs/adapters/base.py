@@ -116,6 +116,30 @@ class CoherenceAdapterCore:
         """Register a shared artifact in the coordinator directory."""
         return self.coordinator.register_artifact(name=name, content=content, size_tokens=size_tokens)
 
+    def agent_names_snapshot(self) -> dict[UUID, str]:
+        """Return a snapshot copy of the agent_id → name registry.
+
+        Stable public accessor for callers that need to enumerate
+        registered agents (e.g., replay-recorder manifest finalization).
+        Returns a fresh dict — mutation by the caller does NOT affect
+        the coordinator's internal state.
+        """
+        return dict(self._agent_names)
+
+    def artifact_names_snapshot(self) -> dict[UUID, str]:
+        """Return a snapshot copy of the artifact_id → name registry.
+
+        Mirrors ``agent_names_snapshot`` for symmetry. Drains the
+        artifact registry via the public ``registry.artifact_ids()`` +
+        ``registry.get_artifact()`` chain; returns a fresh dict.
+        """
+        names: dict[UUID, str] = {}
+        for artifact_id in self.registry.artifact_ids():
+            meta = self.registry.get_artifact(artifact_id)
+            if meta is not None:
+                names[artifact_id] = meta.name
+        return names
+
     def read(self, *, agent_name: str, artifact_id: UUID, now_tick: int) -> FetchResponse:
         """Read artifact through one registered runtime."""
         binding = self._binding(agent_name)

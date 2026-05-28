@@ -129,6 +129,59 @@ def test_agent_id_for_unknown_name_raises_key_error() -> None:
         pass
 
 
+# --- Public registry snapshot accessors (Gated #17) ---
+
+
+def test_agent_names_snapshot_empty_when_no_registrations() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    assert core.agent_names_snapshot() == {}
+
+
+def test_agent_names_snapshot_reflects_registrations() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("planner")
+    core.register_agent("reviewer")
+    snapshot = core.agent_names_snapshot()
+    assert set(snapshot.values()) == {"planner", "reviewer"}
+    assert all(isinstance(k, type(core.agent_id_for("planner"))) for k in snapshot)
+
+
+def test_agent_names_snapshot_mutation_does_not_affect_core() -> None:
+    # Snapshot is a fresh dict — mutating it must not corrupt the
+    # coordinator's internal registry.
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_agent("planner")
+    snapshot = core.agent_names_snapshot()
+    snapshot.clear()
+    snapshot["bogus"] = "injected"  # type: ignore[index]
+    fresh = core.agent_names_snapshot()
+    assert "injected" not in fresh.values()
+    assert "planner" in fresh.values()
+
+
+def test_artifact_names_snapshot_empty_when_no_artifacts() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    assert core.artifact_names_snapshot() == {}
+
+
+def test_artifact_names_snapshot_reflects_registrations() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    a = core.register_artifact(name="outline.md", content="x")
+    b = core.register_artifact(name="draft.md", content="y")
+    snapshot = core.artifact_names_snapshot()
+    assert snapshot[a.id] == "outline.md"
+    assert snapshot[b.id] == "draft.md"
+
+
+def test_artifact_names_snapshot_mutation_does_not_affect_core() -> None:
+    core = CoherenceAdapterCore(strategy_name="lazy")
+    core.register_artifact(name="outline.md", content="x")
+    snapshot = core.artifact_names_snapshot()
+    snapshot.clear()
+    fresh = core.artifact_names_snapshot()
+    assert "outline.md" in fresh.values()
+
+
 # --- Crash recovery adapter tests (Unit 2) ---
 
 
