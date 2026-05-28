@@ -590,6 +590,77 @@ class TestTraceErrors:
 
 
 # ---------------------------------------------------------------------------
+# Exception envelope (Gated #1) — BrokenPipeError + uncaught Exception
+# ---------------------------------------------------------------------------
+
+
+class TestExceptionEnvelope:
+    """BrokenPipeError -> exit 0; any other uncaught Exception -> exit 4.
+
+    Decouples CLI bugs / pipe-close from the CONFIRMED breach signal
+    (exit 1) so agent consumers can triage cleanly.
+    """
+
+    def test_broken_pipe_exits_zero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A consumer that closes the pipe early (e.g. ``| head -1``)
+        # surfaces as BrokenPipeError on the next write. Replay treats
+        # it as benign — exit 0, not a failure.
+        session = _clean_session(tmp_path)
+
+        def raise_broken_pipe(*_args: Any, **_kwargs: Any) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        monkeypatch.setattr("ccs.cli.coherence_replay._run", raise_broken_pipe)
+        rc = main([str(session)])
+        assert rc == 0
+
+    def test_internal_error_exits_four_with_stderr_message(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # An uncaught exception inside _run (loader bug, predicate
+        # crash, etc.) maps to exit 4 with a typed stderr line and
+        # no Python traceback.
+        session = _clean_session(tmp_path)
+
+        def raise_internal(*_args: Any, **_kwargs: Any) -> int:
+            raise RuntimeError("simulated CLI internal error")
+
+        monkeypatch.setattr("ccs.cli.coherence_replay._run", raise_internal)
+        rc = main([str(session)])
+        captured = capsys.readouterr()
+        assert rc == 4
+        assert "internal error" in captured.err
+        assert "RuntimeError" in captured.err
+        assert "simulated CLI internal error" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_internal_error_distinct_from_confirmed_breach(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression guard: exit 4 must not collide with exit 1
+        # (CONFIRMED breach) so agents distinguish "tool crashed" from
+        # "real coordination defect found."
+        session = _clean_session(tmp_path)
+
+        def raise_internal(*_args: Any, **_kwargs: Any) -> int:
+            raise ValueError("predicate fold bug")
+
+        monkeypatch.setattr("ccs.cli.coherence_replay._run", raise_internal)
+        rc = main([str(session)])
+        assert rc != 1
+        assert rc == 4
+
+
+# ---------------------------------------------------------------------------
 # JSON schema conformance
 # ---------------------------------------------------------------------------
 
