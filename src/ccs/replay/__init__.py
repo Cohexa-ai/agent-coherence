@@ -71,6 +71,7 @@ from ccs.replay.formatters import (
 )
 from ccs.replay.recorder import (
     RecordingSession,
+    SessionDirectoryNotEmptyError,
     UnverifiedAdapterCaptureError,
     record_callbacks,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "ReplayConfigurationError",
     "ReplayError",
     "ReplayTraceError",
+    "SessionDirectoryNotEmptyError",
     "SingleWriterPredicate",
     "StaleReadPredicate",
     "SummaryFinding",

@@ -24,7 +24,11 @@ from unittest.mock import patch
 
 import pytest
 
-from ccs.replay import UnverifiedAdapterCaptureError, record_callbacks
+from ccs.replay import (
+    SessionDirectoryNotEmptyError,
+    UnverifiedAdapterCaptureError,
+    record_callbacks,
+)
 from ccs.replay.recorder import (
     DEFAULT_STREAMS,
     SCHEMA_NOTE,
@@ -158,6 +162,81 @@ class TestManifestLifecycle:
         assert manifest["instance_id"] is None
         assert manifest["agents"] == {}
         assert manifest["artifacts"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Existing-path safety (Gated #2) — refuse-if-exists
+# ---------------------------------------------------------------------------
+
+
+class TestExistingPathSafety:
+    """A pre-existing manifest.json in session_dir means a second capture
+    would silently interleave entries from two coordinator instances.
+    Refuse at __enter__ so the failure surfaces before any new entries
+    land on disk."""
+
+    def test_pre_existing_manifest_raises(self, tmp_path: Path) -> None:
+        session_dir = tmp_path / "session"
+        # First capture completes normally — leaves a manifest behind.
+        with record_callbacks(session_dir, accept_unverified=True):
+            pass
+        assert (session_dir / "manifest.json").exists()
+
+        # Second capture against the same path must refuse.
+        with pytest.raises(SessionDirectoryNotEmptyError) as exc_info:
+            with record_callbacks(session_dir, accept_unverified=True):
+                pass
+        msg = str(exc_info.value)
+        assert "manifest.json" in msg
+        assert str(session_dir) in msg
+        assert "delete" in msg.lower() or "choose a different path" in msg.lower()
+
+    def test_pre_existing_manifest_does_not_overwrite_state_log(
+        self, tmp_path: Path,
+    ) -> None:
+        # Regression guard: the refuse-if-exists check fires BEFORE any
+        # stream writers open, so the prior state_log.jsonl is untouched
+        # when the second capture is rejected.
+        session_dir = tmp_path / "session"
+        with record_callbacks(
+            session_dir, accept_unverified=True
+        ) as (state_cb, _audit_cb):
+            state_cb(_state_log_entry(tick=1, instance_id="inst-original"))
+        original_state = (session_dir / "state_log.jsonl").read_bytes()
+
+        with pytest.raises(SessionDirectoryNotEmptyError):
+            with record_callbacks(session_dir, accept_unverified=True):
+                pass
+
+        # state_log.jsonl is byte-identical to what the first capture
+        # wrote — no append from the rejected second attempt.
+        assert (session_dir / "state_log.jsonl").read_bytes() == original_state
+
+    def test_empty_directory_succeeds(self, tmp_path: Path) -> None:
+        # Pre-existing empty directory is fine — only manifest.json
+        # presence triggers the refusal.
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        with record_callbacks(session_dir, accept_unverified=True):
+            pass
+        assert (session_dir / "manifest.json").exists()
+
+    def test_pre_existing_jsonl_without_manifest_succeeds(
+        self, tmp_path: Path,
+    ) -> None:
+        # A stray state_log.jsonl without a manifest is treated as
+        # incidental clutter — the manifest is the authoritative
+        # "session exists" marker. (The session's __enter__ opens the
+        # JSONL in append mode, so a partner pre-staging garbage data
+        # there would corrupt the trace, but that's a partner-side
+        # documentation matter, not something the refuse-if-exists
+        # gate is for.)
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        (session_dir / "state_log.jsonl").write_text("preexisting garbage\n")
+        with record_callbacks(session_dir, accept_unverified=True):
+            pass
+        assert (session_dir / "manifest.json").exists()
 
 
 # ---------------------------------------------------------------------------
