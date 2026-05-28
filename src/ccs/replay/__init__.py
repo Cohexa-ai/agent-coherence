@@ -32,8 +32,9 @@ can write a single ``except`` clause per intent:
   errors. Currently: :class:`UnverifiedAdapterCaptureError`.
 - :class:`ReplayTraceError` — trace structural defects detected at
   read time. Currently: :class:`ManifestMissingOrUnreadableError`,
-  :class:`MultiInstanceTraceError`, :class:`TraceCorruptionError`.
-  CLI maps the whole category to exit code 3.
+  :class:`MultiInstanceTraceError`, :class:`SessionDirectoryNotFoundError`,
+  :class:`TraceCorruptionError`. CLI maps the whole category to exit
+  code 3.
 
 Base classes live in ``ccs.replay.errors`` so concrete subclasses in
 ``recorder`` / ``loader`` can import them without forming an import
@@ -46,6 +47,7 @@ from ccs.replay.errors import (
     ReplayConfigurationError,
     ReplayError,
     ReplayTraceError,
+    SessionDirectoryNotFoundError,
 )
 from ccs.replay.loader import (
     LoadedTrace,
@@ -90,6 +92,7 @@ __all__ = [
     "ReplayError",
     "ReplayTraceError",
     "SessionDirectoryNotEmptyError",
+    "SessionDirectoryNotFoundError",
     "SingleWriterPredicate",
     "StaleReadPredicate",
     "SummaryFinding",

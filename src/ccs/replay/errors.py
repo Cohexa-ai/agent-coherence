@@ -18,6 +18,7 @@ single ``except`` clause matching the failure category:
     └── ReplayTraceError              (trace defect — fix the data; CLI exit 3)
         ├── ManifestMissingOrUnreadableError
         ├── MultiInstanceTraceError
+        ├── SessionDirectoryNotFoundError
         └── TraceCorruptionError
 
 Future trace-defect subclasses inherit ``ReplayTraceError`` and
@@ -42,4 +43,13 @@ class ReplayTraceError(ReplayError):
     """Errors raised when reading or interpreting a captured trace.
     The trace is structurally invalid (multi-instance, duplicate seq,
     missing manifest, or unreadable manifest). Maps to CLI exit code 3.
+    """
+
+
+class SessionDirectoryNotFoundError(ReplayTraceError):
+    """Raised by the CLI pre-flight when the session directory does not
+    exist on disk. Modeled as a ``ReplayTraceError`` subclass so the
+    outer trace-error catch in ``main()`` handles it uniformly with the
+    loader/iterator errors — keeps the exit-3 envelope logic in one
+    place (Gated #15 resolution).
     """

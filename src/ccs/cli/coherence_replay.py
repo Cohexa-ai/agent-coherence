@@ -33,17 +33,31 @@ AMBIGUOUS suppression resolved in plan Open Question P1-B: per-finding
 output suppresses AMBIGUOUS by default; ``--include-ambiguous`` opts
 in. Summary ALWAYS counts AMBIGUOUS, and the callout fires when count
 exceeds ``--ambiguous-threshold`` (default 10), naming both remedies.
+
+JSON error envelope (Gated #15 resolution): when ``--json`` is active
+and a trace error fires (exit 3), a final NDJSON object is written to
+stdout before the human prose hits stderr::
+
+    {"kind": "error", "exit_code": 3, "exception": "<ClassName>",
+     "message": "..."}
+
+Keeps stdout self-contained for ``--json`` consumers; the stderr line
+remains for human log tailing. The pre-flight session-directory check
+raises ``SessionDirectoryNotFoundError`` (a ``ReplayTraceError``
+subclass) so the envelope logic stays centralized in the outer catch.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from ccs.replay import (
     ReplayTraceError,
+    SessionDirectoryNotFoundError,
     load,
     run_predicates,
 )
@@ -177,6 +191,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         # shutdown-time BrokenPipeError via os._exit.
         return 0
     except (ReplayTraceError, OSError) as exc:
+        # JSON consumers need a self-contained stdout — emit the error
+        # envelope BEFORE the human prose so an agent capturing stdout
+        # can parse a single NDJSON stream end-to-end. Use write+flush
+        # rather than print so a downstream BrokenPipeError surfaces
+        # cleanly (Gated #1 handles BrokenPipeError end-to-end).
+        if args.json:
+            sys.stdout.write(json.dumps({
+                "kind": "error",
+                "exit_code": 3,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }) + "\n")
+            sys.stdout.flush()
         print(f"agent-coherence-replay: {exc}", file=sys.stderr)
         return 3
     except Exception as exc:  # noqa: BLE001 — intentional translate-and-return
@@ -196,12 +223,12 @@ def _run(args: argparse.Namespace) -> int:
     the style-guide line ceiling.
     """
     if not args.session_dir.exists():
-        print(
-            f"agent-coherence-replay: session directory not found: "
-            f"{args.session_dir}",
-            file=sys.stderr,
+        # Raise rather than print+return so the outer trace-error catch
+        # in main() handles both the stderr prose and the --json error
+        # envelope in one place (Gated #15).
+        raise SessionDirectoryNotFoundError(
+            f"session directory not found: {args.session_dir}"
         )
-        return 3
     loaded = load(args.session_dir)
     findings, summary = run_predicates(loaded, invariants=args.invariant)
     if args.json:
