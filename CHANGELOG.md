@@ -6,17 +6,20 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-Unreleased work targets **`v0.8.2`** — consolidated patch release
-covering both the v0.2 strict-mode track (landed earlier on dev) and
-the D v1 LangGraph cycle replay tooling + ce:review gated cluster
-(shipped to dev 2026-05-27 → 2026-05-28). Both tracks are additive: new
-wire fields for v0.2 strict mode AND a new CLI surface
-(`agent-coherence-replay`) + new module (`src/ccs/replay/`). The
-`coordinator_uptime_s` deprecation alias from the `0.8.0` AC-02 plan
-stays in place through `0.8.x`; its removal continues to be targeted
-for a future minor bump per the original SemVer commitment.
+(No unreleased work at the moment — v0.8.2 was tagged 2026-05-28.)
 
-### Added — v0.8.2 — D v1 LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
+## [0.8.2] — 2026-05-28
+
+Consolidated patch release covering both the v0.2 strict-mode track
+(landed earlier on dev) and the D v1 LangGraph cycle replay tooling +
+ce:review gated cluster (shipped to dev 2026-05-27 → 2026-05-28). Both
+tracks are additive: new wire fields for v0.2 strict mode AND a new
+CLI surface (`agent-coherence-replay`) + new module (`src/ccs/replay/`).
+The `coordinator_uptime_s` deprecation alias from the `0.8.0` AC-02
+plan stays in place through `0.8.x`; its removal continues to be
+targeted for a future minor bump per the original SemVer commitment.
+
+### Added — D v1 LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
 
 - **`agent-coherence-replay` console script** — invariant replay CLI
   that walks a captured coordinator session and reports breaches of
@@ -145,6 +148,22 @@ for a future minor bump per the original SemVer commitment.
   consumes this library via its broad-beta launch package (plan Units
   8-11). The Node coordinator does NOT ship strict mode in v0.2 —
   strict-mode workspaces must use `coherence.coordinator_backend = "python"`.
+
+## [0.8.1] — 2026-05-27
+
+Single-fix patch.
+
+### Fixed
+
+- **`agent-coherence-track` / `-untrack` reject absolute paths.** The CLIs
+  now normalize absolute paths that fall inside the workspace root to
+  workspace-relative form before applying the server-side validator.
+  Previously the validator rejected absolute paths outright, requiring
+  callers to strip the workspace prefix manually even for paths the
+  workspace clearly owns. Tracking paths outside the workspace remains
+  rejected as before. (Equivalent fix landed on dev as commit `10f1e16`
+  during the v0.2 strict-mode track; this 0.8.1 release ships the
+  patch from main without dragging in the strict-mode work-in-flight.)
 
 ## [0.8.0] — 2026-05-23
 
