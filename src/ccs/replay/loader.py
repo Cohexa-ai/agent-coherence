@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from ccs.replay.errors import ReplayTraceError
+
 __all__ = [
     "LoadedTrace",
     "ManifestMissingOrUnreadableError",
@@ -69,26 +71,32 @@ _KNOWN_STREAMS: frozenset[str] = frozenset(_STREAM_PRIORITY)
 # ---------------------------------------------------------------------------
 
 
-class ManifestMissingOrUnreadableError(RuntimeError):
+class ManifestMissingOrUnreadableError(ReplayTraceError):
     """``manifest.json`` does not exist or fails JSON parse.
 
     Raised eagerly by :func:`load` — partial walks are not possible
     without a manifest. Message points at the offending path so partners
     can re-capture or fix the directory.
+
+    Inherits from :class:`ccs.replay.ReplayTraceError` so CLI callers
+    can catch all trace-defect errors with one ``except`` clause and
+    route them to exit code 3.
     """
 
 
-class MultiInstanceTraceError(RuntimeError):
+class MultiInstanceTraceError(ReplayTraceError):
     """Two distinct ``instance_id`` values observed in the same stream.
 
     v1 supports single-coordinator-instance traces only. Raised lazily
     from the iterator so partial walks succeed up to the boundary —
     Unit 5's CLI maps this to exit code 3 and surfaces the D+1
     roadmap pointer to the operator.
+
+    Inherits from :class:`ccs.replay.ReplayTraceError`.
     """
 
 
-class TraceCorruptionError(RuntimeError):
+class TraceCorruptionError(ReplayTraceError):
     """Two entries in a stream share ``(instance_id, sequence_number)``.
 
     Defense-in-depth against partner-written callbacks (CrewAI /
@@ -100,6 +108,8 @@ class TraceCorruptionError(RuntimeError):
 
     Raised lazily from the iterator with the duplicate seq value, the
     offending file path, and the line number of the second occurrence.
+
+    Inherits from :class:`ccs.replay.ReplayTraceError`.
     """
 
 

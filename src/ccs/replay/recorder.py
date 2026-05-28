@@ -38,6 +38,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Callable, Iterator
 
+from ccs.replay.errors import ReplayConfigurationError
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -86,7 +88,7 @@ _MULTI_INSTANCE_WARNING = (
 )
 
 
-class UnverifiedAdapterCaptureError(RuntimeError):
+class UnverifiedAdapterCaptureError(ReplayConfigurationError):
     """Raised by :func:`record_callbacks` when ``accept_unverified=True``
     was not passed.
 
@@ -96,6 +98,10 @@ class UnverifiedAdapterCaptureError(RuntimeError):
     invoke the helper directly and MUST acknowledge the unverified
     status by passing the flag — surfacing the v1 scope boundary at
     the call site, not buried in README copy.
+
+    Inherits from :class:`ccs.replay.ReplayConfigurationError` (API
+    misuse) rather than :class:`ccs.replay.ReplayTraceError` — the
+    trace itself never got written.
     """
 
 
