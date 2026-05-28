@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "UnverifiedAdapterCaptureError",
+    "SessionDirectoryNotEmptyError",
     "RecordingSession",
     "record_callbacks",
     "DEFAULT_STREAMS",
@@ -102,6 +103,25 @@ class UnverifiedAdapterCaptureError(ReplayConfigurationError):
     Inherits from :class:`ccs.replay.ReplayConfigurationError` (API
     misuse) rather than :class:`ccs.replay.ReplayTraceError` — the
     trace itself never got written.
+    """
+
+
+class SessionDirectoryNotEmptyError(RuntimeError):
+    """Raised by ``RecordingSession.__enter__`` when ``session_dir`` already
+    contains a ``manifest.json``.
+
+    The capture path is append-mode on the JSONL files, so a second
+    ``record_to(path)`` against an existing session would silently
+    interleave entries from two coordinator instances. Replay would
+    later raise ``MultiInstanceTraceError`` or ``TraceCorruptionError``
+    *after* findings from the mixed session were already emitted —
+    a confusing, hard-to-diagnose failure mode for partners.
+
+    Refusing at capture time forces the caller to explicitly delete the
+    directory (``shutil.rmtree(path)``) or choose a different path. No
+    ``overwrite=True`` opt-in is offered in v1: the explicit imperative
+    is clearer than a flag, and the operation is rare enough that the
+    extra line is harmless.
     """
 
 
@@ -272,6 +292,21 @@ class RecordingSession:
 
     def __enter__(self) -> "RecordingSession":
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        # Refuse-if-exists (Gated #2): a prior capture's manifest at this
+        # path means a second record_to would silently interleave JSONL
+        # entries from two coordinator instances; replay would later
+        # raise MultiInstance/TraceCorruption *after* findings from the
+        # mixed session had already been emitted. Force the caller to
+        # explicitly delete (shutil.rmtree) or choose a different path.
+        manifest_path = self.session_dir / "manifest.json"
+        if manifest_path.exists():
+            raise SessionDirectoryNotEmptyError(
+                f"session directory already contains a manifest.json: "
+                f"{self.session_dir}. Delete the directory or choose a "
+                f"different path before capturing — appending to an "
+                f"existing session would silently produce a "
+                f"multi-instance trace."
+            )
         # streams parameter declares what the manifest advertises; we
         # always open the audit no-op writer too so caller-supplied
         # audit callbacks still see the bookkeeping (instance_id tracking,
