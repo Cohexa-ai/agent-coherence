@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from uuid import UUID
 
@@ -22,16 +22,26 @@ from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSi
 from .registry import ArtifactRegistry
 
 
+# v0.8.3 deprecation cycle — see docs/plans/2026-05-28-001-feat-c-flip-...
+# Module-level sentinel distinguishes bare CrashRecoveryConfig() from
+# explicit CrashRecoveryConfig(enabled=False). Both the sentinel and the
+# emit-once flag are removed in v0.9.0 when the default flips to True.
+_DEFAULT_ENABLED_SENTINEL: object = object()
+_BARE_CONSTRUCTION_WARNED: bool = False
+
+
 @dataclass(frozen=True)
 class CrashRecoveryConfig:
     """Configuration knobs for the stable-grant reclamation sweep.
 
-    The sweep ships disabled by default (R10) and is gated on the TLA+
-    amendment before any default-on flip.
+    The sweep ships disabled by default in v0.8.x (R10). The default
+    will flip to ``enabled=True`` in v0.9.0; bare ``CrashRecoveryConfig()``
+    in v0.8.3 emits a ``DeprecationWarning`` once per process to warn
+    downstream consumers ahead of the flip.
 
     Attributes:
-        enabled: Master flag. When ``False`` (default), the sweep is never
-            invoked and no heartbeat is required.
+        enabled: Master flag. When ``False`` (v0.8.x default), the sweep
+            is never invoked and no heartbeat is required.
         heartbeat_timeout_ticks: Sweep reclaims any M∪E grant whose holder
             has not heartbeated within this many ticks.
         max_hold_ticks: Sweep reclaims any M∪E grant held for at least this
@@ -39,9 +49,55 @@ class CrashRecoveryConfig:
             inspectable strategy lease TTL when ``enabled=True`` (R11).
     """
 
-    enabled: bool = False
+    # field(default=_DEFAULT_ENABLED_SENTINEL) lets __post_init__ distinguish
+    # bare construction from explicit False; the type-ignore is necessary
+    # because the runtime sentinel is not a bool but the public type is.
+    enabled: bool = field(default=_DEFAULT_ENABLED_SENTINEL)  # type: ignore[assignment]
     heartbeat_timeout_ticks: int = 10
     max_hold_ticks: int = 1000
+
+    def __post_init__(self) -> None:
+        """Detect bare construction; emit one-shot DeprecationWarning.
+
+        The dataclass is ``frozen=True``, so we normalize the sentinel-typed
+        ``enabled`` field via ``object.__setattr__`` (direct assignment would
+        raise ``FrozenInstanceError``).
+        """
+        global _BARE_CONSTRUCTION_WARNED
+        if self.enabled is _DEFAULT_ENABLED_SENTINEL:
+            if not _BARE_CONSTRUCTION_WARNED:
+                warnings.warn(
+                    "CrashRecoveryConfig() default will flip to "
+                    "`enabled=True` in v0.9.0. Recommended migration: pass "
+                    "CrashRecoveryConfig(enabled=True) to opt in now and "
+                    "surface any false-reclaim issues under your workload. "
+                    "If you have a specific reason to keep crash recovery "
+                    "off, pass CrashRecoveryConfig(enabled=False) "
+                    "explicitly. See CHANGELOG v0.8.3 for migration details.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+                _BARE_CONSTRUCTION_WARNED = True
+            # frozen dataclass — direct assignment raises FrozenInstanceError.
+            # object.__setattr__ is the documented escape for __post_init__
+            # normalization on frozen dataclasses.
+            object.__setattr__(self, "enabled", False)
+
+
+def _default_disabled_config() -> CrashRecoveryConfig:
+    """Internal helper: construct ``CrashRecoveryConfig(enabled=False)``
+    without triggering the v0.8.3 bare-construction ``DeprecationWarning``.
+
+    Used by library-internal code paths (``simulation.engine``,
+    ``adapters.base``) that need the v0.8.x default-disabled config object
+    but should not surface the deprecation warning to end users — the bare
+    construction is the library's own, not the user's, so it would be a
+    false alarm.
+
+    Removed in v0.9.0 when the default flips to ``enabled=True`` and the
+    sentinel mechanism is unwound.
+    """
+    return CrashRecoveryConfig(enabled=False)
 
 
 def validate_crash_recovery_config(

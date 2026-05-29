@@ -422,3 +422,43 @@ def test_flag_off_heartbeat_is_noop() -> None:
     core.heartbeat(agent_name="A", now_tick=42)
 
     assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
+
+
+# ---- v0.8.3 C-flip Unit 2 — R2 internal-bare-construction hygiene ------------
+#
+# See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
+# Unit 2. The library's own adapter __init__ fallbacks must not surface the
+# v0.8.3 deprecation warning to users who construct adapters without passing
+# crash_recovery=. The user's bare CoherenceAdapterCore() / CCSStore() call
+# should not look like a misconfigured CrashRecoveryConfig site to them.
+
+
+def test_bare_coherence_adapter_core_emits_no_deprecation_warning() -> None:
+    """R2: CoherenceAdapterCore() with no crash_recovery= must not warn."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        core = CoherenceAdapterCore(strategy_name="lazy")
+    deprecation_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_warnings == [], (
+        f"bare CoherenceAdapterCore construction must not emit "
+        f"DeprecationWarning, got: {[str(w.message) for w in deprecation_warnings]}"
+    )
+    # And the v0.8.x default behavior is preserved.
+    assert core._crash_recovery.enabled is False
+
+
+def test_explicit_crash_recovery_kwarg_emits_no_deprecation_warning() -> None:
+    """Passing an explicit CrashRecoveryConfig must not warn either."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        core = CoherenceAdapterCore(
+            strategy_name="lazy",
+            crash_recovery=CrashRecoveryConfig(enabled=True),
+        )
+    deprecation_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_warnings == []
+    assert core._crash_recovery.enabled is True

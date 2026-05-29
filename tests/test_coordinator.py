@@ -404,7 +404,18 @@ from ccs.strategies.lease import LeaseStrategy  # noqa: E402
 
 
 def test_crash_recovery_config_defaults_are_safe() -> None:
-    cfg = CrashRecoveryConfig()
+    """v0.8.3: bare CrashRecoveryConfig() construction is an intentional API
+    surface and asserts both the v0.8.x default-disabled behavior AND the
+    presence of the deprecation warning. The pytest.warns wrapper makes the
+    warning part of the test contract, not collateral CI noise.
+    """
+    # Reset the module-level emit-once flag so this test sees the warning
+    # regardless of test ordering. (The TestCrashRecoveryDeprecationWarning
+    # class below also resets it; this standalone test predates that class.)
+    from ccs.coordinator import service as _service_mod
+    _service_mod._BARE_CONSTRUCTION_WARNED = False
+    with pytest.warns(DeprecationWarning, match="enabled=True"):
+        cfg = CrashRecoveryConfig()
     assert cfg.enabled is False
     assert cfg.heartbeat_timeout_ticks == 10
     assert cfg.max_hold_ticks == 1000
@@ -563,3 +574,135 @@ def test_set_agent_state_failed_log_emit_consistent_for_me_exit_too() -> None:
     # Bookkeeping cleanup ran even though log emit raised.
     assert registry.get_agent_state(artifact.id, agent_id) == MESIState.INVALID
     assert registry.granted_at_tick(agent_id, artifact.id) is None
+
+
+# ---- v0.8.3 C-flip deprecation cycle ----------------------------------------
+#
+# See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
+# Unit 1. The bare CrashRecoveryConfig() construction must emit a one-shot
+# DeprecationWarning naming the v0.9.0 default flip. Tests below assert both
+# the emission behavior and the silence paths.
+
+
+import warnings as _warnings  # noqa: E402
+
+from ccs.coordinator import service as _service_module  # noqa: E402
+
+
+@pytest.fixture
+def reset_bare_construction_flag():
+    """Reset the module-level emit-once flag between tests.
+
+    Without this, the first test to construct CrashRecoveryConfig() would
+    set _BARE_CONSTRUCTION_WARNED=True for the entire pytest session and
+    later tests in this class would see zero warnings (false negatives).
+    """
+    _service_module._BARE_CONSTRUCTION_WARNED = False
+    yield
+    _service_module._BARE_CONSTRUCTION_WARNED = False
+
+
+class TestCrashRecoveryDeprecationWarning:
+    """Unit 1 — bare CrashRecoveryConfig() emits one-shot DeprecationWarning."""
+
+    def test_bare_construction_emits_deprecation_warning(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """Happy path: bare construction in fresh process emits one warning."""
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            CrashRecoveryConfig()
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 1
+
+    def test_warning_message_names_both_silence_paths(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """Warning prose must give users BOTH the opt-in and opt-out recipes."""
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            CrashRecoveryConfig()
+        msg = str(caught[0].message)
+        assert "enabled=True" in msg, "warning must name the recommended opt-in"
+        assert "enabled=False" in msg, "warning must name the explicit opt-out"
+        assert "v0.9.0" in msg, "warning must name the target release"
+
+    def test_bare_construction_preserves_v0_8_x_default(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """After bare construction, enabled is False (v0.8.x behavior preserved)."""
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = CrashRecoveryConfig()
+        assert cfg.enabled is False
+        assert cfg.heartbeat_timeout_ticks == 10
+        assert cfg.max_hold_ticks == 1000
+
+    def test_emit_once_dedupes_consecutive_bare_constructions(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """Module-level flag means two bare constructions emit exactly ONE warning."""
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            CrashRecoveryConfig()
+            CrashRecoveryConfig()
+            CrashRecoveryConfig()
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 1, (
+            f"expected 1 warning across three bare constructions, "
+            f"got {len(deprecation_warnings)}"
+        )
+
+    def test_explicit_false_emits_no_warning(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """User passes enabled=False explicitly → no warning, enabled stays False."""
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            cfg = CrashRecoveryConfig(enabled=False)
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert deprecation_warnings == []
+        assert cfg.enabled is False
+
+    def test_explicit_true_emits_no_warning(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """User passes enabled=True explicitly → no warning, enabled stays True."""
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            cfg = CrashRecoveryConfig(enabled=True)
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert deprecation_warnings == []
+        assert cfg.enabled is True
+
+    def test_composition_validation_unchanged_for_explicit_true(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """R11 composition rule still works on explicit-True configs after Unit 1."""
+        cfg = CrashRecoveryConfig(
+            enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000
+        )
+        # Should not raise — 1000 > 300.
+        validate_crash_recovery_config(cfg, LeaseStrategy(ttl_ticks=300))
+
+    def test_dataclass_remains_frozen(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """frozen=True invariant — sentinel mechanism must not break immutability."""
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = CrashRecoveryConfig()
+        # Direct assignment must still raise FrozenInstanceError.
+        with pytest.raises(Exception) as exc_info:
+            cfg.enabled = True  # type: ignore[misc]
+        assert "frozen" in str(exc_info.value).lower() or "FrozenInstanceError" in type(
+            exc_info.value
+        ).__name__
