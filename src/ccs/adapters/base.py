@@ -16,6 +16,7 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
     CoordinatorService,
     CrashRecoveryConfig,
+    _default_disabled_config,
     validate_crash_recovery_config,
 )
 from ccs.core.types import Artifact, FetchResponse
@@ -56,7 +57,14 @@ class CoherenceAdapterCore:
         self._instance_id = instance_id
         self._content_audit_log = content_audit_log
         self._audit_seq = audit_seq
-        self._crash_recovery = crash_recovery if crash_recovery is not None else CrashRecoveryConfig()
+        # Use _default_disabled_config() to avoid surfacing the v0.8.3
+        # DeprecationWarning on every bare CoherenceAdapterCore() / CCSStore()
+        # construction. The user did not pass crash_recovery=; their bare
+        # adapter call should not look like a misconfigured CrashRecoveryConfig
+        # site to them.
+        self._crash_recovery = (
+            crash_recovery if crash_recovery is not None else _default_disabled_config()
+        )
         self.registry = ArtifactRegistry(
             state_log=state_log,
             agent_names=self._agent_names,

@@ -6,7 +6,75 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-(No unreleased work at the moment — v0.8.2 was tagged 2026-05-28.)
+(Nothing yet.)
+
+## [0.8.3] — 2026-05-30
+
+**First behavioral default-flip in the library's history.** v0.8.3 is a
+deprecation-only release: it adds a one-shot `DeprecationWarning` to bare
+`CrashRecoveryConfig()` construction announcing the v0.9.0 default flip
+from `enabled=False` to `enabled=True`. **No behavior changes ship in
+v0.8.3.** Downstream consumers get one release cycle to surface false-
+reclaim issues under their own workloads before the flip lands.
+
+This is novel for this repo — the only prior deprecation precedent
+(`coordinator_uptime_s` rename + alias in v0.8.0) was a field rename, not
+a behavior default change. Operators who depend on the v0.8.x
+default-disabled behavior have two clear paths to silence the warning:
+
+- **Recommended migration**: pass `CrashRecoveryConfig(enabled=True)` to
+  opt in now and surface any false-reclaim issues under your workload
+  before v0.9.0 ships.
+- **Preserve current behavior**: pass `CrashRecoveryConfig(enabled=False)`
+  explicitly. Crash recovery stays off; the warning stays silent.
+
+See [`docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md`](docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md)
+for the full two-release migration plan (v0.8.3 deprecation → v0.9.0 flip +
+sweep wiring) and [`docs/specs/crash-recovery.md`](docs/specs/crash-recovery.md)
+for the underlying sweep semantics.
+
+### Changed
+
+- **Behavior change preview — v0.9.0 will flip
+  `CrashRecoveryConfig().enabled` from `False` to `True`.** v0.8.3
+  emits `DeprecationWarning` exactly once per process on the first
+  bare `CrashRecoveryConfig()` construction. The warning names both
+  silence paths (`enabled=True` opt-in or `enabled=False` opt-out) and
+  the target release.
+- Composition rule (R11) is unaffected: explicit
+  `CrashRecoveryConfig(enabled=True, max_hold_ticks=…)` continues to
+  validate against the longest inspectable strategy lease TTL via
+  `validate_crash_recovery_config`. v0.9.0 will additionally retune
+  `heartbeat_timeout_ticks` and `max_hold_ticks` from sim-anchor values
+  (10 / 1000) to batch-tick-realistic defaults (120 / 900) — see the
+  plan above for the calibration rationale.
+
+### Internal
+
+- `CrashRecoveryConfig` distinguishes bare construction from explicit
+  `enabled=False` via a *falsy* module-level sentinel default and a
+  `__post_init__` normalization step that uses `object.__setattr__` to
+  satisfy the `frozen=True` constraint. The sentinel is deliberately
+  falsy so that any path which skips normalization — `importlib.reload`
+  rebinding the module sentinel (gunicorn/uvicorn `--reload`, Jupyter
+  autoreload), or a subclass `__post_init__` that omits `super()` —
+  still reads as disabled rather than silently activating the sweep.
+- The deprecation signal fires at most once per process (a thread-safe
+  emit-once guard) on **two** channels: the `warnings` system *and* a
+  WARNING-level log record on the `ccs.coordinator.service` logger. The
+  second channel ensures the migration signal survives CPython's default
+  `DeprecationWarning` filter, which suppresses warnings raised from
+  non-`__main__` importers — i.e. virtually every SDK consumer. The
+  sentinel, the guard, and the dual-channel emit are all removed in
+  v0.9.0.
+- A library-internal helper (in `ccs.coordinator.service`) lets
+  library code paths (`ccs.simulation.engine`, `ccs.adapters.base`)
+  construct the v0.8.x default-disabled config object without
+  surfacing the deprecation warning to users. Removed in v0.9.0.
+- Architecture-level regression gate
+  (`tests/test_architecture.py::test_no_bare_crash_recovery_config_construction_in_src`)
+  asserts no bare `CrashRecoveryConfig()` call sites exist in `src/`.
+  Catches accidental re-introduction in future patches.
 
 ## [0.8.2] — 2026-05-28
 

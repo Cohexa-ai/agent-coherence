@@ -33,10 +33,11 @@ full command-line toolset, and the API reference.
 13. [Real-workload benchmarks](#real-workload-benchmarks)
 14. [Benchmarking your own workload](#benchmarking-your-own-workload)
 15. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-16. [Command-line tools](#command-line-tools)
-17. [API reference](#api-reference)
-18. [Low-level adapter API](#low-level-adapter-api)
-19. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+16. [Replay (v0.8.2+)](#replay-v082)
+17. [Command-line tools](#command-line-tools)
+18. [API reference](#api-reference)
+19. [Low-level adapter API](#low-level-adapter-api)
+20. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
 
 ---
 
@@ -318,6 +319,16 @@ When both `content_audit_log` and `state_log` are enabled, `instance_id` is shar
 When an agent crashes (OOM-kill, segfault) or livelocks (holds a grant indefinitely),
 its `MODIFIED` or `EXCLUSIVE` grant blocks all other agents from writing to that artifact.
 The crash-recovery extension reclaims stale grants automatically.
+
+> **Deprecation — default flips in v0.9.0.** As of **v0.8.3**, constructing
+> `CrashRecoveryConfig()` without an explicit `enabled=` emits a one-shot
+> `DeprecationWarning`: the default changes from `enabled=False` to
+> `enabled=True` in **v0.9.0**. Pass `enabled=` explicitly to silence the
+> warning and pin your intended behavior — `CrashRecoveryConfig(enabled=True)`
+> to opt in now, or `CrashRecoveryConfig(enabled=False)` to keep crash
+> recovery off. See [CHANGELOG.md](../CHANGELOG.md) for the full migration
+> notes (including the v0.9.0 `heartbeat_timeout_ticks` / `max_hold_ticks`
+> retuning).
 
 ### Enabling
 

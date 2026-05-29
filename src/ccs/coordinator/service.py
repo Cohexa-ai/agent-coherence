@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from uuid import UUID
 
@@ -22,16 +23,93 @@ from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSi
 from .registry import ArtifactRegistry
 
 
+# v0.8.3 deprecation cycle — see docs/plans/2026-05-28-001-feat-c-flip-...
+# A module-level sentinel distinguishes bare ``CrashRecoveryConfig()`` from
+# explicit ``CrashRecoveryConfig(enabled=False)``. The sentinel, the
+# emit-once flag, the lock, and the message constant are all removed in
+# v0.9.0 when the default flips to ``enabled=True``.
+
+
+class _DefaultEnabledSentinel:
+    """Falsy marker for an unspecified ``enabled`` in ``CrashRecoveryConfig``.
+
+    ``__post_init__`` uses identity (``is``) to detect bare construction and
+    normalize ``enabled`` to ``False``. The sentinel is deliberately *falsy*
+    so that on the rare paths where normalization is skipped, the value still
+    reads as disabled — matching the v0.8.x default and keeping the crash
+    recovery sweep from silently activating:
+
+    * ``importlib.reload`` (gunicorn/uvicorn ``--reload``, Jupyter autoreload)
+      re-executes this module in place, rebinding ``_DEFAULT_ENABLED_SENTINEL``
+      to a fresh instance. An instance of the *pre-reload* class still carries
+      the old sentinel as its field default, so the ``is`` check fails and
+      normalization is skipped (ce:review ADV-01).
+    * A subclass whose ``__post_init__`` overrides ours without calling
+      ``super().__post_init__()`` never normalizes at all (ce:review ADV-03).
+
+    In both cases ``bool(enabled)`` is ``False``, so production checks of the
+    form ``if self._crash_recovery.enabled:`` stay correct. Removed in v0.9.0.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "<CrashRecoveryConfig.enabled unset>"
+
+
+# Test-isolation contract: ``_BARE_CONSTRUCTION_WARNED`` is module-level
+# mutable state that persists across pytest test functions in the same
+# process. Tests that assert on warning emission MUST reset it to ``False``
+# before the bare construction (either directly via
+# ``service._BARE_CONSTRUCTION_WARNED = False`` or via the
+# ``reset_bare_construction_flag`` pytest fixture in
+# ``tests/test_coordinator.py``). Without the reset, test ordering
+# determines whether the first test sees the warning and later tests do
+# not — a silent-degrade failure mode under pytest-xdist or randomized
+# ordering. The reset is paired with the flag's lifecycle by intent: this
+# whole block is removed in v0.9.0 along with the test fixture.
+#
+# ``_BARE_CONSTRUCTION_LOCK`` makes the check-then-set atomic so two threads
+# constructing bare configs concurrently cannot both emit. The GIL made the
+# naive check incidentally safe; free-threaded Python 3.13+ removes it. This
+# mirrors the ``threading.Lock`` pattern the plan's KD-4 specifies for the
+# v0.9.0 first-use guard (ce:review ADV-02).
+_DEFAULT_ENABLED_SENTINEL = _DefaultEnabledSentinel()
+_BARE_CONSTRUCTION_WARNED: bool = False
+_BARE_CONSTRUCTION_LOCK = threading.Lock()
+
+# Emitted on BOTH the warnings channel (visible under ``-W`` / pytest) and the
+# logging channel (visible under any ``logging.basicConfig()`` — the common
+# case CPython's default ``DeprecationWarning`` filter hides for non-__main__
+# importers). These are two of the three RM-9 belt-and-suspenders layers; the
+# third is the v0.9.0 transitional first-use warning. Removed in v0.9.0.
+_BARE_CONSTRUCTION_MESSAGE = (
+    "CrashRecoveryConfig() default will flip to `enabled=True` in v0.9.0. "
+    "Recommended migration: pass CrashRecoveryConfig(enabled=True) to opt in "
+    "now and surface any false-reclaim issues under your workload. If you "
+    "have a specific reason to keep crash recovery off, pass "
+    "CrashRecoveryConfig(enabled=False) explicitly. See CHANGELOG.md "
+    "(section: [0.8.3]) at "
+    "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md "
+    "for migration details."
+)
+
+
 @dataclass(frozen=True)
 class CrashRecoveryConfig:
     """Configuration knobs for the stable-grant reclamation sweep.
 
-    The sweep ships disabled by default (R10) and is gated on the TLA+
-    amendment before any default-on flip.
+    The sweep ships disabled by default in v0.8.x (R10). The default
+    will flip to ``enabled=True`` in v0.9.0; bare ``CrashRecoveryConfig()``
+    in v0.8.3 emits a ``DeprecationWarning`` once per process to warn
+    downstream consumers ahead of the flip.
 
     Attributes:
-        enabled: Master flag. When ``False`` (default), the sweep is never
-            invoked and no heartbeat is required.
+        enabled: Master flag. When ``False`` (v0.8.x default), the sweep
+            is never invoked and no heartbeat is required.
         heartbeat_timeout_ticks: Sweep reclaims any M∪E grant whose holder
             has not heartbeated within this many ticks.
         max_hold_ticks: Sweep reclaims any M∪E grant held for at least this
@@ -39,9 +117,59 @@ class CrashRecoveryConfig:
             inspectable strategy lease TTL when ``enabled=True`` (R11).
     """
 
-    enabled: bool = False
+    # field(default=_DEFAULT_ENABLED_SENTINEL) lets __post_init__ distinguish
+    # bare construction from explicit False; the type-ignore is necessary
+    # because the runtime sentinel is not a bool but the public type is.
+    enabled: bool = field(default=_DEFAULT_ENABLED_SENTINEL)  # type: ignore[assignment]
     heartbeat_timeout_ticks: int = 10
     max_hold_ticks: int = 1000
+
+    def __post_init__(self) -> None:
+        """Detect bare construction; emit the one-shot deprecation signal.
+
+        The dataclass is ``frozen=True``, so we normalize the sentinel-typed
+        ``enabled`` field via ``object.__setattr__`` (direct assignment would
+        raise ``FrozenInstanceError``).
+        """
+        global _BARE_CONSTRUCTION_WARNED
+        if self.enabled is _DEFAULT_ENABLED_SENTINEL:
+            # Claim the one-shot emission atomically under the lock, then emit
+            # OUTSIDE it: warning filters and logging handlers can run arbitrary
+            # user code, and we never hold the lock across that (ADV-02).
+            should_emit = False
+            with _BARE_CONSTRUCTION_LOCK:
+                if not _BARE_CONSTRUCTION_WARNED:
+                    _BARE_CONSTRUCTION_WARNED = True
+                    should_emit = True
+            if should_emit:
+                # logging first, so the migration signal is recorded even when
+                # ``-W error`` escalates the DeprecationWarning into a raise
+                # (and so it survives CPython's default filter — RM-9 Layer 2).
+                logger.warning(_BARE_CONSTRUCTION_MESSAGE)
+                # stacklevel=3: warn() -> __post_init__ -> __init__ -> caller.
+                warnings.warn(
+                    _BARE_CONSTRUCTION_MESSAGE, DeprecationWarning, stacklevel=3
+                )
+            # frozen dataclass — direct assignment raises FrozenInstanceError.
+            # object.__setattr__ is the documented escape for __post_init__
+            # normalization on frozen dataclasses.
+            object.__setattr__(self, "enabled", False)
+
+
+def _default_disabled_config() -> CrashRecoveryConfig:
+    """Internal helper: construct ``CrashRecoveryConfig(enabled=False)``
+    without triggering the v0.8.3 bare-construction ``DeprecationWarning``.
+
+    Used by library-internal code paths (``simulation.engine``,
+    ``adapters.base``) that need the v0.8.x default-disabled config object
+    but should not surface the deprecation warning to end users — the bare
+    construction is the library's own, not the user's, so it would be a
+    false alarm.
+
+    Removed in v0.9.0 when the default flips to ``enabled=True`` and the
+    sentinel mechanism is unwound.
+    """
+    return CrashRecoveryConfig(enabled=False)
 
 
 def validate_crash_recovery_config(
