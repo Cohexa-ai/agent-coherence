@@ -319,6 +319,16 @@ When an agent crashes (OOM-kill, segfault) or livelocks (holds a grant indefinit
 its `MODIFIED` or `EXCLUSIVE` grant blocks all other agents from writing to that artifact.
 The crash-recovery extension reclaims stale grants automatically.
 
+> **Deprecation — default flips in v0.9.0.** As of **v0.8.3**, constructing
+> `CrashRecoveryConfig()` without an explicit `enabled=` emits a one-shot
+> `DeprecationWarning`: the default changes from `enabled=False` to
+> `enabled=True` in **v0.9.0**. Pass `enabled=` explicitly to silence the
+> warning and pin your intended behavior — `CrashRecoveryConfig(enabled=True)`
+> to opt in now, or `CrashRecoveryConfig(enabled=False)` to keep crash
+> recovery off. See [CHANGELOG.md](../CHANGELOG.md) for the full migration
+> notes (including the v0.9.0 `heartbeat_timeout_ticks` / `max_hold_ticks`
+> retuning).
+
 ### Enabling
 
 ```python

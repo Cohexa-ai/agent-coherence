@@ -145,8 +145,24 @@ from ccs.coordinator.service import CrashRecoveryConfig  # noqa: E402
 
 
 def test_engine_uses_default_crash_recovery_config_when_block_absent() -> None:
-    engine = SimulationEngine(_scenario(), strategy_name="lazy", seed=5)
-    assert engine._crash_recovery == CrashRecoveryConfig()
+    """R2: omitting the YAML block must produce the v0.8.x default-disabled config
+    WITHOUT emitting the v0.8.3 bare-construction DeprecationWarning from the
+    library's own engine code path.
+    """
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        engine = SimulationEngine(_scenario(), strategy_name="lazy", seed=5)
+    deprecation_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_warnings == [], (
+        f"engine construction must not emit DeprecationWarning, got: "
+        f"{[str(w.message) for w in deprecation_warnings]}"
+    )
+    # Compare against explicit-False (not bare CrashRecoveryConfig()) so the
+    # comparison itself does not emit the warning.
+    assert engine._crash_recovery == CrashRecoveryConfig(enabled=False)
     assert engine._crash_recovery.enabled is False
 
 

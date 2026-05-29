@@ -1040,3 +1040,29 @@ def test_ccsstore_flag_off_heartbeat_noop() -> None:
 
     agent_id = store.core.agent_id_for("planner")
     assert store.core.registry.last_heartbeat_tick(agent_id) is None
+
+
+# ---- v0.8.3 C-flip Unit 2 — R2 internal-bare-construction hygiene ------------
+#
+# See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
+# Unit 2. The most-common adapter construction path (bare CCSStore() with no
+# crash_recovery= argument) traverses CoherenceAdapterCore.__init__ which used
+# to bare-construct CrashRecoveryConfig() — that emitted the v0.8.3
+# DeprecationWarning from inside library code, indistinguishable to users
+# from their own code. Test that the helper fix removed this.
+
+
+def test_bare_ccsstore_emits_no_deprecation_warning() -> None:
+    """R2: CCSStore() with no crash_recovery= must not surface the v0.8.3 warning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        store = CCSStore(strategy="lazy")
+    deprecation_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_warnings == [], (
+        f"bare CCSStore construction must not emit DeprecationWarning, got: "
+        f"{[str(w.message) for w in deprecation_warnings]}"
+    )
+    # And the v0.8.x default behavior is preserved.
+    assert store.core._crash_recovery.enabled is False
