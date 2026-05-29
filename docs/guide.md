@@ -33,10 +33,11 @@ full command-line toolset, and the API reference.
 13. [Real-workload benchmarks](#real-workload-benchmarks)
 14. [Benchmarking your own workload](#benchmarking-your-own-workload)
 15. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-16. [Command-line tools](#command-line-tools)
-17. [API reference](#api-reference)
-18. [Low-level adapter API](#low-level-adapter-api)
-19. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+16. [Replay (v0.8.2+)](#replay-v082)
+17. [Command-line tools](#command-line-tools)
+18. [API reference](#api-reference)
+19. [Low-level adapter API](#low-level-adapter-api)
+20. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
 
 ---
 
