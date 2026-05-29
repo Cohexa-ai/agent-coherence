@@ -6,11 +6,9 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-(No unreleased work beyond the v0.8.3 entry below, which is prepared on
-this branch but not yet tagged — it ships via the dev → main → tag-push
-release flow.)
+(Nothing yet.)
 
-## [0.8.3] — 2026-05-29
+## [0.8.3] — 2026-05-30
 
 **First behavioral default-flip in the library's history.** v0.8.3 is a
 deprecation-only release: it adds a one-shot `DeprecationWarning` to bare
