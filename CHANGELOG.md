@@ -51,17 +51,16 @@ for the underlying sweep semantics.
 
 ### Internal
 
-- `CrashRecoveryConfig.enabled` is now declared as
-  `field(default=_DEFAULT_ENABLED_SENTINEL)` so `__post_init__` can
-  distinguish bare construction from explicit `enabled=False`. The
-  dataclass remains `frozen=True`; normalization uses
-  `object.__setattr__`. Both the sentinel and the module-level
-  `_BARE_CONSTRUCTION_WARNED` flag are removed in v0.9.0.
-- New internal helper `_default_disabled_config()` in
-  `ccs.coordinator.service` lets library-internal code paths
-  (`ccs.simulation.engine`, `ccs.adapters.base`) construct the
-  v0.8.x default-disabled config object without surfacing the
-  deprecation warning to users. Removed in v0.9.0.
+- `CrashRecoveryConfig` distinguishes bare construction from explicit
+  `enabled=False` via a module-level sentinel default and a
+  `__post_init__` normalization step that uses `object.__setattr__` to
+  satisfy the `frozen=True` constraint. A module-level emit-once flag
+  ensures the deprecation warning fires at most once per process.
+  Both the sentinel mechanism and the flag are removed in v0.9.0.
+- A library-internal helper (in `ccs.coordinator.service`) lets
+  library code paths (`ccs.simulation.engine`, `ccs.adapters.base`)
+  construct the v0.8.x default-disabled config object without
+  surfacing the deprecation warning to users. Removed in v0.9.0.
 - Architecture-level regression gate
   (`tests/test_architecture.py::test_no_bare_crash_recovery_config_construction_in_src`)
   asserts no bare `CrashRecoveryConfig()` call sites exist in `src/`.

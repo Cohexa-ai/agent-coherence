@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from ccs.hardening.architecture import find_boundary_violations, find_cycles, run_architecture_checks
@@ -50,9 +51,6 @@ def test_boundary_violation_detection_reports_forbidden_edge() -> None:
 #
 # This entire test (and its helper) is REMOVED in v0.9.0 when the deprecation
 # warning is also removed and bare ``CrashRecoveryConfig()`` becomes safe again.
-
-
-import ast  # noqa: E402
 
 
 def _find_bare_crash_recovery_config_sites(src_root: Path) -> list[str]:

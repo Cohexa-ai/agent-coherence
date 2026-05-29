@@ -624,6 +624,12 @@ class TestCrashRecoveryDeprecationWarning:
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
             CrashRecoveryConfig()
+        # Length guard before indexing — without it, a regression that drops
+        # the warning emission entirely surfaces as IndexError instead of an
+        # informative AssertionError, masking the actual failure mode.
+        assert len(caught) >= 1, (
+            "bare CrashRecoveryConfig() must emit a warning; got 0 warnings"
+        )
         msg = str(caught[0].message)
         assert "enabled=True" in msg, "warning must name the recommended opt-in"
         assert "enabled=False" in msg, "warning must name the explicit opt-out"

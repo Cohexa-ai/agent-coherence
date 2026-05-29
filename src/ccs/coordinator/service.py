@@ -26,6 +26,18 @@ from .registry import ArtifactRegistry
 # Module-level sentinel distinguishes bare CrashRecoveryConfig() from
 # explicit CrashRecoveryConfig(enabled=False). Both the sentinel and the
 # emit-once flag are removed in v0.9.0 when the default flips to True.
+#
+# Test-isolation contract: ``_BARE_CONSTRUCTION_WARNED`` is module-level
+# mutable state that persists across pytest test functions in the same
+# process. Tests that assert on warning emission MUST reset it to ``False``
+# before the bare construction (either directly via
+# ``service._BARE_CONSTRUCTION_WARNED = False`` or via the
+# ``reset_bare_construction_flag`` pytest fixture in
+# ``tests/test_coordinator.py``). Without the reset, test ordering
+# determines whether the first test sees the warning and later tests do
+# not — a silent-degrade failure mode under pytest-xdist or randomized
+# ordering. The reset is paired with the flag's lifecycle by intent: this
+# whole block is removed in v0.9.0 along with the test fixture.
 _DEFAULT_ENABLED_SENTINEL: object = object()
 _BARE_CONSTRUCTION_WARNED: bool = False
 
@@ -73,7 +85,9 @@ class CrashRecoveryConfig:
                     "surface any false-reclaim issues under your workload. "
                     "If you have a specific reason to keep crash recovery "
                     "off, pass CrashRecoveryConfig(enabled=False) "
-                    "explicitly. See CHANGELOG v0.8.3 for migration details.",
+                    "explicitly. See CHANGELOG.md (section: [0.8.3]) at "
+                    "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md "
+                    "for migration details.",
                     DeprecationWarning,
                     stacklevel=3,
                 )
