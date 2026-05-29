@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -23,10 +24,42 @@ from .registry import ArtifactRegistry
 
 
 # v0.8.3 deprecation cycle — see docs/plans/2026-05-28-001-feat-c-flip-...
-# Module-level sentinel distinguishes bare CrashRecoveryConfig() from
-# explicit CrashRecoveryConfig(enabled=False). Both the sentinel and the
-# emit-once flag are removed in v0.9.0 when the default flips to True.
-#
+# A module-level sentinel distinguishes bare ``CrashRecoveryConfig()`` from
+# explicit ``CrashRecoveryConfig(enabled=False)``. The sentinel, the
+# emit-once flag, the lock, and the message constant are all removed in
+# v0.9.0 when the default flips to ``enabled=True``.
+
+
+class _DefaultEnabledSentinel:
+    """Falsy marker for an unspecified ``enabled`` in ``CrashRecoveryConfig``.
+
+    ``__post_init__`` uses identity (``is``) to detect bare construction and
+    normalize ``enabled`` to ``False``. The sentinel is deliberately *falsy*
+    so that on the rare paths where normalization is skipped, the value still
+    reads as disabled — matching the v0.8.x default and keeping the crash
+    recovery sweep from silently activating:
+
+    * ``importlib.reload`` (gunicorn/uvicorn ``--reload``, Jupyter autoreload)
+      re-executes this module in place, rebinding ``_DEFAULT_ENABLED_SENTINEL``
+      to a fresh instance. An instance of the *pre-reload* class still carries
+      the old sentinel as its field default, so the ``is`` check fails and
+      normalization is skipped (ce:review ADV-01).
+    * A subclass whose ``__post_init__`` overrides ours without calling
+      ``super().__post_init__()`` never normalizes at all (ce:review ADV-03).
+
+    In both cases ``bool(enabled)`` is ``False``, so production checks of the
+    form ``if self._crash_recovery.enabled:`` stay correct. Removed in v0.9.0.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "<CrashRecoveryConfig.enabled unset>"
+
+
 # Test-isolation contract: ``_BARE_CONSTRUCTION_WARNED`` is module-level
 # mutable state that persists across pytest test functions in the same
 # process. Tests that assert on warning emission MUST reset it to ``False``
@@ -38,8 +71,31 @@ from .registry import ArtifactRegistry
 # not — a silent-degrade failure mode under pytest-xdist or randomized
 # ordering. The reset is paired with the flag's lifecycle by intent: this
 # whole block is removed in v0.9.0 along with the test fixture.
-_DEFAULT_ENABLED_SENTINEL: object = object()
+#
+# ``_BARE_CONSTRUCTION_LOCK`` makes the check-then-set atomic so two threads
+# constructing bare configs concurrently cannot both emit. The GIL made the
+# naive check incidentally safe; free-threaded Python 3.13+ removes it. This
+# mirrors the ``threading.Lock`` pattern the plan's KD-4 specifies for the
+# v0.9.0 first-use guard (ce:review ADV-02).
+_DEFAULT_ENABLED_SENTINEL = _DefaultEnabledSentinel()
 _BARE_CONSTRUCTION_WARNED: bool = False
+_BARE_CONSTRUCTION_LOCK = threading.Lock()
+
+# Emitted on BOTH the warnings channel (visible under ``-W`` / pytest) and the
+# logging channel (visible under any ``logging.basicConfig()`` — the common
+# case CPython's default ``DeprecationWarning`` filter hides for non-__main__
+# importers). These are two of the three RM-9 belt-and-suspenders layers; the
+# third is the v0.9.0 transitional first-use warning. Removed in v0.9.0.
+_BARE_CONSTRUCTION_MESSAGE = (
+    "CrashRecoveryConfig() default will flip to `enabled=True` in v0.9.0. "
+    "Recommended migration: pass CrashRecoveryConfig(enabled=True) to opt in "
+    "now and surface any false-reclaim issues under your workload. If you "
+    "have a specific reason to keep crash recovery off, pass "
+    "CrashRecoveryConfig(enabled=False) explicitly. See CHANGELOG.md "
+    "(section: [0.8.3]) at "
+    "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md "
+    "for migration details."
+)
 
 
 @dataclass(frozen=True)
@@ -69,7 +125,7 @@ class CrashRecoveryConfig:
     max_hold_ticks: int = 1000
 
     def __post_init__(self) -> None:
-        """Detect bare construction; emit one-shot DeprecationWarning.
+        """Detect bare construction; emit the one-shot deprecation signal.
 
         The dataclass is ``frozen=True``, so we normalize the sentinel-typed
         ``enabled`` field via ``object.__setattr__`` (direct assignment would
@@ -77,21 +133,23 @@ class CrashRecoveryConfig:
         """
         global _BARE_CONSTRUCTION_WARNED
         if self.enabled is _DEFAULT_ENABLED_SENTINEL:
-            if not _BARE_CONSTRUCTION_WARNED:
+            # Claim the one-shot emission atomically under the lock, then emit
+            # OUTSIDE it: warning filters and logging handlers can run arbitrary
+            # user code, and we never hold the lock across that (ADV-02).
+            should_emit = False
+            with _BARE_CONSTRUCTION_LOCK:
+                if not _BARE_CONSTRUCTION_WARNED:
+                    _BARE_CONSTRUCTION_WARNED = True
+                    should_emit = True
+            if should_emit:
+                # logging first, so the migration signal is recorded even when
+                # ``-W error`` escalates the DeprecationWarning into a raise
+                # (and so it survives CPython's default filter — RM-9 Layer 2).
+                logger.warning(_BARE_CONSTRUCTION_MESSAGE)
+                # stacklevel=3: warn() -> __post_init__ -> __init__ -> caller.
                 warnings.warn(
-                    "CrashRecoveryConfig() default will flip to "
-                    "`enabled=True` in v0.9.0. Recommended migration: pass "
-                    "CrashRecoveryConfig(enabled=True) to opt in now and "
-                    "surface any false-reclaim issues under your workload. "
-                    "If you have a specific reason to keep crash recovery "
-                    "off, pass CrashRecoveryConfig(enabled=False) "
-                    "explicitly. See CHANGELOG.md (section: [0.8.3]) at "
-                    "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md "
-                    "for migration details.",
-                    DeprecationWarning,
-                    stacklevel=3,
+                    _BARE_CONSTRUCTION_MESSAGE, DeprecationWarning, stacklevel=3
                 )
-                _BARE_CONSTRUCTION_WARNED = True
             # frozen dataclass — direct assignment raises FrozenInstanceError.
             # object.__setattr__ is the documented escape for __post_init__
             # normalization on frozen dataclasses.

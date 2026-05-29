@@ -6,7 +6,9 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-(No unreleased work at the moment — v0.8.3 was tagged 2026-05-29.)
+(No unreleased work beyond the v0.8.3 entry below, which is prepared on
+this branch but not yet tagged — it ships via the dev → main → tag-push
+release flow.)
 
 ## [0.8.3] — 2026-05-29
 
@@ -52,11 +54,21 @@ for the underlying sweep semantics.
 ### Internal
 
 - `CrashRecoveryConfig` distinguishes bare construction from explicit
-  `enabled=False` via a module-level sentinel default and a
+  `enabled=False` via a *falsy* module-level sentinel default and a
   `__post_init__` normalization step that uses `object.__setattr__` to
-  satisfy the `frozen=True` constraint. A module-level emit-once flag
-  ensures the deprecation warning fires at most once per process.
-  Both the sentinel mechanism and the flag are removed in v0.9.0.
+  satisfy the `frozen=True` constraint. The sentinel is deliberately
+  falsy so that any path which skips normalization — `importlib.reload`
+  rebinding the module sentinel (gunicorn/uvicorn `--reload`, Jupyter
+  autoreload), or a subclass `__post_init__` that omits `super()` —
+  still reads as disabled rather than silently activating the sweep.
+- The deprecation signal fires at most once per process (a thread-safe
+  emit-once guard) on **two** channels: the `warnings` system *and* a
+  WARNING-level log record on the `ccs.coordinator.service` logger. The
+  second channel ensures the migration signal survives CPython's default
+  `DeprecationWarning` filter, which suppresses warnings raised from
+  non-`__main__` importers — i.e. virtually every SDK consumer. The
+  sentinel, the guard, and the dual-channel emit are all removed in
+  v0.9.0.
 - A library-internal helper (in `ccs.coordinator.service`) lets
   library code paths (`ccs.simulation.engine`, `ccs.adapters.base`)
   construct the v0.8.x default-disabled config object without

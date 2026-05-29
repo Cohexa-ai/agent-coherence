@@ -712,3 +712,169 @@ class TestCrashRecoveryDeprecationWarning:
         assert "frozen" in str(exc_info.value).lower() or "FrozenInstanceError" in type(
             exc_info.value
         ).__name__
+
+    # ---- RM-9 Layer 2: logging channel (ce:review AN-1) ---------------------
+
+    def test_bare_construction_logs_warning_on_service_logger(
+        self, reset_bare_construction_flag, caplog
+    ) -> None:
+        """RM-9 Layer 2: bare construction also logs a WARNING on
+        ``ccs.coordinator.service`` so the migration signal survives CPython's
+        default ``DeprecationWarning`` filter (which hides it for non-__main__
+        importers — i.e. virtually every SDK consumer).
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="ccs.coordinator.service"):
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore", DeprecationWarning)
+                CrashRecoveryConfig()
+        records = [
+            r
+            for r in caplog.records
+            if r.name == "ccs.coordinator.service" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 1, "bare construction must log exactly one WARNING"
+        message = records[0].getMessage()
+        assert "enabled=True" in message, "log must name the recommended opt-in"
+        assert "enabled=False" in message, "log must name the explicit opt-out"
+        assert "v0.9.0" in message, "log must name the target release"
+
+    def test_logger_channel_honors_emit_once(
+        self, reset_bare_construction_flag, caplog
+    ) -> None:
+        """The logging channel shares the emit-once gate with warnings.warn:
+        three bare constructions log exactly one WARNING."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="ccs.coordinator.service"):
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore", DeprecationWarning)
+                CrashRecoveryConfig()
+                CrashRecoveryConfig()
+                CrashRecoveryConfig()
+        records = [
+            r
+            for r in caplog.records
+            if r.name == "ccs.coordinator.service" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 1
+
+
+# ---- ce:review ADV-01 / ADV-03 — skipped-normalization robustness -----------
+#
+# The sentinel marking an unspecified ``enabled`` is falsy, so any path that
+# skips __post_init__ normalization (importlib.reload identity mismatch, or a
+# subclass __post_init__ that omits super()) still reads as disabled rather
+# than truthy-enabled. Removed in v0.9.0 with the rest of the sentinel
+# mechanism.
+
+from ccs.coordinator.service import _DefaultEnabledSentinel  # noqa: E402
+
+
+class TestSentinelNormalizationRobustness:
+    """ADV-01/ADV-03 — skipped normalization must read as disabled, not enabled."""
+
+    def test_sentinel_is_falsy(self) -> None:
+        """The unset-enabled sentinel evaluates falsy."""
+        assert bool(_service_module._DEFAULT_ENABLED_SENTINEL) is False
+        assert not _service_module._DEFAULT_ENABLED_SENTINEL
+
+    def test_subclass_post_init_override_without_super_reads_disabled(self) -> None:
+        """ADV-03: a frozen subclass overriding __post_init__ without calling
+        super() skips normalization — enabled stays the sentinel, which must be
+        falsy so ``if config.enabled:`` does not misfire the sweep.
+        """
+        from dataclasses import dataclass as _dataclass
+
+        @_dataclass(frozen=True)
+        class _NoSuperConfig(CrashRecoveryConfig):
+            def __post_init__(self) -> None:  # deliberately omits super()
+                pass
+
+        cfg = _NoSuperConfig()
+        # enabled is the un-normalized sentinel object, not a real bool ...
+        assert cfg.enabled is _service_module._DEFAULT_ENABLED_SENTINEL
+        # ... but it reads as disabled, which is what production checks rely on.
+        assert bool(cfg.enabled) is False
+        assert not cfg.enabled
+
+    def test_reload_identity_mismatch_reads_disabled(self) -> None:
+        """ADV-01: simulate importlib.reload rebinding the module sentinel. An
+        instance carrying a *different* (pre-reload) sentinel fails the ``is``
+        check, skips normalization, and must still read as disabled.
+        """
+        stale_sentinel = _DefaultEnabledSentinel()  # distinct identity
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            cfg = CrashRecoveryConfig(enabled=stale_sentinel)  # type: ignore[arg-type]
+        # Identity check fails → normalization skipped → enabled keeps the stale
+        # sentinel, and no warning fires (the bare path keys on the *current*
+        # module sentinel).
+        assert cfg.enabled is stale_sentinel
+        assert bool(cfg.enabled) is False
+        assert [w for w in caught if issubclass(w.category, DeprecationWarning)] == []
+
+
+# ---- ce:review ADV-02 — concurrent emit-once --------------------------------
+
+
+class TestConcurrentEmitOnce:
+    """ADV-02 — the lock keeps emit-once intact under thread contention."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_concurrent_bare_construction_emits_one_log(
+        self, reset_bare_construction_flag
+    ) -> None:
+        """Eight threads constructing bare configs simultaneously produce exactly
+        one WARNING log. Asserts via the logging channel (thread-safe by design)
+        rather than warnings.catch_warnings, which mutates global filter state and
+        is itself not thread-safe. The expected DeprecationWarning is filtered at
+        the mark (thread-safe) since this test cannot wrap workers in
+        catch_warnings; the log assertion is the real contract.
+        """
+        import logging
+        import threading
+
+        captured: list[logging.LogRecord] = []
+        capture_lock = threading.Lock()
+
+        class _CountingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                with capture_lock:
+                    captured.append(record)
+
+        svc_logger = logging.getLogger("ccs.coordinator.service")
+        handler = _CountingHandler()
+        handler.setLevel(logging.WARNING)
+        svc_logger.addHandler(handler)
+        previous_level = svc_logger.level
+        svc_logger.setLevel(logging.WARNING)
+
+        thread_count = 8
+        barrier = threading.Barrier(thread_count)
+
+        def worker() -> None:
+            barrier.wait()  # release all threads together to maximize contention
+            try:
+                CrashRecoveryConfig()
+            except DeprecationWarning:
+                # Under -W error the single emitting thread raises *after* the
+                # log record is emitted (logging precedes warnings.warn).
+                pass
+
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            svc_logger.removeHandler(handler)
+            svc_logger.setLevel(previous_level)
+
+        warning_records = [r for r in captured if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING across {thread_count} concurrent bare "
+            f"constructions, got {len(warning_records)}"
+        )
