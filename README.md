@@ -2,7 +2,7 @@
 
 **The coherence layer for multi-agent systems — vendor-neutral, framework-agnostic.**
 
-When two agents share state, one of them is usually reading a stale copy. `agent-coherence` makes that visible — and serves the fresh version on the next read instead of rebroadcasting the full artifact every turn. Same library, same protocol, across LangGraph, CrewAI, AutoGen, and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
+When agents share state, one of them is reading a stale copy. That stale read is how shared memory pollution starts — one agent's hallucination becomes a "fact" the next one reasons from, and a cascading error propagates downstream. `agent-coherence` makes that moment visible and serves the current version on the next read instead of rebroadcasting the full artifact every turn. Same library, same protocol, across LangGraph, CrewAI, AutoGen, and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
 
 [![CI](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml/badge.svg)](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agent-coherence)](https://pypi.org/project/agent-coherence/)
