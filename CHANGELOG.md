@@ -28,10 +28,8 @@ default-disabled behavior have two clear paths to silence the warning:
 - **Preserve current behavior**: pass `CrashRecoveryConfig(enabled=False)`
   explicitly. Crash recovery stays off; the warning stays silent.
 
-See [`docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md`](docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md)
-for the full two-release migration plan (v0.8.3 deprecation → v0.9.0 flip +
-sweep wiring) and [`docs/specs/crash-recovery.md`](docs/specs/crash-recovery.md)
-for the underlying sweep semantics.
+The migration lands across two releases: v0.8.3 ships this deprecation
+notice; v0.9.0 will flip the default and wire the crash-recovery sweep.
 
 ### Changed
 
@@ -46,8 +44,7 @@ for the underlying sweep semantics.
   validate against the longest inspectable strategy lease TTL via
   `validate_crash_recovery_config`. v0.9.0 will additionally retune
   `heartbeat_timeout_ticks` and `max_hold_ticks` from sim-anchor values
-  (10 / 1000) to batch-tick-realistic defaults (120 / 900) — see the
-  plan above for the calibration rationale.
+  (10 / 1000) to batch-tick-realistic defaults (120 / 900).
 
 ### Internal
 
@@ -382,14 +379,6 @@ Total: 1101 passing, 2 skipped, 2 launch_gate deselected by default.
 
 - **`pyproject.toml`** — registered `launch_gate` and `launch_gate_pilot`
   pytest markers; default `pytest -q` runs skip them via `addopts`.
-
-### Plan reference
-
-Full architectural rationale in
-[`docs/plans/2026-05-13-001-feat-claude-code-coherence-plugin-v0.1-plan.md`](docs/plans/2026-05-13-001-feat-claude-code-coherence-plugin-v0.1-plan.md)
-including Phase 0 buildability probes, KTD decisions (1-13), per-unit
-adversarial review findings, and operator deliverables for v0.1
-launch.
 
 ## [0.7.1] — 2026-05-13
 
