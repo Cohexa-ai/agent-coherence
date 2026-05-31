@@ -24,3 +24,6 @@ build/
 venv/
 .env
 benchmarks/results/latest.json
+
+# Q6 probe verdict output (may reference conversation metadata; local-only)
+examples/conversations_stale_read/*verdict*.json
