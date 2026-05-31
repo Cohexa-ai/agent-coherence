@@ -32,9 +32,11 @@ Requires ``OPENAI_API_KEY`` and/or ``MISTRAL_API_KEY`` in the environment and
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -45,6 +47,7 @@ STALE_READS_OBSERVED = "stale_reads_observed"  # pathology reproduces → procee
 NO_STALENESS_OBSERVED = "no_staleness_observed"  # failed to falsify → pivot consideration
 NO_TRIALS = "no_trials"  # nothing measured (empty input)
 SKIPPED = "skipped"  # key missing for this vendor
+ERROR = "error"  # vendor runner failed before producing any trial
 
 SCHEMA_VERSION = "ccs.q6probe.v1"
 
@@ -82,6 +85,7 @@ class VendorVerdict:
     verdict: str
     skipped: bool = False
     skip_reason: str | None = None
+    error: str | None = None  # set on total failure, or a "partial: N/M" note
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -135,10 +139,11 @@ def summarize_trials(vendor: str, trials: list[TrialResult]) -> VendorVerdict:
 def gate_decision(verdicts: list[VendorVerdict]) -> str:
     """Roll up per-vendor verdicts to the Phase-0 gate decision. Pure.
 
-    'proceed' if any non-skipped vendor reproduced the pathology; otherwise
-    'pivot' (consider the Session-cache layer per the plan's Q6 pivot table).
+    'proceed' if any vendor that produced a real measurement reproduced the
+    pathology; otherwise 'pivot' (consider the Session-cache layer per the
+    plan's Q6 pivot table). Skipped and errored vendors are not evidence.
     """
-    measured = [v for v in verdicts if not v.skipped]
+    measured = [v for v in verdicts if v.verdict in (STALE_READS_OBSERVED, NO_STALENESS_OBSERVED)]
     if not measured:
         return "pivot"
     return "proceed" if any(v.verdict == STALE_READS_OBSERVED for v in measured) else "pivot"
@@ -151,12 +156,40 @@ def _hash_content(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def run_openai_trials(n_trials: int) -> list[TrialResult]:
+_RECENT_WINDOW = 8  # how many most-recent messages B inspects for A's payload
+
+
+def _run_trials(
+    n_trials: int,
+    delay_ms: int,
+    append_and_read: Callable[[int], TrialResult],
+) -> list[TrialResult]:
+    """Drive ``n_trials`` of one vendor, preserving partial results on failure.
+
+    A per-trial exception (e.g., HTTP 429 token-rate-limit) stops the loop and
+    returns whatever completed, so one vendor's rate limit never discards
+    another vendor's data nor crashes the whole probe.
+    """
+    import time
+
+    results: list[TrialResult] = []
+    for i in range(n_trials):
+        try:
+            results.append(append_and_read(i))
+        except Exception as exc:  # noqa: BLE001 — partial-result preservation is the point
+            print(f"  trial {i} stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
+            break
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
+    return results
+
+
+def run_openai_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     """Q6a: measure OpenAI ``client.conversations`` cross-client consistency.
 
-    Deferred imports keep the module SDK-free at collection time. Written to the
-    documented 2.x ``client.conversations`` / ``client.conversations.items``
-    shape; exact field access is verified on the first live run (SDK is 2.x).
+    OpenAI Conversations is *passive* state: ``items.create`` stores the exact
+    item; a separate-client ``items.list`` should return it. Stale = B's read
+    does not yet contain A's just-ACK'd payload. Verified live (SDK 2.x).
     """
     import time
 
@@ -165,68 +198,68 @@ def run_openai_trials(n_trials: int) -> list[TrialResult]:
     writer = OpenAI()
     reader = OpenAI()  # separate client instance — no shared client-side cache
     conversation = writer.conversations.create()
-    results: list[TrialResult] = []
-    for i in range(n_trials):
+
+    def append_and_read(i: int) -> TrialResult:
         payload = f"q6a-trial-{i}-{_hash_content(str(i))[:8]}"
         expected = _hash_content(payload)
         writer.conversations.items.create(
             conversation.id,
             items=[{"type": "message", "role": "user", "content": payload}],
         )  # await ACK
-        results.append(_measure_convergence(lambda: _latest_openai_hash(reader, conversation.id), expected, time))
-    return results
+        return _measure_convergence(lambda: _openai_recent_hashes(reader, conversation.id), expected, time)
+
+    return _run_trials(n_trials, delay_ms, append_and_read)
 
 
-def _latest_openai_hash(reader: object, conversation_id: str) -> str | None:
-    page = reader.conversations.items.list(conversation_id, order="desc", limit=1)  # type: ignore[attr-defined]
-    items = list(page)
-    if not items:
-        return None
-    item = items[0]
-    text = _extract_text(item)
-    return _hash_content(text) if text is not None else None
+def _openai_recent_hashes(reader: object, conversation_id: str) -> set[str]:
+    page = reader.conversations.items.list(conversation_id, order="desc", limit=_RECENT_WINDOW)  # type: ignore[attr-defined]
+    return {_hash_content(t) for t in (_extract_text(item) for item in page) if t is not None}
 
 
-def run_mistral_trials(n_trials: int) -> list[TrialResult]:
+def run_mistral_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     """Q6b: measure Mistral ``client.beta.conversations`` cross-client consistency.
 
-    Mistral's ``start()`` actively runs a completion (vs OpenAI's passive state),
-    so the harness shares the *interface* (write-then-cross-client-read) but not
-    one code path — see the capability matrix in README.md. Field access verified
-    on first live run (SDK is 2.x, beta surface).
+    Mistral's ``start``/``append`` *actively run a completion* (vs OpenAI's
+    passive state), so each append yields [user:payload, assistant:reply] and the
+    latest message is the assistant reply — NOT A's input. We therefore test
+    membership: did B's read of the recent window contain A's user payload at
+    all. This is the active-vs-passive asymmetry the capability matrix records.
+
+    Because every append spends completion tokens, this vendor is token-rate
+    limited (HTTP 429); use a small ``delay_ms`` and a lower trial count. The
+    harness preserves partial results if the limit is still hit.
     """
     import time
 
-    from mistralai import Mistral  # deferred
+    from mistralai.client import Mistral  # deferred (2.4.x is a namespace pkg; class lives in .client)
 
     api_key = os.environ["MISTRAL_API_KEY"]
     writer = Mistral(api_key=api_key)
     reader = Mistral(api_key=api_key)
     conversation = writer.beta.conversations.start(model="mistral-small-latest", inputs="q6b-init")
-    results: list[TrialResult] = []
-    for i in range(n_trials):
+    cid = conversation.conversation_id
+
+    def append_and_read(i: int) -> TrialResult:
         payload = f"q6b-trial-{i}-{_hash_content(str(i))[:8]}"
         expected = _hash_content(payload)
-        writer.beta.conversations.append(conversation_id=conversation.conversation_id, inputs=payload)  # await ACK
-        results.append(
-            _measure_convergence(
-                lambda: _latest_mistral_hash(reader, conversation.conversation_id), expected, time
-            )
-        )
-    return results
+        writer.beta.conversations.append(conversation_id=cid, inputs=payload)  # await ACK (runs a completion)
+        return _measure_convergence(lambda: _mistral_recent_hashes(reader, cid), expected, time)
+
+    return _run_trials(n_trials, delay_ms, append_and_read)
 
 
-def _latest_mistral_hash(reader: object, conversation_id: str) -> str | None:
-    convo = reader.beta.conversations.get(conversation_id=conversation_id)  # type: ignore[attr-defined]
-    entries = getattr(convo, "entries", None) or getattr(convo, "outputs", None) or []
-    if not entries:
-        return None
-    text = _extract_text(entries[-1])
-    return _hash_content(text) if text is not None else None
+def _mistral_recent_hashes(reader: object, conversation_id: str) -> set[str]:
+    msgs = reader.beta.conversations.get_messages(conversation_id=conversation_id)  # type: ignore[attr-defined]
+    messages = getattr(msgs, "messages", None) or []
+    return {
+        _hash_content(t)
+        for t in (_extract_text(entry) for entry in messages[-_RECENT_WINDOW:])
+        if t is not None
+    }
 
 
 def _extract_text(item: object) -> str | None:
-    """Best-effort text extraction from a vendor item/entry (shape verified live)."""
+    """Best-effort text extraction from a vendor item/entry (shapes verified live)."""
     content = getattr(item, "content", None)
     if isinstance(content, str):
         return content
@@ -238,17 +271,20 @@ def _extract_text(item: object) -> str | None:
     return None
 
 
-def _measure_convergence(read_latest_hash: Callable[[], str | None], expected: str, time_mod: object) -> TrialResult:
-    """Read once; if stale, poll until convergence or timeout. Records latency."""
-    first = read_latest_hash()
-    if first == expected:
+def _measure_convergence(read_hashes: Callable[[], set[str]], expected: str, time_mod: object) -> TrialResult:
+    """Read once; if B has not seen A's payload, poll to convergence or timeout.
+
+    ``read_hashes`` returns the hash set of B's recent-window message contents;
+    ``expected`` is the hash of A's just-ACK'd payload. Membership-based so it is
+    correct for both passive (OpenAI) and active-completion (Mistral) vendors.
+    """
+    if expected in read_hashes():
         return TrialResult(observed_stale=False)
-    # Stale on first read — poll to convergence.
     start = time_mod.monotonic()  # type: ignore[attr-defined]
     deadline = start + _POLL_TIMEOUT_MS / 1000.0
     while time_mod.monotonic() < deadline:  # type: ignore[attr-defined]
         time_mod.sleep(_POLL_INTERVAL_MS / 1000.0)  # type: ignore[attr-defined]
-        if read_latest_hash() == expected:
+        if expected in read_hashes():
             return TrialResult(observed_stale=True, convergence_latency_ms=(time_mod.monotonic() - start) * 1000.0)  # type: ignore[attr-defined]
     return TrialResult(observed_stale=True, convergence_latency_ms=None)  # did not converge in window
 
@@ -261,26 +297,32 @@ _RUNNERS: dict[str, tuple[str, Callable[[int], list[TrialResult]]]] = {
 }
 
 
-def run_probe(vendors: list[str], n_trials: int) -> dict[str, object]:
-    """Run the probe for the requested vendors. Skips a vendor with no key."""
+def run_probe(vendors: list[str], n_trials: int, delay_ms: int = 0) -> dict[str, object]:
+    """Run the probe for the requested vendors.
+
+    Each vendor is isolated: a missing key skips it, and a runner exception
+    records an ``error`` verdict without discarding other vendors' results or
+    crashing the probe. A runner that returns fewer than ``n_trials`` results
+    (partial, e.g. a mid-run rate limit) is summarized over what completed with
+    a partial note attached.
+    """
     verdicts: list[VendorVerdict] = []
     for vendor in vendors:
         env_var, runner = _RUNNERS[vendor]
         if not os.environ.get(env_var):
             verdicts.append(
-                VendorVerdict(
-                    vendor=vendor,
-                    trials=0,
-                    observed_stale_count=0,
-                    p50_latency_ms=None,
-                    p99_latency_ms=None,
-                    verdict=SKIPPED,
-                    skipped=True,
-                    skip_reason=f"{env_var} not set",
-                )
+                VendorVerdict(vendor, 0, 0, None, None, SKIPPED, skipped=True, skip_reason=f"{env_var} not set")
             )
             continue
-        verdicts.append(summarize_trials(vendor, runner(n_trials)))
+        try:
+            results = runner(n_trials, delay_ms)
+        except Exception as exc:  # noqa: BLE001 — isolate one vendor's setup failure
+            verdicts.append(VendorVerdict(vendor, 0, 0, None, None, ERROR, error=f"{type(exc).__name__}: {exc}"))
+            continue
+        verdict = summarize_trials(vendor, results)
+        if results and len(results) < n_trials:
+            verdict = dataclasses.replace(verdict, error=f"partial: {len(results)}/{n_trials} trials before stop")
+        verdicts.append(verdict)
     return {
         "schema": SCHEMA_VERSION,
         "n_trials": n_trials,
@@ -294,10 +336,13 @@ def _format_summary(report: dict[str, object]) -> str:
     for vendor, v in report["vendors"].items():  # type: ignore[union-attr]
         if v["skipped"]:
             lines.append(f"  {vendor:8s} SKIPPED — {v['skip_reason']}")
+        elif v["verdict"] == ERROR:
+            lines.append(f"  {vendor:8s} ERROR — {v['error']}")
         else:
             lat = f"p50={v['p50_latency_ms']}ms p99={v['p99_latency_ms']}ms" if v["observed_stale_count"] else "n/a"
+            note = f"  [{v['error']}]" if v["error"] else ""
             lines.append(
-                f"  {vendor:8s} {v['verdict']:22s} stale={v['observed_stale_count']}/{v['trials']} {lat}"
+                f"  {vendor:8s} {v['verdict']:22s} stale={v['observed_stale_count']}/{v['trials']} {lat}{note}"
             )
     lines += ["", f"  GATE: {report['gate']}  ('proceed' = pathology reproduces; 'pivot' = Session-cache layer)"]
     return "\n".join(lines)
@@ -307,6 +352,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Q6 OpenAI/Mistral Conversations consistency probe.")
     parser.add_argument("--vendor", choices=("openai", "mistral", "both"), default="both")
     parser.add_argument("--trials", type=int, default=100)
+    parser.add_argument(
+        "--delay-ms",
+        type=int,
+        default=0,
+        help="Inter-trial delay (ms). Use for token-rate-limited vendors like Mistral.",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -326,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No probe ran — set at least one of: {names}")
         return 2
 
-    report = run_probe(vendors, args.trials)
+    report = run_probe(vendors, args.trials, args.delay_ms)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True))
     print(_format_summary(report))
     print(f"\nVerdict written to {args.out}")

@@ -26,7 +26,7 @@ venv/
 benchmarks/results/latest.json
 
 # Q6 probe verdict output (may reference conversation metadata; local-only)
-examples/conversations_stale_read/*verdict*.json
+examples/conversations_stale_read/q6_*.json
 
 # 1Password secret-reference working copy (per-user vault/item names)
 .env.op

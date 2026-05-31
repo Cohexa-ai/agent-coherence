@@ -23,12 +23,26 @@ from examples.conversations_stale_read.probe import (
     STALE_READS_OBSERVED,
     TrialResult,
     VendorVerdict,
+    _measure_convergence,
     _percentile,
     gate_decision,
     main,
     run_probe,
     summarize_trials,
 )
+
+
+class _FakeTime:
+    """Deterministic monotonic clock; sleep advances virtual time, no real wait."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
 
 
 # --- summarize_trials ------------------------------------------------------
@@ -93,6 +107,33 @@ def test_percentile_nearest_rank():
 def test_percentile_rejects_out_of_range():
     with pytest.raises(ValueError):
         _percentile([1.0], 150.0)
+
+
+# --- _measure_convergence (membership-based, pure with injected clock) ------
+
+
+def test_measure_convergence_not_stale_when_payload_present_immediately():
+    result = _measure_convergence(lambda: {"abc", "def"}, "abc", _FakeTime())
+    assert result.observed_stale is False
+    assert result.convergence_latency_ms is None
+
+
+def test_measure_convergence_stale_then_converges_records_latency():
+    calls = {"n": 0}
+
+    def read_hashes() -> set[str]:
+        calls["n"] += 1
+        return {"target"} if calls["n"] >= 3 else set()  # absent on reads 1-2, present on 3
+
+    result = _measure_convergence(read_hashes, "target", _FakeTime())
+    assert result.observed_stale is True
+    assert result.convergence_latency_ms is not None and result.convergence_latency_ms > 0
+
+
+def test_measure_convergence_never_converges_returns_none_latency():
+    result = _measure_convergence(lambda: {"other"}, "target", _FakeTime())
+    assert result.observed_stale is True
+    assert result.convergence_latency_ms is None  # timed out without seeing payload
 
 
 # --- gate_decision ---------------------------------------------------------
@@ -165,7 +206,7 @@ def test_main_writes_verdict_with_injected_runner(monkeypatch, tmp_path):
     # persists a verdict whose gate reflects the (synthetic) stale observation.
     from examples.conversations_stale_read import probe as probe_mod
 
-    def fake_openai_runner(n_trials: int) -> list[TrialResult]:
+    def fake_openai_runner(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
         return [TrialResult(observed_stale=True, convergence_latency_ms=75.0) for _ in range(n_trials)]
 
     monkeypatch.setitem(probe_mod._RUNNERS, "openai", ("OPENAI_API_KEY", fake_openai_runner))
@@ -177,3 +218,41 @@ def test_main_writes_verdict_with_injected_runner(monkeypatch, tmp_path):
     assert written["vendors"]["openai"]["verdict"] == STALE_READS_OBSERVED
     assert written["vendors"]["openai"]["observed_stale_count"] == 5
     assert written["gate"] == "proceed"
+
+
+def test_run_probe_isolates_a_vendor_runner_failure(monkeypatch):
+    # One vendor raising must not discard the other vendor's results nor crash.
+    from examples.conversations_stale_read import probe as probe_mod
+
+    def good_runner(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
+        return [TrialResult(observed_stale=False) for _ in range(n_trials)]
+
+    def boom_runner(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
+        raise RuntimeError("conversation create failed")
+
+    monkeypatch.setitem(probe_mod._RUNNERS, "openai", ("OPENAI_API_KEY", good_runner))
+    monkeypatch.setitem(probe_mod._RUNNERS, "mistral", ("MISTRAL_API_KEY", boom_runner))
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
+    monkeypatch.setenv("MISTRAL_API_KEY", "x")
+    report = run_probe(["openai", "mistral"], n_trials=4)
+    assert report["vendors"]["openai"]["verdict"] == NO_STALENESS_OBSERVED  # preserved
+    assert report["vendors"]["mistral"]["verdict"] == "error"
+    assert "conversation create failed" in report["vendors"]["mistral"]["error"]
+    assert report["gate"] == "pivot"  # errored vendor is not evidence
+
+
+def test_run_probe_marks_partial_results(monkeypatch):
+    # A runner returning fewer than n_trials (mid-run rate limit) is summarized
+    # over what completed, with a partial note — not dropped.
+    from examples.conversations_stale_read import probe as probe_mod
+
+    def partial_runner(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
+        return [TrialResult(observed_stale=False) for _ in range(3)]  # only 3 of n
+
+    monkeypatch.setitem(probe_mod._RUNNERS, "openai", ("OPENAI_API_KEY", partial_runner))
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
+    report = run_probe(["openai"], n_trials=100)
+    v = report["vendors"]["openai"]
+    assert v["trials"] == 3
+    assert v["verdict"] == NO_STALENESS_OBSERVED
+    assert v["error"] == "partial: 3/100 trials before stop"
