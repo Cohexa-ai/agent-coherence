@@ -30,3 +30,6 @@ examples/conversations_stale_read/q6_*.json
 
 # 1Password secret-reference working copy (per-user vault/item names)
 .env.op
+
+# Claude Code coherence plugin local coordinator state (contains hook.secret, state.db)
+.coherence/
