@@ -26,7 +26,6 @@ import subprocess
 import sys
 import textwrap
 
-
 _AUDIT_HARNESS = textwrap.dedent(
     """
     import os

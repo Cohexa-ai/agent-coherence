@@ -49,6 +49,10 @@ from ccs.replay.errors import (
     ReplayTraceError,
     SessionDirectoryNotFoundError,
 )
+from ccs.replay.formatters import (
+    emit_human,
+    emit_json,
+)
 from ccs.replay.loader import (
     LoadedTrace,
     ManifestMissingOrUnreadableError,
@@ -66,10 +70,6 @@ from ccs.replay.predicates import (
     StaleReadPredicate,
     SummaryFinding,
     run_predicates,
-)
-from ccs.replay.formatters import (
-    emit_human,
-    emit_json,
 )
 from ccs.replay.recorder import (
     RecordingSession,

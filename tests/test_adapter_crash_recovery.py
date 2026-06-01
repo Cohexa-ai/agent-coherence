@@ -13,7 +13,6 @@ from __future__ import annotations
 import pytest
 
 from ccs.adapters.autogen import AutoGenAdapter
-from ccs.adapters.base import CoherenceAdapterCore
 from ccs.adapters.crewai import CrewAIAdapter
 from ccs.adapters.langgraph import LangGraphAdapter
 from ccs.coordinator.service import CrashRecoveryConfig
@@ -258,8 +257,9 @@ class TestCCSStoreParity:
 
     def test_ccsstore_oom_kill(self) -> None:
         pytest.importorskip("langgraph.store.base")
+        from langgraph.store.base import PutOp
+
         from ccs.adapters.ccsstore import CCSStore
-        from langgraph.store.base import GetOp, PutOp
 
         store = CCSStore(
             strategy="lazy",

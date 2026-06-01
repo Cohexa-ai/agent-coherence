@@ -13,7 +13,6 @@ from __future__ import annotations
 from examples.conversations_stale_read.broken import run_broken
 from examples.conversations_stale_read.fixed import run_fixed
 
-
 # --- broken case (no coherence) --------------------------------------------
 
 

@@ -1,8 +1,9 @@
 """Tests for CCSStore inline benchmark mode (R9)."""
 from __future__ import annotations
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 pytest.importorskip("langgraph.store.base")
 
@@ -11,7 +12,6 @@ from langgraph.store.base import GetOp, PutOp
 from ccs.adapters.ccsstore import CCSStore
 from ccs.adapters.events import StoreMetricEvent
 from ccs.core.exceptions import CoherenceError
-
 
 # ---------------------------------------------------------------------------
 # Helpers

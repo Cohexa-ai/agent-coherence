@@ -15,7 +15,6 @@ parent. This test re-creates that scenario locally via ``git worktree add``.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 

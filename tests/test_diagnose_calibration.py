@@ -44,7 +44,6 @@ from ccs.diagnose.detection import detect
 from ccs.diagnose.telemetry import CURRENT_POLICY_VERSION, ConsentState
 from ccs.validation import validate_log
 
-
 # -------------------------------------------------------------------- #
 # Fixtures
 # -------------------------------------------------------------------- #

@@ -18,7 +18,6 @@ from typing import Any
 import pytest
 
 from tests.protocol_corpus.harness import (
-    ALL_BACKENDS,
     BACKEND_NODE,
     Fixture,
     load_fixtures,
@@ -26,7 +25,6 @@ from tests.protocol_corpus.harness import (
     resolve_node_dist_path,
     run_scenario,
 )
-
 
 pytestmark = pytest.mark.protocol_corpus
 

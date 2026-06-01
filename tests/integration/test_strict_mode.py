@@ -45,7 +45,6 @@ from ccs.adapters.claude_code.hook_payloads import (
     emit_allow,
 )
 
-
 # ----------------------------------------------------------------------
 # Test plumbing — mirrors tests/test_claude_code_coordinator_server.py
 # ----------------------------------------------------------------------

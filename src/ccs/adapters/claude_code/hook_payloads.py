@@ -40,7 +40,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Literal, NotRequired, TypedDict
 
-
 # ----------------------------------------------------------------------
 # v0.2 strict-mode helpers — KTD-P (static deny text), KTD-U (terminal
 # denial invariant)

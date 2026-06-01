@@ -21,8 +21,6 @@ These tests verify three orthogonal failure-prevention paths:
 from __future__ import annotations
 
 import shutil
-import subprocess
-from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -36,7 +34,6 @@ pytest.importorskip("langgraph.graph")
 
 from ccs.adapters.ccsstore import CCSStore, StoreMetricEvent
 from ccs.core.states import MESIState
-
 from examples.refactor_demo.executor import EXECUTOR_AGENT
 from examples.refactor_demo.main import (
     FIXTURE_REPO_TS,

@@ -6,13 +6,20 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 
 import pytest
+from diagnose_helpers import (
+    hash_value as _hash,
+)
+from diagnose_helpers import (
+    ids_for as _ids_for,
+)
+from diagnose_helpers import (
+    make_event as _make_event,
+)
 
-from ccs.core.identity import artifact_uuid
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
-from ccs.diagnose.callback import DEFAULT_SCOPE, DiagnoseEvent
+from ccs.diagnose.callback import DiagnoseEvent
 from ccs.diagnose.classifier import (
     Bucket,
     ClassifierVerdict,
@@ -20,21 +27,8 @@ from ccs.diagnose.classifier import (
     CoverageReport,
 )
 from ccs.diagnose.detection import (
-    DetectionReport,
-    DivergenceEvent,
-    ExclusionPanel,
-    HeatmapRow,
-    ReadObservation,
-    ReaderPairCount,
     build_report_json,
     detect,
-)
-
-from diagnose_helpers import (
-    INSTANCE_ID as _INSTANCE_ID,
-    hash_value as _hash,
-    ids_for as _ids_for,
-    make_event as _make_event,
 )
 
 

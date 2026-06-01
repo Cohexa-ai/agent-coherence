@@ -18,7 +18,6 @@ import pytest
 from ccs.cli import coherence_migrate_rules
 from ccs.cli.coherence_migrate_rules import detect_rules
 
-
 # ----------------------------------------------------------------------
 # Fixtures
 # ----------------------------------------------------------------------
@@ -275,7 +274,8 @@ def test_adv007_concurrent_apply_creates_lock_sidecar(tmp_path: Path) -> None:
     settings.local.json in fcntl.flock on a sidecar lock file so two
     operators invoking --apply simultaneously don't lose each other's
     edits. After --apply, the sidecar lock file must exist."""
-    import sys as _sys, builtins as _builtins
+    import builtins as _builtins
+    import sys as _sys
     # Pre-seed a workspace with a CLAUDE.md that triggers a deny entry.
     (tmp_path / ".git").mkdir()
     (tmp_path / "CLAUDE.md").write_text(
@@ -325,7 +325,9 @@ def test_adv007_concurrent_apply_no_lost_entries(tmp_path: Path) -> None:
     )
 
     def run_apply(yes: bool = True) -> int:
-        import sys as _s, io as _io, builtins as _b
+        import builtins as _b
+        import io as _io
+        import sys as _s
         _b.input = lambda *_a, **_k: "y"
         class _FakeTty(_io.StringIO):
             def isatty(self) -> bool: return True

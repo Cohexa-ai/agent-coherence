@@ -6,17 +6,15 @@
 from __future__ import annotations
 
 import json
-from uuid import uuid4, UUID
+import re
+from uuid import UUID, uuid4
 
 import pytest
 
-import re
-
-from ccs.coordinator.registry import ArtifactRegistry, CCS_STATE_LOG_SCHEMA_VERSION
+from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION, ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, FetchRequest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -389,8 +387,9 @@ def test_tick_values_propagate_to_log_entries() -> None:
 
 pytest.importorskip("langgraph.store.base")
 
-from ccs.adapters.ccsstore import CCSStore  # noqa: E402
 from langgraph.store.base import GetOp, PutOp  # noqa: E402
+
+from ccs.adapters.ccsstore import CCSStore  # noqa: E402
 
 
 def _ccs_put(store: CCSStore, namespace: tuple, key: str, value: dict) -> None:

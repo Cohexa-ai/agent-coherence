@@ -8,17 +8,17 @@ from __future__ import annotations
 import json
 import warnings
 from typing import Any
+from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
-from unittest.mock import patch
 
 pytest.importorskip("langgraph.store.base")
 
+from langgraph.store.base import GetOp, PutOp, SearchOp
+
 from ccs.adapters.ccsstore import CCSStore, StoreMetricEvent
 from ccs.core.states import MESIState
-from langgraph.store.base import GetOp, ListNamespacesOp, MatchCondition, PutOp, SearchOp
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -561,7 +561,6 @@ def test_ccsstore_telemetry_none_has_noop() -> None:
 
 
 def test_ccsstore_telemetry_exporter_receives_put_event() -> None:
-    from unittest.mock import MagicMock
     from ccs.adapters.telemetry import TelemetryExporter
 
     class CapturingExporter(TelemetryExporter):
@@ -638,6 +637,7 @@ def test_on_error_strict_is_default() -> None:
 
 def test_on_error_strict_reraises_coherence_error_on_get() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="strict")
@@ -649,6 +649,7 @@ def test_on_error_strict_reraises_coherence_error_on_get() -> None:
 
 def test_on_error_strict_reraises_coherence_error_on_put() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="strict")
@@ -659,6 +660,7 @@ def test_on_error_strict_reraises_coherence_error_on_put() -> None:
 
 def test_on_error_degrade_put_emits_degraded_event() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     events: list[StoreMetricEvent] = []
@@ -670,6 +672,7 @@ def test_on_error_degrade_put_emits_degraded_event() -> None:
 
 def test_on_error_degrade_get_emits_degraded_event() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     events: list[StoreMetricEvent] = []
@@ -683,6 +686,7 @@ def test_on_error_degrade_get_emits_degraded_event() -> None:
 
 def test_on_error_degrade_get_returns_fallback_value() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
@@ -698,6 +702,7 @@ def test_on_error_degrade_get_returns_fallback_value() -> None:
 
 def test_on_error_degrade_does_not_raise_on_coherence_error() -> None:
     from unittest.mock import patch
+
     from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
@@ -719,8 +724,9 @@ def test_is_degraded_false_before_any_error() -> None:
 
 
 def test_is_degraded_true_after_degraded_get() -> None:
-    from ccs.core.exceptions import CoherenceError
     import warnings
+
+    from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
     _put(store, ("planner", "shared"), "plan", {"v": 1})
@@ -732,8 +738,9 @@ def test_is_degraded_true_after_degraded_get() -> None:
 
 
 def test_is_degraded_true_after_degraded_put() -> None:
-    from ccs.core.exceptions import CoherenceError
     import warnings
+
+    from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
     with warnings.catch_warnings():
@@ -744,8 +751,9 @@ def test_is_degraded_true_after_degraded_put() -> None:
 
 
 def test_degradation_count_increments_per_error() -> None:
-    from ccs.core.exceptions import CoherenceError
     import warnings
+
+    from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
     _put(store, ("planner", "shared"), "plan", {"v": 1})
@@ -758,8 +766,8 @@ def test_degradation_count_increments_per_error() -> None:
 
 
 def test_degraded_warning_emitted_on_first_degradation() -> None:
-    from ccs.core.exceptions import CoherenceError
     from ccs.adapters.ccsstore import CoherenceDegradedWarning
+    from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
     _put(store, ("planner", "shared"), "plan", {"v": 1})
@@ -769,9 +777,10 @@ def test_degraded_warning_emitted_on_first_degradation() -> None:
 
 
 def test_degraded_warning_not_emitted_on_second_degradation() -> None:
-    from ccs.core.exceptions import CoherenceError
-    from ccs.adapters.ccsstore import CoherenceDegradedWarning
     import warnings
+
+    from ccs.adapters.ccsstore import CoherenceDegradedWarning
+    from ccs.core.exceptions import CoherenceError
 
     store = _store(on_error="degrade")
     _put(store, ("planner", "shared"), "plan", {"v": 1})
@@ -799,8 +808,8 @@ def test_coherence_degraded_warning_importable_from_adapters() -> None:
 # ---------------------------------------------------------------------------
 
 def test_schema_version_constants_importable() -> None:
-    from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
     from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION
+    from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
     assert CCS_STATE_LOG_SCHEMA_VERSION == "ccs.state_log.v2"
     assert CCS_METRIC_SCHEMA_VERSION == "ccs.metric.v1"
 
@@ -900,7 +909,8 @@ def test_search_hit_increments_metric_seq_per_result() -> None:
 def test_out_of_sequence_event_produces_gap_in_validate_log(tmp_path) -> None:
     """An event with sequence_number=0 triggers Gap(expected=1, found=0)."""
     import json
-    from ccs.validation import validate_log, Gap
+
+    from ccs.validation import Gap, validate_log
     bad_line = {
         "sequence_number": 0,
         "instance_id": "some-id",
@@ -916,6 +926,7 @@ def test_out_of_sequence_event_produces_gap_in_validate_log(tmp_path) -> None:
 def test_none_sequence_number_raises_value_error(tmp_path) -> None:
     """StoreMetricEvent with default None sequence_number raises ValueError in validate_log."""
     import json
+
     from ccs.validation import validate_log
     bad_line = {
         "sequence_number": None,

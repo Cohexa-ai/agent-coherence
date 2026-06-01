@@ -24,6 +24,8 @@ from .langgraph_v0_preview import (
     Confidence,
     CoverageReport,
     build_key_index,
+)
+from .langgraph_v0_preview import (
     classify as _classify_langgraph_v0_preview,
 )
 
@@ -48,7 +50,6 @@ __all__ = [
 # callers that want explicit attribute access (matches the `selector.py`
 # strategy lookup convention).
 from . import langgraph_v0_preview  # noqa: E402  (positioned for re-export)
-
 
 DEFAULT_CLASSIFIER_NAME: str = "langgraph-v0-preview"
 

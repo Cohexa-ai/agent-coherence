@@ -22,7 +22,6 @@ from ccs.adapters.openai_agents import (
     OpenAIAgentsAdapter,
 )
 from ccs.core.exceptions import CoherenceError
-from ccs.core.states import MESIState
 
 
 class FakeSession:

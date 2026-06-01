@@ -39,7 +39,6 @@ from ccs.diagnose.callback import (  # noqa: E402
     UnsupportedExecutionModelError,
 )
 
-
 # -----------------------------------------------------------------------
 # Synthetic graph helpers
 # -----------------------------------------------------------------------
