@@ -33,7 +33,7 @@ __all__ = [
 _EXPORTS: dict[str, tuple[str, str]] = {
     "AutoGenAdapter": (".autogen", "AutoGenAdapter"),
     "CCSStore": (".ccsstore", "CCSStore"),
-    "CoherenceDegradedWarning": (".ccsstore", "CoherenceDegradedWarning"),
+    "CoherenceDegradedWarning": (".base", "CoherenceDegradedWarning"),
     "CoherenceAdapterCore": (".base", "CoherenceAdapterCore"),
     "CoherenceSession": (".openai_agents", "CoherenceSession"),
     "CrewAIAdapter": (".crewai", "CrewAIAdapter"),

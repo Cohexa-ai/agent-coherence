@@ -23,13 +23,29 @@ from examples.conversations_stale_read.probe import (
     STALE_READS_OBSERVED,
     TrialResult,
     VendorVerdict,
+    _extract_text,
     _measure_convergence,
     _percentile,
+    _scrub,
     gate_decision,
     main,
     run_probe,
     summarize_trials,
 )
+
+
+class _Block:
+    """Stand-in for a vendor content block with a ``.text`` attribute."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _Item:
+    """Stand-in for a vendor message/item with a ``.content`` attribute."""
+
+    def __init__(self, content):
+        self.content = content
 
 
 class _FakeTime:
@@ -91,6 +107,43 @@ def test_summarize_trials_ignores_none_latencies_in_percentiles():
     assert verdict.p99_latency_ms == 200.0
 
 
+# --- _extract_text (membership-hash input; 4 branches) ----------------------
+
+
+def test_extract_text_string_content():
+    assert _extract_text(_Item("hello")) == "hello"
+
+
+def test_extract_text_list_of_blocks_returns_first_text():
+    assert _extract_text(_Item([_Block("hi"), _Block("ignored")])) == "hi"
+
+
+def test_extract_text_list_block_with_none_text_returns_none():
+    assert _extract_text(_Item([_Block(None)])) is None
+
+
+def test_extract_text_empty_list_returns_none():
+    assert _extract_text(_Item([])) is None
+
+
+def test_extract_text_no_content_attr_returns_none():
+    assert _extract_text(object()) is None
+
+
+# --- _scrub (no key material leaks into stderr/verdict error strings) --------
+
+
+def test_scrub_redacts_openai_project_key():
+    msg = "401 invalid api key sk-proj-ABCdef123456789 try again"
+    scrubbed = _scrub(msg)
+    assert "sk-proj-ABCdef123456789" not in scrubbed
+    assert "<redacted>" in scrubbed
+
+
+def test_scrub_leaves_clean_messages_intact():
+    assert _scrub("Status 429. Token rate limit reached.") == "Status 429. Token rate limit reached."
+
+
 # --- _percentile -----------------------------------------------------------
 
 
@@ -100,6 +153,7 @@ def test_percentile_empty_returns_none():
 
 def test_percentile_nearest_rank():
     values = [10.0, 20.0, 30.0, 40.0, 50.0]
+    assert _percentile(values, 0.0) == 10.0
     assert _percentile(values, 50.0) == 30.0
     assert _percentile(values, 100.0) == 50.0
 

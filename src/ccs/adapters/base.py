@@ -19,9 +19,12 @@ from ccs.coordinator.service import (
     _default_disabled_config,
     validate_crash_recovery_config,
 )
+from ccs.core.exceptions import CoherenceDegradedWarning  # re-exported; langgraph-free export point
 from ccs.core.types import Artifact, FetchResponse
 from ccs.strategies.base import SyncStrategy
 from ccs.strategies.selector import build_strategy
+
+__all__ = ["AgentBinding", "CoherenceAdapterCore", "CoherenceDegradedWarning"]
 
 logger = logging.getLogger(__name__)
 

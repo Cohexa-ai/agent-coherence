@@ -36,10 +36,29 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Protocol
+
+
+class _Clock(Protocol):
+    """Minimal clock surface used by ``_measure_convergence`` (real ``time`` or a fake)."""
+
+    def monotonic(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+
+# Redacts vendor key-like tokens (e.g. ``sk-proj-...``) from any error string before
+# it is printed or persisted, so a stray auth-error body can't echo key material.
+_KEY_TOKEN = re.compile(r"\b(sk-[A-Za-z0-9_\-]{6,}|[A-Za-z0-9_\-]{0,4}\*{2,}[A-Za-z0-9_\-]{2,})\b")
+
+
+def _scrub(message: str) -> str:
+    return _KEY_TOKEN.sub("<redacted>", message)
 
 # --- Verdict vocabulary (epistemically honest) -----------------------------
 
@@ -170,14 +189,12 @@ def _run_trials(
     returns whatever completed, so one vendor's rate limit never discards
     another vendor's data nor crashes the whole probe.
     """
-    import time
-
     results: list[TrialResult] = []
     for i in range(n_trials):
         try:
             results.append(append_and_read(i))
         except Exception as exc:  # noqa: BLE001 — partial-result preservation is the point
-            print(f"  trial {i} stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"  trial {i} stopped: {type(exc).__name__}: {_scrub(str(exc))}", file=sys.stderr)
             break
         if delay_ms:
             time.sleep(delay_ms / 1000.0)
@@ -191,9 +208,7 @@ def run_openai_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     item; a separate-client ``items.list`` should return it. Stale = B's read
     does not yet contain A's just-ACK'd payload. Verified live (SDK 2.x).
     """
-    import time
-
-    from openai import OpenAI  # deferred
+    from openai import OpenAI  # deferred (third-party SDK; keep out of module-load path)
 
     writer = OpenAI()
     reader = OpenAI()  # separate client instance — no shared client-side cache
@@ -211,8 +226,8 @@ def run_openai_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     return _run_trials(n_trials, delay_ms, append_and_read)
 
 
-def _openai_recent_hashes(reader: object, conversation_id: str) -> set[str]:
-    page = reader.conversations.items.list(conversation_id, order="desc", limit=_RECENT_WINDOW)  # type: ignore[attr-defined]
+def _openai_recent_hashes(reader: Any, conversation_id: str) -> set[str]:
+    page = reader.conversations.items.list(conversation_id, order="desc", limit=_RECENT_WINDOW)
     return {_hash_content(t) for t in (_extract_text(item) for item in page) if t is not None}
 
 
@@ -229,8 +244,6 @@ def run_mistral_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     limited (HTTP 429); use a small ``delay_ms`` and a lower trial count. The
     harness preserves partial results if the limit is still hit.
     """
-    import time
-
     from mistralai.client import Mistral  # deferred (2.4.x is a namespace pkg; class lives in .client)
 
     api_key = os.environ["MISTRAL_API_KEY"]
@@ -248,8 +261,8 @@ def run_mistral_trials(n_trials: int, delay_ms: int = 0) -> list[TrialResult]:
     return _run_trials(n_trials, delay_ms, append_and_read)
 
 
-def _mistral_recent_hashes(reader: object, conversation_id: str) -> set[str]:
-    msgs = reader.beta.conversations.get_messages(conversation_id=conversation_id)  # type: ignore[attr-defined]
+def _mistral_recent_hashes(reader: Any, conversation_id: str) -> set[str]:
+    msgs = reader.beta.conversations.get_messages(conversation_id=conversation_id)
     messages = getattr(msgs, "messages", None) or []
     return {
         _hash_content(t)
@@ -271,7 +284,7 @@ def _extract_text(item: object) -> str | None:
     return None
 
 
-def _measure_convergence(read_hashes: Callable[[], set[str]], expected: str, time_mod: object) -> TrialResult:
+def _measure_convergence(read_hashes: Callable[[], set[str]], expected: str, clock: _Clock) -> TrialResult:
     """Read once; if B has not seen A's payload, poll to convergence or timeout.
 
     ``read_hashes`` returns the hash set of B's recent-window message contents;
@@ -280,18 +293,18 @@ def _measure_convergence(read_hashes: Callable[[], set[str]], expected: str, tim
     """
     if expected in read_hashes():
         return TrialResult(observed_stale=False)
-    start = time_mod.monotonic()  # type: ignore[attr-defined]
+    start = clock.monotonic()
     deadline = start + _POLL_TIMEOUT_MS / 1000.0
-    while time_mod.monotonic() < deadline:  # type: ignore[attr-defined]
-        time_mod.sleep(_POLL_INTERVAL_MS / 1000.0)  # type: ignore[attr-defined]
+    while clock.monotonic() < deadline:
+        clock.sleep(_POLL_INTERVAL_MS / 1000.0)
         if expected in read_hashes():
-            return TrialResult(observed_stale=True, convergence_latency_ms=(time_mod.monotonic() - start) * 1000.0)  # type: ignore[attr-defined]
+            return TrialResult(observed_stale=True, convergence_latency_ms=(clock.monotonic() - start) * 1000.0)
     return TrialResult(observed_stale=True, convergence_latency_ms=None)  # did not converge in window
 
 
 # --- Orchestration ---------------------------------------------------------
 
-_RUNNERS: dict[str, tuple[str, Callable[[int], list[TrialResult]]]] = {
+_RUNNERS: dict[str, tuple[str, Callable[[int, int], list[TrialResult]]]] = {
     "openai": ("OPENAI_API_KEY", run_openai_trials),
     "mistral": ("MISTRAL_API_KEY", run_mistral_trials),
 }
@@ -317,10 +330,14 @@ def run_probe(vendors: list[str], n_trials: int, delay_ms: int = 0) -> dict[str,
         try:
             results = runner(n_trials, delay_ms)
         except Exception as exc:  # noqa: BLE001 — isolate one vendor's setup failure
-            verdicts.append(VendorVerdict(vendor, 0, 0, None, None, ERROR, error=f"{type(exc).__name__}: {exc}"))
+            verdicts.append(
+                VendorVerdict(vendor, 0, 0, None, None, ERROR, error=f"{type(exc).__name__}: {_scrub(str(exc))}")
+            )
             continue
         verdict = summarize_trials(vendor, results)
-        if results and len(results) < n_trials:
+        if len(results) < n_trials:
+            # Covers a partial run AND a zero-result run (first trial failed): the
+            # verdict carries an explicit note instead of looking like "never asked".
             verdict = dataclasses.replace(verdict, error=f"partial: {len(results)}/{n_trials} trials before stop")
         verdicts.append(verdict)
     return {

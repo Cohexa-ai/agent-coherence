@@ -129,6 +129,14 @@ def test_first_read_before_any_write_is_not_stale():
     assert asyncio.run(scenario()) is False
 
 
+def test_peer_mutated_is_true_before_any_read_baseline():
+    # Conservative contract: with no baseline read, the only safe answer is "read first".
+    adapter = OpenAIAgentsAdapter()
+    store: dict[str, list] = {}
+    b = adapter.wrap_session(FakeSession(store, "conv-1"), agent_name="b", session_id="conv-1")
+    assert b.peer_mutated_since_read() is True  # never called get_items yet
+
+
 # --- degrade contract ------------------------------------------------------
 
 
@@ -162,6 +170,69 @@ def test_degrade_mode_swallows_and_warns_once_but_underlying_write_persists():
     assert items == [{"x": 1}, {"y": 2}]
     assert adapter.is_degraded is True
     assert adapter.degradation_count == 2
+
+
+# --- shared-warning identity (regression for the dual-class export bug) ------
+
+
+def test_degraded_warning_is_catchable_via_package_export():
+    # `from ccs.adapters import CoherenceDegradedWarning` must catch what THIS
+    # adapter emits — both resolve to the canonical ccs.core.exceptions class.
+    import ccs.adapters as adapters_pkg
+
+    assert adapters_pkg.CoherenceDegradedWarning is CoherenceDegradedWarning
+    adapter = OpenAIAgentsAdapter(on_error="degrade")
+    store: dict[str, list] = {}
+    a = adapter.wrap_session(FakeSession(store, "c"), agent_name="a", session_id="c")
+
+    async def scenario():
+        with patch.object(adapter.core, "write", side_effect=CoherenceError("boom")):
+            with pytest.warns(adapters_pkg.CoherenceDegradedWarning):  # package-level class
+                await a.add_items([{"x": 1}])
+
+    asyncio.run(scenario())
+
+
+# --- degrade/strict on the read path (get_items) ----------------------------
+
+
+def test_strict_mode_reraises_on_read_failure():
+    adapter = OpenAIAgentsAdapter(on_error="strict")
+    store: dict[str, list] = {}
+    a = adapter.wrap_session(FakeSession(store, "c"), agent_name="a", session_id="c")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("read boom")):
+            with pytest.raises(CoherenceError):
+                await a.get_items()
+
+    asyncio.run(scenario())
+
+
+def test_degrade_mode_swallows_read_failure_and_still_returns_items():
+    adapter = OpenAIAgentsAdapter(on_error="degrade")
+    store: dict[str, list] = {"c": [{"x": 1}]}
+    a = adapter.wrap_session(FakeSession(store, "c"), agent_name="a", session_id="c")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("read boom")):
+            with pytest.warns(CoherenceDegradedWarning):
+                items = await a.get_items()  # coherence degraded, underlying read still served
+        return items
+
+    assert asyncio.run(scenario()) == [{"x": 1}]
+
+
+# --- crash-recovery passthrough parity --------------------------------------
+
+
+def test_heartbeat_and_recover_passthrough_are_noops_when_disabled():
+    # Parity with the other adapters: forward to core; no-op heartbeat when crash
+    # recovery is disabled, recover always flushes the local cache.
+    adapter = OpenAIAgentsAdapter()
+    adapter.register_agent("a")
+    adapter.heartbeat(agent_name="a", now_tick=1)  # must not raise
+    adapter.recover(agent_name="a", now_tick=2)  # must not raise
 
 
 # --- integration: real SQLiteSession ---------------------------------------
