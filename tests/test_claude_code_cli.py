@@ -242,6 +242,52 @@ def test_status_renders_table_against_live_coordinator(
     )
 
 
+def test_render_table_keeps_version_on_same_line_as_long_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: a long tracked path used to pad every row past the screen
+    edge, soft-wrapping the version onto its own line ("number below the
+    filename"). Each row must now fit the terminal — long paths middle-elide,
+    the version stays inline — and a legend must explain the version column."""
+    monkeypatch.setenv("COLUMNS", "80")
+    long_path = (
+        ".claude/worktrees/feat_crash_recovery/docs/plans/"
+        "2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md"
+    )
+    payload = {
+        "tracked_artifacts": [
+            {"path": "plan.md", "version": 2},
+            {"path": long_path, "version": 13},
+        ],
+        "sessions": [],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    out = capsys.readouterr().out
+
+    # Legend describes what the version column means.
+    assert "version = artifact revision" in out
+    assert "committed edit" in out
+
+    lines = out.splitlines()
+    # No row exceeds the terminal width → nothing soft-wraps.
+    assert all(len(line) <= 80 for line in lines), [l for l in lines if len(l) > 80]
+
+    # The long path is middle-elided but its filename tail survives, and its
+    # version sits on the SAME line (not orphaned below it).
+    long_row = next(line for line in lines if line.rstrip().endswith("13"))
+    assert "…" in long_row
+    assert "plan.md" in long_row
+
+    # The short path keeps its version inline too.
+    short_row = next(
+        line for line in lines
+        if line.strip().startswith("plan.md") and line.rstrip().endswith("2")
+    )
+    assert short_row  # found
+
+
 def test_status_json_mode_emits_raw_payload(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
