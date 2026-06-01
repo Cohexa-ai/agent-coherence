@@ -53,7 +53,6 @@ import os
 import re
 import socket
 import subprocess
-import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -61,7 +60,6 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"

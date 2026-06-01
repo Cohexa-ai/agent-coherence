@@ -31,7 +31,6 @@ import pytest
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 
-
 GRAPH_PATH = (
     Path(__file__).resolve().parent.parent
     / "examples"

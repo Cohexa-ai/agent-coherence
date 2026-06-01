@@ -29,7 +29,6 @@ import pytest
 
 from ccs.cli.coherence_replay import main as replay_main
 
-
 # ---------------------------------------------------------------------------
 # Helpers — minimal fixture builders (mirror the trace-format spec §3 + §4)
 # ---------------------------------------------------------------------------
@@ -320,10 +319,12 @@ def test_e2e_real_langgraph_capture_and_replay(
     pytest.importorskip("langgraph.graph")
     pytest.importorskip("langgraph.config")
 
-    from ccs.adapters.ccsstore import CCSStore
+    from typing import TypedDict
+
     from langgraph.config import get_store as lg_get_store
     from langgraph.graph import END, START, StateGraph
-    from typing import TypedDict
+
+    from ccs.adapters.ccsstore import CCSStore
 
     class GraphState(TypedDict):
         log: list[str]

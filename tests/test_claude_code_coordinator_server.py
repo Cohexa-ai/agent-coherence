@@ -24,14 +24,11 @@ import pytest
 
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
-    CoordinatorHTTPServer,
-    HANDLER_TIMEOUT_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
+    CoordinatorHTTPServer,
     session_to_agent_id,
 )
-from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.core.states import MESIState
-
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
 # Sessions now must be UUIDs (A3 validation); tests use this to keep label
@@ -746,8 +743,9 @@ def test_a1_orphan_notices_evicted_after_ttl(coordinator) -> None:
     eventually evicted to bound state growth. Registry exposes
     evict_stale_notices(max_age_sec) for the lifecycle sweep."""
     import time
+
     # Create a notice manually with an old timestamp
-    from uuid import UUID, uuid4
+    from uuid import uuid4
     victim = uuid4()
     preempter = uuid4()
     # Need an artifact_id that exists (FK)
@@ -781,6 +779,7 @@ def test_a1_upsert_uses_wall_clock_not_commit_order(coordinator) -> None:
     Z commits later at clock=99 (out-of-order), the row stays at Y's
     record (later wall-clock)."""
     from uuid import uuid4
+
     from ccs.core.types import Artifact
     victim = uuid4()
     art = Artifact(id=uuid4(), name="upsert-test.md", version=1, content_hash="h")
@@ -899,7 +898,9 @@ def test_secret_file_mode_is_0600_atomically(tmp_path: Path) -> None:
     no mode-0644 window between write and chmod. Exercises ensure_secret
     directly to avoid the HTTPServer.shutdown deadlock when serve_in_thread
     was never called."""
-    import os, stat
+    import os
+    import stat
+
     from ccs.adapters.claude_code.auth import ensure_secret
 
     token = ensure_secret(tmp_path)
@@ -1200,8 +1201,8 @@ def test_status_includes_watchdog_counters_zeroed_at_startup(client: _Client) ->
 def test_a6_watchdog_timeout_increments_counter(coordinator, client: _Client) -> None:
     """A6 — handler timeout / sweep deadlock: when FuturesTimeout fires in
     _run_or_degrade, watchdog_timeouts_total increments and /status reflects it."""
-    from unittest.mock import patch
     from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
 
     with patch.object(coordinator, "run_with_watchdog", side_effect=FuturesTimeout()):
         status, body = client.post("/hooks/pre-read",
@@ -1242,9 +1243,9 @@ def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> Non
     pool size, this test will fail loudly so the operator confirms the
     new concurrency cap is intentional."""
     from ccs.adapters.claude_code.coordinator_server import (
+        _WATCHDOG_POOL_SIZE,
         HANDLER_CONCURRENCY_LIMIT,
         WATCHDOG_QUEUE_LIMIT,
-        _WATCHDOG_POOL_SIZE,
     )
 
     assert _WATCHDOG_POOL_SIZE == 4
@@ -1416,8 +1417,9 @@ def test_r21_request_body_overflow_returns_413(coordinator) -> None:
     memory — protects against single-request OOM by a hostile or buggy
     client inside the trust boundary."""
     import http.client
-    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
+
     from ccs.adapters.claude_code.auth import load_secret
+    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
 
     secret = load_secret(coordinator.coordinator_root)
     assert secret is not None
@@ -1452,8 +1454,8 @@ def test_r21_request_body_overflow_returns_413(coordinator) -> None:
 def test_r21_body_at_cap_accepted(coordinator) -> None:
     """Boundary: a body at exactly MAX_REQUEST_BODY_BYTES (still well
     over our real payload sizes) is accepted, not 413'd off."""
-    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
     from ccs.adapters.claude_code.auth import load_secret
+    from ccs.adapters.claude_code.coordinator_server import MAX_REQUEST_BODY_BYTES
 
     secret = load_secret(coordinator.coordinator_root)
     assert secret is not None
@@ -1858,6 +1860,7 @@ def test_r11_ensure_secret_recovers_from_empty_file_during_retries(
     letting ensure_secret retry through to a clean O_EXCL after we
     unlink it from a sidecar 'racer' thread."""
     import threading as _t
+
     from ccs.adapters.claude_code import auth as _auth
 
     coherence_dir = tmp_path / ".coherence"
@@ -2633,7 +2636,6 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     """pre-edit's wire contract is {ok: bool}; degraded envelope on
     watchdog timeout must include ok=True so clients reading
     result.get('ok') don't see None. AC-05 fix."""
-    import ccs.adapters.claude_code.coordinator_server as mod
     from concurrent.futures import TimeoutError as FuturesTimeout
 
     def force_timeout(fn):

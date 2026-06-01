@@ -25,7 +25,6 @@ from tests.protocol_corpus.harness import (
     run_scenario,
 )
 
-
 pytestmark = pytest.mark.protocol_corpus
 
 

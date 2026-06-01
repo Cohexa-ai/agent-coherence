@@ -46,7 +46,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.calibration import (
     append_calibration_entry,
     calibration_path,

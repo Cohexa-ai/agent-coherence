@@ -13,8 +13,6 @@ from langgraph.store.base import GetOp, PutOp, SearchOp
 
 from ccs.adapters.ccsstore import CCSStore
 from ccs.agent.runtime import CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
-from ccs.core.hashing import compute_content_hash
-
 
 # ---------------------------------------------------------------------------
 # Unit 6: CCSStore → CoherenceAdapterCore → AgentRuntime wiring

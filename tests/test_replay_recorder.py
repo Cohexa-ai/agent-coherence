@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -33,9 +34,7 @@ from ccs.replay.recorder import (
     DEFAULT_STREAMS,
     SCHEMA_NOTE,
     SCHEMA_VERSION,
-    _STATE_LOG,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test fixtures
@@ -589,8 +588,9 @@ class TestCCSStoreRecordTo:
     def test_caller_state_log_composes(self, tmp_path: Path) -> None:
         """Caller-supplied state_log callback composes with the file
         writer — both fire, neither is overridden."""
-        from ccs.adapters.ccsstore import CCSStore
         from langgraph.store.base import PutOp
+
+        from ccs.adapters.ccsstore import CCSStore
 
         captured: list[dict] = []
         session_dir = tmp_path / "session"

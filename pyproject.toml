@@ -63,7 +63,7 @@ agent-coherence-replay = "ccs.cli.coherence_replay:main"
 # `python tools/check_release_readiness.py`. Maintainers run the same path.
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
 langgraph = ["langgraph>=0.2"]
 crewai = ["crewai>=0.80"]
 # `opentelemetry-api` is the runtime dep (the OtelExporter no-ops without an
@@ -118,3 +118,12 @@ where = ["src"]
 Homepage = "https://github.com/hipvlady/agent-coherence"
 Repository = "https://github.com/hipvlady/agent-coherence"
 Issues = "https://github.com/hipvlady/agent-coherence/issues"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402", "E501", "E701", "E702", "E741", "F841"]

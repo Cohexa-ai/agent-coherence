@@ -10,14 +10,14 @@ from uuid import uuid4
 import pytest
 
 from ccs.core.states import MESIState
+from ccs.simulation.engine import SimulationEngine
+from ccs.simulation.scenarios import load_scenario
 from ccs.strategies.access_count import AccessCountStrategy
 from ccs.strategies.broadcast import BroadcastStrategy
 from ccs.strategies.eager import EagerStrategy
 from ccs.strategies.lazy import LazyStrategy
 from ccs.strategies.lease import LeaseStrategy
 from ccs.strategies.selector import build_strategy, select_strategy_name_for_role
-from ccs.simulation.engine import SimulationEngine
-from ccs.simulation.scenarios import load_scenario
 
 
 def test_eager_broadcasts_full_content_and_has_zero_staleness_bound() -> None:

@@ -10,14 +10,13 @@ import pytest
 # env without `opentelemetry-sdk` (e.g. a bare `[dev]` install).
 pytest.importorskip("opentelemetry.sdk")
 
+from langgraph.store.base import GetOp, PutOp
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from ccs.adapters.ccsstore import CCSStore
 from ccs.adapters.events import StoreMetricEvent
 from ccs.adapters.telemetry.otel import OtelExporter
-from langgraph.store.base import GetOp, PutOp
-
 
 # ---------------------------------------------------------------------------
 # Helpers

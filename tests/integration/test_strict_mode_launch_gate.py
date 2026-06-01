@@ -40,14 +40,19 @@ import shutil
 import subprocess
 import tempfile
 import time
-import uuid
-import yaml
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
+
+from ccs.adapters.claude_code.lifecycle import (
+    LifecycleConfig,
+    ensure_coordinator,
+    stop_coordinator,
+)
 
 # Reuse the warn-mode launch-gate plumbing where possible — the workspace
 # build, coordinator spawn, seed-coordinator-state, and bin resolution
@@ -59,15 +64,8 @@ from tests.integration.test_warn_mode_behavior_change import (
     _build_workspace,
     _claude_available,
     _plugin_dir_available,
-    _resolve_bin,
     _seed_coordinator_state,
 )
-from ccs.adapters.claude_code.lifecycle import (
-    LifecycleConfig,
-    ensure_coordinator,
-    stop_coordinator,
-)
-
 
 SCENARIO_FILE = Path(__file__).parent / "scenarios" / "strict_mode_behaviors.yaml"
 

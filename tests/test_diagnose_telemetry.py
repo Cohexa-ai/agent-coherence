@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import stat
 import threading
 import uuid
@@ -37,7 +36,7 @@ import pytest
 
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.classifier import ClassifierVerdict, classify
-from ccs.diagnose.detection import detect, DetectionReport
+from ccs.diagnose.detection import DetectionReport, detect
 from ccs.diagnose.telemetry import (
     CONSENT_FILE_NAME,
     CURRENT_POLICY_VERSION,
@@ -54,7 +53,6 @@ from ccs.diagnose.telemetry import (
     resolve_consent,
     save_consent,
 )
-
 
 # -------------------------------------------------------------------- #
 # Fixtures
@@ -829,6 +827,7 @@ def test_detect_stack_handles_missing_package(
 ) -> None:
     """When importlib.metadata raises PackageNotFoundError, fall back to the marker."""
     from importlib.metadata import PackageNotFoundError
+
     import ccs.diagnose.telemetry as telemetry_mod
 
     def _fake_version(name: str) -> str:

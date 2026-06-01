@@ -37,8 +37,8 @@ from ccs.diagnose.detection import (
     DivergenceEvent,
     ExclusionPanel,
     HeatmapRow,
-    ReadObservation,
     ReaderPairCount,
+    ReadObservation,
 )
 from ccs.diagnose.ownership import OwnershipRow
 from ccs.diagnose.render import (
@@ -48,7 +48,6 @@ from ccs.diagnose.render import (
     render_html,
     render_to_string,
 )
-
 
 # -------------------------------------------------------------------- #
 # Helpers

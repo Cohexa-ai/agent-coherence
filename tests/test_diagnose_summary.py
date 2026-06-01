@@ -38,7 +38,6 @@ from ccs.diagnose.detection import (
 )
 from ccs.diagnose.summary import terminal_summary
 
-
 # -------------------------------------------------------------------- #
 # Builder helpers — keep tests terse; no production side effects
 # -------------------------------------------------------------------- #

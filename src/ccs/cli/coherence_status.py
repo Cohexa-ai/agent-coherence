@@ -24,7 +24,6 @@ they reach a real agent session.
 from __future__ import annotations
 
 import argparse
-import sys
 import urllib.error
 from pathlib import Path
 from typing import Any, Sequence
@@ -163,8 +162,9 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     ``agent-coherence-status --self-test``") gives the operator an
     actionable error rather than a stack trace.
     """
-    from ccs.cli._coherence_client import post as _post
     import uuid as _uuid
+
+    from ccs.cli._coherence_client import post as _post
 
     try:
         endpoint = resolve_endpoint(root)

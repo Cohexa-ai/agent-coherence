@@ -9,29 +9,26 @@ the 10-process race integration test that gives Unit 5 its main signal.
 
 from __future__ import annotations
 
-import errno
-import fcntl
-import json
 import multiprocessing as mp
 import os
 import socket
 import time
-import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import pytest
 
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
-    read_port_from_file as _read_port_from_file,
     connect_or_spawn,
     ensure_coordinator,
     stop_coordinator,
 )
-
+from ccs.adapters.claude_code.lifecycle import (
+    read_port_from_file as _read_port_from_file,
+)
 
 # ----------------------------------------------------------------------
 # Fixtures
@@ -333,9 +330,12 @@ def _race_worker(args: tuple) -> tuple[int, int]:
     """Subprocess worker for the race test: call ensure_coordinator and
     return (pid, port). Run at module top-level for picklability."""
     from pathlib import Path as _P
+
+    from ccs.adapters.claude_code.lifecycle import (
+        LifecycleConfig as _C,
+    )
     from ccs.adapters.claude_code.lifecycle import (
         ensure_coordinator as _ec,
-        LifecycleConfig as _C,
     )
     workspace_str, = args
     cfg = _C(
@@ -827,6 +827,7 @@ def test_kp7_wait_for_shutdown_returns_true_after_stop(tmp_path, fast_cfg):
     """End-to-end: spawn → stop in background → wait_for_shutdown
     returns True once shutdown_done flips."""
     import threading as _t
+
     from ccs.adapters.claude_code.lifecycle import (
         ensure_coordinator,
         stop_coordinator,

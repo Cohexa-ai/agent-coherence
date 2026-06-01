@@ -5,11 +5,10 @@
 
 from __future__ import annotations
 
-import logging
 import warnings
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
-from uuid import NAMESPACE_URL, uuid5
 
 from ccs.adapters.autogen import AutoGenAdapter
 from ccs.adapters.base import CoherenceAdapterCore

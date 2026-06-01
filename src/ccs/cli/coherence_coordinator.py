@@ -48,11 +48,15 @@ from pathlib import Path
 from typing import Sequence
 
 from ccs.adapters.claude_code.lifecycle import (
-    read_port_from_file as _read_port_from_file,
-    tcp_probe as _tcp_probe,
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
+)
+from ccs.adapters.claude_code.lifecycle import (
+    read_port_from_file as _read_port_from_file,
+)
+from ccs.adapters.claude_code.lifecycle import (
+    tcp_probe as _tcp_probe,
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import err
@@ -162,12 +166,15 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
     to script as a pre-switch step that may or may not find a live
     coordinator), 2 on any error reaching the coordinator.
     """
+    import urllib.error as _urlerr
+
     from ccs.cli._coherence_client import (
         CoordinatorUnavailable,
-        post as _post,
         resolve_endpoint,
     )
-    import urllib.error as _urlerr
+    from ccs.cli._coherence_client import (
+        post as _post,
+    )
 
     pid_file = root / ".coherence" / "server.pid"
     if not pid_file.exists():
@@ -249,7 +256,6 @@ def _run_daemonized(root: Path) -> int:
     # The wait blocks until idle-shutdown completes, stop_coordinator
     # fires, or the shutdown sequence aborts.
     from ccs.adapters.claude_code.lifecycle import (
-        stop_coordinator,
         wait_for_shutdown,
     )
     try:

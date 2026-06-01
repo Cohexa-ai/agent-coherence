@@ -9,6 +9,12 @@ import uuid
 from collections.abc import Mapping
 
 import pytest
+from diagnose_helpers import (
+    ids_for as _ids_for,
+)
+from diagnose_helpers import (
+    make_event as _make_event,
+)
 
 from ccs.core.identity import artifact_uuid
 from ccs.diagnose.callback import DEFAULT_SCOPE, DiagnoseEvent, DiagnoseWarning
@@ -20,13 +26,6 @@ from ccs.diagnose.classifier import (
     build_key_index,
     classify,
     select_classifier,
-)
-
-from diagnose_helpers import (
-    INSTANCE_ID as _INSTANCE_ID,
-    hash_value as _hash,
-    ids_for as _ids_for,
-    make_event as _make_event,
 )
 
 

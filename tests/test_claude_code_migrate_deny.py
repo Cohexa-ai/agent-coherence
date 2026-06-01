@@ -24,15 +24,11 @@ Covers (per plan test scenarios):
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-from ccs.adapters.claude_code.migrate_deny import detect_deny_entries, main
-
+from ccs.adapters.claude_code.migrate_deny import main
 
 # ----------------------------------------------------------------------
 # Fixtures

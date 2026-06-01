@@ -16,7 +16,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import sys
 import urllib.error
 from pathlib import Path
 from typing import Sequence

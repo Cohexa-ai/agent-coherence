@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
 import threading
 import time
@@ -41,7 +40,6 @@ from ccs.adapters.claude_code.coordinator_server import (
     STRICT_DENY_ROUTE_AROUND_WINDOW_SEC,
     CoordinatorHTTPServer,
 )
-
 
 # ----------------------------------------------------------------------
 # Shared test plumbing — mirrors tests/integration/test_strict_mode.py
