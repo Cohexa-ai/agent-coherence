@@ -24,6 +24,7 @@ they reach a real agent session.
 from __future__ import annotations
 
 import argparse
+import shutil
 import urllib.error
 from pathlib import Path
 from typing import Any, Sequence
@@ -277,6 +278,25 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     return 0
 
 
+def _terminal_columns() -> int:
+    """Best-effort terminal width. Honors ``COLUMNS``; falls back to 80 when
+    stdout is not a tty (the common case when this runs under an agent's shell
+    tool), so rows never exceed the narrowest mainstream terminal."""
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+
+def _elide_middle(text: str, max_len: int) -> str:
+    """Shorten *text* to *max_len* columns with a middle ellipsis so a path's
+    top-level dir (head) and filename (tail) both stay visible. Keeping the
+    whole row within the terminal width is what stops the version column from
+    soft-wrapping onto its own line."""
+    if max_len <= 1 or len(text) <= max_len:
+        return text
+    keep = max_len - 1  # one column for the ellipsis
+    head = keep // 2
+    return f"{text[:head]}…{text[-(keep - head):]}"
+
+
 def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
     """Manual column alignment — stdlib only, no rich/tabulate."""
     tracked = payload.get("tracked_artifacts", [])
@@ -329,11 +349,25 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             print("No tracked artifacts (policy is empty).")
     else:
         print("Observed artifacts:")
-        path_w = max(len("path"), max(len(a.get("path", "")) for a in tracked))
-        print(f"  {'path':<{path_w}}  {'version':>7}")
-        print(f"  {'-' * path_w}  {'-' * 7}")
+        # Legend: the version column is opaque without it (the original report
+        # was "what does the number mean?"). It's the artifact's coherence
+        # revision — that's what stale-read detection compares against.
+        print("  version = artifact revision: starts at 1, +1 on every committed edit")
+        print("  (a read is flagged stale when its version is behind the current one)")
+        print()
+        ver_w = len("version")
+        # Cap the path column to the terminal so long paths get middle-elided
+        # instead of padding every row past the screen edge — which is what
+        # soft-wrapped the version onto the next line. ``+1`` is a safety column.
+        chrome = 2 + 2 + ver_w + 1
+        max_path_w = max(len("path"), _terminal_columns() - chrome)
+        longest = max(len(a.get("path", "")) for a in tracked)
+        path_w = min(longest, max_path_w)
+        print(f"  {'path':<{path_w}}  {'version':>{ver_w}}")
+        print(f"  {'-' * path_w}  {'-' * ver_w}")
         for a in tracked:
-            print(f"  {a.get('path', ''):<{path_w}}  {a.get('version', 0):>7}")
+            label = _elide_middle(a.get("path", ""), path_w)
+            print(f"  {label:<{path_w}}  {a.get('version', 0):>{ver_w}}")
     print()
 
     if show_policy:
@@ -362,9 +396,14 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             if not per_artifact:
                 print("    (no held grants)")
                 continue
-            path_w = max(len(p) for p in per_artifact)
+            # Same elision as the artifacts table so a long held path can't
+            # push the MESI state column off-screen onto a wrapped line.
+            state_w = max(len(s) for s in per_artifact.values())
+            chrome = 4 + 2 + state_w + 1
+            max_path_w = max(1, _terminal_columns() - chrome)
+            path_w = min(max(len(p) for p in per_artifact), max_path_w)
             for path, state in sorted(per_artifact.items()):
-                print(f"    {path:<{path_w}}  {state}")
+                print(f"    {_elide_middle(path, path_w):<{path_w}}  {state}")
 
     # KTD-J (Unit 8): counters section. Only printed when the payload
     # actually carries counter data — the minimal tier strips them.
