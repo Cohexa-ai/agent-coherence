@@ -74,7 +74,14 @@ otel = ["opentelemetry-api>=1.0", "opentelemetry-sdk>=1.0"]
 langsmith = ["langsmith>=0.1"]
 benchmark = ["langchain-core>=0.2"]
 diagnose = ["agent-coherence[langgraph]", "jinja2>=3.1", "langchain-core>=0.2"]
-all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose]"]
+# OpenAI stack: `openai` carries the Conversations client + raw httpx for the
+# demo broken case; `openai-agents` (pinned <0.18 — 0.x surface churns) is the
+# Phase-2 adapter dep and composes the `openai` extra. `mistral` is the second
+# Conversations vendor for the stale-read demo/probe.
+openai = ["openai>=2.0", "httpx>=0.27"]
+openai-agents = ["agent-coherence[openai]", "openai-agents>=0.17,<0.18"]
+mistral = ["mistralai>=2.0"]
+all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -90,11 +97,12 @@ markers = [
     "launch_gate_strict: v0.2 Unit 5 multi-model strict-mode launch gate (10 scenarios × {haiku, sonnet, opus} × 2 consecutive runs). Requires live claude CLI; ~$8-13/cycle × 2 = ~$16-26 per full gate run. Operator runs once consecutively before tagging v0.2.0. Run via `pytest -m launch_gate_strict`.",
     "launch_gate_pilot_matrix: v0.2 Unit 5 per-PR cheap pilot (1 scenario × {haiku, sonnet, opus}). Requires live claude CLI; ~$0.50 per run. Run via `pytest -m launch_gate_pilot_matrix`.",
     "protocol_corpus: v0.2 Unit 7 cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
+    "live_api: OpenAI/Mistral Conversations live-API tests (Q6 probe + adapter smoke). Requires OPENAI_API_KEY and/or MISTRAL_API_KEY and the `[openai,mistral]` extras; ~$10 per full probe run. Excluded from default `pytest -q`. Run via `pytest -m live_api`.",
 ]
-# Skip launch_gate + protocol_corpus markers in default unit test runs. The
-# protocol corpus has a Node-build prerequisite and a multi-second spawn cost
-# per fixture; keep it opt-in to avoid penalizing the normal `pytest -q` loop.
-addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus'"
+# Skip launch_gate + protocol_corpus + live_api markers in default unit test
+# runs. live_api makes paid network calls and needs credentials; keep it opt-in
+# so the normal `pytest -q` loop stays fast, offline, and free.
+addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus and not live_api'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

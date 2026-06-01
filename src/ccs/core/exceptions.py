@@ -10,6 +10,15 @@ class CoherenceError(Exception):
     """Base error for coherence domain failures."""
 
 
+class CoherenceDegradedWarning(UserWarning):
+    """Emitted once per adapter instance when a coherence error degrades to fallback.
+
+    Canonical home so every adapter (CCSStore, OpenAIAgentsAdapter, ...) emits and
+    catches the *same* class — ``from ccs.adapters import CoherenceDegradedWarning``
+    must match whatever any adapter raises.
+    """
+
+
 class InvalidTransitionError(CoherenceError):
     """Raised when the MESI transition table rejects a state transition."""
 
