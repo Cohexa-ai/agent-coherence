@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("opentelemetry")
+# Guard on `opentelemetry.sdk`, not the bare `opentelemetry` api: a `[otel]`
+# install before this fix carried only `opentelemetry-api`, so importing the
+# api succeeded while the `opentelemetry.sdk.*` imports below raised at
+# collection time. Skipping on the sdk submodule degrades gracefully on any
+# env without `opentelemetry-sdk` (e.g. a bare `[dev]` install).
+pytest.importorskip("opentelemetry.sdk")
 
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader

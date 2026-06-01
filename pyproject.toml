@@ -66,7 +66,11 @@ agent-coherence-replay = "ccs.cli.coherence_replay:main"
 dev = ["pytest>=7.0"]
 langgraph = ["langgraph>=0.2"]
 crewai = ["crewai>=0.80"]
-otel = ["opentelemetry-api>=1.0"]
+# `opentelemetry-api` is the runtime dep (the OtelExporter no-ops without an
+# SDK). `opentelemetry-sdk` is required for metrics to actually be collected/
+# exported — and for tests/adapters/telemetry/test_otel_exporter.py to read
+# them back via MeterProvider + InMemoryMetricReader.
+otel = ["opentelemetry-api>=1.0", "opentelemetry-sdk>=1.0"]
 langsmith = ["langsmith>=0.1"]
 benchmark = ["langchain-core>=0.2"]
 diagnose = ["agent-coherence[langgraph]", "jinja2>=3.1", "langchain-core>=0.2"]
