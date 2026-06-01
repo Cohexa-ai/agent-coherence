@@ -19,6 +19,15 @@ class CoherenceDegradedWarning(UserWarning):
     """
 
 
+class CoherenceTopologyWarning(UserWarning):
+    """Emitted when an adapter is used in a topology its coherence model can't fully cover.
+
+    Example: an OpenAI Agents run that combines a server-side ``conversation_id`` with
+    multi-agent handoffs, where the SDK disables ``input_filter`` / nested handoff
+    history — so handoff-history coherence is unavailable. Surfaced once, never silent.
+    """
+
+
 class InvalidTransitionError(CoherenceError):
     """Raised when the MESI transition table rejects a state transition."""
 

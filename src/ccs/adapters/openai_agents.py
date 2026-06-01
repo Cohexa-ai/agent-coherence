@@ -21,6 +21,25 @@ implementing the four-method protocol.
 Scope (v1): in-process multi-agent coherence — peers registered on one
 ``CoherenceAdapterCore``/process (the same boundary as the LangGraph/CrewAI/
 AutoGen adapters). Cross-service coherence needs the out-of-process coordinator.
+
+**Status: experimental (0.x).** The OpenAI Agents SDK is itself 0.x and churns;
+this surface may change with it. Pinned to ``openai-agents>=0.17,<0.18``.
+
+Install::
+
+    pip install "agent-coherence[openai-agents]"
+
+Usage::
+
+    from agents import Runner, SQLiteSession
+    from ccs.adapters.openai_agents import OpenAIAgentsAdapter
+
+    adapter = OpenAIAgentsAdapter()
+    session = adapter.wrap_session(SQLiteSession("chat-1"), agent_name="planner", session_id="chat-1")
+    # Drive the run; the optional RunHooks track identity + refresh coherence:
+    await Runner.run(agent, "...", session=session, hooks=adapter.run_hooks(session_id="chat-1"))
+    if session.peer_mutated_since_read():  # a peer changed the conversation
+        ...  # re-read before acting
 """
 
 from __future__ import annotations
@@ -33,7 +52,7 @@ from uuid import UUID
 
 from ccs.adapters.base import CoherenceAdapterCore
 from ccs.coordinator.service import CrashRecoveryConfig
-from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
+from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, CoherenceTopologyWarning
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact
 
@@ -95,6 +114,20 @@ class OpenAIAgentsAdapter:
 
     # --- Session coherence (the primary surface) ----------------------------
 
+    def _session_artifact_id(self, session_id: str) -> UUID:
+        """Resolve (registering once) the shared coherence artifact for a session_id.
+
+        All agents and the RunHooks that touch the same ``session_id`` through this
+        adapter resolve the same artifact id, so their reads/writes coordinate.
+        """
+        with self._lock:
+            artifact_id = self._sessions.get(session_id)
+            if artifact_id is None:
+                artifact = self.core.register_artifact(name=f"session:{session_id}", content="")
+                artifact_id = artifact.id
+                self._sessions[session_id] = artifact_id
+        return artifact_id
+
     def wrap_session(self, underlying: Any, *, agent_name: str, session_id: str) -> CoherenceSession:
         """Wrap a caller-provided Session so peer mutations invalidate this agent.
 
@@ -103,19 +136,34 @@ class OpenAIAgentsAdapter:
         artifact-id trick required because the adapter coordinates registration.
         """
         self.core.register_agent(agent_name)
-        with self._lock:
-            artifact_id = self._sessions.get(session_id)
-            if artifact_id is None:
-                artifact = self.core.register_artifact(name=f"session:{session_id}", content="")
-                artifact_id = artifact.id
-                self._sessions[session_id] = artifact_id
         return CoherenceSession(
             underlying=underlying,
             adapter=self,
             agent_name=agent_name,
-            artifact_id=artifact_id,
+            artifact_id=self._session_artifact_id(session_id),
             session_id=session_id,
         )
+
+    def run_hooks(self, *, session_id: str, server_conversation: bool = False) -> Any:
+        """Build a ``RunHooks`` that threads coherence accounting through a run.
+
+        Attach the returned object to ``Runner.run(..., hooks=...)``. It tracks the
+        active agent across handoffs and refreshes that agent's coherence view at
+        agent-start and tool-start, so a peer's mutation of the shared session
+        surfaces before the agent acts. Writes remain the ``CoherenceSession``'s job
+        (this coordinates *awareness and identity*, not arbitrary tool side effects).
+
+        Set ``server_conversation=True`` when the run uses a server-side
+        ``conversation_id``; combined with multi-agent handoffs the SDK disables
+        ``input_filter`` / nested handoff history, and the hooks warn once that
+        handoff-history coherence is unavailable in that mode.
+
+        Importing ``agents.RunHooks`` is deferred to here so this module stays
+        importable (and ``CoherenceSession`` usable) without the ``openai-agents``
+        extra installed.
+        """
+        hooks_cls = _coherence_run_hooks_class()
+        return hooks_cls(adapter=self, session_id=session_id, server_conversation=server_conversation)
 
     # --- degradation contract ----------------------------------------------
 
@@ -245,3 +293,98 @@ class CoherenceSession:
         if self._adapter._on_error == "strict":
             raise  # bare re-raise preserves the original traceback from core
         self._adapter._record_degraded(exc)
+
+
+# --- RunHooks lifecycle integration (Unit 7) -------------------------------
+#
+# Defined lazily so importing this module never pulls `agents` — the SDK-free
+# CoherenceSession surface stays importable on a bare `[dev]` install. The class
+# subclasses agents.RunHooks (needed for the Runner's default-method contract)
+# and is built once, on first `OpenAIAgentsAdapter.run_hooks(...)`.
+
+_RUN_HOOKS_CLASS: type | None = None
+
+
+def _coherence_run_hooks_class() -> type:
+    global _RUN_HOOKS_CLASS
+    if _RUN_HOOKS_CLASS is not None:
+        return _RUN_HOOKS_CLASS
+
+    try:
+        from agents import RunHooks  # deferred third-party import
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise ImportError(
+            "OpenAIAgentsAdapter.run_hooks requires the OpenAI Agents SDK. "
+            'Install it with: pip install "agent-coherence[openai-agents]"'
+        ) from exc
+
+    class CoherenceRunHooks(RunHooks):
+        """Threads coherence accounting through an Agents SDK run (Unit 7).
+
+        Tracks the active agent across handoffs and refreshes that agent's
+        coherence view at agent-start and tool-start, so a peer's mutation of the
+        shared session surfaces *before* the agent acts. Writes stay the
+        ``CoherenceSession``'s job — these hooks coordinate awareness and identity,
+        not arbitrary tool side effects (the coherence surface is session state,
+        not every tool call).
+
+        Supported topology: concurrent independent agents sharing one
+        ``conversation_id`` within one process. With ``server_conversation=True``
+        plus a handoff, the SDK disables ``input_filter`` / nested handoff history;
+        the first handoff then warns once (``CoherenceTopologyWarning``) that
+        handoff-history coherence is unavailable — never a silent assumption.
+
+        The coordinator handle is carried by this hooks instance (runtime-only,
+        never serialized to the model), which satisfies the "don't send the
+        coordinator to the LLM" goal the same way ``RunContextWrapper.context``
+        would.
+        """
+
+        def __init__(self, *, adapter: OpenAIAgentsAdapter, session_id: str, server_conversation: bool = False) -> None:
+            self._adapter = adapter
+            self._session_id = session_id
+            self._server_conversation = server_conversation
+            self.active_agent: str | None = None
+            self.read_count = 0
+            self._handoff_topology_warned = False
+
+        def _refresh(self, agent_name: str) -> None:
+            """Refresh one agent's coherence view of the shared session (a peer write
+            shows up as a cache miss). Honours the adapter's on_error contract."""
+            self._adapter.register_agent(agent_name)
+            artifact_id = self._adapter._session_artifact_id(self._session_id)
+            try:
+                self._adapter.core.read(
+                    agent_name=agent_name,
+                    artifact_id=artifact_id,
+                    now_tick=self._adapter._next_tick(),
+                )
+                self.read_count += 1
+            except CoherenceError as exc:
+                if self._adapter._on_error == "strict":
+                    raise
+                self._adapter._record_degraded(exc)
+
+        async def on_agent_start(self, context: Any, agent: Any) -> None:
+            self.active_agent = agent.name
+            self._refresh(agent.name)
+
+        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+            self._refresh(agent.name)
+
+        async def on_handoff(self, context: Any, from_agent: Any, to_agent: Any) -> None:
+            self.active_agent = to_agent.name
+            if self._server_conversation and not self._handoff_topology_warned:
+                self._handoff_topology_warned = True
+                warnings.warn(
+                    "OpenAI Agents handoff with a server-side conversation_id: the SDK "
+                    "disables input_filter / nested handoff history, so handoff-history "
+                    "coherence is unavailable. Use concurrent agents sharing one "
+                    "conversation_id (no handoff history rewriting) instead.",
+                    CoherenceTopologyWarning,
+                    stacklevel=2,
+                )
+            self._refresh(to_agent.name)
+
+    _RUN_HOOKS_CLASS = CoherenceRunHooks
+    return _RUN_HOOKS_CLASS
