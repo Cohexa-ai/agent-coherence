@@ -12,6 +12,7 @@ behind ``pytest.importorskip`` to prove delegation against the actual SDK.
 from __future__ import annotations
 
 import asyncio
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -232,6 +233,135 @@ def test_heartbeat_and_recover_passthrough_are_noops_when_disabled():
     adapter.register_agent("a")
     adapter.heartbeat(agent_name="a", now_tick=1)  # must not raise
     adapter.recover(agent_name="a", now_tick=2)  # must not raise
+
+
+# --- Unit 7: RunHooks lifecycle integration ---------------------------------
+
+
+class _FakeAgent:
+    """Stand-in for an Agents SDK Agent (only `.name` is used by the hooks)."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+def test_run_hooks_tracks_active_agent_and_refreshes_on_lifecycle():
+    pytest.importorskip("agents")  # run_hooks pulls the SDK
+    adapter = OpenAIAgentsAdapter()
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        await hooks.on_agent_start(None, _FakeAgent("planner"))
+        assert hooks.active_agent == "planner"
+        await hooks.on_tool_start(None, _FakeAgent("planner"), object())
+        return hooks.read_count
+
+    # agent_start + tool_start each refresh the active agent's coherence view.
+    assert asyncio.run(scenario()) == 2
+
+
+def test_run_hooks_handoff_advances_identity():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter()
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        await hooks.on_agent_start(None, _FakeAgent("planner"))
+        await hooks.on_handoff(None, _FakeAgent("planner"), _FakeAgent("executor"))
+        return hooks.active_agent
+
+    assert asyncio.run(scenario()) == "executor"
+
+
+def test_run_hooks_warns_once_on_server_conversation_handoff():
+    from ccs.core.exceptions import CoherenceTopologyWarning
+
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter()
+    hooks = adapter.run_hooks(session_id="c1", server_conversation=True)
+
+    async def scenario():
+        with pytest.warns(CoherenceTopologyWarning):
+            await hooks.on_handoff(None, _FakeAgent("a"), _FakeAgent("b"))
+        # second handoff must NOT warn again (warn-once)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceTopologyWarning)
+            await hooks.on_handoff(None, _FakeAgent("b"), _FakeAgent("c"))
+
+    asyncio.run(scenario())
+
+
+def test_run_hooks_no_warning_without_server_conversation():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter()
+    hooks = adapter.run_hooks(session_id="c1")  # server_conversation defaults False
+
+    async def scenario():
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning fails the test
+            await hooks.on_handoff(None, _FakeAgent("a"), _FakeAgent("b"))
+
+    asyncio.run(scenario())
+
+
+def test_run_hooks_refresh_observes_peer_write():
+    # Integration: hooks + CoherenceSession compose. A's session write invalidates
+    # B; B's tool-start refresh re-fetches, clearing the stale signal.
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter()
+    store: dict[str, list] = {}
+    a = adapter.wrap_session(FakeSession(store, "c1"), agent_name="a", session_id="c1")
+    b = adapter.wrap_session(FakeSession(store, "c1"), agent_name="b", session_id="c1")
+    hooks_b = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        await b.get_items()  # B establishes a baseline
+        await a.add_items([{"v": 2}])  # A mutates -> invalidates B
+        assert b.peer_mutated_since_read() is True
+        await hooks_b.on_tool_start(None, _FakeAgent("b"), object())  # hooks refresh B
+        return b.peer_mutated_since_read()
+
+    assert asyncio.run(scenario()) is False  # B's view was refreshed by the hooks
+
+
+def test_run_hooks_degrade_swallows_refresh_error():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter(on_error="degrade")
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("boom")):
+            with pytest.warns(CoherenceDegradedWarning):
+                await hooks.on_agent_start(None, _FakeAgent("a"))  # refresh degrades, no raise
+        return hooks.active_agent
+
+    assert asyncio.run(scenario()) == "a"  # identity still tracked despite degrade
+
+
+def test_run_hooks_strict_reraises_on_handoff_refresh_error():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter(on_error="strict")
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("boom")):
+            with pytest.raises(CoherenceError):
+                await hooks.on_handoff(None, _FakeAgent("a"), _FakeAgent("b"))
+
+    asyncio.run(scenario())
+
+
+def test_run_hooks_strict_reraises_on_tool_start_refresh_error():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter(on_error="strict")
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("boom")):
+            with pytest.raises(CoherenceError):
+                await hooks.on_tool_start(None, _FakeAgent("a"), object())
+
+    asyncio.run(scenario())
 
 
 # --- integration: real SQLiteSession ---------------------------------------
