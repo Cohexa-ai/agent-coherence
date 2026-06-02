@@ -33,7 +33,7 @@ from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION, StoreMetricEvent  # r
 from ccs.adapters.telemetry import TelemetryExporter, build_telemetry
 from ccs.agent.runtime import CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
 from ccs.coordinator.service import CrashRecoveryConfig
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
 from ccs.core.hashing import compute_content_hash
 from ccs.core.identity import artifact_uuid
 from ccs.core.states import MESIState
@@ -41,11 +41,9 @@ from ccs.core.types import Artifact
 
 logger = logging.getLogger(__name__)
 
+# CoherenceDegradedWarning is re-exported from ccs.core.exceptions (canonical home)
+# so CCSStore and every other adapter raise/catch the same class.
 __all__ = ["CCSStore", "CoherenceDegradedWarning", "StoreMetricEvent"]
-
-
-class CoherenceDegradedWarning(UserWarning):
-    """Emitted once per CCSStore instance when the first coherence error degrades to fallback."""
 
 
 class CCSStore(BaseStore):

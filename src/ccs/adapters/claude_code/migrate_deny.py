@@ -37,13 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
-
 
 # ----------------------------------------------------------------------
 # Detection rules — deterministic, regex-only, under-emit bias per KTD-R

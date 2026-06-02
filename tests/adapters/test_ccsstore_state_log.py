@@ -6,15 +6,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import pytest
 
 pytest.importorskip("langgraph.store.base")
 
-from ccs.adapters.ccsstore import CCSStore
 from langgraph.store.base import GetOp, PutOp
 
+from ccs.adapters.ccsstore import CCSStore
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -26,12 +26,9 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import sqlite3
 import stat
 import subprocess
-import sys
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -45,7 +42,6 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
-
 
 # ----------------------------------------------------------------------
 # Fixtures

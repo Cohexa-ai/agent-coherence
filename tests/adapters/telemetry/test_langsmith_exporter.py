@@ -7,11 +7,11 @@ import pytest
 
 pytest.importorskip("langsmith")
 
+from langgraph.store.base import PutOp
+
 from ccs.adapters.ccsstore import CCSStore
 from ccs.adapters.events import StoreMetricEvent
 from ccs.adapters.telemetry.langsmith import LangSmithExporter
-from langgraph.store.base import PutOp
-
 
 # ---------------------------------------------------------------------------
 # Helpers

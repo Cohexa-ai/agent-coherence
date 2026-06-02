@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def test_multi_agent_planning_demo_runs() -> None:

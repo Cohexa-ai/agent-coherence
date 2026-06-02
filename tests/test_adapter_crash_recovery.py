@@ -10,17 +10,38 @@ enforce_stable_grant_timeouts between adapter calls.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from ccs.adapters.autogen import AutoGenAdapter
-from ccs.adapters.base import CoherenceAdapterCore
 from ccs.adapters.crewai import CrewAIAdapter
 from ccs.adapters.langgraph import LangGraphAdapter
+from ccs.adapters.openai_agents import OpenAIAgentsAdapter
 from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.exceptions import CoherenceError
 from ccs.core.states import MESIState
 
 CR_CFG = CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000)
+
+
+class _FakeSession:
+    """Minimal in-memory Session (the four async methods) for adapter parity tests."""
+
+    def __init__(self):
+        self._items: list = []
+
+    async def get_items(self, limit=None):
+        return list(self._items)
+
+    async def add_items(self, items):
+        self._items.extend(items)
+
+    async def pop_item(self):
+        return self._items.pop() if self._items else None
+
+    async def clear_session(self):
+        self._items.clear()
 
 
 def _langgraph(**overrides):
@@ -258,8 +279,9 @@ class TestCCSStoreParity:
 
     def test_ccsstore_oom_kill(self) -> None:
         pytest.importorskip("langgraph.store.base")
+        from langgraph.store.base import PutOp
+
         from ccs.adapters.ccsstore import CCSStore
-        from langgraph.store.base import GetOp, PutOp
 
         store = CCSStore(
             strategy="lazy",
@@ -279,6 +301,50 @@ class TestCCSStoreParity:
 
 
 # ---------------------------------------------------------------------------
+# OpenAIAgentsAdapter parity: heartbeat piggyback, reclamation, recover flush
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIAgentsParity:
+    """OpenAIAgentsAdapter heartbeat/recover/reclamation behaves like the others.
+
+    The adapter is SDK-free (CoherenceSession composes a caller-provided Session),
+    so these run in the default offline suite with a _FakeSession.
+    """
+
+    def test_openai_agents_oom_kill(self) -> None:
+        adapter = OpenAIAgentsAdapter(crash_recovery=CR_CFG)
+        a = adapter.wrap_session(_FakeSession(), agent_name="A", session_id="s")
+        b = adapter.wrap_session(_FakeSession(), agent_name="B", session_id="s")
+        artifact_id = adapter._session_artifact_id("s")
+
+        # A acquires a grant (MODIFIED) and piggybacks a heartbeat via the write.
+        asyncio.run(a.add_items([{"v": 1}]))
+
+        # A goes silent; the sweep reclaims its stale grant.
+        reclaimed = _reclaim(adapter, current_tick=13)
+        assert reclaimed == 1
+        # A's grant is now INVALID at the coordinator (matches the sibling adapter tests).
+        assert adapter.core.registry.get_agent_state(artifact_id, adapter.core.agent_id_for("A")) == MESIState.INVALID
+
+        # B can now write where A's stranded grant would otherwise have blocked it,
+        # and B holds the grant (write committed, not silently degraded).
+        asyncio.run(b.add_items([{"v": 2}]))
+        assert adapter.core.registry.get_agent_state(artifact_id, adapter.core.agent_id_for("B")) == MESIState.MODIFIED
+
+    def test_openai_agents_recover_flushes_cache(self) -> None:
+        adapter = OpenAIAgentsAdapter(crash_recovery=CR_CFG)
+        a = adapter.wrap_session(_FakeSession(), agent_name="A", session_id="s")
+        asyncio.run(a.get_items())  # A caches the session artifact
+        artifact_id = adapter._session_artifact_id("s")
+        assert adapter.core.runtime("A").cache.get(artifact_id) is not None
+        adapter.recover(agent_name="A", now_tick=5)  # post-restart flush
+        # recover invalidates A's local view: the next read is a coordinator miss.
+        entry = adapter.core.runtime("A").cache.get(artifact_id)
+        assert entry is None or entry.state == MESIState.INVALID
+
+
+# ---------------------------------------------------------------------------
 # Composition fail-fast at adapter level (R5/R8)
 # ---------------------------------------------------------------------------
 
@@ -289,6 +355,14 @@ class TestCompositionFailFast:
     def test_langgraph_raises(self) -> None:
         with pytest.raises(ValueError, match="composition violation"):
             LangGraphAdapter(
+                strategy_name="lease",
+                lease_ttl_ticks=300,
+                crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
+            )
+
+    def test_openai_agents_raises(self) -> None:
+        with pytest.raises(ValueError, match="composition violation"):
+            OpenAIAgentsAdapter(
                 strategy_name="lease",
                 lease_ttl_ticks=300,
                 crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),

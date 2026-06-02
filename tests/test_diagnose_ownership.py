@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
-import uuid
+from diagnose_helpers import (
+    ids_for as _ids_for,
+)
+from diagnose_helpers import (
+    make_event as _make_event,
+)
 
-from ccs.diagnose.callback import DiagnoseEvent
 from ccs.diagnose.classifier import (
     Bucket,
     ClassifierVerdict,
@@ -15,13 +19,6 @@ from ccs.diagnose.classifier import (
     CoverageReport,
 )
 from ccs.diagnose.ownership import OwnershipRow, compute_ownership_map
-
-from diagnose_helpers import (
-    INSTANCE_ID as _INSTANCE_ID,
-    hash_value as _hash,
-    ids_for as _ids_for,
-    make_event as _make_event,
-)
 
 
 def _verdict(

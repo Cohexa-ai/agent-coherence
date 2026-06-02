@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import os
 import uuid
 from pathlib import Path
 from typing import Any

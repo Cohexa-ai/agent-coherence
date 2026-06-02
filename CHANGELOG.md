@@ -8,6 +8,55 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.8.4] — 2026-06-02
+
+A patch release that adds the experimental OpenAI Agents SDK integration and
+two packaging/UX fixes. The OpenAI Agents adapter is **experimental (0.x)** and
+tracks the SDK's own 0.x surface; it brings coherence to the SDK `Session`
+cache (the Q6 probe found the OpenAI and Mistral Conversations *servers*
+read-after-write consistent, so the coherence value lives on the readers'
+caches, not the server). No changes to the core protocol, the existing
+LangGraph / CrewAI / AutoGen adapters, or the v0.8.3 crash-recovery deprecation
+cycle — the v0.9.0 default flip is still the next behavioral change.
+
+### Added
+
+- **OpenAI Agents SDK coherence adapter (experimental, 0.x).**
+  `OpenAIAgentsAdapter` (`ccs.adapters.openai_agents`, re-exported from
+  `ccs.adapters`) brings coherence to the OpenAI Agents SDK. Two surfaces:
+  `wrap_session(...)` composes over the SDK `Session` four-method protocol
+  (`get_items` / `add_items` / `pop_item` / `clear_session`) and returns a
+  drop-in `CoherenceSession` that invalidates peers on mutation and exposes
+  `peer_mutated_since_read()`; `run_hooks(...)` returns a `RunHooks` that tracks
+  the active agent across handoffs and refreshes coherence at agent-start /
+  tool-start. Constructor parity with the other adapters (`strategy_name`,
+  `core`, `crash_recovery`, `on_error`) plus `heartbeat` / `recover`; scope is
+  in-process multi-agent (v1). The coherence target is the **Session cache**, not
+  the Conversations server — the Q6 probe found the server consistent. See the
+  [user guide](docs/guide.md#openai-agents-sdk-adapter-experimental).
+- **New install extras:** `openai` (Conversations client + httpx), `openai-agents`
+  (the adapter; pinned `>=0.17,<0.18`, composes `openai`), and `mistral`. `[all]`
+  now includes `openai-agents` and `mistral`.
+- **Conversations stale-read example** (`examples/conversations_stale_read/`): a
+  deterministic, offline, no-keys reproducer of client-cache staleness over a
+  consistent store, plus a live Q6 consistency probe (`probe.py`). The probe
+  measured the OpenAI and Mistral Conversations servers read-after-write
+  consistent (0 stale over 100 + 20 trials), which is why the demo isolates the
+  client cache rather than the server.
+- `CoherenceTopologyWarning` (`ccs.core.exceptions`, re-exported from
+  `ccs.adapters`): emitted once when a server-side `conversation_id` is combined
+  with a handoff, where the SDK disables handoff-history rewriting.
+- `live_api` pytest marker for the paid OpenAI/Mistral live tests; excluded from
+  the default `pytest -q` run (offline and free by default).
+
+### Fixed
+
+- The `otel` extra now also installs `opentelemetry-sdk`. The API package alone
+  no-ops without an SDK, so OpenTelemetry metrics were not actually collected or
+  exported when installing only `agent-coherence[otel]`.
+- `agent-coherence-status` keeps the version column inline and prints a legend,
+  fixing the wrapped/ambiguous status output.
+
 ## [0.8.3] — 2026-05-30
 
 **First behavioral default-flip in the library's history.** v0.8.3 is a

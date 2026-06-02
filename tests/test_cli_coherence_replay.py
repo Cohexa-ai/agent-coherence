@@ -23,7 +23,6 @@ documents its own scenario.
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 from typing import Any
@@ -31,7 +30,6 @@ from typing import Any
 import pytest
 
 from ccs.cli.coherence_replay import build_parser, main
-
 
 # ---------------------------------------------------------------------------
 # Fixture builders

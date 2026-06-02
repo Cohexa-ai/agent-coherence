@@ -53,8 +53,8 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterable
 
-from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.exceptions import InvariantViolationError
+from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState
 from ccs.replay.loader import LoadedTrace
 

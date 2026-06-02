@@ -22,3 +22,11 @@ collect_ignore_glob: list[str] = []
 
 if importlib.util.find_spec("langchain_core") is None:
     collect_ignore_glob.append("test_diagnose_*.py")
+
+# Live-API tests (Q6 probe smoke, OpenAI-adapter smoke) import `openai` /
+# `mistralai` at module level. On a bare `[dev]` install those SDKs are absent;
+# ignore the live-test glob so collection does not ImportError. The live tests
+# also carry an in-module `pytest.importorskip` as a second layer, and the
+# `live_api` marker keeps them out of the default `pytest -q` run regardless.
+if importlib.util.find_spec("openai") is None or importlib.util.find_spec("mistralai") is None:
+    collect_ignore_glob.append("test_*_live.py")

@@ -424,6 +424,7 @@ def test_cor04_resolve_or_register_post_rollback_delete_raises_runtime_error(
     and the post-ROLLBACK SELECT to return None.
     """
     import sqlite3
+
     from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 
     reg = SqliteArtifactRegistry(tmp_path / "state.db")

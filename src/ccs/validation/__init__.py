@@ -36,8 +36,8 @@ import json
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
 from ccs.adapters.events import CCS_METRIC_SCHEMA_VERSION
+from ccs.coordinator.registry import CCS_STATE_LOG_SCHEMA_VERSION
 
 __all__ = [
     "Gap",

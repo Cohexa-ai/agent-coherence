@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Sequence
 
 from ccs.output.report import build_dashboard_payload, write_html_report, write_json_report

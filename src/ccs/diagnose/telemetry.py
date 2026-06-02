@@ -69,16 +69,15 @@ import stat
 import sys
 import tempfile
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any, TextIO
 
 from ccs import __version__ as agent_coherence_version
 from ccs.diagnose import CCS_DIAGNOSE_LOG_SCHEMA_VERSION
 from ccs.diagnose.classifier import ClassifierVerdict
-from ccs.diagnose.detection import DetectionReport
 
 __all__ = [
     "ConsentState",

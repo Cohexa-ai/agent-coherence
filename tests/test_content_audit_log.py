@@ -11,12 +11,11 @@ from uuid import uuid4
 
 import pytest
 
-from ccs.agent.runtime import AgentRuntime, CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION
+from ccs.agent.runtime import CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION, AgentRuntime
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.core.hashing import compute_content_hash
 from ccs.strategies.lazy import LazyStrategy
-
 
 # ---------------------------------------------------------------------------
 # Unit 1: Hash utility and schema version constant

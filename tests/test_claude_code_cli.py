@@ -13,16 +13,11 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
-from io import BytesIO
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
-from ccs.adapters.claude_code import lifecycle
-from ccs.adapters.claude_code.lifecycle import ensure_coordinator, stop_coordinator, LifecycleConfig
+from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator, stop_coordinator
 from ccs.cli import (
     coherence_coordinator,
     coherence_status,
@@ -133,7 +128,6 @@ def test_coordinator_detached_spawn_survives_parent_exit(
     daemon thread that died with its parent."""
     import subprocess
     import sys
-    import errno as _errno
 
     # Run the real CLI as a subprocess (not in-process) — replicates
     # what a user invocation does.
@@ -246,6 +240,52 @@ def test_status_renders_table_against_live_coordinator(
         or "Observed artifacts:" in captured.out
         or "No tracked artifacts (policy is empty)" in captured.out
     )
+
+
+def test_render_table_keeps_version_on_same_line_as_long_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: a long tracked path used to pad every row past the screen
+    edge, soft-wrapping the version onto its own line ("number below the
+    filename"). Each row must now fit the terminal — long paths middle-elide,
+    the version stays inline — and a legend must explain the version column."""
+    monkeypatch.setenv("COLUMNS", "80")
+    long_path = (
+        ".claude/worktrees/feat_crash_recovery/docs/plans/"
+        "2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md"
+    )
+    payload = {
+        "tracked_artifacts": [
+            {"path": "plan.md", "version": 2},
+            {"path": long_path, "version": 13},
+        ],
+        "sessions": [],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    out = capsys.readouterr().out
+
+    # Legend describes what the version column means.
+    assert "version = artifact revision" in out
+    assert "committed edit" in out
+
+    lines = out.splitlines()
+    # No row exceeds the terminal width → nothing soft-wraps.
+    assert all(len(line) <= 80 for line in lines), [l for l in lines if len(l) > 80]
+
+    # The long path is middle-elided but its filename tail survives, and its
+    # version sits on the SAME line (not orphaned below it).
+    long_row = next(line for line in lines if line.rstrip().endswith("13"))
+    assert "…" in long_row
+    assert "plan.md" in long_row
+
+    # The short path keeps its version inline too.
+    short_row = next(
+        line for line in lines
+        if line.strip().startswith("plan.md") and line.rstrip().endswith("2")
+    )
+    assert short_row  # found
 
 
 def test_status_json_mode_emits_raw_payload(
@@ -379,7 +419,8 @@ def test_prepare_for_migration_releases_grants_and_shuts_down(
 
     # Set up an EXCLUSIVE grant via the real HTTP path so registry
     # state matches what a real client would have written.
-    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    from ccs.cli._coherence_client import post as _post
+    from ccs.cli._coherence_client import resolve_endpoint
     endpoint = resolve_endpoint(workspace)
     sid = "11111111-2222-4111-8111-aaaaaaaaaaaa"
     _post(endpoint, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
@@ -572,7 +613,8 @@ def test_show_policy_renders_pending_section_when_path_not_yet_observed(
     'Tracked (pending first read):' — it is in user_added_patterns but
     not yet in tracked_artifacts."""
     workspace, port = live_coordinator
-    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    from ccs.cli._coherence_client import post as _post
+    from ccs.cli._coherence_client import resolve_endpoint
     endpoint = resolve_endpoint(workspace)
 
     # Add a path via /policy/track so it enters user_added_patterns.
@@ -595,8 +637,10 @@ def test_show_policy_renders_none_after_path_is_observed(
     """Once a pre-read fires for every user-added path, the pending list
     is empty and the 'none' branch renders."""
     workspace, port = live_coordinator
-    from ccs.cli._coherence_client import resolve_endpoint, post as _post
     import uuid as _uuid
+
+    from ccs.cli._coherence_client import post as _post
+    from ccs.cli._coherence_client import resolve_endpoint
     endpoint = resolve_endpoint(workspace)
 
     path = "observed_test.md"
@@ -624,7 +668,8 @@ def test_show_policy_json_injects_pending_first_read_key(
     """--show-policy --json injects 'policy_pending_first_read' into the
     payload so agent callers get the same data as the table renderer."""
     workspace, port = live_coordinator
-    from ccs.cli._coherence_client import resolve_endpoint, post as _post
+    from ccs.cli._coherence_client import post as _post
+    from ccs.cli._coherence_client import resolve_endpoint
     endpoint = resolve_endpoint(workspace)
 
     path = "json_pending_test.md"

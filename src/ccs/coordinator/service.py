@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from uuid import UUID
 
-logger = logging.getLogger(__name__)
-
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
@@ -21,6 +19,8 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSignal
 
 from .registry import ArtifactRegistry
+
+logger = logging.getLogger(__name__)
 
 
 # v0.8.3 deprecation cycle — see docs/plans/2026-05-28-001-feat-c-flip-...
@@ -277,9 +277,13 @@ class CoordinatorService:
         if other_holders:
             # Multiple readers must stay coherent; downgrade any exclusive/modified holder.
             for agent_id in other_holders:
-                self.registry.set_agent_state(request.artifact_id, agent_id, MESIState.SHARED, trigger="fetch", tick=request.requested_at_tick)
+                self.registry.set_agent_state(
+                    request.artifact_id, agent_id, MESIState.SHARED, trigger="fetch", tick=request.requested_at_tick
+                )
 
-        self.registry.set_agent_state(request.artifact_id, request.requesting_agent_id, grant, trigger="fetch", tick=request.requested_at_tick)
+        self.registry.set_agent_state(
+            request.artifact_id, request.requesting_agent_id, grant, trigger="fetch", tick=request.requested_at_tick
+        )
         self.registry.clear_agent_transient(request.artifact_id, request.requesting_agent_id)
         self._validate_single_writer(request.artifact_id)
 
@@ -402,7 +406,9 @@ class CoordinatorService:
                     transient,
                     entered_tick=issued_at_tick,
                 )
-            self.registry.set_agent_state(artifact_id, peer_id, MESIState.INVALID, trigger="commit", tick=issued_at_tick)
+            self.registry.set_agent_state(
+                artifact_id, peer_id, MESIState.INVALID, trigger="commit", tick=issued_at_tick
+            )
             signals.append(
                 InvalidationSignal(
                     artifact_id=artifact_id,
@@ -436,7 +442,9 @@ class CoordinatorService:
         """
         if not self.registry.has_artifact(artifact_id):
             return None
-        self.registry.set_agent_state(artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick)
+        self.registry.set_agent_state(
+            artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
+        )
         self.registry.clear_agent_transient(artifact_id, agent_id)
         return InvalidationSignal(
             artifact_id=artifact_id,
@@ -494,7 +502,9 @@ class CoordinatorService:
                     continue
 
                 # Conservative fail-safe: transient timeout always forces local invalidation.
-                self.registry.set_agent_state(artifact_id, agent_id, MESIState.INVALID, trigger="timeout", tick=current_tick)
+                self.registry.set_agent_state(
+                    artifact_id, agent_id, MESIState.INVALID, trigger="timeout", tick=current_tick
+                )
                 self.registry.clear_agent_transient(artifact_id, agent_id)
                 expired += 1
 

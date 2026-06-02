@@ -40,21 +40,21 @@ import re
 import socketserver
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
-from typing import runtime_checkable
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
-from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.auth import (
     ensure_secret,
     verify_bearer,
     verify_host,
 )
+from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
@@ -1435,7 +1435,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
     path_err = validate_path(path)
     if path_err:
-        req._json(400, {"error": "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err})
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
         return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
@@ -1590,7 +1591,8 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         return
     path_err = validate_path(path)
     if path_err:
-        req._json(400, {"error": "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err})
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
         return
     # content_hash is required only on success — if the tool succeeded, the
     # hook script computed it from the worktree's post-write state.
