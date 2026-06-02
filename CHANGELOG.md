@@ -6,6 +6,19 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+(Nothing yet.)
+
+## [0.8.4] — 2026-06-02
+
+A patch release that adds the experimental OpenAI Agents SDK integration and
+two packaging/UX fixes. The OpenAI Agents adapter is **experimental (0.x)** and
+tracks the SDK's own 0.x surface; it brings coherence to the SDK `Session`
+cache (the Q6 probe found the OpenAI and Mistral Conversations *servers*
+read-after-write consistent, so the coherence value lives on the readers'
+caches, not the server). No changes to the core protocol, the existing
+LangGraph / CrewAI / AutoGen adapters, or the v0.8.3 crash-recovery deprecation
+cycle — the v0.9.0 default flip is still the next behavioral change.
+
 ### Added
 
 - **OpenAI Agents SDK coherence adapter (experimental, 0.x).**

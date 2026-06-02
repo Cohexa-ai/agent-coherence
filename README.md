@@ -66,7 +66,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-**`v0.8.3` released — crash-recovery default-flip deprecation notice.** A deprecation-only release: bare `CrashRecoveryConfig()` now emits a one-shot `DeprecationWarning` announcing the v0.9.0 default flip from `enabled=False` to `enabled=True`. No behavior changes ship in v0.8.3 — downstream consumers get one release cycle to surface false-reclaim issues under their own workloads before the flip lands. Silence the warning by passing `enabled=True` (opt in now) or `enabled=False` (preserve current behavior) explicitly.
+**`v0.8.4` released — experimental OpenAI Agents SDK adapter + packaging fixes.** Adds an experimental (0.x) adapter that brings coherence to the OpenAI Agents SDK `Session` cache (`wrap_session` + optional `RunHooks`); install with `pip install "agent-coherence[openai-agents]"`. New `openai` / `openai-agents` / `mistral` extras and an offline Conversations stale-read example. Fixes: the `otel` extra now pulls `opentelemetry-sdk` so metrics actually export, and `agent-coherence-status` keeps the version column inline. No core-protocol changes; the v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
