@@ -5,10 +5,10 @@ This guide shows how to drop in `agent-coherence` — surfacing those reads
 and serving fresh artifacts on demand, with a one-line import change.
 
 `agent-coherence` is **vendor-neutral by design**: the same protocol and
-the same library work across LangGraph, CrewAI, AutoGen, and any custom
-orchestrator, with any model provider (Anthropic, OpenAI, Google, Mistral,
-open-source). Pick the integration extra that matches your stack; the
-concepts below apply uniformly.
+the same library work across LangGraph, CrewAI, AutoGen, the OpenAI Agents
+SDK, and any custom orchestrator, with any model provider (Anthropic, OpenAI,
+Google, Mistral, open-source). Pick the integration extra that matches your
+stack; the concepts below apply uniformly.
 
 Below: installation, namespace convention, sync strategies, observability,
 telemetry, graceful degradation, examples, the `ccs-diagnose` CLI, the
@@ -38,6 +38,7 @@ full command-line toolset, and the API reference.
 18. [API reference](#api-reference)
 19. [Low-level adapter API](#low-level-adapter-api)
 20. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+21. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -61,7 +62,10 @@ pip install "agent-coherence[langgraph,otel]"
 # With LangSmith tracing
 pip install "agent-coherence[langgraph,langsmith]"
 
-# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose)
+# OpenAI Agents SDK adapter (experimental, 0.x)
+pip install "agent-coherence[openai-agents]"
+
+# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral)
 pip install "agent-coherence[all]"
 ```
 
@@ -573,6 +577,7 @@ All examples are runnable with `python -m examples.<name>.main` from the project
 | Code review pipeline | `python -m examples.code_review.main` | 3-agent, SHARED state transitions |
 | Research pipeline | `python -m examples.research_pipeline.main` | 4-agent, 3 artifacts, 60% hit rate |
 | Shared codebase | `python -m examples.shared_codebase.main` | 4-agent code review, 37.6% savings, benchmark output |
+| Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
 
 ### Code review pipeline
 
@@ -585,6 +590,19 @@ neither wrote to it. Both hold it in SHARED state simultaneously.
 Four agents operate on three artifacts (`brief`, `findings`, `analysis`). The key
 behavior: `researcher`'s write to `findings` does **not** invalidate `brief` held
 by `analyst` — each artifact key has its own independent MESI state per agent.
+
+### Conversations stale-read
+
+Two agents share one conversation: one caches it locally, the other revises it, and
+the first acts on a stale copy. `CoherenceAdapterCore` invalidates the stale cache so
+the reader re-fetches before acting. Runs offline with no API keys. The companion
+`probe.py` measured the OpenAI and Mistral Conversations *servers* as read-after-write
+consistent (zero stale reads over 100 + 20 live trials), so the demo isolates the real
+failure — the **client cache**, not the server. See
+[`examples/conversations_stale_read/README.md`](../examples/conversations_stale_read/README.md)
+for the full framing and the optional live Q6 probe. This is the same mechanism the
+[OpenAI Agents SDK adapter](#openai-agents-sdk-adapter-experimental) applies to a live
+`Session`.
 
 ---
 
@@ -884,6 +902,10 @@ from ccs.adapters import (
     build_telemetry,
 )
 from ccs.coordinator.service import CrashRecoveryConfig
+
+# OpenAI Agents SDK adapter (experimental). These imports and wrap_session work on a
+# bare install; only run_hooks() requires the openai-agents extra (deferred import).
+from ccs.adapters import OpenAIAgentsAdapter, CoherenceSession
 ```
 
 ---
@@ -986,3 +1008,112 @@ adapter = CoherenceAdapterCore(strategy_name="lazy")
 ```
 
 Crash recovery (`heartbeat` / `recover`) is identical across all four adapters.
+
+---
+
+## OpenAI Agents SDK adapter (experimental)
+
+> **Status: experimental (0.x).** The [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+> is itself 0.x and its surface churns; this adapter is pinned to
+> `openai-agents>=0.17,<0.18` and may change with it. Install with
+> `pip install "agent-coherence[openai-agents]"`.
+
+The OpenAI Agents SDK has no `BaseStore`-style seam, so this adapter does **not**
+use the `before_node` / `commit_outputs` surface. The coherence target here is the
+SDK's **`Session`** — the agent's local conversation memory
+(`get_items` / `add_items` / `pop_item` / `clear_session`). A peer that mutates a
+shared session leaves this agent's cached view stale, *regardless of how consistent
+the durable store is*. (The Q6 probe measured the OpenAI and Mistral Conversations
+servers read-after-write consistent — so the coherence value lives on the readers'
+caches, not on the server. See the [Conversations stale-read example](#conversations-stale-read).)
+
+The SDK exposes no Session hook/middleware API, so interception is by **composition**:
+`wrap_session` wraps a caller-provided Session and overrides the four async methods.
+Because the underlying Session is supplied by the caller, the adapter module imports
+no `agents` symbol — it works against anything implementing the four-method protocol.
+
+**Scope (v1):** in-process multi-agent coherence — peers registered on one
+`OpenAIAgentsAdapter` / `CoherenceAdapterCore` per process, the same boundary as the
+LangGraph / CrewAI / AutoGen adapters. Cross-service coherence needs the
+out-of-process coordinator.
+
+### Wrapping a Session
+
+```python
+from agents import Runner, SQLiteSession
+from ccs.adapters import OpenAIAgentsAdapter
+
+adapter = OpenAIAgentsAdapter(strategy_name="lazy")  # on_error defaults to "degrade"
+
+# Every agent wraps the *same* session_id through the adapter, so their reads and
+# writes coordinate on one shared coherence artifact (single registration, shared id).
+planner_session = adapter.wrap_session(
+    SQLiteSession("chat-1"), agent_name="planner", session_id="chat-1"
+)
+reviewer_session = adapter.wrap_session(
+    SQLiteSession("chat-1"), agent_name="reviewer", session_id="chat-1"
+)
+
+await Runner.run(planner_agent, "draft the plan", session=planner_session)
+
+# Before the reviewer acts, check whether a peer moved the conversation underneath it.
+if reviewer_session.peer_mutated_since_read():
+    await reviewer_session.get_items()  # take the cache miss, re-read the fresh version
+```
+
+`CoherenceSession` is a drop-in `Session`: pass it anywhere the SDK expects a session.
+A mutation (`add_items` / `pop_item` / `clear_session`) persists to the underlying
+Session **first**, then invalidates peers; `get_items` refreshes this agent's coherence
+state so a prior peer write surfaces as a cache miss. The underlying Session stays the
+durable source of truth for the items — the coherence layer governs *awareness*, not
+storage.
+
+`peer_mutated_since_read()` is conservative by design: it returns `True` when a peer
+has mutated the session since this agent's last read, **and** when this agent has never
+read yet (no baseline → "you must read first"). Call `get_items()` once to establish the
+baseline; after that it reports only genuine peer mutations.
+
+### RunHooks lifecycle (optional)
+
+Attach `run_hooks(...)` to `Runner.run(..., hooks=...)` to thread coherence accounting
+through a run. It tracks the active agent across handoffs and refreshes that agent's
+coherence view at agent-start and tool-start, so a peer's mutation surfaces *before* the
+agent acts. Writes remain the `CoherenceSession`'s job — the hooks coordinate awareness
+and identity, not arbitrary tool side effects.
+
+```python
+hooks = adapter.run_hooks(session_id="chat-1")
+await Runner.run(agent, "...", session=planner_session, hooks=hooks)
+```
+
+Importing `agents.RunHooks` is deferred until this call, so the module (and
+`wrap_session`) stays usable on a bare install; `run_hooks` raises `ImportError` with an
+install hint if the `openai-agents` extra is absent.
+
+**Server-side conversations + handoffs.** Pass `server_conversation=True` when the run
+uses a server-side `conversation_id`. Combined with a multi-agent handoff, the SDK
+disables `input_filter` / nested handoff history, so handoff-history coherence is
+unavailable — the first handoff then warns once with `CoherenceTopologyWarning` rather
+than silently assuming it works. The supported topology is concurrent independent agents
+sharing one `conversation_id` within one process.
+
+### Parity and error handling
+
+`OpenAIAgentsAdapter` mirrors the other adapters' constructor and exposes
+`register_agent`, `register_artifact`, `heartbeat(agent_name=, now_tick=)`, and
+`recover(agent_name=, now_tick=)`, plus `is_degraded` / `degradation_count`. It accepts
+`crash_recovery=CrashRecoveryConfig(...)` like the rest. The SDK has no step counter, so
+the adapter mints its own monotonic tick internally — you do not pass `now_tick` to
+`wrap_session` / `run_hooks`.
+
+One difference from `CCSStore`: `on_error` defaults to **`"degrade"`** here (best-effort
+coherence that never swallows the underlying Session op), not `"strict"`. Use
+`on_error="strict"` to propagate `CoherenceError`.
+
+> **Degrade-mode caveat for concurrent writers.** Under `on_error="degrade"`, a
+> `CoherenceError` from a mutation is swallowed after the Session write already
+> succeeded. Because `core.write` grants EXCLUSIVE and then commits as two steps, a
+> failed commit (e.g. a concurrent writer reclaimed the grant) can strand the writer
+> holding a stable EXCLUSIVE grant with peers already invalidated. That grant is only
+> reclaimed by the crash-recovery sweep. For concurrent-writer workloads on the same
+> session under degrade, enable `CrashRecoveryConfig` so stranded grants self-heal.

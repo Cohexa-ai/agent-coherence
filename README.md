@@ -2,7 +2,7 @@
 
 **The coherence layer for multi-agent systems — vendor-neutral, framework-agnostic.**
 
-When agents share state, one of them is reading a stale copy. The next write lands on a version that has already moved — a lost write, or a divergent view two agents now disagree on, and the error propagates to every decision downstream. `agent-coherence` makes that moment visible and serves the current version on the next read instead of rebroadcasting the full artifact every turn. Same library, same protocol, across LangGraph, CrewAI, AutoGen, and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
+When agents share state, one of them is reading a stale copy. The next write lands on a version that has already moved — a lost write, or a divergent view two agents now disagree on, and the error propagates to every decision downstream. `agent-coherence` makes that moment visible and serves the current version on the next read instead of rebroadcasting the full artifact every turn. Same library, same protocol, across LangGraph, CrewAI, AutoGen, the OpenAI Agents SDK, and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
 
 [![CI](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml/badge.svg)](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agent-coherence)](https://pypi.org/project/agent-coherence/)
@@ -10,10 +10,11 @@ When agents share state, one of them is reading a stale copy. The next write lan
 [![Discussions](https://img.shields.io/github/discussions/hipvlady/agent-coherence)](https://github.com/hipvlady/agent-coherence/discussions)
 
 ```bash
-pip install "agent-coherence[langgraph]"   # LangGraph drop-in
-pip install "agent-coherence[crewai]"      # CrewAI adapter
-pip install "agent-coherence[diagnose]"    # ccs-diagnose CLI
-pip install "agent-coherence[all]"         # everything
+pip install "agent-coherence[langgraph]"        # LangGraph drop-in
+pip install "agent-coherence[crewai]"           # CrewAI adapter
+pip install "agent-coherence[openai-agents]"    # OpenAI Agents SDK adapter (experimental)
+pip install "agent-coherence[diagnose]"         # ccs-diagnose CLI
+pip install "agent-coherence[all]"              # everything
 ```
 
 ```python
@@ -57,7 +58,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 
 - **Protocol** (`ccs.core`, `ccs.strategies`) — coherence state machine and synchronization strategies; no framework dependencies.
 - **Coordinator** (`ccs.coordinator`) — authority service tracking directory state, publishing invalidations, and reclaiming stale grants (crash recovery).
-- **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen; ~100 lines each.
+- **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen (~100 lines each), plus an experimental OpenAI Agents SDK adapter (`Session`-cache coherence + `RunHooks`).
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
