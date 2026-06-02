@@ -43,10 +43,11 @@ def test_round_trip_over_real_conversations_session():
     session = adapter.wrap_session(underlying, agent_name="a", session_id="live-round-trip")
 
     async def scenario():
-        await session.add_items([{"role": "user", "content": "coherence live smoke"}])
-        items = await session.get_items()
-        await underlying.clear_session()  # cleanup server-side state
-        return items
+        try:
+            await session.add_items([{"role": "user", "content": "coherence live smoke"}])
+            return await session.get_items()
+        finally:
+            await underlying.clear_session()  # cleanup server-side state even on failure
 
     items = asyncio.run(scenario())
     assert items and items[-1]["content"] == "coherence live smoke"
@@ -55,23 +56,26 @@ def test_round_trip_over_real_conversations_session():
 def test_cross_agent_invalidation_over_one_real_conversation():
     """Two agents on one live conversation_id: A's write invalidates B's cached view."""
     adapter = OpenAIAgentsAdapter()
-    underlying = agents.OpenAIConversationsSession()
-    conversation_id = underlying.session_id  # the shared conversation
-    a = adapter.wrap_session(underlying, agent_name="a", session_id=conversation_id)
-    b = adapter.wrap_session(
-        agents.OpenAIConversationsSession(conversation_id=conversation_id),
-        agent_name="b",
-        session_id=conversation_id,
-    )
 
     async def scenario():
-        await b.get_items()  # B establishes a baseline over the live session
-        assert b.peer_mutated_since_read() is False
-        await a.add_items([{"role": "user", "content": "A revises the plan"}])  # invalidates B
-        stale = b.peer_mutated_since_read()  # B's cached view is now INVALID
-        fresh = await b.get_items()  # re-fetch from the live conversation
-        await a._underlying.clear_session()  # cleanup
-        return stale, fresh
+        # OpenAIConversationsSession.session_id raises until the session is lazily
+        # initialized by a method call, so seed one item first to obtain the id.
+        underlying_a = agents.OpenAIConversationsSession()
+        await underlying_a.add_items([{"role": "user", "content": "seed"}])
+        conversation_id = underlying_a.session_id
+        underlying_b = agents.OpenAIConversationsSession(conversation_id=conversation_id)
+        a = adapter.wrap_session(underlying_a, agent_name="a", session_id=conversation_id)
+        b = adapter.wrap_session(underlying_b, agent_name="b", session_id=conversation_id)
+        try:
+            await b.get_items()  # B establishes a baseline over the live session
+            assert b.peer_mutated_since_read() is False
+            await a.add_items([{"role": "user", "content": "A revises the plan"}])  # invalidates B
+            stale = b.peer_mutated_since_read()  # B's cached view is now INVALID
+            fresh = await b.get_items()  # re-fetch from the live conversation
+            return stale, fresh
+        finally:
+            await underlying_a.clear_session()
+            await underlying_b.clear_session()
 
     stale, fresh = asyncio.run(scenario())
     assert stale is True

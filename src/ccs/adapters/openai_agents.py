@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from ccs.adapters.base import CoherenceAdapterCore
@@ -55,6 +55,9 @@ from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, CoherenceTopologyWarning
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact
+
+if TYPE_CHECKING:  # annotation-only; never imported at runtime (keeps the module SDK-free)
+    from agents import RunHooks
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +147,7 @@ class OpenAIAgentsAdapter:
             session_id=session_id,
         )
 
-    def run_hooks(self, *, session_id: str, server_conversation: bool = False) -> Any:
+    def run_hooks(self, *, session_id: str, server_conversation: bool = False) -> RunHooks:
         """Build a ``RunHooks`` that threads coherence accounting through a run.
 
         Attach the returned object to ``Runner.run(..., hooks=...)``. It tracks the
@@ -190,6 +193,17 @@ class OpenAIAgentsAdapter:
         if first:
             warnings.warn(f"OpenAI Agents adapter degraded: {exc}", CoherenceDegradedWarning, stacklevel=3)
             logger.warning("OpenAI Agents adapter degraded under on_error='degrade': %s", exc)
+
+    def _handle_coherence_error(self, exc: CoherenceError) -> None:
+        """Single on_error dispatch shared by the Session wrapper and RunHooks.
+
+        ``strict`` re-raises (``raise exc`` — explicit, and preserves the original
+        traceback); ``degrade`` records + warns once and lets the real work stand.
+        Must be called from within the ``except`` block that caught ``exc``.
+        """
+        if self._on_error == "strict":
+            raise exc
+        self._record_degraded(exc)
 
 
 class CoherenceSession:
@@ -290,9 +304,7 @@ class CoherenceSession:
     def _degrade_or_raise(self, exc: CoherenceError) -> None:
         # The underlying Session op already succeeded — under degrade, coherence is
         # best-effort and we never swallow the real work, only the accounting.
-        if self._adapter._on_error == "strict":
-            raise  # bare re-raise preserves the original traceback from core
-        self._adapter._record_degraded(exc)
+        self._adapter._handle_coherence_error(exc)
 
 
 # --- RunHooks lifecycle integration (Unit 7) -------------------------------
@@ -303,6 +315,7 @@ class CoherenceSession:
 # and is built once, on first `OpenAIAgentsAdapter.run_hooks(...)`.
 
 _RUN_HOOKS_CLASS: type | None = None
+_RUN_HOOKS_CLASS_LOCK = threading.Lock()
 
 
 def _coherence_run_hooks_class() -> type:
@@ -310,6 +323,16 @@ def _coherence_run_hooks_class() -> type:
     if _RUN_HOOKS_CLASS is not None:
         return _RUN_HOOKS_CLASS
 
+    # Lock the build so two threads racing the first call can't define two distinct
+    # class objects (matters under free-threaded Python; harmless under the GIL).
+    with _RUN_HOOKS_CLASS_LOCK:
+        if _RUN_HOOKS_CLASS is not None:
+            return _RUN_HOOKS_CLASS
+        return _build_run_hooks_class()
+
+
+def _build_run_hooks_class() -> type:
+    global _RUN_HOOKS_CLASS
     try:
         from agents import RunHooks  # deferred third-party import
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -340,17 +363,26 @@ def _coherence_run_hooks_class() -> type:
         would.
         """
 
+        active_agent: str | None
+        read_count: int
+
         def __init__(self, *, adapter: OpenAIAgentsAdapter, session_id: str, server_conversation: bool = False) -> None:
+            super().__init__()
             self._adapter = adapter
             self._session_id = session_id
             self._server_conversation = server_conversation
-            self.active_agent: str | None = None
+            self.active_agent = None
             self.read_count = 0
             self._handoff_topology_warned = False
 
         def _refresh(self, agent_name: str) -> None:
             """Refresh one agent's coherence view of the shared session (a peer write
-            shows up as a cache miss). Honours the adapter's on_error contract."""
+            shows up as a cache miss). Honours the adapter's on_error contract.
+
+            ``read_count`` counts *successful* coordinator reads; it stays flat while a
+            refresh is degrading. The coordinator read is in-process (pure dict work),
+            so calling it synchronously from these async hooks does not block the loop.
+            """
             self._adapter.register_agent(agent_name)
             artifact_id = self._adapter._session_artifact_id(self._session_id)
             try:
@@ -361,9 +393,7 @@ def _coherence_run_hooks_class() -> type:
                 )
                 self.read_count += 1
             except CoherenceError as exc:
-                if self._adapter._on_error == "strict":
-                    raise
-                self._adapter._record_degraded(exc)
+                self._adapter._handle_coherence_error(exc)
 
         async def on_agent_start(self, context: Any, agent: Any) -> None:
             self.active_agent = agent.name

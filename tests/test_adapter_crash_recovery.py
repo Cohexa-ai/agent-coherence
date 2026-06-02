@@ -316,6 +316,7 @@ class TestOpenAIAgentsParity:
         adapter = OpenAIAgentsAdapter(crash_recovery=CR_CFG)
         a = adapter.wrap_session(_FakeSession(), agent_name="A", session_id="s")
         b = adapter.wrap_session(_FakeSession(), agent_name="B", session_id="s")
+        artifact_id = adapter._session_artifact_id("s")
 
         # A acquires a grant (MODIFIED) and piggybacks a heartbeat via the write.
         asyncio.run(a.add_items([{"v": 1}]))
@@ -323,9 +324,13 @@ class TestOpenAIAgentsParity:
         # A goes silent; the sweep reclaims its stale grant.
         reclaimed = _reclaim(adapter, current_tick=13)
         assert reclaimed == 1
+        # A's grant is now INVALID at the coordinator (matches the sibling adapter tests).
+        assert adapter.core.registry.get_agent_state(artifact_id, adapter.core.agent_id_for("A")) == MESIState.INVALID
 
-        # B can now write where A's stranded grant would otherwise have blocked it.
+        # B can now write where A's stranded grant would otherwise have blocked it,
+        # and B holds the grant (write committed, not silently degraded).
         asyncio.run(b.add_items([{"v": 2}]))
+        assert adapter.core.registry.get_agent_state(artifact_id, adapter.core.agent_id_for("B")) == MESIState.MODIFIED
 
     def test_openai_agents_recover_flushes_cache(self) -> None:
         adapter = OpenAIAgentsAdapter(crash_recovery=CR_CFG)

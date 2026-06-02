@@ -338,6 +338,32 @@ def test_run_hooks_degrade_swallows_refresh_error():
     assert asyncio.run(scenario()) == "a"  # identity still tracked despite degrade
 
 
+def test_run_hooks_strict_reraises_on_handoff_refresh_error():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter(on_error="strict")
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("boom")):
+            with pytest.raises(CoherenceError):
+                await hooks.on_handoff(None, _FakeAgent("a"), _FakeAgent("b"))
+
+    asyncio.run(scenario())
+
+
+def test_run_hooks_strict_reraises_on_tool_start_refresh_error():
+    pytest.importorskip("agents")
+    adapter = OpenAIAgentsAdapter(on_error="strict")
+    hooks = adapter.run_hooks(session_id="c1")
+
+    async def scenario():
+        with patch.object(adapter.core, "read", side_effect=CoherenceError("boom")):
+            with pytest.raises(CoherenceError):
+                await hooks.on_tool_start(None, _FakeAgent("a"), object())
+
+    asyncio.run(scenario())
+
+
 # --- integration: real SQLiteSession ---------------------------------------
 
 
