@@ -275,7 +275,11 @@ def test_recover_invalidates_cache_before_heartbeat() -> None:
 
 
 def test_flag_off_write_does_not_heartbeat() -> None:
-    core = CoherenceAdapterCore(strategy_name="lazy")
+    # Explicit enabled=False: post-v0.9.0 bare construction enables the sweep,
+    # so the "flag off" contract requires opting out explicitly.
+    core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     core.register_agent("A")
     artifact = core.register_artifact(name="x.md", content="v1")
     core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
@@ -302,7 +306,9 @@ def test_recover_anti_trap_after_recovery_not_immediately_reclaimed() -> None:
 
 
 def test_recover_flag_off_invalidates_cache_no_heartbeat() -> None:
-    core = CoherenceAdapterCore(strategy_name="lazy")
+    core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     core.register_agent("A")
     artifact = core.register_artifact(name="x.md", content="v1")
     core.read(agent_name="A", artifact_id=artifact.id, now_tick=1)
@@ -322,7 +328,9 @@ def test_register_agent_seeds_heartbeat_when_enabled() -> None:
 
 
 def test_register_agent_no_seed_when_disabled() -> None:
-    core = CoherenceAdapterCore(strategy_name="lazy")
+    core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     core.register_agent("A")
 
     assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
@@ -395,7 +403,12 @@ def test_framework_adapter_passthrough_autogen_raises() -> None:
 
 
 def test_framework_adapter_external_core_ignores_crash_recovery_kwarg() -> None:
-    external_core = CoherenceAdapterCore(strategy_name="lazy")
+    # External core built with enabled=False so it is distinct from the kwarg's
+    # enabled=True; the assertion below proves the adapter uses the external
+    # core's config and ignores its own crash_recovery= kwarg.
+    external_core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     adapter = LangGraphAdapter(
         core=external_core,
         crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
@@ -405,7 +418,9 @@ def test_framework_adapter_external_core_ignores_crash_recovery_kwarg() -> None:
 
 
 def test_flag_off_read_does_not_heartbeat() -> None:
-    core = CoherenceAdapterCore(strategy_name="lazy")
+    core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     core.register_agent("A")
     artifact = core.register_artifact(name="x.md", content="v1")
 
@@ -415,7 +430,9 @@ def test_flag_off_read_does_not_heartbeat() -> None:
 
 
 def test_flag_off_heartbeat_is_noop() -> None:
-    core = CoherenceAdapterCore(strategy_name="lazy")
+    core = CoherenceAdapterCore(
+        strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False)
+    )
     core.register_agent("A")
 
     core.heartbeat(agent_name="A", now_tick=42)
@@ -423,17 +440,25 @@ def test_flag_off_heartbeat_is_noop() -> None:
     assert core.registry.last_heartbeat_tick(core.agent_id_for("A")) is None
 
 
-# ---- v0.8.3 C-flip Unit 2 — R2 internal-bare-construction hygiene ------------
+# ---- v0.9.0 C-flip — bare adapter adopts enabled-by-default -----------------
 #
 # See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
-# Unit 2. The library's own adapter __init__ fallbacks must not surface the
-# v0.8.3 deprecation warning to users who construct adapters without passing
-# crash_recovery=. The user's bare CoherenceAdapterCore() / CCSStore() call
-# should not look like a misconfigured CrashRecoveryConfig site to them.
+# Units 5 + 6. Post-flip, a bare CoherenceAdapterCore() / CCSStore() (no
+# crash_recovery= argument) adopts the enabled-by-default crash recovery. The
+# v0.8.3 DeprecationWarning is gone; at most one v0.9.0 transitional
+# RuntimeWarning may surface (suppressed suite-wide by the conftest neutralizer
+# except in the dedicated tests/test_coordinator.py assertions).
 
 
-def test_bare_coherence_adapter_core_emits_no_deprecation_warning() -> None:
-    """R2: CoherenceAdapterCore() with no crash_recovery= must not warn."""
+def test_bare_coherence_adapter_core_adopts_enabled_default() -> None:
+    """v0.9.0: bare CoherenceAdapterCore() emits no DeprecationWarning and adopts
+    the enabled-by-default crash recovery; at most one transitional
+    RuntimeWarning may surface."""
+    from ccs.coordinator import service as _service_mod
+
+    # Reset the once-per-process flag so we deterministically observe the
+    # transitional warning here (the conftest neutralizer otherwise pre-sets it).
+    _service_mod._V090_FIRST_USE_WARNED = False
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         core = CoherenceAdapterCore(strategy_name="lazy")
@@ -444,12 +469,16 @@ def test_bare_coherence_adapter_core_emits_no_deprecation_warning() -> None:
         f"bare CoherenceAdapterCore construction must not emit "
         f"DeprecationWarning, got: {[str(w.message) for w in deprecation_warnings]}"
     )
-    # And the v0.8.x default behavior is preserved.
-    assert core._crash_recovery.enabled is False
+    runtime_warnings = [
+        w for w in caught if issubclass(w.category, RuntimeWarning)
+    ]
+    assert len(runtime_warnings) <= 1
+    # The flip: bare construction now enables crash recovery.
+    assert core._crash_recovery.enabled is True
 
 
 def test_explicit_crash_recovery_kwarg_emits_no_deprecation_warning() -> None:
-    """Passing an explicit CrashRecoveryConfig must not warn either."""
+    """Passing an explicit CrashRecoveryConfig must not surface a DeprecationWarning."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         core = CoherenceAdapterCore(

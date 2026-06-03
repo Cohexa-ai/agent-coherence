@@ -15,7 +15,6 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
     CoordinatorService,
     CrashRecoveryConfig,
-    _default_disabled_config,
     validate_crash_recovery_config,
 )
 from ccs.core.clock import LogicalClock
@@ -44,14 +43,18 @@ class _FailureEvent:
 
 
 def _build_crash_recovery_config(scenario_config: Mapping[str, Any]) -> CrashRecoveryConfig:
-    """Read optional ``crash_recovery`` block from scenario; default to safe values.
+    """Read optional ``crash_recovery`` block from scenario.
 
-    Uses ``_default_disabled_config()`` (not bare ``CrashRecoveryConfig()``)
-    to avoid surfacing the v0.8.3 ``DeprecationWarning`` on every
-    ``SimulationEngine`` instantiation that omits a ``crash_recovery`` block.
+    A scenario that omits the ``crash_recovery`` block inherits the library
+    default — which flipped to ``enabled=True`` (with retuned 120/900
+    thresholds) in v0.9.0 (R4/R6). The engine therefore emits heartbeats and
+    runs the reclamation sweep by default; scenarios opt out with
+    ``crash_recovery: {enabled: false}``. Per R5, byte-identity now holds
+    between an omitted block and an explicit ``{enabled: true}`` block (and
+    DIVERGES from ``{enabled: false}``) — see ``tests/test_engine.py``.
     """
     block = scenario_config.get("crash_recovery") or {}
-    defaults = _default_disabled_config()
+    defaults = CrashRecoveryConfig()
     return CrashRecoveryConfig(
         enabled=bool(block.get("enabled", defaults.enabled)),
         heartbeat_timeout_ticks=int(

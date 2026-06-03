@@ -145,9 +145,9 @@ from ccs.coordinator.service import CrashRecoveryConfig  # noqa: E402
 
 
 def test_engine_uses_default_crash_recovery_config_when_block_absent() -> None:
-    """R2: omitting the YAML block must produce the v0.8.x default-disabled config
-    WITHOUT emitting the v0.8.3 bare-construction DeprecationWarning from the
-    library's own engine code path.
+    """v0.9.0: omitting the YAML block inherits the flipped library default
+    (enabled=True with retuned 120/900), and engine construction surfaces no
+    DeprecationWarning (the v0.8.3 warning is removed).
     """
     import warnings as _w
     with _w.catch_warnings(record=True) as caught:
@@ -160,10 +160,11 @@ def test_engine_uses_default_crash_recovery_config_when_block_absent() -> None:
         f"engine construction must not emit DeprecationWarning, got: "
         f"{[str(w.message) for w in deprecation_warnings]}"
     )
-    # Compare against explicit-False (not bare CrashRecoveryConfig()) so the
-    # comparison itself does not emit the warning.
-    assert engine._crash_recovery == CrashRecoveryConfig(enabled=False)
-    assert engine._crash_recovery.enabled is False
+    # The engine inherits the flipped default; compare against explicit-True.
+    assert engine._crash_recovery == CrashRecoveryConfig(enabled=True)
+    assert engine._crash_recovery.enabled is True
+    assert engine._crash_recovery.heartbeat_timeout_ticks == 120
+    assert engine._crash_recovery.max_hold_ticks == 900
 
 
 def test_engine_reads_crash_recovery_block_from_scenario() -> None:
@@ -194,52 +195,115 @@ def test_engine_fail_fast_accepts_max_hold_above_ttl() -> None:
     SimulationEngine(scenario, strategy_name="lease", seed=5)
 
 
-def test_engine_flag_off_state_log_is_byte_identical_with_or_without_block() -> None:
-    """R5: the flag-off path must produce a state-log identical to the v0.5 baseline.
+def _capture_normalized_state_log(
+    crash_recovery_block: dict | None, *, seed: int = 42
+) -> list[dict]:
+    """Run ``_scenario()`` under the given crash_recovery block and return the
+    state-log with per-run uuid fields (instance_id, artifact_id) normalized to
+    deterministic placeholders. Shared by the R5 byte-identity tests below."""
+    scenario = _scenario()
+    if crash_recovery_block is not None:
+        scenario["crash_recovery"] = crash_recovery_block
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=seed)
+    log: list[dict] = []
+    engine._registry._state_log = log.append
+    engine.run()
+    artifact_id_map: dict[str, str] = {}
+    for entry in log:
+        entry["instance_id"] = "<inst>"
+        aid = entry.get("artifact_id")
+        if aid is not None:
+            aid_str = str(aid)
+            placeholder = artifact_id_map.setdefault(
+                aid_str, f"<artifact-{len(artifact_id_map)}>"
+            )
+            entry["artifact_id"] = placeholder
+    return log
 
-    We compare two runs of the same scenario+strategy+seed:
-      - Run A: no ``crash_recovery`` block (legacy v0.5 shape).
-      - Run B: explicit ``crash_recovery: { enabled: false, ... }`` block with
-        knobs the sweep would otherwise read.
 
-    Today this is preventive (Unit 4 will add the sweep call site). The
-    contract: when ``enabled=False`` the engine MUST never invoke the sweep
-    or emit heartbeats, so the state-log is identical to a run with the
-    block omitted entirely.
+def test_engine_flag_off_state_log_is_byte_identical_across_explicit_false_variants() -> None:
+    """R5 (off-path): two explicit ``{enabled: false}`` runs that differ only in
+    the (ignored) sweep knobs produce byte-identical state-logs.
+
+    Post-v0.9.0 the omitted-block default is ENABLED, so the off-path
+    byte-identity contract is asserted between two EXPLICIT-false variants:
+    when ``enabled=False`` the engine MUST never invoke the sweep or emit
+    heartbeats, so the knobs are inert and the logs are identical.
     """
-
-    def _run_and_capture(crash_recovery_block: dict | None) -> list[dict]:
-        scenario = _scenario()
-        if crash_recovery_block is not None:
-            scenario["crash_recovery"] = crash_recovery_block
-        engine = SimulationEngine(scenario, strategy_name="lazy", seed=42)
-        # Wire a state_log onto the registry post-construction. Construction
-        # already populated _instance_id, so it's safe to attach the callback.
-        log: list[dict] = []
-        engine._registry._state_log = log.append
-        engine.run()
-        # Normalize per-run uuid4 fields (instance_id, artifact_id) to
-        # deterministic placeholders. artifact_id is fresh on every Artifact
-        # construction; first-seen order maps to a stable placeholder.
-        artifact_id_map: dict[str, str] = {}
-        for entry in log:
-            entry["instance_id"] = "<inst>"
-            aid = entry.get("artifact_id")
-            if aid is not None:
-                aid_str = str(aid)
-                placeholder = artifact_id_map.setdefault(
-                    aid_str, f"<artifact-{len(artifact_id_map)}>"
-                )
-                entry["artifact_id"] = placeholder
-        return log
-
-    log_without_block = _run_and_capture(None)
-    log_with_disabled_block = _run_and_capture(
+    log_a = _capture_normalized_state_log({"enabled": False})
+    log_b = _capture_normalized_state_log(
         {"enabled": False, "heartbeat_timeout_ticks": 5, "max_hold_ticks": 50}
     )
+    assert log_a == log_b
+    assert len(log_a) > 0  # sanity: we actually captured something
 
-    assert log_without_block == log_with_disabled_block
-    assert len(log_without_block) > 0  # sanity: we actually captured something
+
+def test_engine_flag_on_state_log_is_byte_identical_with_yaml_absent_or_explicit_true() -> None:
+    """R5 (on-path — the inverted contract): an OMITTED crash_recovery block now
+    behaves identically to an explicit ``{enabled: true}`` block. The engine
+    inherits the flipped default, so both runs emit the same heartbeats and the
+    state-logs are byte-identical. This is the v0.9.0 R5 preservation proof.
+    """
+    log_absent = _capture_normalized_state_log(None)
+    log_explicit_true = _capture_normalized_state_log({"enabled": True})
+    assert log_absent == log_explicit_true
+    assert len(log_absent) > 0
+
+
+def test_engine_flag_on_diverges_from_explicit_false_via_reclaim() -> None:
+    """R5 (divergence is real, not trivial — ADV-07): an omitted crash_recovery
+    block (enabled-by-default) DIVERGES from explicit ``{enabled: false}``, and
+    the divergence is attributable to a ``reclaim_*`` event in the enabled-side
+    log — proving the sweep mechanism actually ran, not merely that heartbeat
+    entries appeared.
+
+    Fixture preconditions (ADV-07): the workload drives > heartbeat_timeout_ticks
+    (=120, the v0.9.0 default) so a killed grant-holder's heartbeat gaps past the
+    timeout and the sweep reclaims it. No agent is pre-held past max_hold_ticks
+    (=900), so the reclaim is heartbeat-attributable, not max-hold.
+    """
+
+    def _run(crash_recovery_block: dict | None) -> list[dict]:
+        scenario = _failure_scenario(num_agents=2, duration=150)
+        scenario["failure_events"] = [
+            {"tick": 5, "action": "kill", "agent": "agent_0"},
+        ]
+        if crash_recovery_block is not None:
+            scenario["crash_recovery"] = crash_recovery_block
+        engine = SimulationEngine(scenario, strategy_name="lazy", seed=1)
+        log: list[dict] = []
+        engine._registry._state_log = log.append
+        # Pre-grant EXCLUSIVE to the soon-killed agent so the sweep has a stable
+        # grant to reclaim once its heartbeat gaps past the timeout.
+        artifact_id = engine._artifact_ids[0]
+        agent_a = engine._agent_id_by_name["agent_0"]
+        engine._coordinator.fetch(
+            FetchRequest(
+                artifact_id=artifact_id,
+                requesting_agent_id=agent_a,
+                requested_at_tick=0,
+            )
+        )
+        engine.run()
+        return log
+
+    log_enabled = _run(None)  # omitted block -> enabled-by-default
+    log_disabled = _run({"enabled": False})  # explicit opt-out
+
+    assert log_enabled != log_disabled, (
+        "enabled-by-default must diverge from explicit-false"
+    )
+    enabled_reclaims = [
+        e for e in log_enabled if str(e.get("trigger", "")).startswith("reclaim_")
+    ]
+    assert len(enabled_reclaims) >= 1, (
+        "divergence must be attributable to a reclaim_* event in the enabled log "
+        "(fixture must drive > heartbeat_timeout_ticks with a killed grant-holder)"
+    )
+    disabled_reclaims = [
+        e for e in log_disabled if str(e.get("trigger", "")).startswith("reclaim_")
+    ]
+    assert disabled_reclaims == []
 
 
 # ---- Unit 4: failure-event injection + sweep wiring -------------------------
@@ -456,32 +520,16 @@ def test_baseline_state_log_byte_identical_with_disabled_flag_after_unit4() -> N
     the call site MUST keep the heartbeat / sweep entries out of the log.
     """
 
-    def _run_and_capture(crash_recovery_block: dict | None) -> list[dict]:
-        scenario = _scenario()
-        if crash_recovery_block is not None:
-            scenario["crash_recovery"] = crash_recovery_block
-        engine = SimulationEngine(scenario, strategy_name="lazy", seed=42)
-        log: list[dict] = []
-        engine._registry._state_log = log.append
-        engine.run()
-        artifact_id_map: dict[str, str] = {}
-        for entry in log:
-            entry["instance_id"] = "<inst>"
-            aid = entry.get("artifact_id")
-            if aid is not None:
-                aid_str = str(aid)
-                placeholder = artifact_id_map.setdefault(
-                    aid_str, f"<artifact-{len(artifact_id_map)}>"
-                )
-                entry["artifact_id"] = placeholder
-        return log
-
-    log_without_block = _run_and_capture(None)
-    log_with_disabled_block = _run_and_capture(
+    # Post-v0.9.0 the omitted-block default is enabled, so both arms are
+    # explicit-false to assert the off-path byte-identity (the Unit 4 sweep
+    # call site must stay inert under enabled=False). Reuses the shared
+    # _capture_normalized_state_log helper rather than a local duplicate.
+    log_explicit_false = _capture_normalized_state_log({"enabled": False})
+    log_with_disabled_block = _capture_normalized_state_log(
         {"enabled": False, "heartbeat_timeout_ticks": 5, "max_hold_ticks": 50}
     )
-    assert log_without_block == log_with_disabled_block
-    assert len(log_without_block) > 0
+    assert log_explicit_false == log_with_disabled_block
+    assert len(log_explicit_false) > 0
 
 
 def test_failure_event_unknown_agent_name_raises() -> None:

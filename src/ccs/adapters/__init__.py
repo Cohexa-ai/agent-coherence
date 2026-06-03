@@ -18,6 +18,7 @@ __all__ = [
     "CoherenceDegradedWarning",
     "CoherenceTopologyWarning",
     "CoherenceAdapterCore",
+    "CrashRecoveryConfig",
     "LangGraphAdapter",
     "CrewAIAdapter",
     "AutoGenAdapter",
@@ -37,6 +38,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "CoherenceDegradedWarning": (".base", "CoherenceDegradedWarning"),
     "CoherenceTopologyWarning": (".base", "CoherenceTopologyWarning"),
     "CoherenceAdapterCore": (".base", "CoherenceAdapterCore"),
+    # Re-exported from the coordinator package so the v0.9.0 opt-out
+    # (CrashRecoveryConfig(enabled=False)) is reachable from ccs.adapters,
+    # alongside the adapters whose default it now governs.
+    "CrashRecoveryConfig": ("..coordinator.service", "CrashRecoveryConfig"),
     "CoherenceSession": (".openai_agents", "CoherenceSession"),
     "CrewAIAdapter": (".crewai", "CrewAIAdapter"),
     "LangGraphAdapter": (".langgraph", "LangGraphAdapter"),

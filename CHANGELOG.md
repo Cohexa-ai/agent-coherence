@@ -6,7 +6,67 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-(Nothing yet.)
+The **[0.9.0]** entry below is prepared on the C-flip Phase 2 feature branch but
+**not yet tagged**. It ships via the dev → main → tag-push release flow no earlier
+than **2026-06-09** (the day after the Claude Code plugin Phase E monitoring window
+closes), or earlier only with written confirmation that the plugin pins
+`agent-coherence` below v0.9.0. The release date is filled in at tag time.
+
+## [0.9.0] — UNRELEASED (gated ≥ 2026-06-09)
+
+**The crash-recovery default flips ON.** This completes the deprecation cycle begun
+in v0.8.3: `CrashRecoveryConfig().enabled` changes from `False` to `True`, so a bare
+`CCSStore()` / `CoherenceAdapterCore()` now reclaims stale `MODIFIED`/`EXCLUSIVE`
+grants automatically. Operators who depend on the v0.8.x default-disabled behavior
+**must pass `CrashRecoveryConfig(enabled=False)` explicitly** to opt out.
+
+### Changed
+
+- **Breaking default — crash recovery is now ON.** `CrashRecoveryConfig.enabled`
+  flipped `False` → `True`. Bare `CrashRecoveryConfig()`, `CCSStore()`, and
+  `CoherenceAdapterCore()` now run the reclamation sweep. **Migration to keep
+  v0.8.x behavior: pass `CrashRecoveryConfig(enabled=False)` explicitly.**
+- **Default thresholds retuned** from simulation-anchored to batch-tick-realistic
+  values: `heartbeat_timeout_ticks` 10 → 120, `max_hold_ticks` 1000 → 900. The old
+  values remain settable explicitly. Calibrated so a bare `CCSStore` under realistic
+  LLM workloads does not false-reclaim live agents. Benchmark token reductions are
+  unchanged — see [`benchmarks/results/v0.9.0/attestation.md`](benchmarks/results/v0.9.0/attestation.md).
+- **Migration caveat — `lease` strategy with `lease_ttl_ticks` ≥ 900.** Because the
+  default is now enabled, the R11 composition rule (`max_hold_ticks` must exceed the
+  strategy's inspectable lease TTL) is enforced at construction for bare `CCSStore()`
+  / `CoherenceAdapterCore()`. A `lease` strategy with `lease_ttl_ticks` ≥ 900 (the new
+  default `max_hold_ticks`) now raises `ValueError` at startup where v0.8.x silently
+  skipped the check. Fix: pass `CrashRecoveryConfig(max_hold_ticks=…)` above your lease
+  TTL, or `CrashRecoveryConfig(enabled=False)`.
+- **Breaking — state-log byte-identity inverted (direction only).** A state-log produced with
+  the `crash_recovery` block omitted is now byte-identical to one with an explicit
+  `{enabled: true}` block, and diverges from `{enabled: false}`. CI that gates on
+  state-log byte equality against v0.8.x output must now set `enabled=False`
+  explicitly. The contract itself is unchanged — only which default it maps to.
+
+### Added
+
+- **Rate-limited reclamation sweep wired into `CoherenceAdapterCore`.** `read()` /
+  `write()` invoke a thread-safe `_maybe_sweep(now_tick)` after recording the
+  heartbeat; it reclaims stale grants at most once per `heartbeat_timeout_ticks // 2`
+  ticks. `CCSStore.batch()` inherits once-per-batch sweep semantics from its shared
+  per-batch tick — no separate state. The sweep is best-effort: a failure is logged
+  and never crashes the adapter's read/write path.
+- **Per-instance reclamation diagnostic.** The first time an adapter instance
+  reclaims, it logs a one-shot `WARNING` on the `ccs.adapters.base` logger with
+  structured `extra` fields (`trigger`, `agent_id_short`, `artifact_id_short`,
+  `reclaim_count`); a companion `DEBUG` carries full UUIDs. Field names are stable
+  for the v0.9 series. See the [crash-recovery guide](docs/guide.md#crash-recovery).
+- **Transitional first-use warning.** The first `CrashRecoveryConfig` construction
+  per process emits a one-shot `RuntimeWarning` naming the default change — a
+  migration heads-up for anyone upgrading straight from v0.8.2 who skipped the v0.8.3
+  `DeprecationWarning`. Removed in v0.10.0.
+
+### Removed
+
+- The v0.8.3 deprecation machinery: the falsy `_DefaultEnabledSentinel`, the
+  bare-construction `DeprecationWarning`, and the internal `_default_disabled_config`
+  helper. Bare `CrashRecoveryConfig()` is safe again — it now means "enabled".
 
 ## [0.8.4] — 2026-06-02
 
