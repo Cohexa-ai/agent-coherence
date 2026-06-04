@@ -11,7 +11,10 @@ separately.
 
 from __future__ import annotations
 
+import builtins
+import io
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,7 +24,12 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
-from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.coherent_volume import (
+    CoherentVolume,
+    coherent_workspace,
+    install,
+    uninstall,
+)
 from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
 
 
@@ -395,5 +403,143 @@ def test_deny_raises_even_in_degrade_mode(
             vol_b.write("data/shared.txt", b"stale")  # deny still raises in degrade mode
         assert not vol_b.is_degraded  # the deny did not register as infra degradation
         assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Unit 3 — install() builtins.open / io.open shim (opt-in, demo-grade).
+#
+# Routes managed-path opens through a process-singleton volume. The coverage
+# matrix is the contract: builtins.open + pathlib are coordinated; os.open and
+# subprocess are NOT. The shim preserves the sequential guard (the lost update
+# is denied through open() too, via fail-closed close()).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _uninstall_shim_safety():
+    """Safety net: never let an installed open()-shim leak across tests (a leaked
+    builtins.open patch would corrupt every later test). No-op when not installed."""
+    yield
+    uninstall()
+
+
+def test_shim_coordinates_open_round_trip(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A plain open() read+write of a managed path is coordinated, and the patch
+    is reversed on context exit."""
+    target = _seed(tmp_path, content=b"v1")
+    original_open = builtins.open
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+            assert builtins.open is not original_open  # patched while installed
+            with open(target) as f:  # read via the shim
+                assert f.read() == "v1"
+            with open(target, "w") as f:  # write via the shim
+                f.write("v2")
+            assert target.read_bytes() == b"v2"
+            # Proof the write was coordinated (routed through volume.write):
+            assert "data/shared.txt" in vol._last_committed_hash
+        assert builtins.open is original_open  # restored on exit
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_shim_install_is_idempotent(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A second install() returns the already-installed singleton volume (one
+    workspace per process in v1)."""
+    _seed(tmp_path)
+    try:
+        vol1 = install(tmp_path, managed=("data/**",), config=fast_cfg)
+        vol2 = install(tmp_path, managed=("data/**",), config=fast_cfg)
+        assert vol1 is vol2
+    finally:
+        uninstall()
+        stop_coordinator(tmp_path)
+
+
+def test_shim_covers_pathlib_write_text(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """pathlib Path.write_text IS coordinated — it calls io.open, which the shim
+    patches alongside builtins.open (patching builtins.open alone would miss it)."""
+    (tmp_path / "data").mkdir()
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+            (tmp_path / "data/note.txt").write_text("hello")  # pathlib -> io.open -> shim
+            assert (tmp_path / "data/note.txt").read_bytes() == b"hello"
+            assert "data/note.txt" in vol._last_committed_hash  # coordinated, not bypassed
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_shim_does_not_cover_os_open_or_subprocess(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The documented boundary: os.open/os.write (raw fds) and subprocess/shell
+    redirection bypass the shim — the bytes land but the volume never sees them."""
+    target = _seed(tmp_path, rel="data/raw.txt", content=b"orig")
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+            fd = os.open(str(target), os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.write(fd, b"via-os")
+            finally:
+                os.close(fd)
+            subprocess.run(
+                ["sh", "-c", f"printf '+sub' >> {target}"], check=True
+            )
+            assert target.read_bytes() == b"via-os+sub"  # both writes landed on disk
+            # ... but neither was coordinated (the documented NOT-COVERED boundary).
+            assert "data/raw.txt" not in vol._last_committed_hash
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_shim_inert_without_install() -> None:
+    """Without install(), builtins.open / io.open are the real builtins — importing
+    the module has no side effect on open()."""
+    assert builtins.open.__name__ == "open"  # not our 'coherent_open' wrapper
+    assert builtins.open is io.open
+
+
+def test_shim_lost_update_is_denied_through_open(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The teeth, through the shim: B reads v1 via open(); a peer (explicit API,
+    sibling-attached) commits v2; B writes a v1-derived buffer via open() →
+    close() raises fail-closed and the stale bytes never land."""
+    target = _seed(tmp_path, content=b"v1")
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg):
+            # Peer A: explicit API on the same workspace (sibling-attaches to the
+            # coordinator the shim singleton spawned).
+            vol_a = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+            with open(target) as f:  # B reads v1 via the shim -> SHARED@v1
+                b_view = f.read()
+            assert b_view == "v1"
+            vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+            # B writes a v1-derived buffer via open() (never re-read) -> deny on close.
+            with pytest.raises(CoherenceError):
+                with open(target, "w") as f:
+                    f.write(b_view + "-edited-by-B")
+            assert target.read_bytes() == b"v2-from-A"  # stale write did not land
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_shim_reattaches_after_fork(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """After a fork drops the endpoint, the next shim'd open lazily re-attaches
+    under the child's fresh identity (simulated via a direct _after_fork call to
+    avoid forking the coordinator's threads)."""
+    _seed(tmp_path, content=b"v1")
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+            assert vol.is_attached
+            old_sid = vol.session_id
+            vol._after_fork()  # simulate the child-side fork handler
+            assert vol._endpoint is None and vol._needs_reattach
+            with open(tmp_path / "data/shared.txt") as f:  # lazily re-attaches
+                assert f.read() == "v1"
+            assert vol.is_attached  # re-attached
+            assert vol.session_id != old_sid  # fresh identity
     finally:
         stop_coordinator(tmp_path)

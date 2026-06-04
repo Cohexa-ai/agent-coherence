@@ -31,13 +31,17 @@ recovers from the sticky strict deny. The ``install()`` shim (Unit 3) is next.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import hashlib
+import io
 import logging
 import os
 import threading
 import urllib.error
 import uuid
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -49,6 +53,7 @@ from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file,
     tcp_probe,
 )
+from ccs.adapters.claude_code.policy import _matches_any
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
@@ -64,7 +69,7 @@ from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CoherentVolume"]
+__all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 
 
 class CoherentVolume:
@@ -112,6 +117,9 @@ class CoherentVolume:
         self._tick = 0
         self._degradation_count = 0
         self._endpoint: CoordinatorEndpoint | None = None
+        # Set by the fork child-handler so the next read/write re-attaches (the
+        # child cannot re-attach inside the fork handler — see _ensure_attached).
+        self._needs_reattach = False
         # Per-path commit hashes for the Unit 2 write no-op-skip; declared here so
         # the fork handler and reacquire() can reset it.
         self._last_committed_hash: dict[str, str] = {}
@@ -139,8 +147,22 @@ class CoherentVolume:
         with self._lock:
             self._session_id = str(uuid.uuid4())
             self._endpoint = None
+            self._needs_reattach = True
             self._tick = 0
             self._last_committed_hash.clear()
+
+    def _ensure_attached(self) -> None:
+        """Lazily re-attach after a fork dropped the endpoint.
+
+        ``_after_fork`` re-mints identity and clears the endpoint but cannot
+        re-attach in the fork handler (the coordinator-client context is the
+        parent's). The child's first ``read``/``write`` re-attaches here,
+        sibling-attaching to the coordinator under the child's fresh identity.
+        A no-op outside the post-fork window.
+        """
+        if self._endpoint is None and self._needs_reattach:
+            self._needs_reattach = False
+            self._attach_with_strict()
 
     @property
     def session_id(self) -> str:
@@ -293,12 +315,13 @@ class CoherentVolume:
         ``CoherenceError`` — a read whose coherence cannot be registered fails
         closed.
         """
+        self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         # Stat before registering so a missing file raises rather than seeding a
         # phantom artifact in the coordinator registry.
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {rel}")
-        data = abs_path.read_bytes()  # empty file -> b"" -> sha256(b"")
+        data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -338,6 +361,7 @@ class CoherentVolume:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("CoherentVolume.write expects bytes")
         data = bytes(data)
+        self._ensure_attached()
         abs_path, rel = self._to_relative(path)
 
         if self._endpoint is None:
@@ -421,14 +445,40 @@ class CoherentVolume:
     def _sha256_bytes(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
+    @staticmethod
+    def _read_file_bytes(abs_path: Path) -> bytes:
+        """Read a file via raw ``os.read`` (NOT ``builtins.open``), so the
+        volume's own I/O is never self-intercepted by the ``install()``
+        open()-shim (which patches ``builtins.open`` / ``io.open`` only — a
+        ``read_bytes`` here would recurse back into the shim)."""
+        fd = os.open(abs_path, os.O_RDONLY)
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
     def _atomic_write(self, abs_path: Path, data: bytes) -> None:
-        """Durable, atomic replace: write a sibling temp, fsync, ``os.replace``."""
+        """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT
+        ``builtins.open``), so the volume's own I/O is never self-intercepted by
+        the ``install()`` open()-shim — an ``open(tmp, "wb")`` here would route
+        the temp file (it matches the managed glob) back through the shim and
+        recurse infinitely."""
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = abs_path.with_name(f"{abs_path.name}.{self._session_id}.tmp")
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, abs_path)
 
     def _post(self, endpoint_path: str, payload: dict) -> dict | None:
@@ -509,3 +559,195 @@ class CoherentVolume:
                 stacklevel=3,
             )
             logger.warning("CoherentVolume degraded under on_error='degrade': %s", message)
+
+
+# ----------------------------------------------------------------------
+# install() — opt-in builtins.open / io.open shim (Unit 3, demo-grade)
+# ----------------------------------------------------------------------
+#
+# Routes opens of *managed* paths through a process-singleton CoherentVolume so
+# existing code gets coherence without changing its open()/pathlib calls. This
+# is a DEMO-GRADE convenience layer; the explicit CoherentVolume read/write/
+# reacquire API is the supported primitive. Coverage matrix (single-host, one
+# process + its forks):
+#
+#   COORDINATED   builtins.open(p, "r"|"rb"|"w"|"wb") for a managed path, and
+#                 pathlib Path.open / read_text / write_text / read_bytes /
+#                 write_bytes — they call io.open, which we patch ALONGSIDE
+#                 builtins.open (patching builtins.open alone does NOT catch
+#                 pathlib; verified empirically).
+#   NOT COVERED   os.open / os.write (raw fds), subprocess / shell redirection
+#                 ("echo >> p"), mmap, C-level writes, and append / update /
+#                 exclusive modes ("a", "r+", "x") — all delegate to the
+#                 original open() unchanged.
+#
+# Recovery: a managed read() through the shim registers a SHARED view, so a peer
+# commit makes the next shim'd write fail closed (raises out of close()). The
+# deny is STICKY — a bare re-open for read does NOT clear it; recovery uses the
+# explicit volume.reacquire() (the shim deliberately keeps open() semantics
+# simple rather than auto-refetching, which would defeat the guard).
+
+
+class _CommitOnCloseMixin:
+    """In-memory write buffer that commits through the volume on ``close()``.
+
+    A stale-view deny raises out of ``close()`` (fail-closed), so a
+    ``with open(p, "w") as f: ...`` block surfaces the lost-update guard. The
+    bytes never touch disk except via the volume's atomic write.
+    """
+
+    _volume: CoherentVolume
+    _rel: str
+    _encoding: str | None  # None => binary mode
+    _committed: bool
+
+    def close(self) -> None:  # type: ignore[override]
+        if self._committed or self.closed:  # type: ignore[attr-defined]
+            super().close()  # type: ignore[misc]
+            return
+        self._committed = True
+        try:
+            payload = self.getvalue()  # type: ignore[attr-defined]
+            if self._encoding is not None:
+                payload = payload.encode(self._encoding)
+            self._volume.write(self._rel, payload)
+        finally:
+            super().close()  # type: ignore[misc]
+
+
+class _CoherentBytesWriter(_CommitOnCloseMixin, io.BytesIO):
+    def __init__(self, volume: CoherentVolume, rel: str) -> None:
+        io.BytesIO.__init__(self)
+        self._volume = volume
+        self._rel = rel
+        self._encoding = None
+        self._committed = False
+
+
+class _CoherentTextWriter(_CommitOnCloseMixin, io.StringIO):
+    def __init__(self, volume: CoherentVolume, rel: str, encoding: str) -> None:
+        io.StringIO.__init__(self)
+        self._volume = volume
+        self._rel = rel
+        self._encoding = encoding
+        self._committed = False
+
+
+class _ShimState:
+    """Process-global state for the installed shim (one workspace per process)."""
+
+    def __init__(self, volume: CoherentVolume, original_open: Callable) -> None:
+        self.volume = volume
+        self.original_open = original_open
+
+
+_shim_state: _ShimState | None = None
+
+
+def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
+    """Return the workspace-relative posix path if ``file`` is a managed path
+    under the volume root, else ``None`` (→ delegate to the original open()).
+
+    Never raises: an fd int, a bytes path, an outside-root or unresolvable path
+    all fall back to ``None`` so the original open() handles them unchanged.
+    """
+    if isinstance(file, int):  # raw fd — not a path
+        return None
+    try:
+        raw = os.fspath(file)
+    except TypeError:
+        return None
+    if not isinstance(raw, str):  # bytes path — demo-grade: delegate
+        return None
+    try:
+        # Resolve like builtins.open (relative → against CWD), then require it be
+        # under the volume root.
+        rel = Path(raw).resolve().relative_to(volume._root).as_posix()
+    except (ValueError, OSError):
+        return None
+    # Use the coordinator's own glob matcher so the shim's notion of "managed" is
+    # exactly the coordinator's tracked set (handles ``**`` segment globs).
+    return rel if _matches_any(rel, volume._managed) else None
+
+
+def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Callable:
+    def coherent_open(file, mode="r", *args, **kwargs):
+        rel = _managed_rel(volume, file)
+        if rel is None:
+            return original_open(file, mode, *args, **kwargs)
+        # Demo-grade: only plain read / truncating-write are mediated. Append,
+        # update ("+"), and exclusive ("x") modes delegate unchanged.
+        if "+" in mode or "a" in mode or "x" in mode:
+            return original_open(file, mode, *args, **kwargs)
+        if "w" in mode:
+            if "b" in mode:
+                return _CoherentBytesWriter(volume, rel)
+            return _CoherentTextWriter(volume, rel, kwargs.get("encoding") or "utf-8")
+        if "r" in mode:
+            # Register the SHARED view (raises FileNotFoundError if missing, like
+            # open()), then return a real handle over the same on-disk bytes.
+            volume.read(rel)
+            return original_open(file, mode, *args, **kwargs)
+        return original_open(file, mode, *args, **kwargs)
+
+    return coherent_open
+
+
+def install(
+    root: str | os.PathLike[str],
+    *,
+    managed: tuple[str, ...] = (),
+    on_error: Literal["strict", "degrade"] = "strict",
+    config: LifecycleConfig | None = None,
+    bind_host: str = "127.0.0.1",
+) -> CoherentVolume:
+    """Patch ``builtins.open`` + ``io.open`` to route managed-path opens through
+    a process-singleton :class:`CoherentVolume`. Idempotent — a second call
+    returns the already-installed volume (one workspace per process in v1).
+    Reverse with :func:`uninstall`, or use the :func:`coherent_workspace` context
+    manager. Opt-in and demo-grade — see the coverage matrix above.
+    """
+    global _shim_state
+    if _shim_state is not None:
+        return _shim_state.volume
+    volume = CoherentVolume(
+        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+    )
+    original_open = builtins.open  # is io.open (same object) at install time
+    wrapper = _make_open_wrapper(volume, original_open)
+    builtins.open = wrapper  # type: ignore[assignment]
+    io.open = wrapper  # type: ignore[assignment]  # pathlib routes here, not builtins.open
+    _shim_state = _ShimState(volume, original_open)
+    return volume
+
+
+def uninstall() -> None:
+    """Restore the original ``builtins.open`` / ``io.open``. Idempotent."""
+    global _shim_state
+    if _shim_state is None:
+        return
+    builtins.open = _shim_state.original_open  # type: ignore[assignment]
+    io.open = _shim_state.original_open  # type: ignore[assignment]
+    _shim_state = None
+
+
+@contextlib.contextmanager
+def coherent_workspace(
+    root: str | os.PathLike[str],
+    *,
+    managed: tuple[str, ...] = (),
+    on_error: Literal["strict", "degrade"] = "strict",
+    config: LifecycleConfig | None = None,
+    bind_host: str = "127.0.0.1",
+):
+    """Context manager wrapping :func:`install`/:func:`uninstall`; yields the
+    process-singleton :class:`CoherentVolume`. Guarantees the ``open()`` patch is
+    reversed on exit even if the body raises.
+    """
+    volume = install(
+        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+    )
+    try:
+        yield volume
+    finally:
+        uninstall()
