@@ -247,3 +247,67 @@ def test_load_scenario_rejects_busy_until_tick_not_after_tick(tmp_path: Path) ->
 
     with pytest.raises(ScenarioValidationError, match="until_tick"):
         load_scenario(str(scenario_path))
+
+
+# ---- Unit 2: source_mutation schema ----------------------------------------
+
+
+def test_load_scenario_without_source_mutation_block_uses_defaults(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "no-sm.yaml"
+    payload = _minimal_scenario_payload()
+    _write_yaml(scenario_path, payload)
+
+    config = load_scenario(str(scenario_path))
+    # Block is normalized to an empty mapping; engine reads defaults (disabled).
+    assert config["source_mutation"] == {}
+
+
+def test_load_scenario_with_source_mutation_block_parses(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "with-sm.yaml"
+    payload = _minimal_scenario_payload()
+    payload["source_mutation"] = {"enabled": True, "answer_sensitivity": 0.25}
+    _write_yaml(scenario_path, payload)
+
+    config = load_scenario(str(scenario_path))
+    assert config["source_mutation"]["enabled"] is True
+    assert config["source_mutation"]["answer_sensitivity"] == 0.25
+
+
+def test_load_scenario_rejects_non_bool_source_mutation_enabled(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-sm-enabled.yaml"
+    payload = _minimal_scenario_payload()
+    payload["source_mutation"] = {"enabled": "yes"}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="enabled"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_answer_sensitivity_above_one(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-sm-high.yaml"
+    payload = _minimal_scenario_payload()
+    payload["source_mutation"] = {"answer_sensitivity": 1.5}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="answer_sensitivity"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_answer_sensitivity_below_zero(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-sm-low.yaml"
+    payload = _minimal_scenario_payload()
+    payload["source_mutation"] = {"answer_sensitivity": -0.1}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="answer_sensitivity"):
+        load_scenario(str(scenario_path))
+
+
+def test_load_scenario_rejects_non_numeric_answer_sensitivity(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "bad-sm-type.yaml"
+    payload = _minimal_scenario_payload()
+    payload["source_mutation"] = {"answer_sensitivity": "high"}
+    _write_yaml(scenario_path, payload)
+
+    with pytest.raises(ScenarioValidationError, match="answer_sensitivity"):
+        load_scenario(str(scenario_path))

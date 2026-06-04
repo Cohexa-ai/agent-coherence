@@ -50,6 +50,10 @@ class AggregatedMetrics:
     invalidation_efficiency_std: float
     message_overhead_mean: float
     message_overhead_std: float
+    source_refetches_mean: float
+    source_refetches_std: float
+    wasted_refetches_mean: float
+    wasted_refetches_std: float
 
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-safe dictionary payload."""
@@ -83,6 +87,10 @@ def aggregate_strategy_runs(strategy: str, runs: Sequence[SimulationMetrics]) ->
         invalidation_efficiency_std=_std([m.invalidation_efficiency for m in runs]),
         message_overhead_mean=_mean([float(m.message_overhead) for m in runs]),
         message_overhead_std=_std([float(m.message_overhead) for m in runs]),
+        source_refetches_mean=_mean([float(m.source_refetches) for m in runs]),
+        source_refetches_std=_std([float(m.source_refetches) for m in runs]),
+        wasted_refetches_mean=_mean([float(m.wasted_refetches) for m in runs]),
+        wasted_refetches_std=_std([float(m.wasted_refetches) for m in runs]),
     )
 
 

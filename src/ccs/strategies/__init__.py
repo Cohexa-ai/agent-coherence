@@ -5,6 +5,7 @@
 
 from .access_count import AccessCountStrategy
 from .base import SyncStrategy
+from .blind_cache import BlindCacheStrategy
 from .broadcast import BroadcastStrategy
 from .eager import EagerStrategy
 from .lazy import LazyStrategy
@@ -13,6 +14,7 @@ from .selector import build_strategy, select_strategy_name_for_role
 
 __all__ = [
     "SyncStrategy",
+    "BlindCacheStrategy",
     "BroadcastStrategy",
     "EagerStrategy",
     "LazyStrategy",
