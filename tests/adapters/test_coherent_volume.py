@@ -148,3 +148,252 @@ def test_foreign_coordinator_degrade_warns(tmp_path: Path, fast_cfg: LifecycleCo
         assert vol.is_degraded
     finally:
         stop_coordinator(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Unit 2 — sequential enforce-on-INVALID read/write/reacquire contract.
+#
+# The teeth: a write from a holder that a peer commit invalidated is DENIED
+# (fail-closed). These tests use a FIXED stale buffer — bytes computed from the
+# view read BEFORE the peer commit, never re-read — i.e. the OpenViktor cron
+# lost-update shape. A refetch-safe "re-read then write" arm would pass even if
+# the deny were broken (it would silently re-fetch fresh bytes), so it proves
+# nothing; only the fixed-stale-buffer shape actually exercises the deny. See
+# docs/solutions/best-practices/
+#   coordinator-invalidation-not-mutex-honest-coherence-claims-2026-06-04.md.
+# ---------------------------------------------------------------------------
+
+
+def _seed(tmp_path: Path, rel: str = "data/shared.txt", content: bytes = b"v1") -> Path:
+    """Create a tracked file under the workspace; return its absolute path."""
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
+def _pair(tmp_path: Path, cfg: LifecycleConfig) -> tuple[CoherentVolume, CoherentVolume]:
+    """Two volumes sharing one workspace + coordinator: A spawns it (writing the
+    strict policy), B sibling-attaches to the strict coordinator A spawned."""
+    vol_a = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
+    vol_b = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
+    return vol_a, vol_b
+
+
+def test_sibling_volume_attaches_to_strict_coordinator(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The fleet case: two volumes on one workspace both attach with strict
+    enforced. The second must NOT trip the foreign-coordinator guard — a sibling
+    appliance enabled strict, so attaching (rather than failing closed) is
+    correct. A truly foreign coordinator without strict still fails closed
+    (covered by test_foreign_coordinator_strict_raises)."""
+    _seed(tmp_path)
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol_a.is_attached and vol_b.is_attached
+        assert vol_a.strict_mode_active() and vol_b.strict_mode_active()
+        assert vol_a.session_id != vol_b.session_id
+        assert not vol_a.is_degraded and not vol_b.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fixed_stale_buffer_write_is_denied(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """THE TEETH. A reads v1, B reads v1, A commits v2 (B -> INVALID), then B
+    writes a buffer it computed from v1 WITHOUT re-reading -> the coordinator
+    denies the write and write() raises. The stale bytes never land."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol_a.read("data/shared.txt") == b"v1"
+        b_view = vol_b.read("data/shared.txt")
+        assert b_view == b"v1"
+        # B captures a write derived from its v1 view (the lost-update shape).
+        b_stale_buffer = b_view + b"\nappended-by-B"
+
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+        assert target.read_bytes() == b"v2-from-A"
+
+        with pytest.raises(CoherenceError):
+            vol_b.write("data/shared.txt", b_stale_buffer)  # DENIED
+
+        # The deny actually protected the file — the stale write did not land.
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_strict_deny_is_sticky_bare_read_does_not_recover(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """KTD-T: once INVALID, a bare read() returns fresh bytes but does NOT clear
+    INVALID — a subsequent write is still denied, with byte-stable deny text
+    across retries (a bare re-read is more robust than an auto-refetch would
+    be; recovery requires reacquire())."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        vol_b.read("data/shared.txt")
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+
+        # Bare re-read returns the current bytes ...
+        assert vol_b.read("data/shared.txt") == b"v2-from-A"
+        # ... but does NOT clear INVALID: the write is still denied.
+        with pytest.raises(CoherenceError) as first:
+            vol_b.write("data/shared.txt", b"v3-attempt-1")
+        with pytest.raises(CoherenceError) as second:
+            vol_b.write("data/shared.txt", b"v3-attempt-2")
+        # Byte-stable deny reason across retries (KTD-P — the model's retry loop
+        # relies on this; regenerating it worsens retries).
+        assert str(first.value) == str(second.value)
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_recovers_then_write_succeeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """RECOVERY: reacquire() re-mints identity AND does a mandatory fresh read
+    (atomically), clearing INVALID. A write from the returned fresh bytes then
+    succeeds — no lost update."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        vol_b.read("data/shared.txt")
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+
+        with pytest.raises(CoherenceError):
+            vol_b.write("data/shared.txt", b"stale")  # denied
+
+        old_session = vol_b.session_id
+        fresh = vol_b.reacquire("data/shared.txt")
+        assert fresh == b"v2-from-A"  # mandatory fresh read returns current bytes
+        assert vol_b.session_id != old_session  # identity re-minted
+
+        # Write rebased on the fresh bytes -> granted.
+        vol_b.write("data/shared.txt", fresh + b"\nrebased-by-B")
+        assert target.read_bytes() == b"v2-from-A\nrebased-by-B"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_first_time_writer_is_not_denied(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Negative control / boundary: strict mode denies an INVALID (preempted)
+    writer, NOT a first-time writer. A write to a path this instance never read
+    is granted — the strict intent is 'must re-read after preemption', not
+    'must read before any write'."""
+    _seed(tmp_path)  # ensure data/ exists so the managed glob spawns a coordinator
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/brand-new.txt", b"hello")  # never read -> granted
+        assert (tmp_path / "data/brand-new.txt").read_bytes() == b"hello"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_then_ignoring_fresh_bytes_is_not_caught(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """HONEST BOUNDARY (documented, not a bug): after reacquire() returns fresh
+    bytes, a caller that IGNORES them and writes a buffer computed earlier is
+    NOT caught — no layer (OCC included) catches 'wrote from a buffer older than
+    the read'. v1's honest scope is 'write from the bytes read()/reacquire()
+    returned'. This pins the ceiling so a future reader doesn't mistake it for a
+    regression."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        b_v1_view = vol_b.read("data/shared.txt")
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+        vol_b.reacquire("data/shared.txt")  # B current again — but ignores the result
+        # B writes a buffer derived from the STALE v1 view -> NOT caught.
+        vol_b.write("data/shared.txt", b_v1_view + b"\nignored-reacquire")
+        assert target.read_bytes() == b"v1\nignored-reacquire"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_read_missing_file_raises_filenotfound(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """read() stats before registering: a missing file raises FileNotFoundError
+    and seeds no phantom artifact in the coordinator."""
+    _seed(tmp_path)  # ensure data/ exists so a coordinator spawns
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(FileNotFoundError):
+            vol.read("data/missing.txt")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_read_empty_file_then_write(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """An empty file reads as b'' (sha256(b'')), and a subsequent write from the
+    same instance is granted (no spurious deny on the empty-hash seed)."""
+    _seed(tmp_path, rel="data/empty.txt", content=b"")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.read("data/empty.txt") == b""
+        vol.write("data/empty.txt", b"now-full")
+        assert (tmp_path / "data/empty.txt").read_bytes() == b"now-full"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_identical_rewrite_skips_filesystem_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-op skip: rewriting the exact bytes this instance last committed, while
+    holding a fresh grant, skips the os.replace (no filesystem churn) but still
+    finalizes the coordinator grant (so the EXCLUSIVE grant is not leaked)."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path, rel="data/x.txt", content=b"orig")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"committed")  # establishes last_committed_hash
+        assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
+
+        calls = {"n": 0}
+        real_replace = cv_mod.os.replace
+
+        def counting_replace(src: object, dst: object) -> None:
+            calls["n"] += 1
+            real_replace(src, dst)
+
+        monkeypatch.setattr(cv_mod.os, "replace", counting_replace)
+        vol.write("data/x.txt", b"committed")  # identical bytes -> no-op skip
+        assert calls["n"] == 0  # os.replace NOT called the second time
+        assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_deny_raises_even_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A coordinator deny is enforcement WORKING, not an infrastructure failure,
+    so write() raises on deny in BOTH on_error modes. on_error governs only
+    infra failures (unavailable coordinator, watchdog timeout) — not the deny."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    vol_b = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        vol_b.read("data/shared.txt")
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+        with pytest.raises(CoherenceError):
+            vol_b.write("data/shared.txt", b"stale")  # deny still raises in degrade mode
+        assert not vol_b.is_degraded  # the deny did not register as infra degradation
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
