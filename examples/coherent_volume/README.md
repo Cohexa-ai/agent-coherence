@@ -30,6 +30,12 @@ denied until the writer re-reads. The scope is deliberately narrow and exact:
 - **Boundary** — a writer that re-reads the fresh bytes and then writes a buffer
   it computed *before* that read is not caught by any layer (the honest claim is
   "write from the bytes `read()`/`reacquire()` returned").
+- **Requirement (hard)** — every instance coordinating a workspace MUST declare
+  the **same** `managed` globs. Strict enforcement is verified only coarsely (the
+  coordinator exposes a strict-pattern *count*, not the patterns), so a fleet
+  member whose globs differ from the spawner's is **silently unprotected** — its
+  stale writes land **with no signal** (`is_degraded` stays `False`). Treat a
+  shared managed set as a hard requirement; a precise per-glob check is v1.1.
 
 ## Files
 
@@ -81,3 +87,11 @@ Coverage matrix (demo-grade, single-host): coordinates `builtins.open` and
 `pathlib` (`Path.open`/`read_text`/`write_text`/`read_bytes`/`write_bytes`); does
 **not** cover `os.open`/`os.write`, `subprocess`/shell redirection, or
 append/update/exclusive modes. Recovery still uses the explicit `reacquire()`.
+
+**Known demo-grade caveats (deferred to v1.1).** Prefer the explicit API for
+anything beyond a demo. Specifically: a managed read double-opens the file (a
+peer write in the tiny window between the two opens can register a stale hash);
+`install()` called twice with a *different* root silently returns the first
+volume; and a write is committed on **close**, so always use a `with` block — a
+writer that is never closed may not commit. (A `with` block whose body raises
+correctly discards the buffer rather than committing a partial write.)

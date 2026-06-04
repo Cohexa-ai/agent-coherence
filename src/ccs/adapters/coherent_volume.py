@@ -41,7 +41,7 @@ import threading
 import urllib.error
 import uuid
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Literal
 
@@ -90,6 +90,15 @@ class CoherentVolume:
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
+
+    **Fleet requirement (hard, v1).** Every instance coordinating a given
+    workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
+    verified only coarsely (the coordinator's ``/status`` exposes a strict-pattern
+    *count*, not the patterns), so a sibling whose globs **differ** from the
+    spawner's passes construction yet its own paths are **not** strict — its stale
+    writes then land **with no signal** (``is_degraded`` stays ``False``). A
+    precise per-glob check needs coordinator support; until then a
+    heterogeneous-globs fleet is unsupported (v1.1).
     """
 
     def __init__(
@@ -114,7 +123,6 @@ class CoherentVolume:
         self._bind_host = bind_host
 
         self._lock = threading.Lock()
-        self._tick = 0
         self._degradation_count = 0
         self._endpoint: CoordinatorEndpoint | None = None
         # Set by the fork child-handler so the next read/write re-attaches (the
@@ -148,7 +156,6 @@ class CoherentVolume:
             self._session_id = str(uuid.uuid4())
             self._endpoint = None
             self._needs_reattach = True
-            self._tick = 0
             self._last_committed_hash.clear()
 
     def _ensure_attached(self) -> None:
@@ -217,9 +224,14 @@ class CoherentVolume:
         #     case (two volumes coordinating one workspace): attaching is correct
         #   * a foreign coordinator (e.g. a Claude Code session) -> strict OFF and
         #     we cannot enable it (load-once) -> fail closed.
-        # NB: strict_mode_active() is a coarse "any strict pattern present" check
-        # (the /status summary exposes only a count). v1 assumes a fleet shares
-        # one managed set per workspace; a heterogeneous-globs fleet is v1.1.
+        # NB: strict_mode_active() is a COARSE "any strict pattern present" check
+        # (the /status summary exposes only a count, not the patterns). HARD v1
+        # REQUIREMENT: every instance coordinating a workspace must declare the
+        # SAME managed globs. A sibling whose globs differ from the spawner's
+        # passes this check (count > 0 from the spawner's globs) yet its own paths
+        # are NOT strict — its stale writes then land with NO signal (is_degraded
+        # stays False). A precise per-glob check needs coordinator support; until
+        # then a heterogeneous-globs fleet is unsupported (v1.1).
         if self._managed and not self.strict_mode_active():
             self._fail_closed_or_degrade(
                 "attached to a coordinator that does not enforce strict mode for the "
@@ -230,6 +242,11 @@ class CoherentVolume:
                 "(v1.1). In degrade mode the volume operates best-effort with coherence "
                 "enforcement off."
             )
+            # Degrade mode fell through (strict raised above). Do NOT keep a live
+            # endpoint to a coordinator that does not enforce our paths — that
+            # would route reads/writes through a non-strict coordinator while
+            # is_attached reported True. Mirror the other two degrade branches.
+            self._endpoint = None
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.
@@ -259,7 +276,10 @@ class CoherentVolume:
         if merged == sorted(existing):
             return  # nothing new — avoid a needless rewrite
         # Atomic write so a concurrent coordinator spawn never reads a partial file.
-        tmp = path.with_name(path.name + ".tmp")
+        # UUID-suffix the temp name (like _atomic_write) so a predictable ``.tmp``
+        # path can't be pre-placed as a symlink by a local same-uid process (the
+        # write_text would otherwise follow it).
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(yaml.safe_dump(merged, default_flow_style=False), encoding="utf-8")
         os.replace(tmp, path)
 
@@ -340,7 +360,7 @@ class CoherentVolume:
                 )
         return data
 
-    def write(self, path: str | os.PathLike[str], data: bytes) -> None:
+    def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
         """Write bytes to a workspace file under the single-writer guard.
 
         Prevents the **sequential** stale-read→write lost update: if a peer
@@ -381,7 +401,20 @@ class CoherentVolume:
         # grant means the file already has them — skip the os.replace (no
         # filesystem churn) but still finalize the grant via post-edit below.
         if self._last_committed_hash.get(rel) != new_hash:
-            self._atomic_write(abs_path, data)
+            try:
+                self._atomic_write(abs_path, data)
+            except OSError:
+                # The FS write failed AFTER pre-edit granted EXCLUSIVE. Release the
+                # grant via the coordinator's tool-failure path so it is not
+                # orphaned until the sweep, then re-raise the original error.
+                # Best-effort release — a release failure must not mask the OSError.
+                with contextlib.suppress(Exception):
+                    _coordinator_post(
+                        self._endpoint,
+                        "/hooks/post-edit",
+                        {"session_id": self._session_id, "path": rel, "success": False},
+                    )
+                raise
 
         post_resp = self._post(
             "/hooks/post-edit",
@@ -471,15 +504,22 @@ class CoherentVolume:
         recurse infinitely."""
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = abs_path.with_name(f"{abs_path.name}.{self._session_id}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, abs_path)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, abs_path)
+        except OSError:
+            # Don't leave an orphan temp on a failed write; re-raise so write()
+            # releases the grant and propagates the error.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     def _post(self, endpoint_path: str, payload: dict) -> dict | None:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses
@@ -536,11 +576,6 @@ class CoherentVolume:
     @property
     def degradation_count(self) -> int:
         return self._degradation_count
-
-    def _next_tick(self) -> int:
-        with self._lock:
-            self._tick += 1
-            return self._tick
 
     def _fail_closed_or_degrade(self, message: str) -> None:
         """Strict → raise (fail-closed); degrade → warn once + count."""
@@ -600,6 +635,16 @@ class _CommitOnCloseMixin:
     _rel: str
     _encoding: str | None  # None => binary mode
     _committed: bool
+
+    def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore[override]
+        # If the ``with`` body raised, DISCARD the buffered write rather than
+        # commit a partial/abandoned buffer. No coordinator grant was acquired
+        # (the EXCLUSIVE acquire happens inside volume.write, only on a clean
+        # commit in close()), so there is nothing to release — skipping the
+        # commit is sufficient and leaks nothing.
+        if exc_type is not None:
+            self._committed = True
+        return super().__exit__(exc_type, exc_val, exc_tb)  # type: ignore[misc]
 
     def close(self) -> None:  # type: ignore[override]
         if self._committed or self.closed:  # type: ignore[attr-defined]
@@ -739,15 +784,21 @@ def coherent_workspace(
     on_error: Literal["strict", "degrade"] = "strict",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
-):
+) -> Iterator[CoherentVolume]:
     """Context manager wrapping :func:`install`/:func:`uninstall`; yields the
     process-singleton :class:`CoherentVolume`. Guarantees the ``open()`` patch is
     reversed on exit even if the body raises.
+
+    Reentrant-safe: if a shim is already installed (e.g. a nested
+    ``coherent_workspace``), this yields the existing volume and does NOT
+    uninstall on exit — the outer context owns the patch.
     """
+    already_installed = _shim_state is not None
     volume = install(
         root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
     )
     try:
         yield volume
     finally:
-        uninstall()
+        if not already_installed:
+            uninstall()

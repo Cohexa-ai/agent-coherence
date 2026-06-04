@@ -73,7 +73,8 @@ def main() -> int:
         f"  LOST UPDATE: {trace['lost_update']}  "
         f"(final={trace['final_total']}, expected={trace['expected_total']})"
     )
-    return 0
+    # Exit code reflects the invariant so an agent can use this as a gate.
+    return 0 if trace["lost_update"] else 1
 
 
 if __name__ == "__main__":

@@ -543,3 +543,184 @@ def test_shim_reattaches_after_fork(tmp_path: Path, fast_cfg: LifecycleConfig) -
             assert vol.session_id != old_sid  # fresh identity
     finally:
         stop_coordinator(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Code-review regression tests (PR #91): fail-closed completeness, grant-leak
+# safety, the no-op-skip grant finalization, fork/degrade edges, and the shim's
+# exceptional-close discard.
+# ---------------------------------------------------------------------------
+
+
+def _raise_oserror(*_args: object, **_kwargs: object) -> None:
+    raise OSError("simulated filesystem failure")
+
+
+def test_fs_write_failure_releases_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the atomic FS write fails AFTER pre-edit granted EXCLUSIVE, the grant is
+    released via a post-edit success:false (not orphaned until the sweep), and the
+    original OSError propagates."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        posts: list[tuple[str, dict]] = []
+        real_post = cv_mod._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict) -> object:
+            posts.append((path, dict(payload)))
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
+        monkeypatch.setattr(vol, "_atomic_write", _raise_oserror)
+
+        with pytest.raises(OSError):
+            vol.write("data/shared.txt", b"never-lands")
+
+        assert any(
+            p == "/hooks/post-edit" and pay.get("success") is False for p, pay in posts
+        ), "FS-write failure must release the grant via post-edit success=false"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_no_op_skip_still_finalizes_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-op skip (identical bytes) skips the os.replace but MUST still call
+    post-edit to finalize the EXCLUSIVE grant — otherwise the grant leaks. The
+    earlier os.replace-spy test cannot see this failure mode."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path, rel="data/x.txt", content=b"orig")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"same")  # establishes last_committed_hash
+
+        posts: list[str] = []
+        real_post = cv_mod._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict) -> object:
+            posts.append(path)
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
+        vol.write("data/x.txt", b"same")  # identical -> no-op skip
+        assert "/hooks/post-edit" in posts, "no-op skip must still finalize the grant"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_fails_closed_on_watchdog_degrade(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watchdog-timeout degrade ({ok:true, degraded:true}) at pre-edit is an
+    infra failure → in strict mode write() fails closed (raises), it does NOT
+    proceed. Covers the degrade branch of _check_grant during an active write."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    try:
+        def fake_post(endpoint: object, path: str, payload: dict) -> dict:
+            if path == "/hooks/pre-edit":
+                return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+            return {"ok": True}
+
+        monkeypatch.setattr(cv_mod, "_coordinator_post", fake_post)
+        with pytest.raises(CoherenceError):
+            vol.write("data/shared.txt", b"x")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_shim_exceptional_close_discards_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A `with open(p,'w') as f: ...` block whose body raises DISCARDS the
+    buffered write rather than committing a partial/abandoned buffer (and leaks no
+    grant — the acquire only happens on a clean commit)."""
+    target = _seed(tmp_path, content=b"v1")
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg):
+            with pytest.raises(RuntimeError):
+                with open(target, "w") as f:
+                    f.write("garbage-must-not-commit")
+                    raise RuntimeError("boom")
+            assert target.read_bytes() == b"v1"  # buffer discarded, file unchanged
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_degrade_foreign_coordinator_drops_endpoint(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Under on_error='degrade', attaching to a foreign non-strict coordinator
+    must drop the endpoint (not stay attached to a coordinator that can't enforce
+    the managed paths while is_attached reports True)."""
+    port = ensure_coordinator(tmp_path, config=fast_cfg)  # foreign: no strict yaml
+    assert port > 0
+    try:
+        with pytest.warns(CoherenceDegradedWarning):
+            vol = CoherentVolume(
+                tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+            )
+        assert vol.is_degraded
+        assert not vol.is_attached  # endpoint dropped — no false sense of coordination
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_nested_coherent_workspace_keeps_outer_shim(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A nested coherent_workspace must NOT uninstall the outer shim on inner
+    exit — the outer context owns the patch."""
+    _seed(tmp_path)
+    try:
+        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg):
+            outer_open = builtins.open
+            assert outer_open.__name__ == "coherent_open"  # outer installed
+            with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg):
+                pass  # inner exit must NOT uninstall
+            assert builtins.open is outer_open  # outer shim still active
+        assert builtins.open.__name__ == "open"  # outer exit restores
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_rejects_non_bytes(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """write() rejects non-bytes input with TypeError (the bytes|bytearray contract)."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(TypeError):
+            vol.write("data/shared.txt", "a string, not bytes")  # type: ignore[arg-type]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_accepts_bytearray(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """write() accepts bytearray (matches the bytes|bytearray annotation)."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/shared.txt", bytearray(b"from-bytearray"))
+        assert target.read_bytes() == b"from-bytearray"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_read_outside_root_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A path that escapes the workspace root raises CoherenceError (not a silent
+    coordinate-the-wrong-file)."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(CoherenceError):
+            vol.read("/etc/hostname")  # absolute, outside the workspace root
+    finally:
+        stop_coordinator(tmp_path)
