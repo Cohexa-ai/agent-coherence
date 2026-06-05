@@ -36,6 +36,9 @@ def build_strategy(
 ) -> SyncStrategy:
     """Create strategy instance from normalized strategy name."""
     normalized = strategy_name.strip().lower()
+    # Benchmark-internal cost floor (unbounded staleness) — intentionally absent
+    # from ``ccs.strategies.__all__``; resolvable here only so the temporal cost
+    # sweep can name it. Not a production strategy.
     if normalized == "blind":
         return BlindCacheStrategy()
     if normalized == "broadcast":

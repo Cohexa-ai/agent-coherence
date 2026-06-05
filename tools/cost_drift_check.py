@@ -35,6 +35,11 @@ _EXPECTED_PATH = _REPO_ROOT / "benchmarks" / "expected_cost.json"
 # Strict >; a delta exactly at the threshold passes (mirrors benchmark_drift_check).
 _SAVINGS_THRESHOLD = 0.02  # absolute, on the [0, 1] savings_ratio
 _AVOIDED_THRESHOLD = 2.0  # absolute, on the mean refetches_avoided count
+# savings_ratio is sensitivity-invariant by design (gating re-fetches on EVERY
+# source change regardless of answer-relevance), so wasted_refetches is the only
+# metric that moves along the answer_sensitivity axis -- gate it or that whole
+# second axis is unguarded in CI.
+_WASTED_THRESHOLD = 2.0  # absolute, on the mean wasted_refetches count
 
 
 def check_drift(latest_path: Path, expected_path: Path) -> tuple[bool, list[str]]:
@@ -61,6 +66,12 @@ def check_drift(latest_path: Path, expected_path: Path) -> tuple[bool, list[str]
     # baseline (cells under "cells"). Both key on "cell".
     latest_by_cell = {row["cell"]: row for row in latest_data.get("rows", [])}
     expected_by_cell = {cell["cell"]: cell for cell in expected_data.get("cells", [])}
+
+    if not expected_by_cell:
+        return False, [
+            f"ERROR: {expected_path} has no cells — regenerate the baseline from a "
+            "`make cost-benchmark` run before gating.",
+        ]
 
     errors: list[str] = []
 
@@ -96,6 +107,7 @@ def check_drift(latest_path: Path, expected_path: Path) -> tuple[bool, list[str]
         for metric, threshold in (
             ("savings_ratio", _SAVINGS_THRESHOLD),
             ("refetches_avoided", _AVOIDED_THRESHOLD),
+            ("wasted_refetches", _WASTED_THRESHOLD),
         ):
             exp = float(expected_cell[metric])
             act = float(latest_cell[metric])
@@ -127,9 +139,13 @@ def check_drift(latest_path: Path, expected_path: Path) -> tuple[bool, list[str]
 
 def main() -> None:
     passed, messages = check_drift(_LATEST_PATH, _EXPECTED_PATH)
-    stream = sys.stdout if passed else sys.stderr
+    # The full report always goes to stdout (so a CI job capturing stdout sees the
+    # table on pass AND on fail, mirroring tools/benchmark_drift_check.py); stderr
+    # carries only the terminal failure signal alongside the non-zero exit code.
     for line in messages:
-        print(line, file=stream)
+        print(line)
+    if not passed:
+        print("cost-benchmark-check FAILED (see report above).", file=sys.stderr)
     sys.exit(0 if passed else 1)
 
 

@@ -106,11 +106,14 @@ class SimulationEngine:
             source_mutation_cfg.get("answer_sensitivity", 1.0)
         )
         self._mutation_rng = random.Random(self.seed + _SOURCE_MUTATION_SEED_OFFSET)
-        # Per-tick map {artifact_id: relevant} of source mutations applied this
-        # tick. Unit 3 consumes it; here we only populate/clear it correctly.
-        self._pending_source_mutations: dict[UUID, bool] = {}
-        # Test-only running total of source mutations applied across the run.
-        self._source_mutation_count = 0
+        # Persistent per-(artifact, holder) marker. Presence means the holder has
+        # un-read source churn for that artifact; the value is whether ANY of that
+        # churn was answer-relevant (accumulated by OR). Set when the source
+        # mutates an artifact the agent holds; consumed (deleted) when that holder
+        # re-fetches. Persisting across ticks is what makes attribution correct
+        # when an agent reads only every few ticks (action_probability < 1) under
+        # churn -- a per-tick reset would lose or mis-tag those re-fetches.
+        self._pending_source_mutations: dict[tuple[UUID, UUID], bool] = {}
 
         self._monitor = ConsistencyMonitor(self._strategy)
         self._network = NetworkSimulator(
@@ -326,9 +329,6 @@ class SimulationEngine:
           themselves, which double-invalidate and hardcode trigger="invalidate",
           masking the distinct "source_mutation" state-log label.
         """
-        # Per-tick semantics: reset before populating so the dict reflects only
-        # mutations applied on THIS tick (Unit 3 consumes it each tick).
-        self._pending_source_mutations = {}
         for artifact_id in self._artifact_ids:
             spec = self._artifact_specs_by_id[artifact_id]
             if not bool(spec.get("mutable", True)):
@@ -363,9 +363,19 @@ class SimulationEngine:
                     issued_at_tick=now,
                 )
 
+            # Accumulate per-holder relevance for EVERY agent that currently holds
+            # a cached copy: the holders just invalidated, plus any already-INVALID
+            # from earlier churn they have not re-read yet. A re-fetch is "wasted"
+            # only if NONE of the churn since the holder last fetched was answer-
+            # relevant, so OR the relevance into each holder's marker.
             relevant = self._mutation_rng.random() < self._source_mutation_answer_sensitivity
-            self._pending_source_mutations[artifact_id] = relevant
-            self._source_mutation_count += 1
+            for holder_id, runtime in self._runtime_by_agent.items():
+                if runtime.cache.get(artifact_id) is None:
+                    continue
+                key = (artifact_id, holder_id)
+                self._pending_source_mutations[key] = (
+                    self._pending_source_mutations.get(key, False) or relevant
+                )
 
     def _register_artifacts(self) -> None:
         for artifact_cfg in self._config["artifacts"]:
@@ -436,24 +446,23 @@ class SimulationEngine:
             self._fetch_actions += 1
             self._context_injections += 1
             self._tokens_fetch += self._artifact_token_size(artifact_id)
-            # Source-mutation attribution (Unit 3). A re-fetch is attributed to
-            # a source mutation only when BOTH hold:
-            #   (a) the holder already had a cached copy now sitting at INVALID
-            #       — i.e. this is a genuine re-fetch of an invalidated entry,
-            #       NOT an initial empty-cache fill (entry is None), an
-            #       always_read forced re-read, or a lease-expiry refresh; and
-            #   (b) the artifact was source-mutated THIS tick
-            #       (_pending_source_mutations is reset every tick in Unit 2, so
-            #       membership means "the source just churned this artifact").
-            # The pending entry is intentionally NOT cleared: distinct holders
-            # each re-fetching the same this-tick-mutated artifact are separate,
-            # real re-fetches and all count (each agent acts <=1x/tick, so no
-            # single-agent double-count).
-            relevant = self._pending_source_mutations.get(artifact_id)
+            # Source-mutation attribution. Credit this re-fetch to source churn
+            # only when (a) the holder had a cached copy now sitting at INVALID --
+            # a genuine re-fetch of an invalidated entry, NOT an initial fill
+            # (entry is None), an always_read forced re-read of a still-valid
+            # entry, or a lease-expiry refresh -- and (b) this holder carries an
+            # un-read source-churn marker for the artifact. The marker persists
+            # across ticks (set when the source mutated an artifact this holder
+            # held) and is CONSUMED here, so the holder is credited exactly once
+            # per stretch of un-read churn no matter how many ticks it spanned.
+            # "Wasted" means none of that churn was answer-relevant.
+            key = (artifact_id, agent_id)
+            relevant = self._pending_source_mutations.get(key)
             if relevant is not None and entry is not None and entry.state == MESIState.INVALID:
                 self._source_refetches += 1
                 if relevant is False:
                     self._wasted_refetches += 1
+                del self._pending_source_mutations[key]
         else:
             self._cache_hits += 1
 

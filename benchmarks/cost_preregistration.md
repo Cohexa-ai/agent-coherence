@@ -27,6 +27,14 @@ dependency at realistic change-rates**, or whether it collapses to noise.
 | Avoided | `refetches_avoided` | Absolute re-fetches gating skips vs. always-read. |
 | Waste | `wasted_refetches` | Gating re-fetches that were answer-irrelevant churn. |
 
+**Axis note (by design).** `savings_ratio` and `refetches_avoided` are **invariant
+along the answer-sensitivity axis**: gating re-fetches on *every* source change
+regardless of whether the change was answer-relevant, so the fetch counts depend
+only on change-rate. `wasted_refetches` is therefore the only metric that moves
+with answer-sensitivity, and it is drift-gated in `tools/cost_drift_check.py` so
+the second axis is not left unguarded in CI. A savings PASS/NULL verdict must not
+depend on sensitivity (see the `degenerate-sensitivity-model` distinguisher).
+
 ## Verdicts
 
 ### PASS — gating's savings are materially worth the dependency

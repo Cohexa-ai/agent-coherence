@@ -36,11 +36,17 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data))
 
 
-def _cell(name: str, savings_ratio: float, refetches_avoided: float) -> dict:
+def _cell(
+    name: str,
+    savings_ratio: float,
+    refetches_avoided: float,
+    wasted_refetches: float = 0.0,
+) -> dict:
     return {
         "cell": name,
         "savings_ratio": savings_ratio,
         "refetches_avoided": refetches_avoided,
+        "wasted_refetches": wasted_refetches,
     }
 
 
@@ -227,3 +233,46 @@ def test_cost_preregistration_has_three_verdicts_and_distinguishers():
         "baseline-mis-modeled",
     ):
         assert distinguisher in doc
+
+
+# ---------------------------------------------------------------------------
+# Answer-sensitivity axis is gated (wasted_refetches) + stream routing
+# ---------------------------------------------------------------------------
+
+
+def test_cost_drift_wasted_delta_just_over_threshold_fails(cost_drift_check, tmp_path):
+    """savings/avoided match; only wasted_refetches drifts past its threshold.
+
+    Guards the answer-sensitivity axis -- savings_ratio is sensitivity-invariant
+    by design, so without gating wasted_refetches a sensitivity-axis regression
+    would pass CI silently.
+    """
+    over = cost_drift_check._WASTED_THRESHOLD + 0.01
+    latest = tmp_path / "cost_sweep.json"
+    expected = tmp_path / "expected_cost.json"
+    _write_json(latest, _latest(_cell("r0.5_s0.0", 0.5, 20.0, wasted_refetches=over)))
+    _write_json(expected, _expected(_cell("r0.5_s0.0", 0.5, 20.0, wasted_refetches=0.0)))
+
+    passed, messages = cost_drift_check.check_drift(latest, expected)
+    assert passed is False
+    assert any("wasted_refetches" in m for m in messages)
+
+
+def test_cost_drift_main_routes_report_to_stdout_on_failure(
+    cost_drift_check, tmp_path, monkeypatch, capsys
+):
+    """On failure the drift table goes to stdout (so a CI job capturing stdout
+    sees it), and stderr carries the terminal failure signal."""
+    latest = tmp_path / "cost_sweep.json"
+    expected = tmp_path / "expected_cost.json"
+    _write_json(latest, _latest(_cell("r0.0_s0.0", 0.9000, 87.0)))  # savings drifts
+    _write_json(expected, _expected(_cell("r0.0_s0.0", 0.7952, 87.0)))
+    monkeypatch.setattr(cost_drift_check, "_LATEST_PATH", latest)
+    monkeypatch.setattr(cost_drift_check, "_EXPECTED_PATH", expected)
+
+    with pytest.raises(SystemExit) as exc:
+        cost_drift_check.main()
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "savings_ratio" in captured.out
+    assert "FAILED" in captured.err

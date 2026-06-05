@@ -244,6 +244,8 @@ def test_engine_flag_off_state_log_is_byte_identical_with_or_without_block() -> 
 
 # ---- Unit 4: failure-event injection + sweep wiring -------------------------
 
+from uuid import UUID  # noqa: E402
+
 from ccs.core.states import MESIState  # noqa: E402
 from ccs.core.types import FetchRequest  # noqa: E402
 
@@ -779,7 +781,6 @@ def test_source_mutation_zero_volatility_never_mutates() -> None:
     engine.run()
 
     assert engine._registry.get_artifact(artifact_id).version == start_version
-    assert engine._source_mutation_count == 0
 
 
 def test_source_mutation_immutable_artifact_never_mutates() -> None:
@@ -794,14 +795,12 @@ def test_source_mutation_immutable_artifact_never_mutates() -> None:
     engine.run()
 
     assert engine._registry.get_artifact(artifact_id).version == start_version
-    assert engine._source_mutation_count == 0
 
 
 def test_source_mutation_full_sensitivity_tags_all_relevant() -> None:
     """answer_sensitivity=1.0 ⇒ every mutation is tagged relevant=True."""
-    scenario = _mutation_scenario(enabled=True, volatility=1.0, answer_sensitivity=1.0)
+    scenario = _refetch_scenario(volatility=1.0, answer_sensitivity=1.0)
     engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
-    artifact_id = engine._artifact_ids[0]
 
     seen_relevances: list[bool] = []
     original = engine._apply_source_mutations_for_tick
@@ -819,7 +818,7 @@ def test_source_mutation_full_sensitivity_tags_all_relevant() -> None:
 
 def test_source_mutation_zero_sensitivity_tags_all_irrelevant() -> None:
     """answer_sensitivity=0.0 ⇒ every mutation is tagged relevant=False."""
-    scenario = _mutation_scenario(enabled=True, volatility=1.0, answer_sensitivity=0.0)
+    scenario = _refetch_scenario(volatility=1.0, answer_sensitivity=0.0)
     engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
 
     seen_relevances: list[bool] = []
@@ -836,29 +835,55 @@ def test_source_mutation_zero_sensitivity_tags_all_irrelevant() -> None:
     assert not any(seen_relevances)
 
 
-def test_source_mutation_pending_dict_reflects_only_current_tick() -> None:
-    """`_pending_source_mutations` is per-tick: cleared at the start of each tick.
+def test_source_refetch_attribution_survives_unread_ticks() -> None:
+    """A holder invalidated on an earlier tick is still credited when it finally
+    re-reads (action_probability < 1).
 
-    With volatility=1.0 a single-artifact scenario produces exactly one entry
-    per tick; after the run completes the dict reflects the final tick only.
+    The per-(artifact, holder) marker persists across ticks rather than resetting,
+    so EVERY re-fetch of a source-invalidated entry is counted exactly once --
+    including the ones that lag the invalidating tick (the regime a per-tick reset
+    would mis-count). With no agent writes, INVALID can only come from the source,
+    so ``source_refetches`` must equal the number of reads that found the entry
+    INVALID.
     """
-    scenario = _mutation_scenario(enabled=True, volatility=1.0, duration=4)
-    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
-    artifact_id = engine._artifact_ids[0]
+    scenario = _refetch_scenario(volatility=0.5, answer_sensitivity=0.5, duration=60)
+    # Read sparsely so entries stay INVALID across several mutation ticks before a
+    # holder re-reads.
+    scenario["scenario"]["action_probability"] = 0.4
+    scenario["simulation"]["action_probability"] = 0.4
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=7)
 
-    per_tick_sizes: list[int] = []
-    original = engine._apply_source_mutations_for_tick
+    invalid_entry_reads = 0
+    original = engine._perform_read
 
-    def _spy(now: int) -> None:
-        original(now)
-        per_tick_sizes.append(len(engine._pending_source_mutations))
+    def _spy(*, agent_id: UUID, artifact_id: UUID, now_tick: int) -> None:
+        nonlocal invalid_entry_reads
+        entry = engine._runtime_by_agent[agent_id].cache.get(artifact_id)
+        if entry is not None and entry.state == MESIState.INVALID:
+            invalid_entry_reads += 1
+        original(agent_id=agent_id, artifact_id=artifact_id, now_tick=now_tick)
 
-    engine._apply_source_mutations_for_tick = _spy  # type: ignore[assignment]
-    engine.run()
+    engine._perform_read = _spy  # type: ignore[assignment]
+    metrics = engine.run()
 
-    # Exactly one mutable artifact ⇒ at most one entry per tick, never accumulating.
-    assert per_tick_sizes == [1, 1, 1, 1]
-    assert set(engine._pending_source_mutations) == {artifact_id}
+    assert invalid_entry_reads > 0
+    assert metrics.source_refetches == invalid_entry_reads
+    assert metrics.wasted_refetches <= metrics.source_refetches
+
+
+def test_always_read_does_not_overattribute_source_refetches() -> None:
+    """Under context_model=always_read every read forces a fetch, but only the
+    fetches of source-INVALIDATED entries are credited to the source -- forced
+    re-reads of still-valid entries (and initial fills) are not. So
+    source_refetches stays strictly below the total fetch count. (lease-expiry
+    refreshes are excluded by the same entry.state == INVALID gate.)
+    """
+    scenario = _refetch_scenario(volatility=0.5, answer_sensitivity=0.5, duration=40)
+    scenario["context_semantics"] = {"model": "always_read"}
+    metrics = SimulationEngine(scenario, strategy_name="lazy", seed=5).run()
+
+    assert metrics.fetch_actions > 0
+    assert 0 < metrics.source_refetches < metrics.fetch_actions
 
 
 def test_source_mutation_disabled_run_is_byte_identical_to_no_block() -> None:

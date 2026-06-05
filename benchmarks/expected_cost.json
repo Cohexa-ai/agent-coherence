@@ -17,62 +17,74 @@
     {
       "cell": "r0.0_s0.0",
       "savings_ratio": 0.7884,
-      "refetches_avoided": 88.3
+      "refetches_avoided": 88.3,
+      "wasted_refetches": 0.0
     },
     {
       "cell": "r0.0_s0.5",
       "savings_ratio": 0.7884,
-      "refetches_avoided": 88.3
+      "refetches_avoided": 88.3,
+      "wasted_refetches": 0.0
     },
     {
       "cell": "r0.0_s1.0",
       "savings_ratio": 0.7884,
-      "refetches_avoided": 88.3
+      "refetches_avoided": 88.3,
+      "wasted_refetches": 0.0
     },
     {
       "cell": "r0.25_s0.0",
       "savings_ratio": 0.3694,
-      "refetches_avoided": 42.0
+      "refetches_avoided": 42.0,
+      "wasted_refetches": 54.6
     },
     {
       "cell": "r0.25_s0.5",
       "savings_ratio": 0.3694,
-      "refetches_avoided": 42.0
+      "refetches_avoided": 42.0,
+      "wasted_refetches": 17.3
     },
     {
       "cell": "r0.25_s1.0",
       "savings_ratio": 0.3694,
-      "refetches_avoided": 42.0
+      "refetches_avoided": 42.0,
+      "wasted_refetches": 0.0
     },
     {
       "cell": "r0.5_s0.0",
       "savings_ratio": 0.1775,
-      "refetches_avoided": 20.4
+      "refetches_avoided": 20.4,
+      "wasted_refetches": 78.3
     },
     {
       "cell": "r0.5_s0.5",
       "savings_ratio": 0.1775,
-      "refetches_avoided": 20.4
+      "refetches_avoided": 20.4,
+      "wasted_refetches": 20.6
     },
     {
       "cell": "r0.5_s1.0",
       "savings_ratio": 0.1775,
-      "refetches_avoided": 20.4
+      "refetches_avoided": 20.4,
+      "wasted_refetches": 0.0
     },
     {
       "cell": "r1.0_s0.0",
       "savings_ratio": 0.0,
-      "refetches_avoided": 0.0
+      "refetches_avoided": 0.0,
+      "wasted_refetches": 99.4
     },
     {
       "cell": "r1.0_s0.5",
       "savings_ratio": 0.0,
-      "refetches_avoided": 0.0
+      "refetches_avoided": 0.0,
+      "wasted_refetches": 22.1
     },
     {
       "cell": "r1.0_s1.0",
       "savings_ratio": 0.0,
-      "refetches_avoided": 0.0
+      "refetches_avoided": 0.0,
+      "wasted_refetches": 0.0
     }
   ]
 }

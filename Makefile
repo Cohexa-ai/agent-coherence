@@ -11,7 +11,7 @@ benchmark-check:  ## Check latest.json drift against expected.json (skips benchm
 cost-benchmark:  ## Run the change-rate × answer-sensitivity cost sweep and write cost_sweep.json
 	python tools/run_cost_sweep.py
 
-cost-benchmark-check:  ## Check cost_sweep.json drift against expected_cost.json (skips sweep run)
+cost-benchmark-check: cost-benchmark  ## Re-run the cost sweep, then drift-check it against expected_cost.json
 	python tools/cost_drift_check.py
 
 TLA2TOOLS := formal/tla/lib/tla2tools.jar

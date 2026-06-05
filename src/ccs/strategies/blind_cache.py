@@ -1,7 +1,15 @@
 # Copyright (c) 2026 Arbiter contributors.
 # The Coherence Protocol for AI Agents
 
-"""Blind cache strategy that never refetches after the first fill."""
+"""Blind cache strategy — BENCHMARK COST-FLOOR ONLY, never for production.
+
+``requires_refresh`` always returns ``False``: it serves the first-fetched copy
+forever and never honors ``MESIState.INVALID``, modelling the exact failure the
+coherence protocol exists to prevent (unbounded staleness). It is intentionally
+NOT part of the public ``ccs.strategies`` API (absent from ``__all__``) and is
+reachable only via ``build_strategy("blind")`` so the temporal cost benchmark can
+resolve it by name.
+"""
 
 from __future__ import annotations
 
@@ -14,12 +22,15 @@ from .base import SyncStrategy
 
 
 class BlindCacheStrategy(SyncStrategy):
-    """Fetch once on first fill, then serve the local copy forever.
+    """BENCHMARK COST-FLOOR — UNBOUNDED STALENESS, NEVER FOR PRODUCTION.
 
-    This is the cost floor for the temporal benchmark: it deliberately ignores
-    ``MESIState.INVALID`` so it never re-fetches a stale entry. Realistic
-    strategies trade tokens for freshness; this one pays the minimum token cost
-    and accepts unbounded staleness as the comparison baseline.
+    Fetches once on first fill, then serves the local copy forever: it
+    deliberately ignores ``MESIState.INVALID`` so it never re-fetches a stale
+    entry. This models the exact failure the coherence protocol exists to
+    prevent, and exists only as the comparison baseline for the temporal cost
+    benchmark. It is intentionally excluded from ``ccs.strategies.__all__`` and
+    reachable only via ``build_strategy("blind")``. Do not use it in production —
+    it has no freshness guarantee whatsoever.
     """
 
     name = "blind"

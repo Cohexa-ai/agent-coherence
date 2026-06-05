@@ -27,6 +27,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -49,23 +50,26 @@ SEED_START = 20260318
 PROVENANCE = "temporal-sim (third lane)"
 
 
-def _make_scenario(rate: float, sensitivity: float) -> dict:
+def _make_scenario(rate: float, sensitivity: float) -> dict[str, Any]:
     """Gated config: source churn ON, ``conditional_injection`` (the default).
 
     Every mutable artifact's ``volatility`` is set to ``rate`` so the change-rate
     axis is a single dial; ``answer_sensitivity`` sets the relevant fraction.
+
+    The seed is supplied per-run via ``run_strategy_comparison(seed_start=...)``,
+    which the engine prefers over any scenario-level seed, so this helper does not
+    set ``scenario["simulation"]["seed"]``.
     """
     scenario = load_scenario(str(BASE_SCENARIO))
     for artifact in scenario["artifacts"]:
         if bool(artifact.get("mutable", True)):
             artifact["volatility"] = rate
     scenario["source_mutation"] = {"enabled": True, "answer_sensitivity": sensitivity}
-    scenario["simulation"]["seed"] = SEED_START
     scenario["scenario"]["name"] = f"cost-sweep-r{rate}-s{sensitivity}"
     return scenario
 
 
-def _make_always_read_variant(rate: float, sensitivity: float) -> dict:
+def _make_always_read_variant(rate: float, sensitivity: float) -> dict[str, Any]:
     """Always-re-fetch ceiling: same churn, but force a re-fetch on every read."""
     scenario = _make_scenario(rate, sensitivity)
     scenario["context_semantics"]["model"] = "always_read"
@@ -80,17 +84,17 @@ def _mean_fetch_actions(report: StrategyComparisonReport, strategy: str) -> floa
     ``*_mean`` in ``report.aggregated``, so we average the per-run values here.
     ``report.runs`` is flattened across all strategies, hence the filter.
     """
-    values = [m.to_dict()["fetch_actions"] for m in report.runs if m.strategy == strategy]
+    values = [m.fetch_actions for m in report.runs if m.strategy == strategy]
     if not values:
         return 0.0
     return sum(values) / len(values)
 
 
-def _aggregated_by_strategy(report: StrategyComparisonReport) -> dict[str, dict]:
+def _aggregated_by_strategy(report: StrategyComparisonReport) -> dict[str, dict[str, Any]]:
     return {item["strategy"]: item for item in report.aggregated}
 
 
-def _build_cell_row(rate: float, sensitivity: float, runs_per_point: int) -> dict:
+def _build_cell_row(rate: float, sensitivity: float, runs_per_point: int) -> dict[str, Any]:
     """Run both configs for one cell and compute the savings-regime row."""
     gated_report = run_strategy_comparison(
         _make_scenario(rate, sensitivity),
@@ -109,9 +113,14 @@ def _build_cell_row(rate: float, sensitivity: float, runs_per_point: int) -> dic
     gated_fetches = _mean_fetch_actions(gated_report, "lazy")
     always_fetches = _mean_fetch_actions(always_report, "lazy")
 
-    refetches_avoided = always_fetches - gated_fetches
+    # gated and always come from two independent runs (different context_model),
+    # so sampling noise can make gated marginally exceed always; clamp the derived
+    # figures to >= 0 rather than report a nonsensical negative "avoided"/"saving".
+    refetches_avoided = max(0.0, always_fetches - gated_fetches)
     wasted_refetches = float(_aggregated_by_strategy(gated_report)["lazy"]["wasted_refetches_mean"])
-    savings_ratio = 0.0 if always_fetches == 0 else 1.0 - gated_fetches / always_fetches
+    savings_ratio = (
+        0.0 if always_fetches == 0 else max(0.0, 1.0 - gated_fetches / always_fetches)
+    )
 
     return {
         "cell": f"r{rate}_s{sensitivity}",
@@ -130,7 +139,7 @@ def run_cost_sweep(
     rates: list[float],
     sensitivities: list[float],
     runs_per_point: int,
-) -> dict:
+) -> dict[str, Any]:
     """Sweep change-rate × answer-sensitivity and return the savings-map payload.
 
     Callable without argparse so tests can drive a tiny grid. The returned dict
