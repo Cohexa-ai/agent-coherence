@@ -157,3 +157,16 @@ def test_run_cost_sweep_cli_output_roundtrips(tmp_path: Path) -> None:
     assert len(payload["rows"]) == 4
     for row in payload["rows"]:
         assert _ROW_KEYS == set(row)
+
+
+def test_run_cost_sweep_absolute_output_passes_through(tmp_path: Path) -> None:
+    """An absolute --output path is written as-is, not re-rooted under REPO_ROOT."""
+    module = _load_cost_sweep_module()
+    module.RATES = [0.0]
+    module.SENSITIVITIES = [0.0]
+    module.RUNS_PER_POINT = 2
+
+    out = tmp_path / "abs_sweep.json"
+    rc = module.main(["--output", str(out)])
+    assert rc == 0
+    assert out.exists()

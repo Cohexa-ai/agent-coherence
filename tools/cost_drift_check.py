@@ -24,6 +24,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -137,8 +138,23 @@ def check_drift(latest_path: Path, expected_path: Path) -> tuple[bool, list[str]
     return True, messages
 
 
-def main() -> None:
-    passed, messages = check_drift(_LATEST_PATH, _EXPECTED_PATH)
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Drift-gate the cost sweep against the committed baseline."
+    )
+    parser.add_argument(
+        "--latest",
+        default=str(_LATEST_PATH),
+        help="Sweep output to check (default: benchmarks/results/cost_sweep.json).",
+    )
+    parser.add_argument(
+        "--expected",
+        default=str(_EXPECTED_PATH),
+        help="Committed baseline (default: benchmarks/expected_cost.json).",
+    )
+    args = parser.parse_args(argv)
+
+    passed, messages = check_drift(Path(args.latest), Path(args.expected))
     # The full report always goes to stdout (so a CI job capturing stdout sees the
     # table on pass AND on fail, mirroring tools/benchmark_drift_check.py); stderr
     # carries only the terminal failure signal alongside the non-zero exit code.

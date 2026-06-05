@@ -76,6 +76,10 @@ def can_act_in_transient(
             return lease_valid
         if strategy_name == "access_count":
             return accesses_remaining
+        # Non-enumerated strategies -- ``broadcast`` and the benchmark-internal
+        # ``blind`` cost floor -- intentionally do not act mid-acquisition. For
+        # ``blind`` this is verified not to contaminate the cost-floor measurement:
+        # it still performs exactly num_agents x num_artifacts fetches regardless.
         return False
 
     if transient_state in {TransientState.MWB, TransientState.MSA}:

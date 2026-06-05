@@ -178,7 +178,11 @@ def main(argv: list[str] | None = None) -> int:
             f"savings={row['savings_ratio']:.1%}"
         )
 
-    output_path = REPO_ROOT / args.output
+    # Absolute --output paths pass through; relative ones resolve under REPO_ROOT
+    # (so the default benchmarks/results/... lands in the repo regardless of CWD).
+    output_path = Path(args.output)
+    if not output_path.is_absolute():
+        output_path = REPO_ROOT / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Wrote {output_path}  [provenance: {payload['provenance']}]")

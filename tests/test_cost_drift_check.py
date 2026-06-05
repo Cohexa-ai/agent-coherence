@@ -89,7 +89,7 @@ def test_cost_drift_check_main_exits_zero_on_match(cost_drift_check, tmp_path, m
     monkeypatch.setattr(cost_drift_check, "_EXPECTED_PATH", expected)
 
     with pytest.raises(SystemExit) as exc:
-        cost_drift_check.main()
+        cost_drift_check.main([])
     assert exc.value.code == 0
 
 
@@ -102,7 +102,7 @@ def test_cost_drift_check_main_exits_one_on_drift(cost_drift_check, tmp_path, mo
     monkeypatch.setattr(cost_drift_check, "_EXPECTED_PATH", expected)
 
     with pytest.raises(SystemExit) as exc:
-        cost_drift_check.main()
+        cost_drift_check.main([])
     assert exc.value.code == 1
 
 
@@ -271,8 +271,20 @@ def test_cost_drift_main_routes_report_to_stdout_on_failure(
     monkeypatch.setattr(cost_drift_check, "_EXPECTED_PATH", expected)
 
     with pytest.raises(SystemExit) as exc:
-        cost_drift_check.main()
+        cost_drift_check.main([])
     assert exc.value.code == 1
     captured = capsys.readouterr()
     assert "savings_ratio" in captured.out
     assert "FAILED" in captured.err
+
+
+def test_cost_drift_check_flags_override_paths(cost_drift_check, tmp_path):
+    """--latest / --expected route to the given files (no monkeypatching needed)."""
+    latest = tmp_path / "sweep.json"
+    expected = tmp_path / "baseline.json"
+    _write_json(latest, _latest(_cell("r0.0_s0.0", 0.5, 10.0)))
+    _write_json(expected, _expected(_cell("r0.0_s0.0", 0.5, 10.0)))
+
+    with pytest.raises(SystemExit) as exc:
+        cost_drift_check.main(["--latest", str(latest), "--expected", str(expected)])
+    assert exc.value.code == 0
