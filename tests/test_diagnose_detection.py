@@ -389,6 +389,61 @@ def test_single_writer_verdict_with_zero_divergence_events():
     assert report.agent_pain_count == 0
 
 
+def test_heatmap_divergent_reads_bounded_by_total_reads():
+    """Regression: heatmap ``share`` must stay within [0, 100%].
+
+    ``divergent_reads`` counts distinct reads handed a divergent version
+    (the ``later_read`` of a headline event), NOT headline events. Events
+    are ordered read *pairs* (O(n^2)), so an event-count numerator could
+    far exceed ``total_reads`` and overflow the report's "share" bar past
+    100% (observed 600% in the field).
+
+    Shape: one write of the current version, three fresh readers, then
+    three later readers handed the stale prior version. That yields
+    3 x 3 = 9 headline divergence events but only 3 distinct stale reads
+    out of 6 total reads -> share 50%, never 150%.
+    """
+    key_index = _ids_for(["A"])
+    events: list[DiagnoseEvent] = []
+    seq = 0
+
+    def add(tick: int, node: str, evtype: str, state: dict) -> None:
+        nonlocal seq
+        seq += 1
+        events.append(
+            _make_event(sequence=seq, tick=tick, node=node, event_type=evtype, state=state)
+        )
+
+    add(1, "W", "node_end", {"A": "a-v2"})  # single write: current version
+    add(2, "fresh1", "node_start", {"A": "a-v2"})
+    add(3, "fresh2", "node_start", {"A": "a-v2"})
+    add(4, "fresh3", "node_start", {"A": "a-v2"})
+    add(5, "stale1", "node_start", {"A": "a-v1"})  # handed the prior version
+    add(6, "stale2", "node_start", {"A": "a-v1"})
+    add(7, "stale3", "node_start", {"A": "a-v1"})
+
+    report = detect(
+        events,
+        verdict=_verdict(tracked_keys=("A",)),
+        key_index=key_index,
+    )
+
+    # The raw pair-count exceeds the read count — this is the condition that
+    # made the old event-count numerator overflow the share bar.
+    assert len(report.headline_divergence_events) == 9
+    assert len(report.heatmap) == 1
+    row = report.heatmap[0]
+    assert row.artifact_key == "A"
+    assert row.total_reads == 6
+    # Distinct stale (later) reads, not the 9 events.
+    assert row.divergent_reads == 3
+
+    # The invariant the renderer relies on: share is bounded to [0, 100%].
+    for r in report.heatmap:
+        assert 0 <= r.divergent_reads <= r.total_reads
+        assert 0.0 <= (r.divergent_reads * 100.0 / r.total_reads) <= 100.0
+
+
 # -------------------------------------------------------------------- #
 # Cost extrapolation paths
 # -------------------------------------------------------------------- #
