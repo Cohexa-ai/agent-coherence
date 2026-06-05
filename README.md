@@ -66,7 +66,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-**`v0.8.4` released — experimental OpenAI Agents SDK adapter + packaging fixes.** Adds an experimental (0.x) adapter that brings coherence to the OpenAI Agents SDK `Session` cache (`wrap_session` + optional `RunHooks`); install with `pip install "agent-coherence[openai-agents]"`. New `openai` / `openai-agents` / `mistral` extras and an offline Conversations stale-read example. Fixes: the `otel` extra now pulls `opentelemetry-sdk` so metrics actually export, and `agent-coherence-status` keeps the version column inline. No core-protocol changes; the v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
+**`v0.8.4.1` released — `ccs-diagnose` heatmap fix.** A patch over `v0.8.4`: the diagnose report's Per-Artifact Heatmap `share` column counted divergent read-*pairs* against the read *count*, so it could exceed 100% (observed 600%); it now reports the share of distinct reads handed a divergent version, bounded to `[0, 100%]`. No API or core-protocol changes. `v0.8.4` added the experimental (0.x) OpenAI Agents SDK adapter that brings coherence to the SDK `Session` cache (`wrap_session` + optional `RunHooks`; `pip install "agent-coherence[openai-agents]"`), the `openai` / `openai-agents` / `mistral` extras, and an offline Conversations stale-read example — see [CHANGELOG.md](CHANGELOG.md). The v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 

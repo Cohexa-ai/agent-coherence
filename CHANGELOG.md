@@ -8,6 +8,24 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.8.4.1] — 2026-06-05
+
+A patch release fixing a display bug in the `ccs-diagnose` HTML report. No
+API, core-protocol, or adapter changes.
+
+### Fixed
+
+- **`ccs-diagnose` Per-Artifact Heatmap `share` could exceed 100%.** The
+  heatmap counted headline divergence *events* — which are ordered read
+  *pairs* (`O(n²)`) — against the read *count*, so an artifact written late
+  and read by many downstream nodes rendered shares like 600%, overflowing
+  the CSS bar. `HeatmapRow.divergent_reads` now counts the distinct reads
+  handed a divergent version (the `later_read` of ≥1 headline event), which
+  is a subset of `total_reads`, so `share` is bounded to `[0, 100%]`. The
+  report template also clamps the bar width and labels the column's
+  witness-quality meaning. The headline-event count is unchanged and still
+  drives the Reader-Pair Matrix.
+
 ## [0.8.4] — 2026-06-02
 
 A patch release that adds the experimental OpenAI Agents SDK integration and
