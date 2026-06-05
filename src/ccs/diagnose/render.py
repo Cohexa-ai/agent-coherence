@@ -401,6 +401,62 @@ def _build_section_toggles(
     }
 
 
+@dataclass(frozen=True)
+class _HeatmapDisplayRow:
+    """A heatmap row enriched with its writer count for display.
+
+    The detection-layer :class:`~ccs.diagnose.detection.HeatmapRow` ranks
+    purely by ``divergent_reads``, which over-surfaces single-writer artifacts
+    whose high ``share`` is expected pipeline ordering (readers handed the
+    pre-write value). For the report we re-rank genuine *multi-writer*
+    artifacts — the coordination signal — first.
+    """
+
+    artifact_key: str
+    divergent_reads: int
+    total_reads: int
+    writer_count: int
+
+    @property
+    def is_multi_writer(self) -> bool:
+        return self.writer_count >= 2
+
+
+def _build_heatmap_display_rows(
+    *,
+    report: DetectionReport,
+    ownership: tuple[OwnershipRow, ...],
+) -> tuple[_HeatmapDisplayRow, ...]:
+    """Heatmap rows for the report: joined with writer counts and re-ranked so
+    genuine multi-writer artifacts sort above single-writer pipeline ordering.
+
+    Mirrors the Ownership Map's multi-writer-first sort
+    (:func:`ccs.diagnose.ownership._row_sort_key`). Detection's ``HeatmapRow``
+    order — which feeds :func:`_pick_top_event` — is left unchanged; this is a
+    presentation-only re-rank. Artifacts absent from ``ownership`` (writer
+    count unknown) fall back to the existing divergent-reads order.
+    """
+    writers_by_id = {row.artifact_id: len(row.writers) for row in ownership}
+    rows = [
+        _HeatmapDisplayRow(
+            artifact_key=row.artifact_key,
+            divergent_reads=row.divergent_reads,
+            total_reads=row.total_reads,
+            writer_count=writers_by_id.get(row.artifact_id, 0),
+        )
+        for row in report.heatmap
+        if row.divergent_reads > 0
+    ]
+    rows.sort(
+        key=lambda r: (
+            0 if r.writer_count >= 2 else 1,
+            -r.divergent_reads,
+            r.artifact_key,
+        )
+    )
+    return tuple(rows)
+
+
 def _build_section_data(
     *,
     verdict: ClassifierVerdict,
@@ -412,8 +468,8 @@ def _build_section_data(
         "top_event": report.top_event,
         "top_event_writes": _top_event_writes(report),
         "ownership": ownership,
-        "heatmap_rows": tuple(
-            row for row in report.heatmap if row.divergent_reads > 0
+        "heatmap_rows": _build_heatmap_display_rows(
+            report=report, ownership=ownership
         ),
         "reader_pairs": report.reader_pair_matrix,
         "exclusion_panel": report.exclusion_panel,

@@ -44,6 +44,7 @@ from ccs.diagnose.ownership import OwnershipRow
 from ccs.diagnose.render import (
     DEFAULT_BOOK_A_CALL_URL,
     RenderOptions,
+    _build_heatmap_display_rows,
     build_environment,
     render_html,
     render_to_string,
@@ -995,6 +996,78 @@ def test_heatmap_omits_rows_with_zero_divergent_reads():
     heatmap_section = html[heatmap_section_idx:next_section_idx]
     assert "A" in heatmap_section
     assert ">B<" not in heatmap_section  # filtered out
+
+
+def test_heatmap_ranks_multi_writer_above_higher_share_single_writer():
+    """A single-writer artifact's high divergent-read share is expected
+    pipeline ordering; a genuine multi-writer artifact is the coordination
+    signal and must surface first even with a lower share (mirrors Run 001:
+    single-writer sentiment_report ~79% vs the multi-writer debate dicts)."""
+    sw = _aid(21)  # single-writer, HIGH share
+    mw = _aid(22)  # multi-writer, LOWER share
+    events = (
+        _make_divergence_event(artifact_key="sentiment_report", artifact_id=sw),
+        _make_divergence_event(artifact_key="risk_debate_state", artifact_id=mw),
+    )
+    heatmap = (
+        HeatmapRow("sentiment_report", sw, 27, 34),
+        HeatmapRow("risk_debate_state", mw, 6, 34),
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="sentiment_report",
+            artifact_id=sw,
+            writers=(("Sentiment Analyst", 1),),
+            readers=(("Trader", 5),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="risk_debate_state",
+            artifact_id=mw,
+            writers=(
+                ("Aggressive", 1),
+                ("Conservative", 1),
+                ("Neutral", 1),
+                ("Portfolio Manager", 1),
+            ),
+            readers=(("Portfolio Manager", 4),),
+            version_range="va6 -> v55",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=events,
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=events[0],
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=2,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    # Helper: multi-writer ranks first despite the LOWER divergent-read share.
+    rows = _build_heatmap_display_rows(report=report, ownership=ownership)
+    assert [r.artifact_key for r in rows] == [
+        "risk_debate_state",
+        "sentiment_report",
+    ]
+    assert rows[0].writer_count == 4 and rows[0].is_multi_writer
+    assert rows[1].writer_count == 1 and not rows[1].is_multi_writer
+
+    # Rendered report surfaces the multi-writer artifact first + labels it.
+    html = render_to_string(verdict=_verdict(), report=report, ownership=ownership)
+    start = html.find("Per-Artifact Heatmap")
+    end = html.find("Reader-Pair Matrix", start)
+    section = html[start : end if end != -1 else len(html)]
+    assert section.find("risk_debate_state") < section.find("sentiment_report")
+    assert "multi-writer" in section
 
 
 # -------------------------------------------------------------------- #
