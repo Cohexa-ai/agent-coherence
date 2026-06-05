@@ -154,6 +154,7 @@ th {
 .bar {
   display: inline-block;
   height: 8px;
+  max-width: 100%;
   background: var(--accent);
   border-radius: 2px;
   vertical-align: middle;
@@ -340,6 +341,12 @@ details[open] summary { margin-bottom: 8px; }
 {# ============================================================ #}
 {% if show_heatmap %}
 <h2>Per-Artifact Heatmap</h2>
+<p class="note">
+  <code>divergent_reads</code> is the count of distinct reads handed a version
+  that diverged from another read of the same artifact; <code>share</code> is
+  that count over <code>total_reads</code>. Witness-quality &mdash; a divergent
+  handing is observed; whether the node acted on the value is unobservable.
+</p>
 <table>
   <thead>
     <tr>
@@ -357,7 +364,8 @@ details[open] summary { margin-bottom: 8px; }
         <td data-label="total_reads">{{ row.total_reads }}</td>
         <td data-label="share">
           {% set pct = (row.divergent_reads * 100 / row.total_reads) if row.total_reads > 0 else 0 %}
-          <span class="bar" style="width: {{ pct|round(0, 'floor')|int }}%"></span>
+          {% set bar_pct = 100 if pct > 100 else pct %}
+          <span class="bar" style="width: {{ bar_pct|round(0, 'floor')|int }}%"></span>
           {{ pct|round(1) }}%
         </td>
       </tr>

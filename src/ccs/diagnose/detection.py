@@ -156,7 +156,16 @@ class DivergenceEvent:
 
 @dataclass(frozen=True)
 class HeatmapRow:
-    """Per-artifact divergent vs total read counts (for the heatmap panel)."""
+    """Per-artifact divergent vs total read counts (for the heatmap panel).
+
+    ``divergent_reads`` is the number of *distinct read observations* handed
+    a divergent version — i.e. the ``later_read`` of at least one headline
+    divergence event. It is a subset of ``total_reads`` (the count of read
+    observations for the artifact), so ``divergent_reads <= total_reads``
+    always holds and the rendered ``share`` is bounded to ``[0, 100%]``. It
+    is deliberately *not* the headline-event count: events are ordered read
+    *pairs* (``O(n^2)``), which can far exceed the read count.
+    """
 
     artifact_key: str
     artifact_id: uuid.UUID
@@ -691,14 +700,20 @@ def _build_heatmap(
     headline_events: Sequence[DivergenceEvent],
     inverse: Mapping[uuid.UUID, str],
 ) -> tuple[HeatmapRow, ...]:
-    divergent_per_artifact: dict[uuid.UUID, int] = {}
+    # Count DISTINCT reads handed a divergent version (the ``later_read`` of
+    # ≥1 headline event), NOT the number of headline events. Events are
+    # ordered read pairs (O(n^2)); counting them would let ``divergent_reads``
+    # exceed ``total_reads`` and overflow the report's "share" bar past 100%.
+    # Key on object identity, not value: every ``later_read`` instance
+    # originates from ``reads_per_artifact`` and is alive for this call, so
+    # ``id()`` shares the positional basis of ``total_reads = len(reads)`` and
+    # guarantees ``divergent_reads <= total_reads``.
+    divergent_read_ids: dict[uuid.UUID, set[int]] = {}
     for ev in headline_events:
-        divergent_per_artifact[ev.artifact_id] = (
-            divergent_per_artifact.get(ev.artifact_id, 0) + 1
-        )
+        divergent_read_ids.setdefault(ev.artifact_id, set()).add(id(ev.later_read))
 
     rows: list[HeatmapRow] = []
-    for aid, count in divergent_per_artifact.items():
+    for aid, read_ids in divergent_read_ids.items():
         key = inverse.get(aid)
         if key is None:
             continue
@@ -706,7 +721,7 @@ def _build_heatmap(
             HeatmapRow(
                 artifact_key=key,
                 artifact_id=aid,
-                divergent_reads=count,
+                divergent_reads=len(read_ids),
                 total_reads=len(reads_per_artifact.get(aid, [])),
             )
         )
