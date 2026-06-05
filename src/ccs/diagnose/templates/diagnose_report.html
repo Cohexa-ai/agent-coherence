@@ -363,7 +363,7 @@ details[open] summary { margin-bottom: 8px; }
   </thead>
   <tbody>
     {% for row in heatmap_rows %}
-      <tr>
+      <tr class="{% if row.is_multi_writer %}multi-writer{% endif %}">
         <td data-label="artifact_key"><code>{{ row.artifact_key }}</code></td>
         <td data-label="writers">
           {% if row.writer_count >= 1 %}{{ row.writer_count }}{% else %}&mdash;{% endif %}

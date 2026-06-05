@@ -273,7 +273,7 @@ class _ReportContext(TypedDict):
     top_event_writes: Any
     ownership: tuple[OwnershipRow, ...]
     # Section 3 data
-    heatmap_rows: tuple[Any, ...]
+    heatmap_rows: tuple[_HeatmapDisplayRow, ...]
     # Section 4 data
     reader_pairs: Any
     # Section 5 data
@@ -437,7 +437,7 @@ def _build_heatmap_display_rows(
     count unknown) fall back to the existing divergent-reads order.
     """
     writers_by_id = {row.artifact_id: len(row.writers) for row in ownership}
-    rows = [
+    rows = (
         _HeatmapDisplayRow(
             artifact_key=row.artifact_key,
             divergent_reads=row.divergent_reads,
@@ -446,15 +446,19 @@ def _build_heatmap_display_rows(
         )
         for row in report.heatmap
         if row.divergent_reads > 0
-    ]
-    rows.sort(
-        key=lambda r: (
-            0 if r.writer_count >= 2 else 1,
-            -r.divergent_reads,
-            r.artifact_key,
+    )
+    # Stable sort: multi-writer first, then by divergent reads, then key. The
+    # multi-writer threshold lives only in ``_HeatmapDisplayRow.is_multi_writer``.
+    return tuple(
+        sorted(
+            rows,
+            key=lambda r: (
+                0 if r.is_multi_writer else 1,
+                -r.divergent_reads,
+                r.artifact_key,
+            ),
         )
     )
-    return tuple(rows)
 
 
 def _build_section_data(
