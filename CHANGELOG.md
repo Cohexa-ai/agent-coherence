@@ -8,6 +8,28 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.8.4.3] — 2026-06-06
+
+A patch release completing the `ccs-diagnose` heatmap report improvements
+started in v0.8.4.2. No API, core-protocol, or adapter changes.
+
+### Changed
+
+- **`ccs-diagnose` Per-Artifact Heatmap note now bridges the two ranking
+  criteria.** When the highest-rework artifact (Section 2, "The Event That
+  Matters Most") differs from the highest-coordination-signal artifact
+  (Section 3, heatmap row-1), a new sentence in the heatmap note explains
+  that Section 2 ranks by rework impact (`divergent_reads`) while Section 3
+  ranks by multi-writer coordination signal. Prevents reader confusion when
+  comparing the two panels in a shared report.
+- **Sort-key secondary difference documented.** `_build_heatmap_display_rows`
+  and `ownership._row_sort_key` share the multi-writer-first top bucket; the
+  secondary sort keys differ intentionally (`-divergent_reads` vs
+  `-total_reads`). The docstring now calls this out explicitly, and a new
+  machine-checked regression test pins the shared invariant.
+- **Minor template cleanup.** The writer-count display cell's redundant
+  `>= 1` outer guard simplified to `> 0`.
+
 ## [0.8.4.2] — 2026-06-06
 
 A patch release improving the `ccs-diagnose` HTML report's Per-Artifact

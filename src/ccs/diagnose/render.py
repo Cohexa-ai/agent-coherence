@@ -427,16 +427,28 @@ def _build_heatmap_display_rows(
     report: DetectionReport,
     ownership: tuple[OwnershipRow, ...],
 ) -> tuple[_HeatmapDisplayRow, ...]:
-    """Heatmap rows for the report: joined with writer counts and re-ranked so
-    genuine multi-writer artifacts sort above single-writer pipeline ordering.
+    """Return heatmap display rows joined with writer counts and re-ranked multi-writer-first.
 
     Mirrors the Ownership Map's multi-writer-first sort
-    (:func:`ccs.diagnose.ownership._row_sort_key`). Detection's ``HeatmapRow``
-    order — which feeds :func:`_pick_top_event` — is left unchanged; this is a
-    presentation-only re-rank. Artifacts absent from ``ownership`` (writer
-    count unknown) fall back to the existing divergent-reads order.
+    (:func:`ccs.diagnose.ownership._row_sort_key`) at the top bucket; the
+    secondary sort key differs intentionally — this function sorts within each
+    bucket by ``-divergent_reads`` (detection signal), while ``_row_sort_key``
+    sorts by ``-total_reads`` (reader-traffic signal). Detection's
+    ``HeatmapRow`` order — which feeds :func:`_pick_top_event` — is left
+    unchanged; this is a presentation-only re-rank. Artifacts absent from
+    ``ownership`` (writer count unknown) fall back to the divergent-reads order.
     """
     writers_by_id = {row.artifact_id: len(row.writers) for row in ownership}
+    # CLI invariant: both ``report`` and ``ownership`` are built from the same
+    # ``key_index``, so every heatmap artifact_id has a matching ownership row
+    # and ``writers_by_id.get(aid, 0)`` always returns the real writer count.
+    # The fallback to 0 handles callers that pass ownership built from a
+    # different key_index snapshot (e.g. test fixtures); those rows sort into
+    # the single-writer display bucket by ``is_multi_writer == False``.
+    # Known ambiguity: ``writer_count == 0`` means both "artifact absent from
+    # ownership" (unknown) and "OwnershipRow.writers == () i.e. zero observed
+    # writers". Both are correctly treated as non-multi-writer; the distinction
+    # is not surfaced in the display because neither is a coordination signal.
     rows = (
         _HeatmapDisplayRow(
             artifact_key=row.artifact_key,

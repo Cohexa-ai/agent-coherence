@@ -349,7 +349,10 @@ details[open] summary { margin-bottom: 8px; }
   Rows are ordered with genuine <strong>multi-writer</strong> artifacts first
   &mdash; those are the coordination signal. A high share on a single-writer
   artifact is usually expected pipeline ordering (readers handed the pre-write
-  value), not a coordination gap.
+  value), not a coordination gap. The <em>Event That Matters Most</em> panel above
+  ranks by rework impact (highest <code>divergent_reads</code>); this table ranks
+  by coordination signal (multi-writer first), so the two panels may highlight
+  different artifacts.
 </p>
 <table>
   <thead>
@@ -366,7 +369,7 @@ details[open] summary { margin-bottom: 8px; }
       <tr class="{% if row.is_multi_writer %}multi-writer{% endif %}">
         <td data-label="artifact_key"><code>{{ row.artifact_key }}</code></td>
         <td data-label="writers">
-          {% if row.writer_count >= 1 %}{{ row.writer_count }}{% else %}&mdash;{% endif %}
+          {% if row.writer_count > 0 %}{{ row.writer_count }}{% else %}&mdash;{% endif %}
           {% if row.is_multi_writer %}<strong>multi-writer</strong>{% elif row.writer_count == 1 %}<span style="opacity:0.6">pipeline ordering</span>{% endif %}
         </td>
         <td data-label="divergent_reads">{{ row.divergent_reads }}</td>
