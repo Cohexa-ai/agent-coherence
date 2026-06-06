@@ -3,4 +3,4 @@
 
 """agent-coherence core package."""
 
-__version__ = "0.8.4.2"
+__version__ = "0.8.4.3"

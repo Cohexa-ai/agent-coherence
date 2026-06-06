@@ -66,7 +66,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-**`v0.8.4.2` released — `ccs-diagnose` heatmap multi-writer ranking.** A patch over `v0.8.4.1`: the diagnose report's Per-Artifact Heatmap now ranks genuine *multi-writer* artifacts — the real coordination signal — above single-writer artifacts whose high `share` is expected pipeline ordering, adds a `writers` column and a multi-writer row highlight, and leaves the detection-layer ordering (which drives the top-event callout) unchanged. Presentation-only; no API or core-protocol changes. `v0.8.4.1` bounded that same heatmap's `share` column to `[0, 100%]` (it previously counted divergent read-*pairs* against the read *count* and could exceed 100%). See [CHANGELOG.md](CHANGELOG.md). The v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
+**`v0.8.4.3` released — `ccs-diagnose` heatmap report clarity.** A patch over `v0.8.4.2`: the Per-Artifact Heatmap note now explains why the "Event That Matters Most" panel (ranked by rework impact) and the heatmap row-1 (ranked by multi-writer coordination signal) can name different artifacts, preventing reader confusion in shared reports. Also closes test-coverage and documentation residuals from the v0.8.4.2 heatmap re-rank. No API or core-protocol changes. See [CHANGELOG.md](CHANGELOG.md). The v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
