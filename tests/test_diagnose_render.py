@@ -1281,6 +1281,211 @@ def test_heatmap_display_rows_join_invariant_holds_for_all_tracked_artifacts():
 
 
 # -------------------------------------------------------------------- #
+# Sort-key coverage (#6, #7, #8)
+# -------------------------------------------------------------------- #
+
+
+def test_heatmap_sort_mirrors_ownership_multi_writer_first_bucket():
+    """#6 — machine-checked 'mirrors' regression.
+
+    Both ``_build_heatmap_display_rows`` and ``ownership._row_sort_key`` share
+    the same top-bucket rule: multi-writer artifacts first.  The secondary sort
+    keys differ intentionally (``-divergent_reads`` vs ``-total_reads``), so we
+    only pin the shared invariant: given the same multi-writer / single-writer
+    split, both orderings agree on which group comes first."""
+    from ccs.diagnose.ownership import _row_sort_key
+
+    mw = _aid(61)
+    sw = _aid(62)
+
+    # Heatmap side.
+    heatmap = (
+        HeatmapRow("single_writer_artifact", sw, 50, 60),  # high reads but single-writer
+        HeatmapRow("multi_writer_artifact", mw, 3, 60),   # low reads but multi-writer
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="single_writer_artifact",
+            artifact_id=sw,
+            writers=(("Agent A", 1),),
+            readers=(("Agent B", 10),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="multi_writer_artifact",
+            artifact_id=mw,
+            writers=(("Agent X", 1), ("Agent Y", 1)),
+            readers=(("Agent Z", 1),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=(),
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=None,
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=0,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    display_rows = _build_heatmap_display_rows(report=report, ownership=ownership)
+    ownership_sorted = sorted(ownership, key=_row_sort_key)
+
+    # Both orderings agree on multi-writer first: top bucket is the shared invariant.
+    assert display_rows[0].artifact_key == "multi_writer_artifact"
+    assert ownership_sorted[0].artifact_key == "multi_writer_artifact"
+    assert display_rows[1].artifact_key == "single_writer_artifact"
+    assert ownership_sorted[1].artifact_key == "single_writer_artifact"
+
+
+def test_heatmap_intra_group_tiebreak_by_divergent_reads_then_key():
+    """#7 — intra-bucket tie-break: within each bucket, higher divergent_reads
+    first; when divergent_reads are equal, artifact_key lexicographic order."""
+    mw_high = _aid(71)
+    mw_low = _aid(72)
+    sw_aardvark = _aid(73)
+    sw_zebra = _aid(74)
+
+    heatmap = (
+        HeatmapRow("mw_low_reads", mw_low, 4, 20),
+        HeatmapRow("mw_high_reads", mw_high, 12, 20),
+        HeatmapRow("zebra_artifact", sw_zebra, 8, 20),
+        HeatmapRow("aardvark_artifact", sw_aardvark, 8, 20),  # same reads, sorts first by key
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="mw_high_reads",
+            artifact_id=mw_high,
+            writers=(("A", 1), ("B", 1)),
+            readers=(("C", 2),),
+            version_range="v1",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="mw_low_reads",
+            artifact_id=mw_low,
+            writers=(("D", 1), ("E", 1)),
+            readers=(("F", 2),),
+            version_range="v1",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="aardvark_artifact",
+            artifact_id=sw_aardvark,
+            writers=(("G", 1),),
+            readers=(("H", 2),),
+            version_range="v1",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="zebra_artifact",
+            artifact_id=sw_zebra,
+            writers=(("I", 1),),
+            readers=(("J", 2),),
+            version_range="v1",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=(),
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=None,
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=0,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    rows = _build_heatmap_display_rows(report=report, ownership=ownership)
+    keys = [r.artifact_key for r in rows]
+
+    # Multi-writer group: higher divergent_reads first.
+    assert keys[0] == "mw_high_reads"
+    assert keys[1] == "mw_low_reads"
+    # Single-writer group: equal divergent_reads → lexicographic key order.
+    assert keys[2] == "aardvark_artifact"
+    assert keys[3] == "zebra_artifact"
+
+
+def test_detection_heatmap_order_unchanged_after_display_rerank():
+    """#8 — detection-layer invariant: ``_build_heatmap_display_rows`` must not
+    mutate or re-sort ``report.heatmap``, and ``top_event`` must still reflect
+    the detection winner (highest divergent_reads) even when the display rerank
+    promotes a different artifact to heatmap row-1."""
+    sw = _aid(81)  # detection winner: highest divergent_reads
+    mw = _aid(82)  # display winner: multi-writer
+
+    events = (
+        _make_divergence_event(artifact_key="detection_winner", artifact_id=sw),
+        _make_divergence_event(artifact_key="display_winner", artifact_id=mw),
+    )
+    # Detection heatmap: detection_winner first (30 > 5).
+    heatmap = (
+        HeatmapRow("detection_winner", sw, 30, 40),
+        HeatmapRow("display_winner", mw, 5, 40),
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="detection_winner",
+            artifact_id=sw,
+            writers=(("Solo", 1),),
+            readers=(("Reader", 5),),
+            version_range="v1",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="display_winner",
+            artifact_id=mw,
+            writers=(("Alpha", 1), ("Beta", 1)),
+            readers=(("Gamma", 3),),
+            version_range="v1",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=events,
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=events[0],  # detection_winner selected by _pick_top_event
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=2,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    display_rows = _build_heatmap_display_rows(report=report, ownership=ownership)
+
+    # Display re-rank promotes multi-writer to row-1 …
+    assert display_rows[0].artifact_key == "display_winner"
+    # … but the detection heatmap order is UNCHANGED.
+    assert report.heatmap[0].artifact_key == "detection_winner"
+    assert report.heatmap[1].artifact_key == "display_winner"
+    # And top_event still reflects the detection-layer winner.
+    assert report.top_event is not None
+    assert report.top_event.artifact_key == "detection_winner"
+
+
+# -------------------------------------------------------------------- #
 # RenderOptions URL / email scheme allowlist (XSS prevention)
 # -------------------------------------------------------------------- #
 
