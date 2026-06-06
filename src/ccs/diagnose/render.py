@@ -437,6 +437,12 @@ def _build_heatmap_display_rows(
     count unknown) fall back to the existing divergent-reads order.
     """
     writers_by_id = {row.artifact_id: len(row.writers) for row in ownership}
+    # CLI invariant: both ``report`` and ``ownership`` are built from the same
+    # ``key_index``, so every heatmap artifact_id has a matching ownership row
+    # and ``writers_by_id.get(aid, 0)`` always returns the real writer count.
+    # The fallback to 0 handles callers that pass ownership built from a
+    # different key_index snapshot (e.g. test fixtures); those rows sort into
+    # the single-writer display bucket by ``is_multi_writer == False``.
     rows = (
         _HeatmapDisplayRow(
             artifact_key=row.artifact_key,

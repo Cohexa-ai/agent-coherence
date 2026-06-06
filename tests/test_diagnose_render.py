@@ -1132,6 +1132,154 @@ def test_heatmap_artifact_absent_from_ownership_falls_back_to_unknown_bucket():
     assert section.find("risk_debate_state") < section.find("orphan_artifact")
 
 
+def test_heatmap_note_explains_ranking_difference_from_top_event():
+    """When top_event.artifact_key (detection order, max divergent_reads) differs
+    from heatmap_rows[0].artifact_key (display order, multi-writer first), the
+    heatmap section note must contain a bridging sentence so a reader understands
+    why Section 2 and Section 3 name different artifacts."""
+    sw = _aid(41)  # single-writer, HIGHEST divergent_reads — wins top_event
+    mw = _aid(42)  # multi-writer, fewer reads — wins heatmap row-1
+    events = (
+        _make_divergence_event(artifact_key="sentiment_report", artifact_id=sw),
+        _make_divergence_event(artifact_key="risk_debate_state", artifact_id=mw),
+    )
+    # Detection heatmap: sentiment_report ranks first (27 > 6 divergent_reads).
+    # _pick_top_event therefore selects events[0] = sentiment_report.
+    heatmap = (
+        HeatmapRow("sentiment_report", sw, 27, 34),
+        HeatmapRow("risk_debate_state", mw, 6, 34),
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="sentiment_report",
+            artifact_id=sw,
+            writers=(("Sentiment Analyst", 1),),
+            readers=(("Trader", 5),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="risk_debate_state",
+            artifact_id=mw,
+            writers=(("Aggressive", 1), ("Conservative", 1), ("Neutral", 1)),
+            readers=(("Portfolio Manager", 3),),
+            version_range="va6 -> v55",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=events,
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=events[0],  # sentiment_report (detection order winner)
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=2,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    html = render_to_string(verdict=_verdict(), report=report, ownership=ownership)
+
+    # Section 2 names the detection-order winner.
+    s2_start = html.find("The Event That Matters Most")
+    s2_end = html.find("Per-Artifact Heatmap", s2_start)
+    s2 = html[s2_start:s2_end]
+    assert "sentiment_report" in s2
+
+    # Section 3 heatmap row-1 names the multi-writer winner.
+    start = html.find("Per-Artifact Heatmap")
+    end = html.find("Reader-Pair Matrix", start)
+    section = html[start : end if end != -1 else len(html)]
+    assert section.find("risk_debate_state") < section.find("sentiment_report")
+
+    # The heatmap note must contain a bridging sentence so a reader understands
+    # why "The Event That Matters Most" (Section 2, ranked by divergent_reads /
+    # rework) can name a different artifact than heatmap row-1 (ranked by
+    # multi-writer coordination signal). The note must cross-reference the
+    # Section 2 callout or explicitly mention the two different criteria.
+    note_start = section.find("<p class=\"note\">")
+    note_end = section.find("</p>", note_start)
+    note = section[note_start:note_end]
+    note_lower = note.lower()
+    has_cross_reference = (
+        "section 2" in note_lower
+        or "above" in note_lower
+        or "event that matters" in note_lower
+        or "top event" in note_lower
+    )
+    assert has_cross_reference, (
+        "heatmap note must cross-reference Section 2 to bridge the two ranking criteria"
+    )
+
+
+def test_heatmap_display_rows_join_invariant_holds_for_all_tracked_artifacts():
+    """Smoke-test the CLI-level invariant: when both ``report`` and ``ownership``
+    are built from the same key_index (as the CLI always does), every heatmap
+    artifact has a non-zero writer_count — the writer_count==0 fallback should
+    NOT fire under normal production conditions.
+
+    This does not use the CLI end-to-end; it verifies that a report+ownership
+    pair constructed consistently (matching artifact_ids) gives no writer_count==0
+    rows for tracked multi-writer artifacts."""
+    mw1 = _aid(51)
+    mw2 = _aid(52)
+    events = (
+        _make_divergence_event(artifact_key="debate_state", artifact_id=mw1),
+        _make_divergence_event(artifact_key="risk_state", artifact_id=mw2),
+    )
+    heatmap = (
+        HeatmapRow("debate_state", mw1, 10, 20),
+        HeatmapRow("risk_state", mw2, 5, 20),
+    )
+    ownership = (
+        OwnershipRow(
+            artifact_key="debate_state",
+            artifact_id=mw1,  # same id as heatmap row
+            writers=(("A", 1), ("B", 1)),
+            readers=(("C", 2),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+        OwnershipRow(
+            artifact_key="risk_state",
+            artifact_id=mw2,  # same id as heatmap row
+            writers=(("X", 1), ("Y", 1)),
+            readers=(("Z", 2),),
+            version_range="v1 -> v5",
+            append_only=False,
+        ),
+    )
+    report = DetectionReport(
+        headline_divergence_events=events,
+        excluded_events=(),
+        heatmap=heatmap,
+        reader_pair_matrix=(),
+        top_event=events[0],
+        exclusion_panel=ExclusionPanel(0, 0, 0),
+        agent_pain_count=2,
+        rework_tokens_this_run=0,
+        rework_cost_this_run=0.0,
+        rework_cost_annualized=None,
+        cost_unmeasurable_reason=None,
+        strict_mode=False,
+        schema_version=CCS_DIAGNOSE_LOG_SCHEMA_VERSION,
+    )
+
+    rows = _build_heatmap_display_rows(report=report, ownership=ownership)
+    # When artifact_ids are consistent (as the CLI guarantees), every row has a
+    # real writer_count and no row silently falls back to the unknown (0) bucket.
+    assert all(r.writer_count > 0 for r in rows), (
+        "CLI-invariant violation: heatmap row with writer_count==0 despite "
+        "consistent artifact_ids — the join likely used different key_indexes."
+    )
+    assert all(r.is_multi_writer for r in rows)
+
+
 # -------------------------------------------------------------------- #
 # RenderOptions URL / email scheme allowlist (XSS prevention)
 # -------------------------------------------------------------------- #
