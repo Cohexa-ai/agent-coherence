@@ -346,11 +346,16 @@ details[open] summary { margin-bottom: 8px; }
   that diverged from another read of the same artifact; <code>share</code> is
   that count over <code>total_reads</code>. Witness-quality &mdash; a divergent
   handing is observed; whether the node acted on the value is unobservable.
+  Rows are ordered with genuine <strong>multi-writer</strong> artifacts first
+  &mdash; those are the coordination signal. A high share on a single-writer
+  artifact is usually expected pipeline ordering (readers handed the pre-write
+  value), not a coordination gap.
 </p>
 <table>
   <thead>
     <tr>
       <th>artifact_key</th>
+      <th>writers</th>
       <th>divergent_reads</th>
       <th>total_reads</th>
       <th>share</th>
@@ -358,8 +363,12 @@ details[open] summary { margin-bottom: 8px; }
   </thead>
   <tbody>
     {% for row in heatmap_rows %}
-      <tr>
+      <tr class="{% if row.is_multi_writer %}multi-writer{% endif %}">
         <td data-label="artifact_key"><code>{{ row.artifact_key }}</code></td>
+        <td data-label="writers">
+          {% if row.writer_count >= 1 %}{{ row.writer_count }}{% else %}&mdash;{% endif %}
+          {% if row.is_multi_writer %}<strong>multi-writer</strong>{% elif row.writer_count == 1 %}<span style="opacity:0.6">pipeline ordering</span>{% endif %}
+        </td>
         <td data-label="divergent_reads">{{ row.divergent_reads }}</td>
         <td data-label="total_reads">{{ row.total_reads }}</td>
         <td data-label="share">
