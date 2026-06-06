@@ -8,6 +8,24 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.8.4.2] — 2026-06-06
+
+A patch release improving the `ccs-diagnose` HTML report's Per-Artifact
+Heatmap. No API, core-protocol, or adapter changes.
+
+### Changed
+
+- **`ccs-diagnose` Per-Artifact Heatmap ranks multi-writer artifacts first.**
+  The heatmap previously ranked purely by `divergent_reads`, which surfaced
+  single-writer artifacts — whose high `share` is expected pipeline ordering
+  (readers handed the pre-write value) — above genuine *multi-writer*
+  artifacts, the actual coordination signal. Display rows are now re-ranked
+  multi-writer-first (mirroring the Ownership Map), gain a `writers` column
+  with a `multi-writer` / `pipeline ordering` flag, and multi-writer rows are
+  highlighted. This is a presentation-only re-rank at the render layer; the
+  detection-layer ordering that drives the top-event callout and
+  `_pick_top_event` is unchanged. Follows up the v0.8.4.1 `share` fix.
+
 ## [0.8.4.1] — 2026-06-05
 
 A patch release fixing a display bug in the `ccs-diagnose` HTML report. No
