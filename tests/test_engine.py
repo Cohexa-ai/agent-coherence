@@ -308,6 +308,8 @@ def test_engine_flag_on_diverges_from_explicit_false_via_reclaim() -> None:
 
 # ---- Unit 4: failure-event injection + sweep wiring -------------------------
 
+from uuid import UUID  # noqa: E402
+
 from ccs.core.states import MESIState  # noqa: E402
 from ccs.core.types import FetchRequest  # noqa: E402
 
@@ -679,3 +681,448 @@ def test_restore_after_kill_resumes_heartbeat_emission() -> None:
     assert last_hb is not None
     assert last_hb >= 12, f"heartbeat should have resumed after restore, got {last_hb}"
     assert last_hb <= 19, f"heartbeat must not exceed final tick, got {last_hb}"
+
+
+# ---- Unit 2: source-mutation step (the change-rate dial) --------------------
+
+
+def _mutation_scenario(
+    *,
+    enabled: bool,
+    volatility: float = 1.0,
+    answer_sensitivity: float = 1.0,
+    num_agents: int = 2,
+    duration: int = 10,
+    mutable: bool = True,
+) -> dict:
+    """Scenario whose single artifact's mutation behavior is fully controlled.
+
+    Action knobs are zero so agents take no actions of their own; the only
+    version churn comes from the source-mutation step. The `source_mutation`
+    block is included only when a non-default shape is requested by the caller.
+    """
+    scenario = {
+        "simulation": {
+            "duration_ticks": duration,
+            "num_agents": num_agents,
+            "seed": 7,
+            "action_probability": 0.0,
+            "actions_per_tick": 1,
+        },
+        "network": {"latency_ticks": 0, "message_loss_rate": 0.0},
+        "scenario": {
+            "name": "source-mutation",
+            "workload": "read_heavy",
+            "action_probability": 0.0,
+            "write_probability": 0.0,
+            "agent_velocity": None,
+            "revocation_tick": None,
+        },
+        "artifacts": [
+            {
+                "id": "plan.md",
+                "size_tokens": 100,
+                "volatility": volatility,
+                "initial_version": 1,
+                "mutable": mutable,
+            },
+        ],
+        "strategies": {
+            "eager": {},
+            "lazy": {"check_interval_ticks": 100},
+            "lease": {"default_ttl_ticks": 5},
+            "access_count": {"max_accesses": 4},
+            "exec_count": {"max_operations": 4},
+        },
+        "transient": {"timeout_ticks": 100},
+        "context_semantics": {"model": "conditional_injection"},
+        "source_mutation": {"enabled": enabled, "answer_sensitivity": answer_sensitivity},
+    }
+    return scenario
+
+
+def test_source_mutation_disabled_is_default_when_block_absent() -> None:
+    """No ``source_mutation`` block ⇒ engine treats it as enabled=False."""
+    engine = SimulationEngine(_scenario(), strategy_name="lazy", seed=5)
+    assert engine._source_mutation_enabled is False
+
+
+def test_source_mutation_explicit_disabled_flag() -> None:
+    scenario = _mutation_scenario(enabled=False, volatility=1.0)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    assert engine._source_mutation_enabled is False
+
+
+def test_source_mutation_full_volatility_advances_version_every_tick() -> None:
+    """enabled + volatility=1.0 ⇒ canonical version advances on every tick."""
+    duration = 8
+    scenario = _mutation_scenario(enabled=True, volatility=1.0, duration=duration)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    artifact_id = engine._artifact_ids[0]
+    start_version = engine._registry.get_artifact(artifact_id).version
+
+    engine.run()
+
+    end_version = engine._registry.get_artifact(artifact_id).version
+    # One mutation per tick, no agent writes (action knobs are zero).
+    assert end_version == start_version + duration
+
+
+def test_source_mutation_invalidates_holders_to_invalid() -> None:
+    """A mutation must flip a non-INVALID holder to INVALID in registry + cache."""
+    scenario = _mutation_scenario(enabled=True, volatility=1.0, num_agents=2, duration=5)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    artifact_id = engine._artifact_ids[0]
+    holder = engine._agent_ids[0]
+
+    # Seed a SHARED holder directly: registry state + a live cache entry.
+    engine._registry.set_agent_state(
+        artifact_id, holder, MESIState.SHARED, trigger="seed", tick=0
+    )
+    runtime = engine._runtime_by_agent[holder]
+    from ccs.core.types import ArtifactCacheEntry  # noqa: PLC0415
+
+    runtime.cache.put(
+        artifact_id,
+        ArtifactCacheEntry(
+            artifact_id=artifact_id,
+            state=MESIState.SHARED,
+            local_version=1,
+            acquired_at_tick=0,
+        ),
+    )
+
+    engine._apply_source_mutations_for_tick(0)
+
+    assert engine._registry.get_agent_state(artifact_id, holder) == MESIState.INVALID
+    cache_entry = runtime.cache.get(artifact_id)
+    assert cache_entry is not None
+    assert cache_entry.state == MESIState.INVALID
+
+
+def test_source_mutation_state_log_uses_source_mutation_trigger() -> None:
+    """The invalidation state-log entry must be labelled ``source_mutation``."""
+    scenario = _mutation_scenario(enabled=True, volatility=1.0, num_agents=2, duration=5)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    artifact_id = engine._artifact_ids[0]
+    holder = engine._agent_ids[0]
+    engine._registry.set_agent_state(
+        artifact_id, holder, MESIState.SHARED, trigger="seed", tick=0
+    )
+
+    log = _capture_state_log(engine)
+    engine._apply_source_mutations_for_tick(1)
+
+    triggers = [entry["trigger"] for entry in log]
+    assert "source_mutation" in triggers
+    assert "invalidate" not in triggers
+
+
+def test_source_mutation_zero_volatility_never_mutates() -> None:
+    """volatility=0.0 ⇒ no mutations even with enabled=True."""
+    duration = 10
+    scenario = _mutation_scenario(enabled=True, volatility=0.0, duration=duration)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    artifact_id = engine._artifact_ids[0]
+    start_version = engine._registry.get_artifact(artifact_id).version
+
+    engine.run()
+
+    assert engine._registry.get_artifact(artifact_id).version == start_version
+
+
+def test_source_mutation_immutable_artifact_never_mutates() -> None:
+    """A mutable=False artifact is never source-mutated regardless of volatility."""
+    scenario = _mutation_scenario(
+        enabled=True, volatility=1.0, duration=6, mutable=False
+    )
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+    artifact_id = engine._artifact_ids[0]
+    start_version = engine._registry.get_artifact(artifact_id).version
+
+    engine.run()
+
+    assert engine._registry.get_artifact(artifact_id).version == start_version
+
+
+def test_source_mutation_full_sensitivity_tags_all_relevant() -> None:
+    """answer_sensitivity=1.0 ⇒ every mutation is tagged relevant=True."""
+    scenario = _refetch_scenario(volatility=1.0, answer_sensitivity=1.0)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+
+    seen_relevances: list[bool] = []
+    original = engine._apply_source_mutations_for_tick
+
+    def _spy(now: int) -> None:
+        original(now)
+        seen_relevances.extend(engine._pending_source_mutations.values())
+
+    engine._apply_source_mutations_for_tick = _spy  # type: ignore[assignment]
+    engine.run()
+
+    assert seen_relevances, "expected at least one mutation"
+    assert all(seen_relevances)
+
+
+def test_source_mutation_zero_sensitivity_tags_all_irrelevant() -> None:
+    """answer_sensitivity=0.0 ⇒ every mutation is tagged relevant=False."""
+    scenario = _refetch_scenario(volatility=1.0, answer_sensitivity=0.0)
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=5)
+
+    seen_relevances: list[bool] = []
+    original = engine._apply_source_mutations_for_tick
+
+    def _spy(now: int) -> None:
+        original(now)
+        seen_relevances.extend(engine._pending_source_mutations.values())
+
+    engine._apply_source_mutations_for_tick = _spy  # type: ignore[assignment]
+    engine.run()
+
+    assert seen_relevances, "expected at least one mutation"
+    assert not any(seen_relevances)
+
+
+def test_source_refetch_attribution_survives_unread_ticks() -> None:
+    """A holder invalidated on an earlier tick is still credited when it finally
+    re-reads (action_probability < 1).
+
+    The per-(artifact, holder) marker persists across ticks rather than resetting,
+    so EVERY re-fetch of a source-invalidated entry is counted exactly once --
+    including the ones that lag the invalidating tick (the regime a per-tick reset
+    would mis-count). With no agent writes, INVALID can only come from the source,
+    so ``source_refetches`` must equal the number of reads that found the entry
+    INVALID.
+    """
+    scenario = _refetch_scenario(volatility=0.5, answer_sensitivity=0.5, duration=60)
+    # Read sparsely so entries stay INVALID across several mutation ticks before a
+    # holder re-reads.
+    scenario["scenario"]["action_probability"] = 0.4
+    scenario["simulation"]["action_probability"] = 0.4
+    engine = SimulationEngine(scenario, strategy_name="lazy", seed=7)
+
+    invalid_entry_reads = 0
+    original = engine._perform_read
+
+    def _spy(*, agent_id: UUID, artifact_id: UUID, now_tick: int) -> None:
+        nonlocal invalid_entry_reads
+        entry = engine._runtime_by_agent[agent_id].cache.get(artifact_id)
+        if entry is not None and entry.state == MESIState.INVALID:
+            invalid_entry_reads += 1
+        original(agent_id=agent_id, artifact_id=artifact_id, now_tick=now_tick)
+
+    engine._perform_read = _spy  # type: ignore[assignment]
+    metrics = engine.run()
+
+    assert invalid_entry_reads > 0
+    assert metrics.source_refetches == invalid_entry_reads
+    assert metrics.wasted_refetches <= metrics.source_refetches
+
+
+def test_always_read_does_not_overattribute_source_refetches() -> None:
+    """Under context_model=always_read every read forces a fetch, but only the
+    fetches of source-INVALIDATED entries are credited to the source -- forced
+    re-reads of still-valid entries (and initial fills) are not. So
+    source_refetches stays strictly below the total fetch count. (lease-expiry
+    refreshes are excluded by the same entry.state == INVALID gate.)
+    """
+    scenario = _refetch_scenario(volatility=0.5, answer_sensitivity=0.5, duration=40)
+    scenario["context_semantics"] = {"model": "always_read"}
+    metrics = SimulationEngine(scenario, strategy_name="lazy", seed=5).run()
+
+    assert metrics.fetch_actions > 0
+    assert 0 < metrics.source_refetches < metrics.fetch_actions
+
+
+def test_source_mutation_disabled_run_is_byte_identical_to_no_block() -> None:
+    """Flag-off guarantee (TEST-FIRST): an ``enabled=False`` run produces a
+    state-log byte-identical to the same scenario with no ``source_mutation``
+    block at all.
+
+    Mirrors ``test_engine_flag_off_state_log_is_byte_identical_with_or_without_block``:
+    when the feature is disabled the engine MUST never bump a version or emit a
+    ``source_mutation`` state entry, so the two logs are indistinguishable.
+    """
+
+    def _run_and_capture(source_mutation_block: dict | None) -> list[dict]:
+        scenario = _scenario()
+        if source_mutation_block is not None:
+            scenario["source_mutation"] = source_mutation_block
+        engine = SimulationEngine(scenario, strategy_name="lazy", seed=42)
+        log: list[dict] = []
+        engine._registry._state_log = log.append
+        engine.run()
+        artifact_id_map: dict[str, str] = {}
+        for entry in log:
+            entry["instance_id"] = "<inst>"
+            aid = entry.get("artifact_id")
+            if aid is not None:
+                aid_str = str(aid)
+                placeholder = artifact_id_map.setdefault(
+                    aid_str, f"<artifact-{len(artifact_id_map)}>"
+                )
+                entry["artifact_id"] = placeholder
+        return log
+
+    log_without_block = _run_and_capture(None)
+    log_with_disabled_block = _run_and_capture(
+        {"enabled": False, "answer_sensitivity": 1.0}
+    )
+
+    assert log_without_block == log_with_disabled_block
+    assert len(log_without_block) > 0
+
+
+def test_source_mutation_enabled_same_seed_runs_are_byte_identical() -> None:
+    """Determinism: two ``enabled=True`` runs at the same seed must produce
+    identical ``to_dict()`` payloads, and the dedicated mutation RNG must not
+    have perturbed the action-selection stream non-deterministically.
+    """
+    scenario = _mutation_scenario(
+        enabled=True, volatility=0.5, answer_sensitivity=0.5, num_agents=4, duration=20
+    )
+    # Give agents some action probability so we also prove the mutation RNG
+    # does not bleed into the action-selection stream across the two runs.
+    scenario["scenario"]["action_probability"] = 0.6
+    scenario["simulation"]["action_probability"] = 0.6
+
+    first = SimulationEngine(scenario, strategy_name="lazy", seed=123).run().to_dict()
+    second = SimulationEngine(scenario, strategy_name="lazy", seed=123).run().to_dict()
+
+    assert first == second
+
+
+def test_source_mutation_does_not_shift_action_stream_when_off() -> None:
+    """A disabled source_mutation block must leave metrics byte-identical to a
+    run with no block — proving the separate RNG seeding never touches the
+    action-selection path when the feature is off.
+    """
+    scenario_off = _mutation_scenario(enabled=False, volatility=1.0, num_agents=4, duration=20)
+    scenario_off["scenario"]["action_probability"] = 0.6
+    scenario_off["simulation"]["action_probability"] = 0.6
+
+    scenario_none = _mutation_scenario(enabled=False, volatility=1.0, num_agents=4, duration=20)
+    scenario_none["scenario"]["action_probability"] = 0.6
+    scenario_none["simulation"]["action_probability"] = 0.6
+    del scenario_none["source_mutation"]
+
+    with_block = SimulationEngine(scenario_off, strategy_name="lazy", seed=77).run().to_dict()
+    without_block = SimulationEngine(scenario_none, strategy_name="lazy", seed=77).run().to_dict()
+
+    assert with_block == without_block
+
+
+# ---- Unit 3: source-triggered & wasted re-fetch cost metrics ----------------
+
+
+def _refetch_scenario(
+    *,
+    volatility: float = 0.5,
+    answer_sensitivity: float = 0.5,
+    num_agents: int = 4,
+    duration: int = 40,
+) -> dict:
+    """Source-mutation scenario with read-only agents that DO act.
+
+    Mutations invalidate holders; on their next read those holders re-fetch,
+    which is what Unit 3 attributes. Agents read every tick (action_probability
+    1.0, write_probability 0.0) so re-fetches actually occur. ``lazy`` is the
+    realistic strategy — it re-fetches exactly on INVALID, the state a source
+    mutation leaves a holder in.
+    """
+    scenario = _mutation_scenario(
+        enabled=True,
+        volatility=volatility,
+        answer_sensitivity=answer_sensitivity,
+        num_agents=num_agents,
+        duration=duration,
+    )
+    scenario["scenario"]["action_probability"] = 1.0
+    scenario["simulation"]["action_probability"] = 1.0
+    scenario["scenario"]["write_probability"] = 0.0
+    return scenario
+
+
+def test_source_refetches_and_wasted_are_counted_for_lazy() -> None:
+    """Happy path: lazy + mid volatility/sensitivity ⇒ some source re-fetches,
+    a strict-positive wasted subset bounded by the total.
+    """
+    metrics = SimulationEngine(
+        _refetch_scenario(volatility=0.5, answer_sensitivity=0.5),
+        strategy_name="lazy",
+        seed=5,
+    ).run()
+
+    assert metrics.source_refetches > 0
+    assert 0 < metrics.wasted_refetches <= metrics.source_refetches
+
+
+def test_full_sensitivity_yields_zero_wasted_refetches() -> None:
+    """answer_sensitivity=1.0 ⇒ every mutation is relevant ⇒ nothing wasted."""
+    metrics = SimulationEngine(
+        _refetch_scenario(volatility=1.0, answer_sensitivity=1.0),
+        strategy_name="lazy",
+        seed=5,
+    ).run()
+
+    assert metrics.source_refetches > 0
+    assert metrics.wasted_refetches == 0
+
+
+def test_zero_sensitivity_makes_every_refetch_wasted() -> None:
+    """answer_sensitivity=0.0 ⇒ every mutation is irrelevant ⇒ all re-fetches wasted."""
+    metrics = SimulationEngine(
+        _refetch_scenario(volatility=1.0, answer_sensitivity=0.0),
+        strategy_name="lazy",
+        seed=5,
+    ).run()
+
+    assert metrics.source_refetches > 0
+    assert metrics.wasted_refetches == metrics.source_refetches
+
+
+def test_blind_strategy_never_attributes_source_refetches() -> None:
+    """blind never re-fetches on INVALID ⇒ source_refetches == 0 even at max
+    volatility. The cost floor pays zero source-triggered re-fetch cost.
+    """
+    metrics = SimulationEngine(
+        _refetch_scenario(volatility=1.0, answer_sensitivity=0.5),
+        strategy_name="blind",
+        seed=5,
+    ).run()
+
+    assert metrics.source_refetches == 0
+    assert metrics.wasted_refetches == 0
+
+
+def test_source_refetch_metrics_appear_in_to_dict() -> None:
+    """Both new fields are part of the JSON-safe payload."""
+    metrics = SimulationEngine(
+        _refetch_scenario(volatility=0.5, answer_sensitivity=0.5),
+        strategy_name="lazy",
+        seed=5,
+    ).run()
+    payload = metrics.to_dict()
+
+    assert "source_refetches" in payload
+    assert "wasted_refetches" in payload
+    assert payload["source_refetches"] == metrics.source_refetches
+    assert payload["wasted_refetches"] == metrics.wasted_refetches
+
+
+def test_source_refetch_metrics_are_deterministic_for_same_seed() -> None:
+    """Same seed ⇒ identical source/wasted re-fetch counts across two runs."""
+    scenario = _refetch_scenario(volatility=0.5, answer_sensitivity=0.5)
+    first = SimulationEngine(scenario, strategy_name="lazy", seed=123).run()
+    second = SimulationEngine(scenario, strategy_name="lazy", seed=123).run()
+
+    assert first.source_refetches == second.source_refetches
+    assert first.wasted_refetches == second.wasted_refetches
+
+
+def test_source_refetch_metrics_default_to_zero_when_mutation_disabled() -> None:
+    """No source mutations ⇒ no attribution: both counters stay 0."""
+    metrics = SimulationEngine(_scenario(), strategy_name="lazy", seed=5).run()
+
+    assert metrics.source_refetches == 0
+    assert metrics.wasted_refetches == 0

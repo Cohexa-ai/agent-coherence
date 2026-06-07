@@ -41,6 +41,8 @@ class SimulationMetrics:
     context_injections: int
     transient_state_timeouts: int = 0
     stable_grant_reclamations: int = 0
+    source_refetches: int = 0
+    wasted_refetches: int = 0
 
     @property
     def synchronization_tokens(self) -> int:

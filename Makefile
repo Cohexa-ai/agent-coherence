@@ -1,12 +1,18 @@
 # Requires: pip install -e ".[langgraph,benchmark]"
 
-.PHONY: benchmark benchmark-check tla-check help
+.PHONY: benchmark benchmark-check cost-benchmark cost-benchmark-check tla-check help
 
 benchmark:  ## Run all three LangGraph benchmarks and write latest.json
 	python tools/run_benchmarks.py
 
 benchmark-check:  ## Check latest.json drift against expected.json (skips benchmark run)
 	python tools/benchmark_drift_check.py
+
+cost-benchmark:  ## Run the change-rate × answer-sensitivity cost sweep and write cost_sweep.json
+	python tools/run_cost_sweep.py
+
+cost-benchmark-check: cost-benchmark  ## Re-run the cost sweep, then drift-check it against expected_cost.json
+	python tools/cost_drift_check.py
 
 TLA2TOOLS := formal/tla/lib/tla2tools.jar
 TLC := java -XX:+UseParallelGC -cp $(TLA2TOOLS) tlc2.TLC -workers auto
