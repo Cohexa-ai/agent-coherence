@@ -66,7 +66,7 @@ Protocol safety properties (single-writer, monotonic versioning, crash-recovery 
 
 ## Status
 
-**`v0.8.4` released — experimental OpenAI Agents SDK adapter + packaging fixes.** Adds an experimental (0.x) adapter that brings coherence to the OpenAI Agents SDK `Session` cache (`wrap_session` + optional `RunHooks`); install with `pip install "agent-coherence[openai-agents]"`. New `openai` / `openai-agents` / `mistral` extras and an offline Conversations stale-read example. Fixes: the `otel` extra now pulls `opentelemetry-sdk` so metrics actually export, and `agent-coherence-status` keeps the version column inline. No core-protocol changes; the v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
+**`v0.8.4.3` released — `ccs-diagnose` heatmap report clarity.** A patch over `v0.8.4.2`: the Per-Artifact Heatmap note now explains why the "Event That Matters Most" panel (ranked by rework impact) and the heatmap row-1 (ranked by multi-writer coordination signal) can name different artifacts, preventing reader confusion in shared reports. Also closes test-coverage and documentation residuals from the v0.8.4.2 heatmap re-rank. No API or core-protocol changes. See [CHANGELOG.md](CHANGELOG.md). The v0.8.3 crash-recovery deprecation cycle and the upcoming v0.9.0 default flip are unaffected.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 

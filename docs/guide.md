@@ -324,15 +324,16 @@ When an agent crashes (OOM-kill, segfault) or livelocks (holds a grant indefinit
 its `MODIFIED` or `EXCLUSIVE` grant blocks all other agents from writing to that artifact.
 The crash-recovery extension reclaims stale grants automatically.
 
-> **Deprecation — default flips in v0.9.0.** As of **v0.8.3**, constructing
-> `CrashRecoveryConfig()` without an explicit `enabled=` emits a one-shot
-> `DeprecationWarning`: the default changes from `enabled=False` to
-> `enabled=True` in **v0.9.0**. Pass `enabled=` explicitly to silence the
-> warning and pin your intended behavior — `CrashRecoveryConfig(enabled=True)`
-> to opt in now, or `CrashRecoveryConfig(enabled=False)` to keep crash
-> recovery off. See [CHANGELOG.md](../CHANGELOG.md) for the full migration
-> notes (including the v0.9.0 `heartbeat_timeout_ticks` / `max_hold_ticks`
-> retuning).
+> **Default flipped in v0.9.0.** As of **v0.9.0**, `CrashRecoveryConfig()`
+> defaults to `enabled=True` (it was `enabled=False` through v0.8.x), so a bare
+> `CCSStore()` / `CoherenceAdapterCore()` now runs crash recovery. The first
+> `CrashRecoveryConfig` construction per process emits a one-shot transitional
+> `RuntimeWarning` flagging the change for anyone upgrading straight from
+> v0.8.2 (removed in v0.10.0). To pin behavior and silence it, pass `enabled=`
+> explicitly — `CrashRecoveryConfig(enabled=True)` to keep the new default, or
+> `CrashRecoveryConfig(enabled=False)` to opt out. The v0.9.0 defaults were
+> also retuned (`heartbeat_timeout_ticks` 10 → 120, `max_hold_ticks` 1000 →
+> 900); see [CHANGELOG.md](../CHANGELOG.md) for the full migration notes.
 
 ### Enabling
 
@@ -356,9 +357,9 @@ The same `crash_recovery=` kwarg works on `LangGraphAdapter`, `CrewAIAdapter`,
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `bool` | `False` | Master switch. When `False`, `heartbeat()` and `recover()` are silent no-ops; the per-tick sweep does not run. |
-| `heartbeat_timeout_ticks` | `int` | `10` | Reclaim a holder's grant if the gap between `now_tick` and the holder's last heartbeat is `>= heartbeat_timeout_ticks`. |
-| `max_hold_ticks` | `int` | `1000` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of how recently the holder heartbeated. Bound the worst-case lock duration. |
+| `enabled` | `bool` | `True` | Master switch (**default-on as of v0.9.0**). When `False`, `heartbeat()` and `recover()` are silent no-ops and the sweep does not run. |
+| `heartbeat_timeout_ticks` | `int` | `120` | Reclaim a holder's grant if the gap between `now_tick` and the holder's last heartbeat is `>= heartbeat_timeout_ticks`. |
+| `max_hold_ticks` | `int` | `900` | Reclaim a holder's grant if it has been continuously held in `MODIFIED`/`EXCLUSIVE` for `>= max_hold_ticks`, regardless of how recently the holder heartbeated. Bound the worst-case lock duration. |
 
 **Tick semantics.** Ticks are a logical clock — the unit is whatever `now_tick` your application advances. For LangGraph, one node invocation per tick is a sensible default. For long-running tool calls or LLM calls, advance ticks at the granularity at which you can call `heartbeat()` or expect grants to be released.
 
@@ -393,23 +394,35 @@ exceed `lease_ttl_ticks`. Equal or smaller values raise `ValueError` at startup.
 
 ### Flag-off behavior
 
-With `enabled=False` (the default), `heartbeat()` and `recover()` are silent no-ops.
-State-transition log output is byte-identical to v0.5. No behavior change for existing
-users.
+With `enabled=False` (the opt-out — the v0.9.0 default is `enabled=True`),
+`heartbeat()` and `recover()` are silent no-ops and the sweep never runs.
+State-transition log output is then byte-identical to a build without crash
+recovery (R5). Note the inversion: omitting the `crash_recovery=` argument no
+longer reproduces that output — pass `CrashRecoveryConfig(enabled=False)`
+explicitly to get it.
 
 ### Disabling / rollback
 
-To turn crash recovery off, omit `crash_recovery=` (it defaults to disabled) or pass
-`CrashRecoveryConfig(enabled=False)`. This is the rollback path if a default-on
-release ever surfaces an issue in your workload — flip the kwarg back to disabled
-and the sweep stops immediately. No data migration, no protocol incompatibility:
-the protocol behavior with `enabled=False` is byte-identical to a build without
-crash recovery.
+To turn crash recovery off, pass `CrashRecoveryConfig(enabled=False)` explicitly.
+(As of v0.9.0 the default is enabled, so omitting `crash_recovery=` no longer
+disables it.) This is the rollback path if the default-on behavior ever surfaces
+an issue in your workload — set `enabled=False` and the sweep stops immediately.
+No data migration, no protocol incompatibility: the protocol behavior with
+`enabled=False` is byte-identical to a build without crash recovery.
 
-If you've enabled crash recovery and want to verify it isn't reclaiming benign
-holders, watch the state-transition log for `reclaim_heartbeat` and
-`reclaim_max_hold` triggers. If they fire on agents that were healthy, raise
-`heartbeat_timeout_ticks` or `max_hold_ticks` rather than disabling the feature.
+If you want to verify the sweep isn't reclaiming benign holders, watch the
+state-transition log for `reclaim_heartbeat` and `reclaim_max_hold` triggers. If
+they fire on agents that were healthy, raise `heartbeat_timeout_ticks` or
+`max_hold_ticks` rather than disabling the feature.
+
+### Reclamation diagnostics
+
+When the sweep reclaims a grant, `CoherenceAdapterCore` logs a one-shot `WARNING`
+on the `ccs.adapters.base` logger the **first** time that adapter instance
+reclaims, with structured `extra` fields `trigger`, `agent_id_short`,
+`artifact_id_short`, and `reclaim_count`. Subsequent reclamations on the same
+instance are silent; a companion `DEBUG` log carries the full UUIDs. Bind a
+handler to `ccs.adapters.base` to surface or ingest these events.
 
 ### Reference
 
@@ -886,7 +899,7 @@ Designed for CI gating; runs on every push. The companion script `tools/check_re
 | `on_error` | `str` | `"strict"` | `"strict"` to propagate `CoherenceError`; `"degrade"` to fall back silently |
 | `state_log` | `Callable[[dict], None] \| None` | `None` | Callback fired on every stable MESI state transition; see [State transitions log](#state-transitions-log) |
 | `content_audit_log` | `Callable[[dict], None] \| None` | `None` | Callback fired on every content delivery; see [Content audit log](#content-audit-log). Enables version retention. |
-| `crash_recovery` | `CrashRecoveryConfig \| None` | `None` | Crash-recovery configuration; see [Crash recovery](#crash-recovery). `None` uses `CrashRecoveryConfig(enabled=False)`. |
+| `crash_recovery` | `CrashRecoveryConfig \| None` | `None` | Crash-recovery configuration; see [Crash recovery](#crash-recovery). `None` uses `CrashRecoveryConfig()` — enabled by default as of v0.9.0. |
 | `**strategy_kwargs` | `Any` | — | Forwarded to the strategy constructor (`lease_ticks`, `threshold`, etc.) |
 
 ### Public imports

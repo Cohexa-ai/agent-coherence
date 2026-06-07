@@ -273,7 +273,7 @@ class _ReportContext(TypedDict):
     top_event_writes: Any
     ownership: tuple[OwnershipRow, ...]
     # Section 3 data
-    heatmap_rows: tuple[Any, ...]
+    heatmap_rows: tuple[_HeatmapDisplayRow, ...]
     # Section 4 data
     reader_pairs: Any
     # Section 5 data
@@ -401,6 +401,78 @@ def _build_section_toggles(
     }
 
 
+@dataclass(frozen=True)
+class _HeatmapDisplayRow:
+    """A heatmap row enriched with its writer count for display.
+
+    The detection-layer :class:`~ccs.diagnose.detection.HeatmapRow` ranks
+    purely by ``divergent_reads``, which over-surfaces single-writer artifacts
+    whose high ``share`` is expected pipeline ordering (readers handed the
+    pre-write value). For the report we re-rank genuine *multi-writer*
+    artifacts — the coordination signal — first.
+    """
+
+    artifact_key: str
+    divergent_reads: int
+    total_reads: int
+    writer_count: int
+
+    @property
+    def is_multi_writer(self) -> bool:
+        return self.writer_count >= 2
+
+
+def _build_heatmap_display_rows(
+    *,
+    report: DetectionReport,
+    ownership: tuple[OwnershipRow, ...],
+) -> tuple[_HeatmapDisplayRow, ...]:
+    """Return heatmap display rows joined with writer counts and re-ranked multi-writer-first.
+
+    Mirrors the Ownership Map's multi-writer-first sort
+    (:func:`ccs.diagnose.ownership._row_sort_key`) at the top bucket; the
+    secondary sort key differs intentionally — this function sorts within each
+    bucket by ``-divergent_reads`` (detection signal), while ``_row_sort_key``
+    sorts by ``-total_reads`` (reader-traffic signal). Detection's
+    ``HeatmapRow`` order — which feeds :func:`_pick_top_event` — is left
+    unchanged; this is a presentation-only re-rank. Artifacts absent from
+    ``ownership`` (writer count unknown) fall back to the divergent-reads order.
+    """
+    writers_by_id = {row.artifact_id: len(row.writers) for row in ownership}
+    # CLI invariant: both ``report`` and ``ownership`` are built from the same
+    # ``key_index``, so every heatmap artifact_id has a matching ownership row
+    # and ``writers_by_id.get(aid, 0)`` always returns the real writer count.
+    # The fallback to 0 handles callers that pass ownership built from a
+    # different key_index snapshot (e.g. test fixtures); those rows sort into
+    # the single-writer display bucket by ``is_multi_writer == False``.
+    # Known ambiguity: ``writer_count == 0`` means both "artifact absent from
+    # ownership" (unknown) and "OwnershipRow.writers == () i.e. zero observed
+    # writers". Both are correctly treated as non-multi-writer; the distinction
+    # is not surfaced in the display because neither is a coordination signal.
+    rows = (
+        _HeatmapDisplayRow(
+            artifact_key=row.artifact_key,
+            divergent_reads=row.divergent_reads,
+            total_reads=row.total_reads,
+            writer_count=writers_by_id.get(row.artifact_id, 0),
+        )
+        for row in report.heatmap
+        if row.divergent_reads > 0
+    )
+    # Stable sort: multi-writer first, then by divergent reads, then key. The
+    # multi-writer threshold lives only in ``_HeatmapDisplayRow.is_multi_writer``.
+    return tuple(
+        sorted(
+            rows,
+            key=lambda r: (
+                0 if r.is_multi_writer else 1,
+                -r.divergent_reads,
+                r.artifact_key,
+            ),
+        )
+    )
+
+
 def _build_section_data(
     *,
     verdict: ClassifierVerdict,
@@ -412,8 +484,8 @@ def _build_section_data(
         "top_event": report.top_event,
         "top_event_writes": _top_event_writes(report),
         "ownership": ownership,
-        "heatmap_rows": tuple(
-            row for row in report.heatmap if row.divergent_reads > 0
+        "heatmap_rows": _build_heatmap_display_rows(
+            report=report, ownership=ownership
         ),
         "reader_pairs": report.reader_pair_matrix,
         "exclusion_panel": report.exclusion_panel,

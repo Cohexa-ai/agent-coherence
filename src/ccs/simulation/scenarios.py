@@ -77,6 +77,7 @@ def _normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
     transient = data.setdefault("transient", {})
     context_semantics = data.setdefault("context_semantics", {})
     data.setdefault("crash_recovery", {})
+    data.setdefault("source_mutation", {})
 
     if "num_agents" not in simulation and "agents" in simulation:
         simulation["num_agents"] = simulation["agents"]
@@ -287,6 +288,26 @@ def _validate_crash_recovery(crash_recovery: dict[str, Any], path: Path) -> None
         )
 
 
+def _validate_source_mutation(source_mutation: dict[str, Any], path: Path) -> None:
+    """Validate optional ``source_mutation`` block; absent or empty ⇒ defaults.
+
+    ``enabled`` (bool, default False) gates the per-tick source-mutation step.
+    ``answer_sensitivity`` (float in [0, 1], default 1.0) is the probability a
+    given source mutation is tagged answer-relevant. Mirrors how
+    ``crash_recovery`` is validated and the ``artifacts[].volatility`` range.
+    """
+    if "enabled" in source_mutation:
+        _require_bool(source_mutation["enabled"], path=path, field="source_mutation.enabled")
+    if "answer_sensitivity" in source_mutation:
+        _require_float(
+            source_mutation["answer_sensitivity"],
+            path=path,
+            field="source_mutation.answer_sensitivity",
+            min_value=0.0,
+            max_value=1.0,
+        )
+
+
 _SUPPORTED_FAILURE_ACTIONS = {"kill", "busy", "restore"}
 
 
@@ -379,6 +400,7 @@ def validate_scenario(data: dict[str, Any], scenario_path: str | Path) -> dict[s
     transient = _require_mapping(normalized, path, "transient")
     context_semantics = _require_mapping(normalized, path, "context_semantics")
     crash_recovery = _require_mapping(normalized, path, "crash_recovery")
+    source_mutation = _require_mapping(normalized, path, "source_mutation")
 
     _validate_simulation(simulation, path)
     _validate_network(network, path)
@@ -388,6 +410,7 @@ def validate_scenario(data: dict[str, Any], scenario_path: str | Path) -> dict[s
     _validate_transient(transient, path)
     _validate_context_semantics(context_semantics, path)
     _validate_crash_recovery(crash_recovery, path)
+    _validate_source_mutation(source_mutation, path)
     _validate_failure_events(normalized.get("failure_events"), path)
 
     return _populate_runtime_aliases(normalized)
