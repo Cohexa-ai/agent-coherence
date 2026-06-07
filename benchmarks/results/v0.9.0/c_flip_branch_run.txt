@@ -1,0 +1,55 @@
+/Users/vladparakhin/projects/agent-coherence/.venv/lib/python3.13/site-packages/langgraph/checkpoint/serde/encrypted.py:5: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+/Users/vladparakhin/projects/agent-coherence/src/ccs/adapters/base.py:72: RuntimeWarning: CrashRecoveryConfig default changed in v0.9.0: enabled=True is now the default (was False in v0.8.x). If you intend the new behavior, you can silence this by passing CrashRecoveryConfig(enabled=True) explicitly. If you need v0.8.x behavior, pass CrashRecoveryConfig(enabled=False) to opt out. See CHANGELOG.md (section: [0.9.0]) at https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md for migration details.
+  crash_recovery if crash_recovery is not None else CrashRecoveryConfig()
+
+Benchmark: 4-agent planning pipeline (read-heavy)
+Content: ~320 tokens per artifact
+
+  InMemoryStore:    4160 tokens   (13 ops × 320)
+  CCSStore lazy:    1301 tokens   (1 write + 3 misses) × 320 + 9 hits × 1
+
+  Cache hit rate:   9 / 12 = 75%    ← fraction of reads served from cache
+  Token reduction:  69%            ← actual savings vs no-cache baseline
+  Elapsed (CCS):    0.018s
+
+  Results saved to: /Users/vladparakhin/projects/agent-coherence/benchmarks/results/langgraph_real/4-agent_planning_pipeline_(read-heavy).json
+
+
+Benchmark: 3-agent code review (write-moderate)
+Content: ~280 tokens per artifact
+
+  InMemoryStore:    5320 tokens   (19 ops × 280)
+  CCSStore lazy:    2835 tokens   (4 write + 6 misses) × 280 + 9 hits × 1
+
+  Cache hit rate:   9 / 15 = 60%    ← fraction of reads served from cache
+  Token reduction:  47%            ← actual savings vs no-cache baseline
+  Elapsed (CCS):    0.012s
+
+  Results saved to: /Users/vladparakhin/projects/agent-coherence/benchmarks/results/langgraph_real/3-agent_code_review_(write-moderate).json
+
+
+Benchmark: 4-agent high-churn (write-heavy)
+Content: ~250 tokens per artifact
+
+  InMemoryStore:    3250 tokens   (13 ops × 250)
+  CCSStore lazy:    2317 tokens   (5 write + 4 misses) × 250 + 4 hits × 1
+
+  Cache hit rate:   4 / 8 = 50%    ← fraction of reads served from cache
+  Token reduction:  29%            ← actual savings vs no-cache baseline
+  Elapsed (CCS):    0.015s
+
+  Results saved to: /Users/vladparakhin/projects/agent-coherence/benchmarks/results/langgraph_real/4-agent_high-churn_(write-heavy).json
+
+
+========================================================================
+  Consolidated benchmark results
+  Workload                                   Baseline       CCS  Savings
+------------------------------------------------------------------------
+  4-agent planning pipeline (read-heavy)         4160      1301    68.7%
+  3-agent code review (write-moderate)           5320      2835    46.7%
+  4-agent high-churn (write-heavy)               3250      2317    28.7%
+========================================================================
+
+Results written to: benchmarks/results/latest.json
+

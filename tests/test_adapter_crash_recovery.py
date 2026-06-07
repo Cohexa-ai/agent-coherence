@@ -11,10 +11,15 @@ enforce_stable_grant_timeouts between adapter calls.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
+from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 
 from ccs.adapters.autogen import AutoGenAdapter
+from ccs.adapters.base import CoherenceAdapterCore
 from ccs.adapters.crewai import CrewAIAdapter
 from ccs.adapters.langgraph import LangGraphAdapter
 from ccs.adapters.openai_agents import OpenAIAgentsAdapter
@@ -367,3 +372,235 @@ class TestCompositionFailFast:
                 lease_ttl_ticks=300,
                 crash_recovery=CrashRecoveryConfig(enabled=True, max_hold_ticks=300),
             )
+
+
+# ---- v0.9.0 Unit 8: rate-limited _maybe_sweep + structured-log diagnostic ----
+#
+# See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
+# Unit 8. CR_CFG uses heartbeat_timeout_ticks=10, so the rate-limit gate is
+# ``10 // 2 == 5`` ticks. Diagnostic is logged on the ``ccs.adapters.base``
+# logger at WARNING with structured ``extra`` fields.
+
+_GATE = CR_CFG.heartbeat_timeout_ticks // 2  # == 5
+
+
+def _core(**overrides) -> CoherenceAdapterCore:
+    defaults = dict(strategy_name="lazy", crash_recovery=CR_CFG)
+    defaults.update(overrides)
+    return CoherenceAdapterCore(**defaults)
+
+
+def _reclaiming_enforce(*, current_tick, heartbeat_timeout_ticks, max_hold_ticks, on_reclaim):
+    """Mock side_effect simulating the sweep reclaiming exactly one grant."""
+    on_reclaim(uuid4(), uuid4(), "reclaim_heartbeat")
+    return 1
+
+
+class TestMaybeSweepRateLimit:
+    """KD-4 rate-limit gate + monotonicity defense + disabled short-circuit."""
+
+    def test_first_call_fires_then_gate_skips_within_window(self) -> None:
+        core = _core()
+        core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+        core._maybe_sweep(now_tick=0)  # first call fires (never-swept sentinel)
+        core._maybe_sweep(now_tick=_GATE - 1)  # within window -> skip
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 1
+
+    def test_fires_again_on_second_eligible_tick(self) -> None:
+        core = _core()
+        core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+        core._maybe_sweep(now_tick=0)
+        core._maybe_sweep(now_tick=_GATE)  # exactly at the gate -> fire
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 2
+        assert core._last_sweep_tick == _GATE
+
+    def test_disabled_short_circuits(self) -> None:
+        core = _core(crash_recovery=CrashRecoveryConfig(enabled=False))
+        core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+        core._maybe_sweep(now_tick=100)
+        core.coordinator.enforce_stable_grant_timeouts.assert_not_called()
+
+    def test_non_monotonic_tick_defense(self) -> None:
+        core = _core()
+        core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+        core._maybe_sweep(now_tick=100)  # fire -> _last_sweep_tick = 100
+        core._maybe_sweep(now_tick=50)  # backward jump (50 - 100 < gate) -> skip
+        assert core._last_sweep_tick == 100
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 1
+
+    def test_read_invokes_maybe_sweep(self) -> None:
+        core = _core()
+        core.register_agent("A")
+        artifact = core.register_artifact(name="x.md", content="v1")
+        core._maybe_sweep = Mock()  # type: ignore[method-assign]
+        core.read(agent_name="A", artifact_id=artifact.id, now_tick=7)
+        core._maybe_sweep.assert_called_once_with(7)
+
+    def test_write_invokes_maybe_sweep(self) -> None:
+        core = _core()
+        core.register_agent("A")
+        artifact = core.register_artifact(name="x.md", content="v1")
+        core._maybe_sweep = Mock()  # type: ignore[method-assign]
+        core.write(agent_name="A", artifact_id=artifact.id, content="v2", now_tick=9)
+        core._maybe_sweep.assert_called_once_with(9)
+
+
+class TestMaybeSweepDiagnostic:
+    """R9 first-reclamation diagnostic: logger.warning + structured extras."""
+
+    def test_first_reclamation_emits_structured_diagnostic(self, caplog) -> None:
+        core = _core()
+        aid, agid = uuid4(), uuid4()
+
+        def _enforce(*, current_tick, heartbeat_timeout_ticks, max_hold_ticks, on_reclaim):
+            on_reclaim(aid, agid, "reclaim_heartbeat")
+            return 1
+
+        core.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_enforce)
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+            core._maybe_sweep(now_tick=10)
+        records = [
+            r for r in caplog.records
+            if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.trigger == "reclaim_heartbeat"
+        assert rec.agent_id_short == str(agid)[:8]
+        assert rec.artifact_id_short == str(aid)[:8]
+        assert rec.reclaim_count == 1
+        assert "sweep reclaimed 1 agent(s)" in rec.getMessage()
+
+    def test_diagnostic_dedupes_per_instance(self, caplog) -> None:
+        core = _core()
+        core.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_reclaiming_enforce)
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+            core._maybe_sweep(now_tick=0)  # fires + reclaims + emits
+            core._maybe_sweep(now_tick=10)  # fires + reclaims, but no second emit
+        records = [
+            r for r in caplog.records
+            if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 1
+
+    def test_diagnostic_is_per_instance_not_per_process(self, caplog) -> None:
+        c1, c2 = _core(), _core()
+        c1.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_reclaiming_enforce)
+        c2.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_reclaiming_enforce)
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+            c1._maybe_sweep(now_tick=10)
+            c2._maybe_sweep(now_tick=10)
+        records = [
+            r for r in caplog.records
+            if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 2
+
+    def test_sweep_failure_is_best_effort_and_rate_limits_retry(self, caplog) -> None:
+        core = _core()  # heartbeat_timeout=10 -> gate=5
+        core.register_agent("A")
+        artifact = core.register_artifact(name="x.md", content="v1")
+        core.coordinator.enforce_stable_grant_timeouts = Mock(
+            side_effect=RuntimeError("synthetic")
+        )
+        with caplog.at_level(logging.ERROR, logger="ccs.adapters.base"):
+            # read must complete despite the sweep raising.
+            core.read(agent_name="A", artifact_id=artifact.id, now_tick=10)
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+        # The slot was CLAIMED in Phase 1, so the failed sweep is rate-limited:
+        # _last_sweep_tick advanced to 10, and a call within the gate window
+        # does NOT retry (no hot loop against a persistently-failing coordinator).
+        assert core._last_sweep_tick == 10
+        core._maybe_sweep(now_tick=11)  # 11 - 10 = 1 < gate(5) -> skip
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 1
+        # A call past the gate window does retry.
+        core._maybe_sweep(now_tick=20)  # 20 - 10 = 10 >= gate -> retry
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 2
+
+
+class TestMaybeSweepConcurrency:
+    """Finding #6 + ce:review ADV-01 — the Phase-1 claim under _sweep_lock
+    serializes concurrent callers at the same tick to a SINGLE coordinator
+    sweep per gate window (and therefore a single diagnostic). A start-barrier
+    maximizes lock contention; the inside-sweep barrier of the old design would
+    now deadlock, since only one thread reaches the coordinator call."""
+
+    def test_concurrent_sweep_invokes_coordinator_and_emits_exactly_once(self, caplog) -> None:
+        core = _core()
+        start = threading.Barrier(2)
+        calls: list[int] = []
+        calls_lock = threading.Lock()
+
+        def _enforce(*, current_tick, heartbeat_timeout_ticks, max_hold_ticks, on_reclaim):
+            with calls_lock:
+                calls.append(current_tick)
+            on_reclaim(uuid4(), uuid4(), "reclaim_heartbeat")
+            return 1
+
+        core.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_enforce)
+
+        def worker() -> None:
+            start.wait()  # release both threads together to contend on _sweep_lock
+            core._maybe_sweep(now_tick=10)
+
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        records = [
+            r for r in caplog.records
+            if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+        ]
+        # The Phase-1 claim serializes: exactly one thread sweeps the coordinator
+        # and exactly one diagnostic is emitted — no double sweep, no double emit.
+        assert len(calls) == 1
+        assert len(records) == 1
+
+    def test_concurrent_gate_invokes_sweep_exactly_once(self) -> None:
+        core = _core()
+        start = threading.Barrier(2)
+
+        def _enforce(*, current_tick, heartbeat_timeout_ticks, max_hold_ticks, on_reclaim):
+            return 0
+
+        core.coordinator.enforce_stable_grant_timeouts = Mock(side_effect=_enforce)
+
+        def worker() -> None:
+            start.wait()  # contend on _sweep_lock at the same tick
+            core._maybe_sweep(now_tick=10)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # The Phase-1 claim (advancing _last_sweep_tick under the lock) means the
+        # second caller sees the advanced tick and skips: exactly one sweep.
+        assert core.coordinator.enforce_stable_grant_timeouts.call_count == 1
+        assert core._last_sweep_tick == 10
+
+
+class TestMaybeSweepEndToEnd:
+    """Integration: a real stale grant is reclaimed on the next read, the
+    diagnostic emits exactly once, and subsequent reads do not re-emit."""
+
+    def test_stale_grant_reclaimed_on_read_diagnostic_once(self, caplog) -> None:
+        core = _core()  # heartbeat_timeout_ticks=10, gate=5
+        core.register_agent("A", now_tick=0)
+        core.register_agent("B", now_tick=0)
+        artifact = core.register_artifact(name="x.md", content="v1")
+        # A acquires MODIFIED then goes silent (no further heartbeat).
+        core.write(agent_name="A", artifact_id=artifact.id, content="v2", now_tick=0)
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+            # B reads far past A's heartbeat timeout -> sweep reclaims A.
+            core.read(agent_name="B", artifact_id=artifact.id, now_tick=50)
+            # A second read does not re-reclaim or re-emit.
+            core.read(agent_name="B", artifact_id=artifact.id, now_tick=100)
+        records = [
+            r for r in caplog.records
+            if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+        ]
+        assert len(records) == 1
+        assert records[0].trigger in ("reclaim_heartbeat", "reclaim_max_hold")

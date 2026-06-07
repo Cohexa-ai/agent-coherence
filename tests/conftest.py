@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 
+import pytest
+
 collect_ignore_glob: list[str] = []
 
 if importlib.util.find_spec("langchain_core") is None:
@@ -30,3 +32,41 @@ if importlib.util.find_spec("langchain_core") is None:
 # `live_api` marker keeps them out of the default `pytest -q` run regardless.
 if importlib.util.find_spec("openai") is None or importlib.util.find_spec("mistralai") is None:
     collect_ignore_glob.append("test_*_live.py")
+
+
+def pytest_configure(config):
+    """Neutralize the v0.9.0 transitional RuntimeWarning at COLLECTION time.
+
+    Module-level ``CrashRecoveryConfig`` constructions in test files (e.g. the
+    ``CR_CFG`` constant in test_adapter_crash_recovery.py) run at import /
+    collection — before the autouse fixture below ever fires. Pre-setting the
+    flag here keeps a ``-W error::RuntimeWarning`` run from failing collection
+    on that first construction. Dedicated warning-assertion tests still reset
+    the flag to ``False`` to observe the warning.
+    """
+    from ccs.coordinator import service as _service
+
+    _service._V090_FIRST_USE_WARNED = True
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_v090_first_use_warning():
+    """Suite-wide neutralizer for the v0.9.0 ``CrashRecoveryConfig`` transitional
+    ``RuntimeWarning`` (C-flip plan, Unit 5).
+
+    The warning fires once per process on the FIRST ``CrashRecoveryConfig``
+    construction — including explicit ones. Without this, whichever test
+    constructs a config first (especially under ``warnings.simplefilter
+    ("error")``) would observe the warning order-dependently. We mark the
+    module-level flag "already warned" before every test so the warning is a
+    no-op by default.
+
+    The dedicated tests in ``tests/test_coordinator.py`` that ASSERT the
+    warning opt back in via their own ``reset_v090_first_use_flag`` fixture
+    (or an inline reset), which pytest runs after this autouse fixture and
+    flips the flag to ``False`` so the warning fires for those tests only.
+    """
+    from ccs.coordinator import service as _service
+
+    _service._V090_FIRST_USE_WARNED = True
+    yield

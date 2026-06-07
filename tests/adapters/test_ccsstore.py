@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import warnings
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -1044,7 +1045,11 @@ def test_ccsstore_recover_checkpoint_restore_flow() -> None:
 
 
 def test_ccsstore_flag_off_heartbeat_noop() -> None:
-    store = _store()
+    # Explicit enabled=False: post-v0.9.0 the bare default is enabled, so the
+    # "flag off" contract requires opting out explicitly.
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = _store(crash_recovery=CrashRecoveryConfig(enabled=False))
     _put(store, ("planner", "shared"), "plan", {"v": 1})
 
     store.heartbeat(agent_name="planner", now_tick=42)
@@ -1053,18 +1058,25 @@ def test_ccsstore_flag_off_heartbeat_noop() -> None:
     assert store.core.registry.last_heartbeat_tick(agent_id) is None
 
 
-# ---- v0.8.3 C-flip Unit 2 — R2 internal-bare-construction hygiene ------------
+# ---- v0.9.0 C-flip — bare CCSStore adopts enabled-by-default ----------------
 #
 # See docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md
-# Unit 2. The most-common adapter construction path (bare CCSStore() with no
-# crash_recovery= argument) traverses CoherenceAdapterCore.__init__ which used
-# to bare-construct CrashRecoveryConfig() — that emitted the v0.8.3
-# DeprecationWarning from inside library code, indistinguishable to users
-# from their own code. Test that the helper fix removed this.
+# Units 5 + 6. Post-flip, bare CCSStore() (no crash_recovery= argument) adopts
+# the enabled-by-default crash recovery. The v0.8.3 DeprecationWarning is gone;
+# the only warning that may surface is the one-shot v0.9.0 transitional
+# RuntimeWarning (suppressed suite-wide by the conftest neutralizer except in
+# the dedicated tests/test_coordinator.py assertions).
 
 
-def test_bare_ccsstore_emits_no_deprecation_warning() -> None:
-    """R2: CCSStore() with no crash_recovery= must not surface the v0.8.3 warning."""
+def test_bare_ccsstore_adopts_enabled_default_no_deprecation_warning() -> None:
+    """v0.9.0: bare CCSStore() emits no DeprecationWarning (the v0.8.3 warning is
+    removed) and adopts the enabled-by-default crash recovery; at most one
+    transitional RuntimeWarning may surface."""
+    from ccs.coordinator import service as _service_mod
+
+    # Reset the once-per-process flag so we deterministically observe the
+    # transitional warning here (the conftest neutralizer otherwise pre-sets it).
+    _service_mod._V090_FIRST_USE_WARNED = False
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         store = CCSStore(strategy="lazy")
@@ -1075,5 +1087,110 @@ def test_bare_ccsstore_emits_no_deprecation_warning() -> None:
         f"bare CCSStore construction must not emit DeprecationWarning, got: "
         f"{[str(w.message) for w in deprecation_warnings]}"
     )
-    # And the v0.8.x default behavior is preserved.
-    assert store.core._crash_recovery.enabled is False
+    runtime_warnings = [
+        w for w in caught if issubclass(w.category, RuntimeWarning)
+    ]
+    assert len(runtime_warnings) <= 1
+    # The flip: bare construction now enables crash recovery.
+    assert store.core._crash_recovery.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 Unit 9: CCSStore once-per-batch sweep (KD-9) + Unit 6 default-threshold
+# false-reclaim regression. No production code changes — once-per-batch emerges
+# from batch()'s shared per-batch tick + CoherenceAdapterCore's rate-limited
+# _maybe_sweep (the sweep seam lives on store.core, not on CCSStore).
+# ---------------------------------------------------------------------------
+
+
+def _enabled_store(**overrides):
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    cfg = CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000)
+    return _store(crash_recovery=cfg, **overrides)
+
+
+def test_ccsstore_batch_sweeps_once_per_batch() -> None:
+    """KD-9: a multi-op batch shares one tick, so the rate-limited sweep fires on
+    the first op and skips the rest — exactly ONE coordinator sweep per batch."""
+    store = _enabled_store()  # heartbeat_timeout=10 -> gate=5
+    _put(store, ("planner", "shared"), "plan", {"v": 1})  # creates artifact; sweeps at tick 1
+    # Spy AFTER setup so we count only the test batch's sweeps.
+    store.core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+    store._tick = 100  # next batch runs at tick 101, well past the gate from tick 1
+    store.batch([
+        GetOp(namespace=("planner", "shared"), key="plan"),
+        GetOp(namespace=("planner", "shared"), key="plan"),
+        GetOp(namespace=("planner", "shared"), key="plan"),
+    ])
+    assert store.core.coordinator.enforce_stable_grant_timeouts.call_count == 1
+
+
+def test_ccsstore_sweep_rate_limited_across_batches() -> None:
+    """Per-batch rate-limit: consecutive batches at ticks 1, 2, 6 sweep on the
+    first and third only (the second is within the gate=5 window)."""
+    store = _enabled_store()  # gate = 5
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    store.core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+    # Reset the sweep gate so the batch timing below is exactly what we control.
+    store.core._last_sweep_tick = None
+    store._tick = 0
+    _get(store, ("planner", "shared"), "plan")  # batch -> tick 1; first ever -> fire
+    _get(store, ("planner", "shared"), "plan")  # batch -> tick 2; 2-1=1 < gate -> skip
+    store._tick = 5
+    _get(store, ("planner", "shared"), "plan")  # batch -> tick 6; 6-1=5 >= gate -> fire
+    assert store.core.coordinator.enforce_stable_grant_timeouts.call_count == 2
+
+
+def test_ccsstore_disabled_never_sweeps() -> None:
+    from ccs.coordinator.service import CrashRecoveryConfig
+
+    store = _store(crash_recovery=CrashRecoveryConfig(enabled=False))
+    store.core.coordinator.enforce_stable_grant_timeouts = Mock(return_value=0)
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    for _ in range(10):
+        _get(store, ("planner", "shared"), "plan")
+    store.core.coordinator.enforce_stable_grant_timeouts.assert_not_called()
+
+
+def test_ccsstore_first_reclamation_diagnostic(caplog) -> None:
+    """First reclamation through a CCSStore batch emits the diagnostic exactly
+    once on the ``ccs.adapters.base`` logger; subsequent batches do not re-emit."""
+    store = _enabled_store()  # hb=10, gate=5
+    _put(store, ("holder", "shared"), "doc", {"v": 1})  # holder MODIFIED on 'doc' at tick 1
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.base"):
+        # A different agent operates on a DIFFERENT artifact to advance the tick
+        # without disturbing holder's grant via the coherence protocol; only the
+        # sweep can reclaim it.
+        store._tick = 50
+        _put(store, ("other", "shared"), "scratch", {"v": 1})  # tick 51: sweep reclaims holder (gap 50 >= 10)
+        store._tick = 100
+        _put(store, ("other", "shared"), "scratch", {"v": 2})  # tick 101: holder already reclaimed -> no re-emit
+    records = [
+        r for r in caplog.records
+        if r.name == "ccs.adapters.base" and r.levelno == logging.WARNING
+    ]
+    assert len(records) == 1
+    assert records[0].reclaim_count == 1
+
+
+def test_ccsstore_default_thresholds_no_false_reclaim_then_reclaims() -> None:
+    """Unit 6 CI-runnable false-reclaim regression (R10 supplement), exercised via
+    CCSStore batch semantics with the v0.9.0 DEFAULT thresholds (heartbeat_timeout
+    =120, gate=60). A held grant is NOT reclaimed while the holder's heartbeat gap
+    is within the timeout, and IS reclaimed once it crosses. Guards future tuning
+    patches against silently regressing the safety floor."""
+    store = _store()  # bare -> enabled-by-default: hb=120, max_hold=900, gate=60
+    _put(store, ("holder", "shared"), "doc", {"v": 1})  # holder MODIFIED at tick 1, last hb=1
+    artifact_id = store._artifact_map[(("shared",), "doc")]
+    holder_id = store.core.agent_id_for("holder")
+
+    # Within the heartbeat window: drive a sweep at tick 61 (gap 60 < 120). Kept.
+    store._tick = 60
+    _put(store, ("other", "shared"), "scratch", {"v": 1})  # tick 61: sweep fires, holder gap 60 < 120
+    assert store.core.registry.get_agent_state(artifact_id, holder_id) == MESIState.MODIFIED
+
+    # Past the window: drive a sweep at tick 121 (gap 120 >= 120). Reclaimed.
+    store._tick = 120
+    _put(store, ("other", "shared"), "scratch", {"v": 2})  # tick 121: sweep fires, holder gap 120 >= 120
+    assert store.core.registry.get_agent_state(artifact_id, holder_id) == MESIState.INVALID

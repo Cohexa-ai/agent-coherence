@@ -1,0 +1,7 @@
+  Workload                                   Expected    Actual    Delta
+------------------------------------------------------------------------
+  4-agent planning pipeline (read-heavy)       68.73%    68.73%    0.00pp
+  3-agent code review (write-moderate)         46.71%    46.71%    0.00pp
+  4-agent high-churn (write-heavy)             28.71%    28.71%    0.00pp
+
+Benchmark regression check passed.
