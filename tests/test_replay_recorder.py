@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -604,3 +605,43 @@ class TestCCSStoreRecordTo:
         assert on_disk, "file writer did not produce on-disk entries"
         # Both saw the same entries (composition, not override).
         assert len(captured) == len(on_disk)
+
+
+# ---------------------------------------------------------------------------
+# Session-directory permissions
+# ---------------------------------------------------------------------------
+
+
+class TestSessionDirPermissions:
+    """The session directory is created owner-only (0o700) to match the
+    0o600 stream-file mode in _open_stream. A world-traversable trace
+    directory would let other local users enumerate stream filenames and
+    sizes even though the JSONL contents stay unreadable."""
+
+    def test_session_dir_created_owner_only(self, tmp_path: Path) -> None:
+        session_dir = tmp_path / "session"
+        assert not session_dir.exists()
+        with record_callbacks(session_dir, accept_unverified=True):
+            pass
+        dir_mode = stat.S_IMODE(session_dir.stat().st_mode)
+        # 0o700 is requested at creation; umask can only narrow it (0o700
+        # has no group/other bits to clear), so assert no group/other
+        # access rather than an exact mode that could vary by platform.
+        assert dir_mode & 0o077 == 0, f"session dir too permissive: {oct(dir_mode)}"
+
+    def test_session_dir_and_stream_file_both_default_deny(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard for the dir/file mode pair: the directory
+        (0o700) and the stream JSONL it contains (0o600) are both
+        owner-only — neither leaks group/other access."""
+        session_dir = tmp_path / "session"
+        with record_callbacks(
+            session_dir, accept_unverified=True
+        ) as (state_cb, _audit_cb):
+            state_cb(_state_log_entry())
+
+        dir_mode = stat.S_IMODE(session_dir.stat().st_mode)
+        file_mode = stat.S_IMODE((session_dir / "state_log.jsonl").stat().st_mode)
+        assert dir_mode & 0o077 == 0, f"session dir too permissive: {oct(dir_mode)}"
+        assert file_mode & 0o077 == 0, f"stream file too permissive: {oct(file_mode)}"
