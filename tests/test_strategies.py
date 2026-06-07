@@ -13,6 +13,7 @@ from ccs.core.states import MESIState
 from ccs.simulation.engine import SimulationEngine
 from ccs.simulation.scenarios import load_scenario
 from ccs.strategies.access_count import AccessCountStrategy
+from ccs.strategies.blind_cache import BlindCacheStrategy
 from ccs.strategies.broadcast import BroadcastStrategy
 from ccs.strategies.eager import EagerStrategy
 from ccs.strategies.lazy import LazyStrategy
@@ -54,6 +55,43 @@ def test_lazy_invalidates_and_fetches_on_demand() -> None:
     assert strategy.requires_refresh(valid_entry, now_tick=3) is False
     assert strategy.requires_refresh(invalid_entry, now_tick=3) is True
     assert strategy.staleness_bound() is None
+
+
+def test_blind_cache_never_refreshes_even_when_invalid() -> None:
+    strategy = BlindCacheStrategy()
+    invalid_entry = strategy.on_fetch(
+        artifact_id=uuid4(),
+        version=4,
+        state=MESIState.INVALID,
+        now_tick=2,
+    )
+
+    # The point of the cost floor: refuse to refetch even a stale/invalid entry.
+    assert strategy.requires_refresh(invalid_entry, now_tick=99) is False
+    assert strategy.broadcasts_content_on_commit() is False
+    assert strategy.staleness_bound() is None
+    assert strategy.on_read(invalid_entry, now_tick=3).access_count == 1
+
+
+def test_build_strategy_constructs_blind_cache() -> None:
+    assert isinstance(build_strategy("blind"), BlindCacheStrategy)
+    with pytest.raises(ValueError):
+        build_strategy("nope")
+
+
+def test_blind_cache_fetches_once_per_agent_artifact_pair() -> None:
+    scenario = load_scenario("benchmarks/scenarios/planning_canonical.yaml")
+    blind = SimulationEngine(scenario, strategy_name="blind", seed=20260305).run()
+    lazy = SimulationEngine(scenario, strategy_name="lazy", seed=20260305).run()
+
+    num_agents = int(scenario["simulation"]["num_agents"])
+    artifact_count = len(scenario["artifacts"])
+    # Cost floor: each (agent, artifact) pair fills its cache at most once, then
+    # every later access is a hit. Never refetching on INVALID keeps blind
+    # strictly below a strategy (lazy) that does refetch stale entries.
+    assert blind.fetch_actions <= num_agents * artifact_count
+    assert blind.cache_misses == blind.fetch_actions
+    assert blind.fetch_actions < lazy.fetch_actions
 
 
 def test_lease_refreshes_after_ttl_expiry() -> None:

@@ -8,6 +8,86 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.9.0] — 2026-06-07
+
+The first minor release since the v0.8 series. Three themes: the crash-recovery
+default flips **ON**, a new **CoherentVolume** shared-workspace adapter, and a
+temporal source-drift **cost benchmark**.
+
+**Crash-recovery default flips ON.** Completes the deprecation cycle begun in
+v0.8.3: `CrashRecoveryConfig().enabled` changes from `False` to `True`, so a bare
+`CCSStore()` / `CoherenceAdapterCore()` now reclaims stale `MODIFIED`/`EXCLUSIVE`
+grants automatically. Operators who depend on the v0.8.x default-disabled behavior
+**must pass `CrashRecoveryConfig(enabled=False)` explicitly** to opt out.
+
+### Changed
+
+- **Breaking default — crash recovery is now ON.** `CrashRecoveryConfig.enabled`
+  flipped `False` → `True`. Bare `CrashRecoveryConfig()`, `CCSStore()`, and
+  `CoherenceAdapterCore()` now run the reclamation sweep. **Migration to keep
+  v0.8.x behavior: pass `CrashRecoveryConfig(enabled=False)` explicitly.**
+- **Default thresholds retuned** from simulation-anchored to batch-tick-realistic
+  values: `heartbeat_timeout_ticks` 10 → 120, `max_hold_ticks` 1000 → 900. The old
+  values remain settable explicitly. Calibrated so a bare `CCSStore` under realistic
+  LLM workloads does not false-reclaim live agents. Benchmark token reductions are
+  unchanged — see [`benchmarks/results/v0.9.0/attestation.md`](benchmarks/results/v0.9.0/attestation.md).
+- **Migration caveat — `lease` strategy with `lease_ttl_ticks` ≥ 900.** Because the
+  default is now enabled, the R11 composition rule (`max_hold_ticks` must exceed the
+  strategy's inspectable lease TTL) is enforced at construction for bare `CCSStore()`
+  / `CoherenceAdapterCore()`. A `lease` strategy with `lease_ttl_ticks` ≥ 900 (the new
+  default `max_hold_ticks`) now raises `ValueError` at startup where v0.8.x silently
+  skipped the check. Fix: pass `CrashRecoveryConfig(max_hold_ticks=…)` above your lease
+  TTL, or `CrashRecoveryConfig(enabled=False)`.
+- **Breaking — state-log byte-identity inverted (direction only).** A state-log produced with
+  the `crash_recovery` block omitted is now byte-identical to one with an explicit
+  `{enabled: true}` block, and diverges from `{enabled: false}`. CI that gates on
+  state-log byte equality against v0.8.x output must now set `enabled=False`
+  explicitly. The contract itself is unchanged — only which default it maps to.
+
+### Added
+
+- **Rate-limited reclamation sweep wired into `CoherenceAdapterCore`.** `read()` /
+  `write()` invoke a thread-safe `_maybe_sweep(now_tick)` after recording the
+  heartbeat; it reclaims stale grants at most once per `heartbeat_timeout_ticks // 2`
+  ticks. `CCSStore.batch()` inherits once-per-batch sweep semantics from its shared
+  per-batch tick — no separate state. The sweep is best-effort: a failure is logged
+  and never crashes the adapter's read/write path.
+- **Per-instance reclamation diagnostic.** The first time an adapter instance
+  reclaims, it logs a one-shot `WARNING` on the `ccs.adapters.base` logger with
+  structured `extra` fields (`trigger`, `agent_id_short`, `artifact_id_short`,
+  `reclaim_count`); a companion `DEBUG` carries full UUIDs. Field names are stable
+  for the v0.9 series. See the [crash-recovery guide](docs/guide.md#crash-recovery).
+- **Transitional first-use warning.** The first `CrashRecoveryConfig` construction
+  per process emits a one-shot `RuntimeWarning` naming the default change — a
+  migration heads-up for anyone upgrading straight from v0.8.2 who skipped the v0.8.3
+  `DeprecationWarning`. Removed in v0.10.0.
+- **`CoherentVolume` — sequential coherence for a shared agent workspace**
+  (`ccs.adapters.CoherentVolume`, plus `coherent_workspace()` / `install()` /
+  `uninstall()`). An out-of-process coordinator client that gives multiple agents on
+  one host, sharing files in a workspace, a coherent `read` / `write` / `reacquire`
+  surface over the shipped local-HTTP coordinator (strict-mode `INVALID`-deny over
+  SQLite-WAL). `write()` acquires EXCLUSIVE or **fails closed** when a peer commit has
+  invalidated the writer; `reacquire()` recovers via a fresh identity + mandatory
+  fresh read; writes are atomic (`tmp → fsync → os.replace`). An opt-in `install()` /
+  `coherent_workspace()` shim patches `open()` / `pathlib` for no-call-site-change
+  coordination (demo-grade). Scope: prevents stale-overwrite lost updates
+  (single-spawner, sequential-conflict); concurrent-write serialization and
+  multi-host are out of v1. Demo: `python -m examples.coherent_volume.main`.
+- **Temporal source-drift cost benchmark.** A simulation-based, cost-only measurement
+  (no LLM, no correctness oracle) of how many re-fetches/re-embeds coherence-gating
+  avoids when an external source changes between an agent's turns, swept over
+  change-rate × answer-sensitivity. Adds a flag-gated source-mutation step to
+  `SimulationEngine` (default off; byte-identical when off, dedicated RNG),
+  `BlindCacheStrategy` (the never-refresh cost floor), `source_refetches` /
+  `wasted_refetches` metrics, `tools/run_cost_sweep.py`, and a CI drift gate
+  (`make cost-benchmark-check` against `benchmarks/expected_cost.json`).
+
+### Removed
+
+- The v0.8.3 deprecation machinery: the falsy `_DefaultEnabledSentinel`, the
+  bare-construction `DeprecationWarning`, and the internal `_default_disabled_config`
+  helper. Bare `CrashRecoveryConfig()` is safe again — it now means "enabled".
+
 ## [0.8.4.3] — 2026-06-06
 
 A patch release completing the `ccs-diagnose` heatmap report improvements

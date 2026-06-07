@@ -9,7 +9,15 @@ from ccs.simulation.aggregation import aggregate_comparison_runs, aggregate_stra
 from ccs.simulation.metrics import SimulationMetrics
 
 
-def _metric(strategy: str, *, fetch: int, broadcast: int, stale_reads: int) -> SimulationMetrics:
+def _metric(
+    strategy: str,
+    *,
+    fetch: int,
+    broadcast: int,
+    stale_reads: int,
+    source_refetches: int = 0,
+    wasted_refetches: int = 0,
+) -> SimulationMetrics:
     return SimulationMetrics(
         scenario="tiny",
         strategy=strategy,
@@ -38,6 +46,8 @@ def _metric(strategy: str, *, fetch: int, broadcast: int, stale_reads: int) -> S
         tokens_invalidation=24,
         context_injections=3,
         transient_state_timeouts=0,
+        source_refetches=source_refetches,
+        wasted_refetches=wasted_refetches,
     )
 
 
@@ -53,6 +63,24 @@ def test_aggregate_strategy_runs() -> None:
     assert agg.fetch_tokens_mean == 200.0
     assert agg.broadcast_tokens_mean == 0.0
     assert agg.stale_reads_mean == 2.0
+
+
+def test_aggregate_reports_source_and_wasted_refetch_means() -> None:
+    runs = [
+        _metric("lazy", fetch=100, broadcast=0, stale_reads=1, source_refetches=4, wasted_refetches=1),
+        _metric("lazy", fetch=300, broadcast=0, stale_reads=3, source_refetches=8, wasted_refetches=3),
+    ]
+    agg = aggregate_strategy_runs("lazy", runs)
+
+    assert agg.source_refetches_mean == 6.0
+    assert agg.wasted_refetches_mean == 2.0
+    # pstdev over [4, 8] is 2.0; over [1, 3] is 1.0.
+    assert agg.source_refetches_std == 2.0
+    assert agg.wasted_refetches_std == 1.0
+    # New fields are part of the JSON-safe payload.
+    payload = agg.to_dict()
+    assert payload["source_refetches_mean"] == 6.0
+    assert payload["wasted_refetches_mean"] == 2.0
 
 
 def test_aggregate_comparison_and_flatten() -> None:

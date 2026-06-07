@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -16,7 +17,6 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
     CoordinatorService,
     CrashRecoveryConfig,
-    _default_disabled_config,
     validate_crash_recovery_config,
 )
 from ccs.core.exceptions import (  # re-exported; langgraph-free export point
@@ -63,13 +63,13 @@ class CoherenceAdapterCore:
         self._instance_id = instance_id
         self._content_audit_log = content_audit_log
         self._audit_seq = audit_seq
-        # Use _default_disabled_config() to avoid surfacing the v0.8.3
-        # DeprecationWarning on every bare CoherenceAdapterCore() / CCSStore()
-        # construction. The user did not pass crash_recovery=; their bare
-        # adapter call should not look like a misconfigured CrashRecoveryConfig
-        # site to them.
+        # Bare CoherenceAdapterCore() / CCSStore() adopt the v0.9.0
+        # enabled-by-default crash recovery: with no crash_recovery= argument,
+        # construct a default CrashRecoveryConfig() (enabled=True). The first
+        # such construction in a process emits the one-shot v0.9.0 transitional
+        # RuntimeWarning — the migration heads-up for jump-upgraders.
         self._crash_recovery = (
-            crash_recovery if crash_recovery is not None else _default_disabled_config()
+            crash_recovery if crash_recovery is not None else CrashRecoveryConfig()
         )
         self.registry = ArtifactRegistry(
             state_log=state_log,
@@ -86,6 +86,19 @@ class CoherenceAdapterCore:
         validate_crash_recovery_config(self._crash_recovery, self.strategy)
         self.event_bus = event_bus if event_bus is not None else InMemoryEventBus()
         self._agents_by_name: dict[str, AgentBinding] = {}
+        # Rate-limited crash-recovery sweep state (v0.9.0, KD-4). The sweep is
+        # invoked from read()/write() via _maybe_sweep; _sweep_lock serializes
+        # the check-then-set so concurrent callers (e.g. LangGraph parallel
+        # branches) cannot double-EMIT the diagnostic. The coordinator sweep
+        # itself runs OUTSIDE the lock, so it may execute concurrently under
+        # contention — any persistent on_reclaim consumer must be idempotent
+        # for a repeated (artifact_id, agent_id, trigger) at the same tick.
+        # _last_sweep_tick is None until the first sweep so the first eligible
+        # call always fires; thereafter the gate rate-limits to once per
+        # ``heartbeat_timeout_ticks // 2`` ticks.
+        self._last_sweep_tick: int | None = None
+        self._first_reclamation_emitted: bool = False
+        self._sweep_lock: threading.Lock = threading.Lock()
 
     def register_agent(self, name: str, *, now_tick: int = 0) -> UUID:
         """Register one agent runtime and subscribe it to bus events."""
@@ -154,11 +167,109 @@ class CoherenceAdapterCore:
                 names[artifact_id] = meta.name
         return names
 
+    def _maybe_sweep(self, now_tick: int) -> None:
+        """Rate-limited crash-recovery sweep (v0.9.0, KD-4 / KD-9).
+
+        Invoked from read()/write() after heartbeat recording. Skips fast when
+        crash recovery is disabled or when fewer than ``heartbeat_timeout_ticks
+        // 2`` ticks have elapsed since the last sweep — so a CCSStore batch
+        (which shares one tick across all ops) sweeps once on its first op and
+        skips the rest. Three-phase, thread-safe (Finding #6 + ce:review ADV-01):
+
+          1. Check the gate AND claim the slot under the lock (advance
+             ``_last_sweep_tick`` before releasing). Claiming under the lock is
+             what makes the coordinator sweep run AT MOST ONCE per gate window
+             under contention: a concurrent caller at the same tick sees the
+             advanced tick and skips, so the sweep / ``on_reclaim`` is not
+             double-fired.
+          2. Run the sweep WITHOUT holding the lock (arbitrary registry work).
+          3. Re-acquire only to gate the one-shot per-instance diagnostic.
+
+        Best-effort: a sweep failure is logged and never propagates into the
+        adapter's read/write path (mirrors the plugin lifecycle sweep). Because
+        the slot is claimed in Phase 1, a FAILED sweep is rate-limited — the next
+        attempt waits for the gate window instead of retrying on every call.
+        """
+        if not self._crash_recovery.enabled:
+            return
+
+        gate = self._crash_recovery.heartbeat_timeout_ticks // 2
+
+        # Fast path (no lock): a lock-free read of the last-sweep tick lets the
+        # common "swept recently" case skip without contending on _sweep_lock —
+        # this runs on every read()/write(). A stale read is benign: it can only
+        # cause a skip this tick (the next eligible tick sweeps); the
+        # authoritative gate check + claim still happens under the lock below.
+        last = self._last_sweep_tick
+        if last is not None and now_tick - last < gate:
+            return
+
+        # Phase 1: gate check + claim, under the lock (None == never swept ->
+        # always fire). Advancing the tick here (the "claim") is what serializes
+        # concurrent callers to a single coordinator sweep per gate window and
+        # rate-limits retries after a failure. The max() keeps the claim
+        # monotonic against a caller-supplied non-monotonic now_tick.
+        with self._sweep_lock:
+            if (
+                self._last_sweep_tick is not None
+                and now_tick - self._last_sweep_tick < gate
+            ):
+                return
+            self._last_sweep_tick = (
+                now_tick
+                if self._last_sweep_tick is None
+                else max(self._last_sweep_tick, now_tick)
+            )
+
+        # Phase 2: sweep WITHOUT holding the lock. Capture reclamations via the
+        # existing on_reclaim callback — no service-layer signature change.
+        reclaimed: list[tuple[UUID, UUID, str]] = []
+
+        def _capture(artifact_id: UUID, agent_id: UUID, trigger: str) -> None:
+            reclaimed.append((artifact_id, agent_id, trigger))
+
+        try:
+            self.coordinator.enforce_stable_grant_timeouts(
+                current_tick=now_tick,
+                heartbeat_timeout_ticks=self._crash_recovery.heartbeat_timeout_ticks,
+                max_hold_ticks=self._crash_recovery.max_hold_ticks,
+                on_reclaim=_capture,
+            )
+        except Exception:  # noqa: BLE001 — sweep is best-effort
+            # logger.exception() already attaches the message + traceback via
+            # exc_info. The slot was claimed in Phase 1, so the failed sweep is
+            # rate-limited (retry waits for the gate window, not every call).
+            logger.exception("agent-coherence: sweep tick failed")
+            return
+
+        # Phase 3: gate the one-shot per-instance diagnostic under the lock
+        # (_last_sweep_tick was already advanced by Phase 1's claim).
+        with self._sweep_lock:
+            should_emit = bool(reclaimed) and not self._first_reclamation_emitted
+            if should_emit:
+                self._first_reclamation_emitted = True
+
+        if should_emit:
+            artifact_id, agent_id, trigger = reclaimed[0]
+            logger.warning(
+                "agent-coherence: sweep reclaimed %d agent(s); first reclamation "
+                "per adapter instance is reported, subsequent are silent",
+                len(reclaimed),
+                extra={
+                    "trigger": trigger,
+                    "agent_id_short": str(agent_id)[:8],
+                    "artifact_id_short": str(artifact_id)[:8],
+                    "reclaim_count": len(reclaimed),
+                },
+            )
+            logger.debug("sweep reclaimed (full tuples): %s", reclaimed)
+
     def read(self, *, agent_name: str, artifact_id: UUID, now_tick: int) -> FetchResponse:
         """Read artifact through one registered runtime."""
         binding = self._binding(agent_name)
         if self._crash_recovery.enabled:
             self.coordinator.record_heartbeat(agent_id=binding.agent_id, now_tick=now_tick)
+        self._maybe_sweep(now_tick)
         return binding.runtime.read(artifact_id, now_tick=now_tick)
 
     def write(
@@ -173,6 +284,7 @@ class CoherenceAdapterCore:
         writer = self._binding(agent_name)
         if self._crash_recovery.enabled:
             self.coordinator.record_heartbeat(agent_id=writer.agent_id, now_tick=now_tick)
+        self._maybe_sweep(now_tick)
         updated, invalidation_signals = writer.runtime.write(
             artifact_id=artifact_id,
             content=content,
