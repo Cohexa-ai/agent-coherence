@@ -508,7 +508,8 @@ class CoherentVolume:
         finally:
             os.close(fd)
 
-    def _disk_hash(self, abs_path: Path) -> str | None:
+    @staticmethod
+    def _disk_hash(abs_path: Path) -> str | None:
         """SHA-256 of the CURRENT on-disk bytes, or ``None`` if the file is
         absent/unreadable.
 
@@ -522,7 +523,7 @@ class CoherentVolume:
         truly a no-op. Reads via :meth:`_read_file_bytes` (raw ``os.read``) so it
         is never self-intercepted by the ``install()`` open()-shim."""
         try:
-            return self._sha256_bytes(self._read_file_bytes(abs_path))
+            return CoherentVolume._sha256_bytes(CoherentVolume._read_file_bytes(abs_path))
         except OSError:
             return None
 
