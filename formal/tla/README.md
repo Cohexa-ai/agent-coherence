@@ -11,7 +11,7 @@ TLC model checking for the MESI coherence protocol and crash-recovery extension.
   trigger ordering. Corresponds to `enforce_stable_grant_timeouts` in `service.py`.
 - **Heartbeat liveness** — monotonic heartbeat recording per agent.
 - **Reclamation slot lifecycle** — slot preserved through I→S, cleared on I→M∪E re-acquire.
-- **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to the planned `commit_cas` (see `docs/plans/2026-06-08-001-feat-occ-write-api-same-host-v1-plan.md`).
+- **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to the `commit_cas` implementation (see `docs/plans/2026-06-08-001-feat-occ-write-api-same-host-v1-plan.md`).
 
 ## What is deliberately out of scope
 
@@ -88,11 +88,11 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `SweepAction` | `CoordinatorService.enforce_stable_grant_timeouts()` |
 | `HeartbeatAction` | `CoordinatorService.record_heartbeat()` |
 | `ObserveAction` | the OCC read supplying `expected_version` (`ArtifactCacheEntry.local_version`) |
-| `CommitCASAction` | planned `commit_cas()` — registry CAS + `CoordinatorService.commit_cas` |
+| `CommitCASAction` | `commit_cas()` — registry CAS + `CoordinatorService.commit_cas` |
 | `States` | `MESIState` enum in `src/ccs/core/states.py` |
 | `SingleWriter` | `check_single_writer()` in `src/ccs/core/invariants.py` |
 | `MonotonicVersion` | `check_monotonic_version()` in `src/ccs/core/invariants.py` |
-| `NoLostUpdate` | planned concurrent-writer test (`tests/test_occ_commit_cas.py`) |
+| `NoLostUpdate` | concurrent-writer test (`tests/test_occ_commit_cas.py`) |
 
 The model abstracts away transient states — the implementation's
 `enforce_transient_timeouts` and transient-skip rule in the sweep are not modeled.
