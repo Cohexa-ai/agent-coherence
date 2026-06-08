@@ -12,11 +12,22 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from uuid import UUID
 
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import (
+    OCC_CALLER_TRANSIENT_REASON,
+    CoherenceError,
+    OccCallerTransientError,
+)
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSignal
+from ccs.core.types import (
+    Artifact,
+    CasCorruption,
+    ConflictDetail,
+    FetchRequest,
+    FetchResponse,
+    InvalidationSignal,
+)
 
 from .registry import ArtifactRegistry
 
@@ -357,6 +368,128 @@ class CoordinatorService:
             trigger="commit", tick=issued_at_tick, content_hash=commit_hash,
         )
         self.registry.clear_agent_transient(artifact_id, agent_id)
+        self._validate_single_writer(artifact_id)
+        return updated, signals
+
+    def commit_cas(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        expected_version: int,
+        content_hash: str,
+        issued_at_tick: int = 0,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+    ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
+        """Optimistic-concurrency commit via an atomic version-checked CAS.
+
+        The OCC counterpart to :meth:`commit` (plan Unit 3, R1–R4/R6). Unlike
+        ``commit`` — which requires the caller to already hold EXCLUSIVE/MODIFIED
+        from a pessimistic ``write()`` acquire — ``commit_cas`` lets a SHARED (or
+        INVALID) caller commit *only if* ``expected_version`` still matches the
+        registry's current version and no *pessimistic* peer holds M/E. The
+        winner is elected by the registry's serialized ``BEGIN IMMEDIATE``, not a
+        lock on the acquire, so two concurrent OCC writers cannot both land the
+        same version.
+
+        This method owns the **D4 precondition layer** the registry deliberately
+        omits (the registry only does the version/holder CAS):
+
+        - artifact must exist (``_require_artifact`` → ``CoherenceError``);
+        - the caller must NOT be mid-transient (``get_agent_transient`` is
+          ``None``, else ``CoherenceError``);
+        - the caller's MESI state must be SHARED or INVALID — a MODIFIED/EXCLUSIVE
+          holder is an *acquired* pessimistic writer and must use plain
+          :meth:`commit` (rejected with a ``CoherenceError`` pointing there).
+
+        Three-outcome discrimination of the registry result (plan R2):
+
+        - :class:`CasCorruption` (``expected_version > current``) → raise
+          ``CoherenceError`` — corruption / a second coordinator on the store,
+          non-retryable.
+        - :class:`ConflictDetail` (``version_mismatch`` / ``other_holder``) →
+          returned UNCHANGED, with **no mutation and no invalidation signals**
+          (it is a typed return, never an exception).
+        - WIN ``(updated_artifact, invalidated_ids)`` → the registry has already
+          done the peer-invalidation + committer S/I→SHARED transition
+          atomically (the OCC writer holds no grant, so it ends SHARED — which
+          keeps a subsequent commit_cas by the same caller eligible past the D4
+          precondition below); this method only builds the matching
+          :class:`InvalidationSignal` list (mirroring ``commit``'s shape),
+          re-validates single-writer, and returns ``(updated, signals)``.
+
+        ``content`` is the winning body, threaded to the registry so the
+        in-memory (library) path advances ``record.content`` on a WIN — a peer
+        re-fetch then reads the winner's NEW content, not the stale pre-CAS body.
+        The cross-process / sqlite path passes ``None`` (it stores no content).
+
+        Returns:
+            ``(updated_artifact, signals)`` on a winning commit, or a
+            :class:`ConflictDetail` on a retry-eligible conflict.
+
+        Raises:
+            OccCallerTransientError: the caller is mid-transient (a peer
+                invalidated it between read and CAS) — a retry-eligible subclass
+                of ``CoherenceError`` carrying the stable wire reason
+                :data:`~ccs.core.exceptions.OCC_CALLER_TRANSIENT_REASON`.
+            CoherenceError: artifact missing, caller in M/E (use ``commit``), or
+                the registry reported corruption (all non-retryable).
+        """
+        artifact = self._require_artifact(artifact_id)
+
+        if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
+            # Retry-eligible: a peer invalidated the caller between its read and
+            # this CAS, leaving an invalidation transient. Typed so the wire
+            # reason stays stable independent of this human message (AC2).
+            raise OccCallerTransientError(
+                f"commit_cas_not_allowed agent={agent_id} artifact={artifact_id} "
+                f"reason={OCC_CALLER_TRANSIENT_REASON}"
+            )
+
+        agent_state = self.registry.get_agent_state(artifact_id, agent_id)
+        if agent_state in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+            raise CoherenceError(
+                f"commit_cas_not_allowed agent={agent_id} artifact={artifact_id} "
+                f"state={agent_state} reason=occ_is_shared_or_invalid_only "
+                f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
+            )
+
+        result = self.registry.commit_cas(
+            artifact_id,
+            agent_id,
+            expected_version=expected_version,
+            content_hash=content_hash,
+            size_tokens=size_tokens,
+            content=content,
+            tick=issued_at_tick,
+        )
+
+        if isinstance(result, CasCorruption):
+            raise CoherenceError(
+                f"commit_cas_corruption agent={agent_id} artifact={artifact_id} "
+                f"expected_version={expected_version} "
+                f"current_version={result.current_version} "
+                f"(expected > current — corruption or multi-coordinator violation)"
+            )
+        if isinstance(result, ConflictDetail):
+            # Typed retry-eligible conflict: no mutation happened in the
+            # registry, so emit no invalidation signals and surface it as-is.
+            return result
+
+        updated, invalidated_ids = result
+        # Defense-in-depth: the CAS computed N+1 atomically; assert it did not
+        # regress (NOT the concurrency guard — that was the version check).
+        check_monotonic_version(artifact.version, updated.version)
+        signals = [
+            InvalidationSignal(
+                artifact_id=artifact_id,
+                new_version=updated.version,
+                issued_at_tick=issued_at_tick,
+                issuer_agent_id=agent_id,
+            )
+            for _ in invalidated_ids
+        ]
         self._validate_single_writer(artifact_id)
         return updated, signals
 

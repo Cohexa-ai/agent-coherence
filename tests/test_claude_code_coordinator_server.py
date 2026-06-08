@@ -189,21 +189,23 @@ def test_get_on_post_route_returns_404(client: _Client) -> None:
 
 def test_pre_read_first_observation_returns_fresh(client: _Client) -> None:
     """KTD-9: first observation of a tracked artifact seeds v1 + grants
-    SHARED + returns fresh."""
+    SHARED + returns fresh. Unit 6: the fresh response also carries the
+    seeded ``version`` (additive — for OCC writers sourcing expected_version)."""
     status, body = client.post("/hooks/pre-read",
                                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                                  "content_hash": _hash("abc")})
     assert status == 200
-    assert body == {"status": "fresh"}
+    assert body == {"status": "fresh", "version": 1}
 
 
 def test_pre_read_repeat_from_same_session_stays_fresh(client: _Client) -> None:
-    """A second read from the same session on the same artifact is fresh."""
+    """A second read from the same session on the same artifact is fresh.
+    Unit 6: still carries the artifact version on the fresh response."""
     client.post("/hooks/pre-read", {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("h1")})
     status, body = client.post("/hooks/pre-read",
                                 {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("h1")})
     assert status == 200
-    assert body == {"status": "fresh"}
+    assert body == {"status": "fresh", "version": 1}
 
 
 def test_pre_read_after_peer_write_returns_stale(client: _Client) -> None:
@@ -1612,6 +1614,299 @@ def test_a8_failed_post_edit_does_not_increment_acquire_release(
                 {"session_id": sid, "path": "plan.md",
                  "content_hash": _hash("j6"), "success": False})
     assert coordinator._intra_task_acquire_release_total == before
+
+
+# ----------------------------------------------------------------------
+# Unit 6 — OCC commit endpoint (/hooks/post-edit-cas)
+# ----------------------------------------------------------------------
+
+
+def _occ_seed_shared(client: _Client, sid: str, path: str, h: str) -> int:
+    """OCC helper: pre-read a tracked path to register SHARED + seed the
+    artifact, returning the coordinator's version (the OCC comparand).
+
+    A first-observation read returns a fresh response carrying a top-level
+    ``version``; a second session reading an already-seeded artifact (matching
+    hash) falls through to the warn-mode stale response, which carries the
+    version under ``summary.current_version`` (mirrors the production
+    ``CoherentVolume._pre_read_version`` two-shape extraction)."""
+    s, b = client.post("/hooks/pre-read",
+                       {"session_id": sid, "path": path, "content_hash": h})
+    assert s == 200, b
+    if isinstance(b.get("version"), int):
+        return b["version"]
+    summary = b.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("current_version"), int):
+        return summary["current_version"]
+    raise AssertionError(f"pre-read surfaced no version for OCC: {b}")
+
+
+def test_occ_commit_happy_path_bumps_version(client: _Client) -> None:
+    """OCC commit (post-edit-cas) with a matching expected_version commits and
+    returns the new version N+1 — WITHOUT a pre-edit EXCLUSIVE acquire."""
+    sid = _sid("occ1")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("occ1-v1"))  # v1
+    s, b = client.post("/hooks/post-edit-cas",
+                       {"session_id": sid, "path": "plan.md",
+                        "success": True, "content_hash": _hash("occ1-v2"),
+                        "expected_version": v})
+    assert s == 200
+    assert b == {"ok": True, "version": v + 1}
+
+
+def _artifact_version(coordinator, path: str) -> int:
+    """Read the coordinator's authoritative version for a tracked path."""
+    aid = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert aid is not None
+    art = coordinator.registry.get_artifact(aid)
+    assert art is not None
+    return art.version
+
+
+def test_occ_commit_stale_version_conflicts_no_mutation(coordinator, client: _Client) -> None:
+    """A stale expected_version → {ok:false, reason:'version_mismatch',
+    current_version} — a clean typed conflict (NOT a degrade), no mutation."""
+    a, b_sid = _sid("occA"), _sid("occB")
+    v1 = _occ_seed_shared(client, a, "plan.md", _hash("v1"))      # A reads v1
+    _occ_seed_shared(client, b_sid, "plan.md", _hash("v1"))       # B reads v1
+    # A commits first → v2 (A wins).
+    s, ba = client.post("/hooks/post-edit-cas",
+                        {"session_id": a, "path": "plan.md", "success": True,
+                         "content_hash": _hash("v2-A"), "expected_version": v1})
+    assert ba == {"ok": True, "version": v1 + 1}
+    after_a = _artifact_version(coordinator, "plan.md")
+
+    # B commits with its now-stale expected_version (still v1) → version_mismatch.
+    s, bb = client.post("/hooks/post-edit-cas",
+                        {"session_id": b_sid, "path": "plan.md", "success": True,
+                         "content_hash": _hash("v2-B-stale"), "expected_version": v1})
+    assert s == 200
+    assert bb["ok"] is False
+    assert bb["reason"] == "version_mismatch"
+    assert bb["current_version"] == after_a
+    assert "degraded" not in bb  # a clean typed conflict, NOT a degrade
+    # No mutation: B's stale commit did not bump the version past A's.
+    assert _artifact_version(coordinator, "plan.md") == after_a
+
+
+def test_occ_commit_corruption_expected_gt_current_raises_body(coordinator, client: _Client) -> None:
+    """expected_version > current → corruption: commit_cas raises CoherenceError,
+    the endpoint returns {ok:false, reason:<verbatim>} the client raises on."""
+    sid = _sid("occCorrupt")
+    _occ_seed_shared(client, sid, "plan.md", _hash("v1"))  # v1
+    s, b = client.post("/hooks/post-edit-cas",
+                       {"session_id": sid, "path": "plan.md", "success": True,
+                        "content_hash": _hash("vN"), "expected_version": 999})
+    assert s == 200
+    assert b["ok"] is False
+    assert "corruption" in b["reason"] or "commit_cas_corruption" in b["reason"]
+    # No mutation on corruption.
+    assert _artifact_version(coordinator, "plan.md") == 1
+
+
+def test_occ_commit_caller_in_transient_returns_stable_reason(
+    coordinator, client: _Client
+) -> None:
+    """AC2: a caller left mid-transient (a peer invalidated it between its read
+    and its CAS) → {ok:false, reason:'caller_in_transient_state'} — a STABLE
+    machine reason (NOT the exception's human message), so the client's retry
+    classifier matches it exactly. The body also carries current_version so the
+    client can advance its comparand. No mutation: this is a lost race."""
+    from ccs.core.states import TransientState
+
+    sid = _sid("occTransient")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))  # caller SHARED@v1
+    # Force the caller mid-transient on the coordinator (the registry shape a
+    # peer's invalidating write leaves on a SHARED holder: SIA). commit_cas
+    # rejects this as a retry-eligible precondition.
+    aid = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    agent_id = session_to_agent_id(sid)
+    coordinator.registry.set_agent_transient(
+        aid, agent_id, TransientState.SIA, entered_tick=v
+    )
+
+    s, b = client.post(
+        "/hooks/post-edit-cas",
+        {"session_id": sid, "path": "plan.md", "success": True,
+         "content_hash": _hash("v2"), "expected_version": v},
+    )
+    assert s == 200
+    # The STABLE wire reason — exactly the literal the client matcher keys on,
+    # decoupled from commit_cas's "commit_cas_not_allowed ..." human message.
+    assert b == {"ok": False, "reason": "caller_in_transient_state", "current_version": v}
+    assert "degraded" not in b  # a clean retry-eligible conflict, not a degrade
+    # No mutation: the version did not advance.
+    assert _artifact_version(coordinator, "plan.md") == v
+
+
+def test_occ_commit_degrade_reads_as_failure(coordinator, client: _Client) -> None:
+    """THE LOAD-BEARING FIX: a timed-out/degraded OCC commit returns
+    {ok:false, degraded:true, reason:'commit_unconfirmed'} — NOT the
+    {ok:true, degraded:true} the pessimistic post-edit uses. A client reading
+    result.get('ok') must see False so it never assumes the write landed."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
+
+    sid = _sid("occDegrade")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))
+    with patch.object(coordinator, "run_with_watchdog", side_effect=FuturesTimeout()):
+        s, b = client.post("/hooks/post-edit-cas",
+                           {"session_id": sid, "path": "plan.md", "success": True,
+                            "content_hash": _hash("v2"), "expected_version": v})
+    assert s == 200
+    assert b.get("ok") is False, "degraded OCC commit must read as FAILURE, not ok:true"
+    assert b.get("degraded") is True
+    assert b.get("reason") == "commit_unconfirmed"
+
+
+def test_occ_commit_does_not_take_pre_edit_acquire(coordinator, client: _Client) -> None:
+    """The OCC path must NOT invoke the pre-edit EXCLUSIVE-acquire handler.
+    Monkeypatch _handle_pre_edit to blow up: a full read→post-edit-cas cycle
+    still succeeds, proving the OCC writer never routes through the acquire."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    original = mod._ROUTES[("POST", "/hooks/pre-edit")]
+
+    def exploding_pre_edit(req, coord):
+        raise AssertionError("OCC path must NOT call _handle_pre_edit")
+
+    mod._ROUTES[("POST", "/hooks/pre-edit")] = exploding_pre_edit
+    try:
+        sid = _sid("occNoAcq")
+        v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))
+        before_pre_edit = coordinator.endpoint_counters_snapshot()["pre_edit_total"]
+        s, b = client.post("/hooks/post-edit-cas",
+                           {"session_id": sid, "path": "plan.md", "success": True,
+                            "content_hash": _hash("v2"), "expected_version": v})
+        assert s == 200
+        assert b == {"ok": True, "version": v + 1}
+        # The OCC writer is never EXCLUSIVE — it ends SHARED via commit_cas's
+        # S/I→S transition (an OCC writer holds no grant), and the pre-edit
+        # counter never moved.
+        after_pre_edit = coordinator.endpoint_counters_snapshot()["pre_edit_total"]
+        assert after_pre_edit == before_pre_edit
+        aid = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+        state = coordinator.registry.get_agent_state(aid, session_to_agent_id(sid))
+        assert state == MESIState.SHARED
+    finally:
+        mod._ROUTES[("POST", "/hooks/pre-edit")] = original
+
+
+def test_occ_commit_untracked_path_fastpath(client: _Client) -> None:
+    """An untracked path fast-paths to {ok:true} without a CAS (mirrors
+    post-edit's is_tracked early return)."""
+    s, b = client.post("/hooks/post-edit-cas",
+                       {"session_id": _sid("occU"), "path": "src/random.py",
+                        "success": True, "content_hash": _hash("h"),
+                        "expected_version": 0})
+    assert s == 200
+    assert b == {"ok": True}
+
+
+def test_occ_commit_rejects_non_int_expected_version(client: _Client) -> None:
+    """expected_version is the OCC discriminator — a malformed (non-int)
+    value is rejected at the boundary with 400, never driven into the CAS."""
+    sid = _sid("occBad")
+    _occ_seed_shared(client, sid, "plan.md", _hash("v1"))
+    s, b = client.post("/hooks/post-edit-cas",
+                       {"session_id": sid, "path": "plan.md", "success": True,
+                        "content_hash": _hash("v2"), "expected_version": "1"})
+    assert s == 400
+    assert "expected_version" in b["error"]
+
+
+def test_occ_commit_missing_content_hash_400(client: _Client) -> None:
+    """The OCC commit always carries the bytes it wrote → content_hash required."""
+    sid = _sid("occNoHash")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))
+    s, b = client.post("/hooks/post-edit-cas",
+                       {"session_id": sid, "path": "plan.md", "success": True,
+                        "expected_version": v})
+    assert s == 400
+
+
+def test_occ_commit_increments_endpoint_counter(coordinator, client: _Client) -> None:
+    """KTD-J: the OCC endpoint has its own per-endpoint counter."""
+    sid = _sid("occCount")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))
+    before = coordinator.endpoint_counters_snapshot()["post_edit_cas_total"]
+    client.post("/hooks/post-edit-cas",
+                {"session_id": sid, "path": "plan.md", "success": True,
+                 "content_hash": _hash("v2"), "expected_version": v})
+    after = coordinator.endpoint_counters_snapshot()["post_edit_cas_total"]
+    assert after == before + 1
+
+
+def test_occ_commit_concurrent_winner_election_no_lost_update(coordinator, client: _Client) -> None:
+    """R11-flavored funnel through the HTTP path: two OCC clients both read v1
+    (fixed stale buffers, NOT a counter increment), barrier-synced, both POST
+    post-edit-cas with expected_version=v1. Exactly one wins (v2), the loser
+    gets a typed version_mismatch, final version is v2 (no lost update)."""
+    n_writers = 2
+    a, b_sid = _sid("raceA"), _sid("raceB")
+    v1 = _occ_seed_shared(client, a, "plan.md", _hash("v1"))
+    assert _occ_seed_shared(client, b_sid, "plan.md", _hash("v1")) == v1
+
+    barrier = threading.Barrier(n_writers)
+    results: dict[str, tuple[int, dict]] = {}
+
+    def commit(sid: str, label: str) -> None:
+        barrier.wait()
+        results[label] = client.post(
+            "/hooks/post-edit-cas",
+            {"session_id": sid, "path": "plan.md", "success": True,
+             "content_hash": _hash(f"v2-{label}"), "expected_version": v1},
+        )
+
+    threads = [
+        threading.Thread(target=commit, args=(a, "A")),
+        threading.Thread(target=commit, args=(b_sid, "B")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    wins = [lbl for lbl, (_, body) in results.items() if body.get("ok") is True]
+    losers = [lbl for lbl, (_, body) in results.items() if body.get("ok") is False]
+    assert len(wins) == 1, f"exactly one OCC writer must win: {results}"
+    assert len(losers) == 1
+    loser_body = results[losers[0]][1]
+    assert loser_body["reason"] == "version_mismatch"
+    # Final version is exactly v1+1 — the loser's stale buffer did NOT clobber.
+    assert _artifact_version(coordinator, "plan.md") == v1 + 1
+
+
+def test_occ_late_completion_residual_contended_is_noop_not_lost_update(
+    coordinator, client: _Client,
+) -> None:
+    """Late-completion residual (plan Unit 6 / Key Decision). The watchdog does
+    not cancel a timed-out future, so a late commit_cas may run after the client
+    gave up. This asserts the SAFE half of that residual deterministically: a
+    late CAS in the CONTENDED case (the version already advanced) sees the
+    advanced version → version_mismatch, NO mutation — it cannot drop an
+    acknowledged write. (The uncontended case lands a phantom/duplicate N+1 from
+    the same edit — a duplicate version bump, NOT a lost write; NoLostUpdate
+    still holds. Full fencing is deferred to the cross-host follow-on.)"""
+    a, late = _sid("liveWinner"), _sid("lateGaveUp")
+    v1 = _occ_seed_shared(client, a, "plan.md", _hash("v1"))
+    _occ_seed_shared(client, late, "plan.md", _hash("v1"))  # the "late" writer also read v1
+    # The live winner commits → v2 (this models the contention the late writer
+    # raced against).
+    s, ba = client.post("/hooks/post-edit-cas",
+                        {"session_id": a, "path": "plan.md", "success": True,
+                         "content_hash": _hash("v2-winner"), "expected_version": v1})
+    assert ba == {"ok": True, "version": v1 + 1}
+    v2 = _artifact_version(coordinator, "plan.md")
+    # The late writer's CAS finally runs with its now-stale expected_version
+    # (==v1): it observes the advanced version → version_mismatch, no mutation.
+    s, bl = client.post("/hooks/post-edit-cas",
+                        {"session_id": late, "path": "plan.md", "success": True,
+                         "content_hash": _hash("v2-late"), "expected_version": v1})
+    assert bl["ok"] is False
+    assert bl["reason"] == "version_mismatch"
+    # No acknowledged write was dropped — the version is the winner's v2, and the
+    # late writer's stale bytes were NOT committed over it.
+    assert _artifact_version(coordinator, "plan.md") == v2
 
 
 def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> None:

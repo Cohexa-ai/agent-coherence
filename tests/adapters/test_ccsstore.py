@@ -1194,3 +1194,43 @@ def test_ccsstore_default_thresholds_no_false_reclaim_then_reclaims() -> None:
     store._tick = 120
     _put(store, ("other", "shared"), "scratch", {"v": 2})  # tick 121: sweep fires, holder gap 120 >= 120
     assert store.core.registry.get_agent_state(artifact_id, holder_id) == MESIState.INVALID
+
+
+# ---------------------------------------------------------------------------
+# Unit 5 — OCC write_cas reachability through CCSStore
+#
+# CCSStore inherits write_cas via CoherenceAdapterCore (store.core). This is a
+# reachability smoke test confirming the OCC path is wired through the verified
+# representative adapter; the other four framework adapters inherit the same
+# write_cas via CoherenceAdapterCore with no per-adapter change (verified by the
+# CoherenceAdapterCore tests in tests/test_adapters.py).
+# ---------------------------------------------------------------------------
+
+
+def test_ccsstore_occ_write_cas_path_is_reachable() -> None:
+    store = _store()
+    _put(store, ("writer", "shared"), "doc", {"v": 1})
+    artifact_id = store._artifact_map[(("shared",), "doc")]
+
+    # Land two SHARED holders at the coordinator (the S/I OCC starting point).
+    store.core.register_agent("writer")
+    store.core.register_agent("peer")
+    store.core.read(agent_name="writer", artifact_id=artifact_id, now_tick=10)
+    store.core.read(agent_name="peer", artifact_id=artifact_id, now_tick=10)
+    assert (
+        store.core.registry.get_agent_state(artifact_id, store.core.agent_id_for("writer"))
+        == MESIState.SHARED
+    )
+
+    # The inherited OCC path commits and invalidates the peer.
+    updated = store.core.write_cas(
+        agent_name="writer",
+        artifact_id=artifact_id,
+        make_content=lambda entry: (json.dumps({"v": entry.local_version + 1}), None),
+        now_tick=11,
+    )
+
+    assert updated.version > 1
+    assert (
+        store.core.runtime("peer").cache.get(artifact_id).state == MESIState.INVALID
+    )

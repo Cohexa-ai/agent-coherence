@@ -12,8 +12,9 @@ import pytest
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.core.exceptions import CoherenceError
+from ccs.core.hashing import compute_content_hash
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import FetchRequest
+from ccs.core.types import ConflictDetail, FetchRequest
 
 
 def _service() -> CoordinatorService:
@@ -833,3 +834,271 @@ class TestConcurrentFirstUseEmitOnce:
             f"expected exactly one transitional warning across {thread_count} "
             f"concurrent constructions, got {len(emissions)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit 3 — CoordinatorService.commit_cas (OCC service-level orchestration).
+#
+# The OCC writer reads (→ SHARED) → computes → commit_cas from S/I; it never
+# takes EXCLUSIVE via write(). Two SHARED peers are the canonical setup: a
+# matching version + no *pessimistic* M/E holder → WIN; a stale version →
+# version_mismatch; a concurrent pessimistic E/M holder → other_holder; an
+# over-shot version → CoherenceError (corruption).
+# ---------------------------------------------------------------------------
+
+
+def _two_shared_holders(svc: CoordinatorService):
+    """Register an artifact and fetch it from two agents so both end SHARED.
+
+    Returns ``(artifact, agent_a, agent_b)``. Both agents are SHARED at the
+    artifact's current version — the eligible (S/I) starting point for an OCC
+    ``commit_cas`` where the *other* holder is not a pessimistic M/E writer.
+    """
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    agent_a = uuid4()
+    agent_b = uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent_a, requested_at_tick=1))
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent_b, requested_at_tick=2))
+    assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.SHARED
+    assert svc.registry.get_agent_state(artifact.id, agent_b) == MESIState.SHARED
+    return artifact, agent_a, agent_b
+
+
+def test_commit_cas_happy_path_commits_and_invalidates_peers() -> None:
+    svc = _service()
+    artifact, writer, peer = _two_shared_holders(svc)
+
+    updated, signals = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash=compute_content_hash("v2"),
+        issued_at_tick=7,
+    )
+
+    # Version advanced N -> N+1.
+    assert updated.version == artifact.version + 1
+    # Committer ends SHARED (an OCC writer holds no grant); the SHARED peer was
+    # invalidated.
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
+    assert svc.registry.get_agent_state(artifact.id, peer) == MESIState.INVALID
+    # Signal shape mirrors commit(): one signal per invalidated peer, carrying
+    # the new version, issued tick, and the committer as issuer.
+    assert len(signals) == 1
+    assert signals[0].artifact_id == artifact.id
+    assert signals[0].new_version == updated.version
+    assert signals[0].issued_at_tick == 7
+    assert signals[0].issuer_agent_id == writer
+
+
+def test_commit_cas_is_repeatable_for_same_agent_no_d4_rejection() -> None:
+    """FIX 3: a winning commit_cas ends the committer SHARED (not MODIFIED), so
+    the SAME agent can commit_cas AGAIN on the same artifact without tripping the
+    D4 precondition (which rejects M/E callers). Two back-to-back wins by one
+    agent: version 1→2→3, no CoherenceError. Before the fix the sticky MODIFIED
+    grant made the second call hard-fail with 'use commit()'.
+    """
+    svc = _service()
+    artifact, writer, _peer = _two_shared_holders(svc)
+    assert artifact.version == 1
+
+    # First OCC win → version 2, committer ends SHARED (the fix).
+    first, _ = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=1,
+        content_hash=compute_content_hash("v2"),
+        issued_at_tick=5,
+    )
+    assert first.version == 2
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
+
+    # Second OCC win by the SAME agent at the new version — must NOT be rejected
+    # by D4 (SHARED is OCC-eligible) and must win again.
+    second, _ = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=2,
+        content_hash=compute_content_hash("v3"),
+        issued_at_tick=6,
+    )
+    assert second.version == 3
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
+
+
+def test_commit_cas_version_mismatch_returns_conflict_no_mutation() -> None:
+    svc = _service()
+    artifact, first, second = _two_shared_holders(svc)
+
+    # First OCC writer wins → version bumps to 2, `second` invalidated.
+    updated, _ = svc.commit_cas(
+        agent_id=first,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash=compute_content_hash("v2"),
+    )
+    assert updated.version == 2
+
+    # `second` still holds the stale expected_version (1) → version_mismatch.
+    result = svc.commit_cas(
+        agent_id=second,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,  # stale (==1, current is 2)
+        content_hash=compute_content_hash("v2-stale"),
+    )
+    assert isinstance(result, ConflictDetail)
+    assert result.reason == "version_mismatch"
+    assert result.current_version == 2
+    # No mutation: version unchanged, winner still SHARED (OCC writer holds no
+    # grant), loser still INVALID.
+    assert svc.registry.get_artifact(artifact.id).version == 2
+    assert svc.registry.get_agent_state(artifact.id, first) == MESIState.SHARED
+    assert svc.registry.get_agent_state(artifact.id, second) == MESIState.INVALID
+
+
+def test_commit_cas_other_holder_returns_conflict_no_mutation() -> None:
+    svc = _service()
+    artifact, occ_writer, pessimist = _two_shared_holders(svc)
+
+    # A pessimistic peer acquires EXCLUSIVE via write() (version unchanged at 1);
+    # this also invalidates the OCC writer. write() leaves the invalidated peer
+    # mid-transient until it ACKs, so apply the invalidation ACK to land the OCC
+    # writer cleanly INVALID (S/I-eligible, no transient) — the realistic state
+    # of a writer that observed the invalidation.
+    svc.write(agent_id=pessimist, artifact_id=artifact.id)
+    svc.invalidate(
+        agent_id=occ_writer,
+        artifact_id=artifact.id,
+        new_version=artifact.version,
+        issuer_agent_id=pessimist,
+        issued_at_tick=4,
+    )
+    assert svc.registry.get_agent_state(artifact.id, pessimist) == MESIState.EXCLUSIVE
+    assert svc.registry.get_agent_state(artifact.id, occ_writer) == MESIState.INVALID
+    assert svc.registry.get_agent_transient(artifact.id, occ_writer) is None
+
+    # Version still matches (write does not bump), but a pessimistic E holder is
+    # present → other_holder (distinct from version_mismatch).
+    result = svc.commit_cas(
+        agent_id=occ_writer,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,  # ==1, current is still 1
+        content_hash=compute_content_hash("v2"),
+    )
+    assert isinstance(result, ConflictDetail)
+    assert result.reason == "other_holder"
+    assert result.current_version == 1
+    # No mutation: version unchanged, pessimist keeps EXCLUSIVE.
+    assert svc.registry.get_artifact(artifact.id).version == 1
+    assert svc.registry.get_agent_state(artifact.id, pessimist) == MESIState.EXCLUSIVE
+
+
+def test_commit_cas_expected_greater_than_current_raises_coherence_error() -> None:
+    svc = _service()
+    artifact, writer, _peer = _two_shared_holders(svc)
+
+    # expected_version > current → corruption / multi-coordinator violation.
+    with pytest.raises(CoherenceError, match="corruption"):
+        svc.commit_cas(
+            agent_id=writer,
+            artifact_id=artifact.id,
+            expected_version=artifact.version + 5,
+            content_hash=compute_content_hash("v2"),
+        )
+    # No mutation.
+    assert svc.registry.get_artifact(artifact.id).version == 1
+
+
+def test_commit_cas_rejects_modified_or_exclusive_caller_pointing_to_commit() -> None:
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    owner = uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=owner, requested_at_tick=1))
+    # Pessimistic acquire → EXCLUSIVE.
+    svc.write(agent_id=owner, artifact_id=artifact.id)
+    assert svc.registry.get_agent_state(artifact.id, owner) == MESIState.EXCLUSIVE
+
+    # EXCLUSIVE holder must use plain commit() (D4) — error points there.
+    with pytest.raises(CoherenceError, match="commit"):
+        svc.commit_cas(
+            agent_id=owner,
+            artifact_id=artifact.id,
+            expected_version=artifact.version,
+            content_hash=compute_content_hash("v2"),
+        )
+    # And the MODIFIED case rejects identically.
+    svc.commit(agent_id=owner, artifact_id=artifact.id, content="v2")
+    assert svc.registry.get_agent_state(artifact.id, owner) == MESIState.MODIFIED
+    with pytest.raises(CoherenceError, match="commit"):
+        svc.commit_cas(
+            agent_id=owner,
+            artifact_id=artifact.id,
+            expected_version=2,
+            content_hash=compute_content_hash("v3"),
+        )
+
+
+def test_commit_cas_rejects_caller_in_transient_state() -> None:
+    svc = _service()
+    artifact, writer, _peer = _two_shared_holders(svc)
+    # Force the OCC writer mid-transient (e.g. ISG) — not eligible to commit.
+    svc.registry.set_agent_transient(
+        artifact.id, writer, TransientState.ISG, entered_tick=3
+    )
+
+    with pytest.raises(CoherenceError, match="transient"):
+        svc.commit_cas(
+            agent_id=writer,
+            artifact_id=artifact.id,
+            expected_version=artifact.version,
+            content_hash=compute_content_hash("v2"),
+        )
+    # No mutation.
+    assert svc.registry.get_artifact(artifact.id).version == 1
+
+
+def test_commit_cas_artifact_not_found_raises_coherence_error() -> None:
+    svc = _service()
+    missing = uuid4()
+
+    with pytest.raises(CoherenceError, match="artifact_not_found"):
+        svc.commit_cas(
+            agent_id=uuid4(),
+            artifact_id=missing,
+            expected_version=1,
+            content_hash=compute_content_hash("v2"),
+        )
+
+
+def test_commit_cas_win_actually_invalidates_peers_in_registry() -> None:
+    """Integration: on a winning CAS, peers are INVALID in the registry itself,
+    not merely named in the returned signal list."""
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    writer = uuid4()
+    peer_b = uuid4()
+    peer_c = uuid4()
+    for tick, agent in enumerate((writer, peer_b, peer_c), start=1):
+        svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent, requested_at_tick=tick))
+    # Three SHARED holders.
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
+
+    updated, signals = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash=compute_content_hash("v2"),
+    )
+
+    # Both peers are actually INVALID in the registry's state map.
+    state_map = svc.registry.get_state_map(artifact.id)
+    assert state_map[peer_b] == MESIState.INVALID
+    assert state_map[peer_c] == MESIState.INVALID
+    # The OCC committer ends SHARED (it holds no grant).
+    assert state_map[writer] == MESIState.SHARED
+    # And the signal list covers exactly the invalidated peers.
+    assert len(signals) == 2
+    assert {s.issuer_agent_id for s in signals} == {writer}
+    assert all(s.new_version == updated.version for s in signals)
+    # Single-writer invariant holds afterward (no exception from the service).
+    svc._validate_single_writer(artifact.id)

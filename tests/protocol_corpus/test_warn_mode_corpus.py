@@ -78,7 +78,9 @@ def test_warn_mode_fixture_response_matches_expected(
     # normalizer so author choice doesn't affect equality.
     expected_status = fixture.expected["status"]
     expected_body = normalize_response(
-        fixture.expected["body"], ignore_keys=fixture.ignore_keys
+        fixture.expected["body"],
+        ignore_keys=fixture.ignore_keys,
+        optional_keys=fixture.optional_keys,
     )
 
     assert actual_status == expected_status, (
@@ -150,3 +152,40 @@ def test_normalizer_handles_nested_uuid_and_timestamp() -> None:
     assert "<UUID>" in session["message"]
     assert "<TS>" in session["message"]
     assert out["coordinator_uptime_seconds"] == "<UPTIME>"
+
+
+def test_optional_keys_dropped_only_at_top_level() -> None:
+    """AC3 harness self-test: ``optional_keys`` drops a key at the TOP-LEVEL
+    response body only. A nested occurrence of the SAME key name is kept and
+    compared, so a nested divergence still fails the diff (the bug was the drop
+    firing at every dict depth, masking nested drift)."""
+    optional = frozenset({"version"})
+
+    # Top-level: dropped on both sides → the version difference is tolerated.
+    top_a = {"status": "fresh", "version": 1}
+    top_b = {"status": "fresh", "version": 99}
+    assert normalize_response(top_a, optional_keys=optional) == normalize_response(
+        top_b, optional_keys=optional
+    )
+    # And the top-level key is actually gone after normalization.
+    assert "version" not in normalize_response(top_a, optional_keys=optional)
+
+    # Nested: a same-named key one level deep is NOT dropped, so a real nested
+    # divergence in that key still makes the two bodies compare UNEQUAL.
+    nested_a = {"status": "fresh", "payload": {"version": 1}}
+    nested_b = {"status": "fresh", "payload": {"version": 2}}
+    norm_nested_a = normalize_response(nested_a, optional_keys=optional)
+    norm_nested_b = normalize_response(nested_b, optional_keys=optional)
+    assert "version" in norm_nested_a["payload"], (
+        "nested optional-named key must be preserved, not dropped"
+    )
+    assert norm_nested_a != norm_nested_b, (
+        "a nested divergence in an optional-named key must still fail the diff"
+    )
+
+    # A same-named key nested inside a LIST element is also preserved/compared.
+    list_a = {"items": [{"version": 1}]}
+    list_b = {"items": [{"version": 7}]}
+    assert normalize_response(list_a, optional_keys=optional) != normalize_response(
+        list_b, optional_keys=optional
+    )
