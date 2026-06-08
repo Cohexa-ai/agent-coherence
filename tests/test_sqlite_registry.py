@@ -25,7 +25,7 @@ from ccs.coordinator.sqlite_registry import (
     SqliteArtifactRegistry,
 )
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 
 @pytest.fixture
@@ -467,3 +467,268 @@ def test_cor04_resolve_or_register_post_rollback_delete_raises_runtime_error(
             reg._conn = real_conn
     finally:
         reg.close()
+
+
+# --------------------------------------------------------------------
+# OCC commit-CAS (plan Unit 2)
+# --------------------------------------------------------------------
+
+
+def _seed_artifact_with_shared_writer(
+    reg: SqliteArtifactRegistry, *, version: int = 1
+) -> tuple[UUID, UUID]:
+    """Register an artifact at ``version`` and put one agent in SHARED (the OCC
+    writer's pre-commit state). Returns ``(artifact_id, agent_id)``."""
+    art = _make_artifact(version=version, content_hash="h-init")
+    reg.register_artifact(art, content="")
+    agent = uuid4()
+    reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)
+    return art.id, agent
+
+
+def test_commit_cas_happy_bumps_version_and_modifies(db_path: Path) -> None:
+    """expected == current, no other E/M holder → version N+1, agent MODIFIED."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=1)
+        result = reg.commit_cas(
+            artifact_id, agent, expected_version=1, content_hash="h-new", tick=7
+        )
+        assert isinstance(result, tuple)
+        updated, invalidated = result
+        assert updated.version == 2
+        assert updated.content_hash == "h-new"
+        assert invalidated == []
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
+        # S→M is an M∪E acquire → granted_at_tick set to the commit tick.
+        assert reg.granted_at_tick(agent, artifact_id) == 7
+        # last_writer recorded on the artifact row.
+        assert reg.last_writer_for(artifact_id) == agent
+
+
+def test_commit_cas_invalidates_non_invalid_peers(db_path: Path) -> None:
+    """WIN invalidates every non-INVALID peer; returns their ids for signals."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=1)
+        peer_shared = uuid4()
+        peer_invalid = uuid4()
+        reg.set_agent_state(artifact_id, peer_shared, MESIState.SHARED, tick=2)
+        reg.set_agent_state(artifact_id, peer_invalid, MESIState.SHARED, tick=2)
+        reg.set_agent_state(artifact_id, peer_invalid, MESIState.INVALID, tick=3)
+
+        updated, invalidated = reg.commit_cas(
+            artifact_id, agent, expected_version=1, content_hash="h-new", tick=9
+        )
+        assert updated.version == 2
+        # Only the still-valid peer is invalidated; the already-INVALID one is not.
+        assert invalidated == [peer_shared]
+        assert reg.get_agent_state(artifact_id, peer_shared) == MESIState.INVALID
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
+
+
+def test_commit_cas_version_mismatch_no_mutation(db_path: Path) -> None:
+    """expected < current → version_mismatch ConflictDetail, NO mutation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, _ = _seed_artifact_with_shared_writer(reg, version=5)
+        loser = uuid4()
+        reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
+        result = reg.commit_cas(
+            artifact_id, loser, expected_version=3, content_hash="h-stale", tick=10
+        )
+        assert result == ConflictDetail("version_mismatch", 5)
+        # No mutation: version unchanged, content_hash unchanged, state SHARED.
+        art = reg.get_artifact(artifact_id)
+        assert art.version == 5
+        assert art.content_hash == "h-init"
+        assert reg.get_agent_state(artifact_id, loser) == MESIState.SHARED
+
+
+def test_commit_cas_other_holder_no_mutation(db_path: Path) -> None:
+    """version matches but another agent holds E/M → other_holder, NO mutation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, occ_writer = _seed_artifact_with_shared_writer(reg, version=1)
+        pessimistic = uuid4()
+        reg.set_agent_state(artifact_id, pessimistic, MESIState.EXCLUSIVE, tick=2)
+        result = reg.commit_cas(
+            artifact_id, occ_writer, expected_version=1, content_hash="h-new", tick=11
+        )
+        assert result == ConflictDetail("other_holder", 1)
+        assert reg.get_artifact(artifact_id).version == 1
+        assert reg.get_agent_state(artifact_id, occ_writer) == MESIState.SHARED
+        # The pessimistic holder is untouched.
+        assert reg.get_agent_state(artifact_id, pessimistic) == MESIState.EXCLUSIVE
+
+
+def test_commit_cas_modified_peer_also_trips_other_holder(db_path: Path) -> None:
+    """MODIFIED (not just EXCLUSIVE) peer trips other_holder."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, occ_writer = _seed_artifact_with_shared_writer(reg, version=1)
+        holder = uuid4()
+        reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=2)
+        reg.set_agent_state(artifact_id, holder, MESIState.MODIFIED, tick=3)
+        result = reg.commit_cas(
+            artifact_id, occ_writer, expected_version=1, content_hash="x", tick=4
+        )
+        assert result == ConflictDetail("other_holder", 1)
+
+
+def test_commit_cas_expected_greater_returns_corruption(db_path: Path) -> None:
+    """expected > current → CasCorruption sentinel (service maps to CoherenceError)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=2)
+        result = reg.commit_cas(
+            artifact_id, agent, expected_version=9, content_hash="x", tick=1
+        )
+        assert isinstance(result, CasCorruption)
+        assert result.current_version == 2
+        # Corruption is distinct from a conflict.
+        assert not isinstance(result, ConflictDetail)
+        # No mutation.
+        assert reg.get_artifact(artifact_id).version == 2
+
+
+def test_commit_cas_version_check_precedes_holder_check(db_path: Path) -> None:
+    """A just-committed winner's MODIFIED state must NOT mis-fire other_holder
+    for a stale loser — the version branch fires first → version_mismatch."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, winner = _seed_artifact_with_shared_writer(reg, version=1)
+        loser = uuid4()
+        reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
+        # Winner commits: version 1→2, winner now MODIFIED.
+        reg.commit_cas(artifact_id, winner, expected_version=1, content_hash="w", tick=5)
+        assert reg.get_agent_state(artifact_id, winner) == MESIState.MODIFIED
+        # Loser retries at stale expected_version=1; winner holds MODIFIED.
+        # version_mismatch must win (not other_holder), proving branch order.
+        result = reg.commit_cas(
+            artifact_id, loser, expected_version=1, content_hash="l", tick=6
+        )
+        assert result == ConflictDetail("version_mismatch", 2)
+
+
+def test_commit_cas_unknown_artifact_raises_keyerror(db_path: Path) -> None:
+    with SqliteArtifactRegistry(db_path) as reg:
+        with pytest.raises(KeyError):
+            reg.commit_cas(uuid4(), uuid4(), expected_version=1, content_hash="x")
+
+
+def test_commit_cas_emits_state_log_for_committer_and_peers(db_path: Path) -> None:
+    """WIN emits one state_log entry per transition (peers→INVALID, committer→M),
+    with monotonic sequence numbers continuing from prior emissions."""
+    emitted: list[dict] = []
+    with SqliteArtifactRegistry(
+        db_path, state_log=emitted.append, instance_id="inst-cas"
+    ) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        agent = uuid4()
+        peer = uuid4()
+        reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)  # seq 1
+        reg.set_agent_state(art.id, peer, MESIState.SHARED, tick=1)  # seq 2
+        assert reg._seq == 2
+        emitted.clear()
+
+        reg.commit_cas(art.id, agent, expected_version=1, content_hash="h-new", tick=5)
+        # One peer invalidation + one committer MODIFIED = 2 new entries.
+        assert len(emitted) == 2
+        transitions = {(e["from_state"], e["to_state"]) for e in emitted}
+        assert ("SHARED", "INVALID") in transitions
+        assert ("SHARED", "MODIFIED") in transitions
+        seqs = sorted(e["sequence_number"] for e in emitted)
+        assert seqs == [3, 4]
+        assert reg._seq == 4
+        # The MODIFIED entry carries the new content_hash; the invalidation does not.
+        mod_entry = next(e for e in emitted if e["to_state"] == "MODIFIED")
+        assert mod_entry["content_hash"] == "h-new"
+        assert mod_entry["version"] == 2
+        inv_entry = next(e for e in emitted if e["to_state"] == "INVALID")
+        assert inv_entry["content_hash"] is None
+        # sequence_number persisted to registry_meta.
+        meta = dict(reg._conn.execute(
+            "SELECT key, value FROM registry_meta WHERE key='sequence_number'"
+        ).fetchall())
+        assert meta["sequence_number"] == "4"
+
+
+def test_commit_cas_state_log_raise_rolls_back_seq_and_state(db_path: Path) -> None:
+    """Atomicity oracle (mirrors test_state_log_raise_rolls_back_seq_and_state):
+    a state_log raise mid-CAS → ROLLBACK leaves version + _seq + agent state
+    untouched, and registry_meta.sequence_number unchanged."""
+    # Raise on the committer's MODIFIED emission (seq 3): the peer invalidation
+    # (seq 3 candidate) is emitted first, the committer emission is the one that
+    # raises — forcing a rollback after the UPDATE + peer mutation already ran
+    # inside the transaction.
+    raise_on_to_state = "MODIFIED"
+    emitted: list[dict] = []
+
+    def hooky(entry: dict) -> None:
+        if entry["to_state"] == raise_on_to_state and entry["trigger"] == "commit_cas":
+            raise RuntimeError("simulated callback failure mid-CAS")
+        emitted.append(entry)
+
+    with SqliteArtifactRegistry(
+        db_path, state_log=hooky, instance_id="inst-cas"
+    ) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        agent = uuid4()
+        peer = uuid4()
+        reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)  # seq 1
+        reg.set_agent_state(art.id, peer, MESIState.SHARED, tick=1)  # seq 2
+        assert reg._seq == 2
+
+        with pytest.raises(RuntimeError, match="simulated callback failure mid-CAS"):
+            reg.commit_cas(art.id, agent, expected_version=1, content_hash="h-new", tick=5)
+
+        # Everything rolled back: version still 1, content_hash still h-init.
+        art_now = reg.get_artifact(art.id)
+        assert art_now.version == 1
+        assert art_now.content_hash == "h-init"
+        # Agent state preserved (committer still SHARED, peer still SHARED — the
+        # peer's INVALID mutation was rolled back too).
+        assert reg.get_agent_state(art.id, agent) == MESIState.SHARED
+        assert reg.get_agent_state(art.id, peer) == MESIState.SHARED
+        # _seq rolled back to 2 (both the peer emission AND the failed committer
+        # reservation are undone).
+        assert reg._seq == 2
+        meta = dict(reg._conn.execute(
+            "SELECT key, value FROM registry_meta WHERE key='sequence_number'"
+        ).fetchall())
+        assert meta["sequence_number"] == "2"
+
+
+def test_commit_cas_concurrent_writers_exactly_one_wins(db_path: Path) -> None:
+    """Two barrier-synced OCC writers (both SHARED, same expected_version) race
+    on commit_cas → exactly one commits (version N+1, not N+2), the loser gets a
+    ConflictDetail. No silent clobber (R5 atomicity via BEGIN IMMEDIATE)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        writers = [uuid4() for _ in range(8)]
+        for w in writers:
+            reg.set_agent_state(art.id, w, MESIState.SHARED, tick=1)
+
+        results: dict[UUID, object] = {}
+        barrier = threading.Barrier(len(writers))
+
+        def attempt(writer_id: UUID) -> None:
+            barrier.wait()
+            results[writer_id] = reg.commit_cas(
+                art.id, writer_id, expected_version=1,
+                content_hash=f"h-{writer_id.hex[:6]}", tick=5,
+            )
+
+        threads = [threading.Thread(target=attempt, args=(w,)) for w in writers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        wins = [r for r in results.values() if isinstance(r, tuple)]
+        conflicts = [r for r in results.values() if isinstance(r, ConflictDetail)]
+        assert len(wins) == 1, f"expected exactly one win, got {len(wins)}"
+        assert len(conflicts) == len(writers) - 1
+        # Final version advanced by exactly one — no lost update / no clobber.
+        assert reg.get_artifact(art.id).version == 2
+        # Every loser saw version_mismatch (two OCC writers are both SHARED, so
+        # the loser is elected by the version check, never other_holder).
+        assert all(c.reason == "version_mismatch" for c in conflicts)
+        assert all(c.current_version == 2 for c in conflicts)

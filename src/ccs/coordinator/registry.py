@@ -10,12 +10,17 @@ from typing import Any, Callable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 
 ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
+
+# OCC commit-CAS result (plan Unit 2) — parity with SqliteArtifactRegistry.
+# WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
+# impossible state = CasCorruption. None is raised by the registry.
+CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
 
 
 @dataclass
@@ -171,6 +176,166 @@ class ArtifactRegistry:
                 # Roll back so the next successful emission does not create a phantom gap.
                 self._seq -= 1
                 raise
+
+    def commit_cas(
+        self,
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        content_hash: str,
+        size_tokens: int | None = None,
+        tick: int = 0,
+        trigger: str = "commit_cas",
+    ) -> CasResult:
+        """In-memory optimistic-concurrency compare-and-swap (plan Unit 2,
+        parity with :meth:`SqliteArtifactRegistry.commit_cas`). Written fresh
+        from the contract — there is no ``resolve_or_register`` precedent here
+        and the two registries share no base class. Plain GIL-atomic dict
+        mutation; no ``BEGIN IMMEDIATE`` (single-process library callers).
+
+        Same 3-outcome discrimination, version check BEFORE the holder check:
+
+        - ``expected_version > current`` → :class:`CasCorruption` (no mutation).
+        - ``expected_version < current`` → ``ConflictDetail("version_mismatch")``
+          (no mutation).
+        - version matches but another agent holds M/E → ``ConflictDetail(
+          "other_holder")`` (no mutation).
+        - else → WIN: version → ``current + 1``, committer S/I → MODIFIED,
+          peers → INVALID; returns ``(updated_artifact, invalidated_agent_ids)``.
+
+        The state-log emit follows the same mutation-then-log + ``_seq``-rollback
+        invariant as :meth:`set_agent_state`. To keep that invariant under a
+        callback raise during peer/committer logging, the in-memory mutations
+        are computed into a staging plan and applied only after all log entries
+        emit successfully — so a raise leaves ``state_by_agent`` /
+        ``granted_at_tick`` untouched (matching the sqlite ROLLBACK).
+        """
+        record = self._records.get(artifact_id)
+        if record is None:
+            raise KeyError(f"artifact {artifact_id} not in registry")
+        current = record.artifact.version
+
+        if expected_version > current:
+            return CasCorruption(current_version=current)
+        if expected_version < current:
+            return ConflictDetail("version_mismatch", current)
+        other_holder = any(
+            peer_id != agent_id and state in _M_OR_E_STATES
+            for peer_id, state in record.state_by_agent.items()
+        )
+        if other_holder:
+            return ConflictDetail("other_holder", current)
+
+        # ---- WIN ----
+        next_version = current + 1
+        committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
+        peers = [
+            (peer_id, state)
+            for peer_id, state in record.state_by_agent.items()
+            if peer_id != agent_id and state != MESIState.INVALID
+        ]
+
+        # Emit all state_log entries FIRST (peers then committer), reserving
+        # _seq per emission. If any raises, _emit_state_log has already
+        # decremented its own reservation; we decrement the ones that already
+        # succeeded in this call and re-raise — nothing has mutated yet, so the
+        # registry stays consistent (mutation-then-log parity).
+        emitted_here = 0
+        try:
+            for peer_id, peer_from in peers:
+                emitted_here += self._emit_state_log(
+                    artifact_id=artifact_id,
+                    agent_id=peer_id,
+                    from_state=peer_from,
+                    to_state=MESIState.INVALID,
+                    trigger=trigger,
+                    tick=tick,
+                    version=next_version,
+                    content_hash=None,
+                )
+            emitted_here += self._emit_state_log(
+                artifact_id=artifact_id,
+                agent_id=agent_id,
+                from_state=committer_from,
+                to_state=MESIState.MODIFIED,
+                trigger=trigger,
+                tick=tick,
+                version=next_version,
+                content_hash=content_hash,
+            )
+        except Exception:
+            self._seq -= emitted_here
+            raise
+
+        # All logs emitted — now apply the mutations (cannot fail).
+        updated = Artifact(
+            id=artifact_id,
+            name=record.artifact.name,
+            version=next_version,
+            content_hash=content_hash,
+            size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
+            depends_on=record.artifact.depends_on,
+        )
+        if self._retain_versions:
+            record.version_history[next_version] = record.content
+        record.artifact = updated
+        record.last_writer = agent_id
+
+        invalidated: list[UUID] = []
+        for peer_id, peer_from in peers:
+            record.state_by_agent[peer_id] = MESIState.INVALID
+            if peer_from in _M_OR_E_STATES:
+                record.granted_at_tick_by_agent.pop(peer_id, None)
+            invalidated.append(peer_id)
+
+        # Committer S/I → MODIFIED is an M∪E acquire: set granted_at_tick,
+        # clear the reclaim slot (set_agent_state's acquire branch).
+        record.state_by_agent[agent_id] = MESIState.MODIFIED
+        record.granted_at_tick_by_agent[agent_id] = tick
+        record.last_reclamation_by_agent.pop(agent_id, None)
+
+        return updated, invalidated
+
+    def _emit_state_log(
+        self,
+        *,
+        artifact_id: UUID,
+        agent_id: UUID,
+        from_state: MESIState,
+        to_state: MESIState,
+        trigger: str,
+        tick: int,
+        version: int,
+        content_hash: str | None,
+    ) -> int:
+        """Emit one ``state_log`` entry for the inlined CAS region. Returns 1 if
+        ``_seq`` was bumped (0 if no state_log configured). On callback raise,
+        decrements its own reservation and re-raises (mutation-then-log parity
+        with :meth:`set_agent_state`)."""
+        if self._state_log is None:
+            return 0
+        self._seq += 1
+        entry = {
+            "tick": tick,
+            "artifact_id": str(artifact_id),
+            "agent_id": str(agent_id),
+            "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
+            "from_state": from_state.name,
+            "to_state": to_state.name,
+            "trigger": trigger,
+            "version": version,
+            "content_hash": content_hash,
+            "sequence_number": self._seq,
+            "instance_id": self._instance_id,
+            "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
+        }
+        try:
+            self._state_log(entry)
+        except Exception:
+            self._seq -= 1
+            raise
+        return 1
 
     def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
         """Record an agent's heartbeat tick using max(prev, incoming) (R12 monotonicity)."""
