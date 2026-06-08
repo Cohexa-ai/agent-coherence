@@ -170,19 +170,26 @@ def normalize_response(
     from the normalized dict (on both actual and expected), for backend-specific
     optional extension fields whose shared baseline both backends must still
     match (e.g. a Python-only OCC ``version`` field on a pre-read response that
-    the Node coordinator does not emit)."""
+    the Node coordinator does not emit). **Scoped to the TOP-LEVEL response body
+    only** (AC3) — a nested key that happens to share a name with an optional_key
+    is still compared, so a real nested divergence is never masked."""
     ignore_keys = ignore_keys or frozenset()
     optional_keys = optional_keys or frozenset()
 
-    def _walk(v: Any, parent_key: Optional[str]) -> Any:
+    def _walk(v: Any, *, depth: int) -> Any:
         if isinstance(v, dict):
+            # optional_keys are dropped at the ROOT dict only (depth == 0): they
+            # describe top-level backend-specific extension fields, not arbitrary
+            # nested occurrences. A nested same-named key (depth > 0) is kept and
+            # compared so a nested divergence still fails the diff.
+            drop = optional_keys if depth == 0 else frozenset()
             return {
-                k: _walk_keyed(v[k], k)
+                k: _walk_keyed(v[k], k, depth=depth)
                 for k in sorted(v.keys())
-                if k not in optional_keys
+                if k not in drop
             }
         if isinstance(v, list):
-            return [_walk(item, None) for item in v]
+            return [_walk(item, depth=depth + 1) for item in v]
         if isinstance(v, str):
             # String-position scrubbing: UUID and ISO-8601 substrings in
             # error messages / log fragments.
@@ -191,7 +198,7 @@ def normalize_response(
             return scrubbed
         return v
 
-    def _walk_keyed(v: Any, key: str) -> Any:
+    def _walk_keyed(v: Any, key: str, *, depth: int) -> Any:
         # Per-fixture ignore set wins over everything else.
         if key in ignore_keys:
             return "<IGNORED>"
@@ -209,9 +216,11 @@ def normalize_response(
             return _UUID_SENTINEL
         if key in _HASH_KEYS:
             return _HASH_SENTINEL
-        return _walk(v, key)
+        # Descend into the value; nested dicts are depth + 1 (so optional_keys no
+        # longer apply below the root).
+        return _walk(v, depth=depth + 1)
 
-    return _walk(value, None)
+    return _walk(value, depth=0)
 
 
 # ----------------------------------------------------------------------

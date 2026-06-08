@@ -1704,6 +1704,41 @@ def test_occ_commit_corruption_expected_gt_current_raises_body(coordinator, clie
     assert _artifact_version(coordinator, "plan.md") == 1
 
 
+def test_occ_commit_caller_in_transient_returns_stable_reason(
+    coordinator, client: _Client
+) -> None:
+    """AC2: a caller left mid-transient (a peer invalidated it between its read
+    and its CAS) → {ok:false, reason:'caller_in_transient_state'} — a STABLE
+    machine reason (NOT the exception's human message), so the client's retry
+    classifier matches it exactly. The body also carries current_version so the
+    client can advance its comparand. No mutation: this is a lost race."""
+    from ccs.core.states import TransientState
+
+    sid = _sid("occTransient")
+    v = _occ_seed_shared(client, sid, "plan.md", _hash("v1"))  # caller SHARED@v1
+    # Force the caller mid-transient on the coordinator (the registry shape a
+    # peer's invalidating write leaves on a SHARED holder: SIA). commit_cas
+    # rejects this as a retry-eligible precondition.
+    aid = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    agent_id = session_to_agent_id(sid)
+    coordinator.registry.set_agent_transient(
+        aid, agent_id, TransientState.SIA, entered_tick=v
+    )
+
+    s, b = client.post(
+        "/hooks/post-edit-cas",
+        {"session_id": sid, "path": "plan.md", "success": True,
+         "content_hash": _hash("v2"), "expected_version": v},
+    )
+    assert s == 200
+    # The STABLE wire reason — exactly the literal the client matcher keys on,
+    # decoupled from commit_cas's "commit_cas_not_allowed ..." human message.
+    assert b == {"ok": False, "reason": "caller_in_transient_state", "current_version": v}
+    assert "degraded" not in b  # a clean retry-eligible conflict, not a degrade
+    # No mutation: the version did not advance.
+    assert _artifact_version(coordinator, "plan.md") == v
+
+
 def test_occ_commit_degrade_reads_as_failure(coordinator, client: _Client) -> None:
     """THE LOAD-BEARING FIX: a timed-out/degraded OCC commit returns
     {ok:false, degraded:true, reason:'commit_unconfirmed'} — NOT the

@@ -336,3 +336,113 @@ def test_write_cas_validates_provided_content_hash() -> None:
         now_tick=3,
     )
     assert updated.version == 2
+
+
+def test_write_cas_refetches_when_cache_entry_evicted_mid_loop() -> None:
+    """T5: a peer invalidation can evict the cache placeholder BETWEEN attempts.
+    write_cas must re-fetch a fresh SHARED entry before reading
+    ``entry.local_version`` (the ``entry is None`` guard) — never raise
+    AttributeError. Here attempt 0 conflicts (a peer won v2), then the
+    top-of-attempt-1 cache.get is forced to None; write_cas re-fetches and the
+    second attempt commits at the fresh version (converges)."""
+    coordinator = CoordinatorService(ArtifactRegistry())
+    artifact = coordinator.register_artifact(name="plan.md", content="v1")
+    writer = _shared_occ_writer(coordinator, artifact.id, version=artifact.version)
+
+    # A concurrent OCC peer commits first (v1 -> v2), so the writer's first
+    # attempt is stale → version_mismatch → the loop iterates to attempt 1.
+    peer = _shared_occ_writer(coordinator, artifact.id, version=artifact.version)
+    coordinator.commit_cas(
+        agent_id=peer.agent_id,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash=compute_content_hash("peer-v2"),
+    )
+
+    # Evict the placeholder exactly once, at the top of the SECOND attempt
+    # (the 3rd cache.get overall: pre-loop, attempt-0 top, attempt-1 top←evict).
+    real_get = writer.cache.get
+    calls = {"n": 0}
+
+    def evicting_get(aid):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return None  # simulate a peer invalidation dropping the entry
+        return real_get(aid)
+
+    writer.cache.get = evicting_get  # type: ignore[assignment]
+    try:
+        updated, _ = writer.write_cas(
+            artifact.id,
+            make_content=lambda entry: (f"occ-v{entry.local_version + 1}", None),
+            now_tick=3,
+        )
+    finally:
+        writer.cache.get = real_get  # type: ignore[assignment]
+
+    # Converged at the fresh version with no AttributeError on entry.local_version.
+    assert updated.version == 3
+    assert calls["n"] >= 4  # the eviction forced the re-fetch + re-get branch
+    entry = writer.cache.get(artifact.id)
+    assert entry is not None
+    assert entry.local_version == 3
+
+
+def test_write_cas_exhaustion_with_eviction_raises_typed_terminal() -> None:
+    """T5 (terminal path): even when the cache entry is evicted on EVERY attempt,
+    write_cas re-fetches cleanly and surfaces the typed CasRetriesExhausted on a
+    perpetual conflict — never an AttributeError, never a silent drop."""
+
+    class _TwoRetryStrategy(LazyStrategy):
+        def max_cas_retries(self) -> int:
+            return 2
+
+    coordinator = CoordinatorService(ArtifactRegistry())
+    artifact = coordinator.register_artifact(name="plan.md", content="v1")
+    runtime = AgentRuntime(
+        agent_id=uuid4(), coordinator=coordinator, strategy=_TwoRetryStrategy()
+    )
+    coordinator.fetch(
+        FetchRequest(artifact_id=artifact.id, requesting_agent_id=runtime.agent_id, requested_at_tick=1)
+    )
+    runtime.cache.put(
+        artifact.id,
+        runtime.strategy.on_fetch(
+            artifact_id=artifact.id, version=1, state=MESIState.SHARED, now_tick=1
+        ),
+    )
+
+    # Perpetual conflict — no real winner advances the registry.
+    def always_conflict(**kwargs):  # type: ignore[no-untyped-def]
+        return ConflictDetail(reason="version_mismatch", current_version=1)
+
+    coordinator.commit_cas = always_conflict  # type: ignore[assignment]
+
+    # Evict the placeholder once mid-loop (at the top of the second attempt:
+    # the 3rd cache.get — pre-loop, attempt-0 top, attempt-1 top←evict). The
+    # eviction must drive the re-fetch branch and the loop must still reach its
+    # bounded terminal rather than raising AttributeError on entry.local_version.
+    real_get = runtime.cache.get
+    calls = {"n": 0}
+
+    def evicting_get(aid):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return None  # peer invalidation drops the entry between attempts
+        return real_get(aid)
+
+    runtime.cache.get = evicting_get  # type: ignore[assignment]
+    try:
+        with pytest.raises(CasRetriesExhausted):
+            runtime.write_cas(
+                artifact.id,
+                make_content=lambda entry: ("never-lands", None),
+                now_tick=2,
+            )
+    finally:
+        runtime.cache.get = real_get  # type: ignore[assignment]
+
+    # The eviction branch was exercised, and the registry never advanced (no
+    # silent drop on the eviction+conflict path).
+    assert calls["n"] >= 4  # re-fetch branch fired after the eviction
+    assert coordinator.registry.get_artifact(artifact.id).version == 1

@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from uuid import UUID
 
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import (
+    OCC_CALLER_TRANSIENT_REASON,
+    CoherenceError,
+    OccCallerTransientError,
+)
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
@@ -425,15 +429,22 @@ class CoordinatorService:
             :class:`ConflictDetail` on a retry-eligible conflict.
 
         Raises:
-            CoherenceError: artifact missing, caller mid-transient, caller in
-                M/E (use ``commit``), or the registry reported corruption.
+            OccCallerTransientError: the caller is mid-transient (a peer
+                invalidated it between read and CAS) — a retry-eligible subclass
+                of ``CoherenceError`` carrying the stable wire reason
+                :data:`~ccs.core.exceptions.OCC_CALLER_TRANSIENT_REASON`.
+            CoherenceError: artifact missing, caller in M/E (use ``commit``), or
+                the registry reported corruption (all non-retryable).
         """
         artifact = self._require_artifact(artifact_id)
 
         if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
-            raise CoherenceError(
+            # Retry-eligible: a peer invalidated the caller between its read and
+            # this CAS, leaving an invalidation transient. Typed so the wire
+            # reason stays stable independent of this human message (AC2).
+            raise OccCallerTransientError(
                 f"commit_cas_not_allowed agent={agent_id} artifact={artifact_id} "
-                f"reason=caller_in_transient_state"
+                f"reason={OCC_CALLER_TRANSIENT_REASON}"
             )
 
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)

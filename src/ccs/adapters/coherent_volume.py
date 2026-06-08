@@ -66,6 +66,7 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    OCC_CALLER_TRANSIENT_REASON,
     CasRetriesExhausted,
     CoherenceDegradedWarning,
     CoherenceError,
@@ -88,6 +89,20 @@ MAX_CAS_REACQUIRES = 8
 
 class CoherentVolume:
     """Coherent shared workspace for a single-host agent fleet (v1).
+
+    .. warning::
+
+       **An instance is NOT thread-safe — one operation at a time, one instance
+       per thread (A5).** ``read``/``write``/``write_cas`` read ``_session_id``
+       lock-free while ``reacquire``/``_after_fork`` re-mint it, so overlapping
+       calls on a SINGLE instance from different threads could split an in-flight
+       CAS across identities. This is misuse, and it is made LOUD: a public op
+       that detects another op already in flight on the same instance raises
+       :class:`~ccs.core.exceptions.CoherenceError` rather than corrupting
+       silently. Each thread (and each forked child) must own its OWN instance —
+       per-instance identity is exactly what makes distinct writers distinct. The
+       guard is re-entrant for the same thread, so the internal
+       ``write_cas`` → ``reacquire`` → ``read`` nesting is unaffected.
 
     The appliance **spawns** the coordinator for ``root`` and enables strict
     mode on the ``managed`` globs (by writing ``.coherence/tracked.yaml`` and
@@ -137,6 +152,16 @@ class CoherentVolume:
         self._bind_host = bind_host
 
         self._lock = threading.Lock()
+        # A5: single-instance concurrency guard, SEPARATE from self._lock (which
+        # protects identity mutation in reacquire/_after_fork). A non-reentrant
+        # threading.Lock here would deadlock with the reacquire-within-write_cas
+        # path; instead we track the owning thread + a re-entry depth so the SAME
+        # thread's nested internal calls (write_cas → reacquire → read) pass while
+        # an OVERLAPPING call from a DIFFERENT thread raises. _guard_meta_lock is
+        # held only for the microsecond check-then-set, never across an operation.
+        self._guard_meta_lock = threading.Lock()
+        self._guard_owner_ident: int | None = None
+        self._guard_depth = 0
         self._degradation_count = 0
         self._endpoint: CoordinatorEndpoint | None = None
         # Set by the fork child-handler so the next read/write re-attaches (the
@@ -194,6 +219,48 @@ class CoherentVolume:
     def is_attached(self) -> bool:
         """True if a coordinator endpoint was resolved (strict-mode owner)."""
         return self._endpoint is not None
+
+    # --- single-instance concurrency guard (A5) -----------------------------
+
+    @contextlib.contextmanager
+    def _single_op_guard(self) -> Iterator[None]:
+        """Reject overlapping use of ONE instance across threads (A5).
+
+        A :class:`CoherentVolume` instance is single-threaded by contract: one
+        operation at a time. Concurrent ``read``/``write``/``write_cas`` on the
+        same instance from different threads could split an in-flight CAS across
+        identities (``reacquire``/``_after_fork`` re-mint ``_session_id`` while
+        the lock-free op path reads it). This guard makes that misuse LOUD rather
+        than silently corrupting: a second thread entering while another holds the
+        guard raises ``CoherenceError``.
+
+        Re-entrant for the SAME thread so internal nesting works (``write_cas``
+        calls :meth:`reacquire`, which calls :meth:`read`): the owning thread
+        bumps a depth counter instead of self-deadlocking. A separate
+        non-reentrant ``threading.Lock`` would deadlock that path, and silently
+        serializing instead of raising would hide the misuse + risk deadlock with
+        ``self._lock`` — so we detect-and-raise, never block.
+        """
+        ident = threading.get_ident()
+        with self._guard_meta_lock:
+            if self._guard_owner_ident is not None and self._guard_owner_ident != ident:
+                raise CoherenceError(
+                    "CoherentVolume is single-threaded; concurrent use detected. "
+                    "One operation at a time per instance — use one instance per "
+                    "thread (an in-flight read/write/write_cas can re-mint identity "
+                    "via reacquire, so overlapping ops on one instance could split a "
+                    "CAS across identities)."
+                )
+            self._guard_owner_ident = ident
+            self._guard_depth += 1
+        try:
+            yield
+        finally:
+            with self._guard_meta_lock:
+                self._guard_depth -= 1
+                if self._guard_depth <= 0:
+                    self._guard_depth = 0
+                    self._guard_owner_ident = None
 
     # --- spawn-with-strict --------------------------------------------------
 
@@ -348,7 +415,15 @@ class CoherentVolume:
         failure (unavailable coordinator, watchdog timeout) raises
         ``CoherenceError`` — a read whose coherence cannot be registered fails
         closed.
+
+        **Not thread-safe (A5).** Overlapping use of this instance from another
+        thread raises ``CoherenceError`` (the single-op guard) — one instance per
+        thread.
         """
+        with self._single_op_guard():
+            return self._read_impl(path)
+
+    def _read_impl(self, path: str | os.PathLike[str]) -> bytes:
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         # Stat before registering so a missing file raises rather than seeding a
@@ -391,7 +466,15 @@ class CoherentVolume:
         :meth:`reacquire`'s fresh bytes. ``on_error`` governs only
         coherence-infrastructure failures (unavailable coordinator, watchdog
         timeout): strict raises, degrade warns once and writes best-effort.
+
+        **Not thread-safe (A5).** Overlapping use of this instance from another
+        thread raises ``CoherenceError`` (the single-op guard) — one instance per
+        thread.
         """
+        with self._single_op_guard():
+            self._write_impl(path, data)
+
+    def _write_impl(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("CoherentVolume.write expects bytes")
         data = bytes(data)
@@ -515,7 +598,20 @@ class CoherentVolume:
         vs. warns *inside* ``_post`` and the genuinely-unattached
         (``_endpoint is None``) degrade branch above — but never lets an
         unconfirmed OCC commit silently land.
+
+        **Not thread-safe (A5).** Overlapping use of this instance from another
+        thread raises ``CoherenceError`` (the single-op guard). The internal
+        :meth:`reacquire` retries run on the SAME thread, so they re-enter the
+        guard rather than tripping it — one instance per thread.
         """
+        with self._single_op_guard():
+            self._write_cas_impl(path, make_content)
+
+    def _write_cas_impl(
+        self,
+        path: str | os.PathLike[str],
+        make_content: Callable[[bytes], bytes | bytearray],
+    ) -> None:
         self._ensure_attached()
         _abs_path, rel = self._to_relative(path)
 
@@ -772,21 +868,30 @@ class CoherentVolume:
             return b""
         return self._read_file_bytes(abs_path)
 
-    # Retry-eligible OCC conflict reasons (typed ConflictDetail.reason values).
-    _CAS_RETRY_REASONS: frozenset[str] = frozenset({"version_mismatch", "other_holder"})
+    # Retry-eligible OCC conflict reasons matched EXACTLY against the wire
+    # ``reason``: the typed ``ConflictDetail`` reasons plus
+    # ``caller_in_transient_state`` (AC2 — a peer invalidated us mid-window).
+    # The transient literal is the SHARED constant the coordinator server emits,
+    # so a reword on either side can't drift the retry classification.
+    _CAS_RETRY_REASONS: frozenset[str] = frozenset(
+        {"version_mismatch", "other_holder", OCC_CALLER_TRANSIENT_REASON}
+    )
 
     def _classify_cas_response(self, resp: dict) -> Literal["win", "conflict", "raise"]:
         """Map a ``/hooks/post-edit-cas`` 200 body to an OCC outcome.
 
         - ``ok: true``  → ``"win"`` (the CAS committed; version bumped).
         - ``ok: false`` with a retry-eligible reason → ``"conflict"`` (reacquire
-          + retry). Two cases: the typed ``ConflictDetail`` reasons
-          (``version_mismatch`` / ``other_holder``), AND
-          ``caller_in_transient_state`` — when a peer invalidates this instance
-          in the window BETWEEN its fresh read and its CAS, the coordinator
-          leaves an invalidation transient that ``commit_cas`` rejects as a
-          precondition; that is a lost race, not corruption, so reacquire +
-          retry (a fresh identity has no transient).
+          + retry). Matched EXACTLY against :attr:`_CAS_RETRY_REASONS`: the
+          typed ``ConflictDetail`` reasons (``version_mismatch`` /
+          ``other_holder``) AND ``caller_in_transient_state`` — when a peer
+          invalidates this instance in the window BETWEEN its fresh read and its
+          CAS, the coordinator leaves an invalidation transient that
+          ``commit_cas`` rejects as a precondition; that is a lost race, not
+          corruption, so reacquire + retry (a fresh identity has no transient).
+          The transient reason is the shared
+          :data:`~ccs.core.exceptions.OCC_CALLER_TRANSIENT_REASON` the server
+          emits, so the match is exact (no brittle substring) and cannot drift.
         - ``ok: false`` otherwise — true corruption (``commit_cas_corruption``,
           ``expected > current``) OR the fail-closed ``{degraded: true,
           reason: "commit_unconfirmed"}`` body → ``"raise"``. The degrade body
@@ -797,10 +902,6 @@ class CoherentVolume:
             return "win"
         reason = resp.get("reason")
         if reason in self._CAS_RETRY_REASONS:
-            return "conflict"
-        # A precondition rejection from a peer invalidating us mid-window is a
-        # lost race (retry-eligible via reacquire), NOT terminal corruption.
-        if isinstance(reason, str) and "caller_in_transient_state" in reason:
             return "conflict"
         return "raise"
 

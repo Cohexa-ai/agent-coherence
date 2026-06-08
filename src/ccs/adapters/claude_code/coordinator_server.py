@@ -60,7 +60,11 @@ from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import (
+    OCC_CALLER_TRANSIENT_REASON,
+    CoherenceError,
+    OccCallerTransientError,
+)
 from ccs.core.states import MESIState
 from ccs.core.types import ConflictDetail
 
@@ -1717,10 +1721,16 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     - :class:`~ccs.core.types.ConflictDetail` → ``{ok: false,
       reason: "version_mismatch"|"other_holder", current_version: N}`` — a
       clean typed conflict, NOT a degrade. The client re-reads + retries.
-    - corruption / precondition failure (``CoherenceError`` from
-      ``commit_cas``: ``expected > current``, artifact missing, caller
-      mid-transient, or caller in M/E) → ``{ok: false, reason: <verbatim>}``
-      the client raises on.
+    - retry-eligible transient precondition
+      (:class:`~ccs.core.exceptions.OccCallerTransientError`: a peer
+      invalidated the caller between its read and this CAS) → ``{ok: false,
+      reason: "caller_in_transient_state", current_version: N}`` carrying the
+      STABLE :data:`~ccs.core.exceptions.OCC_CALLER_TRANSIENT_REASON` so the
+      client (``CoherentVolume._classify_cas_response``) routes it to
+      reacquire + retry independent of the exception's human message (AC2).
+    - corruption / non-retryable precondition failure (``CoherenceError`` from
+      ``commit_cas``: ``expected > current``, artifact missing, or caller in
+      M/E) → ``{ok: false, reason: <verbatim>}`` the client raises on.
 
     Fail-closed degrade: on a watchdog timeout this endpoint returns the
     DISTINCT :data:`_OCC_DEGRADED_RESPONSE` (``{ok: false, degraded: true,
@@ -1784,10 +1794,22 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 content_hash=content_hash,
                 issued_at_tick=now,
             )
+        except OccCallerTransientError:
+            # Retry-eligible (AC2): a peer invalidated the caller between its
+            # read and this CAS. Surface a STABLE machine reason decoupled from
+            # the exception's human message so the client's retry classifier
+            # (CoherentVolume._classify_cas_response) matches exactly. Include
+            # current_version when readily available (the caller is INVALID, so
+            # the artifact still exists) so the client can advance its comparand.
+            current_artifact = coordinator.registry.get_artifact(artifact_id)
+            body: dict = {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+            if current_artifact is not None:
+                body["current_version"] = current_artifact.version
+            return body
         except CoherenceError as exc:
-            # Corruption (expected > current) or a precondition failure
-            # (caller mid-transient / in M/E) — non-retryable; the client
-            # raises on the {ok: false, reason} body.
+            # Corruption (expected > current) or a non-retryable precondition
+            # (caller in M/E) — the client raises on the {ok: false, reason}
+            # body verbatim.
             return {"ok": False, "reason": str(exc)}
 
         if isinstance(result, ConflictDetail):
