@@ -155,6 +155,7 @@ def normalize_response(
     value: Any,
     *,
     ignore_keys: Optional[frozenset[str]] = None,
+    optional_keys: Optional[frozenset[str]] = None,
 ) -> Any:
     """Replace non-deterministic field values with stable sentinels.
 
@@ -163,12 +164,23 @@ def normalize_response(
 
     ``ignore_keys`` — per-fixture opt-in set of additional key names whose
     values should be replaced with ``"<IGNORED>"``. Use sparingly; each entry
-    is a hole in the catch surface."""
+    is a hole in the catch surface.
+
+    ``optional_keys`` — per-fixture opt-in set of key names DROPPED entirely
+    from the normalized dict (on both actual and expected), for backend-specific
+    optional extension fields whose shared baseline both backends must still
+    match (e.g. a Python-only OCC ``version`` field on a pre-read response that
+    the Node coordinator does not emit)."""
     ignore_keys = ignore_keys or frozenset()
+    optional_keys = optional_keys or frozenset()
 
     def _walk(v: Any, parent_key: Optional[str]) -> Any:
         if isinstance(v, dict):
-            return {k: _walk_keyed(v[k], k) for k in sorted(v.keys())}
+            return {
+                k: _walk_keyed(v[k], k)
+                for k in sorted(v.keys())
+                if k not in optional_keys
+            }
         if isinstance(v, list):
             return [_walk(item, None) for item in v]
         if isinstance(v, str):
@@ -229,6 +241,7 @@ class Fixture:
     expected: dict[str, Any]
     backends: tuple[str, ...]
     ignore_keys: frozenset[str]
+    optional_keys: frozenset[str]
 
 
 def load_fixtures(mode: str = "warn_mode") -> list[Fixture]:
@@ -256,6 +269,7 @@ def load_fixtures(mode: str = "warn_mode") -> list[Fixture]:
                 expected=data["expected"],
                 backends=tuple(backends_raw),
                 ignore_keys=frozenset(data.get("ignore_keys", [])),
+                optional_keys=frozenset(data.get("optional_keys", [])),
             )
         )
     return fixtures
@@ -614,4 +628,6 @@ def run_scenario(
         if preflight:
             apply_preflight_requests(backend, preflight)
         status, body = execute_request(backend, fixture.request)
-    return status, normalize_response(body, ignore_keys=fixture.ignore_keys)
+    return status, normalize_response(
+        body, ignore_keys=fixture.ignore_keys, optional_keys=fixture.optional_keys
+    )
