@@ -397,10 +397,22 @@ class CoherentVolume:
             self._check_grant(resp, rel, phase="pre-edit")
 
         new_hash = self._sha256_bytes(data)
-        # No-op skip: bytes identical to our own last commit while we hold a fresh
-        # grant means the file already has them — skip the os.replace (no
-        # filesystem churn) but still finalize the grant via post-edit below.
-        if self._last_committed_hash.get(rel) != new_hash:
+        # No-op skip: when the file ALREADY holds these exact bytes, skip the
+        # os.replace (and its fsync) — but verify against the CURRENT on-disk
+        # hash, never the cached belief alone. _last_committed_hash is only a
+        # cheap fast-path gate (it avoids hashing the file on the common "bytes
+        # changed" write); a peer commit on a tracked-but-NON-strict glob
+        # overwrites the file while our cache still reads our OWN last hash and
+        # pre-edit re-grants without a deny. Trusting the cache there would skip
+        # the write, leaving the peer's bytes on disk while post-edit commits OUR
+        # hash — silent disk/coordinator divergence. Hashing the file is far
+        # cheaper than the atomic write+fsync it guards, so the skip stays a real
+        # optimization while being correct.
+        already_on_disk = (
+            self._last_committed_hash.get(rel) == new_hash
+            and self._disk_hash(abs_path) == new_hash
+        )
+        if not already_on_disk:
             try:
                 self._atomic_write(abs_path, data)
             except OSError:
@@ -495,6 +507,24 @@ class CoherentVolume:
             return b"".join(chunks)
         finally:
             os.close(fd)
+
+    def _disk_hash(self, abs_path: Path) -> str | None:
+        """SHA-256 of the CURRENT on-disk bytes, or ``None`` if the file is
+        absent/unreadable.
+
+        The write no-op-skip uses this to confirm the file ALREADY holds the
+        bytes being committed before skipping the ``os.replace``. A per-instance
+        cached hash (``_last_committed_hash``) can be stale across a peer commit:
+        on a tracked-but-non-strict glob the coordinator re-grants the write
+        without a deny, so the cache still reads this instance's OWN last hash
+        while disk holds the peer's bytes. The cache is therefore only a cheap
+        fast-path gate; the on-disk hash is the authority for whether a write is
+        truly a no-op. Reads via :meth:`_read_file_bytes` (raw ``os.read``) so it
+        is never self-intercepted by the ``install()`` open()-shim."""
+        try:
+            return self._sha256_bytes(self._read_file_bytes(abs_path))
+        except OSError:
+            return None
 
     def _atomic_write(self, abs_path: Path, data: bytes) -> None:
         """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT
