@@ -490,3 +490,124 @@ def test_explicit_crash_recovery_kwarg_emits_no_deprecation_warning() -> None:
     ]
     assert deprecation_warnings == []
     assert core._crash_recovery.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Unit 5 — CoherenceAdapterCore.write_cas (OCC path through the adapter envelope).
+#
+# The adapter exposes the OCC write while preserving the same envelope as
+# write(): heartbeat piggyback (ONLY when crash_recovery.enabled, at THIS layer
+# per R9), _maybe_sweep, and event-bus publish of invalidation signals on
+# success. The five framework adapters inherit write_cas via CoherenceAdapterCore.
+# ---------------------------------------------------------------------------
+
+
+def _two_shared_agents(core: CoherenceAdapterCore, *, name_a: str, name_b: str, artifact_id):
+    """Register two agents and read from both so each ends SHARED at the
+    coordinator (the S/I starting point an OCC commit_cas requires)."""
+    core.register_agent(name_a)
+    core.register_agent(name_b)
+    core.read(agent_name=name_a, artifact_id=artifact_id, now_tick=1)
+    core.read(agent_name=name_b, artifact_id=artifact_id, now_tick=1)
+    assert core.coordinator.registry.get_agent_state(artifact_id, core.agent_id_for(name_a)) == MESIState.SHARED
+    assert core.coordinator.registry.get_agent_state(artifact_id, core.agent_id_for(name_b)) == MESIState.SHARED
+
+
+def test_adapter_write_cas_commits_and_publishes_invalidation_to_peers() -> None:
+    """Integration (R8/R3): a winning OCC commit publishes the same invalidation
+    signals to the bus as write() — peers see INVALID."""
+    core = CoherenceAdapterCore(strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False))
+    artifact = core.register_artifact(name="plan.md", content="v1")
+    _two_shared_agents(core, name_a="writer", name_b="peer", artifact_id=artifact.id)
+
+    updated = core.write_cas(
+        agent_name="writer",
+        artifact_id=artifact.id,
+        make_content=lambda entry: (f"writer-v{entry.local_version + 1}", None),
+        now_tick=2,
+    )
+
+    assert updated.version == 2
+    # The peer's cached copy was invalidated via the published signal (bus path).
+    peer_entry = core.runtime("peer").cache.get(artifact.id)
+    assert peer_entry is not None
+    assert peer_entry.state == MESIState.INVALID
+    # The writer holds MODIFIED locally.
+    assert core.runtime("writer").cache.get(artifact.id).state == MESIState.MODIFIED
+
+
+def test_adapter_write_cas_records_heartbeat_only_when_crash_recovery_enabled() -> None:
+    """Edge (R9): heartbeat is piggybacked at the ADAPTER layer on the OCC path
+    exactly as on write(), and ONLY when crash_recovery.enabled."""
+    # --- enabled: heartbeat recorded on write_cas ---
+    core = CoherenceAdapterCore(
+        strategy_name="lazy",
+        crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    )
+    artifact = core.register_artifact(name="plan.md", content="v1")
+    _two_shared_agents(core, name_a="writer", name_b="peer", artifact_id=artifact.id)
+
+    hb_calls: list[int] = []
+    orig = core.coordinator.record_heartbeat
+
+    def spy(**kwargs):  # type: ignore[no-untyped-def]
+        hb_calls.append(kwargs.get("now_tick"))
+        return orig(**kwargs)
+
+    core.coordinator.record_heartbeat = spy  # type: ignore[assignment]
+    core.write_cas(
+        agent_name="writer",
+        artifact_id=artifact.id,
+        make_content=lambda entry: ("writer-v2", None),
+        now_tick=5,
+    )
+    core.coordinator.record_heartbeat = orig  # type: ignore[assignment]
+    assert 5 in hb_calls  # heartbeat piggybacked for tick 5 on the OCC path
+
+    # --- disabled: NO heartbeat recorded on write_cas ---
+    core2 = CoherenceAdapterCore(strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False))
+    artifact2 = core2.register_artifact(name="plan.md", content="v1")
+    _two_shared_agents(core2, name_a="writer", name_b="peer", artifact_id=artifact2.id)
+
+    hb_calls2: list[int] = []
+    orig2 = core2.coordinator.record_heartbeat
+
+    def spy2(**kwargs):  # type: ignore[no-untyped-def]
+        hb_calls2.append(kwargs.get("now_tick"))
+        return orig2(**kwargs)
+
+    core2.coordinator.record_heartbeat = spy2  # type: ignore[assignment]
+    core2.write_cas(
+        agent_name="writer",
+        artifact_id=artifact2.id,
+        make_content=lambda entry: ("writer-v2", None),
+        now_tick=5,
+    )
+    core2.coordinator.record_heartbeat = orig2  # type: ignore[assignment]
+    assert hb_calls2 == []  # crash recovery off -> no heartbeat on the OCC path
+
+
+def test_adapter_write_cas_propagates_exhaustion_terminal() -> None:
+    """Retry exhaustion surfaces as the typed CasRetriesExhausted through the
+    adapter (a CoherenceError subclass) — never a silent dropped write."""
+    from ccs.core.exceptions import CasRetriesExhausted
+    from ccs.core.types import ConflictDetail
+
+    core = CoherenceAdapterCore(strategy_name="lazy", crash_recovery=CrashRecoveryConfig(enabled=False))
+    artifact = core.register_artifact(name="plan.md", content="v1")
+    _two_shared_agents(core, name_a="writer", name_b="peer", artifact_id=artifact.id)
+
+    def always_conflict(**kwargs):  # type: ignore[no-untyped-def]
+        return ConflictDetail(reason="version_mismatch", current_version=1)
+
+    core.coordinator.commit_cas = always_conflict  # type: ignore[assignment]
+
+    with pytest.raises(CasRetriesExhausted):
+        core.write_cas(
+            agent_name="writer",
+            artifact_id=artifact.id,
+            make_content=lambda entry: ("never-lands", None),
+            now_tick=2,
+        )
+    # No silent drop: version never advanced.
+    assert core.coordinator.registry.get_artifact(artifact.id).version == 1

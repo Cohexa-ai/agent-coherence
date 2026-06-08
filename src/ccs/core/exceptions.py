@@ -42,6 +42,32 @@ class InvariantViolationError(CoherenceError):
     """Raised when a runtime invariant check fails."""
 
 
+class CasRetriesExhausted(CoherenceError):
+    """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
+
+    The typed terminal failure for the OCC write path (plan Unit 5, R6 /
+    R-OCC-6). When ``AgentRuntime.write_cas`` has retried ``commit_cas`` the
+    strategy-allowed number of times and every attempt lost the race
+    (``ConflictDetail``), the loop surfaces THIS rather than silently dropping
+    the write. A ``CasRetriesExhausted`` therefore means *no mutation landed for
+    this caller* — the cache is left at the latest observed (refreshed) version,
+    never corrupted with an unconfirmed write.
+
+    A subclass of :class:`CoherenceError` so the deny-always-raises consumers
+    (CoherentVolume / CCSStore strict mode) already treat it as a hard failure.
+    """
+
+    def __init__(self, artifact_id: object, attempts: int, last_current_version: int) -> None:
+        super().__init__(
+            f"cas_retries_exhausted artifact={artifact_id} attempts={attempts} "
+            f"last_current_version={last_current_version} "
+            f"(no write landed — every commit_cas attempt lost the race)"
+        )
+        self.artifact_id = artifact_id
+        self.attempts = attempts
+        self.last_current_version = last_current_version
+
+
 class ScenarioValidationError(CoherenceError):
     """Raised when scenario configuration does not match schema expectations."""
 
