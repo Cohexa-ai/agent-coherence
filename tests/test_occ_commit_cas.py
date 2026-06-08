@@ -543,3 +543,74 @@ def test_cross_process_funnel_winner_body_is_n_plus_one(
     assert s == 200
     assert b == {"ok": True, "version": v + 1}
     assert _artifact_version(http_coordinator, "plan.md") == v + 1
+
+
+# ----------------------------------------------------------------------
+# Watchdog late-completion residual (deferred; documented behavior)
+# ----------------------------------------------------------------------
+
+
+def test_watchdog_late_completion_is_false_negative_ack_never_lost_update(
+    db_path: Path,
+) -> None:
+    """The watchdog late-completion residual, pinned (T4 — deferred to the
+    cross-host follow-on, but its *safety boundary* is asserted here).
+
+    When a client's ``commit_cas`` is watchdog-degraded it raises fail-closed,
+    yet the coordinator's commit can still land LATE (after the client gave up).
+    This test pins what that late landing can and cannot do:
+
+    - UNCONTENDED (no peer bumped the version in the window): the late completion
+      WINS — version N→N+1 carrying the late writer's ``content_hash``. The client
+      already raised, so it never learned the write landed: a **false-negative
+      acknowledgment**, NOT a lost update. On its next read the client sees its
+      own bytes at N+1 and reconverges idempotently.
+    - CONTENDED (a peer committed N→N+1 inside the window): the SAME late
+      completion — still carrying the stale ``expected_version=N`` — gets a typed
+      :class:`ConflictDetail` (``current_version=N+1``), NOT a clobber. The
+      version CAS makes a late landing safe against an *acknowledged* peer write.
+
+    ⇒ the residual is a false-negative ack, never silent data loss. The only
+    deferred concern is the registry↔disk divergence it can leave (version N+1
+    recorded while the raising client wrote no on-disk bytes) — a cross-host
+    follow-on item, not a single-host correctness hole.
+    """
+    # --- Uncontended: the late completion lands as a clean monotonic bump. ---
+    with SqliteArtifactRegistry(db_path) as reg:
+        art, (writer,) = _seed_shared_writers(reg, 1, version=1)
+        late_hash = hashlib.sha256(b"late-uncontended").hexdigest()
+        result = reg.commit_cas(
+            art.id, writer, expected_version=1, content_hash=late_hash, tick=9
+        )
+        assert isinstance(result, tuple), "uncontended late completion must WIN"
+        updated, _ = result
+        assert updated.version == 2, "a benign phantom bump is N+1 (monotonic)"
+        assert updated.content_hash == late_hash, "the late writer's bytes are recorded"
+
+    # --- Contended: a peer's acked write is NOT clobbered by a late straggler. ---
+    db2 = db_path.parent / "state-contended.db"
+    with SqliteArtifactRegistry(db2) as reg:
+        art, (peer, straggler) = _seed_shared_writers(reg, 2, version=1)
+        peer_hash = hashlib.sha256(b"peer-acked").hexdigest()
+        peer_result = reg.commit_cas(
+            art.id, peer, expected_version=1, content_hash=peer_hash, tick=9
+        )
+        assert isinstance(peer_result, tuple), "the peer commit must land first"
+
+        # The straggler's watchdog-degraded commit lands LATE, still carrying the
+        # now-stale expected_version=1 → the version CAS rejects it as a conflict.
+        straggler_hash = hashlib.sha256(b"straggler-late").hexdigest()
+        late = reg.commit_cas(
+            art.id, straggler, expected_version=1, content_hash=straggler_hash, tick=10
+        )
+        assert isinstance(late, ConflictDetail), (
+            "a late completion must NOT clobber an acknowledged peer write"
+        )
+        assert late.current_version == 2
+
+        # The acked peer's bytes survive intact — the straggler's conflict caused
+        # no mutation, so there is no silent loss.
+        survived = reg.get_artifact(art.id)
+        assert survived is not None
+        assert survived.version == 2
+        assert survived.content_hash == peer_hash, "the acked peer's write must survive"
