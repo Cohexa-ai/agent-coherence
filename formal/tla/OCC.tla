@@ -31,11 +31,12 @@
    repo's safety-only TLC convention (README: "Full liveness proofs" out of
    scope).
 
-   GrantUpdate is overridden (OCCGrantUpdate) to set a fresh grantedAtTick on
-   the S->M commit_cas transition; the base CrashRecovery.GrantUpdate routes
-   S->M through its OTHER branch and would leave the slot stale. This is a
-   MODEL-ONLY correction: the live code already sets a fresh tick on any S->M
-   (sqlite_registry.py, `new_in_me and not prev_in_me`). *)
+   A winning commit_cas leaves the committer in SHARED, not MODIFIED: an OCC
+   writer holds no grant (it never acquired EXCLUSIVE), so SHARED is the honest
+   end-state and lets the same agent immediately re-observe + re-commit. Because
+   no OCC transition ever enters M/E, the inherited CrashRecovery.GrantUpdate
+   suffices (peers leaving M/E on invalidation drop their tick; the committer's
+   S->S preserves) — no override is needed. *)
 
 EXTENDS CrashRecovery
 
@@ -51,20 +52,6 @@ OCCInit ==
     /\ CRInit
     /\ observedVersion = [ag \in Agents |-> [art \in Artifacts |-> None]]
     /\ lostUpdate = FALSE
-
---------------------------------------------------------------------
-(* grantedAtTick maintenance with the S->M fix (R-CR-1, model-only) *)
---------------------------------------------------------------------
-
-OCCGrantUpdate(ag, art, oldSt, newSt) ==
-    CASE oldSt \in MorE /\ newSt \in MorE         -> grantedAtTick[ag][art]
-      [] oldSt \in {"I", "S"} /\ newSt \in MorE   -> clock   (* S included: the fix *)
-      [] oldSt \in MorE /\ newSt \notin MorE       -> None
-      [] OTHER                                      -> grantedAtTick[ag][art]
-
-OCCUpdatedGrantedAtTick ==
-    [ag \in Agents |-> [art \in Artifacts |->
-        OCCGrantUpdate(ag, art, mesiState[art][ag], mesiState'[art][ag])]]
 
 --------------------------------------------------------------------
 (* ObserveAction: an S/I agent reads the current version into its slot.
@@ -94,12 +81,13 @@ CommitCASAction ==
                cur == version[art]
                otherHolder == \E peer \in Agents :
                                   peer /= ag /\ mesiState[art][peer] \in MorE
-           IN \/ (* WIN: version matches, sole writer -> commit, S->M, invalidate *)
+           IN \/ (* WIN: version matches, sole writer -> commit; the committer
+                    ends SHARED (OCC holds no grant), peers invalidated *)
                  /\ obs = cur
                  /\ ~otherHolder
                  /\ mesiState' = [mesiState EXCEPT
                       ![art] = [peer \in Agents |->
-                          IF peer = ag THEN "M"
+                          IF peer = ag THEN "S"
                           ELSE IF peer \in NonInvalidPeers(art, ag) THEN "I"
                           ELSE mesiState[art][peer]]]
                  /\ version' = [version EXCEPT ![art] = cur + 1]
@@ -117,7 +105,7 @@ CommitCASAction ==
                     never a silent drop". *)
                  /\ ~(obs = cur /\ ~otherHolder)
                  /\ UNCHANGED <<mesiState, version, observedVersion, lostUpdate>>
-        /\ grantedAtTick'   = OCCUpdatedGrantedAtTick
+        /\ grantedAtTick'   = UpdatedGrantedAtTick
         /\ lastReclamation' = UpdatedLastReclamation
         /\ UNCHANGED <<clock, lastHeartbeat>>
 
