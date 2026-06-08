@@ -65,11 +65,25 @@ from ccs.cli._coherence_client import (
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
-from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
+from ccs.core.exceptions import (
+    CasRetriesExhausted,
+    CoherenceDegradedWarning,
+    CoherenceError,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
+
+# Plan Unit 6 (R6): client-side bound on the OCC reacquire→re-commit loop in
+# :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
+# (the in-process library knob) — the HTTP path runs its own bounded loop via
+# ``reacquire()`` rather than the ``AgentRuntime``/``SyncStrategy`` loop (which
+# governs only the in-process library path). Total commit attempts is
+# ``MAX_CAS_REACQUIRES + 1`` (initial + retries); on exhaustion ``write_cas``
+# raises :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
+# never a silent drop).
+MAX_CAS_REACQUIRES = 8
 
 
 class CoherentVolume:
@@ -457,6 +471,140 @@ class CoherentVolume:
         # MANDATORY fresh read under the new identity -> SHARED@current.
         return self.read(path)
 
+    def write_cas(
+        self,
+        path: str | os.PathLike[str],
+        make_content: Callable[[bytes], bytes | bytearray],
+    ) -> None:
+        """Optimistically commit a write that BYPASSES the EXCLUSIVE acquire.
+
+        The OCC counterpart to :meth:`write` (plan Unit 6). Unlike ``write`` —
+        which takes EXCLUSIVE via ``pre-edit`` before committing — ``write_cas``
+        **never acquires EXCLUSIVE**: it reads (→ SHARED), derives the bytes via
+        ``make_content(current_bytes)``, and commits through the coordinator's
+        ``/hooks/post-edit-cas`` version-checked CAS. The winner is elected by
+        the coordinator's serialized commit, so two concurrent OCC writers
+        cannot both land the same version — the loser is told ``version_mismatch``
+        and retries. The pessimistic ``write()`` path is untouched.
+
+        Conflict recovery follows the :meth:`reacquire` contract: on a
+        ``version_mismatch`` / ``other_holder`` conflict the loop
+        ``reacquire()``s (re-mint identity + a MANDATORY fresh read), re-derives
+        the bytes from the fresh view via ``make_content``, and retries —
+        bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
+        :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
+        NEVER a silent drop).
+
+        ``make_content`` is invoked once per attempt with the freshly-read
+        current bytes and returns the bytes to commit — re-deriving the caller's
+        intent against the latest state is what makes the retry an *update*
+        rather than a stale overwrite. A caller that ignores its ``bytes``
+        argument and returns a buffer computed from older bytes defeats the
+        guard (the one fundamental OCC-proof boundary; same as :meth:`reacquire`).
+
+        **A deny ALWAYS raises, in both ``on_error`` modes** — including the
+        coordinator's fail-closed degrade body
+        (``{ok: false, degraded: true, reason: "commit_unconfirmed"}``): a
+        degraded CAS is unconfirmed, so it must read as failure (the client must
+        never assume the write landed). ``on_error`` governs only
+        coherence-infrastructure failures (unavailable coordinator, transport).
+        """
+        self._ensure_attached()
+        _abs_path, rel = self._to_relative(path)
+
+        if self._endpoint is None:
+            # Unattached / degraded coordinator (strict already raised at
+            # construction). Degrade mode: best-effort write, no enforcement —
+            # there is no version to CAS against, so derive from current bytes.
+            current = self._current_bytes_or_empty(_abs_path)
+            data = bytes(make_content(current))
+            self._atomic_write(_abs_path, data)
+            self._last_committed_hash[rel] = self._sha256_bytes(data)
+            return
+
+        last_current_version = -1
+        max_attempts = MAX_CAS_REACQUIRES + 1
+        for attempt in range(max_attempts):
+            # Fresh read each attempt. _read_with_version returns the bytes, the
+            # coordinator's authoritative version (the OCC comparand), and
+            # whether the read was a sticky strict-deny — i.e. this instance is
+            # INVALID and the pre-read did NOT re-grant SHARED (KTD-T). An
+            # INVALID writer cannot CAS (the coordinator's invalidation left a
+            # transient that commit_cas rejects as a precondition), so recovery
+            # is the reacquire() contract: re-mint identity (no INVALID /
+            # transient) + a MANDATORY fresh read → clean SHARED@current.
+            current_bytes, expected_version, stale_denied = self._read_with_version(rel)
+            if stale_denied:
+                # This instance is INVALID (sticky strict-deny) → it cannot CAS
+                # until it reacquires (re-mint identity clears INVALID + the
+                # invalidation transient). reacquire() returns the fresh bytes;
+                # _read_with_version then re-resolves the version under the fresh
+                # identity. A warn-mode stale read here is fine — the fresh
+                # identity has no transient, so it can CAS.
+                if attempt >= max_attempts - 1:
+                    last_current_version = max(last_current_version, expected_version)
+                    break
+                current_bytes = self.reacquire(rel)
+                _aid, expected_version, refused_again = self._read_with_version(rel)
+                if refused_again:
+                    # A fresh-minted identity is brand new (no prior INVALID), so
+                    # a strict-deny here is impossible in normal operation — it
+                    # means the coordinator is wedged. Fail closed, do not spin.
+                    raise CoherenceError(
+                        f"OCC reacquire did not clear INVALID for {rel}; "
+                        "coordinator may be wedged"
+                    )
+
+            data = bytes(make_content(current_bytes))
+            new_hash = self._sha256_bytes(data)
+
+            # CAS FIRST, write to disk only on WIN. An OCC writer is S/I — it
+            # holds no EXCLUSIVE grant, so unconfirmed bytes must NEVER touch
+            # disk (a denied/degraded CAS landing on disk would be the very
+            # lost-update this guards). Contrast the pessimistic write(), which
+            # writes between pre-edit (EXCLUSIVE held) and post-edit.
+            resp = self._post(
+                "/hooks/post-edit-cas",
+                {
+                    "session_id": self._session_id,
+                    "path": rel,
+                    "success": True,
+                    "content_hash": new_hash,
+                    "expected_version": expected_version,
+                },
+            )
+            if resp is None:
+                # Degrade mode swallowed a transport/infra failure in _post and
+                # returned None; best-effort write so the bytes are not lost.
+                self._atomic_write(_abs_path, data)
+                self._last_committed_hash[rel] = new_hash
+                return
+
+            outcome = self._classify_cas_response(resp)
+            if outcome == "win":
+                self._atomic_write(_abs_path, data)  # confirmed → persist
+                self._last_committed_hash[rel] = new_hash
+                return
+            if outcome == "conflict":
+                last_current_version = self._cas_current_version(resp, last_current_version)
+                # Recover via the reacquire() contract before the next attempt so
+                # expected_version + make_content() see the winner's state.
+                if attempt < max_attempts - 1:
+                    self.reacquire(rel)
+                continue
+            # outcome == "raise": a deny, corruption, or the fail-closed
+            # commit_unconfirmed degrade body — ALWAYS raises in both modes.
+            # Nothing was written to disk (the CAS did not win).
+            raise CoherenceError(self._deny_reason(resp))
+
+        # Every allowed attempt lost the race — typed terminal, never a silent
+        # drop. (last_current_version is the latest version the loser observed.)
+        raise CasRetriesExhausted(
+            artifact_id=rel,
+            attempts=max_attempts,
+            last_current_version=last_current_version,
+        )
+
     # --- coordinator I/O helpers --------------------------------------------
 
     def _to_relative(self, path: str | os.PathLike[str]) -> tuple[Path, str]:
@@ -532,6 +680,120 @@ class CoherentVolume:
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
             return None  # reached only in degrade mode
+
+    def _read_with_version(self, rel: str) -> tuple[bytes, int, bool]:
+        """OCC helper: register a SHARED view and return
+        ``(bytes, version, stale_denied)``.
+
+        Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
+        handling) but also surfaces the coordinator's authoritative ``version``
+        — the comparand ``write_cas`` passes as ``expected_version`` — and
+        whether this instance is INVALID (a sticky strict-deny: the pre-read
+        returned a ``stale`` response and did NOT re-grant SHARED, KTD-T).
+        ``read`` itself stays ``bytes``-returning (a public contract); this is
+        the internal version-aware variant ``write_cas`` drives.
+
+        A fresh pre-read carries ``{"status": "fresh", "version": N}``; a
+        warn-mode stale read and a strict-deny both carry ``status == "stale"``
+        with the version under ``summary.current_version``. ``stale_denied`` is
+        True on the strict-deny case — an INVALID writer cannot CAS until it
+        :meth:`reacquire`s. If the version cannot be resolved (older coordinator
+        / degraded status surface) ``0`` is used — a CAS against
+        ``expected_version=0`` on a non-empty artifact loses cleanly
+        (``version_mismatch``), so the fallback never causes a silent overwrite.
+        """
+        abs_path, _rel = self._to_relative(rel)
+        if not abs_path.is_file():
+            raise FileNotFoundError(f"no such file in workspace: {_rel}")
+        data = self._read_file_bytes(abs_path)
+        version = 0
+        stale_denied = False
+        if self._endpoint is not None:
+            resp = self._post(
+                "/hooks/pre-read",
+                {
+                    "session_id": self._session_id,
+                    "path": _rel,
+                    "content_hash": self._sha256_bytes(data),
+                },
+            )
+            if isinstance(resp, dict):
+                if resp.get("degraded"):
+                    self._fail_closed_or_degrade(
+                        f"coordinator watchdog timeout during read of {_rel}"
+                    )
+                version = self._pre_read_version(resp)
+                # A strict-deny (INVALID, NOT re-granted — KTD-T) is the only
+                # pre-read outcome that leaves this instance unable to CAS: it
+                # stays INVALID AND keeps the invalidation transient the peer
+                # commit set, which commit_cas rejects as a precondition. A
+                # warn-mode stale read (permissionDecision == "allow") re-grants
+                # SHARED, so it is NOT treated as denied here. The distinguisher
+                # is permissionDecision == "deny" (set only by emit_strict_deny).
+                hook_output = resp.get("hookSpecificOutput")
+                if isinstance(hook_output, dict):
+                    stale_denied = hook_output.get("permissionDecision") == "deny"
+        return data, version, stale_denied
+
+    @staticmethod
+    def _pre_read_version(resp: dict) -> int:
+        """Extract the coordinator version from a pre-read response (fresh or
+        stale shape). Returns 0 when absent (older coordinator / degraded)."""
+        v = resp.get("version")
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        summary = resp.get("summary")
+        if isinstance(summary, dict):
+            cv = summary.get("current_version")
+            if isinstance(cv, int) and not isinstance(cv, bool):
+                return cv
+        return 0
+
+    def _current_bytes_or_empty(self, abs_path: Path) -> bytes:
+        """Degrade-path read of the on-disk bytes (b\"\" if the file is absent),
+        so ``make_content`` always gets a defined current view."""
+        if not abs_path.is_file():
+            return b""
+        return self._read_file_bytes(abs_path)
+
+    # Retry-eligible OCC conflict reasons (typed ConflictDetail.reason values).
+    _CAS_RETRY_REASONS: frozenset[str] = frozenset({"version_mismatch", "other_holder"})
+
+    def _classify_cas_response(self, resp: dict) -> Literal["win", "conflict", "raise"]:
+        """Map a ``/hooks/post-edit-cas`` 200 body to an OCC outcome.
+
+        - ``ok: true``  → ``"win"`` (the CAS committed; version bumped).
+        - ``ok: false`` with a retry-eligible reason → ``"conflict"`` (reacquire
+          + retry). Two cases: the typed ``ConflictDetail`` reasons
+          (``version_mismatch`` / ``other_holder``), AND
+          ``caller_in_transient_state`` — when a peer invalidates this instance
+          in the window BETWEEN its fresh read and its CAS, the coordinator
+          leaves an invalidation transient that ``commit_cas`` rejects as a
+          precondition; that is a lost race, not corruption, so reacquire +
+          retry (a fresh identity has no transient).
+        - ``ok: false`` otherwise — true corruption (``commit_cas_corruption``,
+          ``expected > current``) OR the fail-closed ``{degraded: true,
+          reason: "commit_unconfirmed"}`` body → ``"raise"``. The degrade body
+          deliberately reads as failure so the client never mistakes an
+          unconfirmed CAS for a landed write.
+        """
+        if resp.get("ok") is True:
+            return "win"
+        reason = resp.get("reason")
+        if reason in self._CAS_RETRY_REASONS:
+            return "conflict"
+        # A precondition rejection from a peer invalidating us mid-window is a
+        # lost race (retry-eligible via reacquire), NOT terminal corruption.
+        if isinstance(reason, str) and "caller_in_transient_state" in reason:
+            return "conflict"
+        return "raise"
+
+    @staticmethod
+    def _cas_current_version(resp: dict, fallback: int) -> int:
+        cv = resp.get("current_version")
+        if isinstance(cv, int) and not isinstance(cv, bool):
+            return cv
+        return fallback
 
     def _check_grant(self, resp: dict, rel: str, *, phase: str) -> None:
         """Map a coordinator pre-/post-edit response to the fail-closed contract.

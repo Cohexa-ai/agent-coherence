@@ -245,7 +245,8 @@ def test_pre_read_strict_tracked_fresh_allows(strict_client: _Client) -> None:
     )
     assert status == 200
     # First observation seeds SHARED → fresh response, no hookSpecificOutput.
-    assert body == {"status": "fresh"}
+    # Unit 6: the fresh response additively carries the seeded version.
+    assert body == {"status": "fresh", "version": 1}
 
 
 def test_pre_read_tracked_not_strict_stale_returns_warn(strict_client: _Client) -> None:

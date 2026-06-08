@@ -30,7 +30,11 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
-from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError
+from ccs.core.exceptions import (
+    CasRetriesExhausted,
+    CoherenceDegradedWarning,
+    CoherenceError,
+)
 
 
 @pytest.fixture
@@ -403,6 +407,193 @@ def test_deny_raises_even_in_degrade_mode(
             vol_b.write("data/shared.txt", b"stale")  # deny still raises in degrade mode
         assert not vol_b.is_degraded  # the deny did not register as infra degradation
         assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Unit 6 — CoherentVolume.write_cas (OCC write path, bypasses the acquire).
+#
+# write_cas reads (→ SHARED) → derives bytes via make_content(current) →
+# commits through /hooks/post-edit-cas. On a version conflict it reacquire()s
+# (re-mint + fresh read) and retries, bounded by MAX_CAS_REACQUIRES; on
+# exhaustion it raises CasRetriesExhausted. Deny — including the fail-closed
+# {ok:false, degraded:true, commit_unconfirmed} body — ALWAYS raises.
+# ---------------------------------------------------------------------------
+
+
+def test_write_cas_first_writer_commits(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A single OCC writer reads then write_cas-commits cleanly (version bumps
+    on the coordinator; bytes land on disk)."""
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write_cas("data/shared.txt", lambda cur: cur + b"\nappended")
+        assert target.read_bytes() == b"v1\nappended"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_conflict_reacquires_and_converges(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """THE OCC RECOVERY: A reads v1, B reads v1, A commits v2 (B → INVALID).
+    A's turn then ends (session-stop releases A's grant — the realistic
+    "the other agent finished" case). B.write_cas finds itself INVALID,
+    reacquire()s (re-mint + fresh read of A's v2 bytes), re-derives via
+    make_content against the fresh view, and commits → converges. No lost
+    update: B's commit is an UPDATE rebased on A's v2, not a stale clobber.
+
+    (A's grant must clear before B's OCC commit can land: an OCC writer is S/I
+    and never invalidates a peer's MODIFIED grant, so a lingering pessimistic
+    holder yields ``other_holder`` until the grant is released or times out —
+    the OCC-vs-pessimistic coexistence bound. Here A releases via session-stop.)
+    """
+    from ccs.cli._coherence_client import post as _cpost
+
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        vol_b.read("data/shared.txt")  # B is SHARED@v1
+
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B → INVALID, version → 2
+        assert target.read_bytes() == b"v2-from-A"
+        # A's turn ends — release its grant so the OCC writer is not blocked by
+        # other_holder against A's lingering MODIFIED.
+        _cpost(vol_a._endpoint, "/hooks/session-stop", {"session_id": vol_a.session_id})
+
+        seen: list[bytes] = []
+
+        def make(current: bytes) -> bytes:
+            # Records the bytes each attempt derives from — proves the retry
+            # re-reads A's v2 (not B's stale v1 buffer).
+            seen.append(current)
+            return current + b"\nrebased-by-B"
+
+        vol_b.write_cas("data/shared.txt", make)
+        # Converged on top of A's bytes — the lost update did NOT happen.
+        assert target.read_bytes() == b"v2-from-A\nrebased-by-B"
+        # The winning attempt derived from A's v2 bytes (re-read via reacquire),
+        # never from the original stale v1.
+        assert b"v2-from-A" in seen[-1]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_exhaustion_raises_typed_terminal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Bounded progress (R6): if every attempt loses the race, write_cas raises
+    CasRetriesExhausted (a typed terminal) rather than silently dropping the
+    write. Simulated by a peer that commits a fresh version on EVERY attempt, so
+    B's expected_version is always stale by commit time."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    # Shrink the bound so the test is fast + deterministic.
+    original_max = cv_mod.MAX_CAS_REACQUIRES
+    cv_mod.MAX_CAS_REACQUIRES = 2
+    try:
+        vol_a.read("data/shared.txt")
+        counter = {"n": 1}
+
+        def make(current: bytes) -> bytes:
+            # On every B attempt, A commits a NEW version first → B's read is
+            # immediately stale → guaranteed version_mismatch each attempt.
+            counter["n"] += 1
+            vol_a.reacquire("data/shared.txt")
+            vol_a.write("data/shared.txt", f"vA-{counter['n']}".encode())
+            return current + b"\nB-attempt"
+
+        with pytest.raises(CasRetriesExhausted) as exc:
+            vol_b.write_cas("data/shared.txt", make)
+        # The terminal records the artifact + that no write landed for B.
+        assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        # B's stale buffer never clobbered A's latest.
+        assert b"B-attempt" not in target.read_bytes()
+    finally:
+        cv_mod.MAX_CAS_REACQUIRES = original_max
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_deny_raises_in_both_on_error_modes(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A non-retry-eligible deny (e.g. corruption: expected_version > current)
+    ALWAYS raises CoherenceError — in BOTH strict and degrade on_error modes —
+    and never silently succeeds. write_cas sources expected_version from its own
+    read, so we force corruption by stubbing _read_with_version to over-report
+    the version (expected > current → the coordinator returns an error body)."""
+    for mode in ("strict", "degrade"):
+        target = _seed(tmp_path, content=b"v1")
+        vol = CoherentVolume(
+            tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg
+        )
+        try:
+            # Seed the artifact on the coordinator (v1 + SHARED) via a real read
+            # so the CAS has a real version to compare against.
+            assert vol.read("data/shared.txt") == b"v1"
+            # Force expected_version far above current → corruption body
+            # ({ok:false, reason:commit_cas_corruption...}) which must raise.
+            # (bytes, version, stale_denied) — not stale, so no reacquire.
+            vol._read_with_version = lambda rel: (b"v1", 999, False)  # type: ignore[assignment]
+            with pytest.raises(CoherenceError):
+                vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
+            assert not vol.is_degraded, (
+                "a deny is enforcement working, not infra degradation"
+            )
+            # The unconfirmed write never landed.
+            assert target.read_bytes() == b"v1"
+        finally:
+            stop_coordinator(tmp_path)
+
+
+def test_write_cas_degrade_body_raises_in_both_modes(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The fail-closed degrade body ({ok:false, degraded:true,
+    reason:'commit_unconfirmed'}) must raise in BOTH on_error modes — a degraded
+    CAS is unconfirmed, so the client must never assume the write landed.
+    Simulated by stubbing the coordinator POST to return that body."""
+    for mode in ("strict", "degrade"):
+        target = _seed(tmp_path, content=b"v1")
+        vol = CoherentVolume(
+            tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg
+        )
+        try:
+            real_post = vol._post
+
+            def fake_post(endpoint_path: str, payload: dict, _real=real_post):
+                if endpoint_path == "/hooks/post-edit-cas":
+                    return {"ok": False, "degraded": True, "reason": "commit_unconfirmed"}
+                return _real(endpoint_path, payload)
+
+            vol._post = fake_post  # type: ignore[assignment]
+            with pytest.raises(CoherenceError):
+                vol.write_cas("data/shared.txt", lambda cur: b"unconfirmed")
+            # commit_unconfirmed is a hard failure, not infra degradation, so the
+            # deny path does NOT bump the degradation counter.
+            assert not vol.is_degraded
+            assert target.read_bytes() == b"v1"
+        finally:
+            stop_coordinator(tmp_path)
+
+
+def test_write_cas_make_content_sees_current_bytes(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """make_content is invoked with the freshly-read current bytes so the
+    caller re-derives intent against the latest state (the OCC update contract,
+    same boundary as reacquire())."""
+    _seed(tmp_path, content=b"hello")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        captured: list[bytes] = []
+        vol.write_cas("data/shared.txt", lambda cur: captured.append(cur) or (cur + b"!"))
+        assert captured == [b"hello"]
+        assert (tmp_path / "data/shared.txt").read_bytes() == b"hello!"
     finally:
         stop_coordinator(tmp_path)
 

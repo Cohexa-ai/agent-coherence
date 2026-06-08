@@ -10,6 +10,8 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /hooks/pre-read``      — stale-read check; KTD-9 first-observation
 - ``POST /hooks/pre-edit``      — acquire EXCLUSIVE; KTD-1 single-writer
 - ``POST /hooks/post-edit``     — commit on success, release on failure
+- ``POST /hooks/post-edit-cas`` — OCC commit (Unit 6); version-checked CAS,
+  NO pre-edit acquire (the OCC writer stays S/I); fail-closed degrade
 - ``POST /hooks/session-stop``  — KTD-11 release on end-of-turn
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
@@ -60,6 +62,7 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import CoherenceError
 from ccs.core.states import MESIState
+from ccs.core.types import ConflictDetail
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +399,7 @@ class CoordinatorHTTPServer:
             "pre_read_total": 0,
             "pre_edit_total": 0,
             "post_edit_total": 0,
+            "post_edit_cas_total": 0,
             "session_stop_total": 0,
             "pre_bash_total": 0,
             "pre_grep_total": 0,
@@ -1252,7 +1256,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger="first_read", tick=now, content_hash=seed_hash,
             )
-            return {"status": "fresh"}
+            # Unit 6: surface the version so an OCC writer can source
+            # ``expected_version`` for a later ``post-edit-cas`` (additive —
+            # status-based clients ignore it). First observation seeds v1.
+            seeded = coordinator.registry.get_artifact(artifact_id)
+            return {"status": "fresh", "version": seeded.version if seeded else 1}
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the
@@ -1265,8 +1273,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
         if agent_state is not None and agent_state != MESIState.INVALID:
-            # Reader has a valid grant on the current version.
-            return {"status": "fresh"}
+            # Reader has a valid grant on the current version. Unit 6:
+            # include the version so an OCC writer can source
+            # ``expected_version`` (additive — status clients ignore it).
+            return {"status": "fresh", "version": artifact.version}
 
         # Stale: either first time this session sees the artifact OR they
         # were invalidated by a peer commit.
@@ -1688,6 +1698,129 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+
+
+def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /hooks/post-edit-cas — OCC commit (plan Unit 6, R1–R3 + fail-closed).
+
+    The optimistic-concurrency counterpart to ``/hooks/post-edit``. The hook
+    flow is ``pre-read`` (→ SHARED, returns the artifact ``version``) →
+    [agent edits] → ``post-edit-cas`` carrying that ``expected_version`` —
+    it **never takes the** ``/hooks/pre-edit`` **EXCLUSIVE acquire** (the OCC
+    writer stays S/I; the winner is elected by ``service.commit_cas``'s
+    serialized version check, not a lock on the acquire). The pessimistic
+    ``pre-edit`` → ``post-edit`` flow is untouched for strict-deny callers.
+
+    Three outcomes map to STABLE, byte-consistent bodies (plan R2):
+
+    - WIN → ``{ok: true, version: N+1}``.
+    - :class:`~ccs.core.types.ConflictDetail` → ``{ok: false,
+      reason: "version_mismatch"|"other_holder", current_version: N}`` — a
+      clean typed conflict, NOT a degrade. The client re-reads + retries.
+    - corruption / precondition failure (``CoherenceError`` from
+      ``commit_cas``: ``expected > current``, artifact missing, caller
+      mid-transient, or caller in M/E) → ``{ok: false, reason: <verbatim>}``
+      the client raises on.
+
+    Fail-closed degrade: on a watchdog timeout this endpoint returns the
+    DISTINCT :data:`_OCC_DEGRADED_RESPONSE` (``{ok: false, degraded: true,
+    reason: "commit_unconfirmed"}``), NOT the ``{ok: true, …}``
+    :data:`_OK_DEGRADED_RESPONSE` the pessimistic post-edit uses — a
+    timed-out CAS returning ``ok: true`` would let the client assume its
+    write landed (the load-bearing fix; see :data:`_OCC_DEGRADED_RESPONSE`).
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    path = body.get("path", "")
+    content_hash = body.get("content_hash")  # always required on the OCC commit
+    expected_version = body.get("expected_version")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
+        return
+    # The OCC commit always carries the bytes it just wrote — there is no
+    # "release on failure" sub-mode here (that lives on the pessimistic
+    # post-edit), so content_hash is unconditionally required.
+    hash_err = validate_content_hash(content_hash, required=True)
+    if hash_err:
+        req._json(400, {"error": hash_err})
+        return
+    # expected_version is the OCC discriminator — a non-negative int the
+    # client read from pre-read. Reject anything else at the boundary so a
+    # malformed client cannot drive the CAS with a garbage comparand.
+    if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+        req._json(400, {"error": "expected_version must be a non-negative integer"})
+        return
+    if not coordinator.policy.is_tracked(path):
+        req._json(200, {"ok": True})
+        return
+
+    agent_id = coordinator.register_session(session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            # No prior pre-read seeded the artifact; nothing to CAS against.
+            # Mirror post-edit's untracked-at-commit fast path.
+            return {"ok": True, "note": "untracked-at-commit"}
+
+        # OCC commit — version-checked CAS. Does NOT take EXCLUSIVE: the
+        # caller is S (from pre-read) or I (preempted); commit_cas rejects an
+        # M/E caller (D4) by raising CoherenceError.
+        try:
+            result = coordinator.service.commit_cas(
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                expected_version=expected_version,
+                content_hash=content_hash,
+                issued_at_tick=now,
+            )
+        except CoherenceError as exc:
+            # Corruption (expected > current) or a precondition failure
+            # (caller mid-transient / in M/E) — non-retryable; the client
+            # raises on the {ok: false, reason} body.
+            return {"ok": False, "reason": str(exc)}
+
+        if isinstance(result, ConflictDetail):
+            # Retry-eligible typed conflict: NO mutation happened. Byte-stable
+            # body the client maps to reacquire() + retry.
+            return {
+                "ok": False,
+                "reason": result.reason,
+                "current_version": result.current_version,
+            }
+
+        updated, _signals = result
+        # WIN: commit_cas already did the peer-invalidation + S/I→MODIFIED
+        # transition atomically. A successful OCC commit acquired no separate
+        # EXCLUSIVE grant, but it IS a write that bumped the version, so it
+        # exercises fine-grained write protection — mirror post-edit's signal.
+        coordinator.increment_intra_task_acquire_release()
+        return {"ok": True, "version": updated.version}
+
+    # Fail-closed: the OCC commit degrades to a body that reads as FAILURE.
+    # A timed-out commit_cas whose future the watchdog does NOT cancel may
+    # still run to completion later (a pre-existing hazard — detection-only
+    # via watchdog_late_completion_total). For OCC the residual is bounded
+    # and honest: in the contended case the late CAS sees the advanced
+    # version → version_mismatch, no mutation; in the uncontended case it
+    # lands N+1 AFTER the client gave up — a phantom/duplicate version bump
+    # from the SAME edit, NOT a lost write (NoLostUpdate still holds). Full
+    # prevention (a per-attempt fencing/idempotency token) needs surface
+    # beyond v1 (no new reservation / no migration) and is DEFERRED to the
+    # cross-host follow-on. v1's only obligation: the client must never
+    # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
+    # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
+    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE)
 
 
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2507,6 +2640,9 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-read"): _handle_pre_read,
     ("POST", "/hooks/pre-edit"): _handle_pre_edit,
     ("POST", "/hooks/post-edit"): _handle_post_edit,
+    # Unit 6: OCC commit. Version-checked CAS that bypasses the pre-edit
+    # EXCLUSIVE acquire (the OCC writer stays S/I).
+    ("POST", "/hooks/post-edit-cas"): _handle_post_edit_cas,
     ("POST", "/hooks/session-stop"): _handle_session_stop,
     # v0.1.1 KTD-N — H4 mitigation: catch model routing-around-via-Bash/Grep
     # to bypass the Read-only stale-read warning. Per the v0.2 Phase 0
@@ -2530,6 +2666,12 @@ _ROUTES: dict[tuple[str, str], Callable] = {
 # writes, so they stay out of this set.
 _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/hooks/pre-edit"),
+    # Unit 6: the OCC commit is a self-contained NEW write initiation — it
+    # has no prior pre-edit chain to complete (it bypasses the acquire), so
+    # it belongs here with pre-edit. Letting it through mid-migration would
+    # bump a version the imminent shutdown then strands; the client retries
+    # after the coordinator restarts.
+    ("POST", "/hooks/post-edit-cas"),
 }
 
 
@@ -2541,6 +2683,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/hooks/pre-read"): "pre_read_total",
     ("POST", "/hooks/pre-edit"): "pre_edit_total",
     ("POST", "/hooks/post-edit"): "post_edit_total",
+    ("POST", "/hooks/post-edit-cas"): "post_edit_cas_total",
     ("POST", "/hooks/session-stop"): "session_stop_total",
     ("POST", "/hooks/pre-bash"): "pre_bash_total",
     ("POST", "/hooks/pre-grep"): "pre_grep_total",
@@ -2568,6 +2711,22 @@ whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop) pass
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
 """AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
 post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+
+_OCC_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "commit_unconfirmed",
+}
+"""Plan Unit 6 (the load-bearing fix): degrade envelope for the OCC commit
+endpoint (``/hooks/post-edit-cas``). Unlike the pessimistic endpoints — which
+degrade to ``_OK_DEGRADED_RESPONSE`` (``{ok: true, …}``) so a generic client
+reading ``result.get("ok")`` proceeds — a degraded/timed-out ``commit_cas``
+MUST read as **failure**: returning ``ok: true`` would let the client assume
+its write landed when the CAS never confirmed (and may still be running in the
+watchdog pool — the late-completion residual). ``ok: false`` forces the
+fail-closed client to raise. The residual is a phantom version bump, NOT a
+lost update — full fencing is deferred to the cross-host follow-on (see
+``_handle_post_edit_cas``)."""
 
 
 def _run_or_degrade(
