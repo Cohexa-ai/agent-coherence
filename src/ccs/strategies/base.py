@@ -22,6 +22,32 @@ class SyncStrategy(ABC):
         """Whether peers should receive invalidation when writer commits."""
         return True
 
+    def max_cas_retries(self) -> int:
+        """Max retry attempts the OCC caller may make after a commit-CAS conflict.
+
+        Policy knob only: the retry *loop* (re-read -> recompute -> commit_cas)
+        lives in the caller/``AgentRuntime`` (the actor), never in the strategy
+        (D1 "retry is policy, strategy-layer"; strategies are policy, not actors).
+        Total commit_cas attempts is ``max_cas_retries() + 1`` (initial + retries).
+        Conservative default; a strategy MAY override (e.g. to tune retries vs a
+        lease TTL). There is deliberately NO auto-escalation to EXCLUSIVE (D5).
+        """
+        return 3
+
+    def cas_backoff_ticks(self, attempt: int) -> int:
+        """Deterministic, non-negative backoff (in ticks) before retry ``attempt``.
+
+        ``attempt`` is 0-based (0 == the first retry after the initial attempt).
+        Default is a capped exponential schedule (0, 1, 2, 4, 8, ... up to 16):
+        the first retry is immediate so a single transient conflict re-reads with
+        no delay, then growth bounds livelock under sustained contention. Pure
+        function of ``attempt`` (no wall clock, no RNG) so behavior is testable
+        and reproducible. Negative ``attempt`` clamps to no delay.
+        """
+        if attempt <= 0:
+            return 0
+        return min(1 << (attempt - 1), 16)
+
     def broadcasts_content_on_commit(self) -> bool:
         """Whether the strategy pushes full content on commit."""
         return False

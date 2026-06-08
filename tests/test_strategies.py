@@ -13,6 +13,7 @@ from ccs.core.states import MESIState
 from ccs.simulation.engine import SimulationEngine
 from ccs.simulation.scenarios import load_scenario
 from ccs.strategies.access_count import AccessCountStrategy
+from ccs.strategies.base import SyncStrategy
 from ccs.strategies.blind_cache import BlindCacheStrategy
 from ccs.strategies.broadcast import BroadcastStrategy
 from ccs.strategies.eager import EagerStrategy
@@ -172,3 +173,94 @@ def test_broadcast_baseline_token_cost() -> None:
     expected = n * s * total_artifact_tokens
     ratio_delta = abs(metrics.tokens_broadcast - expected) / float(expected)
     assert ratio_delta < 0.05
+
+
+# --- OCC retry policy seam (Unit 4) -----------------------------------------
+#
+# These cover ONLY the policy surface on ``SyncStrategy``: the retry knobs are
+# concrete-with-default (not abstract, which would break all six concretes), and
+# nothing here adds an actor hook or an auto-escalation path. The "loop obeys the
+# knob" integration test belongs to Unit 5 (AgentRuntime), where the loop exists.
+
+# All concrete strategies a caller can construct, including the benchmark-only
+# blind cost-floor (reachable via ``build_strategy("blind")``).
+_ALL_CONCRETE_STRATEGIES = (
+    LazyStrategy(),
+    LeaseStrategy(),
+    EagerStrategy(),
+    AccessCountStrategy(),
+    BroadcastStrategy(),
+    BlindCacheStrategy(),
+)
+
+# Every name ``build_strategy`` accepts (mirrors the selector's branches).
+_REGISTERED_STRATEGY_NAMES = (
+    "blind",
+    "broadcast",
+    "eager",
+    "lazy",
+    "lease",
+    "access_count",
+    "access-count",
+    "accesscount",
+)
+
+
+def test_default_strategy_returns_sane_cas_retry_policy() -> None:
+    # Use the production default strategy as the representative for the base
+    # concrete-with-default policy.
+    strategy = LazyStrategy()
+
+    assert strategy.max_cas_retries() > 0
+    # Backoff is non-negative and deterministic for the full attempt window.
+    for attempt in range(strategy.max_cas_retries() + 1):
+        assert strategy.cas_backoff_ticks(attempt) >= 0
+        assert strategy.cas_backoff_ticks(attempt) == strategy.cas_backoff_ticks(attempt)
+
+
+def test_cas_backoff_first_retry_is_immediate_and_monotonic_nondecreasing() -> None:
+    strategy = LazyStrategy()
+
+    # First retry (attempt 0) is immediate so a lone transient conflict re-reads
+    # with no delay; a negative attempt clamps to no delay rather than erroring.
+    assert strategy.cas_backoff_ticks(0) == 0
+    assert strategy.cas_backoff_ticks(-1) == 0
+
+    # Schedule never decreases across the retry window (bounds livelock).
+    backoffs = [strategy.cas_backoff_ticks(attempt) for attempt in range(8)]
+    assert backoffs == sorted(backoffs)
+
+
+def test_no_auto_escalation_surface_on_any_strategy() -> None:
+    # D5: a CAS conflict must NEVER auto-escalate to EXCLUSIVE. Assert no method
+    # or attribute hinting at escalation exists on the ABC or any concrete.
+    forbidden_substrings = ("escalat", "exclusive", "auto_acquire", "force_acquire")
+    candidates = (SyncStrategy, *(type(s) for s in _ALL_CONCRETE_STRATEGIES))
+    for strategy_type in candidates:
+        for member in dir(strategy_type):
+            lowered = member.lower()
+            assert not any(token in lowered for token in forbidden_substrings), (
+                f"{strategy_type.__name__} exposes possible auto-escalation member '{member}'"
+            )
+
+
+def test_all_concrete_strategies_construct_and_inherit_default_cas_policy() -> None:
+    # No abstractmethod break: every concrete still instantiates, and each
+    # inherits the base concrete-with-default retry policy.
+    assert len(_ALL_CONCRETE_STRATEGIES) == 6
+    for strategy in _ALL_CONCRETE_STRATEGIES:
+        assert isinstance(strategy, SyncStrategy)
+        # Inherited (not overridden) -> identical to the base default.
+        assert strategy.max_cas_retries() == SyncStrategy.max_cas_retries(strategy)
+        assert strategy.max_cas_retries() > 0
+        assert strategy.cas_backoff_ticks(0) == 0
+        assert strategy.cas_backoff_ticks(1) >= 0
+
+
+@pytest.mark.parametrize("name", _REGISTERED_STRATEGY_NAMES)
+def test_build_strategy_still_builds_each_registered_name_with_cas_policy(name: str) -> None:
+    strategy = build_strategy(name)
+    assert isinstance(strategy, SyncStrategy)
+    # The new policy surface is reachable on every selector-built strategy.
+    assert strategy.max_cas_retries() > 0
+    assert strategy.cas_backoff_ticks(0) >= 0
