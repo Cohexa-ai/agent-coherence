@@ -878,8 +878,9 @@ def test_commit_cas_happy_path_commits_and_invalidates_peers() -> None:
 
     # Version advanced N -> N+1.
     assert updated.version == artifact.version + 1
-    # Committer is now MODIFIED; the SHARED peer was invalidated.
-    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.MODIFIED
+    # Committer ends SHARED (an OCC writer holds no grant); the SHARED peer was
+    # invalidated.
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
     assert svc.registry.get_agent_state(artifact.id, peer) == MESIState.INVALID
     # Signal shape mirrors commit(): one signal per invalidated peer, carrying
     # the new version, issued tick, and the committer as issuer.
@@ -888,6 +889,41 @@ def test_commit_cas_happy_path_commits_and_invalidates_peers() -> None:
     assert signals[0].new_version == updated.version
     assert signals[0].issued_at_tick == 7
     assert signals[0].issuer_agent_id == writer
+
+
+def test_commit_cas_is_repeatable_for_same_agent_no_d4_rejection() -> None:
+    """FIX 3: a winning commit_cas ends the committer SHARED (not MODIFIED), so
+    the SAME agent can commit_cas AGAIN on the same artifact without tripping the
+    D4 precondition (which rejects M/E callers). Two back-to-back wins by one
+    agent: version 1→2→3, no CoherenceError. Before the fix the sticky MODIFIED
+    grant made the second call hard-fail with 'use commit()'.
+    """
+    svc = _service()
+    artifact, writer, _peer = _two_shared_holders(svc)
+    assert artifact.version == 1
+
+    # First OCC win → version 2, committer ends SHARED (the fix).
+    first, _ = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=1,
+        content_hash=compute_content_hash("v2"),
+        issued_at_tick=5,
+    )
+    assert first.version == 2
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
+
+    # Second OCC win by the SAME agent at the new version — must NOT be rejected
+    # by D4 (SHARED is OCC-eligible) and must win again.
+    second, _ = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=2,
+        content_hash=compute_content_hash("v3"),
+        issued_at_tick=6,
+    )
+    assert second.version == 3
+    assert svc.registry.get_agent_state(artifact.id, writer) == MESIState.SHARED
 
 
 def test_commit_cas_version_mismatch_returns_conflict_no_mutation() -> None:
@@ -913,9 +949,10 @@ def test_commit_cas_version_mismatch_returns_conflict_no_mutation() -> None:
     assert isinstance(result, ConflictDetail)
     assert result.reason == "version_mismatch"
     assert result.current_version == 2
-    # No mutation: version unchanged, winner still MODIFIED, loser still INVALID.
+    # No mutation: version unchanged, winner still SHARED (OCC writer holds no
+    # grant), loser still INVALID.
     assert svc.registry.get_artifact(artifact.id).version == 2
-    assert svc.registry.get_agent_state(artifact.id, first) == MESIState.MODIFIED
+    assert svc.registry.get_agent_state(artifact.id, first) == MESIState.SHARED
     assert svc.registry.get_agent_state(artifact.id, second) == MESIState.INVALID
 
 
@@ -1057,7 +1094,8 @@ def test_commit_cas_win_actually_invalidates_peers_in_registry() -> None:
     state_map = svc.registry.get_state_map(artifact.id)
     assert state_map[peer_b] == MESIState.INVALID
     assert state_map[peer_c] == MESIState.INVALID
-    assert state_map[writer] == MESIState.MODIFIED
+    # The OCC committer ends SHARED (it holds no grant).
+    assert state_map[writer] == MESIState.SHARED
     # And the signal list covers exactly the invalidated peers.
     assert len(signals) == 2
     assert {s.issuer_agent_id for s in signals} == {writer}

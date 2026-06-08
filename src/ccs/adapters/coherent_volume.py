@@ -506,8 +506,15 @@ class CoherentVolume:
         coordinator's fail-closed degrade body
         (``{ok: false, degraded: true, reason: "commit_unconfirmed"}``): a
         degraded CAS is unconfirmed, so it must read as failure (the client must
-        never assume the write landed). ``on_error`` governs only
-        coherence-infrastructure failures (unavailable coordinator, transport).
+        never assume the write landed). The SAME fail-closed rule covers a
+        mid-commit transport failure that ``degrade`` mode swallowed (``_post``
+        returned ``None`` after a version was read): an unconfirmed CAS must
+        never write its bytes to disk, so it raises in both modes rather than
+        best-effort writing (unconfirmed bytes on disk would re-open the
+        lost-update). ``on_error`` still governs whether an infra failure raises
+        vs. warns *inside* ``_post`` and the genuinely-unattached
+        (``_endpoint is None``) degrade branch above — but never lets an
+        unconfirmed OCC commit silently land.
         """
         self._ensure_attached()
         _abs_path, rel = self._to_relative(path)
@@ -574,11 +581,20 @@ class CoherentVolume:
                 },
             )
             if resp is None:
-                # Degrade mode swallowed a transport/infra failure in _post and
-                # returned None; best-effort write so the bytes are not lost.
-                self._atomic_write(_abs_path, data)
-                self._last_committed_hash[rel] = new_hash
-                return
+                # Degrade mode swallowed a mid-operation transport/infra failure
+                # in _post and returned None — the CAS was NOT confirmed. An OCC
+                # writer holds NO grant (S/I), so unconfirmed bytes must NEVER
+                # touch disk: writing them would re-open the very lost-update this
+                # guards. Fail closed in BOTH on_error modes — identical to how
+                # the {ok:false, degraded:true, commit_unconfirmed} degrade BODY
+                # is handled below ("raise"). on_error governs only whether the
+                # infra failure already warned (degrade) or raised (strict) inside
+                # _post; either way an unconfirmed CAS must read as failure.
+                raise CoherenceError(
+                    f"OCC commit of {rel} could not be confirmed (coordinator "
+                    "transport failed mid-commit); the write did not land. "
+                    "reacquire() and retry from the fresh bytes."
+                )
 
             outcome = self._classify_cas_response(resp)
             if outcome == "win":

@@ -200,8 +200,9 @@ def test_r11_two_concurrent_writers_exactly_one_wins_no_clobber(db_path: Path) -
         assert persisted.content_hash == expected_winner_hash
         assert winner_artifact.content_hash == expected_winner_hash
         assert winner_artifact.version == 2
-        # The winner transitioned S → MODIFIED; the loser was invalidated.
-        assert reg.get_agent_state(art.id, winner_id) == MESIState.MODIFIED
+        # The winner ends SHARED (an OCC writer holds no grant); the loser was
+        # invalidated.
+        assert reg.get_agent_state(art.id, winner_id) == MESIState.SHARED
         loser_id = next(w for w, r in results.items() if isinstance(r, ConflictDetail))
         assert loser_id in invalidated
         assert reg.get_agent_state(art.id, loser_id) == MESIState.INVALID
@@ -275,9 +276,10 @@ def test_r12_sustained_contention_version_strictly_advances(db_path: Path) -> No
             assert isinstance(peer_result, tuple)
             # Peer winning re-invalidated the peer's peers, including the
             # protagonist; re-grant SHARED so it is OCC-eligible again (a re-read
-            # in production lands it back in S). The peer is now MODIFIED, so to
-            # keep the round OCC-vs-OCC (version-elected, not other_holder) drop
-            # the peer back to SHARED too.
+            # in production lands it back in S). The peer itself already ends
+            # SHARED (an OCC writer holds no grant), so the round stays OCC-vs-OCC
+            # (version-elected, not other_holder); the explicit re-grant below is
+            # defensive and keeps the protagonist SHARED.
             reg.set_agent_state(art.id, protagonist, MESIState.SHARED, tick=round_idx)
             reg.set_agent_state(art.id, peer, MESIState.SHARED, tick=round_idx)
 
@@ -301,8 +303,9 @@ def test_r12_sustained_contention_version_strictly_advances(db_path: Path) -> No
                     continue
                 landed = True
                 observed_versions.append(result[0].version)
-                # The protagonist is now MODIFIED at this version; its next-round
-                # comparand is this version, and it drops back to SHARED.
+                # The protagonist now ends SHARED at this version (OCC writer
+                # holds no grant); its next-round comparand is this version. The
+                # explicit set_agent_state is defensive (it is already SHARED).
                 protagonist_expected = result[0].version
                 reg.set_agent_state(art.id, protagonist, MESIState.SHARED, tick=round_idx)
                 break

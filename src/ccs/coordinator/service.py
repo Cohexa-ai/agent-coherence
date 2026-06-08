@@ -376,6 +376,7 @@ class CoordinatorService:
         content_hash: str,
         issued_at_tick: int = 0,
         size_tokens: int | None = None,
+        content: bytes | str | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
         """Optimistic-concurrency commit via an atomic version-checked CAS.
 
@@ -407,10 +408,17 @@ class CoordinatorService:
           returned UNCHANGED, with **no mutation and no invalidation signals**
           (it is a typed return, never an exception).
         - WIN ``(updated_artifact, invalidated_ids)`` → the registry has already
-          done the peer-invalidation + committer S/I→MODIFIED transition
-          atomically; this method only builds the matching
+          done the peer-invalidation + committer S/I→SHARED transition
+          atomically (the OCC writer holds no grant, so it ends SHARED — which
+          keeps a subsequent commit_cas by the same caller eligible past the D4
+          precondition below); this method only builds the matching
           :class:`InvalidationSignal` list (mirroring ``commit``'s shape),
           re-validates single-writer, and returns ``(updated, signals)``.
+
+        ``content`` is the winning body, threaded to the registry so the
+        in-memory (library) path advances ``record.content`` on a WIN — a peer
+        re-fetch then reads the winner's NEW content, not the stale pre-CAS body.
+        The cross-process / sqlite path passes ``None`` (it stores no content).
 
         Returns:
             ``(updated_artifact, signals)`` on a winning commit, or a
@@ -442,6 +450,7 @@ class CoordinatorService:
             expected_version=expected_version,
             content_hash=content_hash,
             size_tokens=size_tokens,
+            content=content,
             tick=issued_at_tick,
         )
 

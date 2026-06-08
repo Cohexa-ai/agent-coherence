@@ -598,6 +598,61 @@ def test_write_cas_make_content_sees_current_bytes(
         stop_coordinator(tmp_path)
 
 
+def test_write_cas_degrade_none_response_fails_closed_no_disk_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """FIX 1: in degrade mode, a mid-commit transport failure that ``_post``
+    swallowed (returns None for /hooks/post-edit-cas AFTER a version was read)
+    must FAIL CLOSED — raise CoherenceError and NOT write the unconfirmed bytes
+    to disk. An OCC writer holds no grant, so unconfirmed bytes touching disk
+    would re-open the lost update the feature prevents. Before the fix this path
+    best-effort _atomic_write'd and returned success."""
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+    )
+    try:
+        # Seed a real read so the CAS has a real version comparand (pre-read must
+        # succeed; only the commit POST is forced to None).
+        assert vol.read("data/shared.txt") == b"v1"
+        real_post = vol._post
+
+        def fake_post(endpoint_path: str, payload: dict, _real=real_post):
+            # Simulate a degrade-swallowed transport failure on the OCC commit
+            # only — every other call (pre-read) behaves normally.
+            if endpoint_path == "/hooks/post-edit-cas":
+                return None
+            return _real(endpoint_path, payload)
+
+        vol._post = fake_post  # type: ignore[assignment]
+        with pytest.raises(CoherenceError):
+            vol.write_cas("data/shared.txt", lambda cur: b"unconfirmed-bytes")
+        # The unconfirmed bytes NEVER touched disk (the whole point of the fix).
+        assert target.read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_repeatable_for_same_volume(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """FIX 3 (cross-process): the same volume can write_cas the same path TWICE
+    back-to-back — both win (version bumps each time) with no D4 'use commit()'
+    rejection, because a winning commit_cas ends the committer SHARED on the
+    coordinator (an OCC writer holds no grant). Before the fix the first win left
+    the agent MODIFIED and the second write_cas hard-failed the D4 precondition."""
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write_cas("data/shared.txt", lambda cur: cur + b"\nfirst")
+        assert target.read_bytes() == b"v1\nfirst"
+        # Second OCC write by the SAME volume must also land (no D4 rejection).
+        vol.write_cas("data/shared.txt", lambda cur: cur + b"\nsecond")
+        assert target.read_bytes() == b"v1\nfirst\nsecond"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Unit 3 — install() builtins.open / io.open shim (opt-in, demo-grade).
 #

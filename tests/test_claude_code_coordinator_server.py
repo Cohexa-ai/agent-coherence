@@ -1744,13 +1744,14 @@ def test_occ_commit_does_not_take_pre_edit_acquire(coordinator, client: _Client)
                             "content_hash": _hash("v2"), "expected_version": v})
         assert s == 200
         assert b == {"ok": True, "version": v + 1}
-        # The OCC writer is never EXCLUSIVE — it is MODIFIED via commit_cas's
-        # S/I→M transition, and the pre-edit counter never moved.
+        # The OCC writer is never EXCLUSIVE — it ends SHARED via commit_cas's
+        # S/I→S transition (an OCC writer holds no grant), and the pre-edit
+        # counter never moved.
         after_pre_edit = coordinator.endpoint_counters_snapshot()["pre_edit_total"]
         assert after_pre_edit == before_pre_edit
         aid = coordinator.registry.lookup_artifact_id_by_name("plan.md")
         state = coordinator.registry.get_agent_state(aid, session_to_agent_id(sid))
-        assert state == MESIState.MODIFIED
+        assert state == MESIState.SHARED
     finally:
         mod._ROUTES[("POST", "/hooks/pre-edit")] = original
 

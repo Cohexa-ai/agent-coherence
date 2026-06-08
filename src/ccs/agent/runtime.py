@@ -211,6 +211,7 @@ class AgentRuntime:
                 expected_version=expected_version,
                 content_hash=content_hash,
                 issued_at_tick=now_tick,
+                content=content,
             )
 
             if isinstance(result, ConflictDetail):
@@ -228,12 +229,18 @@ class AgentRuntime:
                 continue
 
             updated, signals = result
+            # An OCC win ends the committer SHARED on the coordinator (it holds no
+            # grant — see commit_cas). The local cache must mirror that: a
+            # coherence layer cannot leave the agent's local view (MODIFIED) more
+            # privileged than the coordinator's now-SHARED end-state. Contrast the
+            # pessimistic write() above, which legitimately caches MODIFIED because
+            # it acquired EXCLUSIVE.
             self.cache.put(
                 artifact_id,
                 self.strategy.on_fetch(
                     artifact_id=artifact_id,
                     version=updated.version,
-                    state=MESIState.MODIFIED,
+                    state=MESIState.SHARED,
                     now_tick=now_tick,
                 ),
             )

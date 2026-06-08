@@ -486,8 +486,8 @@ def _seed_artifact_with_shared_writer(
     return art.id, agent
 
 
-def test_commit_cas_happy_bumps_version_and_modifies(db_path: Path) -> None:
-    """expected == current, no other E/M holder → version N+1, agent MODIFIED."""
+def test_commit_cas_happy_bumps_version_and_shares(db_path: Path) -> None:
+    """expected == current, no other E/M holder → version N+1, agent SHARED."""
     with SqliteArtifactRegistry(db_path) as reg:
         artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=1)
         result = reg.commit_cas(
@@ -498,9 +498,10 @@ def test_commit_cas_happy_bumps_version_and_modifies(db_path: Path) -> None:
         assert updated.version == 2
         assert updated.content_hash == "h-new"
         assert invalidated == []
-        assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
-        # S→M is an M∪E acquire → granted_at_tick set to the commit tick.
-        assert reg.granted_at_tick(agent, artifact_id) == 7
+        # An OCC writer holds no grant — it ends SHARED (not MODIFIED), and
+        # SHARED is not an M∪E acquire so no granted_at_tick slot is set.
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
+        assert reg.granted_at_tick(agent, artifact_id) is None
         # last_writer recorded on the artifact row.
         assert reg.last_writer_for(artifact_id) == agent
 
@@ -522,7 +523,7 @@ def test_commit_cas_invalidates_non_invalid_peers(db_path: Path) -> None:
         # Only the still-valid peer is invalidated; the already-INVALID one is not.
         assert invalidated == [peer_shared]
         assert reg.get_agent_state(artifact_id, peer_shared) == MESIState.INVALID
-        assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
 
 
 def test_commit_cas_version_mismatch_no_mutation(db_path: Path) -> None:
@@ -587,17 +588,18 @@ def test_commit_cas_expected_greater_returns_corruption(db_path: Path) -> None:
 
 
 def test_commit_cas_version_check_precedes_holder_check(db_path: Path) -> None:
-    """A just-committed winner's MODIFIED state must NOT mis-fire other_holder
-    for a stale loser — the version branch fires first → version_mismatch."""
+    """The version branch fires before the holder branch → a stale loser gets
+    version_mismatch (not other_holder). The winner ends SHARED (an OCC writer
+    holds no grant), so the version check is the sole discriminator here."""
     with SqliteArtifactRegistry(db_path) as reg:
         artifact_id, winner = _seed_artifact_with_shared_writer(reg, version=1)
         loser = uuid4()
         reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
-        # Winner commits: version 1→2, winner now MODIFIED.
+        # Winner commits: version 1→2, winner now SHARED (no grant).
         reg.commit_cas(artifact_id, winner, expected_version=1, content_hash="w", tick=5)
-        assert reg.get_agent_state(artifact_id, winner) == MESIState.MODIFIED
-        # Loser retries at stale expected_version=1; winner holds MODIFIED.
-        # version_mismatch must win (not other_holder), proving branch order.
+        assert reg.get_agent_state(artifact_id, winner) == MESIState.SHARED
+        # Loser retries at stale expected_version=1; version_mismatch must win
+        # (not other_holder), proving branch order.
         result = reg.commit_cas(
             artifact_id, loser, expected_version=1, content_hash="l", tick=6
         )
@@ -627,18 +629,22 @@ def test_commit_cas_emits_state_log_for_committer_and_peers(db_path: Path) -> No
         emitted.clear()
 
         reg.commit_cas(art.id, agent, expected_version=1, content_hash="h-new", tick=5)
-        # One peer invalidation + one committer MODIFIED = 2 new entries.
+        # One peer invalidation + one committer SHARED = 2 new entries.
         assert len(emitted) == 2
         transitions = {(e["from_state"], e["to_state"]) for e in emitted}
         assert ("SHARED", "INVALID") in transitions
-        assert ("SHARED", "MODIFIED") in transitions
+        # The committer ends SHARED (OCC writer holds no grant): SHARED→SHARED.
+        assert ("SHARED", "SHARED") in transitions
         seqs = sorted(e["sequence_number"] for e in emitted)
         assert seqs == [3, 4]
         assert reg._seq == 4
-        # The MODIFIED entry carries the new content_hash; the invalidation does not.
-        mod_entry = next(e for e in emitted if e["to_state"] == "MODIFIED")
-        assert mod_entry["content_hash"] == "h-new"
-        assert mod_entry["version"] == 2
+        # The committer entry carries the new content_hash; the invalidation does
+        # not. (The committer is the SHARED→SHARED entry, not the peer→INVALID.)
+        committer_entry = next(
+            e for e in emitted if (e["from_state"], e["to_state"]) == ("SHARED", "SHARED")
+        )
+        assert committer_entry["content_hash"] == "h-new"
+        assert committer_entry["version"] == 2
         inv_entry = next(e for e in emitted if e["to_state"] == "INVALID")
         assert inv_entry["content_hash"] is None
         # sequence_number persisted to registry_meta.
@@ -652,11 +658,12 @@ def test_commit_cas_state_log_raise_rolls_back_seq_and_state(db_path: Path) -> N
     """Atomicity oracle (mirrors test_state_log_raise_rolls_back_seq_and_state):
     a state_log raise mid-CAS → ROLLBACK leaves version + _seq + agent state
     untouched, and registry_meta.sequence_number unchanged."""
-    # Raise on the committer's MODIFIED emission (seq 3): the peer invalidation
-    # (seq 3 candidate) is emitted first, the committer emission is the one that
-    # raises — forcing a rollback after the UPDATE + peer mutation already ran
-    # inside the transaction.
-    raise_on_to_state = "MODIFIED"
+    # Raise on the committer's SHARED emission (the committer now ends SHARED —
+    # an OCC writer holds no grant). The peer invalidation is emitted first
+    # (to_state INVALID), the committer emission is the one that raises — forcing
+    # a rollback after the UPDATE + peer mutation already ran inside the
+    # transaction. SHARED uniquely targets the committer (the peer goes →INVALID).
+    raise_on_to_state = "SHARED"
     emitted: list[dict] = []
 
     def hooky(entry: dict) -> None:

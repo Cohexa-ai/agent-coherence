@@ -185,6 +185,7 @@ class ArtifactRegistry:
         expected_version: int,
         content_hash: str,
         size_tokens: int | None = None,
+        content: bytes | str | None = None,
         tick: int = 0,
         trigger: str = "commit_cas",
     ) -> CasResult:
@@ -201,8 +202,10 @@ class ArtifactRegistry:
           (no mutation).
         - version matches but another agent holds M/E → ``ConflictDetail(
           "other_holder")`` (no mutation).
-        - else → WIN: version → ``current + 1``, committer S/I → MODIFIED,
-          peers → INVALID; returns ``(updated_artifact, invalidated_agent_ids)``.
+        - else → WIN: version → ``current + 1``, committer S/I → SHARED (an OCC
+          writer holds no grant — SHARED keeps its next commit_cas repeatable;
+          MODIFIED would trip the service D4 precondition), peers → INVALID;
+          returns ``(updated_artifact, invalidated_agent_ids)``.
 
         The state-log emit follows the same mutation-then-log + ``_seq``-rollback
         invariant as :meth:`set_agent_state`. To keep that invariant under a
@@ -210,6 +213,14 @@ class ArtifactRegistry:
         are computed into a staging plan and applied only after all log entries
         emit successfully — so a raise leaves ``state_by_agent`` /
         ``granted_at_tick`` untouched (matching the sqlite ROLLBACK).
+
+        ``content`` is the winning body. When provided (the in-process library
+        path threads it from ``AgentRuntime.write_cas``) the WIN updates
+        ``record.content`` (and ``version_history[next_version]`` when versions
+        are retained) to the NEW body, so a peer re-fetching after the win reads
+        the winner's content at the new version — not the stale pre-CAS body.
+        ``None`` (the cross-process / sqlite path, which stores no content)
+        leaves the prior content-coherence behaviour unchanged.
         """
         record = self._records.get(artifact_id)
         if record is None:
@@ -258,7 +269,7 @@ class ArtifactRegistry:
                 artifact_id=artifact_id,
                 agent_id=agent_id,
                 from_state=committer_from,
-                to_state=MESIState.MODIFIED,
+                to_state=MESIState.SHARED,
                 trigger=trigger,
                 tick=tick,
                 version=next_version,
@@ -277,6 +288,14 @@ class ArtifactRegistry:
             size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
             depends_on=record.artifact.depends_on,
         )
+        # Content coherence: when the caller threaded the winning body, advance
+        # record.content to it so a peer re-fetch reads the NEW content at the new
+        # version (without this, version + content_hash bump but the body stays
+        # stale). The retained version snapshot stores the SAME new body. content
+        # is None on the cross-process / sqlite path (no content stored) — keep
+        # the prior body unchanged there.
+        if content is not None:
+            record.content = content  # type: ignore[assignment]
         if self._retain_versions:
             record.version_history[next_version] = record.content
         record.artifact = updated
@@ -289,11 +308,14 @@ class ArtifactRegistry:
                 record.granted_at_tick_by_agent.pop(peer_id, None)
             invalidated.append(peer_id)
 
-        # Committer S/I → MODIFIED is an M∪E acquire: set granted_at_tick,
-        # clear the reclaim slot (set_agent_state's acquire branch).
-        record.state_by_agent[agent_id] = MESIState.MODIFIED
-        record.granted_at_tick_by_agent[agent_id] = tick
-        record.last_reclamation_by_agent.pop(agent_id, None)
+        # Committer S/I → SHARED, NOT MODIFIED: an OCC writer is optimistic and
+        # holds no grant, so SHARED is the honest end-state and keeps the same
+        # agent's next commit_cas repeatable (a sticky MODIFIED would trip the
+        # service D4 "M/E callers use commit()" precondition). SHARED is not in
+        # M∪E, so this is not an acquire — do NOT set granted_at_tick and do NOT
+        # clear the reclaim slot (mirror set_agent_state's non-M/E-from-non-M/E
+        # path, which leaves both untouched).
+        record.state_by_agent[agent_id] = MESIState.SHARED
 
         return updated, invalidated
 

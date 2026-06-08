@@ -189,7 +189,9 @@ def test_write_cas_never_calls_coordinator_write() -> None:
 
     assert updated.version == 2
     assert write_calls == 0  # never acquired EXCLUSIVE via coordinator.write()
-    assert writer.cache.get(artifact.id).state == MESIState.MODIFIED
+    # An OCC win ends SHARED (no grant) on the coordinator; the local cache
+    # mirrors that — it must not be left more privileged than the registry.
+    assert writer.cache.get(artifact.id).state == MESIState.SHARED
 
 
 def test_write_cas_conflict_then_reread_then_commits_at_fresh_version() -> None:
@@ -222,9 +224,11 @@ def test_write_cas_conflict_then_reread_then_commits_at_fresh_version() -> None:
     assert seen_expected == [1, 2]
     assert updated.version == 3
     # Cache reflects the committed version; content recomputed against fresh state.
+    # An OCC win ends SHARED (no grant), so the local cache mirrors the
+    # coordinator's now-SHARED committer end-state, not MODIFIED.
     entry = writer.cache.get(artifact.id)
     assert entry is not None
-    assert entry.state == MESIState.MODIFIED
+    assert entry.state == MESIState.SHARED
     assert entry.local_version == 3
     assert writer.content(artifact.id) == "occ-v3"
     assert len(signals) >= 0  # signals mirror commit_cas (peers already INVALID here)

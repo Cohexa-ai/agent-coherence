@@ -39,7 +39,7 @@ def _seed(reg: ArtifactRegistry, *, version: int = 1) -> tuple[UUID, UUID]:
 # --------------------------------------------------------------------
 
 
-def test_commit_cas_happy_bumps_version_and_modifies() -> None:
+def test_commit_cas_happy_bumps_version_and_shares() -> None:
     reg = ArtifactRegistry()
     artifact_id, agent = _seed(reg, version=1)
     result = reg.commit_cas(
@@ -50,8 +50,10 @@ def test_commit_cas_happy_bumps_version_and_modifies() -> None:
     assert updated.version == 2
     assert updated.content_hash == "h-new"
     assert invalidated == []
-    assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
-    assert reg.granted_at_tick(agent, artifact_id) == 7
+    # An OCC writer holds no grant — it ends SHARED (not MODIFIED), with no
+    # granted_at_tick slot (SHARED is not an M∪E acquire).
+    assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
+    assert reg.granted_at_tick(agent, artifact_id) is None
 
 
 def test_commit_cas_invalidates_non_invalid_peers() -> None:
@@ -68,7 +70,7 @@ def test_commit_cas_invalidates_non_invalid_peers() -> None:
     assert updated.version == 2
     assert invalidated == [peer_shared]
     assert reg.get_agent_state(artifact_id, peer_shared) == MESIState.INVALID
-    assert reg.get_agent_state(artifact_id, agent) == MESIState.MODIFIED
+    assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
 
 
 def test_commit_cas_version_mismatch_no_mutation() -> None:
@@ -113,13 +115,15 @@ def test_commit_cas_expected_greater_returns_corruption() -> None:
 
 
 def test_commit_cas_version_check_precedes_holder_check() -> None:
-    """A just-committed winner's MODIFIED must not mis-fire other_holder."""
+    """The version branch fires before the holder branch, so a stale loser gets
+    version_mismatch (not other_holder). The winner ends SHARED (an OCC writer
+    holds no grant), so the discriminator here is purely the version check."""
     reg = ArtifactRegistry()
     artifact_id, winner = _seed(reg, version=1)
     loser = uuid4()
     reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
     reg.commit_cas(artifact_id, winner, expected_version=1, content_hash="w", tick=5)
-    assert reg.get_agent_state(artifact_id, winner) == MESIState.MODIFIED
+    assert reg.get_agent_state(artifact_id, winner) == MESIState.SHARED
     result = reg.commit_cas(
         artifact_id, loser, expected_version=1, content_hash="l", tick=6
     )
@@ -133,7 +137,8 @@ def test_commit_cas_unknown_artifact_raises_keyerror() -> None:
 
 
 def test_commit_cas_committer_with_no_prior_state_wins() -> None:
-    """An OCC writer in I (no prior state row) still wins a clean CAS → MODIFIED."""
+    """An OCC writer in I (no prior state row) still wins a clean CAS → SHARED
+    (an OCC writer holds no grant, so no granted_at_tick is set)."""
     reg = ArtifactRegistry()
     art = _make_artifact(version=1)
     reg.register_artifact(art, content="v")
@@ -143,8 +148,8 @@ def test_commit_cas_committer_with_no_prior_state_wins() -> None:
     )
     assert updated.version == 2
     assert invalidated == []
-    assert reg.get_agent_state(art.id, fresh) == MESIState.MODIFIED
-    assert reg.granted_at_tick(fresh, art.id) == 4
+    assert reg.get_agent_state(art.id, fresh) == MESIState.SHARED
+    assert reg.granted_at_tick(fresh, art.id) is None
 
 
 # --------------------------------------------------------------------
@@ -156,7 +161,9 @@ def test_commit_cas_state_log_raise_rolls_back_seq_and_state() -> None:
     """A state_log raise mid-CAS leaves version, _seq, and agent state
     untouched (mutation-then-log parity with set_agent_state)."""
     def hooky(entry: dict) -> None:
-        if entry["to_state"] == "MODIFIED" and entry["trigger"] == "commit_cas":
+        # The committer now ends SHARED (OCC writer holds no grant); raise on its
+        # emission. Peers emit INVALID, so SHARED uniquely targets the committer.
+        if entry["to_state"] == "SHARED" and entry["trigger"] == "commit_cas":
             raise RuntimeError("simulated callback failure mid-CAS")
 
     reg = ArtifactRegistry(state_log=hooky, instance_id="inst-cas")
@@ -241,3 +248,137 @@ def test_commit_cas_parity_inmem_vs_sqlite(tmp_path: Path, scenario: str) -> Non
         assert mem_out == sql_out, f"{scenario}: in-memory {mem_out} != sqlite {sql_out}"
     finally:
         sql.close()
+
+
+def test_commit_cas_win_omitting_size_tokens_preserves_value_parity(tmp_path: Path) -> None:
+    """FIX 2 parity: a WIN that omits ``size_tokens`` (the cross-process path
+    always passes None) PRESERVES the persisted value rather than NULLing it —
+    identically on BOTH registries. Without the fix the sqlite WIN wrote the raw
+    None into the UPDATE, silently zeroing size_tokens on every cross-process
+    OCC commit while the in-memory registry preserved it (a divergence)."""
+    mem, sql = _build_pair(tmp_path)
+
+    def run(reg: ArtifactRegistry | SqliteArtifactRegistry) -> tuple[int | None, int | None]:
+        art = Artifact(
+            id=uuid4(), name="plan.md", version=1, content_hash="h-init", size_tokens=42
+        )
+        reg.register_artifact(art, content="v")
+        writer = uuid4()
+        reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
+        # WIN with size_tokens OMITTED (defaults to None).
+        updated, _ = reg.commit_cas(
+            art.id, writer, expected_version=1, content_hash="h-new", tick=2
+        )
+        # Returned Artifact AND the persisted row must both keep the prior 42.
+        return updated.size_tokens, reg.get_artifact(art.id).size_tokens
+
+    try:
+        mem_out = run(mem)
+        sql_out = run(sql)
+        assert mem_out == (42, 42), f"in-memory did not preserve size_tokens: {mem_out}"
+        assert sql_out == (42, 42), f"sqlite did not preserve size_tokens: {sql_out}"
+        assert mem_out == sql_out
+    finally:
+        sql.close()
+
+
+def test_commit_cas_win_with_explicit_size_tokens_overwrites_parity(tmp_path: Path) -> None:
+    """Counterpart to the preserve test: a non-None ``size_tokens`` arg OVERWRITES
+    the persisted value on both registries (the preserve rule fires only on None)."""
+    mem, sql = _build_pair(tmp_path)
+
+    def run(reg: ArtifactRegistry | SqliteArtifactRegistry) -> tuple[int | None, int | None]:
+        art = Artifact(
+            id=uuid4(), name="plan.md", version=1, content_hash="h-init", size_tokens=42
+        )
+        reg.register_artifact(art, content="v")
+        writer = uuid4()
+        reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
+        updated, _ = reg.commit_cas(
+            art.id, writer, expected_version=1, content_hash="h-new",
+            size_tokens=99, tick=2,
+        )
+        return updated.size_tokens, reg.get_artifact(art.id).size_tokens
+
+    try:
+        assert run(mem) == (99, 99)
+        assert run(sql) == (99, 99)
+    finally:
+        sql.close()
+
+
+def test_commit_cas_inmem_win_updates_record_content_for_peer_fetch() -> None:
+    """FIX 4: an in-memory commit_cas WIN with ``content`` advances
+    ``record.content`` so a peer re-fetching via the service reads the winner's
+    NEW body — not the stale pre-CAS seed. Without the fix the version +
+    content_hash bumped but ``record.content`` kept the old bytes (silent content
+    staleness)."""
+    from ccs.coordinator.service import CoordinatorService
+    from ccs.core.types import FetchRequest
+
+    svc = CoordinatorService(ArtifactRegistry())
+    artifact = svc.register_artifact(name="plan.md", content="seed-v1")
+    winner = uuid4()
+    peer = uuid4()
+    # Two SHARED holders (a peer must exist so the later fetch grants SHARED, not
+    # EXCLUSIVE, and so the winner has someone to be coherent with).
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=winner, requested_at_tick=1))
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=peer, requested_at_tick=2))
+
+    updated, _ = svc.commit_cas(
+        agent_id=winner,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash="h-new",
+        content="winner-v2",
+        issued_at_tick=3,
+    )
+    assert updated.version == 2
+
+    # Registry content advanced to the winner's body.
+    assert svc.registry.get_content(artifact.id) == "winner-v2"
+    # A peer re-fetch reads the NEW content at the new version (the peer was
+    # invalidated by the win; the fetch re-grants it SHARED@v2 with fresh bytes).
+    resp = svc.fetch(
+        FetchRequest(artifact_id=artifact.id, requesting_agent_id=peer, requested_at_tick=4)
+    )
+    assert resp.version == 2
+    assert resp.content == "winner-v2"
+
+
+def test_commit_cas_inmem_win_with_content_updates_retained_version() -> None:
+    """FIX 4 (retain_versions): the winning body is stored under the NEW version
+    in version_history (not the stale pre-CAS body)."""
+    reg = ArtifactRegistry(retain_versions=True)
+    art = _make_artifact(version=1)
+    reg.register_artifact(art, content="seed-v1")
+    writer = uuid4()
+    reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
+
+    reg.commit_cas(
+        art.id, writer, expected_version=1, content_hash="h-new",
+        content="winner-v2", tick=2,
+    )
+    # The retained snapshot for version 2 is the winner's body.
+    assert reg.get_content_at_version(art.id, 2) == "winner-v2"
+    # The live content is also the winner's body.
+    assert reg.get_content(art.id) == "winner-v2"
+
+
+def test_commit_cas_inmem_win_without_content_leaves_body_unchanged() -> None:
+    """FIX 4 default: when ``content`` is omitted (the cross-process / sqlite
+    path), the in-memory body is left unchanged — only version + content_hash
+    advance (prior content-coherence behaviour preserved)."""
+    reg = ArtifactRegistry()
+    art = _make_artifact(version=1)
+    reg.register_artifact(art, content="seed-v1")
+    writer = uuid4()
+    reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
+
+    updated, _ = reg.commit_cas(
+        art.id, writer, expected_version=1, content_hash="h-new", tick=2
+    )
+    assert updated.version == 2
+    assert updated.content_hash == "h-new"
+    # Body untouched (no content threaded).
+    assert reg.get_content(art.id) == "seed-v1"

@@ -979,6 +979,7 @@ class SqliteArtifactRegistry:
         expected_version: int,
         content_hash: str,
         size_tokens: int | None = None,
+        content: bytes | str | None = None,
         tick: int = 0,
         trigger: str = "commit_cas",
     ) -> CasResult:
@@ -1002,18 +1003,32 @@ class SqliteArtifactRegistry:
           ``ConflictDetail("other_holder")``. No mutation.
         - else (version matches, no other M/E holder) → **WIN**: bump version
           to ``current + 1``, write ``content_hash`` + ``last_writer_id``,
-          transition the committer S/I → MODIFIED, invalidate every non-INVALID
+          transition the committer S/I → SHARED, invalidate every non-INVALID
           peer to INVALID. Returns ``(updated_artifact, invalidated_agent_ids)``.
 
-        The committer's MODIFIED bookkeeping and the per-peer invalidation are
-        INLINED as raw SQL — :meth:`set_agent_state` opens its own
-        ``BEGIN IMMEDIATE`` and cannot be called nested. This reproduces
-        ``set_agent_state``'s contract for the participants it touches:
-        ``granted_at_tick`` (set on the S/I→MODIFIED M∪E acquire; reclaim slot
-        cleared), the mutation-then-log + ``_seq`` rollback invariant, and the
-        ``state_log`` emit per transition (KTD-13: compare on version, never
-        content bytes).
+        The committer ends **SHARED, not MODIFIED**: an OCC writer is optimistic
+        and never acquired EXCLUSIVE, so it holds no grant — SHARED is the honest
+        end-state, and it keeps the same agent's subsequent commit_cas repeatable
+        (a sticky MODIFIED would trip the service's D4 "M/E callers use commit()"
+        precondition). ``size_tokens=None`` PRESERVES the persisted value (the
+        cross-process path always passes None), matching the in-memory registry.
+
+        The committer's bookkeeping and the per-peer invalidation are INLINED as
+        raw SQL — :meth:`set_agent_state` opens its own ``BEGIN IMMEDIATE`` and
+        cannot be called nested. This reproduces ``set_agent_state``'s contract
+        for the participants it touches: SHARED is not in M∪E, so the committer's
+        ``granted_at_tick`` is left untouched (preserved; no acquire) and its
+        reclaim slot is NOT cleared, while a peer leaving M∪E drops its
+        ``granted_at_tick`` slot; plus the mutation-then-log + ``_seq`` rollback
+        invariant and the ``state_log`` emit per transition (KTD-13: compare on
+        version, never content bytes).
+
+        ``content`` is accepted for signature parity with the in-memory registry
+        but IGNORED (KTD-13: this registry persists no content body —
+        :meth:`get_content` returns ``b""``). The content-hash on the artifact is
+        the source of truth for staleness comparison.
         """
+        del content  # KTD-13: not persisted (signature parity only)
         with self._lock:
             # Track every _seq increment in this call so the outer
             # BaseException handler can roll them ALL back if COMMIT (or any
@@ -1023,11 +1038,13 @@ class SqliteArtifactRegistry:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 version_row = self._conn.execute(
-                    "SELECT version FROM artifacts WHERE id = ?", (artifact_id.hex,)
+                    "SELECT version, size_tokens FROM artifacts WHERE id = ?",
+                    (artifact_id.hex,),
                 ).fetchone()
                 if version_row is None:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 current = version_row[0]
+                current_size_tokens = version_row[1]
 
                 # 3-outcome discrimination. Each non-win branch COMMITs the
                 # (read-only) transaction and returns a typed result; nothing
@@ -1059,6 +1076,14 @@ class SqliteArtifactRegistry:
 
                 # ---- WIN: mutate atomically ----
                 next_version = current + 1
+                # Preserve the persisted size_tokens when the caller passes None
+                # (the cross-process / coordinator-server path always does) —
+                # matches the in-memory registry, where a None arg keeps the
+                # prior value rather than NULLing it. Without this, every
+                # cross-process OCC commit would silently zero size_tokens.
+                resolved_size_tokens = (
+                    current_size_tokens if size_tokens is None else size_tokens
+                )
                 self._conn.execute(
                     """
                     UPDATE artifacts
@@ -1069,7 +1094,7 @@ class SqliteArtifactRegistry:
                     (
                         next_version,
                         content_hash,
-                        size_tokens,
+                        resolved_size_tokens,
                         agent_id.hex,
                         time.time(),
                         artifact_id.hex,
@@ -1119,12 +1144,20 @@ class SqliteArtifactRegistry:
                     )
                     invalidated.append(UUID(hex=peer_hex))
 
-                # Transition the committer S/I → MODIFIED. MODIFIED is in M∪E
-                # and the prior S/I is not, so this is an M∪E *acquire*:
-                # granted_at_tick = tick, reclaim slot cleared (mirrors
-                # set_agent_state's "new_in_me and not prev_in_me" branch).
+                # Transition the committer S/I → SHARED. An OCC writer holds NO
+                # grant (it is optimistic — it never acquired EXCLUSIVE), so the
+                # honest end-state is SHARED, NOT MODIFIED. A sticky MODIFIED
+                # grant would make the SAME agent's next commit_cas/write_cas hit
+                # the service D4 precondition (which rejects M/E callers) and hard-
+                # fail; ending SHARED keeps OCC writes repeatable. SHARED is not
+                # in M∪E, so this is NOT an acquire: do NOT set granted_at_tick to
+                # ``tick`` and do NOT clear the reclaim slot (mirror
+                # set_agent_state's non-M/E branch — preserve prior granted_at,
+                # leave reclaim columns untouched). A fresh S/I committer holds no
+                # grant slot, so the preserved value is None either way.
                 committer_row = self._conn.execute(
-                    "SELECT state FROM agent_states WHERE artifact_id = ? AND agent_id = ?",
+                    "SELECT state, granted_at_tick FROM agent_states "
+                    "WHERE artifact_id = ? AND agent_id = ?",
                     (artifact_id.hex, agent_id.hex),
                 ).fetchone()
                 committer_from = (
@@ -1135,25 +1168,28 @@ class SqliteArtifactRegistry:
                         """
                         INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
                                                   last_reclaim_trigger, last_reclaim_tick)
-                        VALUES (?, ?, ?, ?, NULL, NULL)
+                        VALUES (?, ?, ?, NULL, NULL, NULL)
                         """,
-                        (artifact_id.hex, agent_id.hex, MESIState.MODIFIED.name, tick),
+                        (artifact_id.hex, agent_id.hex, MESIState.SHARED.name),
                     )
                 else:
+                    # Preserve granted_at_tick (None for an S/I committer); the
+                    # reclaim columns are NOT touched — exactly set_agent_state's
+                    # "neither new nor prev in M∪E" path.
+                    prior_granted_at = committer_row[1]
                     self._conn.execute(
                         """
                         UPDATE agent_states
-                        SET state = ?, granted_at_tick = ?, last_reclaim_trigger = NULL,
-                            last_reclaim_tick = NULL
+                        SET state = ?, granted_at_tick = ?
                         WHERE artifact_id = ? AND agent_id = ?
                         """,
-                        (MESIState.MODIFIED.name, tick, artifact_id.hex, agent_id.hex),
+                        (MESIState.SHARED.name, prior_granted_at, artifact_id.hex, agent_id.hex),
                     )
                 seq_incremented_count += self._emit_state_log(
                     artifact_id=artifact_id,
                     agent_id=agent_id,
                     from_state=committer_from,
-                    to_state=MESIState.MODIFIED,
+                    to_state=MESIState.SHARED,
                     trigger=trigger,
                     tick=tick,
                     version=next_version,
@@ -1179,7 +1215,7 @@ class SqliteArtifactRegistry:
                 name=self._artifact_name(artifact_id),
                 version=next_version,
                 content_hash=content_hash,
-                size_tokens=size_tokens,
+                size_tokens=resolved_size_tokens,
             )
             return updated, invalidated
 

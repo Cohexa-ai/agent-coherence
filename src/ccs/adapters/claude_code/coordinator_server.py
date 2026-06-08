@@ -1800,10 +1800,11 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             }
 
         updated, _signals = result
-        # WIN: commit_cas already did the peer-invalidation + S/I→MODIFIED
+        # WIN: commit_cas already did the peer-invalidation + S/I→SHARED
         # transition atomically. A successful OCC commit acquired no separate
-        # EXCLUSIVE grant, but it IS a write that bumped the version, so it
-        # exercises fine-grained write protection — mirror post-edit's signal.
+        # EXCLUSIVE grant (it ends SHARED, not MODIFIED), but it IS a write that
+        # bumped the version, so it exercises fine-grained write protection —
+        # mirror post-edit's signal.
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True, "version": updated.version}
 

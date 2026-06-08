@@ -532,8 +532,9 @@ def test_adapter_write_cas_commits_and_publishes_invalidation_to_peers() -> None
     peer_entry = core.runtime("peer").cache.get(artifact.id)
     assert peer_entry is not None
     assert peer_entry.state == MESIState.INVALID
-    # The writer holds MODIFIED locally.
-    assert core.runtime("writer").cache.get(artifact.id).state == MESIState.MODIFIED
+    # The OCC writer ends SHARED locally (an OCC win holds no grant) — the cache
+    # mirrors the coordinator's now-SHARED committer end-state, not MODIFIED.
+    assert core.runtime("writer").cache.get(artifact.id).state == MESIState.SHARED
 
 
 def test_adapter_write_cas_records_heartbeat_only_when_crash_recovery_enabled() -> None:
