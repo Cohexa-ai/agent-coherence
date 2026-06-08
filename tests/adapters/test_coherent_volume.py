@@ -450,6 +450,36 @@ def test_no_op_skip_gated_on_disk_not_stale_cache(
         stop_coordinator(tmp_path)
 
 
+def test_no_op_skip_not_taken_when_disk_file_missing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-op skip is gated on the on-disk hash, so a cache hit ALONE does not
+    skip the write. If the file is gone at write time (``_disk_hash`` -> None,
+    and None != new_hash), the write proceeds and recreates it. Pins the
+    ``_disk_hash`` missing-file branch the divergence fix relies on."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path, rel="data/x.txt", content=b"orig")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"committed")  # cache := H("committed"), disk holds it
+        (tmp_path / "data/x.txt").unlink()  # disk now diverges from the cached belief
+
+        calls = {"n": 0}
+        real_replace = cv_mod.os.replace
+
+        def counting_replace(src: object, dst: object) -> None:
+            calls["n"] += 1
+            real_replace(src, dst)
+
+        monkeypatch.setattr(cv_mod.os, "replace", counting_replace)
+        vol.write("data/x.txt", b"committed")  # same bytes, but the file is GONE
+        assert calls["n"] == 1  # skip NOT taken — the write recreated the file
+        assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_deny_raises_even_in_degrade_mode(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
