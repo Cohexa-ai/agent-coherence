@@ -850,3 +850,32 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
             r[1] for r in reg2._conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
         assert "owner_generation" in art_cols2
+
+
+def test_owner_generation_bumps_on_reclaim_only(db_path: Path) -> None:
+    """A sweep reclamation (M/E -> INVALID via a reclaim trigger) bumps the
+    artifact's owner_generation monotonically; a peer-invalidation or a clean
+    downgrade does NOT bump (version-CAS covers those)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b = uuid4(), uuid4()
+        assert reg.get_owner_generation(art.id) == 0
+
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1  # reclaim bumps
+
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        reg.set_agent_state(art.id, b, MESIState.INVALID, trigger="reclaim_max_hold", tick=20)
+        assert reg.get_owner_generation(art.id) == 2  # monotonic across reclaims
+
+        # Peer-invalidation (non-reclaim trigger) does NOT bump.
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=21)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="peer_invalidation", tick=22)
+        assert reg.get_owner_generation(art.id) == 2
+
+        # Clean downgrade E -> SHARED does NOT bump.
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=23)
+        reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="downgrade", tick=24)
+        assert reg.get_owner_generation(art.id) == 2

@@ -87,6 +87,12 @@ v0.1 raises on mismatch; v0.2 will add real migration dispatch when needed."""
 ReclamationSlot: TypeAlias = tuple[str, int]
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
+# Sweep-reclaim triggers — an M/E -> INVALID carrying one of these bumps the
+# artifact's owner_generation (read-generation fence). Duplicated from
+# registry.py (the two registries share no base class); the dual-registry
+# parity test pins them equal.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
+
 # OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
 # invalidated_agent_ids)`` — the service layer turns the id list into
 # ``InvalidationSignal``s. A loss is a typed ``ConflictDetail`` (retry-eligible,
@@ -404,6 +410,16 @@ class SqliteArtifactRegistry:
                 pass
             raise
 
+    def get_owner_generation(self, artifact_id: UUID) -> int:
+        """Return the artifact's ownership epoch (read-generation fence)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT owner_generation FROM artifacts WHERE id = ?", (artifact_id.hex,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"artifact {artifact_id} not in registry")
+            return row[0]
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -668,6 +684,17 @@ class SqliteArtifactRegistry:
                 if version_row is None:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
+
+                # Read-generation fence: on a sweep reclamation (M/E -> INVALID
+                # via a reclaim trigger) bump the artifact's ownership epoch,
+                # atomically with the state transition in this BEGIN IMMEDIATE,
+                # so a commit by the reclaimed holder fails the generation check.
+                if prev_in_me and not new_in_me and trigger in RECLAIM_TRIGGERS:
+                    self._conn.execute(
+                        "UPDATE artifacts SET owner_generation = owner_generation + 1 "
+                        "WHERE id = ?",
+                        (artifact_id.hex,),
+                    )
 
                 # Upsert agent state.
                 if prior_row is None:

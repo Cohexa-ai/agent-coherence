@@ -17,6 +17,13 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
+# The sweep-reclaim triggers (CoordinatorService.enforce_stable_grant_timeouts).
+# An M/E -> INVALID transition carrying one of these bumps the artifact's
+# owner_generation (the read-generation fence). A peer-invalidation INVALID
+# (any other trigger) does NOT bump -- that path moves the version, so
+# version-CAS already catches a stale write. Shared with SqliteArtifactRegistry.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
+
 # OCC commit-CAS result (plan Unit 2) — parity with SqliteArtifactRegistry.
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
 # impossible state = CasCorruption. None is raised by the registry.
@@ -99,6 +106,10 @@ class ArtifactRegistry:
         record = self._records.get(artifact_id)
         return record.content if record else None
 
+    def get_owner_generation(self, artifact_id: UUID) -> int:
+        """Return the artifact's ownership epoch (read-generation fence)."""
+        return self._records[artifact_id].owner_generation
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,
@@ -164,6 +175,12 @@ class ArtifactRegistry:
                 record.last_reclamation_by_agent.pop(agent_id, None)
         elif prev_in_me:
             record.granted_at_tick_by_agent.pop(agent_id, None)
+            # Read-generation fence: a sweep reclamation of this M/E grant bumps
+            # the artifact's ownership epoch, atomically (GIL) with the INVALID
+            # transition, so a commit by the reclaimed (or any pre-reclaim)
+            # holder fails the generation check. Only sweep triggers bump.
+            if trigger in RECLAIM_TRIGGERS:
+                record.owner_generation += 1
 
         if self._state_log is not None:
             self._seq += 1
