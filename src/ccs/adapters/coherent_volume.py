@@ -494,10 +494,16 @@ class CoherentVolume:
             self._check_grant(resp, rel, phase="pre-edit")
 
         new_hash = self._sha256_bytes(data)
-        # No-op skip: bytes identical to our own last commit while we hold a fresh
-        # grant means the file already has them — skip the os.replace (no
-        # filesystem churn) but still finalize the grant via post-edit below.
-        if self._last_committed_hash.get(rel) != new_hash:
+        # No-op skip: skip the os.replace (and its fsync) only when the file
+        # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
+        # gate (it skips the disk read on the common "bytes changed" write); the
+        # CURRENT on-disk hash is the authority, because the cached belief alone
+        # can be stale across a peer commit (see _disk_hash for the full why).
+        already_on_disk = (
+            self._last_committed_hash.get(rel) == new_hash
+            and self._disk_hash(abs_path) == new_hash
+        )
+        if not already_on_disk:
             try:
                 self._atomic_write(abs_path, data)
             except OSError:
@@ -755,6 +761,25 @@ class CoherentVolume:
             return b"".join(chunks)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _disk_hash(abs_path: Path) -> str | None:
+        """SHA-256 of the CURRENT on-disk bytes, or ``None`` if the file is
+        absent/unreadable.
+
+        The write no-op-skip uses this to confirm the file ALREADY holds the
+        bytes being committed before skipping the ``os.replace``. A per-instance
+        cached hash (``_last_committed_hash``) can be stale across a peer commit:
+        on a tracked-but-non-strict glob the coordinator re-grants the write
+        without a deny, so the cache still reads this instance's OWN last hash
+        while disk holds the peer's bytes. The cache is therefore only a cheap
+        fast-path gate; the on-disk hash is the authority for whether a write is
+        truly a no-op. Reads via :meth:`_read_file_bytes` (raw ``os.read``) so it
+        is never self-intercepted by the ``install()`` open()-shim."""
+        try:
+            return CoherentVolume._sha256_bytes(CoherentVolume._read_file_bytes(abs_path))
+        except OSError:
+            return None
 
     def _atomic_write(self, abs_path: Path, data: bytes) -> None:
         """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT

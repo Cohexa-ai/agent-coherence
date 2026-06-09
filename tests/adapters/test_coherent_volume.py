@@ -193,6 +193,21 @@ def _pair(tmp_path: Path, cfg: LifecycleConfig) -> tuple[CoherentVolume, Coheren
     return vol_a, vol_b
 
 
+def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
+    """Mark a glob TRACKED but NOT strict before the coordinator spawns.
+
+    Writes ``.coherence/tracked.yaml`` (so a peer commit invalidates a SHARED
+    view) while deliberately leaving ``strict_mode.yaml`` absent (so the re-grant
+    is warn-mode — never denied). ``managed=()`` volumes then attach to this
+    coordinator without the strict-mode requirement that ``managed`` globs carry.
+    Reuses the coordinator's own ``_merge_yaml_list`` writer so the fixture tracks
+    the real tracked.yaml format instead of duplicating it.
+    """
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    CoherentVolume._merge_yaml_list(coherence_dir / "tracked.yaml", (glob,))
+
+
 def test_sibling_volume_attaches_to_strict_coordinator(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -386,6 +401,84 @@ def test_identical_rewrite_skips_filesystem_write(
         monkeypatch.setattr(cv_mod.os, "replace", counting_replace)
         vol.write("data/x.txt", b"committed")  # identical bytes -> no-op skip
         assert calls["n"] == 0  # os.replace NOT called the second time
+        assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_no_op_skip_gated_on_disk_not_stale_cache(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Regression (pre-existing since CoherentVolume v1): the write no-op-skip
+    must check the CURRENT on-disk bytes, not a per-instance cached hash a peer
+    commit left stale.
+
+    On a tracked-but-NON-strict glob, pre-edit RE-GRANTS (no strict deny), so the
+    skip's own check is the only thing between a stale belief and a silent skip.
+    A writes C (cache := H(C)); peer B overwrites with D (A is invalidated but,
+    non-strict, not denied); A writes C again. A's cache still reads
+    H(C) == H(C), so a cache-TRUSTING skip leaves B's D on disk while post-edit
+    commits H(C) — disk/coordinator divergence, and the next reader gets D under a
+    coordinator hash of C. The skip must fire only when the file ACTUALLY holds
+    the bytes, so A's rewrite lands C.
+    """
+    rel = "data/shared.txt"
+    _track_only(tmp_path)  # tracked but non-strict, before any coordinator spawns
+    target = _seed(tmp_path, rel=rel, content=b"v0")
+
+    vol_a = CoherentVolume(tmp_path, managed=(), config=fast_cfg)
+    vol_b = CoherentVolume(tmp_path, managed=(), config=fast_cfg)
+    try:
+        # Warn-mode setup sanity: both attached, and the coordinator is NOT strict
+        # for the path (so the later re-grant is not denied — the bug's precondition).
+        assert vol_a.is_attached and vol_b.is_attached
+        assert not vol_a.strict_mode_active()
+
+        c_bytes = b"content-from-A"
+        d_bytes = b"content-from-B-overwrite"
+
+        vol_a.read(rel)
+        vol_a.write(rel, c_bytes)  # A commits C: cache := H(C), disk == C
+        assert target.read_bytes() == c_bytes
+
+        vol_b.read(rel)  # B SHARED@C
+        vol_b.write(rel, d_bytes)  # B commits D: A -> INVALID, disk == D
+        assert target.read_bytes() == d_bytes
+
+        # A rewrites the SAME bytes it last committed. Non-strict -> pre-edit
+        # re-grants; A's cache still reads H(C). A cache-trusting no-op skip would
+        # leave B's D on disk (the bug); the disk-gated skip rewrites C.
+        vol_a.write(rel, c_bytes)
+        assert target.read_bytes() == c_bytes  # A's intent on disk, not B's stale D
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_no_op_skip_not_taken_when_disk_file_missing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-op skip is gated on the on-disk hash, so a cache hit ALONE does not
+    skip the write. If the file is gone at write time (``_disk_hash`` -> None,
+    and None != new_hash), the write proceeds and recreates it. Pins the
+    ``_disk_hash`` missing-file branch the divergence fix relies on."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path, rel="data/x.txt", content=b"orig")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"committed")  # cache := H("committed"), disk holds it
+        (tmp_path / "data/x.txt").unlink()  # disk now diverges from the cached belief
+
+        calls = {"n": 0}
+        real_replace = cv_mod.os.replace
+
+        def counting_replace(src: object, dst: object) -> None:
+            calls["n"] += 1
+            real_replace(src, dst)
+
+        monkeypatch.setattr(cv_mod.os, "replace", counting_replace)
+        vol.write("data/x.txt", b"committed")  # same bytes, but the file is GONE
+        assert calls["n"] == 1  # skip NOT taken — the write recreated the file
         assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
     finally:
         stop_coordinator(tmp_path)
