@@ -67,6 +67,7 @@ from ccs.cli._coherence_client import (
 )
 from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
+    STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
     CoherenceDegradedWarning,
     CoherenceError,
@@ -903,7 +904,15 @@ class CoherentVolume:
     # The transient literal is the SHARED constant the coordinator server emits,
     # so a reword on either side can't drift the retry classification.
     _CAS_RETRY_REASONS: frozenset[str] = frozenset(
-        {"version_mismatch", "other_holder", OCC_CALLER_TRANSIENT_REASON}
+        {
+            "version_mismatch",
+            "other_holder",
+            OCC_CALLER_TRANSIENT_REASON,
+            # Read-generation fence: a reclaimed reader's OCC commit_cas returns
+            # ConflictDetail("stale_read_generation"); retry via reacquire +
+            # fresh read (the next fetch captures the current generation).
+            STALE_READ_GENERATION_REASON,
+        }
     )
 
     def _classify_cas_response(self, resp: dict) -> Literal["win", "conflict", "raise"]:
