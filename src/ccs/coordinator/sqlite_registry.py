@@ -420,6 +420,18 @@ class SqliteArtifactRegistry:
                 raise KeyError(f"artifact {artifact_id} not in registry")
             return row[0]
 
+    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the generation an agent captured at its last claim, or None
+        (the absent operand the commit guard rejects) if it never established
+        one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT read_generation FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (artifact_id.hex, agent_id.hex),
+            ).fetchone()
+            return row[0] if row is not None else None
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -726,6 +738,19 @@ class SqliteArtifactRegistry:
                             """,
                             (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
                         )
+
+                # Read-generation fence: capture the current ownership epoch into
+                # the agent's read_generation when it establishes/refreshes a
+                # write-claim (E/M acquire -- P0 fix, incl. acquire-without-read
+                # -- or a fetch read), atomic with the grant in this BEGIN
+                # IMMEDIATE. The agent_states row exists after the upsert above.
+                if (new_in_me and not prev_in_me) or trigger == "fetch":
+                    self._conn.execute(
+                        "UPDATE agent_states SET read_generation = "
+                        "(SELECT owner_generation FROM artifacts WHERE id = ?) "
+                        "WHERE artifact_id = ? AND agent_id = ?",
+                        (artifact_id.hex, artifact_id.hex, agent_id.hex),
+                    )
 
                 # Mutation-then-log: emit state_log BEFORE commit. If the callback
                 # raises, ROLLBACK undoes the agent_states change AND we decrement

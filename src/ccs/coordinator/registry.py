@@ -110,6 +110,12 @@ class ArtifactRegistry:
         """Return the artifact's ownership epoch (read-generation fence)."""
         return self._records[artifact_id].owner_generation
 
+    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> Optional[int]:
+        """Return the generation an agent captured at its last claim, or None
+        (the absent operand the commit guard rejects) if it never established
+        one."""
+        return self._records[artifact_id].read_generation_by_agent.get(agent_id)
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,
@@ -181,6 +187,13 @@ class ArtifactRegistry:
             # holder fails the generation check. Only sweep triggers bump.
             if trigger in RECLAIM_TRIGGERS:
                 record.owner_generation += 1
+
+        # Read-generation fence: capture the current ownership epoch into the
+        # agent's read_generation when it establishes/refreshes a write-claim --
+        # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
+        # content read) or a genuine fetch read. Atomic (GIL) with the grant.
+        if (new_in_me and not prev_in_me) or trigger == "fetch":
+            record.read_generation_by_agent[agent_id] = record.owner_generation
 
         if self._state_log is not None:
             self._seq += 1

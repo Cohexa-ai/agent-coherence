@@ -879,3 +879,35 @@ def test_owner_generation_bumps_on_reclaim_only(db_path: Path) -> None:
         reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=23)
         reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="downgrade", tick=24)
         assert reg.get_owner_generation(art.id) == 2
+
+
+def test_read_generation_captured_at_claim(db_path: Path) -> None:
+    """read_generation is captured at the claim-establishing point: an E/M
+    acquire (incl. acquire-WITHOUT-a-prior-read -- the P0 fix) and a fetch read.
+    A never-claimed agent has None (absent operand). A reclaim does NOT refresh
+    the captured value; the next claim captures the new generation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b, c = uuid4(), uuid4(), uuid4()
+
+        # Never-claimed agent: absent operand.
+        assert reg.get_read_generation(art.id, c) is None
+
+        # Pessimistic acquire WITHOUT a prior fetch (the P0 fix) captures gen 0.
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        assert reg.get_read_generation(art.id, a) == 0
+        # A fetch read captures too.
+        reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=2)
+        assert reg.get_read_generation(art.id, b) == 0
+
+        # Reclaim a -> owner_generation bumps to 1, but a's captured value is
+        # PRESERVED (the reclaim does not refresh it) -- this is what makes a's
+        # later commit fail the generation guard.
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1
+        assert reg.get_read_generation(art.id, a) == 0
+
+        # A fresh re-acquire by a captures the NEW generation (1).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        assert reg.get_read_generation(art.id, a) == 1
