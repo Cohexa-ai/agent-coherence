@@ -397,17 +397,11 @@ class CoherentVolume:
             self._check_grant(resp, rel, phase="pre-edit")
 
         new_hash = self._sha256_bytes(data)
-        # No-op skip: when the file ALREADY holds these exact bytes, skip the
-        # os.replace (and its fsync) — but verify against the CURRENT on-disk
-        # hash, never the cached belief alone. _last_committed_hash is only a
-        # cheap fast-path gate (it avoids hashing the file on the common "bytes
-        # changed" write); a peer commit on a tracked-but-NON-strict glob
-        # overwrites the file while our cache still reads our OWN last hash and
-        # pre-edit re-grants without a deny. Trusting the cache there would skip
-        # the write, leaving the peer's bytes on disk while post-edit commits OUR
-        # hash — silent disk/coordinator divergence. Hashing the file is far
-        # cheaper than the atomic write+fsync it guards, so the skip stays a real
-        # optimization while being correct.
+        # No-op skip: skip the os.replace (and its fsync) only when the file
+        # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
+        # gate (it skips the disk read on the common "bytes changed" write); the
+        # CURRENT on-disk hash is the authority, because the cached belief alone
+        # can be stale across a peer commit (see _disk_hash for the full why).
         already_on_disk = (
             self._last_committed_hash.get(rel) == new_hash
             and self._disk_hash(abs_path) == new_hash

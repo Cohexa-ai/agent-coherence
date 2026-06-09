@@ -18,7 +18,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
@@ -187,6 +186,21 @@ def _pair(tmp_path: Path, cfg: LifecycleConfig) -> tuple[CoherentVolume, Coheren
     vol_a = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
     vol_b = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
     return vol_a, vol_b
+
+
+def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
+    """Mark a glob TRACKED but NOT strict before the coordinator spawns.
+
+    Writes ``.coherence/tracked.yaml`` (so a peer commit invalidates a SHARED
+    view) while deliberately leaving ``strict_mode.yaml`` absent (so the re-grant
+    is warn-mode — never denied). ``managed=()`` volumes then attach to this
+    coordinator without the strict-mode requirement that ``managed`` globs carry.
+    Reuses the coordinator's own ``_merge_yaml_list`` writer so the fixture tracks
+    the real tracked.yaml format instead of duplicating it.
+    """
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    CoherentVolume._merge_yaml_list(coherence_dir / "tracked.yaml", (glob,))
 
 
 def test_sibling_volume_attaches_to_strict_coordinator(
@@ -385,21 +399,6 @@ def test_identical_rewrite_skips_filesystem_write(
         assert (tmp_path / "data/x.txt").read_bytes() == b"committed"
     finally:
         stop_coordinator(tmp_path)
-
-
-def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
-    """Mark a glob TRACKED but NOT strict before the coordinator spawns.
-
-    Writes ``.coherence/tracked.yaml`` (so a peer commit invalidates a SHARED
-    view) while deliberately leaving ``strict_mode.yaml`` absent (so the re-grant
-    is warn-mode — never denied). ``managed=()`` volumes then attach to this
-    coordinator without the strict-mode requirement that ``managed`` globs carry.
-    """
-    coherence_dir = tmp_path / ".coherence"
-    coherence_dir.mkdir(parents=True, exist_ok=True)
-    (coherence_dir / "tracked.yaml").write_text(
-        yaml.safe_dump([glob], default_flow_style=False), encoding="utf-8"
-    )
 
 
 def test_no_op_skip_gated_on_disk_not_stale_cache(
