@@ -1162,6 +1162,45 @@ def test_fs_write_failure_releases_grant(
         stop_coordinator(tmp_path)
 
 
+def _raise_runtime(*_args: object, **_kwargs: object) -> str:
+    raise RuntimeError("simulated non-OSError in the pre-write window")
+
+
+def test_non_oserror_in_write_window_releases_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A NON-OSError raised after pre-edit granted EXCLUSIVE but before the
+    post-edit commit (here from _disk_hash, in the no-op-skip check) must still
+    release the grant via post-edit success:false — not orphan it until the
+    crash-recovery sweep. The original handler caught only OSError around
+    _atomic_write, leaving the hashing / disk-read window unprotected."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    _seed(tmp_path, rel="data/x.txt", content=b"orig")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"same")  # cache := H("same") so _disk_hash is reached next
+
+        posts: list[tuple[str, dict]] = []
+        real_post = cv_mod._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict) -> object:
+            posts.append((path, dict(payload)))
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
+        monkeypatch.setattr(vol, "_disk_hash", _raise_runtime)  # non-OSError in the window
+
+        with pytest.raises(RuntimeError):
+            vol.write("data/x.txt", b"same")  # cache hit -> _disk_hash -> RuntimeError
+
+        assert any(
+            p == "/hooks/post-edit" and pay.get("success") is False for p, pay in posts
+        ), "a non-OSError in the post-grant window must release the grant"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_no_op_skip_still_finalizes_grant(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

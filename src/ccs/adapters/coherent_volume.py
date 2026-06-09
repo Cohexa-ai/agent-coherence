@@ -493,31 +493,35 @@ class CoherentVolume:
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
 
-        new_hash = self._sha256_bytes(data)
-        # No-op skip: skip the os.replace (and its fsync) only when the file
-        # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
-        # gate (it skips the disk read on the common "bytes changed" write); the
-        # CURRENT on-disk hash is the authority, because the cached belief alone
-        # can be stale across a peer commit (see _disk_hash for the full why).
-        already_on_disk = (
-            self._last_committed_hash.get(rel) == new_hash
-            and self._disk_hash(abs_path) == new_hash
-        )
-        if not already_on_disk:
-            try:
+        # EXCLUSIVE grant is now held. ANY failure before the post-edit commit
+        # must release it via the coordinator's tool-failure path (success:false),
+        # not only an OSError from the atomic write: an unexpected error while
+        # hashing the data or the on-disk file (e.g. MemoryError on a very large
+        # file) would otherwise orphan the grant until the crash-recovery sweep.
+        try:
+            new_hash = self._sha256_bytes(data)
+            # No-op skip: skip the os.replace (and its fsync) only when the file
+            # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
+            # gate (it skips the disk read on the common "bytes changed" write); the
+            # CURRENT on-disk hash is the authority, because the cached belief alone
+            # can be stale across a peer commit (see _disk_hash for the full why).
+            already_on_disk = (
+                self._last_committed_hash.get(rel) == new_hash
+                and self._disk_hash(abs_path) == new_hash
+            )
+            if not already_on_disk:
                 self._atomic_write(abs_path, data)
-            except OSError:
-                # The FS write failed AFTER pre-edit granted EXCLUSIVE. Release the
-                # grant via the coordinator's tool-failure path so it is not
-                # orphaned until the sweep, then re-raise the original error.
-                # Best-effort release — a release failure must not mask the OSError.
-                with contextlib.suppress(Exception):
-                    _coordinator_post(
-                        self._endpoint,
-                        "/hooks/post-edit",
-                        {"session_id": self._session_id, "path": rel, "success": False},
-                    )
-                raise
+        except Exception:
+            # Release the grant so it is not orphaned until the sweep, then
+            # re-raise the original error. Best-effort release — a release failure
+            # must not mask it.
+            with contextlib.suppress(Exception):
+                _coordinator_post(
+                    self._endpoint,
+                    "/hooks/post-edit",
+                    {"session_id": self._session_id, "path": rel, "success": False},
+                )
+            raise
 
         post_resp = self._post(
             "/hooks/post-edit",
