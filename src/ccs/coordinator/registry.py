@@ -36,6 +36,14 @@ class ArtifactRecord:
     version_history: dict[int, str] = field(default_factory=dict)
     granted_at_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
     last_reclamation_by_agent: dict[UUID, ReclamationSlot] = field(default_factory=dict)
+    # Read-generation fence (single-host Piece #2). owner_generation is the
+    # per-artifact ownership epoch, bumped on every sweep reclamation;
+    # read_generation_by_agent[ag] is the owner_generation an agent captured
+    # when it last established its write-claim (a genuine read OR an E/M
+    # acquire). An ABSENT key (== None) is the absent operand => reject at
+    # commit. The counter only grows (resets to 0 per construction in-memory).
+    owner_generation: int = 0
+    read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -59,6 +67,10 @@ class ArtifactRegistry:
         self._state_log = state_log
         self._agent_names = agent_names
         self._instance_id: str = instance_id if instance_id is not None else str(uuid4())
+        # Read-generation fence: per-construction nonce. In-memory resets every
+        # construction; the (coordinator_epoch, owner_generation) pair lets the
+        # Unit 5 commit guard fail a read captured under a prior epoch.
+        self._coordinator_epoch: str = uuid4().hex
         self._seq: int = 0
         self._retain_versions = retain_versions
 

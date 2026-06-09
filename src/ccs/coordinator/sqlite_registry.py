@@ -242,13 +242,14 @@ class SqliteArtifactRegistry:
             c.execute(
                 """
                 CREATE TABLE artifacts (
-                    id              TEXT PRIMARY KEY,
-                    name            TEXT NOT NULL UNIQUE,
-                    version         INTEGER NOT NULL,
-                    content_hash    TEXT NOT NULL,
-                    size_tokens     INTEGER,
-                    last_writer_id  TEXT,
-                    updated_at      REAL NOT NULL
+                    id               TEXT PRIMARY KEY,
+                    name             TEXT NOT NULL UNIQUE,
+                    version          INTEGER NOT NULL,
+                    owner_generation INTEGER NOT NULL DEFAULT 0,
+                    content_hash     TEXT NOT NULL,
+                    size_tokens      INTEGER,
+                    last_writer_id   TEXT,
+                    updated_at       REAL NOT NULL
                 )
                 """
             )
@@ -264,6 +265,7 @@ class SqliteArtifactRegistry:
                     granted_at_tick      INTEGER,
                     last_reclaim_trigger TEXT,
                     last_reclaim_tick    INTEGER,
+                    read_generation      INTEGER,
                     PRIMARY KEY (artifact_id, agent_id),
                     FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
                 )
@@ -303,9 +305,14 @@ class SqliteArtifactRegistry:
                 )
                 """
             )
+            seed_epoch = uuid4().hex
             c.execute(
-                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
-                ("instance_id", seed_id, "sequence_number", "0"),
+                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?), (?, ?)",
+                (
+                    "instance_id", seed_id,
+                    "sequence_number", "0",
+                    "coordinator_epoch", seed_epoch,
+                ),
             )
             # PRAGMA is transactional inside an explicit BEGIN; cannot take
             # parameter bindings, so SCHEMA_USER_VERSION (int constant) is
@@ -322,6 +329,7 @@ class SqliteArtifactRegistry:
             raise
         self._instance_id = seed_id
         self._seq = 0
+        self._coordinator_epoch = seed_epoch
 
     def _rehydrate_meta(self, instance_id_override: str | None) -> None:
         """Load _instance_id + _seq from registry_meta. Caller holds lock."""
@@ -353,6 +361,48 @@ class SqliteArtifactRegistry:
             )
             """
         )
+        # Read-generation fence (Piece #2) forward-compat: additively add the
+        # fence columns + coordinator_epoch to dbs created before the fence.
+        # user_version stays unchanged (additive, plan option (a); same posture
+        # as pending_notices above) so an older binary can still open the db.
+        self._ensure_fence_columns()
+        epoch_row = self._conn.execute(
+            "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
+        ).fetchone()
+        self._coordinator_epoch = epoch_row[0]
+
+    def _ensure_fence_columns(self) -> None:
+        """Additively add the read-generation fence columns + coordinator_epoch
+        to a pre-fence database. Idempotent (PRAGMA-guarded); user_version stays
+        unchanged. Caller holds the lock; runs in one explicit transaction so a
+        SIGKILL mid-add cannot leave a half-applied column set."""
+        c = self._conn
+        art_cols = {row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()}
+        state_cols = {
+            row[1] for row in c.execute("PRAGMA table_info(agent_states)").fetchall()
+        }
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if "owner_generation" not in art_cols:
+                c.execute(
+                    "ALTER TABLE artifacts ADD COLUMN owner_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "read_generation" not in state_cols:
+                # Nullable: a pre-fence grant captured no generation; NULL is the
+                # absent operand the commit guard rejects.
+                c.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
+            c.execute(
+                "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
+                ("coordinator_epoch", uuid4().hex),
+            )
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     # ------------------------------------------------------------------
     # Connection lifecycle

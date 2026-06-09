@@ -739,3 +739,114 @@ def test_commit_cas_concurrent_writers_exactly_one_wins(db_path: Path) -> None:
         # the loser is elected by the version check, never other_holder).
         assert all(c.reason == "version_mismatch" for c in conflicts)
         assert all(c.current_version == 2 for c in conflicts)
+
+
+# ----------------------------------------------------------------------
+# Read-generation fence (Piece #2) — Unit 2: additive schema, no migration
+# ----------------------------------------------------------------------
+
+
+def _build_pre_fence_db(db_path: Path, art_id: str, ag_id: str) -> None:
+    """Create a v1 state.db with the schema as it existed BEFORE the
+    read-generation fence (no owner_generation / read_generation columns, no
+    coordinator_epoch), with one artifact + one M-grant, user_version = 1."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "CREATE TABLE artifacts (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "version INTEGER NOT NULL, content_hash TEXT NOT NULL, size_tokens INTEGER, "
+            "last_writer_id TEXT, updated_at REAL NOT NULL)"
+        )
+        conn.execute("CREATE INDEX idx_artifacts_name ON artifacts(name)")
+        conn.execute(
+            "CREATE TABLE agent_states (artifact_id TEXT NOT NULL, agent_id TEXT NOT NULL, "
+            "state TEXT NOT NULL, transient_state TEXT, transient_tick INTEGER, "
+            "granted_at_tick INTEGER, last_reclaim_trigger TEXT, last_reclaim_tick INTEGER, "
+            "PRIMARY KEY (artifact_id, agent_id), "
+            "FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE)"
+        )
+        conn.execute(
+            "CREATE TABLE heartbeats (agent_id TEXT PRIMARY KEY, last_tick INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
+            ("instance_id", "fixed-instance", "sequence_number", "7"),
+        )
+        conn.execute(
+            "INSERT INTO artifacts (id, name, version, content_hash, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (art_id, "plan.md", 3, "deadbeef", 1.0),
+        )
+        conn.execute(
+            "INSERT INTO agent_states (artifact_id, agent_id, state) VALUES (?, ?, ?)",
+            (art_id, ag_id, "M"),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def test_fresh_db_has_fence_schema(db_path: Path) -> None:
+    """A freshly initialized db carries the fence columns + coordinator_epoch,
+    and (option (a)) does NOT advance user_version beyond the existing v1."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+        state_cols = {
+            r[1] for r in reg._conn.execute("PRAGMA table_info(agent_states)").fetchall()
+        }
+        assert "owner_generation" in art_cols
+        assert "read_generation" in state_cols
+        assert reg._coordinator_epoch
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
+    """A v1 db created before the fence gains the columns + coordinator_epoch
+    additively on open, WITHOUT a user_version bump; existing rows backfill to
+    owner_generation = 0 / read_generation = NULL, and prior meta is preserved.
+    Re-open is idempotent and the epoch is stable."""
+    art_id, ag_id = str(uuid4()), str(uuid4())
+    _build_pre_fence_db(db_path, art_id, ag_id)
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+        state_cols = {
+            r[1] for r in reg._conn.execute("PRAGMA table_info(agent_states)").fetchall()
+        }
+        assert "owner_generation" in art_cols
+        assert "read_generation" in state_cols
+        # Existing rows backfill: artifact -> 0, grant -> NULL (absent operand).
+        assert (
+            reg._conn.execute(
+                "SELECT owner_generation FROM artifacts WHERE id = ?", (art_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            reg._conn.execute(
+                "SELECT read_generation FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (art_id, ag_id),
+            ).fetchone()[0]
+            is None
+        )
+        # Epoch seeded + loaded; user_version NOT bumped (option (a)).
+        assert reg._coordinator_epoch
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        # Prior meta preserved (no clobber of instance_id / sequence_number).
+        assert reg._instance_id == "fixed-instance"
+        assert reg._seq == 7
+        epoch1 = reg._coordinator_epoch
+
+    # Idempotent re-open: no error, columns intact, epoch stable.
+    with SqliteArtifactRegistry(db_path) as reg2:
+        assert reg2._coordinator_epoch == epoch1
+        art_cols2 = {
+            r[1] for r in reg2._conn.execute("PRAGMA table_info(artifacts)").fetchall()
+        }
+        assert "owner_generation" in art_cols2
