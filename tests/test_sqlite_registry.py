@@ -911,3 +911,42 @@ def test_read_generation_captured_at_claim(db_path: Path) -> None:
         # A fresh re-acquire by a captures the NEW generation (1).
         reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=11)
         assert reg.get_read_generation(art.id, a) == 1
+
+
+def test_commit_cas_fence_rejects_superseded_reader(db_path: Path) -> None:
+    """OCC commit_cas returns ConflictDetail('stale_read_generation') when the
+    committer's read_generation was superseded by a reclaim -- version
+    unchanged, no other holder, so version-CAS cannot catch it (the headline
+    reclaim-zombie case). A re-fetch (fresh read_generation) then wins; a
+    never-fetched committer is rejected as an absent operand."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, c = uuid4(), uuid4()
+
+        # A acquires E (captures read_generation=0), then is reclaimed
+        # (owner_generation -> 1; A's read_generation preserved at 0).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1
+
+        # A commits via OCC: version still matches (1), no other holder, but the
+        # generation fence rejects the superseded read -- no phantom bump.
+        res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
+        assert isinstance(res, ConflictDetail)
+        assert res.reason == "stale_read_generation"
+        assert reg.get_artifact(art.id).version == 1
+
+        # A re-fetches -> fresh read_generation=1 -> the commit now wins.
+        reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=11)
+        res2 = reg.commit_cas(art.id, a, expected_version=1, content_hash="new2")
+        assert not isinstance(res2, ConflictDetail)
+        assert reg.get_artifact(art.id).version == 2
+
+        # A never-claimed committer has no captured claim to supersede, so the
+        # fence does NOT reject it -- version-CAS alone arbitrates (here the
+        # version matches, so it wins). The fence only rejects a captured-then-
+        # superseded read.
+        res3 = reg.commit_cas(art.id, c, expected_version=2, content_hash="x")
+        assert not isinstance(res3, ConflictDetail)
+        assert reg.get_artifact(art.id).version == 3

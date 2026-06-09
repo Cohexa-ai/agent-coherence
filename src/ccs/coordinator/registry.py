@@ -111,9 +111,9 @@ class ArtifactRegistry:
         return self._records[artifact_id].owner_generation
 
     def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> Optional[int]:
-        """Return the generation an agent captured at its last claim, or None
-        (the absent operand the commit guard rejects) if it never established
-        one."""
+        """Return the generation an agent captured at its last claim, or None if
+        it never established a fence claim (a plain OCC writer that version-CAS,
+        not the fence, arbitrates)."""
         return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
     def set_artifact_and_content(
@@ -279,6 +279,18 @@ class ArtifactRegistry:
         )
         if other_holder:
             return ConflictDetail("other_holder", current)
+
+        # Read-generation fence: reject a committer whose CAPTURED read-claim
+        # was superseded by a sweep reclamation. A reclaimed M/E holder kept its
+        # stale read_generation (captured at acquire), so it is caught here even
+        # though the version is unchanged and no peer holds M/E -- exactly what
+        # version-CAS cannot catch. An ABSENT read_generation means the committer
+        # never established a fence claim: a plain OCC writer whose lost-update
+        # protection is version-CAS (checked above), so it is admitted. Strict->;
+        # equality admits. Server-side; no commit_cas signature change.
+        read_gen = record.read_generation_by_agent.get(agent_id)
+        if read_gen is not None and read_gen < record.owner_generation:
+            return ConflictDetail("stale_read_generation", current)
 
         # ---- WIN ----
         next_version = current + 1

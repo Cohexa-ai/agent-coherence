@@ -421,9 +421,9 @@ class SqliteArtifactRegistry:
             return row[0]
 
     def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
-        """Return the generation an agent captured at its last claim, or None
-        (the absent operand the commit guard rejects) if it never established
-        one."""
+        """Return the generation an agent captured at its last claim, or None if
+        it never established a fence claim (a plain OCC writer that version-CAS,
+        not the fence, arbitrates)."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT read_generation FROM agent_states "
@@ -1175,6 +1175,28 @@ class SqliteArtifactRegistry:
                 if other_holder is not None:
                     self._conn.execute("COMMIT")
                     return ConflictDetail("other_holder", current)
+
+                # Read-generation fence: reject a committer whose CAPTURED
+                # read-claim was superseded by a sweep reclamation (a reclaimed
+                # M/E holder kept its stale read_generation -- version unchanged,
+                # no other M/E holder, so version-CAS cannot catch it). An ABSENT
+                # read_generation (missing row or NULL) means a plain OCC writer
+                # that never established a fence claim -- version-CAS protects it,
+                # so admit. Strict->; equality admits. Server-side, no signature
+                # change.
+                rg_row = self._conn.execute(
+                    "SELECT read_generation FROM agent_states "
+                    "WHERE artifact_id = ? AND agent_id = ?",
+                    (artifact_id.hex, agent_id.hex),
+                ).fetchone()
+                if rg_row is not None and rg_row[0] is not None:
+                    owner_gen = self._conn.execute(
+                        "SELECT owner_generation FROM artifacts WHERE id = ?",
+                        (artifact_id.hex,),
+                    ).fetchone()[0]
+                    if rg_row[0] < owner_gen:
+                        self._conn.execute("COMMIT")
+                        return ConflictDetail("stale_read_generation", current)
 
                 # ---- WIN: mutate atomically ----
                 next_version = current + 1
