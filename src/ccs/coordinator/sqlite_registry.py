@@ -74,6 +74,7 @@ from typing import Any, Callable, Iterable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.states import MESIState, TransientState
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
@@ -518,14 +519,40 @@ class SqliteArtifactRegistry:
         content: str,
         *,
         last_writer: Optional[UUID] = None,
+        fence_agent_id: Optional[UUID] = None,
     ) -> None:
         """Replace artifact metadata for an existing record. ``content`` is
         ignored per KTD-13 — content_hash on the artifact is the source of
-        truth for staleness comparison."""
+        truth for staleness comparison.
+
+        Read-generation fence (pessimistic ``commit()`` path): when
+        ``fence_agent_id`` is given, reject -- atomically with the version
+        persist in this BEGIN IMMEDIATE -- if that committer's captured
+        read_generation was superseded by a sweep reclamation. A ``None``
+        fence_agent_id (source-churn) is unguarded."""
         del content  # KTD-13: not persisted
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if fence_agent_id is not None:
+                    rg_row = self._conn.execute(
+                        "SELECT read_generation FROM agent_states "
+                        "WHERE artifact_id = ? AND agent_id = ?",
+                        (artifact_id.hex, fence_agent_id.hex),
+                    ).fetchone()
+                    if rg_row is not None and rg_row[0] is not None:
+                        owner_gen = self._conn.execute(
+                            "SELECT owner_generation FROM artifacts WHERE id = ?",
+                            (artifact_id.hex,),
+                        ).fetchone()[0]
+                        if rg_row[0] < owner_gen:
+                            # Raise inside the try; the except below ROLLBACKs
+                            # and re-raises (no double rollback).
+                            raise StaleReadGeneration(
+                                f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
+                                f"artifact={artifact_id} read_gen={rg_row[0]} "
+                                f"owner_gen={owner_gen}"
+                            )
                 self._conn.execute(
                     """
                     UPDATE artifacts

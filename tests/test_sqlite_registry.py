@@ -950,3 +950,40 @@ def test_commit_cas_fence_rejects_superseded_reader(db_path: Path) -> None:
         res3 = reg.commit_cas(art.id, c, expected_version=2, content_hash="x")
         assert not isinstance(res3, ConflictDetail)
         assert reg.get_artifact(art.id).version == 3
+
+
+def test_set_artifact_and_content_fence_rejects_stale_committer(db_path: Path) -> None:
+    """The pessimistic guarded primitive (set_artifact_and_content with
+    fence_agent_id) rejects a committer whose captured read_generation was
+    superseded by a reclaim, atomically with the version persist -- closing the
+    commit() race. A fresh committer persists; committer=None is unguarded."""
+    from ccs.core.exceptions import StaleReadGeneration
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b = uuid4(), uuid4()
+
+        # a acquires E (read_generation=0), then is reclaimed (owner_generation
+        # -> 1; a's read_generation preserved at 0).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+
+        # a's guarded persist is rejected; the version does NOT advance.
+        stale = Artifact(id=art.id, name="plan.md", version=2, content_hash="stale")
+        with pytest.raises(StaleReadGeneration):
+            reg.set_artifact_and_content(art.id, stale, "x", last_writer=a, fence_agent_id=a)
+        assert reg.get_artifact(art.id).version == 1
+
+        # b acquires E AFTER the reclaim -> captures the current generation (1)
+        # -> its guarded persist succeeds.
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        ok = Artifact(id=art.id, name="plan.md", version=2, content_hash="ok")
+        reg.set_artifact_and_content(art.id, ok, "x", last_writer=b, fence_agent_id=b)
+        assert reg.get_artifact(art.id).version == 2
+
+        # committer=None (external source churn) is unguarded -- persists even
+        # though no agent established a claim.
+        src = Artifact(id=art.id, name="plan.md", version=3, content_hash="src")
+        reg.set_artifact_and_content(art.id, src, "x")
+        assert reg.get_artifact(art.id).version == 3

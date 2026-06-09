@@ -337,6 +337,10 @@ class CoordinatorService:
             updated,
             content,
             last_writer=agent_id,
+            # Read-generation fence: reject atomically with the version bump if a
+            # sweep reclaimed this committer in the race window between the
+            # get_agent_state check above and here (raises StaleReadGeneration).
+            fence_agent_id=agent_id,
         )
 
         signals: list[InvalidationSignal] = []

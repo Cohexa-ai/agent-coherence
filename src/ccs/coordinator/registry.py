@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.states import MESIState, TransientState
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
@@ -123,13 +124,30 @@ class ArtifactRegistry:
         content: str,
         *,
         last_writer: Optional[UUID] = None,
+        fence_agent_id: Optional[UUID] = None,
     ) -> None:
-        """Replace artifact metadata/content for an existing record."""
+        """Replace artifact metadata/content for an existing record.
+
+        Read-generation fence (pessimistic ``commit()`` path): when
+        ``fence_agent_id`` is given, reject -- atomically (GIL) with the persist
+        -- if that committer's captured read_generation was superseded by a
+        sweep reclamation (the race the service's earlier get_agent_state check
+        misses). A ``None`` fence_agent_id (source-churn) is unguarded.
+        """
+        record = self._records[artifact_id]
+        if fence_agent_id is not None:
+            read_gen = record.read_generation_by_agent.get(fence_agent_id)
+            if read_gen is not None and read_gen < record.owner_generation:
+                raise StaleReadGeneration(
+                    f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
+                    f"artifact={artifact_id} read_gen={read_gen} "
+                    f"owner_gen={record.owner_generation}"
+                )
         if self._retain_versions:
-            self._records[artifact_id].version_history[artifact.version] = content
-        self._records[artifact_id].artifact = artifact
-        self._records[artifact_id].content = content
-        self._records[artifact_id].last_writer = last_writer
+            record.version_history[artifact.version] = content
+        record.artifact = artifact
+        record.content = content
+        record.last_writer = last_writer
 
     def get_content_at_version(self, artifact_id: UUID, version: int) -> str | None:
         """Return content for a specific version, if retained."""
