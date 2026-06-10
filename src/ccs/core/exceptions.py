@@ -13,9 +13,29 @@ from __future__ import annotations
 # reword on one side would otherwise silently break the other's retry routing.
 OCC_CALLER_TRANSIENT_REASON = "caller_in_transient_state"
 
+# Read-generation fence (Piece #2): the reason a commit is rejected because the
+# committer's read_generation is older than the artifact's current
+# owner_generation -- its captured claim was superseded by a sweep reclamation.
+# Retry-eligible (reacquire + fresh read + re-commit). Shared by the
+# ConflictDetail reason (OCC path) and the StaleReadGeneration exception
+# (pessimistic path) so the two surfaces cannot drift.
+STALE_READ_GENERATION_REASON = "stale_read_generation"
+
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
+
+
+class StaleReadGeneration(CoherenceError):
+    """The read-generation fence rejected a commit: the committer's
+    read_generation is older than the artifact's current owner_generation --
+    its captured ownership/read-claim was superseded by a sweep reclamation.
+
+    Raised on the pessimistic ``commit()`` path; the OCC
+    ``commit_cas`` path returns a :class:`ConflictDetail` with the same reason
+    instead. Retry-eligible: ``reacquire()`` + fresh read + re-commit. Carries
+    ``STALE_READ_GENERATION_REASON`` so the client classifier matches it
+    exactly (never on the human message)."""
 
 
 class OccCallerTransientError(CoherenceError):

@@ -62,8 +62,10 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
+    STALE_READ_GENERATION_REASON,
     CoherenceError,
     OccCallerTransientError,
+    StaleReadGeneration,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import ConflictDetail
@@ -1653,6 +1655,17 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 issued_at_tick=now,
                 content_hash=content_hash,
             )
+        except StaleReadGeneration:
+            # Read-generation fence: a sweep reclaimed this committer in the race
+            # window between its grant and this commit. Surface the STABLE machine
+            # reason (not str(exc)) so the client classifier matches exactly. The
+            # reclaim already released the grant, so there is nothing to release
+            # here. The {ok: false} body reads as a definite reject (fail-closed).
+            current_artifact = coordinator.registry.get_artifact(artifact_id)
+            body: dict = {"ok": False, "reason": STALE_READ_GENERATION_REASON}
+            if current_artifact is not None:
+                body["current_version"] = current_artifact.version
+            return body
         except CoherenceError as exc:
             # A1 + F4: if this commit failed because the grant was preempted
             # silently, enrich the reason with the preemption context so
@@ -1719,8 +1732,10 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     - WIN → ``{ok: true, version: N+1}``.
     - :class:`~ccs.core.types.ConflictDetail` → ``{ok: false,
-      reason: "version_mismatch"|"other_holder", current_version: N}`` — a
-      clean typed conflict, NOT a degrade. The client re-reads + retries.
+      reason: "version_mismatch"|"other_holder"|"stale_read_generation",
+      current_version: N}`` — a clean typed conflict, NOT a degrade. The client
+      re-reads + retries. ``stale_read_generation`` is the read-generation
+      fence: the caller's captured claim was superseded by a sweep reclamation.
     - retry-eligible transient precondition
       (:class:`~ccs.core.exceptions.OccCallerTransientError`: a peer
       invalidated the caller between its read and this CAS) → ``{ok: false,

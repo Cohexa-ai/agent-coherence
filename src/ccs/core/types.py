@@ -44,7 +44,7 @@ class ConflictDetail:
 
     Returned (never raised) by the registry ``commit_cas`` primitive and the
     service ``commit_cas`` orchestration when a compare-and-swap loses the
-    race (OCC write API, plan R2 / R-OCC-2). The two retry-eligible reasons:
+    race (OCC write API, plan R2 / R-OCC-2). The three retry-eligible reasons:
 
     - ``"version_mismatch"`` — the caller's ``expected_version`` is *behind*
       the registry's current version (another writer committed first). Two
@@ -53,6 +53,12 @@ class ConflictDetail:
     - ``"other_holder"`` — the version matched, but a *pessimistic* peer holds
       MODIFIED or EXCLUSIVE during the OCC compute window (OCC-vs-pessimistic
       coexistence guard). Not how two OCC writers are arbitrated.
+    - ``"stale_read_generation"`` — the version matched and no peer holds M/E,
+      but the committer's CAPTURED read_generation was superseded by a sweep
+      reclamation — the read-generation fence (Piece #2). Only the generation
+      catches this; version-CAS cannot (the version is unchanged on a
+      no-successor reclaim). An absent read_generation is NOT this conflict
+      (a plain OCC writer is arbitrated by version-CAS).
 
     Both are retry-eligible (re-read → recompute → retry). ``current_version``
     is the registry's authoritative version at the point the conflict was
@@ -61,7 +67,7 @@ class ConflictDetail:
     ``ConflictDetail``) and the service layer raises ``CoherenceError`` for it.
     """
 
-    reason: Literal["version_mismatch", "other_holder"]
+    reason: Literal["version_mismatch", "other_holder", "stale_read_generation"]
     current_version: int
 
 

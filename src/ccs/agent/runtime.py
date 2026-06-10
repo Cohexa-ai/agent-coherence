@@ -91,7 +91,18 @@ class AgentRuntime:
         content_hash: str | None = None,
         size_tokens: int | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
-        """Write new artifact content through coordinator protocol."""
+        """Write new artifact content through coordinator protocol.
+
+        Raises:
+            StaleReadGeneration: the read-generation fence rejected the commit —
+                a sweep reclaimed this agent's claim in the race window between
+                acquire and commit (``ccs.core.exceptions``). Retry-eligible,
+                but THIS path has no built-in retry loop (unlike ``write_cas``):
+                the caller re-acquires / re-reads and calls ``write()`` again.
+            CoherenceError: the grant was already reclaimed before commit (the
+                error names the reclaim trigger and tick), or another protocol
+                precondition failed.
+        """
         if content_hash is not None:
             computed = compute_content_hash(content)
             if content_hash != computed:

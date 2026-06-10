@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
@@ -16,6 +17,27 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 
 ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
+
+# The coordinator-side EVICTION triggers: the stable-grant sweep
+# (CoordinatorService.enforce_stable_grant_timeouts -> reclaim_heartbeat /
+# reclaim_max_hold) and the transient-timeout fail-safe
+# (enforce_transient_timeouts -> "timeout"). An M/E -> INVALID transition
+# carrying one of these bumps the artifact's owner_generation (the
+# read-generation fence) -- the holder's claim was revoked WITHOUT a version
+# move, which is exactly what version-CAS cannot see. A peer-invalidation
+# INVALID (any other trigger) does NOT bump: that path moves the version, so
+# version-CAS already catches a stale write. Duplicated in
+# SqliteArtifactRegistry; pinned equal by the parity test.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset(
+    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
+)
+
+# Triggers that mark a GENUINE content read for read-generation capture (the
+# E/M-acquire capture is keyed on the state transition, not the trigger).
+# Service.fetch() emits "fetch"; a rename there without updating this constant
+# would silently disable capture on reads -- pinned equal across registries by
+# the parity test, same discipline as RECLAIM_TRIGGERS.
+CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 # OCC commit-CAS result (plan Unit 2) — parity with SqliteArtifactRegistry.
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
@@ -36,6 +58,14 @@ class ArtifactRecord:
     version_history: dict[int, str] = field(default_factory=dict)
     granted_at_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
     last_reclamation_by_agent: dict[UUID, ReclamationSlot] = field(default_factory=dict)
+    # Read-generation fence (single-host Piece #2). owner_generation is the
+    # per-artifact ownership epoch, bumped on every sweep reclamation;
+    # read_generation_by_agent[ag] is the owner_generation an agent captured
+    # when it last established its write-claim (a genuine read OR an E/M
+    # acquire). An ABSENT key (== None) is the absent operand => reject at
+    # commit. The counter only grows (resets to 0 per construction in-memory).
+    owner_generation: int = 0
+    read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -59,6 +89,13 @@ class ArtifactRegistry:
         self._state_log = state_log
         self._agent_names = agent_names
         self._instance_id: str = instance_id if instance_id is not None else str(uuid4())
+        # coordinator_epoch: seeded for the CROSS-HOST fence follow-on
+        # (demand-gated; a client-carried token would compare it). NOT used in
+        # any guard yet -- the single-host fence keys only on owner_generation,
+        # and a wiped/recreated store also wipes the read_generation rows, so
+        # there is no pre-wipe claim for an epoch to fail. Kept so the durable
+        # store identity exists from day one.
+        self._coordinator_epoch: str = uuid4().hex
         self._seq: int = 0
         self._retain_versions = retain_versions
 
@@ -87,6 +124,16 @@ class ArtifactRegistry:
         record = self._records.get(artifact_id)
         return record.content if record else None
 
+    def get_owner_generation(self, artifact_id: UUID) -> int:
+        """Return the artifact's ownership epoch (read-generation fence)."""
+        return self._records[artifact_id].owner_generation
+
+    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the generation an agent captured at its last claim, or None if
+        it never established a fence claim (a plain OCC writer that version-CAS,
+        not the fence, arbitrates)."""
+        return self._records[artifact_id].read_generation_by_agent.get(agent_id)
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,
@@ -94,13 +141,30 @@ class ArtifactRegistry:
         content: str,
         *,
         last_writer: Optional[UUID] = None,
+        fence_agent_id: Optional[UUID] = None,
     ) -> None:
-        """Replace artifact metadata/content for an existing record."""
+        """Replace artifact metadata/content for an existing record.
+
+        Read-generation fence (pessimistic ``commit()`` path): when
+        ``fence_agent_id`` is given, reject -- atomically (GIL) with the persist
+        -- if that committer's captured read_generation was superseded by a
+        sweep reclamation (the race the service's earlier get_agent_state check
+        misses). A ``None`` fence_agent_id (source-churn) is unguarded.
+        """
+        record = self._records[artifact_id]
+        if fence_agent_id is not None:
+            read_gen = record.read_generation_by_agent.get(fence_agent_id)
+            if read_gen is not None and read_gen < record.owner_generation:
+                raise StaleReadGeneration(
+                    f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
+                    f"artifact={artifact_id} read_gen={read_gen} "
+                    f"owner_gen={record.owner_generation}"
+                )
         if self._retain_versions:
-            self._records[artifact_id].version_history[artifact.version] = content
-        self._records[artifact_id].artifact = artifact
-        self._records[artifact_id].content = content
-        self._records[artifact_id].last_writer = last_writer
+            record.version_history[artifact.version] = content
+        record.artifact = artifact
+        record.content = content
+        record.last_writer = last_writer
 
     def get_content_at_version(self, artifact_id: UUID, version: int) -> str | None:
         """Return content for a specific version, if retained."""
@@ -152,6 +216,24 @@ class ArtifactRegistry:
                 record.last_reclamation_by_agent.pop(agent_id, None)
         elif prev_in_me:
             record.granted_at_tick_by_agent.pop(agent_id, None)
+            # Read-generation fence: a sweep reclamation of this M/E grant bumps
+            # the artifact's ownership epoch, atomically (GIL) with the INVALID
+            # transition, so a commit by the reclaimed (or any pre-reclaim)
+            # holder fails the generation check. Only sweep triggers bump.
+            if trigger in RECLAIM_TRIGGERS:
+                record.owner_generation += 1
+
+        # Read-generation fence: capture the current ownership epoch into the
+        # agent's read_generation when it establishes/refreshes a write-claim --
+        # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
+        # content read) or a genuine fetch read. Atomic (GIL) with the grant.
+        # The INVALID guard hardens the fetch leg: no current fetch path grants
+        # INVALID, but a future cache-miss-INVALID fetch must not mint a fresh
+        # claim for an unfenced zombie.
+        if (new_in_me and not prev_in_me) or (
+            trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+        ):
+            record.read_generation_by_agent[agent_id] = record.owner_generation
 
         if self._state_log is not None:
             self._seq += 1
@@ -237,6 +319,18 @@ class ArtifactRegistry:
         )
         if other_holder:
             return ConflictDetail("other_holder", current)
+
+        # Read-generation fence: reject a committer whose CAPTURED read-claim
+        # was superseded by a sweep reclamation. A reclaimed M/E holder kept its
+        # stale read_generation (captured at acquire), so it is caught here even
+        # though the version is unchanged and no peer holds M/E -- exactly what
+        # version-CAS cannot catch. An ABSENT read_generation means the committer
+        # never established a fence claim: a plain OCC writer whose lost-update
+        # protection is version-CAS (checked above), so it is admitted. Strict->;
+        # equality admits. Server-side; no commit_cas signature change.
+        read_gen = record.read_generation_by_agent.get(agent_id)
+        if read_gen is not None and read_gen < record.owner_generation:
+            return ConflictDetail("stale_read_generation", current)
 
         # ---- WIN ----
         next_version = current + 1

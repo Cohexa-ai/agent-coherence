@@ -67,6 +67,7 @@ from ccs.cli._coherence_client import (
 )
 from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
+    STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
     CoherenceDegradedWarning,
     CoherenceError,
@@ -903,7 +904,15 @@ class CoherentVolume:
     # The transient literal is the SHARED constant the coordinator server emits,
     # so a reword on either side can't drift the retry classification.
     _CAS_RETRY_REASONS: frozenset[str] = frozenset(
-        {"version_mismatch", "other_holder", OCC_CALLER_TRANSIENT_REASON}
+        {
+            "version_mismatch",
+            "other_holder",
+            OCC_CALLER_TRANSIENT_REASON,
+            # Read-generation fence: a reclaimed reader's OCC commit_cas returns
+            # ConflictDetail("stale_read_generation"); retry via reacquire +
+            # fresh read (the next fetch captures the current generation).
+            STALE_READ_GENERATION_REASON,
+        }
     )
 
     def _classify_cas_response(self, resp: dict) -> Literal["win", "conflict", "raise"]:
@@ -913,7 +922,10 @@ class CoherentVolume:
         - ``ok: false`` with a retry-eligible reason → ``"conflict"`` (reacquire
           + retry). Matched EXACTLY against :attr:`_CAS_RETRY_REASONS`: the
           typed ``ConflictDetail`` reasons (``version_mismatch`` /
-          ``other_holder``) AND ``caller_in_transient_state`` — when a peer
+          ``other_holder`` / ``stale_read_generation`` — the read-generation
+          fence: the caller's captured claim was superseded by a sweep
+          reclamation; a reacquire + fresh read mints a current claim)
+          AND ``caller_in_transient_state`` — when a peer
           invalidates this instance in the window BETWEEN its fresh read and its
           CAS, the coordinator leaves an invalidation transient that
           ``commit_cas`` rejects as a precondition; that is a lost race, not

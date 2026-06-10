@@ -16,6 +16,7 @@ from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
     CoherenceError,
     OccCallerTransientError,
+    StaleReadGeneration,
 )
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
@@ -301,7 +302,18 @@ class CoordinatorService:
         content_hash: str | None = None,
         size_tokens: int | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
-        """Commit modified content, increment version, and invalidate peers."""
+        """Commit modified content, increment version, and invalidate peers.
+
+        Raises:
+            CoherenceError: the committer does not hold M/E (e.g. its grant was
+                already reclaimed — the error names the reclaim trigger/tick).
+            StaleReadGeneration: the read-generation fence fired — a sweep
+                reclaimed this committer in the race window between the state
+                check above and the version persist (``ccs.core.exceptions``).
+                Retry-eligible: ``reacquire()`` / re-acquire, take a fresh read,
+                and re-commit; there is no built-in retry loop on this path
+                (unlike ``write_cas``).
+        """
         artifact = self._require_artifact(artifact_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
@@ -332,12 +344,25 @@ class CoordinatorService:
             size_tokens=size_tokens if size_tokens is not None else artifact.size_tokens,
             depends_on=artifact.depends_on,
         )
-        self.registry.set_artifact_and_content(
-            artifact_id,
-            updated,
-            content,
-            last_writer=agent_id,
-        )
+        try:
+            self.registry.set_artifact_and_content(
+                artifact_id,
+                updated,
+                content,
+                last_writer=agent_id,
+                # Read-generation fence: reject atomically with the version bump
+                # if a sweep reclaimed this committer in the race window between
+                # the get_agent_state check above and here.
+                fence_agent_id=agent_id,
+            )
+        except StaleReadGeneration:
+            # The MWB transient set above must not outlive a fence reject:
+            # a stuck MWB blocks this agent's next commit_cas (transient
+            # precondition) and makes the stable-grant sweep skip the pair
+            # until the transient timeout. The reclaim already dropped the
+            # grant, so clearing the transient is the only cleanup needed.
+            self.registry.clear_agent_transient(artifact_id, agent_id)
+            raise
 
         signals: list[InvalidationSignal] = []
         for peer_id, state in self.registry.get_state_map(artifact_id).items():
@@ -408,9 +433,12 @@ class CoordinatorService:
         - :class:`CasCorruption` (``expected_version > current``) → raise
           ``CoherenceError`` — corruption / a second coordinator on the store,
           non-retryable.
-        - :class:`ConflictDetail` (``version_mismatch`` / ``other_holder``) →
-          returned UNCHANGED, with **no mutation and no invalidation signals**
-          (it is a typed return, never an exception).
+        - :class:`ConflictDetail` (``version_mismatch`` / ``other_holder`` /
+          ``stale_read_generation``) → returned UNCHANGED, with **no mutation
+          and no invalidation signals** (it is a typed return, never an
+          exception). ``stale_read_generation`` is the read-generation fence:
+          the committer's captured claim was superseded by a sweep reclamation;
+          retry-eligible via reacquire + fresh read.
         - WIN ``(updated_artifact, invalidated_ids)`` → the registry has already
           done the peer-invalidation + committer S/I→SHARED transition
           atomically (the OCC writer holds no grant, so it ends SHARED — which

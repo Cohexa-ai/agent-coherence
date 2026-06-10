@@ -1338,3 +1338,23 @@ def test_read_outside_root_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> 
             vol.read("/etc/hostname")  # absolute, outside the workspace root
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_stale_read_generation_is_cas_retry_eligible() -> None:
+    """The read-generation fence reject reason is retry-eligible on the OCC
+    cross-process path (reacquire + fresh read) -- classified 'conflict', not a
+    terminal 'raise', and matched EXACTLY against the shared constant. Tested
+    spawn-free: _classify_cas_response reads only the class attr."""
+    from unittest.mock import MagicMock
+
+    from ccs.core.exceptions import STALE_READ_GENERATION_REASON
+
+    assert STALE_READ_GENERATION_REASON in CoherentVolume._CAS_RETRY_REASONS
+    classify = CoherentVolume._classify_cas_response
+    # spec'd mock: any future self-attribute the classifier grows raises
+    # AttributeError here instead of silently returning a MagicMock value.
+    stub = MagicMock(spec=CoherentVolume)
+    stub._CAS_RETRY_REASONS = CoherentVolume._CAS_RETRY_REASONS
+    assert classify(stub, {"ok": False, "reason": STALE_READ_GENERATION_REASON}) == "conflict"
+    assert classify(stub, {"ok": True}) == "win"
+    assert classify(stub, {"ok": False, "reason": "commit_cas_corruption"}) == "raise"
