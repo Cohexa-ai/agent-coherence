@@ -6,7 +6,19 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Added
+
+- **Concurrent lost-update demo** (`examples/concurrent_writers/`): a true-race
+  reproduction of the v0.9.1 commit-CAS write path. Two threads update a shared
+  total concurrently; `broken.py` loses an update (last writer wins over a plain
+  file), `fixed.py` runs the identical race through `CoherentVolume.write_cas` and
+  preserves both (the loser is told `version_mismatch`, reacquires, and re-applies
+  on the winner's value via its `make_content` closure). The rung-2 (concurrent,
+  single-host) analog of the rung-1 sequential `examples/coherent_volume` demo —
+  it surfaces the race the invalidation-deny model cannot catch. Offline; the
+  fixed case spawns a local coordinator subprocess. Run:
+  `python -m examples.concurrent_writers.main`. Tests:
+  `tests/test_concurrent_writers_demo.py`.
 
 ## [0.9.1] — 2026-06-10
 
