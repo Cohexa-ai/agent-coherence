@@ -291,7 +291,15 @@ class RecordingSession:
     _writers: dict[str, _StreamWriter] = field(default_factory=dict, init=False)
 
     def __enter__(self) -> "RecordingSession":
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        # Owner-only (0o700) to match the 0o600 stream-file mode in
+        # _open_stream: traces carry artifact UUIDs + content hashes, so the
+        # directory is default-deny too — without it, group/other could
+        # enumerate stream filenames and sizes even though the files
+        # themselves stay unreadable. umask only narrows this mode (0o700
+        # has no group/other bits to clear); a pre-existing dir keeps its
+        # mode (exist_ok does not re-chmod), matching the diagnose/* and
+        # adapters/* mkdir convention.
+        self.session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Refuse-if-exists (Gated #2): a prior capture's manifest at this
         # path means a second record_to would silently interleave JSONL
         # entries from two coordinator instances; replay would later

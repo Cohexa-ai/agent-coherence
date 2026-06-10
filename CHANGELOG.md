@@ -8,6 +8,46 @@ Alpha — APIs may change before `v1.0`.
 
 (Nothing yet.)
 
+## [0.9.1] — 2026-06-10
+
+Two write-correctness mechanisms land, both model-checked with TLA⁺: an
+**optimistic commit-CAS write path** (`NoLostUpdate`) and a **read-generation
+fence** (`NoStaleApply`).
+
+**Optimistic concurrency (commit-CAS).** `CoordinatorService.commit_cas` and
+`AgentRuntime.write_cas` commit a write only if the artifact version still
+equals the version the writer read. Concurrent same-key writers resolve to one
+winner; losers get a typed, retryable `ConflictDetail` (`version_mismatch` /
+`other_holder`) instead of a silent lost update. The cross-process path ships
+as the coordinator's `/hooks/post-edit-cas` endpoint plus
+`CoherentVolume.write_cas` (bounded reacquire-and-retry, fail-closed). A caller
+invalidated between its read and its CAS gets the stable
+`caller_in_transient_state` reason — a lost race, not corruption. Spec:
+`formal/tla/OCC.tla`.
+
+**Read-generation fence.** Closes the reclaim-zombie window a version check
+cannot see: a writer whose grant was evicted (crash-recovery sweep or the
+transient-timeout fail-safe) can no longer land a commit while the version is
+unchanged. Each artifact carries an `owner_generation` bumped on every
+coordinator-side eviction; every claim captures a server-side
+`read_generation`; both commit paths reject a superseded claim atomically with
+the version persist — `StaleReadGeneration` on the pessimistic path,
+`ConflictDetail` (`stale_read_generation`) on the CAS path; both retry-eligible
+after a fresh read. No public write API accepts a generation argument
+(CI-enforced). The SQLite schema gains the fence columns additively: pre-fence
+databases upgrade in place on open, and older binaries can still open upgraded
+databases. Spec: `formal/tla/Fencing.tla`.
+
+**`CoherentVolume` fixes.** `write()` no longer skips the disk write when its
+cached hash matches but the on-disk bytes diverged; and the EXCLUSIVE grant is
+released on any error in the post-grant window, so an `OSError` mid-write can
+no longer orphan a grant.
+
+**Hardening and docs.** The replay recorder creates its session directory with
+mode `0o700`. The README now leads with the verified guarantee set, and
+`formal/tla/README.md` documents all four specs (MESI, CrashRecovery, OCC,
+Fencing) with CI budgets and mutant-testing recipes.
+
 ## [0.9.0] — 2026-06-07
 
 The first minor release since the v0.8 series. Three themes: the crash-recovery

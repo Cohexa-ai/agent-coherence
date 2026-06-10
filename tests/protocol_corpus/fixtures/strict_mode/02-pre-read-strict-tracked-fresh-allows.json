@@ -15,6 +15,7 @@
       "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
     }
   },
+  "optional_keys": ["version"],
   "expected": {
     "status": 200,
     "body": {"status": "fresh"}

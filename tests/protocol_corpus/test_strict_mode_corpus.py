@@ -70,7 +70,9 @@ def test_strict_mode_fixture_response_matches_expected(
 
     expected_status = fixture.expected["status"]
     expected_body = normalize_response(
-        fixture.expected["body"], ignore_keys=fixture.ignore_keys
+        fixture.expected["body"],
+        ignore_keys=fixture.ignore_keys,
+        optional_keys=fixture.optional_keys,
     )
 
     assert actual_status == expected_status, (

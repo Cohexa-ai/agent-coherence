@@ -25,7 +25,7 @@ from ccs.coordinator.sqlite_registry import (
     SqliteArtifactRegistry,
 )
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 
 @pytest.fixture
@@ -467,3 +467,547 @@ def test_cor04_resolve_or_register_post_rollback_delete_raises_runtime_error(
             reg._conn = real_conn
     finally:
         reg.close()
+
+
+# --------------------------------------------------------------------
+# OCC commit-CAS (plan Unit 2)
+# --------------------------------------------------------------------
+
+
+def _seed_artifact_with_shared_writer(
+    reg: SqliteArtifactRegistry, *, version: int = 1
+) -> tuple[UUID, UUID]:
+    """Register an artifact at ``version`` and put one agent in SHARED (the OCC
+    writer's pre-commit state). Returns ``(artifact_id, agent_id)``."""
+    art = _make_artifact(version=version, content_hash="h-init")
+    reg.register_artifact(art, content="")
+    agent = uuid4()
+    reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)
+    return art.id, agent
+
+
+def test_commit_cas_happy_bumps_version_and_shares(db_path: Path) -> None:
+    """expected == current, no other E/M holder → version N+1, agent SHARED."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=1)
+        result = reg.commit_cas(
+            artifact_id, agent, expected_version=1, content_hash="h-new", tick=7
+        )
+        assert isinstance(result, tuple)
+        updated, invalidated = result
+        assert updated.version == 2
+        assert updated.content_hash == "h-new"
+        assert invalidated == []
+        # An OCC writer holds no grant — it ends SHARED (not MODIFIED), and
+        # SHARED is not an M∪E acquire so no granted_at_tick slot is set.
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
+        assert reg.granted_at_tick(agent, artifact_id) is None
+        # last_writer recorded on the artifact row.
+        assert reg.last_writer_for(artifact_id) == agent
+
+
+def test_commit_cas_invalidates_non_invalid_peers(db_path: Path) -> None:
+    """WIN invalidates every non-INVALID peer; returns their ids for signals."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=1)
+        peer_shared = uuid4()
+        peer_invalid = uuid4()
+        reg.set_agent_state(artifact_id, peer_shared, MESIState.SHARED, tick=2)
+        reg.set_agent_state(artifact_id, peer_invalid, MESIState.SHARED, tick=2)
+        reg.set_agent_state(artifact_id, peer_invalid, MESIState.INVALID, tick=3)
+
+        updated, invalidated = reg.commit_cas(
+            artifact_id, agent, expected_version=1, content_hash="h-new", tick=9
+        )
+        assert updated.version == 2
+        # Only the still-valid peer is invalidated; the already-INVALID one is not.
+        assert invalidated == [peer_shared]
+        assert reg.get_agent_state(artifact_id, peer_shared) == MESIState.INVALID
+        assert reg.get_agent_state(artifact_id, agent) == MESIState.SHARED
+
+
+def test_commit_cas_version_mismatch_no_mutation(db_path: Path) -> None:
+    """expected < current → version_mismatch ConflictDetail, NO mutation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, _ = _seed_artifact_with_shared_writer(reg, version=5)
+        loser = uuid4()
+        reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
+        result = reg.commit_cas(
+            artifact_id, loser, expected_version=3, content_hash="h-stale", tick=10
+        )
+        assert result == ConflictDetail("version_mismatch", 5)
+        # No mutation: version unchanged, content_hash unchanged, state SHARED.
+        art = reg.get_artifact(artifact_id)
+        assert art.version == 5
+        assert art.content_hash == "h-init"
+        assert reg.get_agent_state(artifact_id, loser) == MESIState.SHARED
+
+
+def test_commit_cas_other_holder_no_mutation(db_path: Path) -> None:
+    """version matches but another agent holds E/M → other_holder, NO mutation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, occ_writer = _seed_artifact_with_shared_writer(reg, version=1)
+        pessimistic = uuid4()
+        reg.set_agent_state(artifact_id, pessimistic, MESIState.EXCLUSIVE, tick=2)
+        result = reg.commit_cas(
+            artifact_id, occ_writer, expected_version=1, content_hash="h-new", tick=11
+        )
+        assert result == ConflictDetail("other_holder", 1)
+        assert reg.get_artifact(artifact_id).version == 1
+        assert reg.get_agent_state(artifact_id, occ_writer) == MESIState.SHARED
+        # The pessimistic holder is untouched.
+        assert reg.get_agent_state(artifact_id, pessimistic) == MESIState.EXCLUSIVE
+
+
+def test_commit_cas_modified_peer_also_trips_other_holder(db_path: Path) -> None:
+    """MODIFIED (not just EXCLUSIVE) peer trips other_holder."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, occ_writer = _seed_artifact_with_shared_writer(reg, version=1)
+        holder = uuid4()
+        reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=2)
+        reg.set_agent_state(artifact_id, holder, MESIState.MODIFIED, tick=3)
+        result = reg.commit_cas(
+            artifact_id, occ_writer, expected_version=1, content_hash="x", tick=4
+        )
+        assert result == ConflictDetail("other_holder", 1)
+
+
+def test_commit_cas_expected_greater_returns_corruption(db_path: Path) -> None:
+    """expected > current → CasCorruption sentinel (service maps to CoherenceError)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, agent = _seed_artifact_with_shared_writer(reg, version=2)
+        result = reg.commit_cas(
+            artifact_id, agent, expected_version=9, content_hash="x", tick=1
+        )
+        assert isinstance(result, CasCorruption)
+        assert result.current_version == 2
+        # Corruption is distinct from a conflict.
+        assert not isinstance(result, ConflictDetail)
+        # No mutation.
+        assert reg.get_artifact(artifact_id).version == 2
+
+
+def test_commit_cas_version_check_precedes_holder_check(db_path: Path) -> None:
+    """The version branch fires before the holder branch → a stale loser gets
+    version_mismatch (not other_holder). The winner ends SHARED (an OCC writer
+    holds no grant), so the version check is the sole discriminator here."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        artifact_id, winner = _seed_artifact_with_shared_writer(reg, version=1)
+        loser = uuid4()
+        reg.set_agent_state(artifact_id, loser, MESIState.SHARED, tick=2)
+        # Winner commits: version 1→2, winner now SHARED (no grant).
+        reg.commit_cas(artifact_id, winner, expected_version=1, content_hash="w", tick=5)
+        assert reg.get_agent_state(artifact_id, winner) == MESIState.SHARED
+        # Loser retries at stale expected_version=1; version_mismatch must win
+        # (not other_holder), proving branch order.
+        result = reg.commit_cas(
+            artifact_id, loser, expected_version=1, content_hash="l", tick=6
+        )
+        assert result == ConflictDetail("version_mismatch", 2)
+
+
+def test_commit_cas_unknown_artifact_raises_keyerror(db_path: Path) -> None:
+    with SqliteArtifactRegistry(db_path) as reg:
+        with pytest.raises(KeyError):
+            reg.commit_cas(uuid4(), uuid4(), expected_version=1, content_hash="x")
+
+
+def test_commit_cas_emits_state_log_for_committer_and_peers(db_path: Path) -> None:
+    """WIN emits one state_log entry per transition (peers→INVALID, committer→M),
+    with monotonic sequence numbers continuing from prior emissions."""
+    emitted: list[dict] = []
+    with SqliteArtifactRegistry(
+        db_path, state_log=emitted.append, instance_id="inst-cas"
+    ) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        agent = uuid4()
+        peer = uuid4()
+        reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)  # seq 1
+        reg.set_agent_state(art.id, peer, MESIState.SHARED, tick=1)  # seq 2
+        assert reg._seq == 2
+        emitted.clear()
+
+        reg.commit_cas(art.id, agent, expected_version=1, content_hash="h-new", tick=5)
+        # One peer invalidation + one committer SHARED = 2 new entries.
+        assert len(emitted) == 2
+        transitions = {(e["from_state"], e["to_state"]) for e in emitted}
+        assert ("SHARED", "INVALID") in transitions
+        # The committer ends SHARED (OCC writer holds no grant): SHARED→SHARED.
+        assert ("SHARED", "SHARED") in transitions
+        seqs = sorted(e["sequence_number"] for e in emitted)
+        assert seqs == [3, 4]
+        assert reg._seq == 4
+        # The committer entry carries the new content_hash; the invalidation does
+        # not. (The committer is the SHARED→SHARED entry, not the peer→INVALID.)
+        committer_entry = next(
+            e for e in emitted if (e["from_state"], e["to_state"]) == ("SHARED", "SHARED")
+        )
+        assert committer_entry["content_hash"] == "h-new"
+        assert committer_entry["version"] == 2
+        inv_entry = next(e for e in emitted if e["to_state"] == "INVALID")
+        assert inv_entry["content_hash"] is None
+        # sequence_number persisted to registry_meta.
+        meta = dict(reg._conn.execute(
+            "SELECT key, value FROM registry_meta WHERE key='sequence_number'"
+        ).fetchall())
+        assert meta["sequence_number"] == "4"
+
+
+def test_commit_cas_state_log_raise_rolls_back_seq_and_state(db_path: Path) -> None:
+    """Atomicity oracle (mirrors test_state_log_raise_rolls_back_seq_and_state):
+    a state_log raise mid-CAS → ROLLBACK leaves version + _seq + agent state
+    untouched, and registry_meta.sequence_number unchanged."""
+    # Raise on the committer's SHARED emission (the committer now ends SHARED —
+    # an OCC writer holds no grant). The peer invalidation is emitted first
+    # (to_state INVALID), the committer emission is the one that raises — forcing
+    # a rollback after the UPDATE + peer mutation already ran inside the
+    # transaction. SHARED uniquely targets the committer (the peer goes →INVALID).
+    raise_on_to_state = "SHARED"
+    emitted: list[dict] = []
+
+    def hooky(entry: dict) -> None:
+        if entry["to_state"] == raise_on_to_state and entry["trigger"] == "commit_cas":
+            raise RuntimeError("simulated callback failure mid-CAS")
+        emitted.append(entry)
+
+    with SqliteArtifactRegistry(
+        db_path, state_log=hooky, instance_id="inst-cas"
+    ) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        agent = uuid4()
+        peer = uuid4()
+        reg.set_agent_state(art.id, agent, MESIState.SHARED, tick=1)  # seq 1
+        reg.set_agent_state(art.id, peer, MESIState.SHARED, tick=1)  # seq 2
+        assert reg._seq == 2
+
+        with pytest.raises(RuntimeError, match="simulated callback failure mid-CAS"):
+            reg.commit_cas(art.id, agent, expected_version=1, content_hash="h-new", tick=5)
+
+        # Everything rolled back: version still 1, content_hash still h-init.
+        art_now = reg.get_artifact(art.id)
+        assert art_now.version == 1
+        assert art_now.content_hash == "h-init"
+        # Agent state preserved (committer still SHARED, peer still SHARED — the
+        # peer's INVALID mutation was rolled back too).
+        assert reg.get_agent_state(art.id, agent) == MESIState.SHARED
+        assert reg.get_agent_state(art.id, peer) == MESIState.SHARED
+        # _seq rolled back to 2 (both the peer emission AND the failed committer
+        # reservation are undone).
+        assert reg._seq == 2
+        meta = dict(reg._conn.execute(
+            "SELECT key, value FROM registry_meta WHERE key='sequence_number'"
+        ).fetchall())
+        assert meta["sequence_number"] == "2"
+
+
+def test_commit_cas_concurrent_writers_exactly_one_wins(db_path: Path) -> None:
+    """Two barrier-synced OCC writers (both SHARED, same expected_version) race
+    on commit_cas → exactly one commits (version N+1, not N+2), the loser gets a
+    ConflictDetail. No silent clobber (R5 atomicity via BEGIN IMMEDIATE)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact(version=1, content_hash="h-init")
+        reg.register_artifact(art, content="")
+        writers = [uuid4() for _ in range(8)]
+        for w in writers:
+            reg.set_agent_state(art.id, w, MESIState.SHARED, tick=1)
+
+        results: dict[UUID, object] = {}
+        barrier = threading.Barrier(len(writers))
+
+        def attempt(writer_id: UUID) -> None:
+            barrier.wait()
+            results[writer_id] = reg.commit_cas(
+                art.id, writer_id, expected_version=1,
+                content_hash=f"h-{writer_id.hex[:6]}", tick=5,
+            )
+
+        threads = [threading.Thread(target=attempt, args=(w,)) for w in writers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        wins = [r for r in results.values() if isinstance(r, tuple)]
+        conflicts = [r for r in results.values() if isinstance(r, ConflictDetail)]
+        assert len(wins) == 1, f"expected exactly one win, got {len(wins)}"
+        assert len(conflicts) == len(writers) - 1
+        # Final version advanced by exactly one — no lost update / no clobber.
+        assert reg.get_artifact(art.id).version == 2
+        # Every loser saw version_mismatch (two OCC writers are both SHARED, so
+        # the loser is elected by the version check, never other_holder).
+        assert all(c.reason == "version_mismatch" for c in conflicts)
+        assert all(c.current_version == 2 for c in conflicts)
+
+
+# ----------------------------------------------------------------------
+# Read-generation fence (Piece #2) — Unit 2: additive schema, no migration
+# ----------------------------------------------------------------------
+
+
+def _build_pre_fence_db(db_path: Path, art_id: str, ag_id: str) -> None:
+    """Create a v1 state.db with the schema as it existed BEFORE the
+    read-generation fence (no owner_generation / read_generation columns, no
+    coordinator_epoch), with one artifact + one M-grant, user_version = 1."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "CREATE TABLE artifacts (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "version INTEGER NOT NULL, content_hash TEXT NOT NULL, size_tokens INTEGER, "
+            "last_writer_id TEXT, updated_at REAL NOT NULL)"
+        )
+        conn.execute("CREATE INDEX idx_artifacts_name ON artifacts(name)")
+        conn.execute(
+            "CREATE TABLE agent_states (artifact_id TEXT NOT NULL, agent_id TEXT NOT NULL, "
+            "state TEXT NOT NULL, transient_state TEXT, transient_tick INTEGER, "
+            "granted_at_tick INTEGER, last_reclaim_trigger TEXT, last_reclaim_tick INTEGER, "
+            "PRIMARY KEY (artifact_id, agent_id), "
+            "FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE)"
+        )
+        conn.execute(
+            "CREATE TABLE heartbeats (agent_id TEXT PRIMARY KEY, last_tick INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
+            ("instance_id", "fixed-instance", "sequence_number", "7"),
+        )
+        conn.execute(
+            "INSERT INTO artifacts (id, name, version, content_hash, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (art_id, "plan.md", 3, "deadbeef", 1.0),
+        )
+        conn.execute(
+            "INSERT INTO agent_states (artifact_id, agent_id, state) VALUES (?, ?, ?)",
+            (art_id, ag_id, "M"),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def test_fresh_db_has_fence_schema(db_path: Path) -> None:
+    """A freshly initialized db carries the fence columns + coordinator_epoch,
+    and (option (a)) does NOT advance user_version beyond the existing v1."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+        state_cols = {
+            r[1] for r in reg._conn.execute("PRAGMA table_info(agent_states)").fetchall()
+        }
+        assert "owner_generation" in art_cols
+        assert "read_generation" in state_cols
+        assert reg._coordinator_epoch
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
+    """A v1 db created before the fence gains the columns + coordinator_epoch
+    additively on open, WITHOUT a user_version bump; existing rows backfill to
+    owner_generation = 0 / read_generation = NULL, and prior meta is preserved.
+    Re-open is idempotent and the epoch is stable."""
+    art_id, ag_id = str(uuid4()), str(uuid4())
+    _build_pre_fence_db(db_path, art_id, ag_id)
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+        state_cols = {
+            r[1] for r in reg._conn.execute("PRAGMA table_info(agent_states)").fetchall()
+        }
+        assert "owner_generation" in art_cols
+        assert "read_generation" in state_cols
+        # Existing rows backfill: artifact -> 0, grant -> NULL (absent operand).
+        assert (
+            reg._conn.execute(
+                "SELECT owner_generation FROM artifacts WHERE id = ?", (art_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            reg._conn.execute(
+                "SELECT read_generation FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (art_id, ag_id),
+            ).fetchone()[0]
+            is None
+        )
+        # Epoch seeded + loaded; user_version NOT bumped (option (a)).
+        assert reg._coordinator_epoch
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        # Prior meta preserved (no clobber of instance_id / sequence_number).
+        assert reg._instance_id == "fixed-instance"
+        assert reg._seq == 7
+        epoch1 = reg._coordinator_epoch
+
+    # Idempotent re-open: no error, columns intact, epoch stable.
+    with SqliteArtifactRegistry(db_path) as reg2:
+        assert reg2._coordinator_epoch == epoch1
+        art_cols2 = {
+            r[1] for r in reg2._conn.execute("PRAGMA table_info(artifacts)").fetchall()
+        }
+        assert "owner_generation" in art_cols2
+
+
+def test_owner_generation_bumps_on_reclaim_only(db_path: Path) -> None:
+    """A sweep reclamation (M/E -> INVALID via a reclaim trigger) bumps the
+    artifact's owner_generation monotonically; a peer-invalidation or a clean
+    downgrade does NOT bump (version-CAS covers those)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b = uuid4(), uuid4()
+        assert reg.get_owner_generation(art.id) == 0
+
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1  # reclaim bumps
+
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        reg.set_agent_state(art.id, b, MESIState.INVALID, trigger="reclaim_max_hold", tick=20)
+        assert reg.get_owner_generation(art.id) == 2  # monotonic across reclaims
+
+        # Peer-invalidation (non-reclaim trigger) does NOT bump.
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=21)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="peer_invalidation", tick=22)
+        assert reg.get_owner_generation(art.id) == 2
+
+        # Clean downgrade E -> SHARED does NOT bump.
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=23)
+        reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="downgrade", tick=24)
+        assert reg.get_owner_generation(art.id) == 2
+
+
+def test_read_generation_captured_at_claim(db_path: Path) -> None:
+    """read_generation is captured at the claim-establishing point: an E/M
+    acquire (incl. acquire-WITHOUT-a-prior-read -- the P0 fix) and a fetch read.
+    A never-claimed agent has None (absent operand). A reclaim does NOT refresh
+    the captured value; the next claim captures the new generation."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b, c = uuid4(), uuid4(), uuid4()
+
+        # Never-claimed agent: absent operand.
+        assert reg.get_read_generation(art.id, c) is None
+
+        # Pessimistic acquire WITHOUT a prior fetch (the P0 fix) captures gen 0.
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        assert reg.get_read_generation(art.id, a) == 0
+        # A fetch read captures too.
+        reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=2)
+        assert reg.get_read_generation(art.id, b) == 0
+
+        # Reclaim a -> owner_generation bumps to 1, but a's captured value is
+        # PRESERVED (the reclaim does not refresh it) -- this is what makes a's
+        # later commit fail the generation guard.
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1
+        assert reg.get_read_generation(art.id, a) == 0
+
+        # A fresh re-acquire by a captures the NEW generation (1).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        assert reg.get_read_generation(art.id, a) == 1
+
+
+def test_commit_cas_fence_rejects_superseded_reader(db_path: Path) -> None:
+    """OCC commit_cas returns ConflictDetail('stale_read_generation') when the
+    committer's read_generation was superseded by a reclaim -- version
+    unchanged, no other holder, so version-CAS cannot catch it (the headline
+    reclaim-zombie case). A re-fetch (fresh read_generation) then wins; a
+    never-fetched committer is rejected as an absent operand."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, c = uuid4(), uuid4()
+
+        # A acquires E (captures read_generation=0), then is reclaimed
+        # (owner_generation -> 1; A's read_generation preserved at 0).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+        assert reg.get_owner_generation(art.id) == 1
+
+        # A commits via OCC: version still matches (1), no other holder, but the
+        # generation fence rejects the superseded read -- no phantom bump.
+        res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
+        assert isinstance(res, ConflictDetail)
+        assert res.reason == "stale_read_generation"
+        assert reg.get_artifact(art.id).version == 1
+
+        # A re-fetches -> fresh read_generation=1 -> the commit now wins.
+        reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=11)
+        res2 = reg.commit_cas(art.id, a, expected_version=1, content_hash="new2")
+        assert not isinstance(res2, ConflictDetail)
+        assert reg.get_artifact(art.id).version == 2
+
+        # A never-claimed committer has no captured claim to supersede, so the
+        # fence does NOT reject it -- version-CAS alone arbitrates (here the
+        # version matches, so it wins). The fence only rejects a captured-then-
+        # superseded read.
+        res3 = reg.commit_cas(art.id, c, expected_version=2, content_hash="x")
+        assert not isinstance(res3, ConflictDetail)
+        assert reg.get_artifact(art.id).version == 3
+
+
+def test_set_artifact_and_content_fence_rejects_stale_committer(db_path: Path) -> None:
+    """The pessimistic guarded primitive (set_artifact_and_content with
+    fence_agent_id) rejects a committer whose captured read_generation was
+    superseded by a reclaim, atomically with the version persist -- closing the
+    commit() race. A fresh committer persists; committer=None is unguarded."""
+    from ccs.core.exceptions import StaleReadGeneration
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+        reg.register_artifact(art, content="ignored")
+        a, b = uuid4(), uuid4()
+
+        # a acquires E (read_generation=0), then is reclaimed (owner_generation
+        # -> 1; a's read_generation preserved at 0).
+        reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+        reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+
+        # a's guarded persist is rejected; the version does NOT advance.
+        stale = Artifact(id=art.id, name="plan.md", version=2, content_hash="stale")
+        with pytest.raises(StaleReadGeneration):
+            reg.set_artifact_and_content(art.id, stale, "x", last_writer=a, fence_agent_id=a)
+        assert reg.get_artifact(art.id).version == 1
+
+        # b acquires E AFTER the reclaim -> captures the current generation (1)
+        # -> its guarded persist succeeds.
+        reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=11)
+        ok = Artifact(id=art.id, name="plan.md", version=2, content_hash="ok")
+        reg.set_artifact_and_content(art.id, ok, "x", last_writer=b, fence_agent_id=b)
+        assert reg.get_artifact(art.id).version == 2
+
+        # committer=None (external source churn) is unguarded -- persists even
+        # though no agent established a claim.
+        src = Artifact(id=art.id, name="plan.md", version=3, content_hash="src")
+        reg.set_artifact_and_content(art.id, src, "x")
+        assert reg.get_artifact(art.id).version == 3
+
+
+def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
+    """A db whose fence COLUMNS exist but whose coordinator_epoch was never
+    seeded (partial prior upgrade) opens cleanly: _ensure_fence_columns skips
+    the duplicate ALTERs and the INSERT OR IGNORE seeds the missing epoch."""
+    import sqlite3
+
+    # hex ids: the registry's lookups key on UUID.hex (the pre-fence builder
+    # stores ids verbatim, so dashed ids would miss the hex-keyed lookup).
+    art_id, ag_id = uuid4().hex, uuid4().hex
+    _build_pre_fence_db(db_path, art_id, ag_id)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "ALTER TABLE artifacts ADD COLUMN owner_generation INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
+    conn.commit()
+    conn.close()
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        assert reg._coordinator_epoch  # seeded on this open
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reg.get_owner_generation(UUID(art_id)) == 0

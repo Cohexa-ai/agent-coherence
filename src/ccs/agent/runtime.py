@@ -9,12 +9,27 @@ from typing import Any, Callable, Optional
 from uuid import UUID
 
 from ccs.coordinator.service import CoordinatorService
+from ccs.core.exceptions import CasRetriesExhausted
 from ccs.core.hashing import compute_content_hash
 from ccs.core.states import MESIState
-from ccs.core.types import Artifact, FetchRequest, FetchResponse, InvalidationSignal
+from ccs.core.types import (
+    Artifact,
+    ArtifactCacheEntry,
+    ConflictDetail,
+    FetchRequest,
+    FetchResponse,
+    InvalidationSignal,
+)
 from ccs.strategies.base import SyncStrategy
 
 from .cache import ArtifactCache
+
+# A content producer for the OCC write path. Called once per attempt with the
+# freshly-read cache entry (SHARED, carrying the winner's local_version) so the
+# caller re-derives content against current state on every retry. Returns the
+# content body and an OPTIONAL precomputed content_hash (None → the runtime
+# computes it via compute_content_hash, matching how `write` derives the hash).
+MakeContent = Callable[[ArtifactCacheEntry], "tuple[str, str | None]"]
 
 CCS_CONTENT_AUDIT_LOG_SCHEMA_VERSION = "ccs.content_audit.v1"
 
@@ -76,7 +91,18 @@ class AgentRuntime:
         content_hash: str | None = None,
         size_tokens: int | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
-        """Write new artifact content through coordinator protocol."""
+        """Write new artifact content through coordinator protocol.
+
+        Raises:
+            StaleReadGeneration: the read-generation fence rejected the commit —
+                a sweep reclaimed this agent's claim in the race window between
+                acquire and commit (``ccs.core.exceptions``). Retry-eligible,
+                but THIS path has no built-in retry loop (unlike ``write_cas``):
+                the caller re-acquires / re-reads and calls ``write()`` again.
+            CoherenceError: the grant was already reclaimed before commit (the
+                error names the reclaim trigger and tick), or another protocol
+                precondition failed.
+        """
         if content_hash is not None:
             computed = compute_content_hash(content)
             if content_hash != computed:
@@ -119,6 +145,144 @@ class AgentRuntime:
             now_tick=now_tick,
         )
         return updated, [*write_signals, *commit_signals]
+
+    def write_cas(
+        self,
+        artifact_id: UUID,
+        *,
+        make_content: MakeContent,
+        now_tick: int,
+    ) -> tuple[Artifact, list[InvalidationSignal]]:
+        """Optimistic-concurrency write that BYPASSES the pessimistic acquire.
+
+        The OCC counterpart to :meth:`write` (plan Unit 5, R6/R8). Unlike
+        ``write`` — which calls ``coordinator.write()`` to take EXCLUSIVE before
+        ``coordinator.commit()`` — ``write_cas`` **never acquires EXCLUSIVE**. The
+        writer reads (→ SHARED), computes locally (stays SHARED/INVALID), and
+        commits via ``coordinator.commit_cas``; the commit-time version CAS (not a
+        lock on the acquire) elects the winner. ``coordinator.write()`` is never
+        called on this path.
+
+        Retry: policy lives in the strategy (``max_cas_retries`` /
+        ``cas_backoff_ticks``), the loop lives HERE (the actor) — strategies are
+        policy, not actors. ``expected_version`` is sourced from the cache entry's
+        ``local_version`` each attempt; on a :class:`ConflictDetail` the loop
+        re-reads (re-fetch → refreshes ``local_version`` to the winner's new
+        version) and recomputes content via ``make_content`` against that fresh
+        state, then retries. There is NO auto-escalation to EXCLUSIVE (D5).
+
+        ``make_content`` is invoked once per attempt with the freshly-read cache
+        entry and returns ``(content, content_hash | None)``; a ``None`` hash is
+        computed via :func:`compute_content_hash` (mirroring ``write``).
+
+        Args:
+            artifact_id: The shared artifact to commit to.
+            make_content: Producer re-applying the caller's intent against the
+                freshly-read state for THIS attempt (see :data:`MakeContent`).
+            now_tick: Logical tick for the attempt(s).
+
+        Returns:
+            ``(updated_artifact, signals)`` on the winning commit. ``signals``
+            mirrors ``write``'s shape so the adapter publishes them unchanged.
+
+        Raises:
+            CasRetriesExhausted: every allowed attempt lost the race — a typed
+                terminal, NEVER a silent drop. The cache is left at the latest
+                refreshed version (no unconfirmed write cached).
+            CoherenceError: the coordinator reported corruption
+                (``expected_version > current``) or a precondition failure
+                (caller mid-transient / in M/E) — non-retryable, propagated.
+            ValueError: ``make_content`` returned a content_hash that does not
+                match the content (same guard as ``write``).
+        """
+        # Ensure a fresh read first so the cache entry exists and SHARED with a
+        # populated local_version (the OCC writer is now S, never E).
+        entry = self.cache.get(artifact_id)
+        if entry is None or self.strategy.requires_refresh(entry, now_tick=now_tick):
+            self._fetch(artifact_id, now_tick=now_tick)
+
+        last_current_version = -1
+        max_attempts = self.strategy.max_cas_retries() + 1
+        for attempt in range(max_attempts):
+            entry = self.cache.get(artifact_id)
+            if entry is None:
+                # A peer invalidation can drop the placeholder; re-fetch to land
+                # a fresh SHARED entry before reading expected_version.
+                self._fetch(artifact_id, now_tick=now_tick)
+                entry = self.cache.get(artifact_id)
+                assert entry is not None  # _fetch always populates the cache
+
+            expected_version = entry.local_version
+            content, provided_hash = make_content(entry)
+            content_hash = self._resolve_content_hash(content, provided_hash)
+
+            result = self.coordinator.commit_cas(
+                agent_id=self.agent_id,
+                artifact_id=artifact_id,
+                expected_version=expected_version,
+                content_hash=content_hash,
+                issued_at_tick=now_tick,
+                content=content,
+            )
+
+            if isinstance(result, ConflictDetail):
+                last_current_version = result.current_version
+                # Re-read: re-fetch refreshes the cache entry to the winner's new
+                # version (SHARED, fresh local_version) so the next attempt's
+                # expected_version + make_content() see current state.
+                self._fetch(artifact_id, now_tick=now_tick)
+                # Consult the strategy's backoff schedule (policy seam, D1). In
+                # this synchronous logical-tick model there is no wall clock to
+                # sleep against, so the deterministic value documents the bound a
+                # tick-driven scheduler would honor; the loop itself does not block.
+                if attempt < max_attempts - 1:
+                    _ = self.strategy.cas_backoff_ticks(attempt)
+                continue
+
+            updated, signals = result
+            # An OCC win ends the committer SHARED on the coordinator (it holds no
+            # grant — see commit_cas). The local cache must mirror that: a
+            # coherence layer cannot leave the agent's local view (MODIFIED) more
+            # privileged than the coordinator's now-SHARED end-state. Contrast the
+            # pessimistic write() above, which legitimately caches MODIFIED because
+            # it acquired EXCLUSIVE.
+            self.cache.put(
+                artifact_id,
+                self.strategy.on_fetch(
+                    artifact_id=artifact_id,
+                    version=updated.version,
+                    state=MESIState.SHARED,
+                    now_tick=now_tick,
+                ),
+            )
+            self._record_content_view(
+                artifact_id=artifact_id,
+                version=updated.version,
+                content=content,
+                source="write_cas",
+                now_tick=now_tick,
+            )
+            return updated, signals
+
+        raise CasRetriesExhausted(
+            artifact_id=artifact_id,
+            attempts=max_attempts,
+            last_current_version=last_current_version,
+        )
+
+    def _resolve_content_hash(self, content: str, provided_hash: str | None) -> str:
+        """Return the content_hash for content, validating a caller-provided one.
+
+        Mirrors ``write``'s hash handling: a provided hash must match the
+        computed one (fail fast on mismatch), else compute it.
+        """
+        computed = compute_content_hash(content)
+        if provided_hash is not None and provided_hash != computed:
+            raise ValueError(
+                f"content_hash mismatch: caller provided {provided_hash!r}, "
+                f"computed {computed!r}"
+            )
+        return computed
 
     def invalidate_all_cache(
         self,

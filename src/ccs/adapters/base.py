@@ -309,6 +309,55 @@ class CoherenceAdapterCore:
 
         return updated
 
+    def write_cas(
+        self,
+        *,
+        agent_name: str,
+        artifact_id: UUID,
+        make_content: Callable[[Any], "tuple[str, str | None]"],
+        now_tick: int,
+    ) -> Artifact:
+        """Optimistic-concurrency write through one runtime (plan Unit 5).
+
+        The OCC sibling of :meth:`write`: same adapter envelope (heartbeat
+        piggyback gated on ``crash_recovery.enabled`` at THIS layer per R9,
+        ``_maybe_sweep``, peer event-bus publish on success), but it drives
+        ``runtime.write_cas`` — which bypasses the pessimistic acquire and runs
+        the strategy-bounded retry loop. On retry exhaustion the runtime raises
+        ``CasRetriesExhausted`` (a ``CoherenceError`` subclass), propagated here
+        unchanged — never a silent dropped write.
+
+        ``make_content`` re-applies the caller's intent against the freshly-read
+        cache entry on each attempt (see ``AgentRuntime.write_cas``).
+        """
+        writer = self._binding(agent_name)
+        if self._crash_recovery.enabled:
+            self.coordinator.record_heartbeat(agent_id=writer.agent_id, now_tick=now_tick)
+        self._maybe_sweep(now_tick)
+        updated, invalidation_signals = writer.runtime.write_cas(
+            artifact_id=artifact_id,
+            make_content=make_content,
+            now_tick=now_tick,
+        )
+        peers = [binding.agent_id for binding in self._agents_by_name.values() if binding.agent_id != writer.agent_id]
+
+        for signal in invalidation_signals:
+            self.event_bus.publish_invalidation(signal, recipients=peers)
+
+        if self.strategy.broadcasts_content_on_commit():
+            self.event_bus.publish_update(
+                ArtifactUpdateEvent(
+                    artifact_id=artifact_id,
+                    version=updated.version,
+                    content=self.content(agent_name=agent_name, artifact_id=artifact_id) or "",
+                    issued_at_tick=now_tick,
+                    issuer_agent_id=writer.agent_id,
+                ),
+                recipients=peers,
+            )
+
+        return updated
+
     def content(self, *, agent_name: str, artifact_id: UUID) -> str | None:
         """Return local content cached by one agent runtime."""
         return self._binding(agent_name).runtime.content(artifact_id)

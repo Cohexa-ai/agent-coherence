@@ -73,8 +73,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
@@ -86,6 +87,27 @@ v0.1 raises on mismatch; v0.2 will add real migration dispatch when needed."""
 
 ReclamationSlot: TypeAlias = tuple[str, int]
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
+
+# Coordinator-side eviction triggers (the stable-grant sweep's two reclaim
+# triggers + the transient-timeout fail-safe) — an M/E -> INVALID carrying one
+# of these bumps the artifact's owner_generation (read-generation fence): the
+# claim was revoked without a version move, which version-CAS cannot see.
+# Duplicated from registry.py (the two registries share no base class); the
+# dual-registry parity test pins them equal.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset(
+    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
+)
+
+# Genuine-content-read triggers for read-generation capture (mirrors
+# registry.py; pinned equal by the parity test). Service.fetch() emits "fetch".
+CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
+
+# OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
+# invalidated_agent_ids)`` — the service layer turns the id list into
+# ``InvalidationSignal``s. A loss is a typed ``ConflictDetail`` (retry-eligible,
+# no mutation). ``CasCorruption`` is the impossible-state sentinel the service
+# maps to ``CoherenceError``. None of these is raised by the registry.
+CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
 
 
 class SchemaVersionError(RuntimeError):
@@ -235,13 +257,14 @@ class SqliteArtifactRegistry:
             c.execute(
                 """
                 CREATE TABLE artifacts (
-                    id              TEXT PRIMARY KEY,
-                    name            TEXT NOT NULL UNIQUE,
-                    version         INTEGER NOT NULL,
-                    content_hash    TEXT NOT NULL,
-                    size_tokens     INTEGER,
-                    last_writer_id  TEXT,
-                    updated_at      REAL NOT NULL
+                    id               TEXT PRIMARY KEY,
+                    name             TEXT NOT NULL UNIQUE,
+                    version          INTEGER NOT NULL,
+                    owner_generation INTEGER NOT NULL DEFAULT 0,
+                    content_hash     TEXT NOT NULL,
+                    size_tokens      INTEGER,
+                    last_writer_id   TEXT,
+                    updated_at       REAL NOT NULL
                 )
                 """
             )
@@ -257,6 +280,7 @@ class SqliteArtifactRegistry:
                     granted_at_tick      INTEGER,
                     last_reclaim_trigger TEXT,
                     last_reclaim_tick    INTEGER,
+                    read_generation      INTEGER,
                     PRIMARY KEY (artifact_id, agent_id),
                     FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
                 )
@@ -296,9 +320,14 @@ class SqliteArtifactRegistry:
                 )
                 """
             )
+            seed_epoch = uuid4().hex
             c.execute(
-                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?)",
-                ("instance_id", seed_id, "sequence_number", "0"),
+                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?), (?, ?)",
+                (
+                    "instance_id", seed_id,
+                    "sequence_number", "0",
+                    "coordinator_epoch", seed_epoch,
+                ),
             )
             # PRAGMA is transactional inside an explicit BEGIN; cannot take
             # parameter bindings, so SCHEMA_USER_VERSION (int constant) is
@@ -315,6 +344,7 @@ class SqliteArtifactRegistry:
             raise
         self._instance_id = seed_id
         self._seq = 0
+        self._coordinator_epoch = seed_epoch
 
     def _rehydrate_meta(self, instance_id_override: str | None) -> None:
         """Load _instance_id + _seq from registry_meta. Caller holds lock."""
@@ -346,6 +376,82 @@ class SqliteArtifactRegistry:
             )
             """
         )
+        # Read-generation fence (Piece #2) forward-compat: additively add the
+        # fence columns + coordinator_epoch to dbs created before the fence.
+        # user_version stays unchanged (additive, plan option (a); same posture
+        # as pending_notices above) so an older binary can still open the db.
+        self._ensure_fence_columns()
+        epoch_row = self._conn.execute(
+            "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
+        ).fetchone()
+        if epoch_row is None:
+            raise SchemaVersionError(
+                f"coordinator_epoch missing from registry_meta at {self._db_path}; "
+                f"the database may be partially upgraded or corrupted. "
+                f"Delete and restart to rehydrate."
+            )
+        self._coordinator_epoch = epoch_row[0]
+
+    def _ensure_fence_columns(self) -> None:
+        """Additively add the read-generation fence columns + coordinator_epoch
+        to a pre-fence database. Idempotent; user_version stays unchanged.
+        Caller holds the lock; runs in one explicit transaction so a SIGKILL
+        mid-add cannot leave a half-applied column set. The PRAGMA introspection
+        runs INSIDE the BEGIN IMMEDIATE: two processes opening the same
+        pre-fence db serialize on the write lock, and the loser re-reads the
+        schema after the winner's commit — so it sees the columns as present
+        and no-ops instead of crashing on a duplicate-column ALTER."""
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            art_cols = {
+                row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
+            }
+            state_cols = {
+                row[1] for row in c.execute("PRAGMA table_info(agent_states)").fetchall()
+            }
+            if "owner_generation" not in art_cols:
+                c.execute(
+                    "ALTER TABLE artifacts ADD COLUMN owner_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "read_generation" not in state_cols:
+                # Nullable: a pre-fence grant captured no generation; NULL is the
+                # absent operand the commit guard rejects.
+                c.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
+            c.execute(
+                "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
+                ("coordinator_epoch", uuid4().hex),
+            )
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def get_owner_generation(self, artifact_id: UUID) -> int:
+        """Return the artifact's ownership epoch (read-generation fence)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT owner_generation FROM artifacts WHERE id = ?", (artifact_id.hex,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"artifact {artifact_id} not in registry")
+            return row[0]
+
+    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the generation an agent captured at its last claim, or None if
+        it never established a fence claim (a plain OCC writer that version-CAS,
+        not the fence, arbitrates)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT read_generation FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (artifact_id.hex, agent_id.hex),
+            ).fetchone()
+            return row[0] if row is not None else None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -433,14 +539,43 @@ class SqliteArtifactRegistry:
         content: str,
         *,
         last_writer: Optional[UUID] = None,
+        fence_agent_id: Optional[UUID] = None,
     ) -> None:
         """Replace artifact metadata for an existing record. ``content`` is
         ignored per KTD-13 — content_hash on the artifact is the source of
-        truth for staleness comparison."""
+        truth for staleness comparison.
+
+        Read-generation fence (pessimistic ``commit()`` path): when
+        ``fence_agent_id`` is given, reject -- atomically with the version
+        persist in this BEGIN IMMEDIATE -- if that committer's captured
+        read_generation was superseded by a sweep reclamation. A ``None``
+        fence_agent_id (source-churn) is unguarded."""
         del content  # KTD-13: not persisted
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if fence_agent_id is not None:
+                    rg_row = self._conn.execute(
+                        "SELECT read_generation FROM agent_states "
+                        "WHERE artifact_id = ? AND agent_id = ?",
+                        (artifact_id.hex, fence_agent_id.hex),
+                    ).fetchone()
+                    if rg_row is not None and rg_row[0] is not None:
+                        og_row = self._conn.execute(
+                            "SELECT owner_generation FROM artifacts WHERE id = ?",
+                            (artifact_id.hex,),
+                        ).fetchone()
+                        if og_row is None:
+                            raise KeyError(f"artifact {artifact_id} not in registry")
+                        owner_gen = og_row[0]
+                        if rg_row[0] < owner_gen:
+                            # Raise inside the try; the except below ROLLBACKs
+                            # and re-raises (no double rollback).
+                            raise StaleReadGeneration(
+                                f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
+                                f"artifact={artifact_id} read_gen={rg_row[0]} "
+                                f"owner_gen={owner_gen}"
+                            )
                 self._conn.execute(
                     """
                     UPDATE artifacts
@@ -612,6 +747,17 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
 
+                # Read-generation fence: on a sweep reclamation (M/E -> INVALID
+                # via a reclaim trigger) bump the artifact's ownership epoch,
+                # atomically with the state transition in this BEGIN IMMEDIATE,
+                # so a commit by the reclaimed holder fails the generation check.
+                if prev_in_me and not new_in_me and trigger in RECLAIM_TRIGGERS:
+                    self._conn.execute(
+                        "UPDATE artifacts SET owner_generation = owner_generation + 1 "
+                        "WHERE id = ?",
+                        (artifact_id.hex,),
+                    )
+
                 # Upsert agent state.
                 if prior_row is None:
                     self._conn.execute(
@@ -642,6 +788,23 @@ class SqliteArtifactRegistry:
                             """,
                             (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
                         )
+
+                # Read-generation fence: capture the current ownership epoch into
+                # the agent's read_generation when it establishes/refreshes a
+                # write-claim (E/M acquire -- P0 fix, incl. acquire-without-read
+                # -- or a fetch read), atomic with the grant in this BEGIN
+                # IMMEDIATE. The agent_states row exists after the upsert above.
+                # INVALID guard on the fetch leg: a future cache-miss-INVALID
+                # fetch must not mint a fresh claim for an unfenced zombie.
+                if (new_in_me and not prev_in_me) or (
+                    trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+                ):
+                    self._conn.execute(
+                        "UPDATE agent_states SET read_generation = "
+                        "(SELECT owner_generation FROM artifacts WHERE id = ?) "
+                        "WHERE artifact_id = ? AND agent_id = ?",
+                        (artifact_id.hex, artifact_id.hex, agent_id.hex),
+                    )
 
                 # Mutation-then-log: emit state_log BEFORE commit. If the callback
                 # raises, ROLLBACK undoes the agent_states change AND we decrement
@@ -963,6 +1126,337 @@ class SqliteArtifactRegistry:
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def commit_cas(
+        self,
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        content_hash: str,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+        tick: int = 0,
+        trigger: str = "commit_cas",
+    ) -> CasResult:
+        """Atomic optimistic-concurrency compare-and-swap commit (plan Unit 2,
+        R1/R2/R4/R5/R8). Models :meth:`resolve_or_register`: one
+        ``BEGIN IMMEDIATE`` under one lock acquisition does the entire
+        version-check → discriminate → conditional-mutate sequence, so two
+        cross-process OCC writers cannot both win the same version.
+
+        Three-outcome discrimination (the version check PRECEDES the holder
+        check so a just-committed winner's MODIFIED state never mis-fires
+        ``other_holder`` for the loser):
+
+        - ``expected_version > current`` → :class:`CasCorruption` (impossible
+          from an honest single coordinator; service raises ``CoherenceError``).
+          No mutation.
+        - ``expected_version < current`` → ``ConflictDetail("version_mismatch")``.
+          No mutation. (Two OCC writers — both SHARED — are arbitrated here.)
+        - version matches **and** another agent holds M/E (a *pessimistic*
+          peer; the OCC writer itself is S/I and does not count) →
+          ``ConflictDetail("other_holder")``. No mutation.
+        - else (version matches, no other M/E holder) → **WIN**: bump version
+          to ``current + 1``, write ``content_hash`` + ``last_writer_id``,
+          transition the committer S/I → SHARED, invalidate every non-INVALID
+          peer to INVALID. Returns ``(updated_artifact, invalidated_agent_ids)``.
+
+        The committer ends **SHARED, not MODIFIED**: an OCC writer is optimistic
+        and never acquired EXCLUSIVE, so it holds no grant — SHARED is the honest
+        end-state, and it keeps the same agent's subsequent commit_cas repeatable
+        (a sticky MODIFIED would trip the service's D4 "M/E callers use commit()"
+        precondition). ``size_tokens=None`` PRESERVES the persisted value (the
+        cross-process path always passes None), matching the in-memory registry.
+
+        The committer's bookkeeping and the per-peer invalidation are INLINED as
+        raw SQL — :meth:`set_agent_state` opens its own ``BEGIN IMMEDIATE`` and
+        cannot be called nested. This reproduces ``set_agent_state``'s contract
+        for the participants it touches: SHARED is not in M∪E, so the committer's
+        ``granted_at_tick`` is left untouched (preserved; no acquire) and its
+        reclaim slot is NOT cleared, while a peer leaving M∪E drops its
+        ``granted_at_tick`` slot; plus the mutation-then-log + ``_seq`` rollback
+        invariant and the ``state_log`` emit per transition (KTD-13: compare on
+        version, never content bytes).
+
+        ``content`` is accepted for signature parity with the in-memory registry
+        but IGNORED (KTD-13: this registry persists no content body —
+        :meth:`get_content` returns ``b""``). The content-hash on the artifact is
+        the source of truth for staleness comparison.
+        """
+        del content  # KTD-13: not persisted (signature parity only)
+        with self._lock:
+            # Track every _seq increment in this call so the outer
+            # BaseException handler can roll them ALL back if COMMIT (or any
+            # later step) fails — mirrors set_agent_state's COR-02 contract,
+            # generalized to the multiple emissions one CAS can produce.
+            seq_incremented_count = 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                version_row = self._conn.execute(
+                    "SELECT version, size_tokens FROM artifacts WHERE id = ?",
+                    (artifact_id.hex,),
+                ).fetchone()
+                if version_row is None:
+                    raise KeyError(f"artifact {artifact_id} not in registry")
+                current = version_row[0]
+                current_size_tokens = version_row[1]
+
+                # 3-outcome discrimination. Each non-win branch COMMITs the
+                # (read-only) transaction and returns a typed result; nothing
+                # was mutated, so the COMMIT just releases the lock cleanly.
+                if expected_version > current:
+                    self._conn.execute("COMMIT")
+                    return CasCorruption(current_version=current)
+                if expected_version < current:
+                    self._conn.execute("COMMIT")
+                    return ConflictDetail("version_mismatch", current)
+                # Version matches. Holder check is the OCC-vs-pessimistic guard;
+                # exclude the committer itself (it is S/I, but be defensive).
+                other_holder = self._conn.execute(
+                    """
+                    SELECT 1 FROM agent_states
+                    WHERE artifact_id = ? AND agent_id != ? AND state IN (?, ?)
+                    LIMIT 1
+                    """,
+                    (
+                        artifact_id.hex,
+                        agent_id.hex,
+                        MESIState.MODIFIED.name,
+                        MESIState.EXCLUSIVE.name,
+                    ),
+                ).fetchone()
+                if other_holder is not None:
+                    self._conn.execute("COMMIT")
+                    return ConflictDetail("other_holder", current)
+
+                # Read-generation fence: reject a committer whose CAPTURED
+                # read-claim was superseded by a sweep reclamation (a reclaimed
+                # M/E holder kept its stale read_generation -- version unchanged,
+                # no other M/E holder, so version-CAS cannot catch it). An ABSENT
+                # read_generation (missing row or NULL) means a plain OCC writer
+                # that never established a fence claim -- version-CAS protects it,
+                # so admit. Strict->; equality admits. Server-side, no signature
+                # change.
+                rg_row = self._conn.execute(
+                    "SELECT read_generation FROM agent_states "
+                    "WHERE artifact_id = ? AND agent_id = ?",
+                    (artifact_id.hex, agent_id.hex),
+                ).fetchone()
+                if rg_row is not None and rg_row[0] is not None:
+                    og_row = self._conn.execute(
+                        "SELECT owner_generation FROM artifacts WHERE id = ?",
+                        (artifact_id.hex,),
+                    ).fetchone()
+                    if og_row is None:
+                        raise KeyError(f"artifact {artifact_id} not in registry")
+                    if rg_row[0] < og_row[0]:
+                        self._conn.execute("COMMIT")
+                        return ConflictDetail("stale_read_generation", current)
+
+                # ---- WIN: mutate atomically ----
+                next_version = current + 1
+                # Preserve the persisted size_tokens when the caller passes None
+                # (the cross-process / coordinator-server path always does) —
+                # matches the in-memory registry, where a None arg keeps the
+                # prior value rather than NULLing it. Without this, every
+                # cross-process OCC commit would silently zero size_tokens.
+                resolved_size_tokens = (
+                    current_size_tokens if size_tokens is None else size_tokens
+                )
+                self._conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET version = ?, content_hash = ?, size_tokens = ?,
+                        last_writer_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_version,
+                        content_hash,
+                        resolved_size_tokens,
+                        agent_id.hex,
+                        time.time(),
+                        artifact_id.hex,
+                    ),
+                )
+
+                # Invalidate every non-INVALID peer (inlined; cannot call
+                # set_agent_state). Read the peers first so we can both emit a
+                # per-peer state_log entry and return the id list for the
+                # service's InvalidationSignal construction.
+                peer_rows = self._conn.execute(
+                    """
+                    SELECT agent_id, state, granted_at_tick FROM agent_states
+                    WHERE artifact_id = ? AND agent_id != ? AND state != ?
+                    """,
+                    (artifact_id.hex, agent_id.hex, MESIState.INVALID.name),
+                ).fetchall()
+                invalidated: list[UUID] = []
+                for peer_hex, peer_state_name, peer_granted in peer_rows:
+                    peer_from = MESIState[peer_state_name]
+                    # A peer leaving M∪E drops its granted_at_tick slot
+                    # (set_agent_state's "prev_in_me and not new_in_me" branch).
+                    peer_in_me = peer_from in _M_OR_E_STATES
+                    new_granted = None if peer_in_me else peer_granted
+                    self._conn.execute(
+                        """
+                        UPDATE agent_states
+                        SET state = ?, granted_at_tick = ?
+                        WHERE artifact_id = ? AND agent_id = ?
+                        """,
+                        (
+                            MESIState.INVALID.name,
+                            new_granted,
+                            artifact_id.hex,
+                            peer_hex,
+                        ),
+                    )
+                    seq_incremented_count += self._emit_state_log(
+                        artifact_id=artifact_id,
+                        agent_id=UUID(hex=peer_hex),
+                        from_state=peer_from,
+                        to_state=MESIState.INVALID,
+                        trigger=trigger,
+                        tick=tick,
+                        version=next_version,
+                        content_hash=None,
+                    )
+                    invalidated.append(UUID(hex=peer_hex))
+
+                # Transition the committer S/I → SHARED. An OCC writer holds NO
+                # grant (it is optimistic — it never acquired EXCLUSIVE), so the
+                # honest end-state is SHARED, NOT MODIFIED. A sticky MODIFIED
+                # grant would make the SAME agent's next commit_cas/write_cas hit
+                # the service D4 precondition (which rejects M/E callers) and hard-
+                # fail; ending SHARED keeps OCC writes repeatable. SHARED is not
+                # in M∪E, so this is NOT an acquire: do NOT set granted_at_tick to
+                # ``tick`` and do NOT clear the reclaim slot (mirror
+                # set_agent_state's non-M/E branch — preserve prior granted_at,
+                # leave reclaim columns untouched). A fresh S/I committer holds no
+                # grant slot, so the preserved value is None either way.
+                committer_row = self._conn.execute(
+                    "SELECT state, granted_at_tick FROM agent_states "
+                    "WHERE artifact_id = ? AND agent_id = ?",
+                    (artifact_id.hex, agent_id.hex),
+                ).fetchone()
+                committer_from = (
+                    MESIState[committer_row[0]] if committer_row else MESIState.INVALID
+                )
+                if committer_row is None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
+                                                  last_reclaim_trigger, last_reclaim_tick)
+                        VALUES (?, ?, ?, NULL, NULL, NULL)
+                        """,
+                        (artifact_id.hex, agent_id.hex, MESIState.SHARED.name),
+                    )
+                else:
+                    # Preserve granted_at_tick (None for an S/I committer); the
+                    # reclaim columns are NOT touched — exactly set_agent_state's
+                    # "neither new nor prev in M∪E" path.
+                    prior_granted_at = committer_row[1]
+                    self._conn.execute(
+                        """
+                        UPDATE agent_states
+                        SET state = ?, granted_at_tick = ?
+                        WHERE artifact_id = ? AND agent_id = ?
+                        """,
+                        (MESIState.SHARED.name, prior_granted_at, artifact_id.hex, agent_id.hex),
+                    )
+                seq_incremented_count += self._emit_state_log(
+                    artifact_id=artifact_id,
+                    agent_id=agent_id,
+                    from_state=committer_from,
+                    to_state=MESIState.SHARED,
+                    trigger=trigger,
+                    tick=tick,
+                    version=next_version,
+                    content_hash=content_hash,
+                )
+
+                self._conn.execute("COMMIT")
+                # COMMIT succeeded — _seq durably persisted; suppress rollback.
+                seq_incremented_count = 0
+            except BaseException:
+                # BaseException (not Exception) so KeyboardInterrupt/SystemExit
+                # mid-transaction still ROLLBACK before propagating — the same
+                # idiom every mutating method here uses.
+                self._conn.execute("ROLLBACK")
+                # Roll the in-memory _seq back to match the rolled-back DB so
+                # the next successful emission does not leave a phantom gap.
+                if seq_incremented_count:
+                    self._seq -= seq_incremented_count
+                raise
+
+            updated = Artifact(
+                id=artifact_id,
+                name=self._artifact_name(artifact_id),
+                version=next_version,
+                content_hash=content_hash,
+                size_tokens=resolved_size_tokens,
+            )
+            return updated, invalidated
+
+    def _emit_state_log(
+        self,
+        *,
+        artifact_id: UUID,
+        agent_id: UUID,
+        from_state: MESIState,
+        to_state: MESIState,
+        trigger: str,
+        tick: int,
+        version: int,
+        content_hash: str | None,
+    ) -> int:
+        """Emit one ``state_log`` entry for a transition that already happened
+        inside the CALLER's open ``BEGIN IMMEDIATE``. Returns 1 if ``_seq`` was
+        bumped (so the caller can roll it back on a later failure), 0 otherwise.
+
+        Reproduces the mutation-then-log + ``_seq`` rollback invariant from
+        :meth:`set_agent_state` for the inlined CAS region: ``_seq`` is reserved
+        on success, and if the callback raises we decrement and re-raise so the
+        caller's ``ROLLBACK`` leaves no phantom gap. Caller holds the lock and
+        an open transaction.
+        """
+        if self._state_log is None:
+            return 0
+        self._seq += 1
+        entry = {
+            "tick": tick,
+            "artifact_id": str(artifact_id),
+            "agent_id": str(agent_id),
+            "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
+            "from_state": from_state.name,
+            "to_state": to_state.name,
+            "trigger": trigger,
+            "version": version,
+            "content_hash": content_hash,
+            "sequence_number": self._seq,
+            "instance_id": self._instance_id,
+            "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
+        }
+        try:
+            self._state_log(entry)
+        except Exception:
+            self._seq -= 1
+            raise
+        self._conn.execute(
+            "UPDATE registry_meta SET value = ? WHERE key = 'sequence_number'",
+            (str(self._seq),),
+        )
+        return 1
+
+    def _artifact_name(self, artifact_id: UUID) -> str:
+        """Read the artifact's name inside the caller's open transaction."""
+        row = self._conn.execute(
+            "SELECT name FROM artifacts WHERE id = ?", (artifact_id.hex,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - guarded by caller's earlier SELECT
+            raise KeyError(f"artifact {artifact_id} not in registry")
+        return row[0]
 
     def artifacts_held_by_agent(
         self, agent_id: UUID, states: Iterable[MESIState]
