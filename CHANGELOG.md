@@ -6,16 +6,56 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
-The **[0.9.0]** entry below is prepared on the C-flip Phase 2 feature branch but
-**not yet tagged**. It ships via the dev → main → tag-push release flow no earlier
-than **2026-06-09** (the day after the Claude Code plugin Phase E monitoring window
-closes), or earlier only with written confirmation that the plugin pins
-`agent-coherence` below v0.9.0. The release date is filled in at tag time.
+(Nothing yet.)
 
-## [0.9.0] — UNRELEASED (gated ≥ 2026-06-09)
+## [0.9.1] — 2026-06-10
 
-**The crash-recovery default flips ON.** This completes the deprecation cycle begun
-in v0.8.3: `CrashRecoveryConfig().enabled` changes from `False` to `True`, so a bare
+Two write-correctness mechanisms land, both model-checked with TLA⁺: an
+**optimistic commit-CAS write path** (`NoLostUpdate`) and a **read-generation
+fence** (`NoStaleApply`).
+
+**Optimistic concurrency (commit-CAS).** `CoordinatorService.commit_cas` and
+`AgentRuntime.write_cas` commit a write only if the artifact version still
+equals the version the writer read. Concurrent same-key writers resolve to one
+winner; losers get a typed, retryable `ConflictDetail` (`version_mismatch` /
+`other_holder`) instead of a silent lost update. The cross-process path ships
+as the coordinator's `/hooks/post-edit-cas` endpoint plus
+`CoherentVolume.write_cas` (bounded reacquire-and-retry, fail-closed). A caller
+invalidated between its read and its CAS gets the stable
+`caller_in_transient_state` reason — a lost race, not corruption. Spec:
+`formal/tla/OCC.tla`.
+
+**Read-generation fence.** Closes the reclaim-zombie window a version check
+cannot see: a writer whose grant was evicted (crash-recovery sweep or the
+transient-timeout fail-safe) can no longer land a commit while the version is
+unchanged. Each artifact carries an `owner_generation` bumped on every
+coordinator-side eviction; every claim captures a server-side
+`read_generation`; both commit paths reject a superseded claim atomically with
+the version persist — `StaleReadGeneration` on the pessimistic path,
+`ConflictDetail` (`stale_read_generation`) on the CAS path; both retry-eligible
+after a fresh read. No public write API accepts a generation argument
+(CI-enforced). The SQLite schema gains the fence columns additively: pre-fence
+databases upgrade in place on open, and older binaries can still open upgraded
+databases. Spec: `formal/tla/Fencing.tla`.
+
+**`CoherentVolume` fixes.** `write()` no longer skips the disk write when its
+cached hash matches but the on-disk bytes diverged; and the EXCLUSIVE grant is
+released on any error in the post-grant window, so an `OSError` mid-write can
+no longer orphan a grant.
+
+**Hardening and docs.** The replay recorder creates its session directory with
+mode `0o700`. The README now leads with the verified guarantee set, and
+`formal/tla/README.md` documents all four specs (MESI, CrashRecovery, OCC,
+Fencing) with CI budgets and mutant-testing recipes.
+
+## [0.9.0] — 2026-06-07
+
+The first minor release since the v0.8 series. Three themes: the crash-recovery
+default flips **ON**, a new **CoherentVolume** shared-workspace adapter, and a
+temporal source-drift **cost benchmark**.
+
+**Crash-recovery default flips ON.** Completes the deprecation cycle begun in
+v0.8.3: `CrashRecoveryConfig().enabled` changes from `False` to `True`, so a bare
 `CCSStore()` / `CoherenceAdapterCore()` now reclaims stale `MODIFIED`/`EXCLUSIVE`
 grants automatically. Operators who depend on the v0.8.x default-disabled behavior
 **must pass `CrashRecoveryConfig(enabled=False)` explicitly** to opt out.
@@ -61,6 +101,26 @@ grants automatically. Operators who depend on the v0.8.x default-disabled behavi
   per process emits a one-shot `RuntimeWarning` naming the default change — a
   migration heads-up for anyone upgrading straight from v0.8.2 who skipped the v0.8.3
   `DeprecationWarning`. Removed in v0.10.0.
+- **`CoherentVolume` — sequential coherence for a shared agent workspace**
+  (`ccs.adapters.CoherentVolume`, plus `coherent_workspace()` / `install()` /
+  `uninstall()`). An out-of-process coordinator client that gives multiple agents on
+  one host, sharing files in a workspace, a coherent `read` / `write` / `reacquire`
+  surface over the shipped local-HTTP coordinator (strict-mode `INVALID`-deny over
+  SQLite-WAL). `write()` acquires EXCLUSIVE or **fails closed** when a peer commit has
+  invalidated the writer; `reacquire()` recovers via a fresh identity + mandatory
+  fresh read; writes are atomic (`tmp → fsync → os.replace`). An opt-in `install()` /
+  `coherent_workspace()` shim patches `open()` / `pathlib` for no-call-site-change
+  coordination (demo-grade). Scope: prevents stale-overwrite lost updates
+  (single-spawner, sequential-conflict); concurrent-write serialization and
+  multi-host are out of v1. Demo: `python -m examples.coherent_volume.main`.
+- **Temporal source-drift cost benchmark.** A simulation-based, cost-only measurement
+  (no LLM, no correctness oracle) of how many re-fetches/re-embeds coherence-gating
+  avoids when an external source changes between an agent's turns, swept over
+  change-rate × answer-sensitivity. Adds a flag-gated source-mutation step to
+  `SimulationEngine` (default off; byte-identical when off, dedicated RNG),
+  `BlindCacheStrategy` (the never-refresh cost floor), `source_refetches` /
+  `wasted_refetches` metrics, `tools/run_cost_sweep.py`, and a CI drift gate
+  (`make cost-benchmark-check` against `benchmarks/expected_cost.json`).
 
 ### Removed
 

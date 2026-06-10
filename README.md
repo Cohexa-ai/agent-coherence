@@ -94,9 +94,9 @@ Protocol safety properties — single-writer, monotonic versioning, the crash-re
 
 ## Status
 
-**`v0.9.0` released — crash recovery on by default, plus `CoherentVolume` and a temporal cost benchmark.** The crash-recovery default flips from `enabled=False` to **`enabled=True`**, so a bare `CCSStore()` / `CoherenceAdapterCore()` now reclaims stale grants automatically — pass `CrashRecoveryConfig(enabled=False)` to opt out. Byte-identity preservation under the default config now requires explicit `CrashRecoveryConfig(enabled=False)` to reproduce v0.8.x output. Adds `CoherentVolume` — a shared-workspace adapter that fails closed on stale overwrites — and a simulation cost benchmark for temporal source-drift. No wire-protocol changes. See [CHANGELOG.md](CHANGELOG.md).
+**`v0.9.1` released — the optimistic commit-CAS write path and the read-generation fence.** Concurrent same-key writes now resolve to one winner with typed, retryable conflicts (`commit_cas` / `write_cas`; `NoLostUpdate` model-checked), and a writer whose grant was reclaimed can no longer land a stale commit even with the version unchanged (`stale_read_generation`; `NoStaleApply` model-checked). SQLite stores upgrade in place — no migration step. Also: `CoherentVolume` stale-cache and grant-release fixes. See [CHANGELOG.md](CHANGELOG.md).
 
-**Landed on `dev`, unreleased:** the optimistic commit-CAS write API (`commit_cas` / `write_cas` — concurrent same-key lost updates resolve to one winner plus typed, retryable conflicts; `NoLostUpdate` model-checked) and the single-host read-generation fence (crash-reclaimed writers can't land stale commits; `NoStaleApply` model-checked).
+**`v0.9.0` — crash recovery on by default, plus `CoherentVolume` and a temporal cost benchmark.** The crash-recovery default flips from `enabled=False` to **`enabled=True`**, so a bare `CCSStore()` / `CoherenceAdapterCore()` now reclaims stale grants automatically — pass `CrashRecoveryConfig(enabled=False)` to opt out. Byte-identity preservation under the default config now requires explicit `CrashRecoveryConfig(enabled=False)` to reproduce v0.8.x output.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
