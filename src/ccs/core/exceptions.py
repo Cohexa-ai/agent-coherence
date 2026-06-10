@@ -29,7 +29,9 @@ class CoherenceError(Exception):
 class StaleReadGeneration(CoherenceError):
     """The read-generation fence rejected a commit: the committer's
     read_generation is older than the artifact's current owner_generation --
-    its captured ownership/read-claim was superseded by a sweep reclamation. Raised on the pessimistic ``commit()`` path; the OCC
+    its captured ownership/read-claim was superseded by a sweep reclamation.
+
+    Raised on the pessimistic ``commit()`` path; the OCC
     ``commit_cas`` path returns a :class:`ConflictDetail` with the same reason
     instead. Retry-eligible: ``reacquire()`` + fresh read + re-commit. Carries
     ``STALE_READ_GENERATION_REASON`` so the client classifier matches it

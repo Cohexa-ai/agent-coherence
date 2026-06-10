@@ -1732,8 +1732,10 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     - WIN → ``{ok: true, version: N+1}``.
     - :class:`~ccs.core.types.ConflictDetail` → ``{ok: false,
-      reason: "version_mismatch"|"other_holder", current_version: N}`` — a
-      clean typed conflict, NOT a degrade. The client re-reads + retries.
+      reason: "version_mismatch"|"other_holder"|"stale_read_generation",
+      current_version: N}`` — a clean typed conflict, NOT a degrade. The client
+      re-reads + retries. ``stale_read_generation`` is the read-generation
+      fence: the caller's captured claim was superseded by a sweep reclamation.
     - retry-eligible transient precondition
       (:class:`~ccs.core.exceptions.OccCallerTransientError`: a peer
       invalidated the caller between its read and this CAS) → ``{ok: false,

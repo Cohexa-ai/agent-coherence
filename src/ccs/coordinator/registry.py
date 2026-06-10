@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.states import MESIState, TransientState
 from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
@@ -18,12 +18,26 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
-# The sweep-reclaim triggers (CoordinatorService.enforce_stable_grant_timeouts).
-# An M/E -> INVALID transition carrying one of these bumps the artifact's
-# owner_generation (the read-generation fence). A peer-invalidation INVALID
-# (any other trigger) does NOT bump -- that path moves the version, so
-# version-CAS already catches a stale write. Shared with SqliteArtifactRegistry.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
+# The coordinator-side EVICTION triggers: the stable-grant sweep
+# (CoordinatorService.enforce_stable_grant_timeouts -> reclaim_heartbeat /
+# reclaim_max_hold) and the transient-timeout fail-safe
+# (enforce_transient_timeouts -> "timeout"). An M/E -> INVALID transition
+# carrying one of these bumps the artifact's owner_generation (the
+# read-generation fence) -- the holder's claim was revoked WITHOUT a version
+# move, which is exactly what version-CAS cannot see. A peer-invalidation
+# INVALID (any other trigger) does NOT bump: that path moves the version, so
+# version-CAS already catches a stale write. Duplicated in
+# SqliteArtifactRegistry; pinned equal by the parity test.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset(
+    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
+)
+
+# Triggers that mark a GENUINE content read for read-generation capture (the
+# E/M-acquire capture is keyed on the state transition, not the trigger).
+# Service.fetch() emits "fetch"; a rename there without updating this constant
+# would silently disable capture on reads -- pinned equal across registries by
+# the parity test, same discipline as RECLAIM_TRIGGERS.
+CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 # OCC commit-CAS result (plan Unit 2) — parity with SqliteArtifactRegistry.
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
@@ -75,9 +89,12 @@ class ArtifactRegistry:
         self._state_log = state_log
         self._agent_names = agent_names
         self._instance_id: str = instance_id if instance_id is not None else str(uuid4())
-        # Read-generation fence: per-construction nonce. In-memory resets every
-        # construction; the (coordinator_epoch, owner_generation) pair lets the
-        # Unit 5 commit guard fail a read captured under a prior epoch.
+        # coordinator_epoch: seeded for the CROSS-HOST fence follow-on
+        # (demand-gated; a client-carried token would compare it). NOT used in
+        # any guard yet -- the single-host fence keys only on owner_generation,
+        # and a wiped/recreated store also wipes the read_generation rows, so
+        # there is no pre-wipe claim for an epoch to fail. Kept so the durable
+        # store identity exists from day one.
         self._coordinator_epoch: str = uuid4().hex
         self._seq: int = 0
         self._retain_versions = retain_versions
@@ -111,7 +128,7 @@ class ArtifactRegistry:
         """Return the artifact's ownership epoch (read-generation fence)."""
         return self._records[artifact_id].owner_generation
 
-    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> Optional[int]:
+    def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the generation an agent captured at its last claim, or None if
         it never established a fence claim (a plain OCC writer that version-CAS,
         not the fence, arbitrates)."""
@@ -210,7 +227,12 @@ class ArtifactRegistry:
         # agent's read_generation when it establishes/refreshes a write-claim --
         # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
         # content read) or a genuine fetch read. Atomic (GIL) with the grant.
-        if (new_in_me and not prev_in_me) or trigger == "fetch":
+        # The INVALID guard hardens the fetch leg: no current fetch path grants
+        # INVALID, but a future cache-miss-INVALID fetch must not mint a fresh
+        # claim for an unfenced zombie.
+        if (new_in_me and not prev_in_me) or (
+            trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+        ):
             record.read_generation_by_agent[agent_id] = record.owner_generation
 
         if self._state_log is not None:

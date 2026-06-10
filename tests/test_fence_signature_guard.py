@@ -14,6 +14,7 @@ import inspect
 
 import pytest
 
+from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.agent.runtime import AgentRuntime
 from ccs.coordinator.service import CoordinatorService
 
@@ -45,6 +46,8 @@ _PUBLIC_WRITE_APIS = [
     CoordinatorService.commit_cas,
     AgentRuntime.write,
     AgentRuntime.write_cas,
+    CoherentVolume.write,
+    CoherentVolume.write_cas,
 ]
 
 

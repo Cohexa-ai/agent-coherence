@@ -73,8 +73,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.states import MESIState, TransientState
 from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
@@ -88,11 +88,19 @@ v0.1 raises on mismatch; v0.2 will add real migration dispatch when needed."""
 ReclamationSlot: TypeAlias = tuple[str, int]
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
-# Sweep-reclaim triggers — an M/E -> INVALID carrying one of these bumps the
-# artifact's owner_generation (read-generation fence). Duplicated from
-# registry.py (the two registries share no base class); the dual-registry
-# parity test pins them equal.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
+# Coordinator-side eviction triggers (the stable-grant sweep's two reclaim
+# triggers + the transient-timeout fail-safe) — an M/E -> INVALID carrying one
+# of these bumps the artifact's owner_generation (read-generation fence): the
+# claim was revoked without a version move, which version-CAS cannot see.
+# Duplicated from registry.py (the two registries share no base class); the
+# dual-registry parity test pins them equal.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset(
+    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
+)
+
+# Genuine-content-read triggers for read-generation capture (mirrors
+# registry.py; pinned equal by the parity test). Service.fetch() emits "fetch".
+CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 # OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
 # invalidated_agent_ids)`` — the service layer turns the id list into
@@ -376,20 +384,32 @@ class SqliteArtifactRegistry:
         epoch_row = self._conn.execute(
             "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
         ).fetchone()
+        if epoch_row is None:
+            raise SchemaVersionError(
+                f"coordinator_epoch missing from registry_meta at {self._db_path}; "
+                f"the database may be partially upgraded or corrupted. "
+                f"Delete and restart to rehydrate."
+            )
         self._coordinator_epoch = epoch_row[0]
 
     def _ensure_fence_columns(self) -> None:
         """Additively add the read-generation fence columns + coordinator_epoch
-        to a pre-fence database. Idempotent (PRAGMA-guarded); user_version stays
-        unchanged. Caller holds the lock; runs in one explicit transaction so a
-        SIGKILL mid-add cannot leave a half-applied column set."""
+        to a pre-fence database. Idempotent; user_version stays unchanged.
+        Caller holds the lock; runs in one explicit transaction so a SIGKILL
+        mid-add cannot leave a half-applied column set. The PRAGMA introspection
+        runs INSIDE the BEGIN IMMEDIATE: two processes opening the same
+        pre-fence db serialize on the write lock, and the loser re-reads the
+        schema after the winner's commit — so it sees the columns as present
+        and no-ops instead of crashing on a duplicate-column ALTER."""
         c = self._conn
-        art_cols = {row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()}
-        state_cols = {
-            row[1] for row in c.execute("PRAGMA table_info(agent_states)").fetchall()
-        }
         c.execute("BEGIN IMMEDIATE")
         try:
+            art_cols = {
+                row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
+            }
+            state_cols = {
+                row[1] for row in c.execute("PRAGMA table_info(agent_states)").fetchall()
+            }
             if "owner_generation" not in art_cols:
                 c.execute(
                     "ALTER TABLE artifacts ADD COLUMN owner_generation "
@@ -541,10 +561,13 @@ class SqliteArtifactRegistry:
                         (artifact_id.hex, fence_agent_id.hex),
                     ).fetchone()
                     if rg_row is not None and rg_row[0] is not None:
-                        owner_gen = self._conn.execute(
+                        og_row = self._conn.execute(
                             "SELECT owner_generation FROM artifacts WHERE id = ?",
                             (artifact_id.hex,),
-                        ).fetchone()[0]
+                        ).fetchone()
+                        if og_row is None:
+                            raise KeyError(f"artifact {artifact_id} not in registry")
+                        owner_gen = og_row[0]
                         if rg_row[0] < owner_gen:
                             # Raise inside the try; the except below ROLLBACKs
                             # and re-raises (no double rollback).
@@ -771,7 +794,11 @@ class SqliteArtifactRegistry:
                 # write-claim (E/M acquire -- P0 fix, incl. acquire-without-read
                 # -- or a fetch read), atomic with the grant in this BEGIN
                 # IMMEDIATE. The agent_states row exists after the upsert above.
-                if (new_in_me and not prev_in_me) or trigger == "fetch":
+                # INVALID guard on the fetch leg: a future cache-miss-INVALID
+                # fetch must not mint a fresh claim for an unfenced zombie.
+                if (new_in_me and not prev_in_me) or (
+                    trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+                ):
                     self._conn.execute(
                         "UPDATE agent_states SET read_generation = "
                         "(SELECT owner_generation FROM artifacts WHERE id = ?) "
@@ -1217,11 +1244,13 @@ class SqliteArtifactRegistry:
                     (artifact_id.hex, agent_id.hex),
                 ).fetchone()
                 if rg_row is not None and rg_row[0] is not None:
-                    owner_gen = self._conn.execute(
+                    og_row = self._conn.execute(
                         "SELECT owner_generation FROM artifacts WHERE id = ?",
                         (artifact_id.hex,),
-                    ).fetchone()[0]
-                    if rg_row[0] < owner_gen:
+                    ).fetchone()
+                    if og_row is None:
+                        raise KeyError(f"artifact {artifact_id} not in registry")
+                    if rg_row[0] < og_row[0]:
                         self._conn.execute("COMMIT")
                         return ConflictDetail("stale_read_generation", current)
 

@@ -987,3 +987,27 @@ def test_set_artifact_and_content_fence_rejects_stale_committer(db_path: Path) -
         src = Artifact(id=art.id, name="plan.md", version=3, content_hash="src")
         reg.set_artifact_and_content(art.id, src, "x")
         assert reg.get_artifact(art.id).version == 3
+
+
+def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
+    """A db whose fence COLUMNS exist but whose coordinator_epoch was never
+    seeded (partial prior upgrade) opens cleanly: _ensure_fence_columns skips
+    the duplicate ALTERs and the INSERT OR IGNORE seeds the missing epoch."""
+    import sqlite3
+
+    # hex ids: the registry's lookups key on UUID.hex (the pre-fence builder
+    # stores ids verbatim, so dashed ids would miss the hex-keyed lookup).
+    art_id, ag_id = uuid4().hex, uuid4().hex
+    _build_pre_fence_db(db_path, art_id, ag_id)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "ALTER TABLE artifacts ADD COLUMN owner_generation INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
+    conn.commit()
+    conn.close()
+
+    with SqliteArtifactRegistry(db_path) as reg:
+        assert reg._coordinator_epoch  # seeded on this open
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reg.get_owner_generation(UUID(art_id)) == 0

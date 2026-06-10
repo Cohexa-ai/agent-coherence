@@ -2709,6 +2709,48 @@ def test_adv004_post_edit_after_reclamation_returns_reclaimed_message(
     assert "preempted by session" not in body.get("reason", "")
 
 
+def test_post_edit_fence_reject_returns_stable_reason(
+    coordinator, client: _Client,
+) -> None:
+    """End-to-end: the read-generation fence race window — the grant is still
+    EXCLUSIVE but a sweep superseded the claim (owner_generation advanced
+    between commit()'s state check and the version persist). post-edit must
+    return the STABLE stale_read_generation reason (exact constant, not
+    str(exc)) plus current_version, land no phantom bump, and leak no MWB
+    transient."""
+    from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+    from ccs.core.exceptions import STALE_READ_GENERATION_REASON
+
+    sid = _sid("fence-race")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert artifact_id is not None
+
+    # Manufacture the race: generation advances while the state stays E
+    # (a direct bump stands in for the sweep firing mid-commit; autocommit
+    # connection, so no transaction is held open against the server).
+    coordinator.registry._conn.execute(
+        "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
+        (artifact_id.hex,),
+    )
+    before = coordinator.registry.get_artifact(artifact_id).version
+
+    s, body = client.post("/hooks/post-edit", {
+        "session_id": sid,
+        "path": "plan.md",
+        "content_hash": _hash("fence-late"),
+        "success": True,
+    })
+    assert s == 200, body
+    assert body.get("ok") is False
+    assert body.get("reason") == STALE_READ_GENERATION_REASON
+    assert body.get("current_version") == before
+    # No phantom version bump; no leaked MWB transient (review P1 regression).
+    assert coordinator.registry.get_artifact(artifact_id).version == before
+    assert coordinator.registry.get_agent_transient(artifact_id, agent_id) is None
+
+
 def test_adv004_sweep_on_reclaim_callback_exception_does_not_break_sweep(
     coordinator,
 ) -> None:

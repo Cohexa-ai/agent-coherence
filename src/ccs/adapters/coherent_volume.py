@@ -922,7 +922,10 @@ class CoherentVolume:
         - ``ok: false`` with a retry-eligible reason → ``"conflict"`` (reacquire
           + retry). Matched EXACTLY against :attr:`_CAS_RETRY_REASONS`: the
           typed ``ConflictDetail`` reasons (``version_mismatch`` /
-          ``other_holder``) AND ``caller_in_transient_state`` — when a peer
+          ``other_holder`` / ``stale_read_generation`` — the read-generation
+          fence: the caller's captured claim was superseded by a sweep
+          reclamation; a reacquire + fresh read mints a current claim)
+          AND ``caller_in_transient_state`` — when a peer
           invalidates this instance in the window BETWEEN its fresh read and its
           CAS, the coordinator leaves an invalidation transient that
           ``commit_cas`` rejects as a precondition; that is a lost race, not
