@@ -278,6 +278,15 @@ def validate_content_hash(content_hash: Any, *, required: bool) -> str | None:
     return None
 
 
+# Sentinel recorded hash carrying no real content claim: launch-gate
+# scenarios inject artifact rows with "f"*64 (no real SHA-256 matches it,
+# guaranteeing hash_differs on the stale path). The other no-claim seed —
+# "" from KTD-9 first observations without a caller hash — surfaces as
+# ``None`` on the Artifact, so truthiness checks already exclude it. The
+# fresh-SHARED mismatch signal must not fire against either.
+_F_SENTINEL_CONTENT_HASH = "f" * 64
+
+
 # ----------------------------------------------------------------------
 # Server shell
 # ----------------------------------------------------------------------
@@ -454,6 +463,17 @@ class CoordinatorHTTPServer:
         self._strict_mode_denials_total: int = 0
         self._strict_mode_routed_around_via_bash_total: int = 0
         self._audit_log_mode_drift_total: int = 0
+
+        # Defense-in-depth signal (PR #108 follow-up, 2026-06-11):
+        # fresh_shared_hash_mismatch_total counts pre-reads where a
+        # SHARED holder supplied a content_hash that mismatches the
+        # recorded (non-sentinel) artifact hash. A peer commit would
+        # have left the session INVALID, so a mismatch here implies an
+        # out-of-band write or the commit→disk-write lag observed via a
+        # warn-mode re-grant. The fresh response stays an allow (the
+        # plugin path is fail-open); this counter sizes the
+        # false-positive rate before any strict-mode deny knob is added.
+        self._fresh_shared_hash_mismatch_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -769,6 +789,15 @@ class CoordinatorHTTPServer:
         operator-visible signal to fix the mode."""
         self._audit_log_mode_drift_total += 1
 
+    def increment_fresh_shared_hash_mismatch(self) -> None:
+        """PR #108 follow-up: bumped when pre-read's fresh-SHARED branch
+        observes a caller content_hash that mismatches the recorded
+        non-sentinel artifact hash. The response stays fresh/allow — the
+        counter (plus the additive ``hash_differs`` response field) is
+        the observable. Advisory counter, same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._fresh_shared_hash_mismatch_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
@@ -854,6 +883,7 @@ class CoordinatorHTTPServer:
             "strict_mode_routed_around_via_bash_total": self._strict_mode_routed_around_via_bash_total,
             "audit_log_mode_drift_total": self._audit_log_mode_drift_total,
             "stale_warning_reread_total": self._stale_warning_reread_total,
+            "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1284,7 +1314,28 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # Reader has a valid grant on the current version. Unit 6:
             # include the version so an OCC writer can source
             # ``expected_version`` (additive — status clients ignore it).
-            return {"status": "fresh", "version": artifact.version}
+            fresh: dict[str, Any] = {"status": "fresh", "version": artifact.version}
+            # Defense-in-depth (PR #108 follow-up): a SHARED holder whose
+            # supplied disk hash mismatches the recorded content is
+            # anomalous — a peer commit would have left it INVALID — so a
+            # mismatch implies an out-of-band write or the commit→disk-
+            # write lag observed through a warn-mode re-grant. Surface it
+            # additively: the key appears ONLY when firing (exact-shape
+            # status clients are untouched) and the response stays an
+            # allow — the plugin path is fail-open by design; a
+            # strict-mode deny knob waits on this counter proving a
+            # ~zero false-positive rate. Sentinel recorded hashes carry
+            # no content claim and must not fire ("" seeds surface as
+            # None; the truthiness check covers them).
+            if (
+                content_hash
+                and artifact.content_hash
+                and artifact.content_hash != _F_SENTINEL_CONTENT_HASH
+                and content_hash != artifact.content_hash
+            ):
+                coordinator.increment_fresh_shared_hash_mismatch()
+                fresh["hash_differs"] = True
+            return fresh
 
         # Stale: either first time this session sees the artifact OR they
         # were invalidated by a peer commit.

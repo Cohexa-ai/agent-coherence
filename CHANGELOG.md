@@ -35,6 +35,18 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **Fresh-SHARED hash-mismatch signal** (`/hooks/pre-read`): a SHARED holder
+  whose supplied `content_hash` mismatches the recorded artifact hash now gets
+  an additive `hash_differs: true` field on the fresh response, and the
+  coordinator bumps a new `fresh_shared_hash_mismatch_total` counter
+  (`/status?detail=metrics`). Previously the fresh-SHARED fast path returned
+  the version comparand with no validation — only INVALID/None-state reads
+  were hash-checked. A peer commit would have left the session INVALID, so a
+  mismatch implies an out-of-band write or commit→disk-write lag; the signal
+  makes that observable. Warn-mode semantics unchanged: the read is still
+  allowed, the key appears only when the mismatch fires, and sentinel
+  recorded hashes (`""` seeds, `"f" * 64` launch-gate injection) never fire
+  it.
 - **Concurrent lost-update demo** (`examples/concurrent_writers/`): a true-race
   reproduction of the v0.9.1 commit-CAS write path. Two threads update a shared
   total concurrently; `broken.py` loses an update (last writer wins over a plain
