@@ -27,6 +27,7 @@
       "coordinator_version": "<IGNORED>",
       "detail": "minimal",
       "endpoint_counters": "<IGNORED>",
+      "fresh_shared_hash_mismatch_total": 0,
       "handler_concurrency_overflows_total": 0,
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
