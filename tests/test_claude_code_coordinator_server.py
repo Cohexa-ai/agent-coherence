@@ -581,6 +581,46 @@ def test_a1_preemption_surfaces_on_victim_next_pre_read(client: _Client) -> None
     assert y[:8] in msg, f"prose should name the preempter session prefix; got: {msg}"
 
 
+def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
+    """A1 × Unit 6: notice surfacing on the FRESH pre-read path must keep
+    the additive ``version`` key alongside ``hookSpecificOutput``.
+
+    Regression: the ``work_with_notice_surfacing`` wrapper rebuilt the
+    fresh response as a literal dict, dropping ``version`` — an OCC
+    writer sourcing expected_version from the read then CAS'd against 0
+    and burned a wasted version_mismatch round-trip."""
+    x = _sid("X"); y = _sid("Y")
+    # X first-reads task.md — seeds v1 + grants SHARED, so the re-read
+    # below (after the preemption on a DIFFERENT artifact) stays fresh.
+    status, body = client.post("/hooks/pre-read",
+                               {"session_id": x, "path": "task.md",
+                                "content_hash": _hash("t1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+    # X acquires EXCLUSIVE on plan.md; Y pre-edits plan.md, silently
+    # preempting X — a preemption notice queues for X.
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    # X's next hook is a pre-read of task.md (still SHARED → fresh): the
+    # wrapper drains the pending notice onto this fresh response.
+    status, body = client.post("/hooks/pre-read",
+                               {"session_id": x, "path": "task.md",
+                                "content_hash": _hash("t1")})
+    assert status == 200, body
+    assert body.get("status") == "fresh", body
+    assert "hookSpecificOutput" in body, (
+        f"fresh pre-read after a preemption must surface the notice; got {body}"
+    )
+    msg = body["hookSpecificOutput"]["additionalContext"]
+    assert "plan.md" in msg and y[:8] in msg, (
+        f"notice prose should name the preempted artifact + preempter; got: {msg}"
+    )
+    assert body.get("version") == 1, (
+        "fresh-with-notice response must preserve the Unit 6 version key "
+        f"(OCC writers source expected_version from it); got {body}"
+    )
+
+
 def test_a1_preemption_surfaces_on_victim_next_pre_edit(client: _Client) -> None:
     """A1: surface preemption even when X's next hook is pre-edit, not pre-read."""
     x = _sid("X"); y = _sid("Y")
