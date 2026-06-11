@@ -14,8 +14,9 @@ coordinator subprocess (no network).
 
 from __future__ import annotations
 
+from ccs.core.exceptions import CasRetriesExhausted, CoherenceError
 from examples.concurrent_writers.broken import run_broken
-from examples.concurrent_writers.fixed import run_fixed
+from examples.concurrent_writers.fixed import _race_write_cas, run_fixed
 
 # --- broken case (no coherence) --------------------------------------------
 
@@ -62,3 +63,46 @@ def test_broken_and_fixed_diverge_on_the_same_race() -> None:
     assert broken_trace["lost_update"] is True  # update lost
     assert fixed_trace["lost_update"] is False  # both survived
     assert broken_trace["scenario"] == fixed_trace["scenario"]
+
+
+# --- higher-contention regression: the HONEST invariant --------------------
+#
+# Regression for the commit-CAS on-disk lost update (2026-06-10, PR #107). Under
+# contention higher than the 2-writer demo, the stale-deny recovery in
+# write_cas paired the comparand bytes with a SEPARATELY-resolved version (and
+# routed the re-read through the coordinator's unchecked fresh-SHARED branch), so
+# make_content() could win a version-CAS over STALE bytes and silently drop a
+# peer's update — final < N with NO exception. Fixed by re-minting identity
+# WITHOUT a read, so every comparand read is a hash-checked None-state read whose
+# (bytes, version) pair is validated. See
+# docs/solutions/logic-errors/ for the writeup.
+
+
+def test_fixed_under_higher_contention_holds_the_honest_invariant() -> None:
+    """Every run must satisfy the HONEST invariant: final == start + every delta
+    (no update lost), OR a TYPED fail-closed raise (CasRetriesExhausted /
+    CoherenceError under very high contention) — but NEVER a silent loss (a run
+    that RETURNS yet dropped an update). The strict ``final == N`` form is timing-
+    flaky (it reds on the acceptable fail-closed terminal too); this asserts the
+    real guarantee write_cas makes."""
+    n = 5  # > the 2-writer demo; exercises the stale-deny recovery path
+    start = 0
+    saw_completion = False
+    for _ in range(6):
+        try:
+            final, attempts = _race_write_cas([1] * n, start)
+        except RuntimeError as exc:
+            # A failed guarantee must be a TYPED terminal, never a swallowed
+            # silent loss. _race_write_cas re-raises the writer's error as the
+            # RuntimeError's __cause__.
+            assert isinstance(exc.__cause__, (CasRetriesExhausted, CoherenceError)), (
+                f"fail-closed must be typed, got {exc.__cause__!r}"
+            )
+            continue
+        # Returned without raising → EVERY update survived (no silent drop).
+        assert final == start + n, f"SILENT LOST UPDATE: final={final}, expected={start + n}"
+        assert sum(attempts) >= n  # make_content ran at least once per writer
+        saw_completion = True
+    # Contention is real but bounded; at n=5 at least one run should complete
+    # rather than every run exhausting (guards against a degenerate always-raise).
+    assert saw_completion, "every run fail-closed at n=5 — retry budget too tight?"

@@ -26,6 +26,7 @@ from ccs.adapters.claude_code.lifecycle import (
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import (
+    MAX_CAS_REACQUIRES,
     CoherentVolume,
     coherent_workspace,
     install,
@@ -896,9 +897,9 @@ def test_guard_released_after_op_allows_subsequent_ops(
 
 # ---------------------------------------------------------------------------
 # T2 — write_cas recovery from a STICKY strict-deny (KTD-T), plus the
-# coordinator-wedged guard. Distinct from the conflict-classify convergence
+# bounded fail-closed terminal. Distinct from the conflict-classify convergence
 # above: here B is INVALID at CAS time, so the stale-deny branch (NOT a
-# version_mismatch conflict) drives the reacquire.
+# version_mismatch conflict) drives the re-mint + retry.
 # ---------------------------------------------------------------------------
 
 
@@ -907,9 +908,9 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
 ) -> None:
     """T2: a peer commit leaves THIS volume INVALID (sticky strict-deny). The
     very first OCC read inside write_cas is a strict-deny (stale_denied), so
-    write_cas must reacquire() (re-mint identity → clears INVALID + the
-    invalidation transient) and commit the rebased bytes — converge, NOT raise.
-    No lost update: B's commit is rebased on A's v2."""
+    write_cas must re-mint identity (clears INVALID + the invalidation transient)
+    and commit the rebased bytes — converge, NOT raise. No lost update: B's
+    commit is rebased on A's v2."""
     from ccs.cli._coherence_client import post as _cpost
 
     target = _seed(tmp_path, content=b"v1")
@@ -933,10 +934,11 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
             seen.append(current)
             return current + b"\nrebased-by-B"
 
-        # write_cas drives the stale-deny branch → reacquire → fresh read → CAS.
+        # write_cas drives the stale-deny branch → re-mint → fresh hash-checked
+        # read → CAS.
         vol_b.write_cas("data/shared.txt", make)
         assert target.read_bytes() == b"v2-from-A\nrebased-by-B"
-        # The winning attempt derived from A's v2 (re-read via reacquire), never
+        # The winning attempt derived from A's v2 (re-read after re-mint), never
         # the stale v1 buffer.
         assert b"v2-from-A" in seen[-1]
         assert not vol_b.is_degraded  # a deny/recovery is enforcement, not infra
@@ -944,14 +946,20 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
         stop_coordinator(tmp_path)
 
 
-def test_write_cas_raises_when_reacquire_cannot_clear_invalid(
+def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """T2: the coordinator-wedged guard. If a fresh-minted identity STILL reads
-    as a strict-deny (impossible in normal operation — a brand-new identity has
-    no prior INVALID), write_cas must fail closed with a clear CoherenceError and
-    NOT spin forever. Simulated by stubbing _read_with_version to report
-    stale_denied on both the fresh read AND the post-reacquire re-read."""
+    """T2: a comparand read that NEVER clears (every read is a strict-deny) must
+    fail closed with a TYPED terminal — never a silent drop and never an
+    infinite spin. The loop re-mints identity (NOT reacquire(), whose read would
+    route the next comparand read through the coordinator's unchecked
+    fresh-SHARED branch — the on-disk lost-update hole) and re-reads, bounded by
+    the CONSECUTIVE-denied-streak limit (a denied read never POSTs a commit, so
+    it must not consume the CAS budget — that one counts commit attempts).
+    Crucially make_content() runs ONLY after a read that is NOT denied, so a
+    perpetually-denied artifact derives and commits NOTHING — there is no stale
+    buffer to land. Simulated by stubbing _read_with_version to always report
+    stale_denied."""
     _seed(tmp_path, content=b"v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
     try:
@@ -959,8 +967,7 @@ def test_write_cas_raises_when_reacquire_cannot_clear_invalid(
         calls = {"n": 0}
 
         def always_denied(rel: str):
-            # (bytes, version, stale_denied) — always denied → the fresh read is
-            # denied AND the re-read after reacquire is denied (refused_again).
+            # (bytes, version, stale_denied) — every comparand read is a deny.
             calls["n"] += 1
             return (b"v1", 1, True)
 
@@ -972,11 +979,14 @@ def test_write_cas_raises_when_reacquire_cannot_clear_invalid(
             made["called"] = True
             return b"should-not-commit"
 
-        with pytest.raises(CoherenceError, match="wedged"):
+        # Typed terminal (the denied-streak bound), never a silent loss.
+        with pytest.raises(CoherenceError, match="stayed strict-denied"):
             vol.write_cas("data/shared.txt", make)
-        # No spin: fresh read (1) + post-reacquire re-read (2) = exactly 2 calls,
-        # then it raises before ever deriving/committing bytes.
-        assert calls["n"] == 2
+        # Bounded, not an infinite spin: exactly MAX_CAS_REACQUIRES + 1
+        # consecutive denied reads, then the typed raise.
+        assert calls["n"] == MAX_CAS_REACQUIRES + 1
+        # make_content NEVER ran: a denied read derives/commits no bytes, so a
+        # stale buffer can never land (the on-disk lost update is impossible).
         assert made["called"] is False
     finally:
         stop_coordinator(tmp_path)

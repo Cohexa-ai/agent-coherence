@@ -6,18 +6,45 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CoherentVolume.write_cas` on-disk lost update under high same-key
+  contention.** Surfaced by the concurrent-writers demo in CI (≥5 concurrent
+  `write_cas` writers): the stale-deny recovery inside `write_cas` paired the
+  bytes from `reacquire()` with a version comparand resolved by a *separate,
+  later* read — and `reacquire()`'s read left the re-minted identity SHARED, so
+  that follow-up read hit the coordinator's fresh-SHARED pre-read branch, which
+  returns the version **without** re-checking the disk bytes' hash. A peer
+  commit landing between the two reads paired STALE bytes with a FRESH version;
+  the commit-CAS checks only the version, so `make_content` derived from the
+  stale bytes and *won* — silently dropping the peer's update on disk (the
+  protocol-level `NoLostUpdate` invariant held: the version-bump count was
+  right, but the persisted value was wrong). Fixed by re-minting identity
+  WITHOUT a read on every retry (`_remint()`), so each attempt's comparand
+  `(bytes, version)` pair comes from ONE hash-checked None-state read; a
+  stale-bytes/fresh-version split is now structurally unrepresentable, and a
+  lagging-disk read is denied and retried rather than committed. The denied
+  read no longer counts against the commit budget (`MAX_CAS_REACQUIRES` keeps
+  its documented "total commit attempts" meaning); a never-clearing view is
+  separately bounded by a consecutive-denied-streak limit, which also replaces
+  the previous (misdiagnosed) "coordinator may be wedged" raise — that state is
+  the transient disk-write-after-commit window, and now retries. Both
+  terminals are typed (`CasRetriesExhausted` / `CoherenceError`); `write_cas`
+  never returns success without its update landing. Regression:
+  `tests/test_concurrent_writers_demo.py::test_fixed_under_higher_contention_holds_the_honest_invariant`.
+
 ### Added
 
 - **Concurrent lost-update demo** (`examples/concurrent_writers/`): a true-race
   reproduction of the v0.9.1 commit-CAS write path. Two threads update a shared
   total concurrently; `broken.py` loses an update (last writer wins over a plain
   file), `fixed.py` runs the identical race through `CoherentVolume.write_cas` and
-  preserves both (the loser is told `version_mismatch`, reacquires, and re-applies
-  on the winner's value via its `make_content` closure). The rung-2 (concurrent,
-  single-host) analog of the rung-1 sequential `examples/coherent_volume` demo —
-  it surfaces the race the invalidation-deny model cannot catch. Offline; the
-  fixed case spawns a local coordinator subprocess. Run:
-  `python -m examples.concurrent_writers.main`. Tests:
+  preserves both (the loser is told `version_mismatch`, re-mints identity +
+  re-reads, and re-applies on the winner's value via its `make_content` closure).
+  The rung-2 (concurrent, single-host) analog of the rung-1 sequential
+  `examples/coherent_volume` demo — it surfaces the race the invalidation-deny
+  model cannot catch. Offline; the fixed case spawns a local coordinator
+  subprocess. Run: `python -m examples.concurrent_writers.main`. Tests:
   `tests/test_concurrent_writers_demo.py`.
 
 ## [0.9.1] — 2026-06-10

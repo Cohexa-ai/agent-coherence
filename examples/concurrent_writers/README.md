@@ -36,13 +36,14 @@ vol.write_cas("data/tally.txt", lambda current: str(int(current) + delta).encode
 your `make_content` closure, and commits through the coordinator's
 version-checked CAS. Two concurrent writers cannot both land the same version:
 the serialized commit picks a winner, and the loser receives `version_mismatch`,
-[`reacquire()`](../coherent_volume/README.md)s a fresh identity + a **mandatory**
-fresh read, and **re-invokes `make_content` on the new value** before retrying
-(bounded by `MAX_CAS_REACQUIRES`; on exhaustion it raises `CasRetriesExhausted`,
-never a silent drop). Re-deriving intent against the latest state is what turns
-the retry into an *update* rather than a stale overwrite — so a closure that
-ignores its `current` argument defeats the guard (the one fundamental OCC-proof
-boundary).
+re-mints a fresh identity, takes ONE fresh **hash-checked** read (the bytes and
+the version comparand always come from the same validated read — never from two
+reads a peer could commit between), and **re-invokes `make_content` on the new
+value** before retrying (the commit budget is `MAX_CAS_REACQUIRES`; on
+exhaustion it raises `CasRetriesExhausted`, never a silent drop). Re-deriving
+intent against the latest state is what turns the retry into an *update* rather
+than a stale overwrite — so a closure that ignores its `current` argument
+defeats the guard (the one fundamental OCC-proof boundary).
 
 ## How this differs from `examples/coherent_volume`
 
@@ -65,5 +66,18 @@ writers (a network coordinator + a durable cross-host registry) are the
 demand-gated follow-on — see the roadmap's *Epic — Cross-Host Concurrency*
 (Pieces #3–#5). Until that ships, multi-host prospects are pattern-only.
 
+**Contention bound.** The guarantee `write_cas` makes is *every update lands,
+or a typed error is raised* — never a silent loss. Under sustained same-key
+contention approaching the commit budget (`MAX_CAS_REACQUIRES` = 8 → 9 CAS
+attempts; ~8+ writers racing the SAME key at once), a writer can exhaust the
+budget and raise `CasRetriesExhausted` — the honest fail-closed terminal, not a
+dropped update. The 2-writer demo (and fleets up to roughly the budget) converge
+cleanly.
+
 Verified by `formal/tla/OCC.tla` (`NoLostUpdate`) and `formal/tla/Fencing.tla`
-(`NoStaleApply`), both model-checked. Tests: `tests/test_concurrent_writers_demo.py`.
+(`NoStaleApply`), both model-checked — these cover the *protocol*. The
+client-integration path (`CoherentVolume.write_cas` over HTTP + the real
+filesystem) is covered by the regression tests here: the comparand bytes and
+version are always taken from one hash-checked read, so a stale read can never
+win the version CAS (see `test_fixed_under_higher_contention_holds_the_honest_invariant`).
+Tests: `tests/test_concurrent_writers_demo.py`.

@@ -8,9 +8,10 @@ run the identical read→write race as ``broken.py`` — but through ``write_cas
 the optimistic (commit-CAS) write path shipped in v0.9.1. Each writer reads the
 shared total and attempts to commit; the coordinator's serialized commit elects
 one winner, and the loser is told ``version_mismatch`` (a typed, retryable
-conflict — never a silent drop), reacquires (re-mint identity + mandatory fresh
-read), re-derives its update from the winner's value via ``make_content``, and
-retries. Every update survives.
+conflict — never a silent drop), re-mints its identity, takes one fresh
+hash-checked read (bytes + version comparand from the SAME read), re-derives its
+update from the winner's value via ``make_content``, and retries. Every update
+survives.
 
 This is the rung-2 guarantee the *sequential* demo (``examples/coherent_volume``)
 cannot make: surviving a TRUE concurrent same-key race, not just a sequenced
