@@ -9,10 +9,11 @@ amortized GC), **R3** (all three capture points retain), **R4** (GC invisible to
 the protocol, current never collected, exemption-extensible).
 
 This file ESTABLISHES the parametrized dual-registry fixture (the
-``tests/test_fencing.py:27-35`` pattern). The ``sqlite`` arm is xfail-marked for
-retention specifics until Unit 3 lands durable retention — Unit 3 flips it on by
-deleting the xfail marker. Units 3-5 extend/consolidate this fixture; per-reason
-service scenarios arrive with Unit 4's ``read_at_version``.
+``tests/test_fencing.py:27-35`` pattern). Unit 3 landed durable sqlite retention,
+so the ``sqlite`` arm is now ACTIVE (the xfail marker was removed and the ctor
+takes ``retention_policy``); the parity scenarios run against both registries.
+Units 4-5 extend/consolidate this fixture; per-reason service scenarios arrive
+with Unit 4's ``read_at_version``.
 """
 
 from __future__ import annotations
@@ -31,44 +32,23 @@ from ccs.core.states import MESIState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
 # ---------------------------------------------------------------------------
-# Dual-registry fixture (established here; Unit 3 enables the sqlite arm)
+# Dual-registry fixture (both arms ACTIVE as of Unit 3)
 # ---------------------------------------------------------------------------
 
-# Durable retention lands in Unit 3. Until then the sqlite registry raises
-# NotImplementedError on retain_versions=True, so retention-specific scenarios
-# cannot run against it. The fixture is structured exactly like
-# test_fencing.py's so Unit 3 only has to drop this xfail marker — the parity
-# scenarios are already written against `registry` and will light up for free.
-_SQLITE_RETENTION_PENDING = pytest.param(
-    "sqlite",
-    marks=pytest.mark.xfail(
-        reason="durable retention lands in Unit 3; sqlite retain_versions "
-        "raises NotImplementedError today",
-        raises=NotImplementedError,
-        strict=False,
-    ),
-)
 
-
-@pytest.fixture(params=["in_memory", _SQLITE_RETENTION_PENDING])
+@pytest.fixture(params=["in_memory", "sqlite"])
 def retention_registry(request, tmp_path: Path):
     """Yield each registry with a bounded policy (K=2) so the SAME retention
-    scenarios run against both. The sqlite arm is xfail until Unit 3.
-
-    NOTE for Unit 3: ``SqliteArtifactRegistry.__init__`` does not accept
-    ``retention_policy`` yet — it raises ``NotImplementedError`` on
-    ``retain_versions=True`` before any policy kwarg would bind. The sqlite arm
-    therefore constructs WITHOUT a policy today (the xfail catches that raise).
-    Unit 3 adds the ``retention_policy`` parameter to the sqlite ctor, drops the
-    xfail marker, and passes ``retention_policy=policy`` here — the parity
-    scenarios below already run against ``retention_registry`` and light up
-    automatically."""
+    scenarios run against both. Unit 3 enabled the sqlite arm (durable
+    ``artifact_versions`` table + ``retention_policy`` ctor param); the parity
+    scenarios below run identically on both registries."""
     policy = RetentionPolicy(max_versions=2)
     if request.param == "in_memory":
         yield ArtifactRegistry(retain_versions=True, retention_policy=policy)
     else:
-        # Unit 3: add retention_policy=policy once the sqlite ctor accepts it.
-        with SqliteArtifactRegistry(tmp_path / "state.db", retain_versions=True) as reg:
+        with SqliteArtifactRegistry(
+            tmp_path / "state.db", retain_versions=True, retention_policy=policy
+        ) as reg:
             yield reg
 
 

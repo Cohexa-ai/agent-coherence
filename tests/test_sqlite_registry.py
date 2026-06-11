@@ -12,17 +12,26 @@ deliberately does not preserve (KTD-13 contract divergence).
 
 from __future__ import annotations
 
+import os
+import sqlite3
+import stat
 import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
+from ccs.coordinator.retention import RetentionPolicy
 from ccs.coordinator.sqlite_registry import (
     CCS_STATE_LOG_SCHEMA_VERSION,
     SCHEMA_USER_VERSION,
+    MissingDatabaseError,
+    ReadOnlyMutationError,
     SchemaVersionError,
     SqliteArtifactRegistry,
+    StoreNeedsRecoveryError,
+    _ARTIFACT_VERSIONS_DDL,
+    _DB_FILE_MODE,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
@@ -792,8 +801,8 @@ def _build_pre_fence_db(db_path: Path, art_id: str, ag_id: str) -> None:
 
 
 def test_fresh_db_has_fence_schema(db_path: Path) -> None:
-    """A freshly initialized db carries the fence columns + coordinator_epoch,
-    and (option (a)) does NOT advance user_version beyond the existing v1."""
+    """A freshly initialized db carries the fence columns + coordinator_epoch
+    inline in the v2 schema (Unit 3: fresh dbs are created at v2 directly)."""
     with SqliteArtifactRegistry(db_path) as reg:
         art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
         state_cols = {
@@ -802,14 +811,16 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         assert "owner_generation" in art_cols
         assert "read_generation" in state_cols
         assert reg._coordinator_epoch
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        # v1->v2 is the repo's first real schema bump (Unit 3): a fresh db is v2.
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
-    """A v1 db created before the fence gains the columns + coordinator_epoch
-    additively on open, WITHOUT a user_version bump; existing rows backfill to
-    owner_generation = 0 / read_generation = NULL, and prior meta is preserved.
-    Re-open is idempotent and the epoch is stable."""
+    """A pre-fence v1 db migrates to v2 on open (Unit 3): it gains the fence
+    columns + coordinator_epoch (the subsumed fence shim) AND the new
+    artifact_versions table, with user_version stamped 2. Existing rows backfill
+    to owner_generation = 0 / read_generation = NULL, and prior meta is
+    preserved. Re-open is the write-free v2 path; the epoch is stable."""
     art_id, ag_id = str(uuid4()), str(uuid4())
     _build_pre_fence_db(db_path, art_id, ag_id)
 
@@ -820,6 +831,13 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
         }
         assert "owner_generation" in art_cols
         assert "read_generation" in state_cols
+        # The migration also created the v2 retention table.
+        tables = {
+            r[0] for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "artifact_versions" in tables
         # Existing rows backfill: artifact -> 0, grant -> NULL (absent operand).
         assert (
             reg._conn.execute(
@@ -835,9 +853,9 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
             ).fetchone()[0]
             is None
         )
-        # Epoch seeded + loaded; user_version NOT bumped (option (a)).
+        # Epoch seeded + loaded; user_version stamped to 2 by the migration.
         assert reg._coordinator_epoch
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
         # Prior meta preserved (no clobber of instance_id / sequence_number).
         assert reg._instance_id == "fixed-instance"
         assert reg._seq == 7
@@ -990,9 +1008,10 @@ def test_set_artifact_and_content_fence_rejects_stale_committer(db_path: Path) -
 
 
 def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
-    """A db whose fence COLUMNS exist but whose coordinator_epoch was never
-    seeded (partial prior upgrade) opens cleanly: _ensure_fence_columns skips
-    the duplicate ALTERs and the INSERT OR IGNORE seeds the missing epoch."""
+    """A v1 db whose fence COLUMNS exist but whose coordinator_epoch was never
+    seeded (one wild v1 variant) migrates to v2 cleanly: the migration's
+    table_info guards skip the duplicate column ALTERs and the INSERT OR IGNORE
+    seeds the missing epoch, while stamping user_version to 2."""
     import sqlite3
 
     # hex ids: the registry's lookups key on UUID.hex (the pre-fence builder
@@ -1009,5 +1028,541 @@ def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
 
     with SqliteArtifactRegistry(db_path) as reg:
         assert reg._coordinator_epoch  # seeded on this open
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
         assert reg.get_owner_generation(UUID(art_id)) == 0
+
+
+# ======================================================================
+# Durable version retention (plan item N v1, Unit 3) — R2, R3, R4
+# ======================================================================
+
+
+_K8 = RetentionPolicy(max_versions=8)
+
+
+def _retain_artifact(reg, *, version: int = 1, content: str = "v1") -> Artifact:
+    art = Artifact(id=uuid4(), name="plan.md", version=version, content_hash="h")
+    reg.register_artifact(art, content=content)
+    return art
+
+
+def _build_raw_v1_db(
+    db_path: Path, *, fence: bool, notices: bool
+) -> tuple[str, str]:
+    """Construct a RAW v1 ``state.db`` BY HAND (not via the current code path,
+    which now emits v2) for one cell of the wild-v1 2x2 matrix.
+
+    ``fence`` toggles the read-generation fence columns + the ``coordinator_epoch``
+    seed (the fence shim shipped 2026-06-09 with no version bump, so most wild
+    dbs PRE-DATE it). ``notices`` toggles the ``pending_notices`` table (also a
+    no-bump shim). Seeds one artifact at version 3 + one M-grant so post-migration
+    queries have rows to check. Returns ``(artifact_id_hex, agent_id_hex)``.
+    """
+    art_id, ag_id = uuid4().hex, uuid4().hex
+    fence_art = ", owner_generation INTEGER NOT NULL DEFAULT 0" if fence else ""
+    fence_state = ", read_generation INTEGER" if fence else ""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            f"CREATE TABLE artifacts (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            f"version INTEGER NOT NULL{fence_art}, content_hash TEXT NOT NULL, "
+            f"size_tokens INTEGER, last_writer_id TEXT, updated_at REAL NOT NULL)"
+        )
+        conn.execute("CREATE INDEX idx_artifacts_name ON artifacts(name)")
+        conn.execute(
+            f"CREATE TABLE agent_states (artifact_id TEXT NOT NULL, agent_id TEXT NOT NULL, "
+            f"state TEXT NOT NULL, transient_state TEXT, transient_tick INTEGER, "
+            f"granted_at_tick INTEGER, last_reclaim_trigger TEXT, last_reclaim_tick INTEGER"
+            f"{fence_state}, PRIMARY KEY (artifact_id, agent_id), "
+            f"FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE)"
+        )
+        conn.execute(
+            "CREATE TABLE heartbeats (agent_id TEXT PRIMARY KEY, last_tick INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT)")
+        meta = [("instance_id", "wild-v1"), ("sequence_number", "4")]
+        if fence:
+            meta.append(("coordinator_epoch", "epoch-pre-migration"))
+        conn.executemany("INSERT INTO registry_meta (key, value) VALUES (?, ?)", meta)
+        if notices:
+            conn.execute(
+                "CREATE TABLE pending_notices (agent_id TEXT NOT NULL, "
+                "artifact_id TEXT NOT NULL, preempter_agent_id TEXT NOT NULL, "
+                "preempted_at_unix_ts REAL NOT NULL, PRIMARY KEY (agent_id, artifact_id), "
+                "FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE)"
+            )
+        if fence:
+            conn.execute(
+                "INSERT INTO artifacts (id, name, version, owner_generation, "
+                "content_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (art_id, "plan.md", 3, 0, "deadbeef", 1.0),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO artifacts (id, name, version, content_hash, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (art_id, "plan.md", 3, "deadbeef", 1.0),
+            )
+        conn.execute(
+            "INSERT INTO agent_states (artifact_id, agent_id, state) VALUES (?, ?, ?)",
+            (art_id, ag_id, "M"),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return art_id, ag_id
+
+
+class TestDurableRetentionRoundTrip:
+    """R2/R3: retained versions survive a fresh process; types preserved."""
+
+    def test_round_trip_across_fresh_instance_str_and_bytes(self, db_path: Path) -> None:
+        # Capture across all three points with both str and bytes, then reopen a
+        # NEW registry instance (= fresh process) and read the durable rows.
+        pol = RetentionPolicy(max_versions=4)
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=pol
+        ) as reg:
+            art = _retain_artifact(reg, version=1, content="str-v1")  # register
+            n2 = Artifact(id=art.id, name="plan.md", version=2, content_hash="h")
+            reg.set_artifact_and_content(art.id, n2, "str-v2")  # pessimistic
+            w = uuid4()
+            reg.set_agent_state(art.id, w, MESIState.SHARED, tick=1)
+            reg.commit_cas(
+                art.id, w, expected_version=2, content_hash="h3",
+                content=b"\x00\x01bytes-v3", tick=2,
+            )  # commit_cas WIN, bytes
+            art_id = art.id
+
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=pol
+        ) as reg2:
+            v1 = reg2.get_content_at_version(art_id, 1)
+            v2 = reg2.get_content_at_version(art_id, 2)
+            v3 = reg2.get_content_at_version(art_id, 3)
+            # str rows round-trip TEXT -> str; bytes row round-trips BLOB -> bytes.
+            assert v1 == "str-v1" and isinstance(v1, str)
+            assert v2 == "str-v2" and isinstance(v2, str)
+            assert v3 == b"\x00\x01bytes-v3" and isinstance(v3, bytes)
+
+    def test_retention_off_returns_none_and_stores_nothing(self, db_path: Path) -> None:
+        # Default (retain_versions=False): no capture, get_content_at_version None.
+        with SqliteArtifactRegistry(db_path) as reg:
+            art = _retain_artifact(reg, content="discarded")
+            assert reg.get_content_at_version(art.id, 1) is None
+            assert reg._conn.execute(
+                "SELECT COUNT(*) FROM artifact_versions"
+            ).fetchone()[0] == 0
+            # The persisted marker says retention was never enabled.
+            assert reg.retention_meta() == (False, None)
+
+    def test_commit_cas_content_none_skips_capture(self, db_path: Path) -> None:
+        # Mirror of the in-memory fix: a content=None WIN retains NO row for the
+        # new version (no stale-old-body poisoning).
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="seed-v1")
+            w = uuid4()
+            reg.set_agent_state(art.id, w, MESIState.SHARED, tick=1)
+            updated, _ = reg.commit_cas(
+                art.id, w, expected_version=1, content_hash="hN", content=None, tick=2
+            )
+            assert updated.version == 2
+            assert reg.get_content_at_version(art.id, 2) is None
+            assert reg.get_content_at_version(art.id, 1) == "seed-v1"
+
+    def test_unbounded_marker_persisted_when_policy_none(self, db_path: Path) -> None:
+        # retain_versions=True + policy=None -> enabled with NULL axes, so a
+        # resolver can tell retention-on-unbounded from retention-never-enabled.
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=None
+        ) as reg:
+            art = _retain_artifact(reg, content="c1")
+            for v in (2, 3, 4):
+                nx = Artifact(id=art.id, name="plan.md", version=v, content_hash="h")
+                reg.set_artifact_and_content(art.id, nx, f"c{v}")
+            # Unbounded: every version retained.
+            assert reg.get_content_at_version(art.id, 1) == "c1"
+            assert reg.get_content_at_version(art.id, 4) == "c4"
+            assert reg.retention_meta() == (True, None)
+
+
+class TestWildV1Migration:
+    """R2: the four wild v1 variants ({±fence cols} x {±pending_notices}) each
+    migrate to v2 in one transaction with data intact + complete schema."""
+
+    @pytest.mark.parametrize("fence", [True, False])
+    @pytest.mark.parametrize("notices", [True, False])
+    def test_wild_variant_migrates_to_v2(
+        self, db_path: Path, fence: bool, notices: bool
+    ) -> None:
+        art_id, ag_id = _build_raw_v1_db(db_path, fence=fence, notices=notices)
+        with SqliteArtifactRegistry(db_path) as reg:
+            # user_version stamped 2; complete schema guaranteed.
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            tables = {
+                r[0] for r in reg._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert {"artifact_versions", "pending_notices"}.issubset(tables)
+            art_cols = {
+                r[1] for r in reg._conn.execute(
+                    "PRAGMA table_info(artifacts)"
+                ).fetchall()
+            }
+            state_cols = {
+                r[1] for r in reg._conn.execute(
+                    "PRAGMA table_info(agent_states)"
+                ).fetchall()
+            }
+            assert "owner_generation" in art_cols
+            assert "read_generation" in state_cols
+            # Pre-existing data intact.
+            art = reg.get_artifact(UUID(art_id))
+            assert art is not None and art.version == 3
+            assert reg._instance_id == "wild-v1"
+            assert reg._seq == 4
+            # Fence queries work even on a PREVIOUSLY-pre-fence variant.
+            assert reg.get_owner_generation(UUID(art_id)) == 0
+            assert reg.get_read_generation(UUID(art_id), UUID(ag_id)) is None
+            # A fence-present v1 keeps its epoch; a fence-absent one is seeded.
+            if fence:
+                assert reg._coordinator_epoch == "epoch-pre-migration"
+            else:
+                assert reg._coordinator_epoch  # freshly seeded hex
+
+    def test_migrated_v1_supports_durable_capture(self, db_path: Path) -> None:
+        # After migrating a pre-fence v1, retention works on the upgraded store.
+        art_id, _ = _build_raw_v1_db(db_path, fence=False, notices=False)
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            nx = Artifact(id=UUID(art_id), name="plan.md", version=4, content_hash="h")
+            reg.set_artifact_and_content(UUID(art_id), nx, "post-migration-body")
+            assert reg.get_content_at_version(UUID(art_id), 4) == "post-migration-body"
+
+    def test_half_migrated_db_completes_cleanly(self, db_path: Path) -> None:
+        # Characterization: a db with the v2 table already present but
+        # user_version still 1 (a crashed prior migration whose stamp never
+        # committed) must complete to v2, never "table already exists".
+        _build_raw_v1_db(db_path, fence=True, notices=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_ARTIFACT_VERSIONS_DDL)  # table present; user_version still 1
+        conn.commit()
+        conn.close()
+        # Open via the normal path: must not raise OperationalError.
+        with SqliteArtifactRegistry(db_path) as reg:
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+    def test_half_migrated_db_missing_stamp_recovers(self, db_path: Path) -> None:
+        # The classic learnings case generalized to v2: all v2 tables present but
+        # user_version left at 1. The migration's IF-NOT-EXISTS / table_info
+        # guards make it idempotent — clean completion, no error.
+        _build_raw_v1_db(db_path, fence=True, notices=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_ARTIFACT_VERSIONS_DDL)
+        conn.commit()
+        conn.close()
+        reg = SqliteArtifactRegistry(db_path)  # must not raise
+        try:
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        finally:
+            reg.close()
+
+
+class TestRetentionPolicyAcrossRuns:
+    """R2/R4: K-lowered-between-runs (no open-time GC) + disable != purge."""
+
+    def test_k_lowered_between_runs_persists_until_next_capture(
+        self, db_path: Path
+    ) -> None:
+        art_id = None
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=RetentionPolicy(max_versions=10)
+        ) as reg:
+            art = _retain_artifact(reg, content="c1")
+            art_id = art.id
+            for v in range(2, 6):
+                nx = Artifact(id=art_id, name="plan.md", version=v, content_hash="h")
+                reg.set_artifact_and_content(art_id, nx, f"c{v}")
+            assert _versions(reg, art_id) == [1, 2, 3, 4, 5]
+
+        # Reopen with a lower K: rows persist (NO open-time GC pass).
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=RetentionPolicy(max_versions=2)
+        ) as reg:
+            assert _versions(reg, art_id) == [1, 2, 3, 4, 5]
+            # Next capture for THIS artifact prunes to the new K.
+            nx = Artifact(id=art_id, name="plan.md", version=6, content_hash="h")
+            reg.set_artifact_and_content(art_id, nx, "c6")
+            assert _versions(reg, art_id) == [5, 6]
+
+    def test_disable_retention_preserves_existing_rows(self, db_path: Path) -> None:
+        # disable != purge: reopening with retain_versions=False over existing
+        # rows preserves them (capture stops; rows stay readable).
+        art_id = None
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="kept")
+            art_id = art.id
+
+        with SqliteArtifactRegistry(db_path, retain_versions=False) as reg:
+            assert reg.get_content_at_version(art_id, 1) == "kept"
+            # The marker now records retention OFF, but the rows survive.
+            assert reg.retention_meta() == (False, None)
+            # A further write captures NOTHING (retention off).
+            nx = Artifact(id=art_id, name="plan.md", version=2, content_hash="h")
+            reg.set_artifact_and_content(art_id, nx, "not-captured")
+            assert reg.get_content_at_version(art_id, 2) is None
+            assert reg.get_content_at_version(art_id, 1) == "kept"
+
+
+class TestRetentionCrashAtomicity:
+    """R2: a BaseException mid-transaction leaves no phantom history AND no
+    version bump — capture and commit are one atomic unit."""
+
+    def test_commit_cas_win_log_raise_rolls_back_history_and_version(
+        self, db_path: Path
+    ) -> None:
+        # A state_log raise during the committer's WIN log entry must roll back
+        # the whole txn: no version move, no captured next_version row.
+        def boom(entry):
+            if entry["to_state"] == "SHARED" and entry["trigger"] == "commit_cas":
+                raise RuntimeError("boom in committer log")
+
+        iid = str(uuid4())
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8,
+            state_log=boom, instance_id=iid,
+        ) as reg:
+            art = _retain_artifact(reg, content="seed-v1")
+            w = uuid4()
+            reg.set_agent_state(art.id, w, MESIState.SHARED, tick=1)
+            with pytest.raises(RuntimeError):
+                reg.commit_cas(
+                    art.id, w, expected_version=1, content_hash="hN",
+                    content="cas-v2", tick=2,
+                )
+            # No version bump, no phantom history, _seq consistent.
+            assert reg.get_artifact(art.id).version == 1
+            assert reg.get_content_at_version(art.id, 2) is None
+            assert reg.get_content_at_version(art.id, 1) == "seed-v1"
+
+    def test_fence_reject_leaves_no_capture(self, db_path: Path) -> None:
+        # The pessimistic fence rejects a superseded committer BEFORE the
+        # capture, so no phantom history row for the rejected version.
+        from ccs.core.exceptions import StaleReadGeneration
+
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="seed")
+            a = uuid4()
+            reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+            reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=2)
+            stale = Artifact(id=art.id, name="plan.md", version=2, content_hash="stale")
+            with pytest.raises(StaleReadGeneration):
+                reg.set_artifact_and_content(
+                    art.id, stale, "should-not-store", last_writer=a, fence_agent_id=a
+                )
+            assert reg.get_content_at_version(art.id, 2) is None
+
+
+class TestReadOnlyMode:
+    """R2: read-only open never creates / migrates / mutates; typed failures."""
+
+    def test_missing_path_raises_and_creates_no_file(self, tmp_path: Path) -> None:
+        missing = tmp_path / "absent.db"
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(missing, read_only=True)
+        assert not missing.exists()  # NO fresh db materialized
+
+    def test_v1_db_raises_version_error_no_migration(self, db_path: Path) -> None:
+        _build_raw_v1_db(db_path, fence=True, notices=True)
+        with pytest.raises(SchemaVersionError):
+            SqliteArtifactRegistry(db_path, read_only=True)
+        # The read-only open performed NO migration.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    def test_read_only_reads_durable_rows(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="ro-body")
+            art_id = art.id
+            epoch = reg.coordinator_epoch
+        with SqliteArtifactRegistry(db_path, read_only=True) as ro:
+            assert ro.get_content_at_version(art_id, 1) == "ro-body"
+            assert ro.coordinator_epoch == epoch  # same epoch the writer minted
+            assert ro.retention_meta()[0] is True
+
+    def test_read_only_mutator_raises(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(db_path) as reg:
+            _retain_artifact(reg, content="x")
+        with SqliteArtifactRegistry(db_path, read_only=True) as ro:
+            with pytest.raises(ReadOnlyMutationError):
+                ro.register_artifact(
+                    Artifact(id=uuid4(), name="y", version=1, content_hash="h"), content="x"
+                )
+            with pytest.raises(ReadOnlyMutationError):
+                ro.set_agent_state(uuid4(), uuid4(), MESIState.SHARED)
+            with pytest.raises(ReadOnlyMutationError):
+                ro.remove_artifact(uuid4())
+
+    def test_read_only_needs_recovery_fault_injected(
+        self, db_path: Path, monkeypatch
+    ) -> None:
+        # A real post-crash hot-WAL state cannot be deterministically created in
+        # pytest, so inject SQLITE_READONLY_RECOVERY on the ro connection's first
+        # user_version read (the point a hot-WAL ro open fails).
+        with SqliteArtifactRegistry(db_path) as reg:
+            _retain_artifact(reg, content="x")
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        class _RecoveryProxy:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if "user_version" in sql:
+                    raise sqlite3.OperationalError(
+                        "attempt to write a readonly database "
+                        "(SQLITE_READONLY_RECOVERY)"
+                    )
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _RecoveryProxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        with pytest.raises(StoreNeedsRecoveryError):
+            SqliteArtifactRegistry(db_path, read_only=True)
+
+
+class TestRetentionRemoveAndEpoch:
+    """R4: delete cascades history; re-register mints new UUID; epoch reset."""
+
+    def test_remove_artifact_cascades_history(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="seed")
+            for v in (2, 3):
+                nx = Artifact(id=art.id, name="plan.md", version=v, content_hash="h")
+                reg.set_artifact_and_content(art.id, nx, f"c{v}")
+            assert reg._conn.execute(
+                "SELECT COUNT(*) FROM artifact_versions WHERE artifact_id = ?",
+                (art.id.hex,),
+            ).fetchone()[0] == 3
+            reg.remove_artifact(art.id)
+            # ON DELETE CASCADE dropped the retained rows.
+            assert reg._conn.execute(
+                "SELECT COUNT(*) FROM artifact_versions WHERE artifact_id = ?",
+                (art.id.hex,),
+            ).fetchone()[0] == 0
+            assert reg.get_content_at_version(art.id, 1) is None
+
+    def test_delete_then_reregister_same_name_fresh_history(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="old")
+            old_id = art.id
+            reg.remove_artifact(old_id)
+            # Re-register the SAME name mints a new UUID with fresh history.
+            art2 = Artifact(id=uuid4(), name="plan.md", version=1, content_hash="h")
+            assert art2.id != old_id
+            reg.register_artifact(art2, content="new")
+            assert reg.get_content_at_version(art2.id, 1) == "new"
+            assert reg.get_content_at_version(old_id, 1) is None  # old id gone
+
+    def test_epoch_reset_drops_rows(self, db_path: Path) -> None:
+        # Epoch reset = delete-and-recreate the db; retained rows do not survive.
+        art_id = None
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            art = _retain_artifact(reg, content="pre-reset")
+            art_id = art.id
+            epoch1 = reg.coordinator_epoch
+        # Simulate the operator purge: remove the db (+ sidecars) and recreate.
+        db_path.unlink()
+        for sidecar in (db_path.with_name(db_path.name + "-wal"),
+                        db_path.with_name(db_path.name + "-shm")):
+            if sidecar.exists():
+                sidecar.unlink()
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            assert reg.coordinator_epoch != epoch1  # fresh epoch
+            assert reg.get_content_at_version(art_id, 1) is None  # rows gone
+
+
+class TestRetentionFileModes:
+    """R2: state.db + sidecars are 0600, race-free; migration tightens + warns."""
+
+    def test_fresh_db_is_0600_immediately(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(db_path) as reg:
+            mode = stat.S_IMODE(db_path.stat().st_mode)
+            assert mode == _DB_FILE_MODE, f"db mode {oct(mode)} != 0600"
+
+    def test_sidecars_are_0600_after_writes(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=_K8
+        ) as reg:
+            # Force WAL frames so the sidecars materialize.
+            _retain_artifact(reg, content="x")
+            wal = db_path.with_name(db_path.name + "-wal")
+            shm = db_path.with_name(db_path.name + "-shm")
+            for sidecar in (wal, shm):
+                if sidecar.exists():
+                    assert stat.S_IMODE(sidecar.stat().st_mode) == _DB_FILE_MODE, (
+                        f"{sidecar.name} mode "
+                        f"{oct(stat.S_IMODE(sidecar.stat().st_mode))} != 0600"
+                    )
+
+    def test_migration_tightens_broadened_db_and_warns_once(
+        self, db_path: Path, caplog
+    ) -> None:
+        # A pre-existing v1 db whose mode an operator broadened (0644) is
+        # tightened to 0600 by the migration, with a one-time warning.
+        _build_raw_v1_db(db_path, fence=True, notices=True)
+        os.chmod(db_path, 0o644)
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="ccs.coordinator.sqlite_registry"):
+            with SqliteArtifactRegistry(db_path) as reg:
+                pass
+        assert stat.S_IMODE(db_path.stat().st_mode) == _DB_FILE_MODE
+        warnings = [
+            r for r in caplog.records if "v1->v2 migration tightened" in r.message
+        ]
+        assert len(warnings) == 1, "expected exactly one posture-change warning"
+
+
+def _versions(reg, artifact_id) -> list[int]:
+    """Sorted retained versions for an artifact (sqlite test helper)."""
+    return sorted(
+        r[0] for r in reg._conn.execute(
+            "SELECT version FROM artifact_versions WHERE artifact_id = ?",
+            (artifact_id.hex,),
+        ).fetchall()
+    )
