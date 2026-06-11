@@ -4,9 +4,71 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.9.2] — 2026-06-11
 
-(Nothing yet.)
+### Fixed
+
+- **`CoherentVolume.write_cas` on-disk lost update under high same-key
+  contention.** Surfaced by the concurrent-writers demo in CI (≥5 concurrent
+  `write_cas` writers): the stale-deny recovery inside `write_cas` paired the
+  bytes from `reacquire()` with a version comparand resolved by a *separate,
+  later* read — and `reacquire()`'s read left the re-minted identity SHARED, so
+  that follow-up read hit the coordinator's fresh-SHARED pre-read branch, which
+  returns the version **without** re-checking the disk bytes' hash. A peer
+  commit landing between the two reads paired STALE bytes with a FRESH version;
+  the commit-CAS checks only the version, so `make_content` derived from the
+  stale bytes and *won* — silently dropping the peer's update on disk (the
+  protocol-level `NoLostUpdate` invariant held: the version-bump count was
+  right, but the persisted value was wrong). Fixed by re-minting identity
+  WITHOUT a read on every retry (`_remint()`), so each attempt's comparand
+  `(bytes, version)` pair comes from ONE hash-checked None-state read; a
+  stale-bytes/fresh-version split is now structurally unrepresentable, and a
+  lagging-disk read is denied and retried rather than committed. The denied
+  read no longer counts against the commit budget (`MAX_CAS_REACQUIRES` keeps
+  its documented "total commit attempts" meaning); a never-clearing view is
+  separately bounded by a consecutive-denied-streak limit, which also replaces
+  the previous (misdiagnosed) "coordinator may be wedged" raise — that state is
+  the transient disk-write-after-commit window, and now retries. Both
+  terminals are typed (`CasRetriesExhausted` / `CoherenceError`); `write_cas`
+  never returns success without its update landing. Regression:
+  `tests/test_concurrent_writers_demo.py::test_fixed_under_higher_contention_holds_the_honest_invariant`.
+- **Pre-read fresh-path `version` dropped when a preemption notice was
+  surfaced** (`/hooks/pre-read`). The notice-surfacing wrapper rebuilt the
+  fresh response as a literal dict, discarding the additive `version` field
+  (and the new `hash_differs` field) whenever the reader had a pending
+  preemption notice. An OCC writer sourcing `expected_version` from such a
+  read fell back to `0` and burned one `version_mismatch` CAS round-trip
+  before retrying — fail-safe, but wasteful after any preemption (a peer
+  pre-edit or the stable-grant sweep). Fixed by spreading the `work()`
+  payload so additive fresh-path keys survive notice attachment; the COR-03
+  single-consumer notice-drain semantics are unchanged. Regression:
+  `tests/test_claude_code_coordinator_server.py::test_a1_fresh_with_notice_preserves_version_field`.
+
+### Added
+
+- **Fresh-SHARED hash-mismatch signal** (`/hooks/pre-read`): a SHARED holder
+  whose supplied `content_hash` mismatches the recorded artifact hash now gets
+  an additive `hash_differs: true` field on the fresh response, and the
+  coordinator bumps a new `fresh_shared_hash_mismatch_total` counter
+  (`/status?detail=metrics`). Previously the fresh-SHARED fast path returned
+  the version comparand with no validation — only INVALID/None-state reads
+  were hash-checked. A peer commit would have left the session INVALID, so a
+  mismatch implies an out-of-band write or commit→disk-write lag; the signal
+  makes that observable. Warn-mode semantics unchanged: the read is still
+  allowed, the key appears only when the mismatch fires, and sentinel
+  recorded hashes (`""` seeds, `"f" * 64` launch-gate injection) never fire
+  it.
+- **Concurrent lost-update demo** (`examples/concurrent_writers/`): a true-race
+  reproduction of the v0.9.1 commit-CAS write path. Two threads update a shared
+  total concurrently; `broken.py` loses an update (last writer wins over a plain
+  file), `fixed.py` runs the identical race through `CoherentVolume.write_cas` and
+  preserves both (the loser is told `version_mismatch`, re-mints identity +
+  re-reads, and re-applies on the winner's value via its `make_content` closure).
+  The rung-2 (concurrent, single-host) analog of the rung-1 sequential
+  `examples/coherent_volume` demo — it surfaces the race the invalidation-deny
+  model cannot catch. Offline; the fixed case spawns a local coordinator
+  subprocess. Run: `python -m examples.concurrent_writers.main`. Tests:
+  `tests/test_concurrent_writers_demo.py`.
 
 ## [0.9.1] — 2026-06-10
 

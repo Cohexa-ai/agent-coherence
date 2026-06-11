@@ -9,6 +9,7 @@ per-invocation warning-template variation.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -269,6 +270,123 @@ def test_pre_read_missing_session_id_400(client: _Client) -> None:
 def test_pre_read_empty_path_400(client: _Client) -> None:
     status, body = client.post("/hooks/pre-read", {"session_id": _sid("s"), "path": ""})
     assert status == 400
+
+
+# ----------------------------------------------------------------------
+# /hooks/pre-read — fresh-SHARED hash-mismatch signal (PR #108 follow-up)
+# ----------------------------------------------------------------------
+
+
+def test_pre_read_fresh_shared_hash_mismatch_sets_hash_differs(client: _Client) -> None:
+    """Defense-in-depth (PR #108 follow-up): a SHARED holder re-reading
+    with a disk hash that mismatches the recorded content gets
+    ``hash_differs: true`` on the fresh response. A peer commit would
+    have left the session INVALID, so the mismatch implies an
+    out-of-band write — surfaced additively, never denied (the plugin
+    path stays fail-open)."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("out-of-band-edit")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
+def test_pre_read_fresh_shared_matching_hash_omits_hash_differs(client: _Client) -> None:
+    """Additive contract: the key appears ONLY when the mismatch fires.
+    A matching hash keeps the exact two-field fresh shape so
+    exact-shape status clients are untouched."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("on-disk-v1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_without_hash_omits_hash_differs(client: _Client) -> None:
+    """A SHARED re-read that supplies no content_hash has nothing to
+    compare — no signal, exact two-field shape."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md"})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_empty_seed_recorded_hash_never_fires(client: _Client) -> None:
+    """KTD-9 seeding without a caller hash records the "" sentinel
+    (surfaced as None by the registry); a later hash-bearing re-read
+    must not fire against it — there is no real content claim to
+    mismatch."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md"})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("real-disk-bytes")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_f_sentinel_recorded_hash_never_fires(
+    coordinator, client: _Client,
+) -> None:
+    """The synthetic launch-gate sentinel ("f"*64) is not a real SHA-256
+    of any content; a SHARED holder re-reading against it must not fire
+    the signal. (The stale path's hash_differs deliberately DOES fire on
+    it — that asymmetry is the launch-gate contract.)"""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    art_id = coordinator.registry.lookup_artifact_id_by_name("CLAUDE.md")
+    assert art_id is not None
+    art = coordinator.registry.get_artifact(art_id)
+    # Inject the sentinel directly into the artifact row (same shape the
+    # launch-gate synthetic SQLite injection produces); the session's
+    # SHARED grant is untouched.
+    coordinator.registry.set_artifact_and_content(
+        art_id, dataclasses.replace(art, content_hash="f" * 64), "",
+    )
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("on-disk-v1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_hash_mismatch_increments_counter(
+    coordinator, client: _Client,
+) -> None:
+    """Each firing bumps fresh_shared_hash_mismatch_total; matching
+    re-reads don't."""
+    before = coordinator._fresh_shared_hash_mismatch_total
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    assert coordinator._fresh_shared_hash_mismatch_total == before
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("out-of-band-edit")})
+    assert coordinator._fresh_shared_hash_mismatch_total == before + 1
+
+
+def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
+    """fresh_shared_hash_mismatch_total visible in /status?detail=metrics
+    so an operator can size the false-positive rate before any
+    strict-mode deny knob is considered."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "fresh_shared_hash_mismatch_total" in body
+    assert isinstance(body["fresh_shared_hash_mismatch_total"], int)
 
 
 # ----------------------------------------------------------------------
@@ -579,6 +697,46 @@ def test_a1_preemption_surfaces_on_victim_next_pre_read(client: _Client) -> None
     )
     assert "plan.md" in msg
     assert y[:8] in msg, f"prose should name the preempter session prefix; got: {msg}"
+
+
+def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
+    """A1 × Unit 6: notice surfacing on the FRESH pre-read path must keep
+    the additive ``version`` key alongside ``hookSpecificOutput``.
+
+    Regression: the ``work_with_notice_surfacing`` wrapper rebuilt the
+    fresh response as a literal dict, dropping ``version`` — an OCC
+    writer sourcing expected_version from the read then CAS'd against 0
+    and burned a wasted version_mismatch round-trip."""
+    x = _sid("X"); y = _sid("Y")
+    # X first-reads task.md — seeds v1 + grants SHARED, so the re-read
+    # below (after the preemption on a DIFFERENT artifact) stays fresh.
+    status, body = client.post("/hooks/pre-read",
+                               {"session_id": x, "path": "task.md",
+                                "content_hash": _hash("t1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+    # X acquires EXCLUSIVE on plan.md; Y pre-edits plan.md, silently
+    # preempting X — a preemption notice queues for X.
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    # X's next hook is a pre-read of task.md (still SHARED → fresh): the
+    # wrapper drains the pending notice onto this fresh response.
+    status, body = client.post("/hooks/pre-read",
+                               {"session_id": x, "path": "task.md",
+                                "content_hash": _hash("t1")})
+    assert status == 200, body
+    assert body.get("status") == "fresh", body
+    assert "hookSpecificOutput" in body, (
+        f"fresh pre-read after a preemption must surface the notice; got {body}"
+    )
+    msg = body["hookSpecificOutput"]["additionalContext"]
+    assert "plan.md" in msg and y[:8] in msg, (
+        f"notice prose should name the preempted artifact + preempter; got: {msg}"
+    )
+    assert body.get("version") == 1, (
+        "fresh-with-notice response must preserve the Unit 6 version key "
+        f"(OCC writers source expected_version from it); got {body}"
+    )
 
 
 def test_a1_preemption_surfaces_on_victim_next_pre_edit(client: _Client) -> None:

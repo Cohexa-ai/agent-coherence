@@ -77,14 +77,23 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 
-# Plan Unit 6 (R6): client-side bound on the OCC reacquire→re-commit loop in
+# Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
 # (the in-process library knob) — the HTTP path runs its own bounded loop via
-# ``reacquire()`` rather than the ``AgentRuntime``/``SyncStrategy`` loop (which
-# governs only the in-process library path). Total commit attempts is
-# ``MAX_CAS_REACQUIRES + 1`` (initial + retries); on exhaustion ``write_cas``
-# raises :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
-# never a silent drop).
+# ``_remint()`` + a fresh hash-checked read rather than the
+# ``AgentRuntime``/``SyncStrategy`` loop (which governs only the in-process
+# library path). Bounds TWO independent failure modes, both fail-closed:
+#
+# - Total commit (CAS POST) attempts is ``MAX_CAS_REACQUIRES + 1`` (initial +
+#   retries); on exhaustion ``write_cas`` raises
+#   :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal, never
+#   a silent drop). A stale-denied comparand read never POSTs, so it does NOT
+#   consume this budget.
+# - CONSECUTIVE stale-denied comparand reads are bounded at
+#   ``MAX_CAS_REACQUIRES + 1``; on exhaustion ``write_cas`` raises
+#   :class:`~ccs.core.exceptions.CoherenceError` (a view that never clears —
+#   wedged coordinator / perpetually lagging disk — must not spin). A clean
+#   read resets the streak.
 MAX_CAS_REACQUIRES = 8
 
 
@@ -559,11 +568,31 @@ class CoherentVolume:
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
         """
+        self._remint()  # fresh identity -> no INVALID; has committed nothing
+        # MANDATORY fresh read under the new identity -> SHARED@current.
+        return self.read(path)
+
+    def _remint(self) -> None:
+        """Re-mint coordinator identity (shed ``INVALID`` + any invalidation
+        transient) WITHOUT a read — the OCC :meth:`write_cas` retry primitive.
+
+        Distinct from :meth:`reacquire` (re-mint **and** a read): reacquire's
+        read registers the fresh identity as ``SHARED``, after which the
+        ``write_cas`` loop's next :meth:`_read_with_version` hits the
+        coordinator's *fresh-SHARED* pre-read branch, which returns the version
+        WITHOUT re-checking the disk bytes' hash. That pairs a possibly-stale
+        on-disk read with a fresh version — and because the commit-CAS checks
+        only the *version*, a ``make_content()`` over the stale bytes would WIN
+        and silently drop a peer's update (an on-disk lost update; the
+        protocol-level ``NoLostUpdate`` still holds — the version-bump count is
+        right — but the persisted value is wrong). Re-minting WITHOUT a read
+        keeps the loop's next ``_read_with_version`` a **None-state, HASH-CHECKED**
+        read (warn on hash match, deny on mismatch), so its ``(bytes, version)``
+        comparand pair is always validated.
+        """
         with self._lock:
             self._session_id = str(uuid.uuid4())  # fresh identity -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
-        # MANDATORY fresh read under the new identity -> SHARED@current.
-        return self.read(path)
 
     def write_cas(
         self,
@@ -581,13 +610,30 @@ class CoherentVolume:
         cannot both land the same version — the loser is told ``version_mismatch``
         and retries. The pessimistic ``write()`` path is untouched.
 
-        Conflict recovery follows the :meth:`reacquire` contract: on a
-        ``version_mismatch`` / ``other_holder`` conflict the loop
-        ``reacquire()``s (re-mint identity + a MANDATORY fresh read), re-derives
-        the bytes from the fresh view via ``make_content``, and retries —
+        Conflict recovery: on a ``version_mismatch`` / ``other_holder`` conflict
+        (or a stale-read deny) the loop re-mints identity (:meth:`_remint` —
+        sheds ``INVALID``, but does NOT do reacquire's read; that read would route
+        the next comparand read through the coordinator's unchecked *fresh-SHARED*
+        branch and re-open the lost update), then on the next attempt does ONE
+        hash-checked fresh read whose ``(bytes, version)`` pair is validated,
+        re-derives the bytes from that view via ``make_content``, and retries —
         bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
         :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
         NEVER a silent drop).
+
+        **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
+        (=8 → 9 CAS attempts); each lost race (a peer winning the version)
+        costs one. Under very high single-host contention — more concurrent
+        writers racing the SAME key than the budget — a writer can exhaust it
+        and raise :class:`~ccs.core.exceptions.CasRetriesExhausted`. A
+        stale-denied comparand read (the transient window where a peer's commit
+        landed but its disk write hasn't) does NOT consume the commit budget;
+        instead CONSECUTIVE denied reads are separately bounded (also at
+        ``MAX_CAS_REACQUIRES + 1``) and raise ``CoherenceError`` if the view
+        never clears. Both terminals are the honest fail-closed outcome,
+        **never** a silent lost update: the invariant this method guarantees is
+        *final == start + every applied delta, OR a typed raise* — a successful
+        return always means the update landed.
 
         ``make_content`` is invoked once per attempt with the freshly-read
         current bytes and returns the bytes to commit — re-deriving the caller's
@@ -612,8 +658,8 @@ class CoherentVolume:
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard). The internal
-        :meth:`reacquire` retries run on the SAME thread, so they re-enter the
-        guard rather than tripping it — one instance per thread.
+        re-mint + re-read retries run on the SAME thread under the guard already
+        held by this call — one instance per thread.
         """
         with self._single_op_guard():
             self._write_cas_impl(path, make_content)
@@ -637,37 +683,53 @@ class CoherentVolume:
             return
 
         last_current_version = -1
-        max_attempts = MAX_CAS_REACQUIRES + 1
-        for attempt in range(max_attempts):
+        max_attempts = MAX_CAS_REACQUIRES + 1  # commit (CAS POST) budget
+        cas_attempts = 0
+        denied_streak = 0  # CONSECUTIVE stale-denied comparand reads
+        while True:
             # Fresh read each attempt. _read_with_version returns the bytes, the
-            # coordinator's authoritative version (the OCC comparand), and
-            # whether the read was a sticky strict-deny — i.e. this instance is
-            # INVALID and the pre-read did NOT re-grant SHARED (KTD-T). An
-            # INVALID writer cannot CAS (the coordinator's invalidation left a
-            # transient that commit_cas rejects as a precondition), so recovery
-            # is the reacquire() contract: re-mint identity (no INVALID /
-            # transient) + a MANDATORY fresh read → clean SHARED@current.
+            # coordinator's authoritative version (the OCC comparand), and whether
+            # the read was a strict-deny (stale_denied — this instance is INVALID,
+            # or a re-minted identity whose disk read does not match the recorded
+            # content). The comparand read ALWAYS runs under a None-state identity
+            # (the first read's, or a _remint()ed one), so the coordinator
+            # HASH-CHECKS it: warn (re-grant SHARED) on a hash match, deny on a
+            # mismatch. That is exactly what makes (current_bytes,
+            # expected_version) a VALIDATED pair — current_bytes is the content
+            # the coordinator records at expected_version, so make_content()
+            # derives the successor from the right state. (Re-minting WITHOUT a
+            # read is the point: reacquire()'s read would leave the identity
+            # SHARED and route the next comparand read through the coordinator's
+            # fresh-SHARED branch, which returns the version WITHOUT a hash
+            # check — see _remint() / KTD-LU.)
             current_bytes, expected_version, stale_denied = self._read_with_version(rel)
             if stale_denied:
-                # This instance is INVALID (sticky strict-deny) → it cannot CAS
-                # until it reacquires (re-mint identity clears INVALID + the
-                # invalidation transient). reacquire() returns the fresh bytes;
-                # _read_with_version then re-resolves the version under the fresh
-                # identity. A warn-mode stale read here is fine — the fresh
-                # identity has no transient, so it can CAS.
-                if attempt >= max_attempts - 1:
-                    last_current_version = max(last_current_version, expected_version)
-                    break
-                current_bytes = self.reacquire(rel)
-                _aid, expected_version, refused_again = self._read_with_version(rel)
-                if refused_again:
-                    # A fresh-minted identity is brand new (no prior INVALID), so
-                    # a strict-deny here is impossible in normal operation — it
-                    # means the coordinator is wedged. Fail closed, do not spin.
+                # Cannot CAS from this view: INVALID, or the disk lags a just-
+                # committed version whose peer write has not landed yet
+                # (hash_differs under strict). Re-mint identity (sheds INVALID +
+                # the invalidation transient) and RE-READ — once the peer's disk
+                # write lands, the hash-checked None-state read yields a validated
+                # comparand pair. A denied read never POSTs a commit, so it does
+                # NOT consume the CAS budget (max_attempts counts *commit
+                # attempts*, keeping MAX_CAS_REACQUIRES' documented semantic);
+                # instead the CONSECUTIVE-denied streak is bounded so a
+                # never-clearing view (wedged coordinator, perpetually lagging
+                # disk, a starving foreign writer) still fails closed instead of
+                # spinning. A clean read resets the streak.
+                last_current_version = max(last_current_version, expected_version)
+                denied_streak += 1
+                if denied_streak > MAX_CAS_REACQUIRES:
                     raise CoherenceError(
-                        f"OCC reacquire did not clear INVALID for {rel}; "
-                        "coordinator may be wedged"
+                        f"OCC comparand read of {rel} stayed strict-denied across "
+                        f"{denied_streak} consecutive reads under re-minted "
+                        "identities; cannot establish a clean (bytes, version) "
+                        "view to CAS from — the on-disk content may be lagging "
+                        "peer commits or the coordinator may be wedged. No write "
+                        "landed (fail-closed)."
                     )
+                self._remint()
+                continue
+            denied_streak = 0
 
             data = bytes(make_content(current_bytes))
             new_hash = self._sha256_bytes(data)
@@ -677,6 +739,7 @@ class CoherentVolume:
             # disk (a denied/degraded CAS landing on disk would be the very
             # lost-update this guards). Contrast the pessimistic write(), which
             # writes between pre-edit (EXCLUSIVE held) and post-edit.
+            cas_attempts += 1
             resp = self._post(
                 "/hooks/post-edit-cas",
                 {
@@ -710,23 +773,26 @@ class CoherentVolume:
                 return
             if outcome == "conflict":
                 last_current_version = self._cas_current_version(resp, last_current_version)
-                # Recover via the reacquire() contract before the next attempt so
-                # expected_version + make_content() see the winner's state.
-                if attempt < max_attempts - 1:
-                    self.reacquire(rel)
+                if cas_attempts >= max_attempts:
+                    # Every allowed commit attempt lost the race — typed
+                    # terminal, never a silent drop. (last_current_version is
+                    # the latest version the loser observed.)
+                    raise CasRetriesExhausted(
+                        artifact_id=rel,
+                        attempts=cas_attempts,
+                        last_current_version=last_current_version,
+                    )
+                # Re-mint (NOT reacquire) before the next attempt so the next
+                # comparand read is a hash-checked None-state read that sees the
+                # winner's state — reacquire()'s read would route it through the
+                # unchecked fresh-SHARED branch and could pair stale bytes with a
+                # fresh version (the on-disk lost update; see _remint() / KTD-LU).
+                self._remint()
                 continue
             # outcome == "raise": a deny, corruption, or the fail-closed
             # commit_unconfirmed degrade body — ALWAYS raises in both modes.
             # Nothing was written to disk (the CAS did not win).
             raise CoherenceError(self._deny_reason(resp))
-
-        # Every allowed attempt lost the race — typed terminal, never a silent
-        # drop. (last_current_version is the latest version the loser observed.)
-        raise CasRetriesExhausted(
-            artifact_id=rel,
-            attempts=max_attempts,
-            last_current_version=last_current_version,
-        )
 
     # --- coordinator I/O helpers --------------------------------------------
 
