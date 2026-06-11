@@ -7,13 +7,20 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
 from uuid import UUID
 
 from ccs.core.exceptions import (
+    CURRENT_VERSION_REASON,
+    EPOCH_MISMATCH_REASON,
+    FUTURE_VERSION_REASON,
+    NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    RETENTION_OFF_REASON,
+    UNKNOWN_ARTIFACT_REASON,
     CoherenceError,
     OccCallerTransientError,
     StaleReadGeneration,
@@ -28,7 +35,10 @@ from ccs.core.types import (
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
+    VersionedContent,
+    VersionedReadRejection,
 )
+from ccs.coordinator.retention import collectible_versions
 
 from .registry import ArtifactRegistry
 
@@ -238,6 +248,182 @@ class CoordinatorService:
             version=artifact.version,
             content=content,
             state_grant=grant,
+        )
+
+    def read_at_version(
+        self,
+        artifact_id: UUID,
+        version: int,
+        expected_epoch: str | None = None,
+    ) -> VersionedContent | VersionedReadRejection:
+        """Read a specific RETAINED version off-protocol (plan item N v1 / R5–R7).
+
+        The first-class read-at-version surface: returns the body the registry
+        committed at ``version`` as a :class:`~ccs.core.types.VersionedContent`,
+        or a typed :class:`~ccs.core.types.VersionedReadRejection` carrying one of
+        the six wire-stable reasons in :data:`ccs.core.exceptions.READ_AT_VERSION_REASONS`.
+        It is a typed RETURN, never an exception (the ``ConflictDetail``
+        discipline) — except ``version < 1``, which is caller misuse and raises
+        ``ValueError`` (house style; not a wire reason).
+
+        **Protocol non-interaction by construction (R6, R7):** this method calls
+        NONE of ``set_agent_state`` / ``set_agent_transient`` / grant / transient
+        / invalidation code. Read-generation capture lives ONLY inside
+        ``set_agent_state`` (``registry.py`` ``CLAIM_CAPTURE_TRIGGERS``), so not
+        calling it means the read CANNOT touch ``read_generation`` (R6 fence
+        non-capture) or any MESI state / invalidation membership (R7). The whole
+        point is verifiable by reading this body: it only ever READS the registry
+        (``get_artifact`` / ``retention_meta`` / ``coordinator_epoch`` /
+        ``get_version_record``) and constructs frozen return values.
+
+        Discrimination order (first match wins), computed against ONE snapshot of
+        the current version so a racing commit cannot mislabel a reason:
+
+        1. ``version < 1`` → ``ValueError`` (caller misuse).
+        2. artifact unknown → ``unknown_artifact`` (``current_version=None``).
+        3. retention not enabled for the store → ``retention_off``.
+        4. ``expected_epoch`` supplied and != the store epoch → ``epoch_mismatch``.
+        5. ``version == current`` → ``current_version`` (history surface serves
+           history only; current bytes are read via the protocol fetch path).
+        6. ``version > current`` → ``future_version`` (hints at a 2nd coordinator).
+        7. ``1 <= version < current`` → fetch the row. Present AND not T-expired →
+           ``VersionedContent``; absent OR T-expired → ``not_retained``.
+
+        Single-scope atomicity: ``current`` is read ONCE (the linearization
+        point) and every reason is decided relative to that snapshot. History
+        rows below ``current`` are immutable (a version is captured once and only
+        ever DROPPED by GC, never rewritten), so the step-7 row fetch is safe
+        against a commit that races in after the ``current`` read — that commit
+        only captures the NEW (higher) version and never touches the requested
+        ``version < current`` row. The worst a race yields is the old-current
+        served as history (correct bytes) or ``current_version`` (the value that
+        WAS current at the read point) — never wrong bytes or a mislabeled reason.
+
+        T-expiry is LOGICAL at read (R-fix: a read is non-mutating, so an
+        age-collectible row is reported ``not_retained`` but NOT physically
+        deleted here — physical deletion piggybacks on the next capture). It
+        reuses the one GC seam :func:`collectible_versions` against the persisted
+        policy so the read-side expiry rule matches the write-side eviction rule.
+
+        Args:
+            artifact_id: The artifact to read.
+            version: The 1-based version to read (``< 1`` raises ``ValueError``).
+            expected_epoch: If given, the read rejects ``epoch_mismatch`` unless
+                it equals the store's ``coordinator_epoch`` (the store was reset
+                since the caller captured the epoch).
+
+        Returns:
+            :class:`VersionedContent` on a hit, else :class:`VersionedReadRejection`.
+
+        Raises:
+            ValueError: ``version < 1`` (caller misuse — not a wire reason).
+        """
+        if version < 1:
+            raise ValueError(
+                f"read_at_version: version must be >= 1 (got {version}); "
+                f"versions are 1-based. A sub-1 version is caller misuse, not a "
+                f"retained-history miss (which is the not_retained reason)."
+            )
+
+        epoch = self.registry.coordinator_epoch
+
+        # (2) Unknown artifact — no current version exists for it. Read the
+        # artifact ONCE; ``current`` from this same metadata object is the
+        # linearization snapshot every reason below is decided against.
+        artifact = self.registry.get_artifact(artifact_id)
+        if artifact is None:
+            return VersionedReadRejection(
+                reason=UNKNOWN_ARTIFACT_REASON,
+                artifact_id=artifact_id,
+                requested_version=version,
+                current_version=None,
+                coordinator_epoch=epoch,
+            )
+        current = artifact.version
+
+        # (3) Retention never enabled for this store (store-derived: persisted
+        # meta on sqlite, live ctor state in-memory). The artifact_versions
+        # surface exists on every v2 db, so this marker — not table presence —
+        # distinguishes retention-off from a mere history gap.
+        retention_enabled, policy = self.registry.retention_meta()
+        if not retention_enabled:
+            return self._reject(
+                RETENTION_OFF_REASON, artifact_id, version, current, epoch
+            )
+
+        # (4) Epoch guard — a stale expected_epoch means the store was reset
+        # (delete-and-recreate) since the caller captured it, so its retained
+        # history is from a different incarnation.
+        if expected_epoch is not None and expected_epoch != epoch:
+            return self._reject(
+                EPOCH_MISMATCH_REASON, artifact_id, version, current, epoch
+            )
+
+        # (5) Current version — history surface serves HISTORY ONLY. Current
+        # content is read via the protocol fetch path (artifacts store hashes,
+        # not bodies), never here, by design.
+        if version == current:
+            return self._reject(
+                CURRENT_VERSION_REASON, artifact_id, version, current, epoch
+            )
+
+        # (6) Future version — above current suggests a second coordinator
+        # writing the same store (the diagnostic commit_cas keeps via CasCorruption).
+        if version > current:
+            return self._reject(
+                FUTURE_VERSION_REASON, artifact_id, version, current, epoch
+            )
+
+        # (7) 1 <= version < current: a genuine history request. Fetch body +
+        # capture timestamp in ONE scoped accessor (single SELECT/sqlite, GIL-
+        # atomic pair/in-memory). Absent ⇒ not_retained (never captured, K-
+        # evicted, or already T-swept).
+        record = self.registry.get_version_record(artifact_id, version)
+        if record is None:
+            return self._reject(
+                NOT_RETAINED_REASON, artifact_id, version, current, epoch
+            )
+        content, captured_at = record
+
+        # Logical T-expiry (R-fix: non-mutating read). Reuse the single GC seam
+        # against the persisted policy: an age-collectible row reports
+        # not_retained without being physically deleted (deletion piggybacks on
+        # the next capture). ``current`` is exempt in collectible_versions, but
+        # we already excluded version==current above, so this only ages the
+        # requested historical row. ``policy is None`` ⇒ unbounded ⇒ no T axis.
+        if policy is not None and version in collectible_versions(
+            {version: captured_at},
+            current_version=current,
+            policy=policy,
+            now=time.time(),
+        ):
+            return self._reject(
+                NOT_RETAINED_REASON, artifact_id, version, current, epoch
+            )
+
+        return VersionedContent(
+            artifact_id=artifact_id,
+            version=version,
+            content=content,
+            captured_at=captured_at,
+            coordinator_epoch=epoch,
+        )
+
+    @staticmethod
+    def _reject(
+        reason: str,
+        artifact_id: UUID,
+        requested_version: int,
+        current_version: int | None,
+        epoch: str | None,
+    ) -> VersionedReadRejection:
+        """Build a :class:`VersionedReadRejection` (no body material, by type)."""
+        return VersionedReadRejection(
+            reason=reason,
+            artifact_id=artifact_id,
+            requested_version=requested_version,
+            current_version=current_version,
+            coordinator_epoch=epoch,
         )
 
     def write(

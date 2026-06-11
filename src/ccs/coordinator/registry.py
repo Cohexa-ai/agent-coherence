@@ -180,6 +180,33 @@ class ArtifactRegistry:
         record = self._records.get(artifact_id)
         return record.content if record else None
 
+    @property
+    def coordinator_epoch(self) -> str:
+        """The registry's coordinator epoch (read-generation fence follow-on).
+
+        Public accessor mirroring :attr:`SqliteArtifactRegistry.coordinator_epoch`
+        so the two registries satisfy ONE duck-type (Unit 4 / R5): every
+        ``read_at_version`` answer and rejection stamps this, and an optional
+        ``expected_epoch`` is compared against it. The in-memory epoch is
+        **per-construction** (minted fresh in ``__init__``, NOT persisted) — a
+        new ``ArtifactRegistry`` gets a new epoch, so it cannot mismatch across a
+        restart the way the durable sqlite epoch can; it exists for surface
+        parity and for the same-process ``expected_epoch`` guard."""
+        return self._coordinator_epoch
+
+    def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Return ``(retention_enabled, policy_or_None)`` (Unit 4 / R5 duck-type).
+
+        Mirrors :meth:`SqliteArtifactRegistry.retention_meta` so ``read_at_version``
+        derives ``retention_off`` and the T-expiry axis identically on both
+        registries. In-memory there is no persisted meta — the answer is the
+        live constructor state: ``_retain_versions`` is the enabled marker and
+        ``_retention_policy`` the bound (``None`` ⇒ unbounded when enabled).
+        ``retain_versions=False`` ⇒ ``(False, None)`` (retention never on)."""
+        if not self._retain_versions:
+            return False, None
+        return True, self._retention_policy
+
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
         return self._records[artifact_id].owner_generation
@@ -222,12 +249,46 @@ class ArtifactRegistry:
         record.content = content
         record.last_writer = last_writer
 
-    def get_content_at_version(self, artifact_id: UUID, version: int) -> str | None:
-        """Return content for a specific version, if retained."""
+    def get_content_at_version(self, artifact_id: UUID, version: int) -> str | bytes | None:
+        """Return content for a specific version, if retained.
+
+        Returns the body with its original Python type (``bytes`` when the
+        ``commit_cas`` WIN threaded bytes — matching the corrected
+        ``version_history`` annotation); ``None`` when not retained. Mirrors
+        :meth:`SqliteArtifactRegistry.get_content_at_version`'s widened type."""
         record = self._records.get(artifact_id)
         if record is None:
             return None
         return record.version_history.get(version)
+
+    def get_version_record(
+        self, artifact_id: UUID, version: int
+    ) -> tuple[str | bytes, float] | None:
+        """Return ``(content, captured_at)`` for a retained version, or ``None``.
+
+        The single accessor Unit 4's ``read_at_version`` needs: the body AND its
+        wall-clock capture timestamp (for ``VersionedContent.captured_at`` and the
+        T-expiry check) in ONE call. Mirrors
+        :meth:`SqliteArtifactRegistry.get_version_record` so the two registries
+        share one duck-type.
+
+        Single-scope (R5 atomicity): ``version_history`` and
+        ``version_captured_at`` are always mutated together (capture and GC), so
+        their key sets match; reading the body first and missing means the row is
+        absent. The pair of dict reads is GIL-atomic per access, and a concurrent
+        capture/GC of a *different* version cannot make a present row's two halves
+        disagree (the body and timestamp for one version are written before the
+        next statement and dropped together). ``None`` when the artifact or the
+        version is absent (never captured, K-evicted, or T-expired-then-swept)."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        content = record.version_history.get(version)
+        if content is None:
+            return None
+        # captured_at is written in the same _capture_version step as the body
+        # and dropped in the same GC step; a present body implies a present stamp.
+        return content, record.version_captured_at[version]
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
         """Return copy of per-agent MESI states for an artifact."""

@@ -1110,6 +1110,35 @@ class SqliteArtifactRegistry:
             ).fetchone()
         return row[0] if row is not None else None
 
+    def get_version_record(
+        self, artifact_id: UUID, version: int
+    ) -> tuple[str | bytes, float] | None:
+        """Return ``(content, captured_at)`` for a retained version, or ``None``.
+
+        The single accessor Unit 4's ``read_at_version`` needs: the body AND its
+        wall-clock ``captured_at`` (for ``VersionedContent.captured_at`` and the
+        T-expiry check) in ONE call. Mirrors
+        :meth:`ArtifactRegistry.get_version_record` so the two registries share
+        one duck-type.
+
+        Single-scope (R5 atomicity): the body and timestamp come from ONE row of
+        ONE ``SELECT`` under ONE lock, so a racing writer's ``BEGIN IMMEDIATE``
+        commit cannot interleave between reading the content and reading its
+        stamp — they are consistent by construction (no separate-statement
+        window two getters would have). Returns the body with its original Python
+        type (TEXT→``str``, BLOB→``bytes``; affinity-NONE column). ``None`` when
+        retention was never on, the row was K-evicted / T-expired, or it was
+        never captured (e.g. ``commit_cas(content=None)``)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, captured_at FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = ?",
+                (artifact_id.hex, version),
+            ).fetchone()
+        if row is None:
+            return None
+        return row[0], float(row[1])
+
     def remove_artifact(self, artifact_id: UUID) -> None:
         """Remove artifact and cascade-delete agent_states + retained history.
 

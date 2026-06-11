@@ -21,6 +21,72 @@ OCC_CALLER_TRANSIENT_REASON = "caller_in_transient_state"
 # (pessimistic path) so the two surfaces cannot drift.
 STALE_READ_GENERATION_REASON = "stale_read_generation"
 
+# ---------------------------------------------------------------------------
+# read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
+# ---------------------------------------------------------------------------
+#
+# The EXACT string values below are the WIRE CONTRACT: ``read_at_version``
+# returns a :class:`~ccs.core.types.VersionedReadRejection` whose ``reason`` is
+# ONE of these, and every consumer (the Unit 6 replay resolver, SB-17 later)
+# matches with ``reason == CONSTANT`` against :data:`READ_AT_VERSION_REASONS` —
+# NEVER a substring of any human message (the typed-signal-not-substring house
+# rule, ``docs/solutions/best-practices/typed-signal-not-substring-...``).
+# Renaming a value here is a wire break; add, do not mutate.
+#
+# Six reasons, not seven: ``never_retained`` and ``beyond_horizon`` deliberately
+# COLLAPSE into a single ``not_retained``. Once a retained history carries gaps
+# (a T-expiry cleanup, or an off->on retention toggle), "never captured" and
+# "captured then collected/expired" are UNDECIDABLE from persisted state, so a
+# wire-stable constant must not encode a forensic distinction the store cannot
+# honestly make (plan Key Decisions: "Rejection vocabulary (6 reasons ...)").
+RETENTION_OFF_REASON = "retention_off"
+"""Retention was never enabled for this store (``retention_meta()[0]`` False).
+
+Distinct from ``not_retained``: the artifact_versions surface exists on every
+v2 sqlite db, so table-presence cannot tell retention-on-unbounded from
+retention-never-enabled — the persisted ``retention_enabled`` marker does."""
+
+UNKNOWN_ARTIFACT_REASON = "unknown_artifact"
+"""The artifact id is unknown to the registry (``get_artifact`` is None).
+
+Deleted == never-existed: a post-delete read also lands here (delete cascades
+the history rows), per the plan's deliberate collapse."""
+
+NOT_RETAINED_REASON = "not_retained"
+"""``1 <= version < current`` but no servable retained row exists — it was
+never captured (e.g. ``commit_cas(content=None)``), K-evicted, or T-expired.
+The single, deliberately-merged reason (see the module note above)."""
+
+EPOCH_MISMATCH_REASON = "epoch_mismatch"
+"""An ``expected_epoch`` was supplied and != the registry's
+``coordinator_epoch`` — the store was reset (delete-and-recreate) since the
+caller captured the epoch, so its retained history is from a different epoch."""
+
+CURRENT_VERSION_REASON = "current_version"
+"""``version == current``. The history surface serves HISTORY ONLY; current
+content is read via the protocol fetch path (``artifacts`` stores hashes, not
+bodies). A read-only consumer cannot obtain current bytes through any surface —
+by design (plan Key Decisions: consequence of ``current_version``)."""
+
+FUTURE_VERSION_REASON = "future_version"
+"""``version > current``. Preserves the diagnostic ``commit_cas`` keeps via
+:class:`~ccs.core.types.CasCorruption`: a requested version ABOVE the current
+one suggests a second coordinator writing the same store."""
+
+# The closed set every consumer matches against (``reason in
+# READ_AT_VERSION_REASONS``). ``version < 1`` is NOT here — it is a ``ValueError``
+# (caller misuse, house style), never a rejection reason.
+READ_AT_VERSION_REASONS: frozenset[str] = frozenset(
+    {
+        RETENTION_OFF_REASON,
+        UNKNOWN_ARTIFACT_REASON,
+        NOT_RETAINED_REASON,
+        EPOCH_MISMATCH_REASON,
+        CURRENT_VERSION_REASON,
+        FUTURE_VERSION_REASON,
+    }
+)
+
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
