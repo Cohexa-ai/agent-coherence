@@ -4,7 +4,7 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.9.2] — 2026-06-11
 
 ### Fixed
 
@@ -32,6 +32,17 @@ Alpha — APIs may change before `v1.0`.
   terminals are typed (`CasRetriesExhausted` / `CoherenceError`); `write_cas`
   never returns success without its update landing. Regression:
   `tests/test_concurrent_writers_demo.py::test_fixed_under_higher_contention_holds_the_honest_invariant`.
+- **Pre-read fresh-path `version` dropped when a preemption notice was
+  surfaced** (`/hooks/pre-read`). The notice-surfacing wrapper rebuilt the
+  fresh response as a literal dict, discarding the additive `version` field
+  (and the new `hash_differs` field) whenever the reader had a pending
+  preemption notice. An OCC writer sourcing `expected_version` from such a
+  read fell back to `0` and burned one `version_mismatch` CAS round-trip
+  before retrying — fail-safe, but wasteful after any preemption (a peer
+  pre-edit or the stable-grant sweep). Fixed by spreading the `work()`
+  payload so additive fresh-path keys survive notice attachment; the COR-03
+  single-consumer notice-drain semantics are unchanged. Regression:
+  `tests/test_claude_code_coordinator_server.py::test_a1_fresh_with_notice_preserves_version_field`.
 
 ### Added
 
