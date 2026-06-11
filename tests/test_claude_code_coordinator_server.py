@@ -9,6 +9,7 @@ per-invocation warning-template variation.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -269,6 +270,123 @@ def test_pre_read_missing_session_id_400(client: _Client) -> None:
 def test_pre_read_empty_path_400(client: _Client) -> None:
     status, body = client.post("/hooks/pre-read", {"session_id": _sid("s"), "path": ""})
     assert status == 400
+
+
+# ----------------------------------------------------------------------
+# /hooks/pre-read — fresh-SHARED hash-mismatch signal (PR #108 follow-up)
+# ----------------------------------------------------------------------
+
+
+def test_pre_read_fresh_shared_hash_mismatch_sets_hash_differs(client: _Client) -> None:
+    """Defense-in-depth (PR #108 follow-up): a SHARED holder re-reading
+    with a disk hash that mismatches the recorded content gets
+    ``hash_differs: true`` on the fresh response. A peer commit would
+    have left the session INVALID, so the mismatch implies an
+    out-of-band write — surfaced additively, never denied (the plugin
+    path stays fail-open)."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("out-of-band-edit")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
+def test_pre_read_fresh_shared_matching_hash_omits_hash_differs(client: _Client) -> None:
+    """Additive contract: the key appears ONLY when the mismatch fires.
+    A matching hash keeps the exact two-field fresh shape so
+    exact-shape status clients are untouched."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("on-disk-v1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_without_hash_omits_hash_differs(client: _Client) -> None:
+    """A SHARED re-read that supplies no content_hash has nothing to
+    compare — no signal, exact two-field shape."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md"})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_empty_seed_recorded_hash_never_fires(client: _Client) -> None:
+    """KTD-9 seeding without a caller hash records the "" sentinel
+    (surfaced as None by the registry); a later hash-bearing re-read
+    must not fire against it — there is no real content claim to
+    mismatch."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md"})
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("real-disk-bytes")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_f_sentinel_recorded_hash_never_fires(
+    coordinator, client: _Client,
+) -> None:
+    """The synthetic launch-gate sentinel ("f"*64) is not a real SHA-256
+    of any content; a SHARED holder re-reading against it must not fire
+    the signal. (The stale path's hash_differs deliberately DOES fire on
+    it — that asymmetry is the launch-gate contract.)"""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    art_id = coordinator.registry.lookup_artifact_id_by_name("CLAUDE.md")
+    assert art_id is not None
+    art = coordinator.registry.get_artifact(art_id)
+    # Inject the sentinel directly into the artifact row (same shape the
+    # launch-gate synthetic SQLite injection produces); the session's
+    # SHARED grant is untouched.
+    coordinator.registry.set_artifact_and_content(
+        art_id, dataclasses.replace(art, content_hash="f" * 64), "",
+    )
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("on-disk-v1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_fresh_shared_hash_mismatch_increments_counter(
+    coordinator, client: _Client,
+) -> None:
+    """Each firing bumps fresh_shared_hash_mismatch_total; matching
+    re-reads don't."""
+    before = coordinator._fresh_shared_hash_mismatch_total
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    assert coordinator._fresh_shared_hash_mismatch_total == before
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("out-of-band-edit")})
+    assert coordinator._fresh_shared_hash_mismatch_total == before + 1
+
+
+def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
+    """fresh_shared_hash_mismatch_total visible in /status?detail=metrics
+    so an operator can size the false-positive rate before any
+    strict-mode deny knob is considered."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "fresh_shared_hash_mismatch_total" in body
+    assert isinstance(body["fresh_shared_hash_mismatch_total"], int)
 
 
 # ----------------------------------------------------------------------
