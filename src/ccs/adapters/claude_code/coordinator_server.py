@@ -1190,10 +1190,12 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     A pre-read response can shape one of three ways:
 
     1. **Fresh (first observation OR already-seen valid grant)** —
-       returns ``{"status": "fresh"}`` (no ``hookSpecificOutput``).
-       The ``work_with_notice_surfacing`` wrapper at the bottom of
+       returns ``{"status": "fresh", ...}`` (no ``hookSpecificOutput``;
+       additive keys like Unit 6 ``version`` ride along). The
+       ``work_with_notice_surfacing`` wrapper at the bottom of
        this handler pops pending notices on this exact shape and
-       attaches ``hookSpecificOutput.additionalContext`` if any
+       attaches ``hookSpecificOutput.additionalContext`` onto the
+       work() payload — additive keys must survive — if any
        notices were pending. Fresh response → wrapper drains.
 
     2. **Stale (peer commit invalidated us)** — the stale branch
@@ -1426,8 +1428,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             notices = coordinator.registry.pop_pending_notices(agent_id)
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
+                # Spread work()'s payload so additive fresh-path keys
+                # (Unit 6 ``version``) survive the notice attachment —
+                # rebuilding a literal dict here drops them.
                 return {
-                    "status": "fresh",
+                    **result,
                     "hookSpecificOutput": _payloads.emit_allow(
                         source="pre_read_fresh_with_notice",
                         additional_context=notice_text,
