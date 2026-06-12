@@ -26,6 +26,25 @@ Alpha — APIs may change before `v1.0`.
   (`NoCollectedRead` + a versioned-read-is-a-no-op action property), wired into
   `make tla-check`.
 
+### Changed
+
+- **`SqliteArtifactRegistry(retain_versions=True)` is now supported** —
+  previously it raised `NotImplementedError`. Callers that relied on that raise
+  as a feature gate ("durable retention impossible here") no longer get the
+  signal from the constructor; consult `retention_meta()` (the persisted
+  `(enabled, policy)` surface) or the new `RetentionPolicy` parameter to detect
+  and control durable retention. Content bytes now land in `state.db` when (and
+  only when) this flag is on — see `docs/security.md` for the 0600 posture.
+- **`commit_cas(..., content=None)` under retention no longer records the prior
+  body under the new version.** The old behavior silently retained the STALE
+  previous body as the new version's snapshot (history poisoning, observable
+  only through retention reads). A `content=None` WIN now records nothing for
+  the new version: `get_content_at_version(new_version)` returns `None` and
+  `read_at_version(new_version)` (once it is history) rejects `not_retained`.
+  Relatedly, `get_content_at_version` is now annotated `str | bytes | None` on
+  both registries — bytes bodies round-trip as `bytes` (they always did on the
+  in-process path; the annotation was wrong).
+
 ## [0.9.2] — 2026-06-11
 
 ### Fixed

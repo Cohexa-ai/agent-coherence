@@ -27,13 +27,22 @@ a resolve outcome from a replay outcome by exit code alone:
 - ``2`` — ≥1 SKIPPED with ``opted_out=False`` (manifest declared the
   stream but the file is missing — capture-side bug; surfaces as a
   distinct exit code so CI catches it instead of treating it as clean).
+  **Exit 2 is ALSO argparse's usage-error exit code** (missing/unknown/
+  mistyped arguments — BOTH modes): argparse exits 2 before either mode's
+  handler runs, so a bare exit-2 status is ambiguous between "capture bug"
+  and "bad invocation". The streams disambiguate: an argparse error prints
+  usage prose to stderr (and, when ``--json`` is among argv, ALSO emits a
+  ``{"kind": "error", "exit_code": 2, "reason": "argument_error", ...}``
+  envelope on stdout), while a capture-bug exit 2 emits findings output.
 - ``3`` — trace error (``MultiInstanceTraceError``, ``TraceCorruptionError``,
   ``ManifestMissingOrUnreadableError``). The exception's message is printed to
   stderr verbatim; tracebacks are caught so partners get the actionable
   next-step pointer instead of Python internals.
 - ``4`` — internal error (any other uncaught exception). Decouples CLI bugs
   from CONFIRMED breach (exit 1) so agents triage cleanly. The exception type +
-  message land on stderr; Python tracebacks are swallowed.
+  message land on stderr; Python tracebacks are swallowed. Under ``--json`` an
+  error envelope (``exit_code: 4``) is emitted on stdout first, keeping the
+  NDJSON stream self-contained on every exit path.
 
 ``resolve``-mode exit codes (5+) — one per read-at-version rejection reason and
 one per resolver open/lookup error, so a script branches on the code (and the
@@ -66,7 +75,14 @@ JSON ``reason`` slug) without parsing prose:
 
 A ``ValueError`` from the service (``--version < 1``, caller misuse) is NOT a
 resolver reason; ``resolve`` mode surfaces it as exit ``4`` (internal/usage)
-with the message on stderr.
+with the message on stderr. A ``--output-file`` that names an existing symlink
+is refused the same way (exit ``4``): the writer never follows a link, so a
+pre-planted symlink cannot redirect retained bytes.
+
+Mode-dispatch escape hatch: the literal first token ``resolve`` always selects
+the subcommand, so a session directory literally named ``resolve`` must be
+passed with a path spelling — ``./resolve`` (or an absolute path) — which never
+matches the bare token and routes to the default replay mode.
 
 Pipe-close handling: ``BrokenPipeError`` (e.g., from ``| head -5``) exits ``0``
 in both modes — consumer-closed-pipe is not a failure mode and should not poison
@@ -108,9 +124,19 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, NoReturn, Sequence
 
+from ccs.core.exceptions import (
+    CURRENT_VERSION_REASON,
+    EPOCH_MISMATCH_REASON,
+    FUTURE_VERSION_REASON,
+    NOT_RETAINED_REASON,
+    READ_AT_VERSION_REASONS,
+    RETENTION_OFF_REASON,
+    UNKNOWN_ARTIFACT_REASON,
+)
 from ccs.replay import (
+    ReplayConfigurationError,
     ReplayTraceError,
     SessionDirectoryNotFoundError,
     load,
@@ -118,6 +144,9 @@ from ccs.replay import (
 )
 from ccs.replay.formatters import emit_human, emit_json
 from ccs.replay.predicates import Finding, SummaryFinding
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from ccs.core.types import VersionedContent, VersionedReadRejection
 
 _VALID_INVARIANTS: tuple[str, ...] = (
     "single-writer",
@@ -141,14 +170,84 @@ _VALID_INVARIANTS: tuple[str, ...] = (
 # raise a ResolverError (it never imports the resolver).
 _TRACE_ERRORS: tuple[type[ReplayTraceError], ...] = (ReplayTraceError,)
 
-# resolve-mode exit codes (5+) — keyed by the wire-stable read_at_version reason
-# so the mapping is impossible to drift from the constants in core.exceptions.
-# Imported lazily inside the resolve path to honor the no-eager-optional-import
-# discipline (this dict is built there, not at module import).
-_RESOLVE_REJECTION_EXIT_CODE_NOTE = (
-    "current_version=5 not_retained=6 unknown_artifact=7 retention_off=8 "
-    "epoch_mismatch=9 future_version=10"
+# resolve-mode exit codes (5+) — keyed by the wire-stable read_at_version
+# reasons so the mapping cannot drift from the constants in core.exceptions.
+# Module-level (not lazy): ``ccs.core.exceptions`` is the dependency-free core
+# layer, so importing it eagerly keeps ``import ccs.cli.coherence_replay``
+# cheap — the no-eager-optional-import discipline only fences the coordinator
+# surface, which stays lazy inside the resolve path.
+_RESOLVE_REJECTION_EXIT_CODES: dict[str, int] = {
+    CURRENT_VERSION_REASON: 5,
+    NOT_RETAINED_REASON: 6,
+    UNKNOWN_ARTIFACT_REASON: 7,
+    RETENTION_OFF_REASON: 8,
+    EPOCH_MISMATCH_REASON: 9,
+    FUTURE_VERSION_REASON: 10,
+}
+
+# Human hint per reason — rendered into the resolve epilog NEXT TO the exit
+# code so the --help table is GENERATED from the mapping above and cannot drift
+# from it by hand-editing.
+_RESOLVE_REJECTION_HINTS: dict[str, str] = {
+    CURRENT_VERSION_REASON: "use the protocol fetch path for current",
+    NOT_RETAINED_REASON: "never captured / K-evicted / T-expired",
+    UNKNOWN_ARTIFACT_REASON: "id unknown; deleted == never-existed",
+    RETENTION_OFF_REASON: "retention never enabled for this store",
+    EPOCH_MISMATCH_REASON: "--expected-epoch != store epoch",
+    FUTURE_VERSION_REASON: "version > current; hints at a 2nd coordinator",
+}
+
+# Import-time exhaustiveness pin: a reason added to (or renamed in)
+# READ_AT_VERSION_REASONS without a matching exit code / epilog hint must fail
+# LOUDLY at import, not as a KeyError mid-resolve or a silently stale --help.
+if (
+    set(_RESOLVE_REJECTION_EXIT_CODES) != set(READ_AT_VERSION_REASONS)
+    or set(_RESOLVE_REJECTION_HINTS) != set(READ_AT_VERSION_REASONS)
+):
+    raise RuntimeError(
+        "ccs.cli.coherence_replay: the resolve-mode rejection exit-code map "
+        "and epilog hints must cover READ_AT_VERSION_REASONS exactly "
+        f"(codes={sorted(_RESOLVE_REJECTION_EXIT_CODES)}, "
+        f"hints={sorted(_RESOLVE_REJECTION_HINTS)}, "
+        f"reasons={sorted(READ_AT_VERSION_REASONS)}). Update "
+        "_RESOLVE_REJECTION_EXIT_CODES and _RESOLVE_REJECTION_HINTS together "
+        "with the reason constants in ccs.core.exceptions."
+    )
+
+# Compact reason=code note for the DEFAULT parser's epilog pointer (generated
+# from the mapping; insertion order is the exit-code order).
+_RESOLVE_REJECTION_EXIT_CODE_NOTE = " ".join(
+    f"{reason}={code}" for reason, code in _RESOLVE_REJECTION_EXIT_CODES.items()
 )
+
+
+class _ReplayArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser whose usage-error path can also emit the --json envelope.
+
+    argparse handles a bad invocation by printing usage prose to stderr and
+    exiting 2 — BEFORE either mode's guarded handler runs, so the normal
+    envelope logic can never fire. For ``--json`` consumers stdout must stay
+    self-contained on EVERY exit path, so ``main`` flips
+    ``emit_json_error_envelope`` when ``--json`` is among argv and this
+    override emits the standard error envelope (``exit_code: 2``) on stdout
+    first. The stderr prose and the exit status 2 are preserved exactly
+    (``super().error`` raises ``SystemExit(2)``).
+    """
+
+    emit_json_error_envelope: bool = False
+
+    def error(self, message: str) -> NoReturn:
+        if self.emit_json_error_envelope:
+            _emit_json_line(
+                {
+                    "kind": "error",
+                    "exit_code": 2,
+                    "reason": "argument_error",
+                    "exception": "ArgumentError",
+                    "message": message,
+                }
+            )
+        super().error(message)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     begins with the literal ``resolve`` token, so adding the new mode never
     changes how a bare positional is parsed (no subparser shadows it).
     """
-    parser = argparse.ArgumentParser(
+    parser = _ReplayArgumentParser(
         prog="agent-coherence-replay",
         description=(
             "Replay a captured coordinator session and report invariant "
@@ -177,7 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
             "     (also: BrokenPipeError — consumer closed the pipe early)\n"
             "  1  >=1 CONFIRMED invariant breach\n"
             "  2  >=1 SKIPPED for a stream declared but absent on disk "
-            "(capture bug)\n"
+            "(capture bug).\n"
+            "     ALSO argparse's usage-error exit (bad/missing arguments, "
+            "both modes);\n"
+            "     with --json among argv the usage error additionally emits a "
+            "JSON error\n"
+            "     envelope (exit_code 2, reason argument_error) on stdout\n"
             "  3  Trace error (manifest missing, MULTI_INSTANCE_TRACE, "
             "TRACE_CORRUPTION_DUPLICATE_SEQ)\n"
             "  4  Internal error (uncaught exception; CLI bug — file an issue)\n"
@@ -189,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
             "instance-id mismatch); 12 store error (needs_recovery / db_busy / "
             "db_corrupt / schema_version_mismatch); 13 unknown_artifact_path. "
             "See 'resolve --help'.\n"
+            "  A session directory literally named 'resolve' must be passed "
+            "with a path\n"
+            "  spelling (./resolve or absolute) — the bare first token "
+            "'resolve' always\n"
+            "  selects the subcommand.\n"
         ),
     )
     parser.add_argument(
@@ -253,7 +362,14 @@ def build_resolve_parser() -> argparse.ArgumentParser:
     parser stays byte-identical. Content-safe by default: ``--include-content``
     and ``--output-file`` are the only ways retained bytes leave the process.
     """
-    parser = argparse.ArgumentParser(
+    # The per-reason rows are GENERATED from _RESOLVE_REJECTION_EXIT_CODES (+
+    # hints) so the rendered --help can never drift from the implemented
+    # mapping; the import-time pin above guarantees both cover the reason set.
+    rejection_rows = "\n".join(
+        f"  {code:<3} {reason} ({_RESOLVE_REJECTION_HINTS[reason]})"
+        for reason, code in _RESOLVE_REJECTION_EXIT_CODES.items()
+    )
+    parser = _ReplayArgumentParser(
         prog="agent-coherence-replay resolve",
         description=(
             "Resolve 'bytes at version k' against a (restarted) coordinator "
@@ -269,17 +385,17 @@ def build_resolve_parser() -> argparse.ArgumentParser:
         epilog=(
             "Exit codes (resolve mode):\n"
             "  0   WIN — retained bytes resolved at the requested version\n"
-            "  5   current_version (use the protocol fetch path for current)\n"
-            "  6   not_retained (never captured / K-evicted / T-expired)\n"
-            "  7   unknown_artifact (id unknown; deleted == never-existed)\n"
-            "  8   retention_off (retention never enabled for this store)\n"
-            "  9   epoch_mismatch (--expected-epoch != store epoch)\n"
-            "  10  future_version (version > current; hints at a 2nd coordinator)\n"
+            "  2   argument/usage error from the parser (argparse-native; with "
+            "--json among\n"
+            "      argv a JSON error envelope is still emitted on stdout)\n"
+            "  4   usage error past parsing (--version < 1, --output-file is a "
+            "symlink) or\n"
+            "      internal error (shared with the default mode)\n"
+            f"{rejection_rows}\n"
             "  11  config error: missing --db, or --instance-id mismatch\n"
             "  12  store error: needs_recovery / db_busy / db_corrupt / "
             "schema_version_mismatch\n"
             "  13  unknown_artifact_path (--artifact path matched no row)\n"
-            "  4   usage error (e.g. --version < 1) or internal error\n"
         ),
     )
     parser.add_argument(
@@ -335,9 +451,11 @@ def build_resolve_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Write the RAW retained bytes to this path (created at 0o600). The "
-            "metadata still goes to stdout. Use this instead of "
-            "--include-content when piping binary content."
+            "Write the RAW retained bytes to this path (created at 0o600, "
+            "written atomically via a same-directory temp file). An existing "
+            "symlink at the path is refused (exit 4) — the writer never "
+            "follows links. The metadata still goes to stdout. Use this "
+            "instead of --include-content when piping binary content."
         ),
     )
     parser.add_argument(
@@ -390,10 +508,19 @@ def main(argv: Sequence[str] | None = None) -> int:
       (CONFIRMED breach) so agents triage cleanly.
     """
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    # The bare literal token ONLY selects the subcommand: a path spelling of a
+    # session dir named "resolve" (./resolve, /x/resolve) carries a separator
+    # and can never equal the bare word, so it routes to the default replay
+    # mode — the documented escape hatch for that collision (see the epilog).
     if argv_list and argv_list[0] == "resolve":
         return _run_resolve_guarded(argv_list[1:])
 
-    args = build_parser().parse_args(argv_list)
+    parser = build_parser()
+    # Flip the argparse usage-error path into envelope mode by peeking argv:
+    # a parse failure never produces a Namespace, so the flag cannot come from
+    # parse_args itself.
+    parser.emit_json_error_envelope = "--json" in argv_list
+    args = parser.parse_args(argv_list)
     try:
         return _run(args)
     except BrokenPipeError:
@@ -421,6 +548,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"agent-coherence-replay: {exc}", file=sys.stderr)
         return 3
     except Exception as exc:  # noqa: BLE001 — intentional translate-and-return
+        # Same self-contained-stdout discipline as exit 3: --json consumers
+        # get a parseable envelope even when the CLI itself is the bug.
+        if args.json:
+            _emit_json_line(
+                {
+                    "kind": "error",
+                    "exit_code": 4,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
         print(
             f"agent-coherence-replay: internal error: "
             f"{type(exc).__name__}: {exc}",
@@ -491,11 +629,16 @@ def _run_resolve_guarded(resolve_argv: Sequence[str]) -> int:
     ``BrokenPipeError`` → exit 0 (pipe closed). Resolver errors and rejections
     are handled INSIDE ``_run_resolve`` (each mapped to its own 5+ exit code);
     anything else uncaught → exit 4 with the type/message on stderr (no
-    traceback), matching the default mode's internal-error contract. A
-    ``ValueError`` (``--version < 1``) is caller misuse → exit 4 as a usage
-    error.
+    traceback) plus, under ``--json``, an error envelope on stdout — matching
+    the default mode's internal-error contract. A ``ValueError``
+    (``--version < 1``) and a ``ReplayConfigurationError`` raised past parse
+    time (``--output-file`` is a symlink) are caller misuse → exit 4 as usage
+    errors.
     """
-    args = build_resolve_parser().parse_args(list(resolve_argv))
+    resolve_argv_list = list(resolve_argv)
+    parser = build_resolve_parser()
+    parser.emit_json_error_envelope = "--json" in resolve_argv_list
+    args = parser.parse_args(resolve_argv_list)
     try:
         return _run_resolve(args)
     except BrokenPipeError:
@@ -505,30 +648,28 @@ def _run_resolve_guarded(resolve_argv: Sequence[str]) -> int:
         # resolver reason. Surface on stderr (+ JSON envelope) and exit 4.
         _emit_resolve_error_envelope(args, reason="usage_error", exit_code=4, exc=exc)
         return 4
+    except ReplayConfigurationError as exc:
+        # Config misuse detected PAST parse time (e.g. --output-file names an
+        # existing symlink). Same usage-error surface as ValueError. The
+        # instance-id mismatch (also a ReplayConfigurationError) never reaches
+        # here — _run_resolve maps it to exit 11 first.
+        _emit_resolve_error_envelope(args, reason="usage_error", exit_code=4, exc=exc)
+        return 4
     except Exception as exc:  # noqa: BLE001 — intentional translate-and-return
-        print(
-            f"agent-coherence-replay resolve: internal error: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
+        # Keep stdout self-contained for --json consumers on the unexpected
+        # path too (the ValueError arm above already does); stderr prose stays.
+        _emit_resolve_internal_error(args, exc)
         return 4
 
 
 def _run_resolve(args: argparse.Namespace) -> int:
     """Resolve one version and render the content-safe output. Returns exit code.
 
-    Lazy imports (optional-extra discipline): the resolver + reason constants are
-    imported HERE, not at module top, so ``import ccs.cli.coherence_replay`` does
-    not pull the coordinator surface.
+    Lazy imports (optional-extra discipline): the resolver (which pulls the
+    coordinator surface) is imported HERE, not at module top, so ``import
+    ccs.cli.coherence_replay`` stays cheap. The reason constants + exit-code
+    map live at module level (``ccs.core.exceptions`` is dependency-free).
     """
-    from ccs.core.exceptions import (
-        CURRENT_VERSION_REASON,
-        EPOCH_MISMATCH_REASON,
-        FUTURE_VERSION_REASON,
-        NOT_RETAINED_REASON,
-        RETENTION_OFF_REASON,
-        UNKNOWN_ARTIFACT_REASON,
-    )
     from ccs.core.types import VersionedContent, VersionedReadRejection
     from ccs.replay.resolver import (
         ResolverError,
@@ -538,16 +679,6 @@ def _run_resolve(args: argparse.Namespace) -> int:
         ResolverUnknownArtifactPathError,
         resolve_version,
     )
-
-    # Per-rejection exit code, keyed on the wire-stable reason so it cannot drift.
-    rejection_exit_codes = {
-        CURRENT_VERSION_REASON: 5,
-        NOT_RETAINED_REASON: 6,
-        UNKNOWN_ARTIFACT_REASON: 7,
-        RETENTION_OFF_REASON: 8,
-        EPOCH_MISMATCH_REASON: 9,
-        FUTURE_VERSION_REASON: 10,
-    }
 
     request = ResolverRequest(
         db_path=args.db,
@@ -574,8 +705,8 @@ def _run_resolve(args: argparse.Namespace) -> int:
         return 12
 
     if isinstance(outcome, VersionedReadRejection):
-        exit_code = rejection_exit_codes[outcome.reason]
-        _emit_resolve_rejection(args, outcome)
+        exit_code = _RESOLVE_REJECTION_EXIT_CODES[outcome.reason]
+        _emit_resolve_rejection(args, outcome, exit_code=exit_code)
         return exit_code
 
     assert isinstance(outcome, VersionedContent)
@@ -596,36 +727,77 @@ def _content_metadata(content: str | bytes) -> tuple[str, int]:
 
 
 def _write_output_file(path: Path, content: str | bytes) -> None:
-    """Write RAW bytes to ``path`` at mode 0o600 (race-free at creation).
+    """Write RAW bytes to ``path`` at mode 0o600, atomically, never via a symlink.
 
-    Pre-creates the file via ``os.open(O_CREAT, 0o600)`` BEFORE writing so the
-    bytes never land in a file that briefly existed world-readable (the
-    audit_log / state.db 0600-at-creation pattern). A ``str`` body is written as
-    utf-8; ``bytes`` verbatim.
+    Three guarantees (each is a hardening fix over the original direct-write):
+
+    - **No symlink follow.** The target is probed with ``O_NOFOLLOW``: an
+      existing symlink at ``path`` fails with ``ELOOP`` and is refused via the
+      replay layer's typed config error — a pre-planted link can never redirect
+      retained bytes (and the final ``os.replace`` would only ever REPLACE the
+      link inode, never write through it; the probe refuses even that).
+    - **Atomic publish.** Bytes land in a same-directory ``mkstemp`` temp file
+      (created 0600 by mkstemp's contract, umask-independent) and reach
+      ``path`` only via ``os.replace`` — a mid-write failure unlinks the temp
+      and leaves the target absent or with its prior content intact, never
+      partial/empty.
+    - **0600 always.** The published inode IS the 0600 temp file, so even an
+      operator-broadened pre-existing target ends at 0600 (replace swaps the
+      inode; no chmod window).
+
+    A ``str`` body is written as utf-8; ``bytes`` verbatim.
     """
+    import errno
     import os
+    import tempfile
 
     raw = content.encode("utf-8") if isinstance(content, str) else content
-    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+
+    # Symlink probe: no O_CREAT (a missing target is fine — ENOENT passes) and
+    # no O_TRUNC (must not clobber prior content before the temp write lands).
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(raw)
+        probe_fd = os.open(str(path), os.O_WRONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ReplayConfigurationError(
+                f"--output-file {path} is a symlink; refusing to write retained "
+                f"bytes through a link. Pass the real destination path instead."
+            ) from exc
+        if exc.errno != errno.ENOENT:
+            raise
+    else:
+        os.close(probe_fd)
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        fh = os.fdopen(fd, "wb")
     except BaseException:
-        # If fdopen failed before taking ownership, close the raw fd.
+        # fdopen itself failed — the raw fd is still OURS to close. (Once
+        # fdopen succeeds the file object owns the fd; closing it again there
+        # would double-close a possibly re-used descriptor.)
+        os.close(fd)
         try:
-            os.close(fd)
+            os.unlink(tmp_name)
         except OSError:
             pass
         raise
-    # Tighten in case an operator-broadened pre-existing file kept a wider mode
-    # (O_CREAT does not chmod an existing file).
     try:
-        os.chmod(str(path), 0o600)
-    except OSError:
-        pass
+        with fh:
+            fh.write(raw)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
-def _emit_resolve_content(args: argparse.Namespace, outcome) -> None:
+def _emit_resolve_content(
+    args: argparse.Namespace, outcome: VersionedContent
+) -> None:
     """Render a WIN — metadata always; bytes only via --include-content/--output-file."""
     content = outcome.content
     content_hash, content_length = _content_metadata(content)
@@ -684,22 +856,31 @@ def _emit_resolve_content(args: argparse.Namespace, outcome) -> None:
     _write_human_block("\n".join(lines))
 
 
-def _emit_resolve_rejection(args: argparse.Namespace, rejection) -> None:
-    """Render a typed rejection — reason slug + version metadata, NO body."""
-    payload = {
-        "kind": "rejected",
-        "exit_code": None,  # filled by the caller's exit-code map; informational
-        "reason": rejection.reason,
-        "artifact_id": str(rejection.artifact_id),
-        "requested_version": rejection.requested_version,
-        "current_version": rejection.current_version,
-        "coordinator_epoch": rejection.coordinator_epoch,
-    }
+def _emit_resolve_rejection(
+    args: argparse.Namespace,
+    rejection: VersionedReadRejection,
+    *,
+    exit_code: int,
+) -> None:
+    """Render a typed rejection — reason slug + version metadata, NO body.
+
+    ``exit_code`` is the REAL per-reason code the caller is about to return
+    (from ``_RESOLVE_REJECTION_EXIT_CODES``), included in the JSON envelope so
+    a scripted consumer reading only stdout sees the same signal the process
+    exit status carries — the same field the error envelopes already emit.
+    """
     if args.json:
-        # Drop the placeholder exit_code (the process exit code is authoritative;
-        # keeping a null here would mislead a scripted consumer).
-        payload.pop("exit_code")
-        _emit_json_line(payload)
+        _emit_json_line(
+            {
+                "kind": "rejected",
+                "exit_code": exit_code,
+                "reason": rejection.reason,
+                "artifact_id": str(rejection.artifact_id),
+                "requested_version": rejection.requested_version,
+                "current_version": rejection.current_version,
+                "coordinator_epoch": rejection.coordinator_epoch,
+            }
+        )
         return
     lines = [
         f"read-at-version rejected: {rejection.reason}",
@@ -733,7 +914,32 @@ def _emit_resolve_error_envelope(
     print(f"agent-coherence-replay resolve: {exc}", file=sys.stderr)
 
 
-def _emit_json_line(payload: dict) -> None:
+def _emit_resolve_internal_error(args: argparse.Namespace, exc: Exception) -> None:
+    """Emit the resolve mode's exit-4 internal-error: envelope (if --json) + stderr.
+
+    The unexpected-exception twin of :func:`_emit_resolve_error_envelope` —
+    same envelope shape with ``reason: internal_error``, plus the default
+    mode's distinctive ``internal error:`` stderr prose so a human log reader
+    can tell a CLI bug from caller misuse at a glance.
+    """
+    if getattr(args, "json", False):
+        _emit_json_line(
+            {
+                "kind": "error",
+                "exit_code": 4,
+                "reason": "internal_error",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+    print(
+        f"agent-coherence-replay resolve: internal error: "
+        f"{type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
+
+
+def _emit_json_line(payload: dict[str, object]) -> None:
     """Write one JSON object + newline to stdout with an explicit flush.
 
     write+flush (not ``print``) so a downstream ``BrokenPipeError`` surfaces

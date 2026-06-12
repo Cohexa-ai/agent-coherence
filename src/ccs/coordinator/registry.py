@@ -194,6 +194,17 @@ class ArtifactRegistry:
         parity and for the same-process ``expected_epoch`` guard."""
         return self._coordinator_epoch
 
+    @property
+    def instance_id(self) -> str:
+        """The registry's instance identity (minted per construction unless the
+        caller supplied one).
+
+        Public read-only accessor mirroring
+        :attr:`SqliteArtifactRegistry.instance_id` so the two registries share
+        one identity duck-type and consumers never reach into the private
+        field."""
+        return self._instance_id
+
     def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
         """Return ``(retention_enabled, policy_or_None)`` (Unit 4 / R5 duck-type).
 
@@ -275,20 +286,28 @@ class ArtifactRegistry:
         Single-scope (R5 atomicity): ``version_history`` and
         ``version_captured_at`` are always mutated together (capture and GC), so
         their key sets match; reading the body first and missing means the row is
-        absent. The pair of dict reads is GIL-atomic per access, and a concurrent
-        capture/GC of a *different* version cannot make a present row's two halves
-        disagree (the body and timestamp for one version are written before the
-        next statement and dropped together). ``None`` when the artifact or the
-        version is absent (never captured, K-evicted, or T-expired-then-swept)."""
+        absent. Each dict read is GIL-atomic, but the PAIR is not: a concurrent
+        inline GC can drop THIS version between the two reads, so the stamp is
+        read defensively (``.get``) and an absent stamp after a present body is
+        reported as absent — the row was collected mid-read. ``None`` when the
+        artifact or the version is absent (never captured, K-evicted, or
+        T-expired-then-swept)."""
         record = self._records.get(artifact_id)
         if record is None:
             return None
         content = record.version_history.get(version)
         if content is None:
             return None
-        # captured_at is written in the same _capture_version step as the body
-        # and dropped in the same GC step; a present body implies a present stamp.
-        return content, record.version_captured_at[version]
+        # One .get() per dict, no bare getitem: the GIL makes each dict access
+        # atomic but NOT the pair — a concurrent inline GC (a peer thread's
+        # capture under a bounded policy) can drop THIS version between the two
+        # reads, and a getitem here would KeyError out of read_at_version's
+        # never-raise contract. An absent stamp after a present body simply
+        # means the row was GC'd mid-read ⇒ report it as not retained.
+        captured_at = record.version_captured_at.get(version)
+        if captured_at is None:
+            return None
+        return content, captured_at
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
         """Return copy of per-agent MESI states for an artifact."""

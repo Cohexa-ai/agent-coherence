@@ -85,7 +85,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.exceptions import (
+    STALE_READ_GENERATION_REASON,
+    STORE_SIGNAL_BUSY,
+    STORE_SIGNAL_UNREADABLE,
+    STORE_SIGNAL_WAL_RECOVERY,
+    StaleReadGeneration,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
@@ -212,15 +218,49 @@ class ReadOnlyMutationError(ReadOnlyRegistryError):
 
 
 class StoreNeedsRecoveryError(ReadOnlyRegistryError):
-    """The store has an unclean WAL that a read-only connection cannot replay.
+    """The read-only connection could not read the store (recovery/busy/other).
 
     After an embedder crash SQLite leaves a hot WAL whose recovery requires a
     *write* lock; a ``mode=ro`` connection raises ``SQLITE_READONLY_RECOVERY``.
-    This is distinct from missing / corrupt / busy — the remedy is to re-open
+    This is distinct from missing / corrupt — the remedy is to re-open
     the store once with the embedder (read-write) so it checkpoints the WAL,
     then retry the read-only resolve. The forensic population over-represents
     crashed writers, so this is the resolver's most on-brand failure mode.
+
+    ``reason`` is the machine-readable classification signal (one of
+    ``ccs.core.exceptions.STORE_OPEN_SIGNALS``: ``wal_recovery`` / ``busy`` /
+    ``unreadable``), set at the SINGLE classification point
+    (:func:`classify_sqlite_operational_signal`). Consumers (the replay
+    resolver) branch on ``exc.reason == CONSTANT`` — never on the human
+    message — per the typed-signal house rule.
     """
+
+    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_WAL_RECOVERY) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
+    """Classify an ``OperationalError`` from a read-only connection into one of
+    the ``STORE_OPEN_SIGNALS`` (``busy`` / ``wal_recovery`` / ``unreadable``).
+
+    The ONE place sqlite's rendered error text is substring-matched: Python's
+    ``sqlite3`` exposes no stable error code on every path/version, so the
+    classification is unavoidably text-based and therefore FRAGILE against
+    sqlite message rewording — which is exactly why it must not be duplicated
+    (the typed-signal-not-substring house rule,
+    ``docs/solutions/best-practices/typed-signal-not-substring-...``). Every
+    downstream consumer matches the returned constant with ``==``, never the
+    message. Order matters: a locked store is checked FIRST because a busy
+    signal has a different remedy (retry) than a recovery one (re-open with
+    the embedder).
+    """
+    text = str(exc).lower()
+    if "busy" in text or "locked" in text:
+        return STORE_SIGNAL_BUSY
+    if "readonly" in text or "recovery" in text or "wal" in text:
+        return STORE_SIGNAL_WAL_RECOVERY
+    return STORE_SIGNAL_UNREADABLE
 
 
 @dataclass(frozen=True)
@@ -289,6 +329,16 @@ class SqliteArtifactRegistry:
         # (O_CREAT without O_EXCL); the migration re-applies the mode to a
         # pre-existing, possibly operator-broadened db and warns once.
         self._precreate_file_0600(self._db_path)
+        # The -wal/-shm sidecars are pre-created at 0600 BEFORE the connect
+        # too: sidecar-creation timing inside sqlite is platform-dependent
+        # (some kernels materialize -shm at connection open, not at the
+        # journal_mode=WAL switch), so touching them only after the connect
+        # would leave a window in which sqlite materializes them under the
+        # process umask. With both pre-touches ahead of the connect, no
+        # sidecar is ever created by sqlite itself; the tighten-after pass
+        # below stays as belt-and-suspenders.
+        self._precreate_file_0600(self._wal_path())
+        self._precreate_file_0600(self._shm_path())
 
         # check_same_thread=False because ThreadingHTTPServer handler threads
         # all share one registry instance. Coupled with the RLock on every
@@ -298,15 +348,6 @@ class SqliteArtifactRegistry:
             check_same_thread=False,
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
-        # The -wal/-shm sidecars materialize lazily on the first write
-        # (PRAGMA journal_mode=WAL is itself the first write). Pre-create/chmod
-        # them to 0600 immediately around the WAL switch so the window in which
-        # they could exist world-readable is closed BEFORE the migration's first
-        # content-bearing transaction. They may be created by SQLite at any of:
-        # the journal_mode switch, the first WAL frame; pre-touching them here
-        # at 0600 plus a tighten-after pass covers both orderings.
-        self._precreate_file_0600(self._wal_path())
-        self._precreate_file_0600(self._shm_path())
         # WAL for concurrent readers + bounded busy_timeout for write contention.
         # synchronous=NORMAL is durable enough for non-financial use.
         #
@@ -339,6 +380,8 @@ class SqliteArtifactRegistry:
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
         self._persist_retention_policy()
+        # Policy is immutable per handle (see retention_meta) — cache once.
+        self._retention_meta_cache = self._load_retention_meta()
 
     # ------------------------------------------------------------------
     # File-mode helpers (race-free 0600 — audit_log.py pattern)
@@ -599,14 +642,26 @@ class SqliteArtifactRegistry:
         commits the pending BEGIN IMMEDIATE and varies by Python version);
         ``except BaseException`` ROLLBACK so a SIGKILL/Ctrl-C mid-migration
         leaves the v1 db intact (the next open re-migrates cleanly, never hits
-        "table already exists"). The introspection runs INSIDE the txn: two
-        processes racing the same v1 db serialize on the write lock; the loser
-        re-reads post-commit, sees user_version already 2, and dispatches to the
-        write-free rehydrate path instead of double-migrating.
+        "table already exists"). Concurrent-loser path: two processes can BOTH
+        read ``user_version == 1`` in the dispatch (a bare read, outside any
+        txn) and both land here; they serialize on the ``BEGIN IMMEDIATE``
+        write lock. The loser re-reads ``user_version`` INSIDE its txn, sees
+        the winner already stamped v2, and no-ops (COMMIT immediately, zero
+        DDL) before rehydrating — it does NOT re-run the migration body, so a
+        future non-idempotent v3 step cannot be double-applied by the race.
         """
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
+            # Concurrent-loser guard: re-check the stamp now that the write
+            # lock is held. The dispatch decision was made from a pre-lock
+            # read; if a racing winner migrated in between, there is nothing
+            # left to do — COMMIT the empty txn and rehydrate like a normal
+            # v2 open. (The winner already ran the mode-tighten pass.)
+            if c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION:
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
             art_cols = {
                 row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
             }
@@ -711,49 +766,72 @@ class SqliteArtifactRegistry:
             check_same_thread=False,
             isolation_level=None,
         )
-        # foreign_keys is a no-op for a read-only conn (no writes); set for
-        # parity. Do NOT touch journal_mode (that is a write) — opening ro
-        # against a WAL db is fine for reads. busy_timeout helps a reader wait
-        # out a concurrent writer's lock.
-        self._conn.execute("PRAGMA busy_timeout=1500")
+        # Everything past the connect is validation that can raise a TYPED
+        # error; without the close-on-raise the construction failure would leak
+        # the open handle (the caller never gets a registry to .close()). The
+        # BaseException breadth mirrors the transaction-rollback idiom: a
+        # Ctrl-C mid-open must not orphan the connection either.
         try:
-            current = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        except sqlite3.OperationalError as exc:
-            raise self._classify_readonly_operational_error(exc) from exc
-        if current != SCHEMA_USER_VERSION:
-            raise SchemaVersionError(
-                f"read-only open: database at {self._db_path} is schema "
-                f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Read-only "
-                f"mode performs NO migration — re-open the store once with the "
-                f"embedder (read-write) to migrate it, then retry."
-            )
-        try:
-            self._rehydrate_meta(instance_id)
-        except sqlite3.OperationalError as exc:
-            raise self._classify_readonly_operational_error(exc) from exc
+            # foreign_keys is a no-op for a read-only conn (no writes); set for
+            # parity. Do NOT touch journal_mode (that is a write) — opening ro
+            # against a WAL db is fine for reads. busy_timeout helps a reader
+            # wait out a concurrent writer's lock.
+            self._conn.execute("PRAGMA busy_timeout=1500")
+            try:
+                current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            except sqlite3.OperationalError as exc:
+                raise self._classify_readonly_operational_error(exc) from exc
+            if current != SCHEMA_USER_VERSION:
+                raise SchemaVersionError(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Read-only "
+                    f"mode performs NO migration — re-open the store once with the "
+                    f"embedder (read-write) to migrate it, then retry."
+                )
+            try:
+                self._rehydrate_meta(instance_id)
+            except sqlite3.OperationalError as exc:
+                raise self._classify_readonly_operational_error(exc) from exc
+            # Policy is immutable per handle (see retention_meta) — cache once.
+            self._retention_meta_cache = self._load_retention_meta()
+        except BaseException:
+            self._conn.close()
+            raise
 
     def _classify_readonly_operational_error(
         self, exc: sqlite3.OperationalError
     ) -> ReadOnlyRegistryError:
         """Map an OperationalError on a read-only connection to a typed error.
 
-        The needs-recovery case (an unclean hot WAL a ro conn cannot replay)
-        surfaces SQLITE_READONLY_RECOVERY; SQLite renders it with a recognizable
-        substring. Anything else is reported as a generic recovery-or-corruption
-        signal so the CLI never leaks a raw OperationalError to a script.
+        Classification routes through the single
+        :func:`classify_sqlite_operational_signal` seam; the signal rides on
+        ``StoreNeedsRecoveryError.reason`` so consumers (the replay resolver)
+        branch on the attribute, never re-parse the message. All three signals
+        stay ONE exception type — a locked store and a hot WAL are both
+        "cannot read right now" from the registry's perspective; the reason
+        carries the operator remedy.
         """
-        text = str(exc).lower()
-        if "readonly" in text or "recovery" in text or "wal" in text:
+        signal = classify_sqlite_operational_signal(exc)
+        if signal == STORE_SIGNAL_BUSY:
+            return StoreNeedsRecoveryError(
+                f"the store at {self._db_path} is locked by a concurrent writer "
+                f"(SQLITE_BUSY) and the read-only open timed out waiting for the "
+                f"lock. Retry shortly. Underlying: {exc}",
+                reason=signal,
+            )
+        if signal == STORE_SIGNAL_WAL_RECOVERY:
             return StoreNeedsRecoveryError(
                 f"the store at {self._db_path} has an unclean write-ahead log that "
                 f"a read-only connection cannot replay (SQLITE_READONLY_RECOVERY). "
                 f"Re-open it once with the embedder (read-write) so it checkpoints "
-                f"the WAL, then retry the read-only resolve. Underlying: {exc}"
+                f"the WAL, then retry the read-only resolve. Underlying: {exc}",
+                reason=signal,
             )
         return StoreNeedsRecoveryError(
             f"the read-only store at {self._db_path} could not be read "
             f"({exc}); it may need recovery (re-open once with the embedder) or "
-            f"be corrupt."
+            f"be corrupt.",
+            reason=signal,
         )
 
     def _persist_retention_policy(self) -> None:
@@ -766,30 +844,45 @@ class SqliteArtifactRegistry:
         retention semantics are STORE-derived, not process-local. No open-time GC
         pass (dropped per plan): each writer's inline GC trusts its CONSTRUCTOR
         policy; the v1 one-writer-per-store assumption means the last writer
-        open's persisted policy is what readers see. Idempotent UPSERT.
+        open's persisted policy is what readers see.
+
+        Write-free steady-state: the three keys are READ first and the UPSERT is
+        skipped when the persisted values already match — a same-policy reopen
+        issues no write at all (the property the write-free v2 open path
+        documents, and what keeps a reopen from dirtying the WAL).
         """
         if self._read_only:
             return
-        enabled = "1" if self._retain_versions else "0"
         policy = self._retention_policy
-        max_versions = (
-            str(policy.max_versions)
-            if policy is not None and policy.max_versions is not None
-            else None
-        )
-        max_age = (
-            str(policy.max_age_seconds)
-            if policy is not None and policy.max_age_seconds is not None
-            else None
-        )
+        desired: dict[str, str | None] = {
+            _META_RETENTION_ENABLED: "1" if self._retain_versions else "0",
+            _META_RETENTION_MAX_VERSIONS: (
+                str(policy.max_versions)
+                if policy is not None and policy.max_versions is not None
+                else None
+            ),
+            _META_RETENTION_MAX_AGE_SECONDS: (
+                str(policy.max_age_seconds)
+                if policy is not None and policy.max_age_seconds is not None
+                else None
+            ),
+        }
         with self._lock:
+            persisted = dict(
+                self._conn.execute(
+                    "SELECT key, value FROM registry_meta WHERE key IN (?, ?, ?)",
+                    tuple(desired),
+                ).fetchall()
+            )
+            # All three keys present AND equal (incl. NULL axes) ⇒ no write.
+            # len() distinguishes an absent key from a present-NULL value.
+            if len(persisted) == len(desired) and all(
+                persisted[key] == value for key, value in desired.items()
+            ):
+                return
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                for key, value in (
-                    (_META_RETENTION_ENABLED, enabled),
-                    (_META_RETENTION_MAX_VERSIONS, max_versions),
-                    (_META_RETENTION_MAX_AGE_SECONDS, max_age),
-                ):
+                for key, value in desired.items():
                     self._conn.execute(
                         """
                         INSERT INTO registry_meta (key, value) VALUES (?, ?)
@@ -799,15 +892,20 @@ class SqliteArtifactRegistry:
                     )
                 self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                # Guarded ROLLBACK (the schema-init idiom): a COMMIT that failed
+                # mid-promote may have already auto-rolled-back, in which case
+                # the explicit ROLLBACK raises "no transaction is active" and
+                # would mask the original error.
+                try:
+                    self._conn.execute("ROLLBACK")
+                except (sqlite3.Error, OSError):
+                    pass
                 raise
 
-    def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
-        """Return ``(retention_enabled, persisted_policy_or_None)`` read from
-        registry_meta. Used by Unit 4's ``read_at_version`` (store-derived
-        ``retention_off`` + T-expiry) on both the writer and the read-only
-        resolver. ``retention_enabled=False`` ⇒ retention was never turned on for
-        this store; ``True`` with a ``None`` policy ⇒ unbounded (NULL axes)."""
+    def _load_retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Read ``(retention_enabled, persisted_policy_or_None)`` from
+        registry_meta — the construction-time loader behind the
+        :meth:`retention_meta` cache. One SELECT under the lock."""
         with self._lock:
             rows = dict(
                 self._conn.execute(
@@ -830,6 +928,22 @@ class SqliteArtifactRegistry:
             max_versions=int(max_v) if max_v is not None else None,
             max_age_seconds=float(max_a) if max_a is not None else None,
         )
+
+    def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Return ``(retention_enabled, persisted_policy_or_None)``. Used by
+        Unit 4's ``read_at_version`` (store-derived ``retention_off`` +
+        T-expiry) on both the writer and the read-only resolver.
+        ``retention_enabled=False`` ⇒ retention was never turned on for this
+        store; ``True`` with a ``None`` policy ⇒ unbounded (NULL axes).
+
+        Served from a construction-time cache, not a per-call SELECT: the
+        policy is immutable per handle (a writer persists its constructor
+        policy exactly once at open; nothing rewrites the keys while the handle
+        lives), readers are short-lived, and the documented single-writer
+        assumption means a peer writer changing the persisted policy mid-handle
+        is outside the contract — so caching at construction is correct and
+        keeps ``read_at_version`` loops off the DB for this lookup."""
+        return self._retention_meta_cache
 
     def _guard_writable(self) -> None:
         """Raise if a mutator was called on a read-only registry."""
@@ -902,6 +1016,16 @@ class SqliteArtifactRegistry:
         per-construction epoch). Epoch reset = delete-and-recreate the db, which
         also drops ``artifact_versions``."""
         return self._coordinator_epoch
+
+    @property
+    def instance_id(self) -> str:
+        """The store's persisted instance identity (``registry_meta.instance_id``).
+
+        Public read-only accessor mirroring :attr:`ArtifactRegistry.instance_id`
+        so identity consumers (the replay resolver's ``--instance-id``
+        cross-check, trace-manifest comparisons) never reach into the private
+        field. Seeded at first create, stable across reopens."""
+        return self._instance_id
 
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""

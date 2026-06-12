@@ -55,14 +55,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, TypeAlias
 from uuid import UUID
 
+from ccs.core.exceptions import STORE_SIGNAL_BUSY
 from ccs.core.types import VersionedContent, VersionedReadRejection
 from ccs.replay.errors import ReplayConfigurationError, ReplayTraceError
 
+if TYPE_CHECKING:  # pragma: no cover — typing only; the runtime import is lazy
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
 # The union ``resolve_version`` RETURNS (a typed result, never an exception).
 # Errors that have no value to return are RAISED as ResolverError subclasses.
-ResolverResult = "VersionedContent | VersionedReadRejection"
+ResolverResult: TypeAlias = VersionedContent | VersionedReadRejection
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +215,7 @@ def _coerce_selector_to_uuid(selector: str) -> UUID | None:
         return None
 
 
-def resolve_version(request: ResolverRequest) -> "ResolverResult":
+def resolve_version(request: ResolverRequest) -> ResolverResult:
     """Resolve "bytes at version k" against a read-only coordinator store (R5b).
 
     Steps (each failure is a typed error or typed rejection — never a raw trace):
@@ -271,7 +276,9 @@ def resolve_version(request: ResolverRequest) -> "ResolverResult":
     except SchemaVersionError as exc:
         raise ResolverSchemaVersionError(str(exc)) from exc
     except StoreNeedsRecoveryError as exc:
-        raise _classify_recovery_or_corruption(exc) from exc
+        # Branch on the typed signal the registry classified at ITS single
+        # classification point — never on str(exc) content.
+        raise _resolver_error_for_store_signal(exc.reason, exc) from exc
     except sqlite3.DatabaseError as exc:
         # A non-sqlite / corrupt file surfaces sqlite3.DatabaseError on the first
         # access inside the open. ``OperationalError`` is a DatabaseError
@@ -287,7 +294,7 @@ def resolve_version(request: ResolverRequest) -> "ResolverResult":
     try:
         # (3) Optional instance-id identity guard.
         if request.expected_instance_id is not None:
-            actual = registry._instance_id  # noqa: SLF001 — read-only identity read
+            actual = registry.instance_id
             if actual != request.expected_instance_id:
                 raise ResolverInstanceMismatchError(
                     f"read-at-version resolve: --instance-id "
@@ -304,15 +311,23 @@ def resolve_version(request: ResolverRequest) -> "ResolverResult":
         # SQLITE_BUSY/locked store can surface OperationalError at QUERY time
         # (after a clean open) — distinct from the open-time mapping above — so
         # we map it to the resolver taxonomy here too rather than leaking a raw
-        # OperationalError. A genuine query-time corruption signal
-        # (DatabaseError that is not Operational) maps to the corrupt bucket.
+        # OperationalError. Classification routes through the registry's ONE
+        # classification seam (typed-signal house rule). A genuine query-time
+        # corruption signal (DatabaseError that is not Operational) maps to the
+        # corrupt bucket.
         service = CoordinatorService(registry)
         try:
             return service.read_at_version(
                 artifact_id, request.version, expected_epoch=request.expected_epoch
             )
         except sqlite3.OperationalError as exc:
-            raise _classify_recovery_or_corruption(exc) from exc
+            from ccs.coordinator.sqlite_registry import (
+                classify_sqlite_operational_signal,
+            )
+
+            raise _resolver_error_for_store_signal(
+                classify_sqlite_operational_signal(exc), exc
+            ) from exc
         except sqlite3.DatabaseError as exc:
             raise ResolverCorruptDatabaseError(
                 f"read-at-version resolve: a query against {request.db_path} "
@@ -322,7 +337,7 @@ def resolve_version(request: ResolverRequest) -> "ResolverResult":
         registry.close()
 
 
-def _resolve_artifact_id(registry: object, selector: str) -> UUID:
+def _resolve_artifact_id(registry: "SqliteArtifactRegistry", selector: str) -> UUID:
     """Map a selector (raw UUID or ``artifacts.name`` path) to an artifact id.
 
     A UUID selector is returned as-is (an id unknown to the registry flows to
@@ -334,7 +349,7 @@ def _resolve_artifact_id(registry: object, selector: str) -> UUID:
     as_uuid = _coerce_selector_to_uuid(selector)
     if as_uuid is not None:
         return as_uuid
-    looked_up = registry.lookup_artifact_id_by_name(selector)  # type: ignore[attr-defined]
+    looked_up = registry.lookup_artifact_id_by_name(selector)
     if looked_up is None:
         raise ResolverUnknownArtifactPathError(
             f"read-at-version resolve: no artifact registered at workspace path "
@@ -344,26 +359,22 @@ def _resolve_artifact_id(registry: object, selector: str) -> UUID:
     return looked_up
 
 
-def _classify_recovery_or_corruption(exc: Exception) -> ResolverError:
-    """Split the read-only registry's ``StoreNeedsRecoveryError`` into the
-    resolver's needs-recovery vs corrupt vs busy buckets.
+def _resolver_error_for_store_signal(signal: str, exc: Exception) -> ResolverError:
+    """Map a typed store-open signal (``StoreNeedsRecoveryError.reason`` /
+    ``classify_sqlite_operational_signal``) to the resolver error taxonomy.
 
-    Unit 3's ``_classify_readonly_operational_error`` already folds every
-    OperationalError on the read-only connection into ``StoreNeedsRecoveryError``
-    (recovery, corruption, or busy). The resolver re-splits on the rendered text
-    so the CLI can show distinct reasons: a hot-WAL recovery state, a locked
-    store (SQLITE_BUSY), and a generic could-not-read all carry different
-    operator remedies.
+    No message parsing happens here — the signal was classified ONCE at the
+    registry seam and is matched with ``==`` against the constants in
+    ``ccs.core.exceptions`` (the typed-signal house rule). ``busy`` keeps its
+    own class (retry shortly); ``wal_recovery`` and the ``unreadable``
+    catch-all share :class:`ResolverNeedsRecoveryError` because they share the
+    operator remedy (re-open once with the embedder) — preserving the
+    wire-visible JSON reasons / exit codes exactly.
     """
-    text = str(exc).lower()
-    if "busy" in text or "locked" in text:
+    if signal == STORE_SIGNAL_BUSY:
         return ResolverBusyError(
             f"read-at-version resolve: the store is locked by a concurrent "
             f"writer (SQLITE_BUSY) and the read-only resolve timed out waiting "
             f"for the lock. Retry shortly. Underlying: {exc}"
         )
-    if "recovery" in text or "readonly" in text or "wal" in text:
-        return ResolverNeedsRecoveryError(str(exc))
-    # Generic could-not-read (the registry's catch-all branch) — surface as
-    # needs-recovery since the remedy (re-open with the embedder) is the same.
     return ResolverNeedsRecoveryError(str(exc))

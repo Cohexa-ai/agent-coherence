@@ -26,7 +26,7 @@ Requirement trace:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 
 __all__ = ["RetentionPolicy", "collectible_versions"]
@@ -57,6 +57,15 @@ class RetentionPolicy:
             disables the K axis (no count bound). Must be ``>= 1`` when set;
             ``max_versions < 1`` raises :class:`ValueError` (a zero/negative
             bound would try to collect the current row — caller misuse).
+
+            **The K=1 cliff:** ``max_versions=1`` is legal but sharp — only the
+            current version's row survives each capture, so EVERY historical
+            ``read_at_version`` rejects ``not_retained`` (and the current
+            version is rejected ``current_version`` by design: the history
+            surface serves history only). K=1 therefore retains rows the read
+            surface can never serve. Use ``max_versions >= 2`` for any actual
+            history use; K=1 is only meaningful as a deliberate
+            "current-snapshot-on-disk, no readable history" posture.
         max_age_seconds: **T axis.** A version whose capture timestamp is older
             than ``now - max_age_seconds`` is collectible. ``None`` disables the
             T axis (no age bound). Must be ``> 0`` when set; ``max_age_seconds
@@ -102,7 +111,7 @@ def collectible_versions(
     current_version: int,
     policy: RetentionPolicy,
     now: float,
-    exemptions: Iterable[int] = (),
+    exemptions: Collection[int] = (),
 ) -> set[int]:
     """Return the set of versions that GC may drop under ``policy`` (R1, R4).
 

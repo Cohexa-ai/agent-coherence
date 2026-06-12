@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from uuid import UUID
 
+from ccs.coordinator.retention import collectible_versions
 from ccs.core.exceptions import (
     CURRENT_VERSION_REASON,
     EPOCH_MISMATCH_REASON,
@@ -38,7 +39,6 @@ from ccs.core.types import (
     VersionedContent,
     VersionedReadRejection,
 )
-from ccs.coordinator.retention import collectible_versions
 
 from .registry import ArtifactRegistry
 
@@ -415,7 +415,7 @@ class CoordinatorService:
         artifact_id: UUID,
         requested_version: int,
         current_version: int | None,
-        epoch: str | None,
+        epoch: str,
     ) -> VersionedReadRejection:
         """Build a :class:`VersionedReadRejection` (no body material, by type)."""
         return VersionedReadRejection(

@@ -738,6 +738,47 @@ class TestExceptionEnvelope:
         assert rc != 1
         assert rc == 4
 
+    def test_internal_error_with_json_emits_error_envelope(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # --json consumers get a self-contained stdout on EVERY exit path,
+        # including the exit-4 internal-error one (mirrors the exit-3 trace
+        # error envelope). stderr keeps the human prose.
+        session = _clean_session(tmp_path)
+
+        def raise_internal(*_args: Any, **_kwargs: Any) -> int:
+            raise RuntimeError("simulated CLI internal error")
+
+        monkeypatch.setattr("ccs.cli.coherence_replay._run", raise_internal)
+        rc = main([str(session), "--json"])
+        captured = capsys.readouterr()
+        assert rc == 4
+        envelope = json.loads(captured.out.strip())
+        assert envelope["kind"] == "error"
+        assert envelope["exit_code"] == 4
+        assert envelope["exception"] == "RuntimeError"
+        assert "internal error" in captured.err
+
+    def test_internal_error_without_json_keeps_stdout_empty(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        session = _clean_session(tmp_path)
+
+        def raise_internal(*_args: Any, **_kwargs: Any) -> int:
+            raise RuntimeError("simulated CLI internal error")
+
+        monkeypatch.setattr("ccs.cli.coherence_replay._run", raise_internal)
+        rc = main([str(session)])
+        captured = capsys.readouterr()
+        assert rc == 4
+        assert captured.out == ""
+
 
 # ---------------------------------------------------------------------------
 # JSON schema conformance

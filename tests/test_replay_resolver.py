@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from uuid import uuid4
 
@@ -50,7 +51,7 @@ from ccs.core.exceptions import (
     RETENTION_OFF_REASON,
     UNKNOWN_ARTIFACT_REASON,
 )
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, VersionedContent, VersionedReadRejection
 from ccs.replay import (
     ResolverCorruptDatabaseError,
     ResolverInstanceMismatchError,
@@ -61,7 +62,6 @@ from ccs.replay import (
     ResolverUnknownArtifactPathError,
     resolve_version,
 )
-from ccs.core.types import VersionedContent, VersionedReadRejection
 
 _K8 = RetentionPolicy(max_versions=8)
 
@@ -505,6 +505,119 @@ class TestErrorPaths:
         assert rc == 4
         assert obj["reason"] == "usage_error"
 
+    def test_query_time_busy_maps_to_db_busy(self, tmp_path: Path, monkeypatch) -> None:
+        # SQLITE_BUSY surfacing at QUERY time (after a clean read-only open)
+        # must classify identically to the open-time path: db_busy, exit 12.
+        # Inject on the artifact_versions SELECT — past every open-time read.
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        class _QueryBusyProxy:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if "artifact_versions" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _QueryBusyProxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+        assert rc == 12
+        assert obj["reason"] == "db_busy"
+
+    def test_query_time_recovery_maps_to_needs_recovery(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The wal_recovery signal at query time folds into needs_recovery —
+        # same wire outcome as the open-time classification.
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        class _QueryRecoveryProxy:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if "artifact_versions" in sql:
+                    raise sqlite3.OperationalError(
+                        "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)"
+                    )
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _QueryRecoveryProxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
+
+    def test_open_time_unreadable_signal_maps_to_needs_recovery(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The catch-all "unreadable" signal (an OperationalError that is
+        # neither busy nor a recognized recovery state) keeps today's wire
+        # outcome: needs_recovery, exit 12 (same operator remedy).
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        class _UnreadableProxy:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if "user_version" in sql:
+                    raise sqlite3.OperationalError("no such table: sqlite_master_oops")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _UnreadableProxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
+
     def test_no_output_file_written_on_rejection(self, tmp_path: Path) -> None:
         # A rejection must not produce a partial output file even if --output-file
         # was requested (no bytes to write).
@@ -572,7 +685,7 @@ class TestInstanceIdCrossCheck:
         _write_store(db, ("c1", "c2", "c3"))
         # Read the store's persisted instance_id via a read-only registry.
         with SqliteArtifactRegistry(db, read_only=True) as ro:
-            inst = ro._instance_id
+            inst = ro.instance_id
         rc, obj = _resolve_json(
             ["--db", str(db), "--artifact", "plan.md", "--version", "2",
              "--instance-id", inst, "--include-content", "--json"]
@@ -655,6 +768,416 @@ class TestResolverLibrarySurface:
                     expected_instance_id="nope",
                 )
             )
+
+    def test_resolve_version_below_one_raises_value_error(self, tmp_path: Path) -> None:
+        # The LIBRARY contract (not just the CLI's exit-4 translation): a sub-1
+        # version propagates the service's ValueError out of resolve_version —
+        # caller misuse, never a typed rejection and never a ResolverError.
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        for bad_version in (0, -1):
+            with pytest.raises(ValueError, match="version must be >= 1"):
+                resolve_version(
+                    ResolverRequest(db_path=db, selector="plan.md", version=bad_version)
+                )
+
+
+# ===========================================================================
+# NO LEAKED CONNECTION — every typed-raise path closes the read-only handle
+# ===========================================================================
+
+
+class _ConnectionCloseTracker:
+    """Wrap ``sqlite3.connect`` for ``mode=ro`` URIs and track close() calls."""
+
+    def __init__(self, monkeypatch, *, fault_sql: str | None = None,
+                 fault_message: str | None = None) -> None:
+        self.opened: list[object] = []
+        self.closed: list[object] = []
+        tracker = self
+
+        class _Proxy:
+            def __init__(self, real):
+                self._real = real
+
+            def close(self):
+                tracker.closed.append(self)
+                return self._real.close()
+
+            def execute(self, sql, *a, **k):
+                if fault_sql is not None and fault_sql in sql:
+                    raise sqlite3.OperationalError(fault_message)
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                proxy = _Proxy(conn)
+                tracker.opened.append(proxy)
+                return proxy
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+
+    def assert_all_closed(self) -> None:
+        assert self.opened, "the fault never exercised a read-only open"
+        assert len(self.closed) == len(self.opened), (
+            f"{len(self.opened) - len(self.closed)} read-only sqlite "
+            f"connection(s) leaked on the typed-raise path"
+        )
+
+
+class TestNoLeakedConnectionOnTypedRaise:
+    """A typed open/lookup failure must never orphan the read-only handle —
+    the post-connect validation closes the connection before raising."""
+
+    def test_schema_version_mismatch_closes_connection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        db = tmp_path / "state.db"
+        _build_raw_v1_db(db)
+        tracker = _ConnectionCloseTracker(monkeypatch)
+        with pytest.raises(ResolverSchemaVersionError):
+            resolve_version(ResolverRequest(db_path=db, selector="plan.md", version=1))
+        tracker.assert_all_closed()
+
+    def test_needs_recovery_closes_connection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        tracker = _ConnectionCloseTracker(
+            monkeypatch,
+            fault_sql="user_version",
+            fault_message=(
+                "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)"
+            ),
+        )
+        with pytest.raises(ResolverNeedsRecoveryError):
+            resolve_version(ResolverRequest(db_path=db, selector="plan.md", version=2))
+        tracker.assert_all_closed()
+
+    def test_instance_mismatch_closes_connection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The mismatch raises AFTER a successful open; the resolver's finally
+        # must close the handle (pinned here so a refactor cannot drop it).
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        tracker = _ConnectionCloseTracker(monkeypatch)
+        with pytest.raises(ResolverInstanceMismatchError):
+            resolve_version(
+                ResolverRequest(
+                    db_path=db, selector="plan.md", version=2,
+                    expected_instance_id="nope",
+                )
+            )
+        tracker.assert_all_closed()
+
+
+# ===========================================================================
+# CLI CONTRACT HARDENING — argparse exit 2, envelopes, mapping pin, output file
+# ===========================================================================
+
+
+class TestArgparseExit2Contract:
+    """argparse usage errors exit 2; with --json among argv a JSON error
+    envelope reaches stdout first (stderr keeps the usage prose)."""
+
+    def test_resolve_missing_required_arg_with_json_emits_envelope(self) -> None:
+        buf, err = io.StringIO(), io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            with redirect_stdout(buf), redirect_stderr(err):
+                main(["resolve", "--db", "/tmp/x", "--artifact", "a", "--json"])
+        assert excinfo.value.code == 2
+        obj = json.loads(buf.getvalue().strip())
+        assert obj["kind"] == "error"
+        assert obj["exit_code"] == 2
+        assert obj["reason"] == "argument_error"
+        assert "usage:" in err.getvalue()  # stderr prose preserved
+
+    def test_resolve_missing_required_arg_without_json_keeps_stdout_empty(
+        self,
+    ) -> None:
+        buf, err = io.StringIO(), io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            with redirect_stdout(buf), redirect_stderr(err):
+                main(["resolve", "--db", "/tmp/x", "--artifact", "a"])
+        assert excinfo.value.code == 2
+        assert buf.getvalue() == ""  # no envelope without --json
+        assert "usage:" in err.getvalue()
+
+    def test_default_mode_bad_flag_with_json_emits_envelope(self) -> None:
+        buf, err = io.StringIO(), io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            with redirect_stdout(buf), redirect_stderr(err):
+                main(["--json", "--definitely-not-a-flag", "/tmp/session"])
+        assert excinfo.value.code == 2
+        obj = json.loads(buf.getvalue().strip())
+        assert obj["exit_code"] == 2
+        assert obj["reason"] == "argument_error"
+
+    def test_default_mode_bad_flag_without_json_keeps_stdout_empty(self) -> None:
+        buf, err = io.StringIO(), io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            with redirect_stdout(buf), redirect_stderr(err):
+                main(["--definitely-not-a-flag", "/tmp/session"])
+        assert excinfo.value.code == 2
+        assert buf.getvalue() == ""
+
+
+class TestResolveTokenDispatch:
+    """The bare literal 'resolve' selects the subcommand; a path spelling of a
+    session dir literally named resolve routes to the default replay mode."""
+
+    def test_dot_slash_resolve_routes_to_replay_mode(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # A session dir literally named "resolve": invoking it as ./resolve
+        # must hit the DEFAULT replay mode (here: exit 3, manifest missing —
+        # a replay-mode outcome, not a resolve-mode argparse error).
+        session = tmp_path / "resolve"
+        session.mkdir()
+        monkeypatch.chdir(tmp_path)
+        rc = main(["./resolve"])
+        assert rc == 3  # replay-mode trace error (manifest missing)
+
+    def test_bare_resolve_token_still_selects_subcommand(self) -> None:
+        # The bare word stays the subcommand selector (missing required args
+        # → argparse exit 2), regardless of cwd contents.
+        with pytest.raises(SystemExit) as excinfo:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                main(["resolve"])
+        assert excinfo.value.code == 2
+
+
+class TestResolveInternalErrorEnvelope:
+    """An unexpected exception in resolve mode exits 4 AND emits the JSON error
+    envelope under --json (stdout stays self-contained on every exit path)."""
+
+    def test_unexpected_raise_with_json_emits_envelope(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        def boom(request):
+            raise RuntimeError("simulated resolver bug")
+
+        monkeypatch.setattr("ccs.replay.resolver.resolve_version", boom)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+        assert rc == 4
+        assert obj["kind"] == "error"
+        assert obj["exit_code"] == 4
+        assert obj["reason"] == "internal_error"
+        assert obj["exception"] == "RuntimeError"
+
+    def test_unexpected_raise_without_json_keeps_stdout_empty(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        def boom(request):
+            raise RuntimeError("simulated resolver bug")
+
+        monkeypatch.setattr("ccs.replay.resolver.resolve_version", boom)
+        rc = main(["resolve", "--db", str(db), "--artifact", "plan.md", "--version", "2"])
+        captured = capsys.readouterr()
+        assert rc == 4
+        assert captured.out == ""
+        assert "internal error" in captured.err
+        assert "RuntimeError" in captured.err
+        assert "Traceback" not in captured.err
+
+
+class TestRejectionEnvelopeExitCode:
+    """The rejection JSON envelope carries the REAL numeric exit code (the
+    misleading exit_code: None placeholder is gone)."""
+
+    def test_rejection_envelope_exit_code_matches_process_exit(
+        self, tmp_path: Path
+    ) -> None:
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))  # current = 3
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "3", "--json"]
+        )
+        assert rc == 5
+        assert obj["kind"] == "rejected"
+        assert obj["exit_code"] == 5  # the real code, not None / absent
+
+    def test_every_rejection_reason_envelope_carries_its_code(
+        self, tmp_path: Path
+    ) -> None:
+        from ccs.cli.coherence_replay import _RESOLVE_REJECTION_EXIT_CODES
+
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"), policy=RetentionPolicy(max_versions=2))
+        scenarios = {
+            CURRENT_VERSION_REASON: ["--artifact", "plan.md", "--version", "3"],
+            NOT_RETAINED_REASON: ["--artifact", "plan.md", "--version", "1"],
+            UNKNOWN_ARTIFACT_REASON: ["--artifact", str(uuid4()), "--version", "1"],
+            EPOCH_MISMATCH_REASON: [
+                "--artifact", "plan.md", "--version", "2",
+                "--expected-epoch", "not-the-epoch",
+            ],
+            FUTURE_VERSION_REASON: ["--artifact", "plan.md", "--version", "9"],
+        }
+        for reason, argv in scenarios.items():
+            rc, obj = _resolve_json(["--db", str(db), *argv, "--json"])
+            assert obj["reason"] == reason
+            assert rc == _RESOLVE_REJECTION_EXIT_CODES[reason]
+            assert obj["exit_code"] == rc
+
+
+class TestRejectionExitCodeMappingPin:
+    """The mapping is exhaustively pinned against READ_AT_VERSION_REASONS and
+    the rendered --help is generated from it (no hand-drift possible)."""
+
+    def test_mapping_covers_reason_set_exactly(self) -> None:
+        from ccs.cli.coherence_replay import _RESOLVE_REJECTION_EXIT_CODES
+        from ccs.core.exceptions import READ_AT_VERSION_REASONS
+
+        assert set(_RESOLVE_REJECTION_EXIT_CODES) == set(READ_AT_VERSION_REASONS)
+        # Pin the exact reason -> code assignments (the wire contract).
+        assert _RESOLVE_REJECTION_EXIT_CODES == {
+            CURRENT_VERSION_REASON: 5,
+            NOT_RETAINED_REASON: 6,
+            UNKNOWN_ARTIFACT_REASON: 7,
+            RETENTION_OFF_REASON: 8,
+            EPOCH_MISMATCH_REASON: 9,
+            FUTURE_VERSION_REASON: 10,
+        }
+
+    def test_resolve_epilog_mentions_every_reason_with_its_code(self) -> None:
+        from ccs.cli.coherence_replay import (
+            _RESOLVE_REJECTION_EXIT_CODES,
+            build_resolve_parser,
+        )
+
+        help_text = build_resolve_parser().format_help()
+        for reason, code in _RESOLVE_REJECTION_EXIT_CODES.items():
+            assert f"{code:<3} {reason}" in help_text, (
+                f"resolve --help is missing the '{code} {reason}' row"
+            )
+        # And the table is numerically ordered (0/2/4 precede the 5+ rows).
+        positions = [help_text.index(f"{code:<3} {reason}")
+                     for reason, code in _RESOLVE_REJECTION_EXIT_CODES.items()]
+        assert positions == sorted(positions)
+        for shared in ("  0 ", "  2 ", "  4 "):
+            assert help_text.index(shared) < min(positions)
+
+    def test_resolve_epilog_documents_exit_2(self) -> None:
+        from ccs.cli.coherence_replay import build_resolve_parser
+
+        help_text = build_resolve_parser().format_help()
+        assert "argument/usage error" in help_text
+
+    def test_default_epilog_documents_exit_2_collision_and_escape(self) -> None:
+        help_text = build_parser().format_help()
+        assert "argparse" in help_text  # exit-2 usage-error note
+        assert "./resolve" in help_text  # the named-dir escape hatch
+
+
+class TestOutputFileHardening:
+    """_write_output_file: symlink refusal, atomic publish, 0600 preserved."""
+
+    def test_symlink_target_refused_no_write_through(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        real_target = tmp_path / "real-destination.bin"
+        real_target.write_bytes(b"untouched")
+        link = tmp_path / "planted-link.bin"
+        link.symlink_to(real_target)
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            rc = main([
+                "resolve", "--db", str(db), "--artifact", "plan.md",
+                "--version", "2", "--output-file", str(link), "--json",
+            ])
+        assert rc == 4  # usage error (typed config error), not a silent follow
+        obj = json.loads(buf.getvalue().strip())
+        assert obj["reason"] == "usage_error"
+        assert "symlink" in obj["message"]
+        # The bytes never reached the link's destination; the link survives.
+        assert real_target.read_bytes() == b"untouched"
+        assert link.is_symlink()
+
+    def test_mid_write_failure_leaves_prior_content_intact(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import os as os_module
+
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        out = tmp_path / "out.bin"
+        out.write_bytes(b"prior-content")
+
+        def exploding_replace(src, dst):
+            raise OSError("simulated mid-write failure")
+
+        monkeypatch.setattr(os_module, "replace", exploding_replace)
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            rc = main([
+                "resolve", "--db", str(db), "--artifact", "plan.md",
+                "--version", "2", "--output-file", str(out),
+            ])
+        assert rc == 4
+        # Prior content intact — never truncated/partial.
+        assert out.read_bytes() == b"prior-content"
+        # No leftover temp files in the directory.
+        leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+        assert leftovers == []
+
+    def test_mid_write_failure_fresh_target_never_materializes(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import os as os_module
+
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        out = tmp_path / "never-created.bin"
+
+        def exploding_replace(src, dst):
+            raise OSError("simulated mid-write failure")
+
+        monkeypatch.setattr(os_module, "replace", exploding_replace)
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            rc = main([
+                "resolve", "--db", str(db), "--artifact", "plan.md",
+                "--version", "2", "--output-file", str(out),
+            ])
+        assert rc == 4
+        assert not out.exists()  # no partial/empty target
+
+    def test_success_path_still_0600_and_exact_bytes(self, tmp_path: Path) -> None:
+        # Unchanged success contract after the atomic-write rework (the
+        # original 0600 test lives in TestContentSafeDefault; this re-pins it
+        # against the temp+replace implementation alongside an existing file).
+        db = tmp_path / "state.db"
+        _write_store(db, ("seed", b"\x00\x01raw-v2", "c3"))
+        out = tmp_path / "extracted.bin"
+        out.write_bytes(b"old")  # pre-existing target gets atomically replaced
+        os.chmod(out, 0o644)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2",
+             "--output-file", str(out), "--json"]
+        )
+        assert rc == 0
+        assert out.read_bytes() == b"\x00\x01raw-v2"
+        assert (out.stat().st_mode & 0o777) == 0o600  # replace swaps to 0600
 
 
 # ===========================================================================

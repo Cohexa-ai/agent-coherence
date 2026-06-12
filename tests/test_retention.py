@@ -58,6 +58,19 @@ def _register(reg, *, version: int = 1, content: str = "v1") -> Artifact:
     return art
 
 
+def _history_snapshot(reg, artifact_id, max_version: int = 8) -> dict[int, object]:
+    """Retained-history snapshot via the PUBLIC accessor only.
+
+    ``{version: body_or_None}`` over a fixed version range — the
+    no-mutation assertions compare two of these instead of reaching into
+    ``reg._records`` (the test_retention_parity.py ``_content_map`` pattern).
+    """
+    return {
+        v: reg.get_content_at_version(artifact_id, v)
+        for v in range(1, max_version + 1)
+    }
+
+
 # ===========================================================================
 # Part A — collectible_versions: the single pure GC seam (R1, R4)
 # ===========================================================================
@@ -310,10 +323,10 @@ class TestNoCaptureOnRejectedWrites:
         art = _register(reg, version=5, content="seed")
         writer = uuid4()
         reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
-        before = dict(reg._records[art.id].version_history)
+        before = _history_snapshot(reg, art.id)
         res = reg.commit_cas(art.id, writer, expected_version=3, content_hash="h", content="should-not-store", tick=2)
         assert isinstance(res, ConflictDetail)
-        assert reg._records[art.id].version_history == before
+        assert _history_snapshot(reg, art.id) == before
 
     def test_commit_cas_other_holder_no_capture(self):
         # ConflictDetail("other_holder") — a peer holds EXCLUSIVE → no mutation.
@@ -322,10 +335,10 @@ class TestNoCaptureOnRejectedWrites:
         writer, peer = uuid4(), uuid4()
         reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
         reg.set_agent_state(art.id, peer, MESIState.EXCLUSIVE, tick=2)
-        before = dict(reg._records[art.id].version_history)
+        before = _history_snapshot(reg, art.id)
         res = reg.commit_cas(art.id, writer, expected_version=5, content_hash="h", content="should-not-store", tick=3)
         assert isinstance(res, ConflictDetail)
-        assert reg._records[art.id].version_history == before
+        assert _history_snapshot(reg, art.id) == before
 
     def test_commit_cas_corruption_no_capture(self):
         # CasCorruption — expected > current → no mutation.
@@ -333,10 +346,10 @@ class TestNoCaptureOnRejectedWrites:
         art = _register(reg, version=5, content="seed")
         writer = uuid4()
         reg.set_agent_state(art.id, writer, MESIState.SHARED, tick=1)
-        before = dict(reg._records[art.id].version_history)
+        before = _history_snapshot(reg, art.id)
         res = reg.commit_cas(art.id, writer, expected_version=99, content_hash="h", content="should-not-store", tick=2)
         assert isinstance(res, CasCorruption)
-        assert reg._records[art.id].version_history == before
+        assert _history_snapshot(reg, art.id) == before
 
     def test_set_artifact_and_content_fence_reject_no_capture(self):
         # StaleReadGeneration — the pessimistic-commit fence rejects a committer
@@ -350,11 +363,34 @@ class TestNoCaptureOnRejectedWrites:
         # A sweep reclamation bumps owner_generation past the captured read_gen.
         reg.set_agent_state(art.id, committer, MESIState.INVALID, trigger="reclaim_heartbeat", tick=2)
         assert reg.get_owner_generation(art.id) == 1
-        before = dict(reg._records[art.id].version_history)
+        before = _history_snapshot(reg, art.id)
         nxt = Artifact(id=art.id, name="plan.md", version=2, content_hash="h")
         with pytest.raises(StaleReadGeneration):
             reg.set_artifact_and_content(art.id, nxt, "should-not-store", fence_agent_id=committer)
-        assert reg._records[art.id].version_history == before
+        assert _history_snapshot(reg, art.id) == before
+
+
+class TestGetVersionRecordGcWindow:
+    """get_version_record under a mid-read inline GC: absent ⇒ None, never
+    KeyError (the read_at_version never-raise contract)."""
+
+    def test_half_collected_row_returns_none_not_keyerror(self):
+        # Deterministic stand-in for the GIL window: a peer thread's inline GC
+        # pops version_history[v] then version_captured_at[v]; a reader that
+        # saw the body before the pop can find the STAMP already gone. Freeze
+        # that exact intermediate state (private-attr setup is the only way to
+        # hold the window open — the test_fencing.py race-setup precedent) and
+        # pin the contract: the row reads as absent, no KeyError escapes.
+        reg = ArtifactRegistry(retain_versions=True, retention_policy=RetentionPolicy(max_versions=8))
+        art = _register(reg, version=1, content="c1")
+        nxt = Artifact(id=art.id, name="plan.md", version=2, content_hash="h")
+        reg.set_artifact_and_content(art.id, nxt, "c2")
+        # Window: the stamp for v1 is collected; the body briefly survives.
+        del reg._records[art.id].version_captured_at[1]
+        assert reg.get_version_record(art.id, 1) is None  # not KeyError
+        # An intact row still reads normally.
+        record = reg.get_version_record(art.id, 2)
+        assert record is not None and record[0] == "c2"
 
 
 class TestRemoveArtifactDropsHistory:

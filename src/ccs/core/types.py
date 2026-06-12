@@ -142,16 +142,17 @@ class VersionedReadRejection:
       point the reason was decided, or ``None`` when it genuinely cannot be known
       (``unknown_artifact`` — there is no current version for a missing
       artifact). The single-scope read means a racing commit cannot mislabel it.
-    - ``coordinator_epoch`` is the store's epoch (always populated — the registry
-      always has one), so even a rejection tells the consumer which store
-      answered.
+    - ``coordinator_epoch`` is the store's epoch — ALWAYS populated (``str``,
+      never ``None``): the registry always has one, even for ``unknown_artifact``
+      (the artifact may be missing; the store is not), so every rejection tells
+      the consumer which store answered.
     """
 
     reason: str
     artifact_id: UUID
     requested_version: int
     current_version: int | None
-    coordinator_epoch: str | None
+    coordinator_epoch: str
 
 
 @dataclass(frozen=True)

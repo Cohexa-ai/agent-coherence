@@ -23,6 +23,8 @@ import pytest
 
 from ccs.coordinator.retention import RetentionPolicy
 from ccs.coordinator.sqlite_registry import (
+    _ARTIFACT_VERSIONS_DDL,
+    _DB_FILE_MODE,
     CCS_STATE_LOG_SCHEMA_VERSION,
     SCHEMA_USER_VERSION,
     MissingDatabaseError,
@@ -30,8 +32,6 @@ from ccs.coordinator.sqlite_registry import (
     SchemaVersionError,
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
-    _ARTIFACT_VERSIONS_DDL,
-    _DB_FILE_MODE,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
@@ -1174,6 +1174,52 @@ class TestDurableRetentionRoundTrip:
             assert reg.get_content_at_version(art.id, 2) is None
             assert reg.get_content_at_version(art.id, 1) == "seed-v1"
 
+    def test_t_expiry_backdated_row_rejects_then_sweeps(self, db_path: Path) -> None:
+        # Sqlite-arm-isolated T-expiry (the parity suite diagnoses divergence,
+        # not the sqlite SQL mechanics): backdate captured_at DIRECTLY in
+        # artifact_versions, assert read_at_version logically rejects
+        # not_retained, then assert the next capture PHYSICALLY removes the row
+        # (deletion piggybacks on capture-time GC).
+        from ccs.coordinator.service import CoordinatorService
+        from ccs.core.exceptions import NOT_RETAINED_REASON
+        from ccs.core.types import VersionedReadRejection
+
+        pol = RetentionPolicy(max_versions=100, max_age_seconds=600.0)
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=pol
+        ) as reg:
+            art = _retain_artifact(reg, content="c1")
+            for v in (2, 3):
+                nx = Artifact(id=art.id, name="plan.md", version=v, content_hash="h")
+                reg.set_artifact_and_content(art.id, nx, f"c{v}")
+            # Backdate v2 far past the 600s horizon (raw SQL on purpose: this
+            # pins the sqlite captured_at-float comparison path in isolation).
+            reg._conn.execute(
+                "UPDATE artifact_versions SET captured_at = 1.0 "
+                "WHERE artifact_id = ? AND version = 2",
+                (art.id.hex,),
+            )
+            svc = CoordinatorService(reg)
+            out = svc.read_at_version(art.id, 2)
+            assert isinstance(out, VersionedReadRejection)
+            assert out.reason == NOT_RETAINED_REASON
+            # Logical-at-read: the row is still physically present.
+            assert reg._conn.execute(
+                "SELECT COUNT(*) FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = 2",
+                (art.id.hex,),
+            ).fetchone()[0] == 1
+            # The next capture's inline GC physically removes the aged row.
+            nx4 = Artifact(id=art.id, name="plan.md", version=4, content_hash="h")
+            reg.set_artifact_and_content(art.id, nx4, "c4")
+            assert reg._conn.execute(
+                "SELECT COUNT(*) FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = 2",
+                (art.id.hex,),
+            ).fetchone()[0] == 0
+            # Fresh rows are untouched by the sweep.
+            assert reg.get_content_at_version(art.id, 3) == "c3"
+
     def test_unbounded_marker_persisted_when_policy_none(self, db_path: Path) -> None:
         # retain_versions=True + policy=None -> enabled with NULL axes, so a
         # resolver can tell retention-on-unbounded from retention-never-enabled.
@@ -1224,7 +1270,7 @@ class TestWildV1Migration:
             # Pre-existing data intact.
             art = reg.get_artifact(UUID(art_id))
             assert art is not None and art.version == 3
-            assert reg._instance_id == "wild-v1"
+            assert reg.instance_id == "wild-v1"
             assert reg._seq == 4
             # Fence queries work even on a PREVIOUSLY-pre-fence variant.
             assert reg.get_owner_generation(UUID(art_id)) == 0
@@ -1273,6 +1319,46 @@ class TestWildV1Migration:
         finally:
             reg.close()
 
+    def test_concurrent_loser_re_checks_in_txn_and_runs_no_ddl(
+        self, db_path: Path, monkeypatch
+    ) -> None:
+        # Two processes can both read user_version==1 in the dispatch (outside
+        # any txn) and both enter _migrate_v1_to_v2; they serialize on BEGIN
+        # IMMEDIATE. Simulate the LOSER deterministically: the db is already
+        # migrated (the "winner" ran), but the dispatch decision was made from
+        # the stale pre-lock read — force it down the migration path and
+        # assert the in-txn user_version re-check no-ops with ZERO DDL.
+        art_id, _ = _build_raw_v1_db(db_path, fence=True, notices=True)
+        with SqliteArtifactRegistry(db_path) as winner:
+            assert winner._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+        statements: list[str] = []
+
+        def loser_initialize(self, instance_id):
+            # The loser's stale dispatch: call the migration directly against
+            # the already-v2 db, tracing every statement it executes.
+            self._conn.set_trace_callback(statements.append)
+            try:
+                self._migrate_v1_to_v2(instance_id)
+            finally:
+                self._conn.set_trace_callback(None)
+
+        monkeypatch.setattr(
+            SqliteArtifactRegistry, "_initialize_schema", loser_initialize
+        )
+        with SqliteArtifactRegistry(db_path) as loser:
+            # The loser rehydrated normally (meta loaded, data intact) ...
+            assert loser.instance_id == "wild-v1"
+            assert loser.get_artifact(UUID(art_id)) is not None
+            assert loser._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        # ... and performed NO DDL: the in-txn re-check exited before any
+        # ALTER/CREATE could re-run against the migrated schema.
+        ddl = [
+            s for s in statements
+            if s.lstrip().upper().startswith(("ALTER", "CREATE"))
+        ]
+        assert ddl == [], f"concurrent loser re-ran DDL: {ddl}"
+
 
 class TestRetentionPolicyAcrossRuns:
     """R2/R4: K-lowered-between-runs (no open-time GC) + disable != purge."""
@@ -1300,6 +1386,35 @@ class TestRetentionPolicyAcrossRuns:
             nx = Artifact(id=art_id, name="plan.md", version=6, content_hash="h")
             reg.set_artifact_and_content(art_id, nx, "c6")
             assert _versions(reg, art_id) == [5, 6]
+
+    def test_same_policy_reopen_performs_no_write(self, db_path: Path) -> None:
+        # Write-free steady-state: a reopen with the SAME policy must not
+        # UPSERT the (unchanged) retention keys — the v2 open path stays
+        # write-free end-to-end. total_changes counts every row this
+        # connection inserted/updated/deleted; zero == no write happened.
+        pol = RetentionPolicy(max_versions=4, max_age_seconds=60.0)
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=pol
+        ) as reg:
+            _retain_artifact(reg, content="seed")
+
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True, retention_policy=pol
+        ) as reg2:
+            assert reg2._conn.total_changes == 0, (
+                "same-policy reopen wrote to the store (the retention-key "
+                "UPSERT must be skipped when persisted values already match)"
+            )
+            # The cached meta still reflects the persisted policy.
+            assert reg2.retention_meta() == (True, pol)
+
+        # A CHANGED policy does write (the skip is equality-gated, not blanket).
+        with SqliteArtifactRegistry(
+            db_path, retain_versions=True,
+            retention_policy=RetentionPolicy(max_versions=2),
+        ) as reg3:
+            assert reg3._conn.total_changes > 0
+            assert reg3.retention_meta() == (True, RetentionPolicy(max_versions=2))
 
     def test_disable_retention_preserves_existing_rows(self, db_path: Path) -> None:
         # disable != purge: reopening with retain_versions=False over existing
@@ -1456,6 +1571,105 @@ class TestReadOnlyMode:
         with pytest.raises(StoreNeedsRecoveryError):
             SqliteArtifactRegistry(db_path, read_only=True)
 
+    @pytest.mark.parametrize(
+        ("build_store", "fault_message", "expected_error"),
+        [
+            pytest.param("v1", None, SchemaVersionError, id="schema-version-mismatch"),
+            pytest.param(
+                "v2",
+                "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)",
+                StoreNeedsRecoveryError,
+                id="needs-recovery",
+            ),
+            pytest.param(
+                "v2", "database is locked", StoreNeedsRecoveryError, id="busy"
+            ),
+        ],
+    )
+    def test_read_only_open_failure_closes_connection(
+        self, db_path: Path, monkeypatch, build_store, fault_message, expected_error
+    ) -> None:
+        # A typed failure AFTER sqlite3.connect succeeded must close the
+        # connection before raising — the caller never receives a registry
+        # handle, so a leaked conn would hold the db open for the process
+        # lifetime (and pin the WAL on platforms that block unlink).
+        if build_store == "v1":
+            _build_raw_v1_db(db_path, fence=True, notices=True)
+        else:
+            with SqliteArtifactRegistry(db_path) as reg:
+                _retain_artifact(reg, content="x")
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        closes: list[bool] = []
+
+        class _Proxy:
+            def __init__(self, real):
+                self._real = real
+
+            def close(self):
+                closes.append(True)
+                return self._real.close()
+
+            def execute(self, sql, *a, **k):
+                if fault_message is not None and "user_version" in sql:
+                    raise sqlite3.OperationalError(fault_message)
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _Proxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        with pytest.raises(expected_error):
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert closes == [True], "typed read-only open failure leaked the connection"
+
+    def test_read_only_busy_open_carries_busy_reason(
+        self, db_path: Path, monkeypatch
+    ) -> None:
+        # The typed signal (not the message) is the routing contract: a locked
+        # store classifies reason == STORE_SIGNAL_BUSY at the registry's single
+        # classification point.
+        from ccs.core.exceptions import STORE_SIGNAL_BUSY
+
+        with SqliteArtifactRegistry(db_path) as reg:
+            _retain_artifact(reg, content="x")
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        class _BusyProxy:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **k):
+                if "user_version" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        real_connect = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            if a and "mode=ro" in str(a[0]):
+                return _BusyProxy(conn)
+            return conn
+
+        monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_BUSY
+
 
 class TestRetentionRemoveAndEpoch:
     """R4: delete cascades history; re-register mints new UUID; epoch reset."""
@@ -1538,6 +1752,49 @@ class TestRetentionFileModes:
                         f"{sidecar.name} mode "
                         f"{oct(stat.S_IMODE(sidecar.stat().st_mode))} != 0600"
                     )
+
+    def test_umask_window_db_and_sidecars_0600_from_creation(
+        self, db_path: Path, monkeypatch
+    ) -> None:
+        # The no-umask-window claim, pinned: under a permissive umask (0o022)
+        # all three files (db + -wal + -shm) must ALREADY exist at 0600 when
+        # sqlite3.connect first sees the path — i.e. they were pre-created by
+        # os.open(..., 0o600), never materialized by sqlite under the umask.
+        # A regression to open()+chmod (or to post-connect pre-creation) makes
+        # the at-connect snapshot miss files or show a broader mode.
+        from ccs.coordinator import sqlite_registry as sr
+
+        wal = db_path.with_name(db_path.name + "-wal")
+        shm = db_path.with_name(db_path.name + "-shm")
+        modes_at_connect: dict[str, int] = {}
+        real_connect = sqlite3.connect
+
+        def spying_connect(*a, **k):
+            if not modes_at_connect:  # first (writer) connect only
+                for p in (db_path, wal, shm):
+                    if p.exists():
+                        modes_at_connect[p.name] = stat.S_IMODE(p.stat().st_mode)
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", spying_connect)
+        old_umask = os.umask(0o022)
+        try:
+            with SqliteArtifactRegistry(
+                db_path, retain_versions=True, retention_policy=_K8
+            ) as reg:
+                _retain_artifact(reg, content="x")  # force WAL frames
+        finally:
+            os.umask(old_umask)
+        # All three existed at 0600 BEFORE sqlite touched the path ...
+        assert modes_at_connect == {
+            db_path.name: 0o600,
+            wal.name: 0o600,
+            shm.name: 0o600,
+        }, f"files at connect time: {modes_at_connect}"
+        # ... and end at 0600 after real writes under the permissive umask.
+        for p in (db_path, wal, shm):
+            if p.exists():
+                assert stat.S_IMODE(p.stat().st_mode) == _DB_FILE_MODE
 
     def test_migration_tightens_broadened_db_and_warns_once(
         self, db_path: Path, caplog
