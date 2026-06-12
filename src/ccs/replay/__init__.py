@@ -77,6 +77,18 @@ from ccs.replay.recorder import (
     UnverifiedAdapterCaptureError,
     record_callbacks,
 )
+from ccs.replay.resolver import (
+    ResolverBusyError,
+    ResolverCorruptDatabaseError,
+    ResolverError,
+    ResolverInstanceMismatchError,
+    ResolverMissingDatabaseError,
+    ResolverNeedsRecoveryError,
+    ResolverRequest,
+    ResolverSchemaVersionError,
+    ResolverUnknownArtifactPathError,
+    resolve_version,
+)
 
 __all__ = [
     "CORE_PREDICATES",
@@ -91,6 +103,15 @@ __all__ = [
     "ReplayConfigurationError",
     "ReplayError",
     "ReplayTraceError",
+    "ResolverBusyError",
+    "ResolverCorruptDatabaseError",
+    "ResolverError",
+    "ResolverInstanceMismatchError",
+    "ResolverMissingDatabaseError",
+    "ResolverNeedsRecoveryError",
+    "ResolverRequest",
+    "ResolverSchemaVersionError",
+    "ResolverUnknownArtifactPathError",
     "SessionDirectoryNotEmptyError",
     "SessionDirectoryNotFoundError",
     "SingleWriterPredicate",
@@ -102,5 +123,6 @@ __all__ = [
     "emit_json",
     "load",
     "record_callbacks",
+    "resolve_version",
     "run_predicates",
 ]
