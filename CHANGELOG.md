@@ -4,6 +4,28 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Added
+
+- **Bounded, durable version retention + read-at-version.** The coordinator can
+  retain a bounded history of committed artifact versions and serve any retained
+  `(artifact, version)` through `CoordinatorService.read_at_version(...)`,
+  returning a typed `VersionedContent` or a `VersionedReadRejection` over six
+  wire-stable reasons. Opt in per registry with `RetentionPolicy(max_versions=K,
+  max_age_seconds=T)` — **off by default**. The in-memory registry retains in
+  process; `SqliteArtifactRegistry` retains durably across a coordinator restart
+  for in-process embedders, behind the store's first real schema-version bump
+  (v1 → v2, applied automatically and atomically; durable content storage is
+  opt-in and flips no existing deployment silently). `agent-coherence-replay
+  resolve --db <state.db> --artifact <path|uuid> --version <n>` reads bytes at a
+  version from a stored coordinator, content-safe by default (metadata only
+  unless `--include-content` / `--output-file`). Read-at-version is an
+  off-protocol read — it grants no MESI state and captures no read-generation
+  fence claim (R6/R7). Formally modelled in `formal/tla/Retention.tla`
+  (`NoCollectedRead` + a versioned-read-is-a-no-op action property), wired into
+  `make tla-check`.
+
 ## [0.9.2] — 2026-06-11
 
 ### Fixed

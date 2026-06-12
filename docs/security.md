@@ -73,6 +73,50 @@ exists (`SessionDirectoryNotEmptyError`) to prevent silent multi-instance
 trace interleave. No content is read by `agent-coherence-replay` from any
 location other than the explicit `session_dir` argument.
 
+### Durable version retention (opt-in)
+
+`SqliteArtifactRegistry` can durably retain a bounded history of committed
+artifact versions (enabled with `retain_versions=True` plus a `RetentionPolicy`;
+**off by default**). This is the one place the coordinator's durable store holds
+artifact **content bytes** rather than only `content_hash` — a deliberate,
+bounded reversal of the prior hash-only posture, scoped to retained versions and
+to in-process embedders (the Claude Code hook/HTTP coordinator topology is
+unchanged and stays hash-only).
+
+| File | Path | Mode | Holds |
+|---|---|---|---|
+| Version store | `<workspace>/.coherence/state.db` (`artifact_versions` table) | `0600` | Retained version bodies (str/bytes), bounded by the configured `max_versions` / `max_age_seconds` |
+
+What this means for sensitive content:
+
+- **Content on disk.** With retention on, version bodies are written to
+  `state.db`. The file and its `-wal` / `-shm` sidecars are created `0600`
+  *before* the first write — there is no umask window — and `.coherence` is
+  `0700`. Migrating an older database re-applies `0600` and warns once. Bodies
+  can contain whatever your artifacts contain (credentials, PII), so treat the
+  file as sensitive: never commit it to git, and copy it only with mode
+  preserved (`install -m 0600` / `cp -p`) — a copy is as sensitive as the
+  content.
+- **Capture at registration.** A version body is captured when an artifact is
+  first registered, not only on write, so a merely-observed artifact's initial
+  body can land on disk.
+- **Deletion, not unreachability.** Collecting a version (policy GC) or an epoch
+  reset (delete-and-recreate of `state.db`) *deletes* the rows, but SQLite may
+  keep freed-page residue in the file and its WAL until a checkpoint / `VACUUM`.
+  To purge rotated content fully, remove `state.db` together with its `-wal` and
+  `-shm` sidecars. Disabling retention does **not** purge existing rows — they
+  stay readable; purge is a re-open under a tighter policy or an epoch reset.
+- **What a retained version is.** The store records the content the coordinator
+  *committed* at that version — not necessarily the bytes a client later
+  persisted elsewhere.
+
+The read side (`CoordinatorService.read_at_version`, `agent-coherence-replay
+resolve`) opens the store **read-only** and returns retained bytes only on
+explicit request; the replay CLI is metadata-only by default and emits bodies
+only via `--include-content` / `--output-file`, so terminals, CI logs, and shell
+history don't capture content inadvertently. No HTTP route serves version
+content.
+
 ## Hash-pinned install for security-sensitive users
 
 For reproducible installs with full dependency-graph pinning:
