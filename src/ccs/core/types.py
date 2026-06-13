@@ -89,6 +89,73 @@ class CasCorruption:
 
 
 @dataclass(frozen=True)
+class VersionedContent:
+    """A successfully resolved retained version (plan item N v1, Unit 4 / R5).
+
+    The WIN return of :meth:`CoordinatorService.read_at_version` — a typed
+    return (the ``ConflictDetail`` discipline), never an exception. Carries the
+    exact retained body and the forensic metadata a consumer needs:
+
+    - ``content`` is the registry-committed body with its ORIGINAL Python type
+      (``str`` for a TEXT row, ``bytes`` for a BLOB row — the sqlite
+      affinity-NONE column round-trips by value; the in-memory record stores the
+      body as-supplied). It is "the content the registry committed", not what
+      reached any client's disk (the watchdog-ack honesty boundary).
+    - ``captured_at`` is the wall-clock ``time.time()`` capture timestamp — kept
+      on the success surface because forensic consumers need it (omitting it
+      would bake a surface change into the first consumer's contract) and it is
+      also the T-expiry reference.
+    - ``coordinator_epoch`` is the store's epoch, stamped on every answer so a
+      consumer can pin which store-incarnation served the bytes.
+
+    The current version is never served here (``read_at_version`` rejects
+    ``version == current`` with ``current_version``): this is a HISTORY surface.
+    """
+
+    artifact_id: UUID
+    version: int
+    content: str | bytes
+    captured_at: float
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class VersionedReadRejection:
+    """A typed read-at-version rejection (plan item N v1, Unit 4 / R5).
+
+    The non-WIN return of :meth:`CoordinatorService.read_at_version` — a typed
+    return (the ``ConflictDetail`` discipline), never an exception. ``reason`` is
+    exactly one of the six wire-stable constants in
+    :mod:`ccs.core.exceptions` (:data:`~ccs.core.exceptions.READ_AT_VERSION_REASONS`);
+    consumers match with ``==`` against that set, never on a human message.
+
+    **Carries NO content, NO content hash, NO body material** — only the reason,
+    the requested/current versions, and the epoch. This is enforced by a test
+    that pins the exact field set: a rejection is the one surface that must never
+    leak bytes (e.g. an ``epoch_mismatch`` from a different store-incarnation, or
+    a ``future_version`` that hints at a second coordinator), so the dataclass
+    structurally cannot.
+
+    Field semantics:
+
+    - ``current_version`` is the registry's authoritative current version at the
+      point the reason was decided, or ``None`` when it genuinely cannot be known
+      (``unknown_artifact`` — there is no current version for a missing
+      artifact). The single-scope read means a racing commit cannot mislabel it.
+    - ``coordinator_epoch`` is the store's epoch — ALWAYS populated (``str``,
+      never ``None``): the registry always has one, even for ``unknown_artifact``
+      (the artifact may be missing; the store is not), so every rejection tells
+      the consumer which store answered.
+    """
+
+    reason: str
+    artifact_id: UUID
+    requested_version: int
+    current_version: int | None
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
 class InvalidationSignal:
     """Lightweight invalidation signal sent to agents."""
 

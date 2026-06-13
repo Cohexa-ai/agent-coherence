@@ -21,6 +21,122 @@ OCC_CALLER_TRANSIENT_REASON = "caller_in_transient_state"
 # (pessimistic path) so the two surfaces cannot drift.
 STALE_READ_GENERATION_REASON = "stale_read_generation"
 
+# ---------------------------------------------------------------------------
+# read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
+# ---------------------------------------------------------------------------
+#
+# The EXACT string values below are the WIRE CONTRACT: ``read_at_version``
+# returns a :class:`~ccs.core.types.VersionedReadRejection` whose ``reason`` is
+# ONE of these, and every consumer (the Unit 6 replay resolver, SB-17 later)
+# matches with ``reason == CONSTANT`` against :data:`READ_AT_VERSION_REASONS` —
+# NEVER a substring of any human message (the typed-signal-not-substring house
+# rule, ``docs/solutions/best-practices/typed-signal-not-substring-...``).
+# Renaming a value here is a wire break; add, do not mutate.
+#
+# Six reasons, not seven: ``never_retained`` and ``beyond_horizon`` deliberately
+# COLLAPSE into a single ``not_retained``. Once a retained history carries gaps
+# (a T-expiry cleanup, or an off->on retention toggle), "never captured" and
+# "captured then collected/expired" are UNDECIDABLE from persisted state, so a
+# wire-stable constant must not encode a forensic distinction the store cannot
+# honestly make (plan Key Decisions: "Rejection vocabulary (6 reasons ...)").
+RETENTION_OFF_REASON = "retention_off"
+"""Retention was never enabled for this store (``retention_meta()[0]`` False).
+
+Distinct from ``not_retained``: the artifact_versions surface exists on every
+v2 sqlite db, so table-presence cannot tell retention-on-unbounded from
+retention-never-enabled — the persisted ``retention_enabled`` marker does."""
+
+UNKNOWN_ARTIFACT_REASON = "unknown_artifact"
+"""The artifact id is unknown to the registry (``get_artifact`` is None).
+
+Deleted == never-existed: a post-delete read also lands here (delete cascades
+the history rows), per the plan's deliberate collapse."""
+
+NOT_RETAINED_REASON = "not_retained"
+"""``1 <= version < current`` but no servable retained row exists — it was
+never captured (e.g. ``commit_cas(content=None)``), K-evicted, or T-expired.
+The single, deliberately-merged reason (see the module note above)."""
+
+EPOCH_MISMATCH_REASON = "epoch_mismatch"
+"""An ``expected_epoch`` was supplied and != the registry's
+``coordinator_epoch`` — the store was reset (delete-and-recreate) since the
+caller captured the epoch, so its retained history is from a different epoch."""
+
+CURRENT_VERSION_REASON = "current_version"
+"""``version == current``. The history surface serves HISTORY ONLY; current
+content is read via the protocol fetch path (``artifacts`` stores hashes, not
+bodies). A read-only consumer cannot obtain current bytes through any surface —
+by design (plan Key Decisions: consequence of ``current_version``)."""
+
+FUTURE_VERSION_REASON = "future_version"
+"""``version > current``. Preserves the diagnostic ``commit_cas`` keeps via
+:class:`~ccs.core.types.CasCorruption`: a requested version ABOVE the current
+one suggests a second coordinator writing the same store."""
+
+# The closed set every consumer matches against (``reason in
+# READ_AT_VERSION_REASONS``). ``version < 1`` is NOT here — it is a ``ValueError``
+# (caller misuse, house style), never a rejection reason.
+READ_AT_VERSION_REASONS: frozenset[str] = frozenset(
+    {
+        RETENTION_OFF_REASON,
+        UNKNOWN_ARTIFACT_REASON,
+        NOT_RETAINED_REASON,
+        EPOCH_MISMATCH_REASON,
+        CURRENT_VERSION_REASON,
+        FUTURE_VERSION_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# read-only store-open classification signals (Unit 6 hardening)
+# ---------------------------------------------------------------------------
+#
+# Machine-readable signals carried by ``StoreNeedsRecoveryError.reason``
+# (``ccs.coordinator.sqlite_registry``). INTERNAL routing values, not the wire
+# contract: the CLI's JSON ``reason`` slugs (``needs_recovery`` / ``db_busy`` /
+# ``db_corrupt``) stay owned by the resolver error classes. sqlite renders its
+# operational errors as prose, so SOME substring matching is unavoidable — it
+# happens in exactly ONE place (``classify_sqlite_operational_signal``), and
+# every consumer branches on ``exc.reason == CONSTANT`` from here, never on a
+# substring of the human message (the typed-signal-not-substring house rule,
+# ``docs/solutions/best-practices/typed-signal-not-substring-...``).
+STORE_SIGNAL_WAL_RECOVERY = "wal_recovery"
+"""A hot WAL a read-only connection cannot replay (SQLITE_READONLY_RECOVERY).
+Remedy: re-open once with the embedder (read-write) to checkpoint the WAL."""
+
+STORE_SIGNAL_BUSY = "busy"
+"""The store is locked by a concurrent writer (SQLITE_BUSY); retry shortly."""
+
+STORE_SIGNAL_UNREADABLE = "unreadable"
+"""The catch-all: the read-only connection could not read the store for a
+reason that is neither a recognized recovery state nor a lock. The operator
+remedy matches ``wal_recovery`` (re-open with the embedder), so consumers may
+fold this into their needs-recovery surface."""
+
+STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
+    {STORE_SIGNAL_WAL_RECOVERY, STORE_SIGNAL_BUSY, STORE_SIGNAL_UNREADABLE}
+)
+
+# ---------------------------------------------------------------------------
+# cross-runtime store-open guard (sibling Node coordinator hazard)
+# ---------------------------------------------------------------------------
+#
+# The sibling Node coordinator (the agent-coherence-plugin repo) shares the
+# SAME ``<workspace>/.coherence/state.db`` path but maintains its OWN migration
+# ledger: its v2 adds no schema objects (pending_notices validation) and its v3
+# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — so the two ledgers
+# assign DIFFERENT meanings to ``PRAGMA user_version`` 2 and 3 on the same
+# file. ``CrossRuntimeSchemaError`` (defined in
+# ``ccs.coordinator.sqlite_registry`` because it subclasses the
+# coordinator-layer ``SchemaVersionError`` to keep existing catch-sites
+# compatible; core must not import upward) carries THIS wire-stable reason so
+# every consumer — and the Node side's mirror check — matches
+# ``exc.reason == CONSTANT``, never a substring of the human message (the
+# typed-signal-not-substring house rule,
+# ``docs/solutions/best-practices/typed-signal-not-substring-...``).
+# Renaming the value is a wire break; add, do not mutate.
+CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
+
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
