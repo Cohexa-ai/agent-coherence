@@ -80,12 +80,14 @@ import sqlite3
 import stat
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, TypeAlias
+from typing import Any, Callable, Iterable, NoReturn, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
+    CROSS_RUNTIME_SCHEMA_REASON,
     STALE_READ_GENERATION_REASON,
     STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
@@ -174,6 +176,19 @@ _META_RETENTION_ENABLED = "retention_enabled"
 _META_RETENTION_MAX_VERSIONS = "retention_max_versions"
 _META_RETENTION_MAX_AGE_SECONDS = "retention_max_age_seconds"
 
+# Cross-runtime lineage stamp (registry_meta). The sibling Node coordinator
+# shares the SAME ``<workspace>/.coherence/state.db`` path but keeps its OWN
+# migration ledger (its v2/v3 mean different schemas than this repo's v2), so
+# ``PRAGMA user_version`` alone cannot say WHOSE ledger a file belongs to.
+# This side stamps ``schema_runtime=python`` at fresh-create and at the v1->v2
+# migration (inside those existing transactions — the v2 steady-state open
+# stays write-free); the Node side mirrors with ``node`` (alignment issue).
+# A present-and-foreign stamp is the STRONGEST cross-runtime marker — checked
+# before any structural probing. Absence is NOT foreign: every db stamped
+# before this marker shipped lacks the key.
+_META_SCHEMA_RUNTIME = "schema_runtime"
+_SCHEMA_RUNTIME_STAMP = "python"
+
 # OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
 # invalidated_agent_ids)`` — the service layer turns the id list into
 # ``InvalidationSignal``s. A loss is a typed ``ConflictDetail`` (retry-eligible,
@@ -191,6 +206,32 @@ class SchemaVersionError(RuntimeError):
     epoch). The forward path is upgrading the embedder binary to one that
     understands the schema, never ``rm state.db``.
     """
+
+
+class CrossRuntimeSchemaError(SchemaVersionError):
+    """The ``state.db`` was written under the sibling Node coordinator's ledger.
+
+    The Node coordinator (agent-coherence-plugin) shares the same db path but
+    assigns DIFFERENT meanings to ``user_version`` 2 and 3 (its v2 adds no
+    schema objects; its v3 adds ``agent_states.deadline_tick``), so this
+    Python coordinator fails CLOSED at open — it will neither read nor migrate
+    a foreign-ledger db (migrating would corrupt the Node side's live state;
+    reading would misinterpret its schema). Detection is in
+    :meth:`SqliteArtifactRegistry._reject_foreign_ledger_db`.
+
+    Subclasses :class:`SchemaVersionError` so every existing catch-site (the
+    replay resolver's ``except SchemaVersionError`` mapping, CLI exit-code
+    plumbing) handles it without change. ``reason`` is always
+    :data:`ccs.core.exceptions.CROSS_RUNTIME_SCHEMA_REASON`; consumers match
+    ``exc.reason == CONSTANT``, never a substring of the message (the
+    typed-signal-not-substring house rule). Same anti-delete wording rule as
+    the parent: the message must never advise removing the db — it holds the
+    sibling runtime's live coordination state.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.reason = CROSS_RUNTIME_SCHEMA_REASON
 
 
 class ReadOnlyRegistryError(RuntimeError):
@@ -443,9 +484,17 @@ class SqliteArtifactRegistry:
         - ``user_version == 2`` → ``_rehydrate_meta``: the WRITE-FREE open path
           (no ALTER, no IF-NOT-EXISTS) — the prerequisite for read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
+
+        A :class:`CrossRuntimeSchemaError` pre-empts ALL of the above when the
+        db carries sibling-Node-ledger markers (``_reject_foreign_ledger_db``,
+        called BEFORE any migration or rehydrate write).
         """
         with self._lock:
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            # Cross-runtime fail-closed guard: read-only probes, BEFORE the
+            # dispatch can migrate (v1 branch) or write anything — migrating a
+            # Node-ledger db would corrupt the sibling coordinator's live state.
+            self._reject_foreign_ledger_db(current)
             if current == 0:
                 self._apply_v2_schema(instance_id)
             elif current == 1:
@@ -457,12 +506,125 @@ class SqliteArtifactRegistry:
                 raise SchemaVersionError(
                     f"unexpected schema version {current}; this build expects "
                     f"{SCHEMA_USER_VERSION}. The database at {self._db_path} was "
-                    f"written by a newer coordinator build. Upgrade this embedder "
+                    f"written by a newer coordinator build — either a newer "
+                    f"Python coordinator, or a sibling-runtime coordinator whose "
+                    f"ledger this build does not recognize. Upgrade this embedder "
                     f"to a build that understands schema v{current} rather than "
                     f"removing the store — as of v2 it holds durable retained "
                     f"content and read-generation fence state that a delete would "
                     f"destroy."
                 )
+
+    # ------------------------------------------------------------------
+    # Cross-runtime fail-closed guard (sibling Node coordinator hazard)
+    # ------------------------------------------------------------------
+
+    def _has_table(self, name: str) -> bool:
+        """Read-only probe: does a table exist? (sqlite_master, no writes)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """Read-only probe: does ``table`` carry ``column``? PRAGMA table_info
+        takes no bindings (callers pass internal literals only) and returns
+        zero rows for a missing table — absent table reads as absent column."""
+        return any(
+            row[1] == column
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+
+    def _read_schema_runtime_stamp(self) -> str | None:
+        """Return ``registry_meta.schema_runtime``, or None when the table or
+        key is absent (a fresh file, or any db stamped before the marker
+        shipped — absence is NOT foreign)."""
+        if not self._has_table("registry_meta"):
+            return None
+        row = self._conn.execute(
+            "SELECT value FROM registry_meta WHERE key = ?",
+            (_META_SCHEMA_RUNTIME,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def _reject_foreign_ledger_db(self, current: int) -> None:
+        """Fail closed when the db carries sibling-Node-coordinator markers.
+
+        Called by BOTH open paths (writer ``_initialize_schema`` and
+        ``_open_read_only``) right after reading ``user_version`` and BEFORE
+        any migration or rehydrate write; every probe is a plain read
+        (SELECT / PRAGMA table_info), so the guard itself can never dirty a
+        foreign db.
+
+        WHY structural markers and not the version number: the Node
+        coordinator shares this db path but its ledger's v2 adds NO schema
+        objects (pending_notices validation) and its v3 ALTERs
+        ``agent_states ADD COLUMN deadline_tick``, while THIS repo's v2 adds
+        ``artifact_versions`` — the same user_version means different schemas
+        depending on the writer. Detection order (strongest marker first):
+
+        1. ``registry_meta.schema_runtime`` present and foreign — the explicit
+           lineage stamp, checked regardless of version (this side stamps
+           ``python``; the Node side mirrors with ``node``).
+        2. ``user_version >= 3`` with ``agent_states.deadline_tick`` — the
+           Node ledger's v3 ALTER. ``>= 3``, not ``== 3``: a future Node v4+
+           still carries the column (columns are never dropped), and a future
+           Python v3 db is unreadable by this v2 build either way — both
+           classifications stay fail-closed and :class:`CrossRuntimeSchemaError`
+           IS a :class:`SchemaVersionError` for catch-sites. Literal ``3``
+           (the Node ledger's version), deliberately not SCHEMA_USER_VERSION.
+        3. ``user_version == 2`` WITHOUT ``artifact_versions`` — a Python-v2
+           db ALWAYS has the table (the v1->v2 migration creates it atomically
+           with the version stamp); a Node-v2 db never does. Literal ``2``:
+           the check pins user_version-2 semantics even after a future Python
+           v3 bump.
+
+        ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
+        v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
+        indistinguishable by design — the normal v1->v2 migration proceeds
+        (documented residual risk).
+        """
+        runtime = self._read_schema_runtime_stamp()
+        if runtime is not None and runtime != _SCHEMA_RUNTIME_STAMP:
+            self._raise_cross_runtime(
+                f"is stamped registry_meta.schema_runtime={runtime!r} "
+                f"(this build stamps {_SCHEMA_RUNTIME_STAMP!r})"
+            )
+        if current >= 3 and self._has_column("agent_states", "deadline_tick"):
+            self._raise_cross_runtime(
+                f"is user_version={current} and carries the "
+                f"agent_states.deadline_tick column (the Node ledger's v3 "
+                f"watchdog marker; no Python schema has it)"
+            )
+        if current == 2 and not self._has_table("artifact_versions"):
+            self._raise_cross_runtime(
+                "is user_version=2 without the artifact_versions table (a "
+                "Python-v2 store always has it; the Node ledger's v2 adds no "
+                "schema objects)"
+            )
+
+    def _raise_cross_runtime(self, detail: str) -> NoReturn:
+        """Compose the single :class:`CrossRuntimeSchemaError` message shape.
+
+        Wording rules: name the sibling Node coordinator as the likely writer,
+        state the fail-closed posture, and point at the Node CLI's
+        ``--prepare-for-migration`` as the supported backend-switch path. Per
+        the :class:`SchemaVersionError` rule, NEVER advise deleting the db —
+        it holds the sibling runtime's live coordination state (and possibly
+        retained content), which a delete destroys.
+        """
+        raise CrossRuntimeSchemaError(
+            f"the database at {self._db_path} {detail}. The likely writer is "
+            f"the sibling Node coordinator (agent-coherence-coordinator), "
+            f"which shares this path but keeps its own migration ledger — the "
+            f"two ledgers assign different meanings to the same user_version "
+            f"numbers. This Python coordinator will not read or migrate a "
+            f"foreign-ledger db. To switch the store to this backend, run "
+            f"`agent-coherence-coordinator --prepare-for-migration` (the "
+            f"supported backend-switch path, which preserves the live "
+            f"coordination state the file holds)."
+        )
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:
         """Create the COMPLETE v2 schema + seed registry_meta. Caller holds lock.
@@ -561,12 +723,18 @@ class SqliteArtifactRegistry:
             )
             c.execute(_ARTIFACT_VERSIONS_DDL)
             seed_epoch = uuid4().hex
+            # schema_runtime: the cross-runtime lineage stamp, seeded inside
+            # THIS creation transaction (no extra txn) so the sibling Node
+            # coordinator's mirror check can fail closed on an explicit marker
+            # instead of structural probing.
             c.execute(
-                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?), (?, ?)",
+                "INSERT INTO registry_meta (key, value) "
+                "VALUES (?, ?), (?, ?), (?, ?), (?, ?)",
                 (
                     "instance_id", seed_id,
                     "sequence_number", "0",
                     "coordinator_epoch", seed_epoch,
+                    _META_SCHEMA_RUNTIME, _SCHEMA_RUNTIME_STAMP,
                 ),
             )
             # PRAGMA is transactional inside an explicit BEGIN; cannot take
@@ -682,6 +850,16 @@ class SqliteArtifactRegistry:
                 "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
                 ("coordinator_epoch", uuid4().hex),
             )
+            # Cross-runtime lineage stamp, atomic with the v1->v2 stamp in
+            # THIS transaction (no extra txn). A genuine v1 db never carries
+            # the key (the marker postdates v1), but OR IGNORE keeps the step
+            # idempotent alongside the other half-migrated-db guards. The
+            # foreign-stamp case was already rejected at dispatch
+            # (_reject_foreign_ledger_db runs before the migration).
+            c.execute(
+                "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
+                (_META_SCHEMA_RUNTIME, _SCHEMA_RUNTIME_STAMP),
+            )
             # --- Subsume the pending_notices shim (was the IF-NOT-EXISTS) ---
             c.execute(
                 """
@@ -779,8 +957,25 @@ class SqliteArtifactRegistry:
             self._conn.execute("PRAGMA busy_timeout=1500")
             try:
                 current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                # Cross-runtime fail-closed guard (same classification as the
+                # writer path): the probes are plain reads, so a busy/hot-WAL
+                # store surfaces the SAME typed signal as the version read.
+                self._reject_foreign_ledger_db(current)
             except sqlite3.OperationalError as exc:
                 raise self._classify_readonly_operational_error(exc) from exc
+            if current > SCHEMA_USER_VERSION:
+                # No Node marker matched above, so this is the future-Python
+                # posture — but a sibling-runtime ledger is also a possible
+                # writer, and the embedder cannot migrate DOWN, so the v1
+                # remedy below would be wrong advice here.
+                raise SchemaVersionError(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Either "
+                    f"a newer Python coordinator or a sibling-runtime coordinator "
+                    f"whose ledger this build does not recognize may have written "
+                    f"it. Read-only mode performs NO migration — use a build that "
+                    f"understands schema v{current}, then retry."
+                )
             if current != SCHEMA_USER_VERSION:
                 raise SchemaVersionError(
                     f"read-only open: database at {self._db_path} is schema "
@@ -880,6 +1075,10 @@ class SqliteArtifactRegistry:
                 persisted[key] == value for key, value in desired.items()
             ):
                 return
+            # About to OVERWRITE a different persisted policy — warn first
+            # (the operator-visible half of the single-writer-embedder
+            # assumption; see _warn_on_policy_mismatch for the scope rules).
+            self._warn_on_policy_mismatch(persisted, desired)
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 for key, value in desired.items():
@@ -901,6 +1100,52 @@ class SqliteArtifactRegistry:
                 except (sqlite3.Error, OSError):
                     pass
                 raise
+
+    def _warn_on_policy_mismatch(
+        self, persisted: dict[str, str | None], desired: dict[str, str | None]
+    ) -> None:
+        """Emit ONE RuntimeWarning when this writer's constructor retention
+        policy is about to overwrite a DIFFERENT previously persisted one.
+
+        WHY: the durable store's contract is one writer-embedder per store
+        (see :meth:`retention_meta`); each writer's inline GC trusts its
+        CONSTRUCTOR policy, so two embedders alternating with different
+        policies flip-flop the persisted policy AND the GC behaviour readers
+        derive from it — silently, unless surfaced here BEFORE the overwrite.
+
+        Scope: both sides retention-ENABLED with differing K/T axes. A first
+        persist (no keys yet) is setup, not a conflict; a matching reopen was
+        already short-circuited by the caller; the enable/disable toggles stay
+        silent (deliberate acts with their own documented semantics — see
+        ``test_disable_retention_preserves_existing_rows``); read-only mode
+        never reaches the caller at all.
+        """
+        if not self._retain_versions:
+            return
+        if persisted.get(_META_RETENTION_ENABLED) != "1":
+            return  # nothing previously persisted with retention enabled
+        # .get() folds absent-key and present-NULL to None — both mean "axis
+        # unbounded/disabled", which is exactly the comparison we want here.
+        p_k = persisted.get(_META_RETENTION_MAX_VERSIONS)
+        p_t = persisted.get(_META_RETENTION_MAX_AGE_SECONDS)
+        c_k = desired[_META_RETENTION_MAX_VERSIONS]
+        c_t = desired[_META_RETENTION_MAX_AGE_SECONDS]
+        if (p_k, p_t) == (c_k, c_t):
+            return
+        # stacklevel=4: warn() -> this helper -> _persist_retention_policy ->
+        # __init__ -> the embedder's constructor call site (the actionable
+        # frame: that is where the divergent policy is passed).
+        warnings.warn(
+            f"retention policy mismatch at {self._db_path}: the store persists "
+            f"max_versions={p_k} / max_age_seconds={p_t}, but this writer was "
+            f"constructed with max_versions={c_k} / max_age_seconds={c_t}; "
+            f"overwriting with the constructor policy. The durable store "
+            f"assumes a SINGLE writer-embedder per store — alternating "
+            f"embedders with different policies flip-flop the persisted "
+            f"policy and its GC behaviour.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
 
     def _load_retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
         """Read ``(retention_enabled, persisted_policy_or_None)`` from

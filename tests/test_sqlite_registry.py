@@ -16,6 +16,7 @@ import os
 import sqlite3
 import stat
 import threading
+import warnings
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -27,12 +28,14 @@ from ccs.coordinator.sqlite_registry import (
     _DB_FILE_MODE,
     CCS_STATE_LOG_SCHEMA_VERSION,
     SCHEMA_USER_VERSION,
+    CrossRuntimeSchemaError,
     MissingDatabaseError,
     ReadOnlyMutationError,
     SchemaVersionError,
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
 )
+from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
@@ -1360,6 +1363,186 @@ class TestWildV1Migration:
         assert ddl == [], f"concurrent loser re-ran DDL: {ddl}"
 
 
+# ----------------------------------------------------------------------
+# Cross-runtime fail-closed guard (sibling Node coordinator ledger)
+# ----------------------------------------------------------------------
+
+
+def _assert_no_delete_advice(message: str) -> None:
+    """The anti-delete wording rule (SchemaVersionError docstring): a store-open
+    failure message must never advise deleting state.db — the file holds
+    durable retained content and, for a foreign-ledger db, the sibling
+    runtime's live state. The Node coordinator's own KTD-D message DOES say
+    ``rm <workspace>/.coherence/state.db``; assert that advice shape never
+    leaks into this side's cross-runtime message. A strict substring ban is
+    safe here because the message is written without the verbs entirely
+    (unlike SchemaVersionError's, which negates them: 'rather than removing').
+    """
+    lowered = message.lower()
+    for fragment in ("rm ", "delet", "remov", "discard", "unlink"):
+        assert fragment not in lowered, (
+            f"cross-runtime message contains {fragment!r} (reads as delete "
+            f"advice): {message}"
+        )
+
+
+def _forge_node_v3_db(db_path: Path) -> None:
+    """Forge what the sibling Node coordinator's ledger produces at ITS v3:
+    Node v1 is a byte-for-byte mirror of this repo's v1 DDL (pending_notices
+    included, no fence columns), Node v2 adds no schema objects, Node v3 is
+    ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` + user_version=3."""
+    _build_raw_v1_db(db_path, fence=False, notices=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("ALTER TABLE agent_states ADD COLUMN deadline_tick INTEGER")
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _forge_node_v2_db(db_path: Path) -> None:
+    """Forge a Node-v2 db: this repo's v1 DDL with user_version=2 and NO
+    artifact_versions table (the Node ledger's v2 adds no schema objects; a
+    Python-v2 db ALWAYS has artifact_versions)."""
+    _build_raw_v1_db(db_path, fence=False, notices=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stamp_schema_runtime(db_path: Path, value: str) -> None:
+    """Hand-stamp registry_meta.schema_runtime (forging the Node side's mirror
+    stamp, or clearing ours via DELETE elsewhere)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO registry_meta (key, value) "
+            "VALUES ('schema_runtime', ?)",
+            (value,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _user_version(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestCrossRuntimeGuard:
+    """Fail-closed open against a sibling-Node-ledger state.db (both open
+    paths). The Node coordinator shares the db path but its ledger assigns
+    different meanings to user_version 2/3, so the guard must fire BEFORE any
+    migration or rehydrate write — extends the wild-v1 migration and
+    read-only open coverage above."""
+
+    @pytest.mark.parametrize("read_only", [False, True])
+    def test_node_v3_db_raises_cross_runtime(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        _forge_node_v3_db(db_path)
+        with pytest.raises(CrossRuntimeSchemaError) as ei:
+            SqliteArtifactRegistry(db_path, read_only=read_only)
+        # Typed signal: match the wire-stable constant with ==, never the text.
+        assert ei.value.reason == CROSS_RUNTIME_SCHEMA_REASON
+        msg = str(ei.value)
+        # The supported backend-switch path is named; deletion never advised.
+        assert "agent-coherence-coordinator --prepare-for-migration" in msg
+        _assert_no_delete_advice(msg)
+        # Fail-closed means NO migration/write happened: still the Node shape.
+        assert _user_version(db_path) == 3
+
+    @pytest.mark.parametrize("read_only", [False, True])
+    def test_foreign_v2_db_raises_cross_runtime(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        _forge_node_v2_db(db_path)
+        with pytest.raises(CrossRuntimeSchemaError) as ei:
+            SqliteArtifactRegistry(db_path, read_only=read_only)
+        assert ei.value.reason == CROSS_RUNTIME_SCHEMA_REASON
+        _assert_no_delete_advice(str(ei.value))
+        assert _user_version(db_path) == 2
+
+    @pytest.mark.parametrize("read_only", [False, True])
+    @pytest.mark.parametrize("forge_version", [1, 2])
+    def test_schema_runtime_node_stamp_raises_regardless_of_version(
+        self, db_path: Path, read_only: bool, forge_version: int
+    ) -> None:
+        # The explicit stamp is the STRONGEST marker: it must reject even a
+        # db whose structure would otherwise pass — a genuine v1 (normally
+        # migratable) and a structurally perfect Python v2.
+        if forge_version == 1:
+            _build_raw_v1_db(db_path, fence=False, notices=True)
+        else:
+            with SqliteArtifactRegistry(db_path):
+                pass
+        _stamp_schema_runtime(db_path, "node")
+        before = _user_version(db_path)
+        with pytest.raises(CrossRuntimeSchemaError) as ei:
+            SqliteArtifactRegistry(db_path, read_only=read_only)
+        assert ei.value.reason == CROSS_RUNTIME_SCHEMA_REASON
+        _assert_no_delete_advice(str(ei.value))
+        # NO migration ran on the stamped-foreign db (v1 stays v1).
+        assert _user_version(db_path) == before
+
+    def test_genuine_v1_migrates_and_stamps_python(self, db_path: Path) -> None:
+        # The documented residual risk, accepted by design: a v1 db is
+        # byte-identical between the two runtimes, so it is NOT blocked — the
+        # normal v1->v2 migration proceeds and stamps OUR lineage marker.
+        art_id, _ = _build_raw_v1_db(db_path, fence=False, notices=False)
+        with SqliteArtifactRegistry(db_path) as reg:
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert reg.get_artifact(UUID(art_id)) is not None
+            stamp = reg._conn.execute(
+                "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
+            ).fetchone()
+            assert stamp is not None and stamp[0] == "python"
+
+    def test_fresh_db_stamps_python(self, db_path: Path) -> None:
+        with SqliteArtifactRegistry(db_path) as reg:
+            stamp = reg._conn.execute(
+                "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
+            ).fetchone()
+            assert stamp is not None and stamp[0] == "python"
+
+    def test_genuine_python_v2_reopens_fine_both_paths(self, db_path: Path) -> None:
+        # A db this build created (stamped python) passes the guard on the
+        # writer AND read-only paths.
+        with SqliteArtifactRegistry(db_path) as reg:
+            _retain_artifact(reg, content="x")
+        with SqliteArtifactRegistry(db_path) as rw:
+            assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        with SqliteArtifactRegistry(db_path, read_only=True) as ro:
+            assert ro.instance_id
+
+    def test_pre_stamp_python_v2_opens_fine(self, db_path: Path) -> None:
+        # Back-compat: a Python-v2 db written BEFORE the schema_runtime marker
+        # shipped has no stamp at all. Absence is NOT foreign (the v2 open
+        # path is write-free, so the stamp is never backfilled either).
+        with SqliteArtifactRegistry(db_path):
+            pass
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DELETE FROM registry_meta WHERE key = 'schema_runtime'")
+            conn.commit()
+        finally:
+            conn.close()
+        with SqliteArtifactRegistry(db_path) as reg:
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            # Still un-stamped: the steady-state v2 open performs no writes.
+            assert reg._conn.execute(
+                "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
+            ).fetchone() is None
+
+
 class TestRetentionPolicyAcrossRuns:
     """R2/R4: K-lowered-between-runs (no open-time GC) + disable != purge."""
 
@@ -1377,10 +1560,13 @@ class TestRetentionPolicyAcrossRuns:
                 reg.set_artifact_and_content(art_id, nx, f"c{v}")
             assert _versions(reg, art_id) == [1, 2, 3, 4, 5]
 
-        # Reopen with a lower K: rows persist (NO open-time GC pass).
-        with SqliteArtifactRegistry(
-            db_path, retain_versions=True, retention_policy=RetentionPolicy(max_versions=2)
-        ) as reg:
+        # Reopen with a lower K: rows persist (NO open-time GC pass). The
+        # policy change is deliberate here — acknowledge the mismatch warning.
+        with pytest.warns(RuntimeWarning, match="retention policy mismatch"):
+            reg = SqliteArtifactRegistry(
+                db_path, retain_versions=True, retention_policy=RetentionPolicy(max_versions=2)
+            )
+        with reg:
             assert _versions(reg, art_id) == [1, 2, 3, 4, 5]
             # Next capture for THIS artifact prunes to the new K.
             nx = Artifact(id=art_id, name="plan.md", version=6, content_hash="h")
@@ -1408,11 +1594,14 @@ class TestRetentionPolicyAcrossRuns:
             # The cached meta still reflects the persisted policy.
             assert reg2.retention_meta() == (True, pol)
 
-        # A CHANGED policy does write (the skip is equality-gated, not blanket).
-        with SqliteArtifactRegistry(
-            db_path, retain_versions=True,
-            retention_policy=RetentionPolicy(max_versions=2),
-        ) as reg3:
+        # A CHANGED policy does write (the skip is equality-gated, not
+        # blanket) — and warns about the mismatch before overwriting.
+        with pytest.warns(RuntimeWarning, match="retention policy mismatch"):
+            reg3 = SqliteArtifactRegistry(
+                db_path, retain_versions=True,
+                retention_policy=RetentionPolicy(max_versions=2),
+            )
+        with reg3:
             assert reg3._conn.total_changes > 0
             assert reg3.retention_meta() == (True, RetentionPolicy(max_versions=2))
 
@@ -1435,6 +1624,65 @@ class TestRetentionPolicyAcrossRuns:
             reg.set_artifact_and_content(art_id, nx, "not-captured")
             assert reg.get_content_at_version(art_id, 2) is None
             assert reg.get_content_at_version(art_id, 1) == "kept"
+
+    def test_policy_mismatch_reopen_warns_naming_both_policies(
+        self, db_path: Path
+    ) -> None:
+        # A writer whose constructor policy differs from the persisted one
+        # warns ONCE before overwriting — the single-writer-embedder
+        # assumption made operator-visible. Both policies appear in the text.
+        with SqliteArtifactRegistry(
+            db_path,
+            retain_versions=True,
+            retention_policy=RetentionPolicy(max_versions=8, max_age_seconds=60.0),
+        ):
+            pass
+        with pytest.warns(
+            RuntimeWarning,
+            match=(
+                r"retention policy mismatch.*"
+                r"max_versions=8 / max_age_seconds=60\.0.*"
+                r"max_versions=2 / max_age_seconds=None.*"
+                r"SINGLE writer-embedder"
+            ),
+        ):
+            reg = SqliteArtifactRegistry(
+                db_path,
+                retain_versions=True,
+                retention_policy=RetentionPolicy(max_versions=2),
+            )
+        try:
+            # Warn-then-overwrite: the constructor policy DID land.
+            assert reg.retention_meta() == (True, RetentionPolicy(max_versions=2))
+        finally:
+            reg.close()
+
+    def test_policy_first_persist_match_and_read_only_stay_silent(
+        self, db_path: Path
+    ) -> None:
+        # No warning on: first persist (nothing persisted yet), a matching
+        # reopen (skip-if-unchanged), and a read-only open (never persists) —
+        # escalate any RuntimeWarning to an error to prove silence.
+        pol = RetentionPolicy(max_versions=4, max_age_seconds=60.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with SqliteArtifactRegistry(
+                db_path, retain_versions=True, retention_policy=pol
+            ):
+                pass
+            with SqliteArtifactRegistry(
+                db_path, retain_versions=True, retention_policy=pol
+            ):
+                pass
+            # Read-only with a DIVERGENT constructor policy: still silent —
+            # a reader never persists, so there is no overwrite to warn about.
+            with SqliteArtifactRegistry(
+                db_path,
+                read_only=True,
+                retain_versions=True,
+                retention_policy=RetentionPolicy(max_versions=1),
+            ):
+                pass
 
 
 class TestRetentionCrashAtomicity:

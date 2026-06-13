@@ -117,6 +117,26 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
     {STORE_SIGNAL_WAL_RECOVERY, STORE_SIGNAL_BUSY, STORE_SIGNAL_UNREADABLE}
 )
 
+# ---------------------------------------------------------------------------
+# cross-runtime store-open guard (sibling Node coordinator hazard)
+# ---------------------------------------------------------------------------
+#
+# The sibling Node coordinator (the agent-coherence-plugin repo) shares the
+# SAME ``<workspace>/.coherence/state.db`` path but maintains its OWN migration
+# ledger: its v2 adds no schema objects (pending_notices validation) and its v3
+# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — so the two ledgers
+# assign DIFFERENT meanings to ``PRAGMA user_version`` 2 and 3 on the same
+# file. ``CrossRuntimeSchemaError`` (defined in
+# ``ccs.coordinator.sqlite_registry`` because it subclasses the
+# coordinator-layer ``SchemaVersionError`` to keep existing catch-sites
+# compatible; core must not import upward) carries THIS wire-stable reason so
+# every consumer — and the Node side's mirror check — matches
+# ``exc.reason == CONSTANT``, never a substring of the human message (the
+# typed-signal-not-substring house rule,
+# ``docs/solutions/best-practices/typed-signal-not-substring-...``).
+# Renaming the value is a wire break; add, do not mutate.
+CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
+
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
