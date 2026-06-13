@@ -843,8 +843,10 @@ class SqliteArtifactRegistry:
                     "INTEGER NOT NULL DEFAULT 0"
                 )
             if "read_generation" not in state_cols:
-                # Nullable: a pre-fence grant captured no generation; NULL is the
-                # absent operand the commit guard rejects.
+                # Nullable: a pre-fence grant captured no generation. NULL is the
+                # absent operand the commit guard ADMITS (a writer that never
+                # established a fence claim -- version-CAS arbitrates it); only a
+                # present-and-superseded read_generation is rejected.
                 c.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
             c.execute(
                 "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",

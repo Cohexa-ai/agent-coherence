@@ -213,34 +213,45 @@ RetentionInit ==
 --------------------------------------------------------------------
 (* RetentionCommitAction: FencingCommitAction + atomic retain + K-GC.
    Guard and protocol effect are IDENTICAL to Fencing's commit (equality
-   admits, conflict is a clean no-op, absent operand rejects); the WIN
-   branch additionally extends history with the new version and collects
-   beyond K -- one atomic action, the same-transaction discipline.
-   Replaces the inherited FencingCommitAction (the crux above). *)
+   admits, present-but-superseded is a clean no-op, an absent operand admits
+   -- version-CAS arbitrates it, not the fence); the admitted branches (absent
+   and WIN) additionally extend history with the new version and collect beyond
+   K -- one atomic action, the same-transaction discipline. Replaces the
+   inherited FencingCommitAction (the crux above). *)
 --------------------------------------------------------------------
 
 RetentionCommitAction ==
     \E ag \in Agents, art \in Artifacts :
-        /\ readGeneration[ag][art] /= None          (* absent operand => reject (cannot commit) *)
         /\ version[art] < MaxVersion                (* finite bound *)
         /\ LET rg == readGeneration[ag][art]
                og == ownerGeneration[art]
-           IN \/ (* WIN: claim is current -> apply the write AND retain it,
-                    atomically. Version bump, history extend, and K-GC are
+               newVer == version[art] + 1
+           IN \/ (* ADMIT (absent operand): a plain OCC writer with no fence
+                    claim -- version-CAS (OCC.tla) arbitrates, not the fence.
+                    Applies AND retains atomically (same-transaction
+                    discipline), exactly like WIN; no captured generation, so
+                    staleApply cannot be implicated. *)
+                 /\ rg = None
+                 /\ version' = [version EXCEPT ![art] = newVer]
+                 /\ history' = RetainAndCollect(art, newVer)
+                 /\ UNCHANGED staleApply
+              \/ (* WIN: claim present and current -> apply the write AND retain
+                    it, atomically. Version bump, history extend, and K-GC are
                     one step -- mutant recipe 5 splits them and TLC finds
                     the crash-window NoCollectedRead violation. *)
+                 /\ rg /= None
                  /\ rg = og
-                 /\ LET newVer == version[art] + 1
-                    IN /\ version' = [version EXCEPT ![art] = newVer]
-                       /\ history' = RetainAndCollect(art, newVer)
+                 /\ version' = [version EXCEPT ![art] = newVer]
+                 /\ history' = RetainAndCollect(art, newVer)
                  (* Same teeth as Fencing: the WIN guard `rg = og` makes
                     `rg < og` always FALSE here; removing the guard (the
                     Fencing mutant) lets a superseded commit win and TLC
                     reports a NoStaleApply violation. *)
                  /\ staleApply' = (staleApply \/ (rg < og))
-              \/ (* CONFLICT: rg < og (reclaimed since the claim) -- clean
-                    no-op: no version bump, no mutation, and NO capture
-                    (rejected writes leave history unchanged). *)
+              \/ (* CONFLICT: present but superseded (rg < og, reclaimed since
+                    the claim) -- clean no-op: no version bump, no mutation, and
+                    NO capture (rejected writes leave history unchanged). *)
+                 /\ rg /= None
                  /\ ~(rg = og)
                  /\ UNCHANGED <<version, staleApply, history>>
         /\ UNCHANGED <<clock, mesiState, lastHeartbeat, grantedAtTick,
@@ -276,12 +287,13 @@ VersionedReadAction ==
 --------------------------------------------------------------------
 
 (* Inherited actions keep the retention variables unchanged. The fence
-   wrapping mirrors Fencing's own Next; FencingCommitAction is DELIBERATELY
+   wrapping mirrors Fencing's own Next (FencingWriteAction captures the
+   read-generation at the E/M acquire); FencingCommitAction is DELIBERATELY
    replaced by RetentionCommitAction (the crux modeling decision above) --
    in the retention world every version-bumping commit retains atomically. *)
 RetentionNext ==
     \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
-    \/ (CRWriteAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
+    \/ (FencingWriteAction /\ UNCHANGED <<history, collectedRead>>)
     \/ (CRInvalidateAction /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
     \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
