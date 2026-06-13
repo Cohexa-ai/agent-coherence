@@ -42,7 +42,7 @@ vol.write("plans/plan.md", revised_plan)   # stale view? denied fail-closed → 
 
 ## What it guarantees
 
-Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all four specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
+Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all five specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
 
 | The silent failure | What happens instead | Mechanism | Invariant |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` run
 ---
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
-- 🧮 [Formal verification](formal/tla/README.md) — the four TLA+ specs, invariant ↔ implementation map, mutant recipes
+- 🧮 [Formal verification](formal/tla/README.md) — the five TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
@@ -90,7 +90,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
-Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, and the reclamation fence's no-stale-apply — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all four specs on every push and PR.
+Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, and version retention's no-collected-read — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all five specs on every push and PR.
 
 ## Status
 
