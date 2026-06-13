@@ -18,38 +18,62 @@
      - readGeneration  : the ownerGeneration each agent captured when it
                          last ESTABLISHED ITS WRITE-CLAIM (a genuine read
                          for the OCC path, an E/M acquire for the pessimistic
-                         path). None until captured -- absent operand.
+                         path). None until captured -- the absent operand the
+                         commit ADMITS (a writer with no fence claim;
+                         version-CAS arbitrates it -- see the commit bullet).
      - staleApply      : a sticky history flag -- TRUE iff any commit ever
-                         applied a write from a read-generation older than
-                         the artifact's current ownerGeneration (a stale
+                         applied a write from a CAPTURED read-generation older
+                         than the artifact's current ownerGeneration (a stale
                          apply -- the exact failure the fence prevents).
-     - ObserveGenAction  : an agent captures the current ownerGeneration into
-                           its slot. DECOUPLED from the acquire/fetch on
-                           purpose (mirrors OCC.tla's ObserveAction), so the
-                           sweep can interleave BETWEEN capture and commit --
-                           the non-atomic-capture hazard the plan-review
-                           required this spec to model.
+     - ObserveGenAction  : the GENUINE-READ capture leg -- an agent captures
+                           the current ownerGeneration into its slot on a read.
+                           DECOUPLED from the read on purpose (mirrors OCC.tla's
+                           ObserveAction), so the sweep can interleave BETWEEN
+                           the read-set capture and the OCC commit -- the
+                           non-atomic-capture hazard the plan-review required
+                           this spec to model. (The E/M-acquire capture leg is
+                           atomic and lives in FencingWriteAction.)
+     - FencingWriteAction : the pessimistic E/M acquire (inherited
+                            CRWriteAction) PLUS the read-generation capture,
+                            keyed on the I/S -> M/E transition (atomic with the
+                            acquire, exactly as the registry captures it). So a
+                            reclaim-zombie always carries a captured operand and
+                            is caught present-and-stale; absent means a writer
+                            that never acquired and never read.
      - FencingSweepAction: SweepAction + bump ownerGeneration on each
                            reclaimed artifact, atomically.
      - FencingCommitAction: the generation-guarded commit. WIN iff
                             readGeneration = ownerGeneration (strict-> reject,
-                            EQUALITY ADMITS); else a clean no-op conflict
-                            (the typed-conflict analog -- never a silent
-                            drop). Absent readGeneration => cannot commit
-                            (absent-operand = reject).
+                            EQUALITY ADMITS); a present-but-superseded
+                            readGeneration is a clean no-op conflict (the
+                            typed-conflict analog -- never a silent drop). An
+                            ABSENT readGeneration ADMITS -- a writer with no
+                            fence claim, arbitrated by version-CAS (OCC.tla, a
+                            sibling amendment), never by the fence.
 
    KEY MODELING DECISION (the crux). The fence is UNIFORM across both write
    paths, and its safety depends only on (readGeneration vs ownerGeneration),
    not on the committer's MESI state. So a single FencingCommitAction models
    BOTH the pessimistic commit and the OCC commit_cas, guarded. We therefore
-   REPLACE the inherited unguarded commit (CRCommitAction) and the inherited
-   SweepAction with their fenced equivalents -- in the fence world every
-   version-bumping commit is generation-guarded and every reclaim bumps the
-   generation. The capture is available to an agent in any state (it models
-   "established a claim at this generation"): this is exactly the plan-review
-   P0 fix -- capture at the claim-establishing point (fetch OR E/M acquire),
-   not fetch-only, so a legitimate pessimistic acquire-without-content-read
-   still has a valid operand and is admitted.
+   REPLACE the inherited unguarded commit (CRCommitAction), the inherited
+   write (CRWriteAction), and the inherited SweepAction with their fenced
+   equivalents -- in the fence world every version-bumping commit is
+   generation-guarded, every E/M acquire captures its read-generation, and
+   every reclaim bumps the generation. Capture happens at TWO claim-
+   establishing points (the plan-review P0 fix -- not fetch-only): the E/M
+   acquire and a genuine read. The acquire capture is ATOMIC with the acquire
+   (FencingWriteAction, keyed on the I/S -> M/E transition -- the registry
+   captures it the same way), so a pessimistic acquire-without-content-read
+   still has a valid operand and is admitted, AND a reclaim-zombie can never be
+   absent: it captured at acquire and kept the stale value through the reclaim,
+   so it is always caught present-and-stale. The read capture stays DECOUPLED
+   (ObserveGenAction), so the sweep can interleave between a read-set capture
+   and the OCC commit -- the non-atomic-capture hazard the plan-review required
+   this spec to model. The only way to reach a commit with an ABSENT operand is
+   therefore to have neither acquired M/E nor read: a plain OCC writer whose
+   lost-update protection is version-CAS (OCC.tla), not the fence. The fence
+   ADMITS it; version-CAS arbitrates. The two invariants compose (NoStaleApply
+   here, NoLostUpdate there); neither subsumes the other.
 
    LIVENESS is discharged as safety + prose, consistent with OCC.tla and the
    repo's safety-only TLC convention (README). TLC checks the NoStaleApply
@@ -88,10 +112,11 @@ FencingInit ==
     /\ staleApply = FALSE
 
 --------------------------------------------------------------------
-(* ObserveGenAction: an agent captures the current ownerGeneration into its
-   slot -- the moment it establishes a write-claim (fetch read-set OR E/M
-   acquire). Decoupled from the acquire/fetch action so the sweep can fire
-   between capture and commit (the non-atomic-capture hazard). *)
+(* ObserveGenAction: the genuine-read capture leg -- an agent captures the
+   current ownerGeneration into its slot on a read (the OCC read-set capture).
+   Decoupled from the read action so the sweep can fire between capture and
+   commit (the non-atomic-capture hazard). The E/M-acquire capture is the OTHER
+   leg, atomic with the acquire (FencingWriteAction). *)
 --------------------------------------------------------------------
 
 ObserveGenAction ==
@@ -100,19 +125,53 @@ ObserveGenAction ==
         /\ UNCHANGED <<baseVars, crVars, ownerGeneration, staleApply>>
 
 --------------------------------------------------------------------
+(* FencingWriteAction: the pessimistic E/M acquire (inherited CRWriteAction)
+   PLUS the atomic read-generation capture. The capture is keyed on the
+   I/S -> M/E transition (computed from mesiState vs mesiState', the same
+   discipline as CrashRecovery's UpdatedGrantedAtTick -- it never reaches into
+   CRWriteAction's existential binding), exactly as the registry captures
+   read_generation on the E/M-acquire state transition. An already-M/E holder
+   re-writing (E -> E) does NOT re-capture, so its original operand is
+   preserved. Modeling capture at the acquire (not via the decoupled
+   ObserveGenAction) is what makes a reclaim-zombie always carry a captured
+   operand: it is caught present-and-stale, never mistaken for an absent
+   never-claimed writer. *)
+--------------------------------------------------------------------
+
+FencingWriteAction ==
+    /\ CRWriteAction
+    /\ readGeneration' = [ag \in Agents |-> [art \in Artifacts |->
+         IF mesiState[art][ag] \notin MorE /\ mesiState'[art][ag] \in MorE
+         THEN ownerGeneration[art]
+         ELSE readGeneration[ag][art]]]
+    /\ UNCHANGED <<ownerGeneration, staleApply>>
+
+--------------------------------------------------------------------
 (* FencingCommitAction: generation-guarded commit (both paths, uniform).
+   ADMIT (absent) iff readGeneration = None -- a writer with no fence claim;
+            the fence does not arbitrate it, version-CAS (OCC.tla) does. It
+            carries no captured generation, so it can never be a superseded
+            apply: admit and bump the version.
    WIN     iff readGeneration = ownerGeneration (equality admits).
-   CONFLICT otherwise (read-generation superseded by a reclaim) -- clean
-            no-op. Absent readGeneration => cannot fire (absent operand). *)
+   CONFLICT iff readGeneration present but superseded by a reclaim
+            (readGeneration < ownerGeneration) -- a clean no-op. *)
 --------------------------------------------------------------------
 
 FencingCommitAction ==
     \E ag \in Agents, art \in Artifacts :
-        /\ readGeneration[ag][art] /= None          (* absent operand => reject (cannot commit) *)
         /\ version[art] < MaxVersion                (* finite bound *)
         /\ LET rg == readGeneration[ag][art]
                og == ownerGeneration[art]
-           IN \/ (* WIN: claim is current -> apply the write (bump version). *)
+           IN \/ (* ADMIT (absent operand): a plain OCC writer that never
+                    established a fence claim. The fence does not arbitrate it
+                    -- version-CAS (NoLostUpdate, OCC.tla) does. No captured
+                    generation => can never be a superseded apply, so admit and
+                    bump the version (staleApply cannot be implicated). *)
+                 /\ rg = None
+                 /\ version' = [version EXCEPT ![art] = version[art] + 1]
+                 /\ UNCHANGED staleApply
+              \/ (* WIN: claim present and current -> apply the write. *)
+                 /\ rg /= None
                  /\ rg = og
                  /\ version' = [version EXCEPT ![art] = version[art] + 1]
                  (* Records a stale apply iff this commit landed on a
@@ -123,10 +182,11 @@ FencingCommitAction ==
                     NoStaleApply violation. This is what gives the invariant
                     teeth. *)
                  /\ staleApply' = (staleApply \/ (rg < og))
-              \/ (* CONFLICT: rg < og (reclaimed since the claim) -- clean
-                    no-op: no version bump, no mutation. The formal analog of
-                    "typed StaleReadGeneration conflict, never a silent
-                    drop". *)
+              \/ (* CONFLICT: present but superseded (rg < og, reclaimed since
+                    the claim) -- clean no-op: no version bump, no mutation. The
+                    formal analog of "typed StaleReadGeneration conflict, never
+                    a silent drop". *)
+                 /\ rg /= None
                  /\ ~(rg = og)
                  /\ UNCHANGED <<version, staleApply>>
         /\ UNCHANGED <<clock, mesiState, lastHeartbeat, grantedAtTick,
@@ -169,14 +229,15 @@ FencingSweepAction ==
 (* Specification *)
 --------------------------------------------------------------------
 
-(* Inherited CR actions keep the fence variables unchanged. CRWriteAction
-   models the pessimistic E/M acquire; CRFetchAction the read -> S. The
-   unguarded CRCommitAction and the inherited SweepAction are DELIBERATELY
-   replaced by FencingCommitAction and FencingSweepAction (the crux modeling
-   decision above). *)
+(* Inherited CR actions keep the fence variables unchanged, EXCEPT the write:
+   CRFetchAction models the read -> S. The unguarded CRCommitAction, the
+   inherited CRWriteAction, and the inherited SweepAction are DELIBERATELY
+   replaced by FencingCommitAction, FencingWriteAction (which captures the
+   read-generation at the E/M acquire), and FencingSweepAction (the crux
+   modeling decision above). *)
 FencingNext ==
     \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
-    \/ (CRWriteAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
+    \/ FencingWriteAction
     \/ (CRInvalidateAction /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
     \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
@@ -207,9 +268,14 @@ ReadGenBounded ==
             readGeneration[ag][art] <= ownerGeneration[art]
 
 (* The headline safety property: no commit ever applied a write whose
-   read-generation was superseded by a reclaim. SingleWriter,
-   MonotonicVersion, and the CR invariants (I3-I6) are inherited and
-   re-checked to validate composition. *)
+   CAPTURED read-generation was superseded by a reclaim. Scoped to a captured
+   operand on purpose: an absent operand (a writer that never acquired M/E and
+   never read) carries no read-generation to be superseded, so it is outside
+   this property and is admitted (version-CAS, OCC.tla, is its lost-update
+   guard). A reclaim-zombie is NEVER absent -- FencingWriteAction captures at
+   the acquire -- so admit-on-absent removes no fence coverage. SingleWriter,
+   MonotonicVersion, and the CR invariants (I3-I6) are inherited and re-checked
+   to validate composition. *)
 NoStaleApply == staleApply = FALSE
 
 ==========================================================================

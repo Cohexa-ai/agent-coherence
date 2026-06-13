@@ -77,8 +77,12 @@ class ArtifactRecord:
     # per-artifact ownership epoch, bumped on every sweep reclamation;
     # read_generation_by_agent[ag] is the owner_generation an agent captured
     # when it last established its write-claim (a genuine read OR an E/M
-    # acquire). An ABSENT key (== None) is the absent operand => reject at
-    # commit. The counter only grows (resets to 0 per construction in-memory).
+    # acquire). An ABSENT key (== None) means the agent never established a
+    # fence claim -- a plain OCC writer whose lost-update protection is
+    # version-CAS, not the fence -- so the commit guard ADMITS it (version-CAS,
+    # checked first, arbitrates); only a PRESENT-and-superseded read_generation
+    # (captured < current owner_generation) is rejected. The counter only grows
+    # (resets to 0 per construction in-memory).
     owner_generation: int = 0
     read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
 

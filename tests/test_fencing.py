@@ -87,6 +87,33 @@ def test_parity_commit_cas_fence_rejects_superseded_reader(registry) -> None:
     assert reg.get_artifact(art.id).version == 1  # no phantom bump
 
 
+def test_parity_absent_read_generation_admits_version_cas_arbitrates(registry) -> None:
+    """admit-on-absent is INTENTIONAL (resolves the roadmap residual + the
+    line-80 / Fencing.tla / Retention.tla disagreement, and the over-strict
+    absent=reject rule the 7e77e6a OCC suite already rejected). A committer that
+    never established a fence claim has no captured read_generation (None). The
+    fence does NOT reject the absent operand -- a plain OCC writer's lost-update
+    protection is version-CAS, checked BEFORE the fence -- so an absent-operand
+    commit_cas is ADMITTED on a matching version and arbitrated by version-CAS
+    (version_mismatch) on a stale one, never by a stale_read_generation reject.
+    """
+    reg = registry
+    art = _register(reg)
+    a, b = uuid4(), uuid4()
+    assert reg.get_read_generation(art.id, a) is None  # never claimed -> absent
+    # Matching version on an absent operand: the fence admits, version-CAS wins.
+    res = reg.commit_cas(art.id, a, expected_version=1, content_hash="fresh")
+    assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
+    assert reg.get_artifact(art.id).version == 2
+    # Stale version on a still-absent operand: arbitrated by version-CAS
+    # (version_mismatch), NOT rejected by the fence as stale_read_generation.
+    assert reg.get_read_generation(art.id, b) is None
+    res2 = reg.commit_cas(art.id, b, expected_version=1, content_hash="stale")
+    assert isinstance(res2, ConflictDetail)
+    assert res2.reason == "version_mismatch"
+    assert reg.get_artifact(art.id).version == 2  # no phantom bump
+
+
 def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None:
     reg = registry
     art = _register(reg)
