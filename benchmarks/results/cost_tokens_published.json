@@ -1,0 +1,103 @@
+{
+  "translation": "cost-sweep refetches_avoided -> input-token + prompt-cache dollars",
+  "provenance": "temporal-sim (third lane)",
+  "source_runs_per_point": 50,
+  "assumptions": {
+    "tokens_per_artifact": 1000,
+    "input_price_per_mtok_usd": 3.0,
+    "cache_write_multiplier": 1.25,
+    "cache_read_multiplier": 0.1,
+    "prefix_tokens_after_artifact": 0,
+    "note": "Savings are PER SESSION and scale linearly with tokens_per_artifact and input price. Cache-preservation lane is 0 unless prefix_tokens_after_artifact > 0. A regime map in dollar units, not a measured invoice."
+  },
+  "rows": [
+    {
+      "rate": 0.0,
+      "refetches_avoided": 91.34,
+      "reinjection_tokens_saved": 91340.0,
+      "reinjection_usd_saved": 0.27402,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.27402
+    },
+    {
+      "rate": 0.05,
+      "refetches_avoided": 76.92,
+      "reinjection_tokens_saved": 76920.0,
+      "reinjection_usd_saved": 0.23076,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.23076
+    },
+    {
+      "rate": 0.1,
+      "refetches_avoided": 65.7,
+      "reinjection_tokens_saved": 65700.0,
+      "reinjection_usd_saved": 0.1971,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.1971
+    },
+    {
+      "rate": 0.15,
+      "refetches_avoided": 57.08,
+      "reinjection_tokens_saved": 57080.0,
+      "reinjection_usd_saved": 0.17124,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.17124
+    },
+    {
+      "rate": 0.2,
+      "refetches_avoided": 49.4,
+      "reinjection_tokens_saved": 49400.0,
+      "reinjection_usd_saved": 0.1482,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.1482
+    },
+    {
+      "rate": 0.25,
+      "refetches_avoided": 42.9,
+      "reinjection_tokens_saved": 42900.0,
+      "reinjection_usd_saved": 0.1287,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.1287
+    },
+    {
+      "rate": 0.3,
+      "refetches_avoided": 37.84,
+      "reinjection_tokens_saved": 37840.0,
+      "reinjection_usd_saved": 0.11352,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.11352
+    },
+    {
+      "rate": 0.35,
+      "refetches_avoided": 32.74,
+      "reinjection_tokens_saved": 32740.0,
+      "reinjection_usd_saved": 0.09822,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.09822
+    },
+    {
+      "rate": 0.5,
+      "refetches_avoided": 21.14,
+      "reinjection_tokens_saved": 21140.0,
+      "reinjection_usd_saved": 0.06342,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.06342
+    },
+    {
+      "rate": 0.75,
+      "refetches_avoided": 8.74,
+      "reinjection_tokens_saved": 8740.0,
+      "reinjection_usd_saved": 0.02622,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.02622
+    },
+    {
+      "rate": 1.0,
+      "refetches_avoided": 0.0,
+      "reinjection_tokens_saved": 0.0,
+      "reinjection_usd_saved": 0.0,
+      "cache_premium_usd_saved": 0.0,
+      "total_usd_saved_per_session": 0.0
+    }
+  ]
+}

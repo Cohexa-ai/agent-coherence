@@ -169,3 +169,29 @@ a tracked follow-up). The source is synthetic; `R` (the realistic change-rate
 band) is an assumption, not a field measurement. The PASS is therefore scoped to
 *"gating's re-fetch savings clear 30% across the assumed realistic band,"*
 verified reproducibly — a regime map, not a measured dollar figure.
+
+### Token / cost translation (under stated assumptions)
+
+`refetches_avoided` is the proxy; `tools/cost_to_tokens.py` maps it onto the
+headline cost function (input-token spend + prompt-cache preservation) with
+every assumption explicit. **Default assumptions:** 1000 tokens/artifact, $3.00
+/Mtok input (Sonnet 4.6, 2026-06), cache-write 1.25× / cache-read 0.10×.
+Savings are **per session** and scale linearly with tokens/artifact and price.
+
+| rate r | refetches avoided | input tokens saved / session | $ saved / session |
+|---|---|---|---|
+| 0.10 | 65.7 | 65,700 | $0.197 |
+| 0.25 | 42.9 | 42,900 | $0.129 |
+| 0.30 (in-band edge) | 37.8 | 37,840 | $0.113 |
+| 0.50 | 21.1 | 21,140 | $0.063 |
+
+Reproduce: `python tools/cost_to_tokens.py` → `benchmarks/results/cost_tokens_published.json`.
+
+The **prompt-cache-preservation** lane is **opt-in and OFF by default** (the
+table above is re-injection only) because its value depends on the caller's
+prompt structure. Enable it with `--prefix-tokens-after-artifact N` (the cached
+tokens downstream of a typical artifact): a changed artifact inside a cached
+prefix forces the suffix to be re-written (1.25×) instead of read (0.10×), so
+the premium is `avoided × N × (1.25 − 0.10)` input-token-equivalents. Example: at
+`N=2000`, the r=0.30 figure rises from $0.113 to $0.375/session. This lane is
+the most assumption-heavy part and is never in the headline number.
