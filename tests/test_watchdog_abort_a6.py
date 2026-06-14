@@ -21,7 +21,6 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.core.exceptions import WatchdogAbandoned
 from ccs.core.states import MESIState
 
-
 # --- guard correctness (deterministic, in-memory; no timing) --------------
 
 
