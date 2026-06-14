@@ -66,6 +66,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     OccCallerTransientError,
     StaleReadGeneration,
+    WatchdogAbandoned,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import ConflictDetail
@@ -380,6 +381,10 @@ class CoordinatorHTTPServer:
         # cause is rare (4s deadline + 1.5s busy_timeout = real-world
         # only hits with a wedged SQLite or contended drive).
         self._watchdog_late_completion_total: int = 0
+        # A6: a watchdog-timed-out future that aborted cleanly at the registry
+        # write lock (abort_guard) before mutating — the mitigation working.
+        # Distinct from late_completion (which is an UNmitigated phantom).
+        self._watchdog_late_aborts_total: int = 0
 
         # KTD-I (Unit 5 L2) — in-flight handler counter. Incremented at
         # dispatch entry via :meth:`acquire_handler_slot`, decremented in
@@ -833,6 +838,14 @@ class CoordinatorHTTPServer:
         diagnosable from a bug report."""
         self._watchdog_late_completion_total += 1
 
+    def increment_watchdog_late_abort(self) -> None:
+        """A6: a watchdog-timed-out future aborted at the registry write lock
+        (``abort_guard``) before mutating — the late-completion mitigation
+        working as intended. No phantom state landed. Operator-visible via
+        ``/status?detail=metrics`` so the abort rate is distinguishable from
+        the unmitigated ``watchdog_late_completion_total`` residual."""
+        self._watchdog_late_aborts_total += 1
+
     def record_401(self) -> None:
         """P1 #6: bump ``auth_401_total`` and (deduped to once per 60s)
         emit a WARNING log explaining the most common cause — operator
@@ -870,6 +883,7 @@ class CoordinatorHTTPServer:
             "watchdog_timeouts_total": self._watchdog_timeouts_total,
             "watchdog_queue_overflows_total": self._watchdog_queue_overflows_total,
             "watchdog_late_completion_total": self._watchdog_late_completion_total,
+            "watchdog_late_aborts_total": self._watchdog_late_aborts_total,
             "handler_concurrency_overflows_total": (
                 self._server.handler_concurrency_overflows_total
                 if self._server is not None else 0
@@ -907,24 +921,33 @@ class CoordinatorHTTPServer:
                 return True
             return False
 
-    def run_with_watchdog(self, fn: Callable[[], Any]) -> Any:
+    def run_with_watchdog(
+        self, fn: Callable[[], Any], abort: threading.Event | None = None
+    ) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
         :class:`FuturesTimeout` on timeout (caller decides degradation).
 
-        P1 #5 (detection-only): when the future times out, ``cancel_futures``
-        is not set so the underlying work continues running in the pool.
-        Attach a done_callback that fires when that runaway work
-        eventually finishes — if it completed successfully, the
-        registry now holds state the agent never saw (phantom EXCLUSIVE
-        grant being the canonical worry). The callback bumps
-        ``watchdog_late_completion_total`` and logs CRITICAL so the
-        operator can correlate a phantom-grant cluster in a bug report
-        with the rate at which late completions are firing.
+        A6 mitigation: when the future times out, ``cancel_futures`` is not
+        set so the underlying work keeps running in the pool. If the caller
+        passed an ``abort`` Event (the mutating handlers do, threaded into the
+        ``service.*`` calls inside ``fn``), we SET it here — the work then
+        fails closed via ``registry.abort_guard`` the instant it wins the
+        registry write lock, so its mutation never lands after we returned a
+        degraded response. A ``fn`` that ignores ``abort`` (the read-only
+        handlers) is unaffected.
+
+        Either way we attach a done_callback for the residual: a future that
+        slips past the abort window and completes successfully bumps
+        ``watchdog_late_completion_total`` + logs CRITICAL; one that aborts
+        cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
+        mitigation working.
         """
         future = self._watchdog.submit(fn)
         try:
             return future.result(timeout=HANDLER_TIMEOUT_SEC)
         except FuturesTimeout:
+            if abort is not None:
+                abort.set()
             future.add_done_callback(self._on_watchdog_future_done_after_timeout)
             raise
 
@@ -939,6 +962,13 @@ class CoordinatorHTTPServer:
             return
         try:
             future.result(timeout=0)
+        except WatchdogAbandoned:
+            # A6 mitigation fired: the late work aborted at the registry write
+            # lock before mutating. Clean no-op (no phantom state landed) —
+            # counted separately so operators can see the guard working,
+            # distinct from an unmitigated late completion.
+            self.increment_watchdog_late_abort()
+            return
         except Exception:
             # Late failure — no phantom state landed in the registry.
             return
@@ -1594,7 +1624,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
         # Acquire EXCLUSIVE — this invalidates peers (KTD-1 single-writer).
         try:
-            coordinator.service.write(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now)
+            coordinator.service.write(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now, abort=abort)
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -1645,7 +1675,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
     # On watchdog timeout, return the ok-shape degraded envelope so a
     # client doing result.get("ok") sees True rather than None.
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+    # A6: abort threaded into service.write so a late acquire aborts at the
+    # registry lock instead of granting a phantom EXCLUSIVE (and silently
+    # invalidating peers) the agent never saw.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1697,6 +1731,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         new_version=artifact.version,
                         issuer_agent_id=agent_id,
                         issued_at_tick=now,
+                        abort=abort,
                     )
                 except CoherenceError as exc:
                     return {"ok": False, "reason": str(exc)}
@@ -1710,6 +1745,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 content="",  # KTD-13 — registry stores only the hash
                 issued_at_tick=now,
                 content_hash=content_hash,
+                abort=abort,
             )
         except StaleReadGeneration:
             # Read-generation fence: a sweep reclaimed this committer in the race
@@ -1770,7 +1806,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
 
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+    # A6: abort threaded into invalidate/commit so a late post-edit aborts at
+    # the registry lock instead of landing a phantom version bump/invalidation.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1864,6 +1903,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 expected_version=expected_version,
                 content_hash=content_hash,
                 issued_at_tick=now,
+                abort=abort,
             )
         except OccCallerTransientError:
             # Retry-eligible (AC2): a peer invalidated the caller between its
@@ -1903,8 +1943,9 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     # Fail-closed: the OCC commit degrades to a body that reads as FAILURE.
     # A timed-out commit_cas whose future the watchdog does NOT cancel may
-    # still run to completion later (a pre-existing hazard — detection-only
-    # via watchdog_late_completion_total). For OCC the residual is bounded
+    # still run to completion later. A6: the abort token (below) makes the
+    # dominant case — work blocked on the registry write lock — abort before
+    # it lands (tracked via watchdog_late_aborts_total). The residual is bounded
     # and honest: in the contended case the late CAS sees the advanced
     # version → version_mismatch, no mutation; in the uncontended case it
     # lands N+1 AFTER the client gave up — a phantom/duplicate version bump
@@ -1914,7 +1955,8 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     # cross-host follow-on. v1's only obligation: the client must never
     # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
     # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
-    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE)
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1948,6 +1990,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
                     new_version=artifact.version,
                     issuer_agent_id=agent_id,
                     issued_at_tick=now,
+                    abort=abort,
                 )
                 released.append(artifact.name)
             except CoherenceError as exc:
@@ -1987,7 +2030,10 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
 
     # AC-05: session-stop's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+    # A6: abort threaded into the per-artifact invalidate so a late release
+    # aborts before revoking a grant the registry handed to the next session.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2795,11 +2841,31 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
 # ----------------------------------------------------------------------
 
 
-_DEFAULT_DEGRADED_RESPONSE: dict = {"status": "fresh", "degraded": True}
-"""AC-05: pre-read / pre-bash / pre-grep degrade to a fresh-shape envelope
-because their wire contract uses ``{status: "fresh"|"stale"}``. Endpoints
-whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop) pass
-``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
+_DEFAULT_DEGRADED_RESPONSE: dict = {
+    "status": "fresh",
+    "degraded": True,
+    # A7: a degraded read must NOT silently masquerade as a verified-fresh read.
+    # The handler timed out, so the staleness check never ran — surface an
+    # advisory the model actually sees (the hook client passes hookSpecificOutput
+    # straight through) instead of an empty allow. ``status`` stays "fresh" for
+    # wire back-compat (clients branch on it); the advisory + ``degraded`` flag
+    # are the honest signal that freshness is UNVERIFIED, not confirmed.
+    "hookSpecificOutput": _payloads.emit_allow(
+        source="watchdog_degraded_read",
+        additional_context=(
+            "⚠ Coherence could not verify this file's freshness — the coordinator "
+            "staleness check timed out under load. Proceeding WITHOUT a stale-read "
+            "guarantee: if this file is shared with other agents or sessions, "
+            "re-read it before relying on its contents."
+        ),
+    ),
+}
+"""AC-05 / A7: pre-read / pre-bash / pre-grep degrade to a fresh-shape envelope
+because their wire contract uses ``{status: "fresh"|"stale"}``. A7: the envelope
+now carries a ``hookSpecificOutput`` advisory so a watchdog-degraded read is
+visible to the model rather than silently passing as a confirmed fresh read.
+Endpoints whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop)
+pass ``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
 ``result.get("ok")``."""
 
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
@@ -2829,6 +2895,7 @@ def _run_or_degrade(
     work: Callable[[], dict],
     *,
     degraded_response: dict | None = None,
+    abort: threading.Event | None = None,
 ) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
     and return 200 with ``degraded_response`` (or the default fresh-shape
@@ -2872,7 +2939,7 @@ def _run_or_degrade(
         return
 
     try:
-        result = coordinator.run_with_watchdog(work)
+        result = coordinator.run_with_watchdog(work, abort=abort)
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
         coordinator.increment_watchdog_timeout()  # finding #31

@@ -81,9 +81,10 @@ import stat
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, NoReturn, Optional, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, NoReturn, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -93,6 +94,7 @@ from ccs.core.exceptions import (
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
     StaleReadGeneration,
+    WatchdogAbandoned,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
@@ -518,6 +520,37 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
     # Cross-runtime fail-closed guard (sibling Node coordinator hazard)
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+        """Acquire the registry write lock, then fail closed if the handler
+        watchdog already timed out (finding A6).
+
+        The dominant reason a mutation handler exceeds its 4s budget is that it
+        is blocked here — on the process-level ``RLock`` that serializes every
+        registry mutation — while a peer handler holds it. By the time this
+        handler wins the lock the watchdog may have already fired, returned
+        ``degraded: true`` to the client, and SET ``abort``. Checking ``abort``
+        the instant we win the lock, and holding the lock across the caller's
+        whole mutation (the RLock is reentrant, so the inner registry calls
+        re-enter freely), makes the late "phantom grant" abort before it lands.
+
+        ``abort=None`` — every non-watchdog caller (CoherentVolume, CCSStore,
+        the CLI) — is a plain lock acquire with no behavioural change.
+
+        Residual (documented, finding A6): a ``BEGIN IMMEDIATE`` that starts
+        AFTER this check and then blocks on CROSS-PROCESS SQLite write
+        contention is not covered. That window is narrow — the coordinator is
+        single-process, so the RLock already serializes in-process writers — and
+        remains observed by ``watchdog_late_completion_total``.
+        """
+        with self._lock:
+            if abort is not None and abort.is_set():
+                raise WatchdogAbandoned(
+                    "handler watchdog timed out while this mutation was blocked "
+                    "on the registry write lock; aborting before it lands (A6)."
+                )
+            yield
 
     def _has_table(self, name: str) -> bool:
         """Read-only probe: does a table exist? (sqlite_master, no writes)."""

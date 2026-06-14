@@ -3133,7 +3133,7 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     result.get('ok') don't see None. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3155,7 +3155,7 @@ def test_ac05_post_edit_degraded_response_returns_ok_shape(
     include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3180,7 +3180,7 @@ def test_ac05_session_stop_degraded_response_returns_ok_shape(
     must include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3200,7 +3200,7 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     don't see ok=None. AC-05 contract preservation."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3213,6 +3213,33 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     assert body.get("degraded") is True
     # Crucially, pre-read's degraded envelope does NOT include ok.
     assert "ok" not in body
+
+
+def test_a7_degraded_read_surfaces_advisory_not_silent(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A7: a watchdog-degraded read must NOT silently pass as verified-fresh.
+    The degraded envelope now carries a hookSpecificOutput advisory the model
+    sees (the hook client passes it straight through), so an in-queue/processing
+    timeout cannot masquerade as a confirmed fresh read."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn, abort=None):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("a7-degraded"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body.get("status") == "fresh"
+    assert body.get("degraded") is True
+    hso = body.get("hookSpecificOutput")
+    assert isinstance(hso, dict), "degraded read must carry an advisory (non-silent)"
+    assert "timed out" in hso.get("additionalContext", "").lower(), (
+        f"advisory must explain the freshness check did not run; got {hso!r}"
+    )
 
 
 # ----------------------------------------------------------------------
