@@ -432,8 +432,26 @@ class CoordinatorService:
         agent_id: UUID,
         artifact_id: UUID,
         issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
     ) -> list[InvalidationSignal]:
-        """Request write ownership by invalidating peers and granting EXCLUSIVE."""
+        """Request write ownership by invalidating peers and granting EXCLUSIVE.
+
+        Wrapped in :meth:`registry.abort_guard` (finding A6): if the handler
+        watchdog already timed out, the grant aborts before it lands rather than
+        leaving a phantom EXCLUSIVE the agent never saw (and silently
+        invalidating its peers)."""
+        with self.registry.abort_guard(abort):
+            return self._write_impl(
+                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick
+            )
+
+    def _write_impl(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        issued_at_tick: int = 0,
+    ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
         self.registry.set_agent_transient(
             artifact_id,
@@ -479,6 +497,28 @@ class CoordinatorService:
         return self.write(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick)
 
     def commit(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        content: str,
+        issued_at_tick: int = 0,
+        content_hash: str | None = None,
+        size_tokens: int | None = None,
+        abort: threading.Event | None = None,
+    ) -> tuple[Artifact, list[InvalidationSignal]]:
+        """Commit modified content under the A6 abort guard (see _commit_impl)."""
+        with self.registry.abort_guard(abort):
+            return self._commit_impl(
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                content=content,
+                issued_at_tick=issued_at_tick,
+                content_hash=content_hash,
+                size_tokens=size_tokens,
+            )
+
+    def _commit_impl(
         self,
         *,
         agent_id: UUID,
@@ -583,6 +623,30 @@ class CoordinatorService:
         return updated, signals
 
     def commit_cas(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        expected_version: int,
+        content_hash: str,
+        issued_at_tick: int = 0,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+        abort: threading.Event | None = None,
+    ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
+        """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl)."""
+        with self.registry.abort_guard(abort):
+            return self._commit_cas_impl(
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                expected_version=expected_version,
+                content_hash=content_hash,
+                issued_at_tick=issued_at_tick,
+                size_tokens=size_tokens,
+                content=content,
+            )
+
+    def _commit_cas_impl(
         self,
         *,
         agent_id: UUID,
@@ -715,12 +779,32 @@ class CoordinatorService:
         new_version: int,
         issuer_agent_id: UUID,
         issued_at_tick: int,
+        abort: threading.Event | None = None,
     ) -> InvalidationSignal | None:
-        """Apply invalidation for one agent and return corresponding signal object.
+        """Apply invalidation for one agent under the A6 abort guard.
 
-        Returns None when the artifact has already been deleted — callers applying
-        a delete-tombstone invalidation must not crash on a missing artifact.
+        Wrapped in :meth:`registry.abort_guard` (finding A6): a late
+        session-stop release whose handler already timed out aborts here rather
+        than revoking a grant the registry has since handed to another session.
         """
+        with self.registry.abort_guard(abort):
+            return self._invalidate_impl(
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                new_version=new_version,
+                issuer_agent_id=issuer_agent_id,
+                issued_at_tick=issued_at_tick,
+            )
+
+    def _invalidate_impl(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        new_version: int,
+        issuer_agent_id: UUID,
+        issued_at_tick: int,
+    ) -> InvalidationSignal | None:
         if not self.registry.has_artifact(artifact_id):
             return None
         self.registry.set_agent_state(

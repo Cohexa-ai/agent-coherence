@@ -5,12 +5,18 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TypeAlias
+from typing import Any, Callable, Iterator, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.exceptions import (
+    STALE_READ_GENERATION_REASON,
+    StaleReadGeneration,
+    WatchdogAbandoned,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
 
@@ -89,6 +95,24 @@ class ArtifactRecord:
 
 class ArtifactRegistry:
     """Canonical in-memory artifact directory and payload store."""
+
+    @contextmanager
+    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+        """In-memory mirror of :meth:`SqliteArtifactRegistry.abort_guard`
+        (finding A6) so :class:`CoordinatorService` can call it uniformly
+        regardless of which registry backs it.
+
+        This registry is single-threaded (no process-level lock), so the guard
+        is a lock-free abort check: if the handler watchdog already timed out
+        and SET ``abort``, fail closed before the caller mutates; otherwise run
+        the mutation. ``abort=None`` (every non-watchdog caller) is a no-op.
+        """
+        if abort is not None and abort.is_set():
+            raise WatchdogAbandoned(
+                "handler watchdog timed out before this mutation ran; aborting "
+                "before it lands (A6)."
+            )
+        yield
 
     def __init__(
         self,

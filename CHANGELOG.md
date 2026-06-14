@@ -47,6 +47,39 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Watchdog late-completion phantom grant / late grant-revocation (A6).** When
+  a coordinator hook handler exceeded its 4s watchdog and returned
+  `degraded: true`, its work kept running in the pool and its registry mutation
+  could land afterward — the agent could be left holding an `EXCLUSIVE` grant it
+  never saw (and its peers silently invalidated), or a late `session-stop`
+  release could revoke a grant the registry had since handed to the next
+  session. This was detection-only (`watchdog_late_completion_total`). The
+  mutating handlers (`pre-edit`, `post-edit`, `post-edit-cas`, `session-stop`)
+  now thread a per-request abort token into `CoordinatorService.write` /
+  `invalidate` / `commit` / `commit_cas`; the watchdog sets it on timeout, and a
+  new `registry.abort_guard` checks it the instant the late work wins the
+  registry write lock (the reentrant `RLock` that serializes all mutations),
+  raising `WatchdogAbandoned` so the mutation never lands. This closes the
+  dominant case (work blocked on the lock under contention). A new
+  `watchdog_late_aborts_total` counter (in `/status?detail=metrics`) records
+  when the guard fires. Residual (documented): a `BEGIN IMMEDIATE` that begins
+  after the check and then blocks on cross-process SQLite contention is still
+  observed by `watchdog_late_completion_total`; the complete fix
+  (response-and-visibility atomicity) is deferred to a fencing redesign.
+- **Watchdog-degraded reads no longer silently pass as verified-fresh (A7).**
+  When a `pre-read` / `pre-bash` / `pre-grep` handler exceeded its watchdog
+  (e.g. its task burned the budget waiting in the executor queue under SQLite
+  contention), it returned `{status: "fresh", degraded: true}` with no
+  `hookSpecificOutput` — so the staleness check that never ran was
+  indistinguishable from a confirmed-fresh read, and the model saw no warning.
+  The degraded read envelope now carries an advisory `additionalContext` (the
+  hook client passes it straight through) stating that freshness is unverified
+  and the file should be re-read if shared. `status` stays `"fresh"` for wire
+  back-compat. (Unbounded handler concurrency was already bounded by the
+  handler-concurrency semaphore + watchdog queue-depth gate; this addresses the
+  remaining *silent* suppression. Coupling the per-request deadline to dequeue
+  time, so queue wait doesn't consume the work budget, is a separate deferred
+  improvement.)
 - **Coordinator spawn/idle lifecycle hardening (L1, L3, L5).**
   - **L1 — `rm -rf .coherence/` during coordinator construction.** The
     spawn-or-join loop revalidated the `server.pid` inode before acquiring the

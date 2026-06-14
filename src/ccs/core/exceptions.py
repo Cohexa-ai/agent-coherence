@@ -236,3 +236,22 @@ class ScenarioValidationError(CoherenceError):
     def __init__(self, path: str, message: str):
         super().__init__(f"scenario={path}: {message}")
         self.path = path
+
+
+class WatchdogAbandoned(RuntimeError):
+    """A handler's 4s watchdog fired, so its still-running work was told to abort
+    before it could mutate the registry (finding A6).
+
+    Raised by the registries' ``abort_guard`` when the per-request abort
+    :class:`threading.Event` is already set at the moment the mutation wins the
+    registry write lock — i.e. the handler timed out (and the client already got
+    ``degraded: true``) while this work was blocked on that lock. Aborting there
+    is what stops the late "phantom grant" / grant-revocation from landing.
+
+    Deliberately NOT a :class:`CoherenceError`: it never reaches a client. The
+    only caller that ever sets the abort Event is the handler watchdog, which
+    has already responded; this exception surfaces solely inside the abandoned
+    pool future, where ``_on_watchdog_future_done_after_timeout`` treats it as a
+    clean no-op (no phantom state landed). Every non-watchdog caller
+    (CoherentVolume, CCSStore, the CLI) passes ``abort=None`` and never sees it.
+    """
