@@ -80,6 +80,28 @@ Alpha — APIs may change before `v1.0`.
   remaining *silent* suppression. Coupling the per-request deadline to dequeue
   time, so queue wait doesn't consume the work budget, is a separate deferred
   improvement.)
+- **Coordinator spawn/idle lifecycle hardening (L1, L3, L5).**
+  - **L1 — `rm -rf .coherence/` during coordinator construction.** The
+    spawn-or-join loop revalidated the `server.pid` inode before acquiring the
+    flock, but an external `rm -rf .coherence/ && recreate` landing during
+    `CoordinatorHTTPServer` construction (SQLite open + TCP bind, >300ms cold)
+    left the winner about to write the port into an orphaned `server.pid` that
+    no concurrent reader could see — losers read the recreated, port-less file
+    and degraded. The winner now re-validates the inode after construction and
+    immediately before writing the port; on mismatch it tears down the
+    just-bound coordinator (freeing the socket) and recovers on a fresh inode.
+  - **L5 — idle/uptime now use a monotonic clock.** `idle_seconds` and
+    `uptime_s` were computed from `time.time()` deltas, so an NTP step or a
+    suspend/resume could misfire idle shutdown early or defer it. Both now use
+    `time.monotonic()`; `time.time()` is reserved for operator-facing absolute
+    timestamps.
+  - **L3 — thundering-herd loser degrade is now observable.** When the loop
+    exhausts its inode/retry budget under a cold-start herd and returns `-1`,
+    a per-reason process-lifetime counter (`get_spawn_join_exhaustion_total()`
+    / `_by_reason()`) records it — surfacing the otherwise-silent degrade and
+    keeping the herd-exhaustion reasons distinct from the dying-coordinator
+    probe failure. The retry budget itself is unchanged (a deterministic retune
+    is deferred pending real-world p99 cold-start data).
 
 ## [0.9.2] — 2026-06-11
 

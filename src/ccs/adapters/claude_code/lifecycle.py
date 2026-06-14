@@ -42,6 +42,52 @@ from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 logger = logging.getLogger(__name__)
 
 
+# L3 observability (companion to the deferred budget retune): the spawn-or-join
+# loop can exhaust its retry/inode budget under a cold-start thundering herd and
+# return -1, degrading the caller. Each exhaustion already logs a warning, but a
+# per-process, per-reason aggregate lets an operator measure how often — and
+# why — without grepping logs (the real-world p99 data the port_file_retry
+# budget comment is waiting for before any deterministic retune). Telemetry
+# only; never changes control flow. Per-reason (not one total) so herd
+# exhaustion ("inode_budget"/"retry_budget") stays distinguishable from the
+# dying-coordinator probe failure ("loser_probe_failed") — a different failure
+# mode that would otherwise pollute the retune signal.
+_EXHAUSTION_LOCK = threading.Lock()
+_spawn_join_exhaustion_by_reason: dict[str, int] = {}
+
+
+def _record_spawn_join_exhaustion(reason: str) -> None:
+    """Increment the process-lifetime exhaustion counter for ``reason`` (one of
+    ``"inode_budget"``, ``"retry_budget"``, ``"loser_probe_failed"``)."""
+    with _EXHAUSTION_LOCK:
+        _spawn_join_exhaustion_by_reason[reason] = (
+            _spawn_join_exhaustion_by_reason.get(reason, 0) + 1
+        )
+
+
+def get_spawn_join_exhaustion_total() -> int:
+    """Process-lifetime count of spawn/join exhaustion -1 degrades (all reasons).
+
+    Surfaces the otherwise-invisible loser-degrade path (L3). Use
+    :func:`get_spawn_join_exhaustion_by_reason` to separate herd exhaustion
+    (``inode_budget``/``retry_budget``) from the dying-coordinator probe failure
+    (``loser_probe_failed``)."""
+    with _EXHAUSTION_LOCK:
+        return sum(_spawn_join_exhaustion_by_reason.values())
+
+
+def get_spawn_join_exhaustion_by_reason() -> dict[str, int]:
+    """Per-reason snapshot of the spawn/join exhaustion counter (L3)."""
+    with _EXHAUSTION_LOCK:
+        return dict(_spawn_join_exhaustion_by_reason)
+
+
+def _reset_spawn_join_exhaustion() -> None:  # pragma: no cover - test hook
+    """Test-only: clear the counter so tests don't see cross-test bleed."""
+    with _EXHAUSTION_LOCK:
+        _spawn_join_exhaustion_by_reason.clear()
+
+
 # G8 fix (subagent finding #8): fcntl is POSIX-only. On Windows, import-time
 # failure would crash hook handlers with a stack trace on every hook event.
 # Guard the import and provide a stub that degrades gracefully — hook handlers
@@ -211,6 +257,7 @@ def ensure_coordinator(
                     "(%d revalidations); external churn on .coherence/ — giving up",
                     cfg.inode_revalidation_budget,
                 )
+                _record_spawn_join_exhaustion("inode_budget")  # L3 observability
                 _close_quiet(fd)
                 return -1
             revalidations_remaining -= 1
@@ -262,6 +309,31 @@ def ensure_coordinator(
         try:
             coordinator = CoordinatorHTTPServer(coordinator_root, port=0, bind_host=bind_host)
             port = coordinator.port
+            # KTD-H Unit 5 L1: close the construct->write TOCTOU window. The
+            # top-of-loop inode check ran BEFORE this construction, which opens
+            # state.db (+WAL) and binds the TCP socket (>300ms cold). An external
+            # `rm -rf .coherence/ && recreate` landing DURING construction would
+            # leave us about to write the port into an ORPHANED server.pid that no
+            # concurrent reader can see — losers read the recreated, port-less file
+            # and degrade ("spawned a coordinator no one can reach"). Re-validate
+            # the inode now, before committing any bytes. On mismatch: tear down
+            # the just-bound coordinator to free the socket (shutdown() is safe
+            # pre-serve — it skips _server.shutdown when no serve thread exists,
+            # then server_close + registry.close), release the flock, and restart
+            # the loop; the top-of-loop revalidation re-opens on the fresh inode
+            # and consumes one revalidation budget.
+            if not _inode_matches(fd, pid_file):
+                logger.info(
+                    "ensure_coordinator: server.pid inode changed during coordinator "
+                    "construction (rm -rf race in the construct->write window); "
+                    "tearing down and revalidating"
+                )
+                coordinator.shutdown()
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                continue
             _write_pidfile(fd, os.getpid(), port)
             coordinator.serve_in_thread()
             entry = _SpawnedEntry(
@@ -310,6 +382,7 @@ def ensure_coordinator(
         "ensure_coordinator: %d attempts exhausted without acquiring lock or reading port",
         cfg.port_file_retry_attempts,
     )
+    _record_spawn_join_exhaustion("retry_budget")  # L3 observability
     return -1
 
 
@@ -342,6 +415,9 @@ def connect_or_spawn(
     # the just-read port may belong to a coordinator mid-shutdown).
     if not tcp_probe(port, cfg, bind_host=bind_host):
         logger.warning("coordinator spawned at port=%d but TCP probe failed", port)
+        # L3 observability: distinct reason — this is a stale/dying coordinator
+        # (re-probe of an already-read port failed), NOT herd budget exhaustion.
+        _record_spawn_join_exhaustion("loser_probe_failed")
         return -1
     return port
 
@@ -722,8 +798,10 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
 
 
 def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
-    """Wall-clock idle watcher. When ``time.time() - last_request_at >=
-    idle_shutdown_sec``, runs the race-safe shutdown sequence.
+    """Monotonic idle watcher. When ``idle_seconds >= idle_shutdown_sec``,
+    runs the race-safe shutdown sequence. Finding L5: ``idle_seconds`` is now a
+    monotonic delta, so a wall-clock (NTP / suspend-resume) step no longer
+    misfires or defers idle shutdown.
 
     P2 ce-review fix #7 (reliability): retry shutdown on the next tick if
     G4 abort path fired (coordinator.shutdown raised) — previously the

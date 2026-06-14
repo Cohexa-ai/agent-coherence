@@ -312,7 +312,10 @@ class CoordinatorHTTPServer:
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
         self.bind_host = bind_host
-        self._started_at = time.time()
+        # Monotonic reference points (NOT wall-clock): idle/uptime deltas must
+        # survive NTP steps and suspend/resume (finding L5). time.time() stays
+        # reserved for operator-facing absolute timestamps elsewhere.
+        self._started_at = time.monotonic()
         self._last_request_at = self._started_at
         self._shutting_down = False
         # ADV-001 (fix): "migration draining" is a halfway state between
@@ -657,16 +660,19 @@ class CoordinatorHTTPServer:
     # ------------------------------------------------------------------
 
     def mark_request(self) -> None:
-        self._last_request_at = time.time()
+        # Monotonic — see __init__ (L5). Feeds idle_seconds, not any wire timestamp.
+        self._last_request_at = time.monotonic()
 
     @property
     def uptime_s(self) -> float:
-        return time.time() - self._started_at
+        """Monotonic seconds since server start (NTP-/suspend-safe duration)."""
+        return time.monotonic() - self._started_at
 
     @property
     def last_request_at(self) -> float:
-        """Wall-clock timestamp of the most recent request, or the
-        server start time if no requests have hit it yet.
+        """Monotonic reference point of the most recent request (or server
+        start if none yet). NOT a wall-clock timestamp — do not emit on the
+        wire or convert to ISO (finding L5).
 
         P3 ce-review fix #39 (kieran-python): the idle-shutdown loop in
         lifecycle.py previously reached into the private
@@ -676,8 +682,8 @@ class CoordinatorHTTPServer:
 
     @property
     def idle_seconds(self) -> float:
-        """Wall-clock seconds since the most recent request."""
-        return time.time() - self._last_request_at
+        """Monotonic seconds since the most recent request (NTP-/suspend-safe)."""
+        return time.monotonic() - self._last_request_at
 
     @property
     def migration_draining(self) -> bool:
