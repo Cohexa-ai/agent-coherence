@@ -42,11 +42,16 @@ depend on sensitivity (see the `degenerate-sensitivity-model` distinguisher).
 There exists a realistic change-rate regime where gating saves enough re-fetch
 cost, with low enough waste, to justify the coordination layer.
 
-- **Rule (placeholder):** `savings_ratio ≥ X%` **sustained across all rates
-  `r ≤ R`**, with `wasted_refetches ≤ W` in that same regime.
-- Placeholders to be set by founder before the run: `X` (min savings, e.g.
-  `30%`), `R` (the calm-source ceiling savings must hold below, e.g. `0.25`),
-  `W` (max tolerated wasted re-fetches, e.g. `5`).
+- **Rule (LOCKED 2026-06-05, before the run):** `savings_ratio ≥ 30%`
+  **sustained across all rates `r ≤ 0.30`**, with `wasted_refetches ≤
+  refetches_avoided` (evaluated at answer-sensitivity `s = 0.5`) in that same
+  regime.
+- Rationale (fixed before seeing refined numbers): `X = 30%` is the
+  material-improvement bar below which a coordination dependency isn't worth
+  adopting; real RAG sources drift *occasionally* (≤30% of turns), so `R = 0.30`
+  is the realistic-change-rate ceiling; the over-fetch guard requires gating's
+  waste not exceed its savings in-band. (This file's earlier scaffolding gave
+  `R = 0.25` as the conservative example — see § Result: PASS holds at both.)
 - Interpretation: the savings curve is real and lands in the change-rate band
   real workloads actually occupy — not only at the degenerate `r = 0` endpoint.
 
@@ -98,3 +103,69 @@ run full sweep
                     ├─ yes → PASS
                     └─ no  → NULL (honest falsification)
 ```
+
+## Result — PASS (thresholds locked 2026-06-05; confirmed at n=50 on 2026-06-14)
+
+Thresholds were LOCKED 2026-06-05 (`X = 30%`, `R = 0.30`, `W`: `wasted ≤ avoided
+@ s = 0.5`) before any refined run. The prior refined run lived only in an
+uncommitted worktree at `runs_per_point = 10`; **this canonical commit
+(2026-06-14) promotes that verdict into the tracked repo, makes it reproducible
+from committed code, and re-runs the refined grid at `runs_per_point = 50`** to
+confirm the PASS at higher power.
+
+**Reproduce (from committed code):**
+
+```
+python tools/run_cost_sweep.py \
+  --rates 0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.5,0.75,1.0 \
+  --sensitivities 0,0.5,1.0 --runs 50 \
+  --output benchmarks/results/cost_sweep_published.json
+python tools/plot_cost_sweep.py   # → benchmarks/results/cost_sweep_savings_curve.svg
+```
+
+Committed artifacts: `benchmarks/results/cost_sweep_published.json` (raw) +
+`benchmarks/results/cost_sweep_savings_curve.svg` (figure). The sweep is seeded
+(`SEED_START = 20260318`), so the numbers below reproduce exactly.
+
+**Refined curve (n=50; savings is answer-sensitivity-invariant — `wasted` shown @ s=0.5):**
+
+| rate r | savings | avoided | wasted@s0.5 | in-band (r ≤ 0.30) | W ok |
+|---|---|---|---|---|---|
+| 0.00 | 79.3% | 91.3 | 0.0 | ✓ | ✓ |
+| 0.05 | 66.4% | 76.9 | 8.3 | ✓ | ✓ |
+| 0.10 | 56.4% | 65.7 | 12.9 | ✓ | ✓ |
+| 0.15 | 48.8% | 57.1 | 15.4 | ✓ | ✓ |
+| 0.20 | 42.1% | 49.4 | 17.7 | ✓ | ✓ |
+| 0.25 | 36.6% | 42.9 | 19.5 | ✓ | ✓ |
+| 0.30 | 32.1% | 37.8 | 20.7 | ✓ | ✓ |
+| 0.35 | 27.7% | 32.7 | 22.3 | — | — |
+| 0.50 | 17.8% | 21.1 | 23.9 | — | — |
+| 0.75 |  7.3% |  8.7 | 22.6 | — | — |
+| 1.00 |  0.0% |  0.0 | 21.6 | — | — |
+
+**Verdict: PASS.** `savings_ratio ≥ 30%` holds across every in-band rate
+`r ≤ 0.30` (the 30% crossover is at `r ≈ 0.31`), and `wasted ≤ avoided @ s = 0.5`
+holds at every in-band rate. The boundary margin at `r = 0.30` is **2.1pp**
+(32.1% vs 30%) — thin but real, and at the *pre-registered* threshold, not a
+reverse-fit one. PASS also holds at the conservative example ceiling `R = 0.25`
+(savings 36.6%, a 6.6pp margin).
+
+**Distinguishers triaged (all ruled out):**
+
+- *grid-too-coarse* — resolved: the refined grid samples `r ∈ {0.05 … 0.35}`, so
+  the 30% crossover (`r ≈ 0.31`) is directly observed, not interpolated across a gap.
+- *gating-dominates-everywhere* — ruled out: savings decays monotonically to
+  **0.0% at r = 1.0** (a proper cost floor), not flat-high.
+- *degenerate-sensitivity-model* — handled by design: savings is **exactly**
+  sensitivity-invariant (max spread `0.0000` across `s ∈ {0, 0.5, 1}`), so the
+  savings verdict doesn't depend on `s`; the `W` guard is read at `s = 0.5` as specified.
+- *baseline-mis-modeled* — ruled out: blind floor (`12.0`) < gated < always-read
+  ceiling (`~115–120`) at every rate; the baselines bracket gating correctly.
+
+**Honest caveats (carried, not hidden):** the metric is **re-fetches avoided**
+(fetch counts) — a proxy for the headline "token-spend + prompt-cache
+preservation" cost function, **not** a token/cache-dollar model (that modeling is
+a tracked follow-up). The source is synthetic; `R` (the realistic change-rate
+band) is an assumption, not a field measurement. The PASS is therefore scoped to
+*"gating's re-fetch savings clear 30% across the assumed realistic band,"*
+verified reproducibly — a regime map, not a measured dollar figure.

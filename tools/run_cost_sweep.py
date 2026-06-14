@@ -160,14 +160,37 @@ def run_cost_sweep(
     }
 
 
+def _parse_float_list(spec: str) -> list[float]:
+    """Parse a comma-separated float list (e.g. ``0,0.25,0.5``)."""
+    return [float(x) for x in spec.split(",") if x.strip() != ""]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cost sweep (change-rate × answer-sensitivity) savings-regime map."
     )
     parser.add_argument("--output", default="benchmarks/results/cost_sweep.json")
+    parser.add_argument(
+        "--rates",
+        type=_parse_float_list,
+        default=RATES,
+        help="Comma-separated change-rates (default: the fast CI grid 0,0.25,0.5,1.0).",
+    )
+    parser.add_argument(
+        "--sensitivities",
+        type=_parse_float_list,
+        default=SENSITIVITIES,
+        help="Comma-separated answer-sensitivities (default: 0,0.5,1.0).",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=RUNS_PER_POINT,
+        help="Runs per (rate, sensitivity) cell (default: %(default)s).",
+    )
     args = parser.parse_args(argv)
 
-    payload = run_cost_sweep(RATES, SENSITIVITIES, RUNS_PER_POINT)
+    payload = run_cost_sweep(args.rates, args.sensitivities, args.runs)
     for row in payload["rows"]:
         # Provenance-labeled: the savings_ratio percentage is always reported
         # alongside the payload's top-level ``provenance`` field.
