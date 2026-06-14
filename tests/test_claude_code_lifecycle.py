@@ -902,3 +902,118 @@ def test_l2_drain_observable_via_lifecycle_stop(tmp_path, fast_cfg):
         f"shutdown with no in-flight handlers took {elapsed:.2f}s; "
         "drain may not be returning promptly when counter is already 0"
     )
+
+
+# ----------------------------------------------------------------------
+# L1 — construct->write inode TOCTOU sub-window
+# ----------------------------------------------------------------------
+
+
+def test_l1_construct_to_write_window_recheck_recovers(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L1: the top-of-loop inode check runs BEFORE CoordinatorHTTPServer
+    construction (SQLite open + TCP bind). An external rm -rf landing DURING
+    construction must be caught by the post-construct recheck — the winner must
+    tear down the orphaned coordinator and recover on a fresh inode, NOT write
+    the port into an orphaned server.pid no concurrent reader can see."""
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.02,
+        inode_revalidation_budget=3,
+        spawn_self_probe_attempts=20,
+        spawn_self_probe_interval_sec=0.05,
+    )
+    pid_file = workspace / ".coherence" / "server.pid"
+    real_ctor = lifecycle.CoordinatorHTTPServer
+    state = {"constructs": 0, "teardowns": 0}
+
+    def wiping_ctor(*args, **kwargs):
+        inst = real_ctor(*args, **kwargs)
+        state["constructs"] += 1
+        if state["constructs"] == 1:
+            # Simulate `rm -rf .coherence/` racing in DURING construction:
+            # unlink server.pid so the fd ensure_coordinator holds is orphaned.
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+            real_shutdown = inst.shutdown
+
+            def tracking_shutdown() -> None:
+                state["teardowns"] += 1
+                real_shutdown()
+
+            inst.shutdown = tracking_shutdown  # type: ignore[method-assign]
+        return inst
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", wiping_ctor)
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port > 0, f"expected recovery on a fresh inode; got {port}"
+        live_port = _read_port_from_file(pid_file)
+        assert live_port == port, (
+            f"pid file ({live_port}) != bound port ({port}); the recheck did not "
+            "fire and the port was written to an orphaned inode"
+        )
+        assert state["constructs"] >= 2, (
+            "recheck must have torn down the orphaned coordinator and reconstructed "
+            f"on a fresh inode; constructs={state['constructs']}"
+        )
+        assert state["teardowns"] == 1, (
+            f"the orphaned coordinator must be shut down exactly once; "
+            f"teardowns={state['teardowns']}"
+        )
+    finally:
+        monkeypatch.undo()
+        stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# L3 — spawn/join exhaustion observability counter
+# ----------------------------------------------------------------------
+
+
+def test_l3_retry_exhaustion_increments_per_reason_counter(
+    workspace: Path,
+) -> None:
+    """L3: when the spawn-or-join loop exhausts its port-file retry budget and
+    returns -1, the per-reason observability counter records a "retry_budget"
+    exhaustion so the otherwise-silent loser degrade is countable — without
+    conflating it with the dying-coordinator "loser_probe_failed" reason."""
+    import fcntl  # POSIX-only; the surrounding suite is POSIX-gated elsewhere
+
+    lifecycle._reset_spawn_join_exhaustion()
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pid_file = coherence_dir / "server.pid"
+    # Hold the flock from THIS process so ensure_coordinator can never win, and
+    # leave the port line empty so the loser-read never succeeds — deterministic
+    # retry-budget exhaustion with no real coordinator spawned.
+    hold_fd = os.open(str(pid_file), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(hold_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0,
+        port_file_retry_attempts=3,
+        port_file_retry_interval_sec=0.01,
+        inode_revalidation_budget=3,
+        spawn_self_probe_attempts=3,
+        spawn_self_probe_interval_sec=0.01,
+    )
+    try:
+        port = ensure_coordinator(workspace, config=cfg)
+        assert port == -1, f"expected retry-budget exhaustion -> -1; got {port}"
+        by_reason = lifecycle.get_spawn_join_exhaustion_by_reason()
+        assert by_reason.get("retry_budget") == 1, by_reason
+        assert "loser_probe_failed" not in by_reason, (
+            f"must not conflate herd exhaustion with the dying-coordinator probe "
+            f"failure; got {by_reason}"
+        )
+        assert lifecycle.get_spawn_join_exhaustion_total() == 1
+    finally:
+        fcntl.flock(hold_fd, fcntl.LOCK_UN)
+        os.close(hold_fd)
+        lifecycle._reset_spawn_join_exhaustion()

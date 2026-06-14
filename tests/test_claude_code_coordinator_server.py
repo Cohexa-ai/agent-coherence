@@ -3257,3 +3257,35 @@ def test_t01_pre_bash_notices_only_branch_surfaces_preemption(
     else:
         # Notice deferred to next pre-read — handler returned plain fresh.
         assert body.get("status") == "fresh"
+
+
+# ----------------------------------------------------------------------
+# L5 — idle/uptime use a monotonic clock (NTP-/suspend-safe)
+# ----------------------------------------------------------------------
+
+
+def test_l5_idle_and_uptime_use_monotonic_immune_to_wall_clock(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L5: idle_seconds / uptime_s are monotonic deltas, so a wall-clock
+    (NTP step / suspend-resume) jump does not misfire or defer idle shutdown.
+    Against the old time.time() body the backward-time assertions below fail."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    with CoordinatorHTTPServer(tmp_path, port=0, instance_id="l5-test") as srv:
+        # _started_at and _last_request_at were seeded at monotonic 1000.0.
+        clock["t"] = 1030.0
+        assert srv.idle_seconds == 30.0
+        assert srv.uptime_s == 30.0
+        # A wild wall-clock step (NTP back an hour / resume) must NOT perturb the
+        # monotonic-based deltas — the core L5 regression assertion.
+        monkeypatch.setattr(mod.time, "time", lambda: 1.0)
+        assert srv.idle_seconds == 30.0
+        assert srv.uptime_s == 30.0
+        # mark_request resets idle on the monotonic clock.
+        clock["t"] = 1100.0
+        srv.mark_request()
+        clock["t"] = 1105.0
+        assert srv.idle_seconds == 5.0
