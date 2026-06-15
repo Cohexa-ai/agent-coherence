@@ -119,13 +119,41 @@ underlying conflict — they prevent or sidestep it. In all cases, the default
 context-passing mechanism is full rebroadcasting: correct (no stale reads)
 but expensive, and scaling poorly as agent count or shared state size grows.
 
-## 6. Open questions
+## 6. The same gap lands on RAG and agent memory
+
+The evidence above is drawn from orchestration state, but the identical
+failure lands on a surface most teams add later: **retrieval corpora and
+agent memory**. A RAG index and a memory store are shared mutable state —
+agents read records, recompute, and write them back — so the
+stale-read→write lost update applies unchanged. Two agents read a memory
+record at v1; one writes v2; the other, still holding the v1 it read, writes
+an edit derived from v1 and silently clobbers v2. Section 4's
+optimistic-locking request is this same need surfacing from the memory side:
+a `get → modify → put` over `langmem` is exactly the read-recompute-write
+that loses updates when the read is stale.
+
+The non-obvious part: **a consistent store does not save you.** The staleness
+is not in the store — it is in the *agent's cached view of a record*. Agents
+cache retrieved state locally to avoid re-paying for the full history on every
+step, and that local copy goes stale the moment a peer writes, no matter how
+strongly consistent the backing store is. Coherence here is about keeping the
+*readers* honest, not replacing the store: it is the consistency layer
+underneath whatever vector store, memory library (Mem0, Letta, LlamaIndex), or
+plain file you already use to retrieve and remember.
+
+The boundary is worth stating plainly. Writes that go through the coordinator
+are caught. Auto-watching an *unmanaged external source* that changes with no
+coordinator write — a hand-edited corpus file, an out-of-band re-index — is a
+separate problem (a source-watcher), not solved by keeping cached readers
+coherent.
+
+## 7. Open questions
 
 Several questions remain unanswered by any framework or library:
 
 - **What isolation level do multi-agent workloads actually need?** Read-your-writes may suffice for most; some may need snapshot isolation or serializable access. The answer likely varies by workload shape.
 - **Is coherence worth its coordination cost for small agent counts?** At 2–3 agents with small shared state, full rebroadcasting may be cheaper than maintaining coherence metadata. The crossover point is not well-characterized.
-- **How should coherence interact with agent memory systems?** Long-term memory (e.g., `langmem`) and ephemeral shared state have different consistency requirements. Whether they should share a coherence model or remain separate is an open design question.
+- **What isolation level does agent memory specifically need?** Section 6 argues the same read-your-writes coherence that applies to orchestration state applies to memory and RAG — the staleness is in the cached view, not the store. What remains open is whether *long-term* memory (e.g., `langmem`) needs a stronger level than ephemeral shared state — snapshot isolation across a multi-step recall, say — or whether read-your-writes suffices there too.
 
 ---
 
