@@ -11,14 +11,23 @@ that survives process restarts and is safe for multi-threaded access from
 
 Contract divergence from in-memory ``ArtifactRegistry`` (per plan KTD-13):
 
-  This registry does NOT persist artifact content. Only ``content_hash`` is
-  stored. ``get_content(artifact_id)`` returns ``b""`` (empty bytes) for
-  known artifacts and ``None`` for unknown. This is deliberate — the plugin's
-  hot path (Unit 4 HTTP hook handlers) never calls
+  By default this registry does NOT persist artifact content. Only
+  ``content_hash`` is stored. ``get_content(artifact_id)`` returns ``b""``
+  (empty bytes) for known artifacts and ``None`` for unknown. This is
+  deliberate — the plugin's hot path (Unit 4 HTTP hook handlers) never calls
   ``CoordinatorService.fetch``; it uses ``resolve_or_register`` / ``write`` /
   ``commit`` / ``invalidate`` directly. Avoiding content storage shrinks the
   disclosure surface if ``.coherence/state.db`` is accidentally committed to
   git (KTD-13 defense-in-depth).
+
+  EXCEPTION — durable version retention (plan item N v1, Unit 3): when
+  constructed with ``retain_versions=True`` (in-process embedders only; the
+  HTTP coordinator-server constructor leaves it off), the BODY of each captured
+  version is stored durably in the ``artifact_versions`` table (KTD-13 reversed
+  for retained rows only). This is opt-in and reachable through
+  ``get_content_at_version``, not ``get_content``. The file is held at mode 0600
+  (race-free at creation) precisely because this puts content on disk; see the
+  ``_DB_FILE_MODE`` note and ``docs/security.md``.
 
   The duck-typing parity test scoped for v0.1 covers the methods the plugin
   actually exercises; ``tests/test_coordinator.py`` patterns that exercise
@@ -65,28 +74,85 @@ IMMEDIATE transactions).
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
+import stat
 import threading
 import time
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, NoReturn, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.exceptions import (
+    CROSS_RUNTIME_SCHEMA_REASON,
+    STALE_READ_GENERATION_REASON,
+    STORE_SIGNAL_BUSY,
+    STORE_SIGNAL_UNREADABLE,
+    STORE_SIGNAL_WAL_RECOVERY,
+    StaleReadGeneration,
+    WatchdogAbandoned,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
+
+from .retention import RetentionPolicy, collectible_versions
+
+logger = logging.getLogger(__name__)
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 1
-"""Single-version guard per simplified migration framework (plan KTD-3 update).
-v0.1 raises on mismatch; v0.2 will add real migration dispatch when needed."""
+SCHEMA_USER_VERSION = 2
+"""Schema version stamped via ``PRAGMA user_version`` on init.
+
+**v1 -> v2 is the repo's FIRST real schema bump** (plan item N v1, Unit 3): it
+adds the durable ``artifact_versions`` table and — because the fence columns +
+``coordinator_epoch`` seed AND the ``pending_notices`` table both shipped as
+additive no-version-bump shims — idempotently subsumes BOTH shims so that
+``user_version=2`` GUARANTEES the complete schema from every wild v1 variant.
+After migration the normal open path performs **no writes** (no shim ALTERs,
+no IF-NOT-EXISTS), which is the prerequisite that makes the read-only open mode
+implementable. See ``_migrate_v1_to_v2`` and
+``docs/solutions/runtime-errors/sqlite-schema-init-non-atomic-leaves-unbootable-db-2026-05-18.md``."""
+
+_DB_FILE_MODE = 0o600
+"""state.db (and its -wal/-shm sidecars) must be owner-read/write only.
+
+Durable retention puts artifact *content* on disk (v1->v2), so the disclosure
+posture of state.db now matches the audit log's: 0600, race-free at creation.
+Pre-created via ``os.open(..., 0o600)`` BEFORE ``sqlite3.connect`` so the file
+never exists at a broader umask mode; the migration re-applies it (and warns
+once) to an operator-broadened pre-existing db. Mirrors
+``adapters/claude_code/audit_log.py:_REQUIRED_MODE``."""
 
 ReclamationSlot: TypeAlias = tuple[str, int]
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
+
+# Durable version-retention table (plan item N v1, Unit 3). One row per
+# (artifact, version) retained snapshot. The ``content`` column is declared with
+# NO type name on purpose: SQLite then gives it BLOB affinity (affinity NONE),
+# which stores each value with its own storage class — a Python ``str`` binds as
+# TEXT and a ``bytes`` binds as BLOB, and both round-trip back to the SAME Python
+# type (``str``/``bytes``). A typed column (e.g. ``TEXT``/``BLOB``) would coerce
+# one of them; affinity NONE is what makes the str-vs-bytes round-trip hold.
+# ``captured_at`` is wall-clock ``time.time()`` (matches ``artifacts.updated_at``
+# + the in-memory ``version_captured_at`` parallel dict). FK ON DELETE CASCADE
+# (foreign_keys=ON) drops history when the artifact is removed.
+_ARTIFACT_VERSIONS_DDL = """
+CREATE TABLE artifact_versions (
+    artifact_id TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    content,
+    captured_at REAL NOT NULL,
+    PRIMARY KEY (artifact_id, version),
+    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+)
+"""
 
 # Coordinator-side eviction triggers (the stable-grant sweep's two reclaim
 # triggers + the transient-timeout fail-safe) — an M/E -> INVALID carrying one
@@ -102,6 +168,29 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # registry.py; pinned equal by the parity test). Service.fetch() emits "fetch".
 CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
+# registry_meta keys persisting the retention policy on writer open (plan item
+# N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
+# unbounded mode (retain_versions=True + policy=None → enabled with NULL axes):
+# the artifact_versions table exists on EVERY v2 db, so table-presence alone
+# cannot tell retention-on-unbounded from retention-never-enabled — a read-only
+# resolver reads these keys to derive ``retention_off`` and the T-expiry axis.
+_META_RETENTION_ENABLED = "retention_enabled"
+_META_RETENTION_MAX_VERSIONS = "retention_max_versions"
+_META_RETENTION_MAX_AGE_SECONDS = "retention_max_age_seconds"
+
+# Cross-runtime lineage stamp (registry_meta). The sibling Node coordinator
+# shares the SAME ``<workspace>/.coherence/state.db`` path but keeps its OWN
+# migration ledger (its v2/v3 mean different schemas than this repo's v2), so
+# ``PRAGMA user_version`` alone cannot say WHOSE ledger a file belongs to.
+# This side stamps ``schema_runtime=python`` at fresh-create and at the v1->v2
+# migration (inside those existing transactions — the v2 steady-state open
+# stays write-free); the Node side mirrors with ``node`` (alignment issue).
+# A present-and-foreign stamp is the STRONGEST cross-runtime marker — checked
+# before any structural probing. Absence is NOT foreign: every db stamped
+# before this marker shipped lacks the key.
+_META_SCHEMA_RUNTIME = "schema_runtime"
+_SCHEMA_RUNTIME_STAMP = "python"
+
 # OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
 # invalidated_agent_ids)`` — the service layer turns the id list into
 # ``InvalidationSignal``s. A loss is a typed ``ConflictDetail`` (retry-eligible,
@@ -113,11 +202,108 @@ CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorrup
 class SchemaVersionError(RuntimeError):
     """Raised when an existing ``state.db`` carries an unexpected user_version.
 
-    v0.1 ships a single-version guard rather than a full migration framework
-    (per plan KTD-3 simplification). When v0.2 adds schema columns for
-    strict-mode retry counters, a real migration dispatch lands here and
-    this exception graduates to the not-yet-migrated branch.
+    The message deliberately does **not** recommend deleting the database:
+    as of v2 the store holds durable retained content + read-generation fence
+    state, so a delete is destructive (it drops retained history AND the fence
+    epoch). The forward path is upgrading the embedder binary to one that
+    understands the schema, never ``rm state.db``.
     """
+
+
+class CrossRuntimeSchemaError(SchemaVersionError):
+    """The ``state.db`` was written under the sibling Node coordinator's ledger.
+
+    The Node coordinator (agent-coherence-plugin) shares the same db path but
+    assigns DIFFERENT meanings to ``user_version`` 2 and 3 (its v2 adds no
+    schema objects; its v3 adds ``agent_states.deadline_tick``), so this
+    Python coordinator fails CLOSED at open — it will neither read nor migrate
+    a foreign-ledger db (migrating would corrupt the Node side's live state;
+    reading would misinterpret its schema). Detection is in
+    :meth:`SqliteArtifactRegistry._reject_foreign_ledger_db`.
+
+    Subclasses :class:`SchemaVersionError` so every existing catch-site (the
+    replay resolver's ``except SchemaVersionError`` mapping, CLI exit-code
+    plumbing) handles it without change. ``reason`` is always
+    :data:`ccs.core.exceptions.CROSS_RUNTIME_SCHEMA_REASON`; consumers match
+    ``exc.reason == CONSTANT``, never a substring of the message (the
+    typed-signal-not-substring house rule). Same anti-delete wording rule as
+    the parent: the message must never advise removing the db — it holds the
+    sibling runtime's live coordination state.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.reason = CROSS_RUNTIME_SCHEMA_REASON
+
+
+class ReadOnlyRegistryError(RuntimeError):
+    """Base for read-only-open failures (the resolver / SB-17 inherit this).
+
+    A read-only :class:`SqliteArtifactRegistry` (``mode=ro`` URI) never creates,
+    migrates, or mutates the store. The subclasses below give the CLI a typed,
+    prose-free way to distinguish *why* a read-only open or call failed; they
+    are exceptions (not the ``ConflictDetail`` typed-return discipline) because
+    an open that cannot proceed has no value to return.
+    """
+
+
+class MissingDatabaseError(ReadOnlyRegistryError):
+    """A read-only open was asked for a path that does not exist.
+
+    A read-write open would *create* the file; read-only must NOT — a resolver
+    pointed at the wrong path should fail loudly, never materialize a fresh
+    empty ``.coherence/state.db``.
+    """
+
+
+class ReadOnlyMutationError(ReadOnlyRegistryError):
+    """A mutating method was called on a read-only registry."""
+
+
+class StoreNeedsRecoveryError(ReadOnlyRegistryError):
+    """The read-only connection could not read the store (recovery/busy/other).
+
+    After an embedder crash SQLite leaves a hot WAL whose recovery requires a
+    *write* lock; a ``mode=ro`` connection raises ``SQLITE_READONLY_RECOVERY``.
+    This is distinct from missing / corrupt — the remedy is to re-open
+    the store once with the embedder (read-write) so it checkpoints the WAL,
+    then retry the read-only resolve. The forensic population over-represents
+    crashed writers, so this is the resolver's most on-brand failure mode.
+
+    ``reason`` is the machine-readable classification signal (one of
+    ``ccs.core.exceptions.STORE_OPEN_SIGNALS``: ``wal_recovery`` / ``busy`` /
+    ``unreadable``), set at the SINGLE classification point
+    (:func:`classify_sqlite_operational_signal`). Consumers (the replay
+    resolver) branch on ``exc.reason == CONSTANT`` — never on the human
+    message — per the typed-signal house rule.
+    """
+
+    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_WAL_RECOVERY) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
+    """Classify an ``OperationalError`` from a read-only connection into one of
+    the ``STORE_OPEN_SIGNALS`` (``busy`` / ``wal_recovery`` / ``unreadable``).
+
+    The ONE place sqlite's rendered error text is substring-matched: Python's
+    ``sqlite3`` exposes no stable error code on every path/version, so the
+    classification is unavoidably text-based and therefore FRAGILE against
+    sqlite message rewording — which is exactly why it must not be duplicated
+    (the typed-signal-not-substring house rule,
+    ``docs/solutions/best-practices/typed-signal-not-substring-...``). Every
+    downstream consumer matches the returned constant with ``==``, never the
+    message. Order matters: a locked store is checked FIRST because a busy
+    signal has a different remedy (retry) than a recovery one (re-open with
+    the embedder).
+    """
+    text = str(exc).lower()
+    if "busy" in text or "locked" in text:
+        return STORE_SIGNAL_BUSY
+    if "readonly" in text or "recovery" in text or "wal" in text:
+        return STORE_SIGNAL_WAL_RECOVERY
+    return STORE_SIGNAL_UNREADABLE
 
 
 @dataclass(frozen=True)
@@ -146,6 +332,8 @@ class SqliteArtifactRegistry:
         agent_names: dict[UUID, str] | None = None,
         instance_id: str | None = None,
         retain_versions: bool = False,
+        retention_policy: RetentionPolicy | None = None,
+        read_only: bool = False,
     ) -> None:
         if state_log is not None and instance_id is None:
             raise ValueError(
@@ -153,25 +341,47 @@ class SqliteArtifactRegistry:
                 "pass instance_id=str(uuid4()) or route through the plugin coordinator "
                 "which manages instance_id persistence in registry_meta"
             )
-
-        # P2 ce-review fix #5 (maintainability): retain_versions=True was
-        # silently ignored, diverging from ArtifactRegistry's contract
-        # where True enables version-history queries. Raising here makes
-        # the divergence loud — callers expecting history get a clear
-        # error rather than silent None returns from get_content_at_version().
-        # retain_versions=False (the default) is the only supported value
-        # in v0.1; full version history is a v0.2 audit-trail feature.
-        if retain_versions:
-            raise NotImplementedError(
-                "SqliteArtifactRegistry does not yet support retain_versions=True. "
-                "Version history is a v0.2 audit feature; v0.1 only stores the "
-                "latest version per artifact. Use the in-memory ArtifactRegistry "
-                "if you need version history, or wait for v0.2."
+        if read_only and state_log is not None:
+            raise ValueError(
+                "read_only=True is incompatible with state_log: a read-only "
+                "registry never mutates, so it emits no state_log entries"
             )
 
         self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock = threading.RLock()
+        self._read_only = read_only
+        # Retention is active iff retain_versions=True. ``retention_policy=None``
+        # with retain_versions=True == today's UNBOUNDED semantics (no GC) — the
+        # back-compat contract for the v0.5 audit auto-wiring. A policy is an
+        # explicit opt-in to BOUNDED retention. ``_retain_versions`` stays the
+        # private name the recorder test pins. (Mirrors ArtifactRegistry.)
+        self._retain_versions = retain_versions
+        self._retention_policy = retention_policy
+        self._state_log = state_log
+        self._agent_names = agent_names
+
+        if read_only:
+            self._open_read_only(instance_id)
+            return
+
+        self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Race-free 0600: pre-create state.db at 0o600 via os.open BEFORE
+        # sqlite3.connect, so the file never exists at a broader umask mode in
+        # the window between creation and an explicit chmod (the audit_log
+        # pattern). os.open is a no-op-ish touch when the file already exists
+        # (O_CREAT without O_EXCL); the migration re-applies the mode to a
+        # pre-existing, possibly operator-broadened db and warns once.
+        self._precreate_file_0600(self._db_path)
+        # The -wal/-shm sidecars are pre-created at 0600 BEFORE the connect
+        # too: sidecar-creation timing inside sqlite is platform-dependent
+        # (some kernels materialize -shm at connection open, not at the
+        # journal_mode=WAL switch), so touching them only after the connect
+        # would leave a window in which sqlite materializes them under the
+        # process umask. With both pre-touches ahead of the connect, no
+        # sidecar is ever created by sqlite itself; the tighten-after pass
+        # below stays as belt-and-suspenders.
+        self._precreate_file_0600(self._wal_path())
+        self._precreate_file_0600(self._shm_path())
 
         # check_same_thread=False because ThreadingHTTPServer handler threads
         # all share one registry instance. Coupled with the RLock on every
@@ -202,37 +412,255 @@ class SqliteArtifactRegistry:
         self._conn.execute("PRAGMA busy_timeout=1500")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Tighten the sidecars again post-WAL-enable: if SQLite created them at
+        # the journal_mode switch above (before our pre-touch could win the
+        # race on some platforms), this chmod brings them to 0600.
+        self._chmod_if_exists(self._wal_path())
+        self._chmod_if_exists(self._shm_path())
 
         self._initialize_schema(instance_id)
-        self._state_log = state_log
-        self._agent_names = agent_names
-        self._retain_versions = retain_versions
-        # In-memory tracking only; not persisted across restarts.
-        # version_history-by-tick is a v0.2 audit feature, not v0.1.
+        # Persist the retention policy on writer open (incl. the explicit
+        # unbounded marker) so a read-only resolver can derive T-expiry + the
+        # retention_off reason from the store, not a process-local object.
+        self._persist_retention_policy()
+        # Policy is immutable per handle (see retention_meta) — cache once.
+        self._retention_meta_cache = self._load_retention_meta()
+
+    # ------------------------------------------------------------------
+    # File-mode helpers (race-free 0600 — audit_log.py pattern)
+    # ------------------------------------------------------------------
+
+    def _wal_path(self) -> Path:
+        return self._db_path.with_name(self._db_path.name + "-wal")
+
+    def _shm_path(self) -> Path:
+        return self._db_path.with_name(self._db_path.name + "-shm")
+
+    @staticmethod
+    def _precreate_file_0600(path: Path) -> None:
+        """Create ``path`` at mode 0o600 if absent; leave an existing file as-is.
+
+        ``os.open(O_CREAT|O_WRONLY, 0o600)`` applies the mode atomically at
+        creation (subject to umask) so the file never exists at a broader mode
+        in a creation->chmod window. We do NOT pass O_EXCL: a benign double-call
+        (e.g. the file already there from a prior run) must not raise. The mode
+        argument is ignored by the kernel when the file already exists — an
+        operator-broadened existing db is re-tightened by the migration's chmod,
+        not here.
+        """
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, _DB_FILE_MODE)
+        except OSError:
+            # Parent missing / permission — let sqlite3.connect surface the real
+            # error rather than masking it here.
+            return
+        os.close(fd)
+
+    @staticmethod
+    def _chmod_if_exists(path: Path) -> None:
+        """Best-effort tighten ``path`` to 0o600 if it exists."""
+        try:
+            os.chmod(str(path), _DB_FILE_MODE)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # Schema lifecycle
     # ------------------------------------------------------------------
 
     def _initialize_schema(self, instance_id: str | None) -> None:
-        """Apply schema or verify existing user_version; seed registry_meta."""
+        """Apply schema, migrate, or verify user_version; seed registry_meta.
+
+        The migration DISPATCH (the repo's first real one):
+
+        - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
+          COMPLETE v2 schema in one atomic transaction (no shim ever runs on a
+          fresh db).
+        - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2``:
+          idempotently subsumes BOTH additive shims (fence columns + epoch seed,
+          and ``pending_notices``) AND adds ``artifact_versions``, then stamps
+          ``user_version=2`` — all in ONE ``BEGIN IMMEDIATE``. The wild v1
+          population is a 2x2 matrix ({±fence columns} x {±pending_notices})
+          because both shims shipped with no version bump; ``PRAGMA table_info``
+          / ``IF NOT EXISTS`` guards make each piece apply only when missing.
+        - ``user_version == 2`` → ``_rehydrate_meta``: the WRITE-FREE open path
+          (no ALTER, no IF-NOT-EXISTS) — the prerequisite for read-only mode.
+        - anything else → :class:`SchemaVersionError` (no destructive advice).
+
+        A :class:`CrossRuntimeSchemaError` pre-empts ALL of the above when the
+        db carries sibling-Node-ledger markers (``_reject_foreign_ledger_db``,
+        called BEFORE any migration or rehydrate write).
+        """
         with self._lock:
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            # Cross-runtime fail-closed guard: read-only probes, BEFORE the
+            # dispatch can migrate (v1 branch) or write anything — migrating a
+            # Node-ledger db would corrupt the sibling coordinator's live state.
+            self._reject_foreign_ledger_db(current)
             if current == 0:
-                # Fresh database — apply v1 schema.
-                self._apply_v1_schema(instance_id)
+                self._apply_v2_schema(instance_id)
+            elif current == 1:
+                self._migrate_v1_to_v2(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v1 database — rehydrate _instance_id and _seq.
+                # Existing v2 database — rehydrate; NO writes on this path.
                 self._rehydrate_meta(instance_id)
             else:
                 raise SchemaVersionError(
-                    f"unexpected schema version {current}; v0.1 expects {SCHEMA_USER_VERSION}. "
-                    f"Delete {self._db_path} and restart, or upgrade to a plugin version "
-                    f"that supports this schema."
+                    f"unexpected schema version {current}; this build expects "
+                    f"{SCHEMA_USER_VERSION}. The database at {self._db_path} was "
+                    f"written by a newer coordinator build — either a newer "
+                    f"Python coordinator, or a sibling-runtime coordinator whose "
+                    f"ledger this build does not recognize. Upgrade this embedder "
+                    f"to a build that understands schema v{current} rather than "
+                    f"removing the store — as of v2 it holds durable retained "
+                    f"content and read-generation fence state that a delete would "
+                    f"destroy."
                 )
 
-    def _apply_v1_schema(self, instance_id: str | None) -> None:
-        """Create tables, indexes, and seed registry_meta. Caller holds lock.
+    # ------------------------------------------------------------------
+    # Cross-runtime fail-closed guard (sibling Node coordinator hazard)
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+        """Acquire the registry write lock, then fail closed if the handler
+        watchdog already timed out (finding A6).
+
+        The dominant reason a mutation handler exceeds its 4s budget is that it
+        is blocked here — on the process-level ``RLock`` that serializes every
+        registry mutation — while a peer handler holds it. By the time this
+        handler wins the lock the watchdog may have already fired, returned
+        ``degraded: true`` to the client, and SET ``abort``. Checking ``abort``
+        the instant we win the lock, and holding the lock across the caller's
+        whole mutation (the RLock is reentrant, so the inner registry calls
+        re-enter freely), makes the late "phantom grant" abort before it lands.
+
+        ``abort=None`` — every non-watchdog caller (CoherentVolume, CCSStore,
+        the CLI) — is a plain lock acquire with no behavioural change.
+
+        Residual (documented, finding A6): a ``BEGIN IMMEDIATE`` that starts
+        AFTER this check and then blocks on CROSS-PROCESS SQLite write
+        contention is not covered. That window is narrow — the coordinator is
+        single-process, so the RLock already serializes in-process writers — and
+        remains observed by ``watchdog_late_completion_total``.
+        """
+        with self._lock:
+            if abort is not None and abort.is_set():
+                raise WatchdogAbandoned(
+                    "handler watchdog timed out while this mutation was blocked "
+                    "on the registry write lock; aborting before it lands (A6)."
+                )
+            yield
+
+    def _has_table(self, name: str) -> bool:
+        """Read-only probe: does a table exist? (sqlite_master, no writes)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """Read-only probe: does ``table`` carry ``column``? PRAGMA table_info
+        takes no bindings (callers pass internal literals only) and returns
+        zero rows for a missing table — absent table reads as absent column."""
+        return any(
+            row[1] == column
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+
+    def _read_schema_runtime_stamp(self) -> str | None:
+        """Return ``registry_meta.schema_runtime``, or None when the table or
+        key is absent (a fresh file, or any db stamped before the marker
+        shipped — absence is NOT foreign)."""
+        if not self._has_table("registry_meta"):
+            return None
+        row = self._conn.execute(
+            "SELECT value FROM registry_meta WHERE key = ?",
+            (_META_SCHEMA_RUNTIME,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def _reject_foreign_ledger_db(self, current: int) -> None:
+        """Fail closed when the db carries sibling-Node-coordinator markers.
+
+        Called by BOTH open paths (writer ``_initialize_schema`` and
+        ``_open_read_only``) right after reading ``user_version`` and BEFORE
+        any migration or rehydrate write; every probe is a plain read
+        (SELECT / PRAGMA table_info), so the guard itself can never dirty a
+        foreign db.
+
+        WHY structural markers and not the version number: the Node
+        coordinator shares this db path but its ledger's v2 adds NO schema
+        objects (pending_notices validation) and its v3 ALTERs
+        ``agent_states ADD COLUMN deadline_tick``, while THIS repo's v2 adds
+        ``artifact_versions`` — the same user_version means different schemas
+        depending on the writer. Detection order (strongest marker first):
+
+        1. ``registry_meta.schema_runtime`` present and foreign — the explicit
+           lineage stamp, checked regardless of version (this side stamps
+           ``python``; the Node side mirrors with ``node``).
+        2. ``user_version >= 3`` with ``agent_states.deadline_tick`` — the
+           Node ledger's v3 ALTER. ``>= 3``, not ``== 3``: a future Node v4+
+           still carries the column (columns are never dropped), and a future
+           Python v3 db is unreadable by this v2 build either way — both
+           classifications stay fail-closed and :class:`CrossRuntimeSchemaError`
+           IS a :class:`SchemaVersionError` for catch-sites. Literal ``3``
+           (the Node ledger's version), deliberately not SCHEMA_USER_VERSION.
+        3. ``user_version == 2`` WITHOUT ``artifact_versions`` — a Python-v2
+           db ALWAYS has the table (the v1->v2 migration creates it atomically
+           with the version stamp); a Node-v2 db never does. Literal ``2``:
+           the check pins user_version-2 semantics even after a future Python
+           v3 bump.
+
+        ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
+        v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
+        indistinguishable by design — the normal v1->v2 migration proceeds
+        (documented residual risk).
+        """
+        runtime = self._read_schema_runtime_stamp()
+        if runtime is not None and runtime != _SCHEMA_RUNTIME_STAMP:
+            self._raise_cross_runtime(
+                f"is stamped registry_meta.schema_runtime={runtime!r} "
+                f"(this build stamps {_SCHEMA_RUNTIME_STAMP!r})"
+            )
+        if current >= 3 and self._has_column("agent_states", "deadline_tick"):
+            self._raise_cross_runtime(
+                f"is user_version={current} and carries the "
+                f"agent_states.deadline_tick column (the Node ledger's v3 "
+                f"watchdog marker; no Python schema has it)"
+            )
+        if current == 2 and not self._has_table("artifact_versions"):
+            self._raise_cross_runtime(
+                "is user_version=2 without the artifact_versions table (a "
+                "Python-v2 store always has it; the Node ledger's v2 adds no "
+                "schema objects)"
+            )
+
+    def _raise_cross_runtime(self, detail: str) -> NoReturn:
+        """Compose the single :class:`CrossRuntimeSchemaError` message shape.
+
+        Wording rules: name the sibling Node coordinator as the likely writer,
+        state the fail-closed posture, and point at the Node CLI's
+        ``--prepare-for-migration`` as the supported backend-switch path. Per
+        the :class:`SchemaVersionError` rule, NEVER advise deleting the db —
+        it holds the sibling runtime's live coordination state (and possibly
+        retained content), which a delete destroys.
+        """
+        raise CrossRuntimeSchemaError(
+            f"the database at {self._db_path} {detail}. The likely writer is "
+            f"the sibling Node coordinator (agent-coherence-coordinator), "
+            f"which shares this path but keeps its own migration ledger — the "
+            f"two ledgers assign different meanings to the same user_version "
+            f"numbers. This Python coordinator will not read or migrate a "
+            f"foreign-ledger db. To switch the store to this backend, run "
+            f"`agent-coherence-coordinator --prepare-for-migration` (the "
+            f"supported backend-switch path, which preserves the live "
+            f"coordination state the file holds)."
+        )
+
+    def _apply_v2_schema(self, instance_id: str | None) -> None:
+        """Create the COMPLETE v2 schema + seed registry_meta. Caller holds lock.
 
         P1 ce-review fix (correctness): schema init must be atomic against
         SIGKILL. Earlier version ran executescript() THEN a separate PRAGMA
@@ -245,6 +673,12 @@ class SqliteArtifactRegistry:
         The truly atomic fix is an explicit BEGIN IMMEDIATE / COMMIT wrapping
         all DDL + meta seed + PRAGMA user_version (which IS transactional
         when issued inside an explicit transaction per SQLite docs).
+
+        A fresh db is created at v2 directly: the fence columns are inline in the
+        ``artifacts``/``agent_states`` DDL, ``coordinator_epoch`` is seeded, and
+        ``pending_notices`` + ``artifact_versions`` are created here — so NO shim
+        (``_ensure_fence_columns`` / the ``pending_notices`` IF-NOT-EXISTS) ever
+        runs against a fresh db, and the open path that follows is write-free.
         """
         c = self._conn
         seed_id = instance_id if instance_id is not None else str(uuid4())
@@ -320,13 +754,20 @@ class SqliteArtifactRegistry:
                 )
                 """
             )
+            c.execute(_ARTIFACT_VERSIONS_DDL)
             seed_epoch = uuid4().hex
+            # schema_runtime: the cross-runtime lineage stamp, seeded inside
+            # THIS creation transaction (no extra txn) so the sibling Node
+            # coordinator's mirror check can fail closed on an explicit marker
+            # instead of structural probing.
             c.execute(
-                "INSERT INTO registry_meta (key, value) VALUES (?, ?), (?, ?), (?, ?)",
+                "INSERT INTO registry_meta (key, value) "
+                "VALUES (?, ?), (?, ?), (?, ?), (?, ?)",
                 (
                     "instance_id", seed_id,
                     "sequence_number", "0",
                     "coordinator_epoch", seed_epoch,
+                    _META_SCHEMA_RUNTIME, _SCHEMA_RUNTIME_STAMP,
                 ),
             )
             # PRAGMA is transactional inside an explicit BEGIN; cannot take
@@ -347,7 +788,14 @@ class SqliteArtifactRegistry:
         self._coordinator_epoch = seed_epoch
 
     def _rehydrate_meta(self, instance_id_override: str | None) -> None:
-        """Load _instance_id + _seq from registry_meta. Caller holds lock."""
+        """Load _instance_id + _seq + epoch from registry_meta. Caller holds lock.
+
+        WRITE-FREE: a v2 db carries the complete schema (the migration subsumed
+        every shim), so this open path issues NO DDL/DML — exactly what lets the
+        same code be reused read-only. Earlier versions ran the
+        ``pending_notices`` IF-NOT-EXISTS and the fence-column ALTERs here on
+        EVERY open; those moved into ``_migrate_v1_to_v2`` and run once.
+        """
         rows = dict(
             self._conn.execute(
                 "SELECT key, value FROM registry_meta WHERE key IN ('instance_id', 'sequence_number')"
@@ -356,73 +804,118 @@ class SqliteArtifactRegistry:
         if "instance_id" not in rows or "sequence_number" not in rows:
             raise SchemaVersionError(
                 f"registry_meta is missing required keys at {self._db_path}; "
-                f"the database may be corrupted. Delete and restart to rehydrate."
+                f"the database may be corrupted (a v2 store always carries these). "
+                f"Restore from a backup rather than deleting — the store may hold "
+                f"durable retained content."
             )
         # Caller's explicit instance_id wins (rare; typically used in tests).
         self._instance_id = instance_id_override or rows["instance_id"]
         self._seq = int(rows["sequence_number"])
-        # A1 forward-compat: ensure pending_notices exists even on dbs
-        # initialized before this table was added. PRAGMA user_version stays
-        # at 1; this is an additive change that doesn't warrant a migration.
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_notices (
-                agent_id              TEXT NOT NULL,
-                artifact_id           TEXT NOT NULL,
-                preempter_agent_id    TEXT NOT NULL,
-                preempted_at_unix_ts  REAL NOT NULL,
-                PRIMARY KEY (agent_id, artifact_id),
-                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-            )
-            """
-        )
-        # Read-generation fence (Piece #2) forward-compat: additively add the
-        # fence columns + coordinator_epoch to dbs created before the fence.
-        # user_version stays unchanged (additive, plan option (a); same posture
-        # as pending_notices above) so an older binary can still open the db.
-        self._ensure_fence_columns()
         epoch_row = self._conn.execute(
             "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
         ).fetchone()
         if epoch_row is None:
             raise SchemaVersionError(
                 f"coordinator_epoch missing from registry_meta at {self._db_path}; "
-                f"the database may be partially upgraded or corrupted. "
-                f"Delete and restart to rehydrate."
+                f"the database may be corrupted (a v2 store always seeds the epoch). "
+                f"Restore from a backup rather than deleting — the store may hold "
+                f"durable retained content and fence state."
             )
         self._coordinator_epoch = epoch_row[0]
 
-    def _ensure_fence_columns(self) -> None:
-        """Additively add the read-generation fence columns + coordinator_epoch
-        to a pre-fence database. Idempotent; user_version stays unchanged.
-        Caller holds the lock; runs in one explicit transaction so a SIGKILL
-        mid-add cannot leave a half-applied column set. The PRAGMA introspection
-        runs INSIDE the BEGIN IMMEDIATE: two processes opening the same
-        pre-fence db serialize on the write lock, and the loser re-reads the
-        schema after the winner's commit — so it sees the columns as present
-        and no-ops instead of crashing on a duplicate-column ALTER."""
+    def _migrate_v1_to_v2(self, instance_id: str | None) -> None:
+        """Migrate any wild v1 db to v2 in ONE atomic transaction. Caller holds lock.
+
+        Correctness-required (not housekeeping): v1 dbs in the wild form a 2x2
+        matrix because BOTH the fence columns + ``coordinator_epoch`` seed AND
+        the ``pending_notices`` table shipped as additive shims with no version
+        bump. This migration idempotently subsumes BOTH shims and adds the new
+        ``artifact_versions`` table, so after it ``user_version=2`` GUARANTEES
+        the complete schema from EVERY v1 variant. Each piece is guarded
+        (``PRAGMA table_info`` for columns, ``IF NOT EXISTS`` for tables,
+        ``INSERT OR IGNORE`` for the epoch) so it applies only when missing.
+
+        Atomicity discipline (learnings skeleton —
+        sqlite-schema-init-non-atomic-leaves-unbootable-db): ONE explicit
+        ``BEGIN IMMEDIATE`` wrapping all DDL + seed + the ``PRAGMA user_version``
+        stamp (which IS transactional inside an explicit txn); individual
+        ``execute()`` calls (NEVER ``executescript`` — its autocommit silently
+        commits the pending BEGIN IMMEDIATE and varies by Python version);
+        ``except BaseException`` ROLLBACK so a SIGKILL/Ctrl-C mid-migration
+        leaves the v1 db intact (the next open re-migrates cleanly, never hits
+        "table already exists"). Concurrent-loser path: two processes can BOTH
+        read ``user_version == 1`` in the dispatch (a bare read, outside any
+        txn) and both land here; they serialize on the ``BEGIN IMMEDIATE``
+        write lock. The loser re-reads ``user_version`` INSIDE its txn, sees
+        the winner already stamped v2, and no-ops (COMMIT immediately, zero
+        DDL) before rehydrating — it does NOT re-run the migration body, so a
+        future non-idempotent v3 step cannot be double-applied by the race.
+        """
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
+            # Concurrent-loser guard: re-check the stamp now that the write
+            # lock is held. The dispatch decision was made from a pre-lock
+            # read; if a racing winner migrated in between, there is nothing
+            # left to do — COMMIT the empty txn and rehydrate like a normal
+            # v2 open. (The winner already ran the mode-tighten pass.)
+            if c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION:
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
             art_cols = {
                 row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
             }
             state_cols = {
                 row[1] for row in c.execute("PRAGMA table_info(agent_states)").fetchall()
             }
+            # --- Subsume the fence-column shim (was _ensure_fence_columns) ---
             if "owner_generation" not in art_cols:
                 c.execute(
                     "ALTER TABLE artifacts ADD COLUMN owner_generation "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
             if "read_generation" not in state_cols:
-                # Nullable: a pre-fence grant captured no generation; NULL is the
-                # absent operand the commit guard rejects.
+                # Nullable: a pre-fence grant captured no generation. NULL is the
+                # absent operand the commit guard ADMITS (a writer that never
+                # established a fence claim -- version-CAS arbitrates it); only a
+                # present-and-superseded read_generation is rejected.
                 c.execute("ALTER TABLE agent_states ADD COLUMN read_generation INTEGER")
             c.execute(
                 "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
                 ("coordinator_epoch", uuid4().hex),
             )
+            # Cross-runtime lineage stamp, atomic with the v1->v2 stamp in
+            # THIS transaction (no extra txn). A genuine v1 db never carries
+            # the key (the marker postdates v1), but OR IGNORE keeps the step
+            # idempotent alongside the other half-migrated-db guards. The
+            # foreign-stamp case was already rejected at dispatch
+            # (_reject_foreign_ledger_db runs before the migration).
+            c.execute(
+                "INSERT OR IGNORE INTO registry_meta (key, value) VALUES (?, ?)",
+                (_META_SCHEMA_RUNTIME, _SCHEMA_RUNTIME_STAMP),
+            )
+            # --- Subsume the pending_notices shim (was the IF-NOT-EXISTS) ---
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_notices (
+                    agent_id              TEXT NOT NULL,
+                    artifact_id           TEXT NOT NULL,
+                    preempter_agent_id    TEXT NOT NULL,
+                    preempted_at_unix_ts  REAL NOT NULL,
+                    PRIMARY KEY (agent_id, artifact_id),
+                    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+                )
+                """
+            )
+            # --- The new v2 surface: durable retention table ---
+            # IF NOT EXISTS guards the half-migrated-db case (table created by a
+            # prior crashed migration whose user_version stamp never committed).
+            c.execute(_ARTIFACT_VERSIONS_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+            # In-txn stamp: PRAGMA user_version is transactional inside an explicit
+            # BEGIN; commits atomically with the DDL above. Cannot take bindings,
+            # so the int constant is interpolated.
+            c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
         except BaseException:
             try:
@@ -430,6 +923,389 @@ class SqliteArtifactRegistry:
             except Exception:
                 pass
             raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+        # A v1 db predates durable content storage; v2 may now persist content,
+        # so re-apply 0600 to a possibly operator-broadened file and warn ONCE
+        # that the content-storage posture changed (audit_log drift pattern).
+        self._tighten_existing_db_mode_and_warn()
+
+    def _tighten_existing_db_mode_and_warn(self) -> None:
+        """Re-apply 0600 to a pre-existing db whose mode an operator may have
+        broadened, emitting a one-time stderr warning that the content-storage
+        posture changed at v1->v2. Mirrors audit_log's mode-drift warning."""
+        try:
+            actual = stat.S_IMODE(self._db_path.stat().st_mode)
+        except OSError:
+            return
+        if actual != _DB_FILE_MODE:
+            logger.warning(
+                "state.db at %s had mode %o (expected %o). The v1->v2 migration "
+                "tightened it to %o: as of schema v2 this store persists durable "
+                "retained artifact content, so it is now as sensitive as the "
+                "content itself. Copies of state.db do NOT inherit 0600 and carry "
+                "the same content — treat them accordingly.",
+                self._db_path, actual, _DB_FILE_MODE, _DB_FILE_MODE,
+            )
+            self._chmod_if_exists(self._db_path)
+        self._chmod_if_exists(self._wal_path())
+        self._chmod_if_exists(self._shm_path())
+
+    def _open_read_only(self, instance_id: str | None) -> None:
+        """Open the store read-only: never creates, migrates, ALTERs, or mutates.
+
+        Used by the replay resolver (Unit 6) and SB-17 later. The
+        ``file:...?mode=ro`` URI requires ``uri=True`` to be passed EXPLICITLY —
+        without it sqlite3 treats the whole string as a literal filename and can
+        silently fall back to read-write (and create the file). A missing path is
+        a typed :class:`MissingDatabaseError` (a read-write open would create it;
+        read-only must not materialize a fresh empty store). A v1 (un-migrated)
+        db is a typed :class:`SchemaVersionError` with NO migration attempted. A
+        post-crash hot WAL that needs replay raises
+        :class:`StoreNeedsRecoveryError` (a read-only connection cannot run WAL
+        recovery — SQLITE_READONLY_RECOVERY).
+        """
+        if not self._db_path.exists():
+            raise MissingDatabaseError(
+                f"read-only open: no database at {self._db_path}. A read-only "
+                f"registry never creates the file (that would materialize a fresh "
+                f"empty store); point it at an existing coordinator state.db."
+            )
+        # mode=ro + uri=True (explicit) — see docstring on the silent-rw hazard.
+        uri = f"file:{self._db_path}?mode=ro"
+        self._conn = sqlite3.connect(
+            uri,
+            uri=True,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        # Everything past the connect is validation that can raise a TYPED
+        # error; without the close-on-raise the construction failure would leak
+        # the open handle (the caller never gets a registry to .close()). The
+        # BaseException breadth mirrors the transaction-rollback idiom: a
+        # Ctrl-C mid-open must not orphan the connection either.
+        try:
+            # foreign_keys is a no-op for a read-only conn (no writes); set for
+            # parity. Do NOT touch journal_mode (that is a write) — opening ro
+            # against a WAL db is fine for reads. busy_timeout helps a reader
+            # wait out a concurrent writer's lock.
+            self._conn.execute("PRAGMA busy_timeout=1500")
+            try:
+                current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                # Cross-runtime fail-closed guard (same classification as the
+                # writer path): the probes are plain reads, so a busy/hot-WAL
+                # store surfaces the SAME typed signal as the version read.
+                self._reject_foreign_ledger_db(current)
+            except sqlite3.OperationalError as exc:
+                raise self._classify_readonly_operational_error(exc) from exc
+            if current > SCHEMA_USER_VERSION:
+                # No Node marker matched above, so this is the future-Python
+                # posture — but a sibling-runtime ledger is also a possible
+                # writer, and the embedder cannot migrate DOWN, so the v1
+                # remedy below would be wrong advice here.
+                raise SchemaVersionError(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Either "
+                    f"a newer Python coordinator or a sibling-runtime coordinator "
+                    f"whose ledger this build does not recognize may have written "
+                    f"it. Read-only mode performs NO migration — use a build that "
+                    f"understands schema v{current}, then retry."
+                )
+            if current != SCHEMA_USER_VERSION:
+                raise SchemaVersionError(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Read-only "
+                    f"mode performs NO migration — re-open the store once with the "
+                    f"embedder (read-write) to migrate it, then retry."
+                )
+            try:
+                self._rehydrate_meta(instance_id)
+            except sqlite3.OperationalError as exc:
+                raise self._classify_readonly_operational_error(exc) from exc
+            # Policy is immutable per handle (see retention_meta) — cache once.
+            self._retention_meta_cache = self._load_retention_meta()
+        except BaseException:
+            self._conn.close()
+            raise
+
+    def _classify_readonly_operational_error(
+        self, exc: sqlite3.OperationalError
+    ) -> ReadOnlyRegistryError:
+        """Map an OperationalError on a read-only connection to a typed error.
+
+        Classification routes through the single
+        :func:`classify_sqlite_operational_signal` seam; the signal rides on
+        ``StoreNeedsRecoveryError.reason`` so consumers (the replay resolver)
+        branch on the attribute, never re-parse the message. All three signals
+        stay ONE exception type — a locked store and a hot WAL are both
+        "cannot read right now" from the registry's perspective; the reason
+        carries the operator remedy.
+        """
+        signal = classify_sqlite_operational_signal(exc)
+        if signal == STORE_SIGNAL_BUSY:
+            return StoreNeedsRecoveryError(
+                f"the store at {self._db_path} is locked by a concurrent writer "
+                f"(SQLITE_BUSY) and the read-only open timed out waiting for the "
+                f"lock. Retry shortly. Underlying: {exc}",
+                reason=signal,
+            )
+        if signal == STORE_SIGNAL_WAL_RECOVERY:
+            return StoreNeedsRecoveryError(
+                f"the store at {self._db_path} has an unclean write-ahead log that "
+                f"a read-only connection cannot replay (SQLITE_READONLY_RECOVERY). "
+                f"Re-open it once with the embedder (read-write) so it checkpoints "
+                f"the WAL, then retry the read-only resolve. Underlying: {exc}",
+                reason=signal,
+            )
+        return StoreNeedsRecoveryError(
+            f"the read-only store at {self._db_path} could not be read "
+            f"({exc}); it may need recovery (re-open once with the embedder) or "
+            f"be corrupt.",
+            reason=signal,
+        )
+
+    def _persist_retention_policy(self) -> None:
+        """Persist the constructor retention policy to registry_meta (writer open).
+
+        Stores ``retention_enabled`` (the explicit marker — set even in unbounded
+        mode) plus the two axes (NULL when an axis is disabled or unbounded). A
+        read-only resolver derives ``retention_off`` from the absence/0 of the
+        marker and the T-expiry axis from the persisted ``max_age_seconds`` — so
+        retention semantics are STORE-derived, not process-local. No open-time GC
+        pass (dropped per plan): each writer's inline GC trusts its CONSTRUCTOR
+        policy; the v1 one-writer-per-store assumption means the last writer
+        open's persisted policy is what readers see.
+
+        Write-free steady-state: the three keys are READ first and the UPSERT is
+        skipped when the persisted values already match — a same-policy reopen
+        issues no write at all (the property the write-free v2 open path
+        documents, and what keeps a reopen from dirtying the WAL).
+        """
+        if self._read_only:
+            return
+        policy = self._retention_policy
+        desired: dict[str, str | None] = {
+            _META_RETENTION_ENABLED: "1" if self._retain_versions else "0",
+            _META_RETENTION_MAX_VERSIONS: (
+                str(policy.max_versions)
+                if policy is not None and policy.max_versions is not None
+                else None
+            ),
+            _META_RETENTION_MAX_AGE_SECONDS: (
+                str(policy.max_age_seconds)
+                if policy is not None and policy.max_age_seconds is not None
+                else None
+            ),
+        }
+        with self._lock:
+            persisted = dict(
+                self._conn.execute(
+                    "SELECT key, value FROM registry_meta WHERE key IN (?, ?, ?)",
+                    tuple(desired),
+                ).fetchall()
+            )
+            # All three keys present AND equal (incl. NULL axes) ⇒ no write.
+            # len() distinguishes an absent key from a present-NULL value.
+            if len(persisted) == len(desired) and all(
+                persisted[key] == value for key, value in desired.items()
+            ):
+                return
+            # About to OVERWRITE a different persisted policy — warn first
+            # (the operator-visible half of the single-writer-embedder
+            # assumption; see _warn_on_policy_mismatch for the scope rules).
+            self._warn_on_policy_mismatch(persisted, desired)
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for key, value in desired.items():
+                    self._conn.execute(
+                        """
+                        INSERT INTO registry_meta (key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, value),
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                # Guarded ROLLBACK (the schema-init idiom): a COMMIT that failed
+                # mid-promote may have already auto-rolled-back, in which case
+                # the explicit ROLLBACK raises "no transaction is active" and
+                # would mask the original error.
+                try:
+                    self._conn.execute("ROLLBACK")
+                except (sqlite3.Error, OSError):
+                    pass
+                raise
+
+    def _warn_on_policy_mismatch(
+        self, persisted: dict[str, str | None], desired: dict[str, str | None]
+    ) -> None:
+        """Emit ONE RuntimeWarning when this writer's constructor retention
+        policy is about to overwrite a DIFFERENT previously persisted one.
+
+        WHY: the durable store's contract is one writer-embedder per store
+        (see :meth:`retention_meta`); each writer's inline GC trusts its
+        CONSTRUCTOR policy, so two embedders alternating with different
+        policies flip-flop the persisted policy AND the GC behaviour readers
+        derive from it — silently, unless surfaced here BEFORE the overwrite.
+
+        Scope: both sides retention-ENABLED with differing K/T axes. A first
+        persist (no keys yet) is setup, not a conflict; a matching reopen was
+        already short-circuited by the caller; the enable/disable toggles stay
+        silent (deliberate acts with their own documented semantics — see
+        ``test_disable_retention_preserves_existing_rows``); read-only mode
+        never reaches the caller at all.
+        """
+        if not self._retain_versions:
+            return
+        if persisted.get(_META_RETENTION_ENABLED) != "1":
+            return  # nothing previously persisted with retention enabled
+        # .get() folds absent-key and present-NULL to None — both mean "axis
+        # unbounded/disabled", which is exactly the comparison we want here.
+        p_k = persisted.get(_META_RETENTION_MAX_VERSIONS)
+        p_t = persisted.get(_META_RETENTION_MAX_AGE_SECONDS)
+        c_k = desired[_META_RETENTION_MAX_VERSIONS]
+        c_t = desired[_META_RETENTION_MAX_AGE_SECONDS]
+        if (p_k, p_t) == (c_k, c_t):
+            return
+        # stacklevel=4: warn() -> this helper -> _persist_retention_policy ->
+        # __init__ -> the embedder's constructor call site (the actionable
+        # frame: that is where the divergent policy is passed).
+        warnings.warn(
+            f"retention policy mismatch at {self._db_path}: the store persists "
+            f"max_versions={p_k} / max_age_seconds={p_t}, but this writer was "
+            f"constructed with max_versions={c_k} / max_age_seconds={c_t}; "
+            f"overwriting with the constructor policy. The durable store "
+            f"assumes a SINGLE writer-embedder per store — alternating "
+            f"embedders with different policies flip-flop the persisted "
+            f"policy and its GC behaviour.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+    def _load_retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Read ``(retention_enabled, persisted_policy_or_None)`` from
+        registry_meta — the construction-time loader behind the
+        :meth:`retention_meta` cache. One SELECT under the lock."""
+        with self._lock:
+            rows = dict(
+                self._conn.execute(
+                    "SELECT key, value FROM registry_meta WHERE key IN (?, ?, ?)",
+                    (
+                        _META_RETENTION_ENABLED,
+                        _META_RETENTION_MAX_VERSIONS,
+                        _META_RETENTION_MAX_AGE_SECONDS,
+                    ),
+                ).fetchall()
+            )
+        enabled = rows.get(_META_RETENTION_ENABLED) == "1"
+        if not enabled:
+            return False, None
+        max_v = rows.get(_META_RETENTION_MAX_VERSIONS)
+        max_a = rows.get(_META_RETENTION_MAX_AGE_SECONDS)
+        if max_v is None and max_a is None:
+            return True, None  # unbounded (NULL axes)
+        return True, RetentionPolicy(
+            max_versions=int(max_v) if max_v is not None else None,
+            max_age_seconds=float(max_a) if max_a is not None else None,
+        )
+
+    def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Return ``(retention_enabled, persisted_policy_or_None)``. Used by
+        Unit 4's ``read_at_version`` (store-derived ``retention_off`` +
+        T-expiry) on both the writer and the read-only resolver.
+        ``retention_enabled=False`` ⇒ retention was never turned on for this
+        store; ``True`` with a ``None`` policy ⇒ unbounded (NULL axes).
+
+        Served from a construction-time cache, not a per-call SELECT: the
+        policy is immutable per handle (a writer persists its constructor
+        policy exactly once at open; nothing rewrites the keys while the handle
+        lives), readers are short-lived, and the documented single-writer
+        assumption means a peer writer changing the persisted policy mid-handle
+        is outside the contract — so caching at construction is correct and
+        keeps ``read_at_version`` loops off the DB for this lookup."""
+        return self._retention_meta_cache
+
+    def _guard_writable(self) -> None:
+        """Raise if a mutator was called on a read-only registry."""
+        if self._read_only:
+            raise ReadOnlyMutationError(
+                f"this SqliteArtifactRegistry was opened read-only "
+                f"(mode=ro) against {self._db_path}; mutating methods are "
+                f"rejected. Open it read-write (the embedder) to mutate."
+            )
+
+    def _capture_version_sql(
+        self, artifact_id: UUID, version: int, content: bytes | str
+    ) -> None:
+        """Snapshot ``content`` under ``version`` + run inline K/T GC, INSIDE the
+        caller's already-open ``BEGIN IMMEDIATE`` (crash-atomic with the commit /
+        version-bump it captures — a rollback leaves neither phantom history nor
+        a version move). Caller holds the lock and an open transaction; this adds
+        NO new lock acquisition (busy_timeout derivation untouched).
+
+        Mirrors the in-memory ``ArtifactRegistry._capture_version``: store body +
+        wall-clock ``captured_at``, then (only when a bounded policy is set) drop
+        the versions :func:`collectible_versions` marks — the current version is
+        always exempt; unbounded mode (policy=None) skips GC entirely, preserving
+        today's semantics. Decisions route through the persisted authoritative
+        rows (this txn), never an in-memory mirror.
+
+        ``content`` is stored against the affinity-NONE ``content`` column so a
+        ``str`` round-trips TEXT and ``bytes`` round-trips BLOB by value. The
+        single ``time.time()`` read is both the stamp and the GC reference.
+        """
+        c = self._conn
+        captured_at = time.time()
+        # REPLACE (not INSERT): re-capturing the same version (e.g. a retried
+        # commit at the same version on the in-memory parity path) overwrites
+        # rather than raising on the (artifact_id, version) PK.
+        c.execute(
+            "INSERT OR REPLACE INTO artifact_versions "
+            "(artifact_id, version, content, captured_at) VALUES (?, ?, ?, ?)",
+            (artifact_id.hex, version, content, captured_at),
+        )
+        if self._retention_policy is None:
+            return  # unbounded mode (retain_versions=True, no policy): no GC.
+        # Read the authoritative retained set for this artifact (this txn) and
+        # compute the drop set with the SAME pure seam the in-memory path uses.
+        rows = c.execute(
+            "SELECT version, captured_at FROM artifact_versions WHERE artifact_id = ?",
+            (artifact_id.hex,),
+        ).fetchall()
+        timestamps = {int(v): float(ts) for v, ts in rows}
+        for dropped in collectible_versions(
+            timestamps,
+            current_version=version,
+            policy=self._retention_policy,
+            now=captured_at,
+        ):
+            c.execute(
+                "DELETE FROM artifact_versions WHERE artifact_id = ? AND version = ?",
+                (artifact_id.hex, dropped),
+            )
+
+    @property
+    def coordinator_epoch(self) -> str:
+        """The store's coordinator epoch (persisted in registry_meta).
+
+        Read from ``registry_meta.coordinator_epoch`` at open (writer OR
+        read-only), so a resolver opening the durable store read-only sees the
+        same epoch the writer minted. Unit 4's ``read_at_version`` stamps this on
+        every response/rejection and compares an optional ``expected_epoch``
+        against it. Survives restart (unlike the in-memory registry's
+        per-construction epoch). Epoch reset = delete-and-recreate the db, which
+        also drops ``artifact_versions``."""
+        return self._coordinator_epoch
+
+    @property
+    def instance_id(self) -> str:
+        """The store's persisted instance identity (``registry_meta.instance_id``).
+
+        Public read-only accessor mirroring :attr:`ArtifactRegistry.instance_id`
+        so identity consumers (the replay resolver's ``--instance-id``
+        cross-check, trace-manifest comparisons) never reach into the private
+        field. Seeded at first create, stable across reopens."""
+        return self._instance_id
 
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
@@ -476,10 +1352,13 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
 
     def register_artifact(self, artifact: Artifact, content: str) -> None:
-        """Insert artifact record. Content is hashed by the caller and stored
-        only as ``content_hash`` (KTD-13); the ``content`` parameter is
-        accepted for signature compatibility but its bytes are discarded."""
-        del content  # KTD-13: not persisted. caller must pre-compute content_hash on artifact.
+        """Insert artifact record. ``content_hash`` (KTD-13) is always stored;
+        the ``content`` BODY is stored in ``artifact_versions`` ONLY when
+        retention is active (``retain_versions=True``) — otherwise discarded.
+
+        Threat-model note: with retention on, ``register_artifact`` puts the v1
+        body of a merely-OBSERVED artifact on disk (per plan R2 + docs/security)."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -497,6 +1376,9 @@ class SqliteArtifactRegistry:
                         time.time(),
                     ),
                 )
+                # Durable capture INSIDE this txn (crash-atomic with the insert).
+                if self._retain_versions:
+                    self._capture_version_sql(artifact.id, artifact.version, content)
                 self._conn.execute("COMMIT")
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
@@ -549,8 +1431,13 @@ class SqliteArtifactRegistry:
         ``fence_agent_id`` is given, reject -- atomically with the version
         persist in this BEGIN IMMEDIATE -- if that committer's captured
         read_generation was superseded by a sweep reclamation. A ``None``
-        fence_agent_id (source-churn) is unguarded."""
-        del content  # KTD-13: not persisted
+        fence_agent_id (source-churn) is unguarded.
+
+        With retention active, the NEW ``content`` body is captured under the
+        NEW version in ``artifact_versions``, atomically inside this txn (a fence
+        reject raises before the capture, so no phantom history). Otherwise the
+        body is discarded (KTD-13)."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -593,6 +1480,10 @@ class SqliteArtifactRegistry:
                         artifact_id.hex,
                     ),
                 )
+                # Durable capture of the NEW body under the NEW version, INSIDE
+                # this txn (the fence reject above raises before we reach here).
+                if self._retain_versions:
+                    self._capture_version_sql(artifact_id, artifact.version, content)
                 self._conn.execute("COMMIT")
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches
@@ -602,13 +1493,63 @@ class SqliteArtifactRegistry:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def get_content_at_version(self, artifact_id: UUID, version: int) -> str | None:
-        """v0.1 returns None — content history is not persisted (KTD-13)."""
-        del version
-        return None
+    def get_content_at_version(
+        self, artifact_id: UUID, version: int
+    ) -> str | bytes | None:
+        """Return the retained body for ``(artifact_id, version)``, or ``None``.
+
+        Durable as of v2 (plan item N v1, Unit 3): reads the ``artifact_versions``
+        table and returns the value with its original Python type — ``str`` for a
+        TEXT row, ``bytes`` for a BLOB row (the affinity-NONE column round-trips
+        by value). ``None`` when retention was never on, the row was K-evicted /
+        T-expired, or it was never captured (e.g. ``commit_cas(content=None)``).
+        Unit 4 builds the typed-reason surface (``not_retained`` vs ``retention_off``)
+        above this raw getter.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = ?",
+                (artifact_id.hex, version),
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def get_version_record(
+        self, artifact_id: UUID, version: int
+    ) -> tuple[str | bytes, float] | None:
+        """Return ``(content, captured_at)`` for a retained version, or ``None``.
+
+        The single accessor Unit 4's ``read_at_version`` needs: the body AND its
+        wall-clock ``captured_at`` (for ``VersionedContent.captured_at`` and the
+        T-expiry check) in ONE call. Mirrors
+        :meth:`ArtifactRegistry.get_version_record` so the two registries share
+        one duck-type.
+
+        Single-scope (R5 atomicity): the body and timestamp come from ONE row of
+        ONE ``SELECT`` under ONE lock, so a racing writer's ``BEGIN IMMEDIATE``
+        commit cannot interleave between reading the content and reading its
+        stamp — they are consistent by construction (no separate-statement
+        window two getters would have). Returns the body with its original Python
+        type (TEXT→``str``, BLOB→``bytes``; affinity-NONE column). ``None`` when
+        retention was never on, the row was K-evicted / T-expired, or it was
+        never captured (e.g. ``commit_cas(content=None)``)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, captured_at FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = ?",
+                (artifact_id.hex, version),
+            ).fetchone()
+        if row is None:
+            return None
+        return row[0], float(row[1])
 
     def remove_artifact(self, artifact_id: UUID) -> None:
-        """Remove artifact and cascade-delete agent_states for it."""
+        """Remove artifact and cascade-delete agent_states + retained history.
+
+        ``artifact_versions`` carries ``FOREIGN KEY ... ON DELETE CASCADE`` and
+        ``PRAGMA foreign_keys=ON`` is set on the connection, so the retained
+        history rows drop with the artifact (deleted ≡ never-existed)."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -705,6 +1646,7 @@ class SqliteArtifactRegistry:
         rolled back AND _seq is decremented so the next successful emission
         does not create a phantom gap.
         """
+        self._guard_writable()
         with self._lock:
             # COR-02: initialised outside the try so the except handler can
             # check it even if BEGIN IMMEDIATE or any pre-_seq SQL raises.
@@ -882,6 +1824,7 @@ class SqliteArtifactRegistry:
         entered_tick: int,
     ) -> None:
         """Set transient state and entry tick for one agent/artifact pair."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -909,6 +1852,7 @@ class SqliteArtifactRegistry:
 
     def clear_agent_transient(self, artifact_id: UUID, agent_id: UUID) -> None:
         """Clear transient state and timestamp for one agent/artifact pair."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -956,6 +1900,7 @@ class SqliteArtifactRegistry:
 
     def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
         """Record an agent's heartbeat tick using max(prev, incoming) (R12 monotonicity)."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -988,6 +1933,7 @@ class SqliteArtifactRegistry:
         self, agent_id: UUID, artifact_id: UUID, trigger: str, tick: int
     ) -> None:
         """Record the most recent reclamation slot for an (agent, artifact) pair."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1074,6 +2020,7 @@ class SqliteArtifactRegistry:
         pre-read handler then calls ``set_agent_state(..., SHARED, ...)``).
         """
         del initial_owner  # parameter symmetry only; plugin handler sets state explicitly
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1179,12 +2126,20 @@ class SqliteArtifactRegistry:
         invariant and the ``state_log`` emit per transition (KTD-13: compare on
         version, never content bytes).
 
-        ``content`` is accepted for signature parity with the in-memory registry
-        but IGNORED (KTD-13: this registry persists no content body —
-        :meth:`get_content` returns ``b""``). The content-hash on the artifact is
-        the source of truth for staleness comparison.
+        ``content`` is the winning body. KTD-13 still governs ``get_content``
+        (the ``artifacts`` table persists no body; ``get_content`` returns
+        ``b""``) and the content-hash remains the staleness source of truth —
+        but with retention active the WIN captures ``content`` under
+        ``next_version`` in ``artifact_versions``, atomically in this txn.
+        ``content=None`` SKIPS the capture (mirror of the in-memory fix: the old
+        path would have stored the stale OLD body under the NEW version — a
+        latent history-poisoning bug; now an unsupplied body means no snapshot,
+        and a later read of ``next_version`` misses). An embedder following the
+        KTD-13 cross-process discipline (``content=None`` on every OCC commit)
+        therefore gets NO durable capture — retention is inert for that workload
+        by design.
         """
-        del content  # KTD-13: not persisted (signature parity only)
+        self._guard_writable()
         with self._lock:
             # Track every _seq increment in this call so the outer
             # BaseException handler can roll them ALL back if COMMIT (or any
@@ -1376,6 +2331,16 @@ class SqliteArtifactRegistry:
                     content_hash=content_hash,
                 )
 
+                # Durable capture of the WINNING body under next_version, INSIDE
+                # this txn (crash-atomic with the version bump). content=None
+                # SKIPS capture (the in-memory parity fix): an unsupplied body
+                # leaves next_version with no snapshot rather than poisoning it
+                # with the stale OLD body. The non-OSError escape window (binding
+                # a large bytes/str into the INSERT) is covered by the outer
+                # BaseException ROLLBACK below.
+                if self._retain_versions and content is not None:
+                    self._capture_version_sql(artifact_id, next_version, content)
+
                 self._conn.execute("COMMIT")
                 # COMMIT succeeded — _seq durably persisted; suppress rollback.
                 seq_incremented_count = 0
@@ -1549,6 +2514,7 @@ class SqliteArtifactRegistry:
         update conditional on excluded.preempted_at_unix_ts being strictly
         greater than the existing row's.
         """
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1584,6 +2550,7 @@ class SqliteArtifactRegistry:
         """Atomically SELECT and DELETE all pending notices for ``agent_id``.
         Returns list of ``(artifact_id, preempter_agent_id, preempted_at_unix_ts)``.
         Empty list if no pending notices."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1654,6 +2621,7 @@ class SqliteArtifactRegistry:
         None. Used by the post-edit failure path so the notice is consumed
         at the point it surfaces in the error reason, preventing the next
         pre-event from re-emitting the same preemption prose."""
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1698,6 +2666,7 @@ class SqliteArtifactRegistry:
             # import and confused readers).
             now_unix = time.time()
         cutoff = now_unix - max_age_sec
+        self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:

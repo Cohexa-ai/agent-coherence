@@ -26,19 +26,20 @@ full command-line toolset, and the API reference.
 6. [State transitions log](#state-transitions-log)
 7. [Content audit log](#content-audit-log)
 8. [Crash recovery](#crash-recovery)
-9. [Inline benchmark mode](#inline-benchmark-mode)
-10. [Telemetry](#telemetry)
-11. [Graceful degradation](#graceful-degradation)
-12. [Examples](#examples)
-13. [Real-workload benchmarks](#real-workload-benchmarks)
-14. [Benchmarking your own workload](#benchmarking-your-own-workload)
-15. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-16. [Replay (v0.8.2+)](#replay-v082)
-17. [Command-line tools](#command-line-tools)
-18. [API reference](#api-reference)
-19. [Low-level adapter API](#low-level-adapter-api)
-20. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-21. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+9. [Version retention and read-at-version](#version-retention-and-read-at-version)
+10. [Inline benchmark mode](#inline-benchmark-mode)
+11. [Telemetry](#telemetry)
+12. [Graceful degradation](#graceful-degradation)
+13. [Examples](#examples)
+14. [Real-workload benchmarks](#real-workload-benchmarks)
+15. [Benchmarking your own workload](#benchmarking-your-own-workload)
+16. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+17. [Replay (v0.8.2+)](#replay-v082)
+18. [Command-line tools](#command-line-tools)
+19. [API reference](#api-reference)
+20. [Low-level adapter API](#low-level-adapter-api)
+21. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+22. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -431,6 +432,91 @@ versioning, and crash-recovery sweep invariants, see
 [`formal/tla/README.md`](../formal/tla/README.md).
 
 ---
+
+## Version retention and read-at-version
+
+By default the coordinator keeps only the **current** version of each artifact.
+Opt in to retaining a bounded history, and you can read back the exact bytes of
+an earlier version.
+
+### Enabling
+
+Pass a `RetentionPolicy` to the registry (retention is off unless
+`retain_versions=True`):
+
+```python
+from ccs.coordinator.retention import RetentionPolicy
+
+policy = RetentionPolicy(max_versions=16, max_age_seconds=None)
+```
+
+`max_versions` keeps the K most-recent versions (including the current one,
+which is never collected); `max_age_seconds` expires versions older than T
+wall-clock seconds. Either axis can be `None` to disable it. GC is amortized —
+it runs inline as new versions are committed; there is no background sweep.
+
+### Durability
+
+The in-memory `ArtifactRegistry` retains versions for the life of the process.
+`SqliteArtifactRegistry` retains them **durably**, surviving a coordinator
+restart, for in-process embedders. Enabling durable retention adds an
+`artifact_versions` table via the store's first real schema-version bump
+(v1 → v2), applied automatically and atomically the first time a v1 database is
+opened. Durable retention is opt-in — a deployment that doesn't enable it stores
+no version content. (The Claude Code hook/HTTP coordinator carries only content
+hashes on the wire, so durable retention there is inert: there are no bodies to
+store. It is an in-process-embedder feature.)
+
+### Reading a version
+
+```python
+result = service.read_at_version(artifact_id, version)
+```
+
+The result is either a `VersionedContent` (`content`, `version`, `captured_at`,
+`coordinator_epoch`) or a typed `VersionedReadRejection` whose `reason` is one of
+six wire-stable constants:
+
+| Reason | Meaning |
+|---|---|
+| `retention_off` | The registry is not retaining versions. |
+| `unknown_artifact` | No such artifact. |
+| `not_retained` | The version is not in the retained history (never captured, or collected / expired). |
+| `current_version` | The requested version is the current one — read it through the normal `read` / `fetch` path, not the history surface. |
+| `future_version` | The version is greater than the current version. |
+| `epoch_mismatch` | The optional `expected_epoch` did not match (the store was reset). |
+
+`read_at_version` is an **off-protocol read**: it grants no MESI state, joins no
+invalidation set, and captures no read-generation fence claim — versioned reads
+never affect a concurrent writer. It serves history only; current content is
+always read through the protocol path.
+
+### Reading from a stored coordinator
+
+`agent-coherence-replay resolve` answers "bytes at version k" against a
+`.coherence/state.db` on disk — useful for audit and post-hoc inspection:
+
+```bash
+agent-coherence-replay resolve --db ./.coherence/state.db \
+    --artifact plans/plan.md --version 2 --json
+```
+
+The store is opened **read-only** (never created, never migrated). Output is
+content-safe by default — `version`, `coordinator_epoch`, `captured_at`, content
+hash and length — and emits the retained bytes only with `--include-content`
+(base64 for binary) or `--output-file` (raw, written `0600`), so secrets don't
+leak into terminals or CI logs. Each rejection reason and store error maps to a
+distinct exit code with the wire-stable `reason` in the JSON envelope.
+
+### Honesty boundary
+
+Retention records and serves the bytes the coordinator committed at each version;
+it does not make an agent's *use* of an old version safe. An agent that reads a
+fresh current version through the protocol but writes content derived from an
+older retained version still commits a fence-legal write of stale meaning — the
+coherence guarantee is "write from the bytes your latest read returned," and
+read-at-version makes an older version easy to fetch, so keep writes anchored to
+the current read.
 
 ## Inline benchmark mode
 

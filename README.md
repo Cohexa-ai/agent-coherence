@@ -42,7 +42,7 @@ vol.write("plans/plan.md", revised_plan)   # stale view? denied fail-closed → 
 
 ## What it guarantees
 
-Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all four specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
+Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all five specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
 
 | The silent failure | What happens instead | Mechanism | Invariant |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` run
 ---
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
-- 🧮 [Formal verification](formal/tla/README.md) — the four TLA+ specs, invariant ↔ implementation map, mutant recipes
+- 🧮 [Formal verification](formal/tla/README.md) — the five TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
@@ -90,9 +90,11 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
-Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, and the reclamation fence's no-stale-apply — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all four specs on every push and PR.
+Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, and version retention's no-collected-read — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all five specs on every push and PR.
 
 ## Status
+
+**`v0.9.3` released — bounded, durable version retention + read-at-version, plus coordinator lifecycle hardening.** The coordinator can now retain a bounded history of committed versions and serve any retained `(artifact, version)` via `read_at_version(...)` — opt-in `RetentionPolicy(max_versions=K, max_age_seconds=T)`, **off by default**; durable across restart for in-process embedders behind an automatic, atomic SQLite `v1 → v2` upgrade. Read-at-version is off-protocol (no MESI grant, no fence capture) and model-checked in `formal/tla/Retention.tla`. Also: watchdog late-completion/degraded-read hardening (A6/A7), spawn/idle lifecycle fixes (L1/L3/L5), the read-generation fence's absent-operand semantics reconciled with the spec, and a reproducible temporal-cost sweep with a token/prompt-cache-dollar translation. See [CHANGELOG.md](CHANGELOG.md).
 
 **`v0.9.2` released — closes a silent lost-update in `CoherentVolume.write_cas` under high same-key write contention.** A peer commit landing between `write_cas`'s `reacquire()` and its version read could pair stale bytes with a fresh version and win the CAS, silently dropping the peer's update on disk (the protocol-level `NoLostUpdate` invariant still held — the bug was below it, in the demo write path). Each retry now derives its `(bytes, version)` comparand from one hash-checked read, so the split is structurally unrepresentable. Also: an additive `hash_differs` signal on the `/hooks/pre-read` fresh-SHARED path (with a `fresh_shared_hash_mismatch_total` counter), and a coordinator fix that preserves the fresh-path `version` field when a preemption notice rides along. See [CHANGELOG.md](CHANGELOG.md).
 

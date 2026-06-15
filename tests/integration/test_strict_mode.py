@@ -344,6 +344,7 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_edit_notice_only",          # coordinator_server._handle_pre_edit
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
+    "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
 ]
 
 

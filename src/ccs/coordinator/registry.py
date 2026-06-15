@@ -5,13 +5,22 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TypeAlias
+from typing import Any, Callable, Iterator, Optional, TypeAlias
 from uuid import UUID, uuid4
 
-from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.exceptions import (
+    STALE_READ_GENERATION_REASON,
+    StaleReadGeneration,
+    WatchdogAbandoned,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail
+
+from .retention import RetentionPolicy, collectible_versions
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 
@@ -55,21 +64,55 @@ class ArtifactRecord:
     transient_by_agent: dict[UUID, TransientState] = field(default_factory=dict)
     transient_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
     last_writer: Optional[UUID] = None
-    version_history: dict[int, str] = field(default_factory=dict)
+    # Retained version snapshots, keyed by artifact version. The value is the
+    # captured BODY. The annotation admits ``bytes`` because the ``commit_cas``
+    # WIN path stores ``record.content``, which is ``bytes`` on the in-process
+    # library path (``AgentRuntime.write_cas`` threads bytes through). The old
+    # ``dict[int, str]`` annotation was wrong (a ``type: ignore`` papered over
+    # it at the WIN site); corrected here as part of the value-shape change for
+    # bounded retention. ``version_captured_at`` is a PARALLEL dict of capture
+    # wall-clock timestamps (``time.time()``), one per retained version — kept
+    # separate (rather than tupling the value) so the v0.5 pinned suites that
+    # read ``version_history[v]`` as the body stay valid byte-for-byte. The two
+    # dicts are always mutated together (capture and GC) so their key sets match.
+    version_history: dict[int, bytes | str] = field(default_factory=dict)
+    version_captured_at: dict[int, float] = field(default_factory=dict)
     granted_at_tick_by_agent: dict[UUID, int] = field(default_factory=dict)
     last_reclamation_by_agent: dict[UUID, ReclamationSlot] = field(default_factory=dict)
     # Read-generation fence (single-host Piece #2). owner_generation is the
     # per-artifact ownership epoch, bumped on every sweep reclamation;
     # read_generation_by_agent[ag] is the owner_generation an agent captured
     # when it last established its write-claim (a genuine read OR an E/M
-    # acquire). An ABSENT key (== None) is the absent operand => reject at
-    # commit. The counter only grows (resets to 0 per construction in-memory).
+    # acquire). An ABSENT key (== None) means the agent never established a
+    # fence claim -- a plain OCC writer whose lost-update protection is
+    # version-CAS, not the fence -- so the commit guard ADMITS it (version-CAS,
+    # checked first, arbitrates); only a PRESENT-and-superseded read_generation
+    # (captured < current owner_generation) is rejected. The counter only grows
+    # (resets to 0 per construction in-memory).
     owner_generation: int = 0
     read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
     """Canonical in-memory artifact directory and payload store."""
+
+    @contextmanager
+    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+        """In-memory mirror of :meth:`SqliteArtifactRegistry.abort_guard`
+        (finding A6) so :class:`CoordinatorService` can call it uniformly
+        regardless of which registry backs it.
+
+        This registry is single-threaded (no process-level lock), so the guard
+        is a lock-free abort check: if the handler watchdog already timed out
+        and SET ``abort``, fail closed before the caller mutates; otherwise run
+        the mutation. ``abort=None`` (every non-watchdog caller) is a no-op.
+        """
+        if abort is not None and abort.is_set():
+            raise WatchdogAbandoned(
+                "handler watchdog timed out before this mutation ran; aborting "
+                "before it lands (A6)."
+            )
+        yield
 
     def __init__(
         self,
@@ -78,6 +121,7 @@ class ArtifactRegistry:
         agent_names: dict[UUID, str] | None = None,
         instance_id: str | None = None,
         retain_versions: bool = False,
+        retention_policy: RetentionPolicy | None = None,
     ) -> None:
         if state_log is not None and instance_id is None:
             raise ValueError(
@@ -97,13 +141,53 @@ class ArtifactRegistry:
         # store identity exists from day one.
         self._coordinator_epoch: str = uuid4().hex
         self._seq: int = 0
+        # Retention is active iff ``retain_versions`` is True. The attribute is
+        # kept TRUTHY and named ``_retain_versions`` because the recorder test
+        # (tests/test_replay_recorder.py) asserts on this private name.
         self._retain_versions = retain_versions
+        # ``retention_policy=None`` with ``retain_versions=True`` == today's
+        # UNBOUNDED semantics (no GC) — this is the back-compat contract that
+        # keeps the four pinned v0.5/recorder suites green. A policy is an
+        # explicit opt-in to BOUNDED retention: GC runs only when this is set.
+        self._retention_policy = retention_policy
+
+    def _capture_version(
+        self, record: ArtifactRecord, version: int, content: bytes | str
+    ) -> None:
+        """Snapshot ``content`` under ``version`` and run inline GC (R1, R3, R4).
+
+        The single retention apply path shared by all three capture points
+        (``register_artifact``, ``set_artifact_and_content``, the ``commit_cas``
+        WIN). Stores the body and its capture timestamp, then — ONLY when a
+        bounded policy is set — drops the versions :func:`collectible_versions`
+        marks (the current version always survives; unbounded mode skips GC
+        entirely, preserving today's semantics).
+
+        Lock-free posture (registry contract): this is plain GIL-atomic dict
+        mutation. The store-then-drop is a sequence of individual dict ops, each
+        atomic under the GIL; a concurrent reader of ``get_content_at_version``
+        sees a consistent value at any single dict access. No locks, no
+        ``BEGIN IMMEDIATE``.
+        """
+        captured_at = time.time()  # one wall-clock read: stamp == GC reference.
+        record.version_history[version] = content
+        record.version_captured_at[version] = captured_at
+        if self._retention_policy is None:
+            return  # unbounded mode (retain_versions=True, no policy): no GC.
+        for dropped in collectible_versions(
+            record.version_captured_at,
+            current_version=version,
+            policy=self._retention_policy,
+            now=captured_at,
+        ):
+            record.version_history.pop(dropped, None)
+            record.version_captured_at.pop(dropped, None)
 
     def register_artifact(self, artifact: Artifact, content: str) -> None:
         """Insert artifact record into registry."""
         record = ArtifactRecord(artifact=artifact, content=content)
         if self._retain_versions:
-            record.version_history[artifact.version] = content
+            self._capture_version(record, artifact.version, content)
         self._records[artifact.id] = record
 
     def has_artifact(self, artifact_id: UUID) -> bool:
@@ -123,6 +207,44 @@ class ArtifactRegistry:
         """Return artifact content if present."""
         record = self._records.get(artifact_id)
         return record.content if record else None
+
+    @property
+    def coordinator_epoch(self) -> str:
+        """The registry's coordinator epoch (read-generation fence follow-on).
+
+        Public accessor mirroring :attr:`SqliteArtifactRegistry.coordinator_epoch`
+        so the two registries satisfy ONE duck-type (Unit 4 / R5): every
+        ``read_at_version`` answer and rejection stamps this, and an optional
+        ``expected_epoch`` is compared against it. The in-memory epoch is
+        **per-construction** (minted fresh in ``__init__``, NOT persisted) — a
+        new ``ArtifactRegistry`` gets a new epoch, so it cannot mismatch across a
+        restart the way the durable sqlite epoch can; it exists for surface
+        parity and for the same-process ``expected_epoch`` guard."""
+        return self._coordinator_epoch
+
+    @property
+    def instance_id(self) -> str:
+        """The registry's instance identity (minted per construction unless the
+        caller supplied one).
+
+        Public read-only accessor mirroring
+        :attr:`SqliteArtifactRegistry.instance_id` so the two registries share
+        one identity duck-type and consumers never reach into the private
+        field."""
+        return self._instance_id
+
+    def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
+        """Return ``(retention_enabled, policy_or_None)`` (Unit 4 / R5 duck-type).
+
+        Mirrors :meth:`SqliteArtifactRegistry.retention_meta` so ``read_at_version``
+        derives ``retention_off`` and the T-expiry axis identically on both
+        registries. In-memory there is no persisted meta — the answer is the
+        live constructor state: ``_retain_versions`` is the enabled marker and
+        ``_retention_policy`` the bound (``None`` ⇒ unbounded when enabled).
+        ``retain_versions=False`` ⇒ ``(False, None)`` (retention never on)."""
+        if not self._retain_versions:
+            return False, None
+        return True, self._retention_policy
 
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
@@ -161,17 +283,59 @@ class ArtifactRegistry:
                     f"owner_gen={record.owner_generation}"
                 )
         if self._retain_versions:
-            record.version_history[artifact.version] = content
+            self._capture_version(record, artifact.version, content)
         record.artifact = artifact
         record.content = content
         record.last_writer = last_writer
 
-    def get_content_at_version(self, artifact_id: UUID, version: int) -> str | None:
-        """Return content for a specific version, if retained."""
+    def get_content_at_version(self, artifact_id: UUID, version: int) -> str | bytes | None:
+        """Return content for a specific version, if retained.
+
+        Returns the body with its original Python type (``bytes`` when the
+        ``commit_cas`` WIN threaded bytes — matching the corrected
+        ``version_history`` annotation); ``None`` when not retained. Mirrors
+        :meth:`SqliteArtifactRegistry.get_content_at_version`'s widened type."""
         record = self._records.get(artifact_id)
         if record is None:
             return None
         return record.version_history.get(version)
+
+    def get_version_record(
+        self, artifact_id: UUID, version: int
+    ) -> tuple[str | bytes, float] | None:
+        """Return ``(content, captured_at)`` for a retained version, or ``None``.
+
+        The single accessor Unit 4's ``read_at_version`` needs: the body AND its
+        wall-clock capture timestamp (for ``VersionedContent.captured_at`` and the
+        T-expiry check) in ONE call. Mirrors
+        :meth:`SqliteArtifactRegistry.get_version_record` so the two registries
+        share one duck-type.
+
+        Single-scope (R5 atomicity): ``version_history`` and
+        ``version_captured_at`` are always mutated together (capture and GC), so
+        their key sets match; reading the body first and missing means the row is
+        absent. Each dict read is GIL-atomic, but the PAIR is not: a concurrent
+        inline GC can drop THIS version between the two reads, so the stamp is
+        read defensively (``.get``) and an absent stamp after a present body is
+        reported as absent — the row was collected mid-read. ``None`` when the
+        artifact or the version is absent (never captured, K-evicted, or
+        T-expired-then-swept)."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        content = record.version_history.get(version)
+        if content is None:
+            return None
+        # One .get() per dict, no bare getitem: the GIL makes each dict access
+        # atomic but NOT the pair — a concurrent inline GC (a peer thread's
+        # capture under a bounded policy) can drop THIS version between the two
+        # reads, and a getitem here would KeyError out of read_at_version's
+        # never-raise contract. An absent stamp after a present body simply
+        # means the row was GC'd mid-read ⇒ report it as not retained.
+        captured_at = record.version_captured_at.get(version)
+        if captured_at is None:
+            return None
+        return content, captured_at
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
         """Return copy of per-agent MESI states for an artifact."""
@@ -298,11 +462,14 @@ class ArtifactRegistry:
 
         ``content`` is the winning body. When provided (the in-process library
         path threads it from ``AgentRuntime.write_cas``) the WIN updates
-        ``record.content`` (and ``version_history[next_version]`` when versions
-        are retained) to the NEW body, so a peer re-fetching after the win reads
-        the winner's content at the new version — not the stale pre-CAS body.
-        ``None`` (the cross-process / sqlite path, which stores no content)
-        leaves the prior content-coherence behaviour unchanged.
+        ``record.content`` to the NEW body, so a peer re-fetching after the win
+        reads the winner's content at the new version — not the stale pre-CAS
+        body, and (when versions are retained) captures that NEW body under
+        ``next_version``. ``None`` (the cross-process / sqlite path, which stores
+        no content) leaves the prior content-coherence behaviour unchanged AND
+        skips the version capture (it is not retained under ``next_version``);
+        previously the None path retained the stale OLD body under the new
+        version, a latent history-poisoning bug now fixed.
         """
         record = self._records.get(artifact_id)
         if record is None:
@@ -385,13 +552,20 @@ class ArtifactRegistry:
         # Content coherence: when the caller threaded the winning body, advance
         # record.content to it so a peer re-fetch reads the NEW content at the new
         # version (without this, version + content_hash bump but the body stays
-        # stale). The retained version snapshot stores the SAME new body. content
-        # is None on the cross-process / sqlite path (no content stored) — keep
-        # the prior body unchanged there.
+        # stale). content is None on the cross-process / sqlite path (no content
+        # stored) — keep the prior body unchanged there.
         if content is not None:
-            record.content = content  # type: ignore[assignment]
-        if self._retain_versions:
-            record.version_history[next_version] = record.content
+            record.content = content
+        # Retention capture joins this APPLIED block (after every state_log emit
+        # succeeded) so a callback raise above cannot leave phantom history —
+        # parity with the stage-then-apply discipline for the MESI mutations.
+        # content=None SKIPS capture entirely (R-fix): the old code retained the
+        # OLD body under the NEW version when content was None — a latent
+        # history-poisoning bug only observable through retention reads. Now an
+        # unsupplied body simply means "no snapshot for this version"; a later
+        # read of next_version misses (None), rather than returning stale bytes.
+        if self._retain_versions and content is not None:
+            self._capture_version(record, next_version, content)
         record.artifact = updated
         record.last_writer = agent_id
 

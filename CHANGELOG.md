@@ -4,6 +4,114 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+## [0.9.3] - 2026-06-14
+
+### Added
+
+- **Bounded, durable version retention + read-at-version.** The coordinator can
+  retain a bounded history of committed artifact versions and serve any retained
+  `(artifact, version)` through `CoordinatorService.read_at_version(...)`,
+  returning a typed `VersionedContent` or a `VersionedReadRejection` over six
+  wire-stable reasons. Opt in per registry with `RetentionPolicy(max_versions=K,
+  max_age_seconds=T)` — **off by default**. The in-memory registry retains in
+  process; `SqliteArtifactRegistry` retains durably across a coordinator restart
+  for in-process embedders, behind the store's first real schema-version bump
+  (v1 → v2, applied automatically and atomically; durable content storage is
+  opt-in and flips no existing deployment silently). `agent-coherence-replay
+  resolve --db <state.db> --artifact <path|uuid> --version <n>` reads bytes at a
+  version from a stored coordinator, content-safe by default (metadata only
+  unless `--include-content` / `--output-file`). Read-at-version is an
+  off-protocol read — it grants no MESI state and captures no read-generation
+  fence claim (R6/R7). Formally modelled in `formal/tla/Retention.tla`
+  (`NoCollectedRead` + a versioned-read-is-a-no-op action property), wired into
+  `make tla-check`.
+- **Reproducible temporal-cost sweep + token/$ translation** (benchmark tooling,
+  no library API change). The change-rate × answer-sensitivity sweep
+  (`tools/run_cost_sweep.py`) gains `--rates/--sensitivities/--runs` so a refined
+  grid reproduces from committed code; the pre-registered savings-regime verdict
+  is recorded in `benchmarks/cost_preregistration.md` (PASS at n=50, crossover
+  r≈0.31). `tools/cost_to_tokens.py` translates the re-fetch-avoided proxy into
+  input-token + prompt-cache dollar terms under explicit, labeled assumptions.
+
+### Changed
+
+- **`SqliteArtifactRegistry(retain_versions=True)` is now supported** —
+  previously it raised `NotImplementedError`. Callers that relied on that raise
+  as a feature gate ("durable retention impossible here") no longer get the
+  signal from the constructor; consult `retention_meta()` (the persisted
+  `(enabled, policy)` surface) or the new `RetentionPolicy` parameter to detect
+  and control durable retention. Content bytes now land in `state.db` when (and
+  only when) this flag is on — see `docs/security.md` for the 0600 posture.
+- **`commit_cas(..., content=None)` under retention no longer records the prior
+  body under the new version.** The old behavior silently retained the STALE
+  previous body as the new version's snapshot (history poisoning, observable
+  only through retention reads). A `content=None` WIN now records nothing for
+  the new version: `get_content_at_version(new_version)` returns `None` and
+  `read_at_version(new_version)` (once it is history) rejects `not_retained`.
+  Relatedly, `get_content_at_version` is now annotated `str | bytes | None` on
+  both registries — bytes bodies round-trip as `bytes` (they always did on the
+  in-process path; the annotation was wrong).
+
+### Fixed
+
+- **Watchdog late-completion phantom grant / late grant-revocation (A6).** When
+  a coordinator hook handler exceeded its 4s watchdog and returned
+  `degraded: true`, its work kept running in the pool and its registry mutation
+  could land afterward — the agent could be left holding an `EXCLUSIVE` grant it
+  never saw (and its peers silently invalidated), or a late `session-stop`
+  release could revoke a grant the registry had since handed to the next
+  session. This was detection-only (`watchdog_late_completion_total`). The
+  mutating handlers (`pre-edit`, `post-edit`, `post-edit-cas`, `session-stop`)
+  now thread a per-request abort token into `CoordinatorService.write` /
+  `invalidate` / `commit` / `commit_cas`; the watchdog sets it on timeout, and a
+  new `registry.abort_guard` checks it the instant the late work wins the
+  registry write lock (the reentrant `RLock` that serializes all mutations),
+  raising `WatchdogAbandoned` so the mutation never lands. This closes the
+  dominant case (work blocked on the lock under contention). A new
+  `watchdog_late_aborts_total` counter (in `/status?detail=metrics`) records
+  when the guard fires. Residual (documented): a `BEGIN IMMEDIATE` that begins
+  after the check and then blocks on cross-process SQLite contention is still
+  observed by `watchdog_late_completion_total`; the complete fix
+  (response-and-visibility atomicity) is deferred to a fencing redesign.
+- **Watchdog-degraded reads no longer silently pass as verified-fresh (A7).**
+  When a `pre-read` / `pre-bash` / `pre-grep` handler exceeded its watchdog
+  (e.g. its task burned the budget waiting in the executor queue under SQLite
+  contention), it returned `{status: "fresh", degraded: true}` with no
+  `hookSpecificOutput` — so the staleness check that never ran was
+  indistinguishable from a confirmed-fresh read, and the model saw no warning.
+  The degraded read envelope now carries an advisory `additionalContext` (the
+  hook client passes it straight through) stating that freshness is unverified
+  and the file should be re-read if shared. `status` stays `"fresh"` for wire
+  back-compat. (Unbounded handler concurrency was already bounded by the
+  handler-concurrency semaphore + watchdog queue-depth gate; this addresses the
+  remaining *silent* suppression. Coupling the per-request deadline to dequeue
+  time, so queue wait doesn't consume the work budget, is a separate deferred
+  improvement.)
+- **Coordinator spawn/idle lifecycle hardening (L1, L3, L5).**
+  - **L1 — `rm -rf .coherence/` during coordinator construction.** The
+    spawn-or-join loop revalidated the `server.pid` inode before acquiring the
+    flock, but an external `rm -rf .coherence/ && recreate` landing during
+    `CoordinatorHTTPServer` construction (SQLite open + TCP bind, >300ms cold)
+    left the winner about to write the port into an orphaned `server.pid` that
+    no concurrent reader could see — losers read the recreated, port-less file
+    and degraded. The winner now re-validates the inode after construction and
+    immediately before writing the port; on mismatch it tears down the
+    just-bound coordinator (freeing the socket) and recovers on a fresh inode.
+  - **L5 — idle/uptime now use a monotonic clock.** `idle_seconds` and
+    `uptime_s` were computed from `time.time()` deltas, so an NTP step or a
+    suspend/resume could misfire idle shutdown early or defer it. Both now use
+    `time.monotonic()`; `time.time()` is reserved for operator-facing absolute
+    timestamps.
+  - **L3 — thundering-herd loser degrade is now observable.** When the loop
+    exhausts its inode/retry budget under a cold-start herd and returns `-1`,
+    a per-reason process-lifetime counter (`get_spawn_join_exhaustion_total()`
+    / `_by_reason()`) records it — surfacing the otherwise-silent degrade and
+    keeping the herd-exhaustion reasons distinct from the dying-coordinator
+    probe failure. The retry budget itself is unchanged (a deterministic retune
+    is deferred pending real-world p99 cold-start data).
+
 ## [0.9.2] — 2026-06-11
 
 ### Fixed

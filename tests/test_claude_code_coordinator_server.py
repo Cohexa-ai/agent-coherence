@@ -3133,7 +3133,7 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     result.get('ok') don't see None. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3155,7 +3155,7 @@ def test_ac05_post_edit_degraded_response_returns_ok_shape(
     include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3180,7 +3180,7 @@ def test_ac05_session_stop_degraded_response_returns_ok_shape(
     must include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3200,7 +3200,7 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     don't see ok=None. AC-05 contract preservation."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn):
+    def force_timeout(fn, abort=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3213,6 +3213,33 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     assert body.get("degraded") is True
     # Crucially, pre-read's degraded envelope does NOT include ok.
     assert "ok" not in body
+
+
+def test_a7_degraded_read_surfaces_advisory_not_silent(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A7: a watchdog-degraded read must NOT silently pass as verified-fresh.
+    The degraded envelope now carries a hookSpecificOutput advisory the model
+    sees (the hook client passes it straight through), so an in-queue/processing
+    timeout cannot masquerade as a confirmed fresh read."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    def force_timeout(fn, abort=None):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("a7-degraded"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body.get("status") == "fresh"
+    assert body.get("degraded") is True
+    hso = body.get("hookSpecificOutput")
+    assert isinstance(hso, dict), "degraded read must carry an advisory (non-silent)"
+    assert "timed out" in hso.get("additionalContext", "").lower(), (
+        f"advisory must explain the freshness check did not run; got {hso!r}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -3257,3 +3284,35 @@ def test_t01_pre_bash_notices_only_branch_surfaces_preemption(
     else:
         # Notice deferred to next pre-read — handler returned plain fresh.
         assert body.get("status") == "fresh"
+
+
+# ----------------------------------------------------------------------
+# L5 — idle/uptime use a monotonic clock (NTP-/suspend-safe)
+# ----------------------------------------------------------------------
+
+
+def test_l5_idle_and_uptime_use_monotonic_immune_to_wall_clock(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L5: idle_seconds / uptime_s are monotonic deltas, so a wall-clock
+    (NTP step / suspend-resume) jump does not misfire or defer idle shutdown.
+    Against the old time.time() body the backward-time assertions below fail."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    with CoordinatorHTTPServer(tmp_path, port=0, instance_id="l5-test") as srv:
+        # _started_at and _last_request_at were seeded at monotonic 1000.0.
+        clock["t"] = 1030.0
+        assert srv.idle_seconds == 30.0
+        assert srv.uptime_s == 30.0
+        # A wild wall-clock step (NTP back an hour / resume) must NOT perturb the
+        # monotonic-based deltas — the core L5 regression assertion.
+        monkeypatch.setattr(mod.time, "time", lambda: 1.0)
+        assert srv.idle_seconds == 30.0
+        assert srv.uptime_s == 30.0
+        # mark_request resets idle on the monotonic clock.
+        clock["t"] = 1100.0
+        srv.mark_request()
+        clock["t"] = 1105.0
+        assert srv.idle_seconds == 5.0
