@@ -6,6 +6,8 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-14
+
 ### Added
 
 - **Bounded, durable version retention + read-at-version.** The coordinator can
@@ -25,6 +27,13 @@ Alpha — APIs may change before `v1.0`.
   fence claim (R6/R7). Formally modelled in `formal/tla/Retention.tla`
   (`NoCollectedRead` + a versioned-read-is-a-no-op action property), wired into
   `make tla-check`.
+- **Reproducible temporal-cost sweep + token/$ translation** (benchmark tooling,
+  no library API change). The change-rate × answer-sensitivity sweep
+  (`tools/run_cost_sweep.py`) gains `--rates/--sensitivities/--runs` so a refined
+  grid reproduces from committed code; the pre-registered savings-regime verdict
+  is recorded in `benchmarks/cost_preregistration.md` (PASS at n=50, crossover
+  r≈0.31). `tools/cost_to_tokens.py` translates the re-fetch-avoided proxy into
+  input-token + prompt-cache dollar terms under explicit, labeled assumptions.
 
 ### Changed
 
