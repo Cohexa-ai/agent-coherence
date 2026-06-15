@@ -77,6 +77,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
 - 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
+- 🗂️ [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files) — `CoherentVolume`, the data-plane appliance for plain files shared across processes
 - 🧮 [Formal verification](formal/tla/README.md) — the five TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
@@ -97,21 +98,41 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 
 - **Protocol** (`ccs.core`, `ccs.strategies`) — coherence state machine and synchronization strategies; no framework dependencies.
 - **Coordinator** (`ccs.coordinator`) — authority service tracking directory state, publishing invalidations, arbitrating commit-CAS, and reclaiming stale grants (crash recovery + read-generation fence).
-- **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen (~100 lines each), an experimental OpenAI Agents SDK adapter (`Session`-cache coherence + `RunHooks`), and `CoherentVolume` for plain files shared across processes.
+- **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen (~100 lines each), plus an experimental OpenAI Agents SDK adapter (`Session`-cache coherence + `RunHooks`).
+- **Coherent workspace** (`ccs.adapters.coherent_volume`) — the **data-plane appliance**: an out-of-process coordinator client that brings the same guarantee to plain files on disk, no framework required. See [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files).
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by default, swap in Redis, Kafka, NATS, or gRPC streams for production.
 
 Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, and version retention's no-collected-read — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all five specs on every push and PR.
 
+## Coherent workspace: the data plane for shared files
+
+The framework adapters wrap a store. `CoherentVolume` is the other half — the **data-plane appliance**, the building block that makes a shared *workspace* coherent for plain files on disk, with no framework in the loop. Architecturally it's an out-of-process coordinator *client*, not an in-process wrapper: it writes the policy, spawns (or attaches to) a local coordinator over SQLite-WAL, and routes reads and writes through it. Your content stays on the real filesystem; the coordinator holds only MESI state, a content hash, and a version per managed file. Point a sibling volume in another process at the same workspace and it attaches to the same coordinator, so a single-host fleet shares one coherent view.
+
+```python
+from ccs.adapters.coherent_volume import CoherentVolume
+
+vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
+data = vol.read("plans/plan.md")              # bytes — registers a SHARED view
+vol.write("plans/plan.md", revise(data))      # stale view? denied fail-closed
+data = vol.reacquire("plans/plan.md")         # recover: re-mint identity + mandatory fresh read
+```
+
+The explicit `read` / `write` / `reacquire` / `write_cas` API is the **supported** primitive (`write_cas(path, make_content)` is the optimistic counterpart for same-key contention — the loser gets a typed conflict, never a silent drop). For code you'd rather not rewrite, an **opt-in, demo-grade** `open()` shim routes managed-path opens through the volume so existing `open()` / `pathlib` calls get coherence unchanged:
+
+```python
+from ccs.adapters.coherent_volume import coherent_workspace
+
+with coherent_workspace(workspace_root, managed=("plans/**",)):
+    text = open("plans/plan.md").read()       # registers a SHARED view
+    open("plans/plan.md", "w").write(edit)    # stale view? raises out of close()
+```
+
+**Scope, honestly.** v1 prevents the **sequential** stale-read→write lost update for a single-host fleet sharing one workspace (A reads v1, B reads v1, A commits v2, B's stale write is denied → B re-reads). It does **not** serialize concurrent racing writers, nor catch an agent that re-reads fresh bytes and then writes a buffer computed from older ones. The `open()` shim is convenience, not the contract: it covers `open()`/`pathlib` text+binary read/write, but not raw `os.open`, subprocess redirection, `mmap`, or append/update modes — those delegate to the original `open()` unchanged. Run it yourself: `python -m examples.coherent_volume.main` (offline, deterministic, no keys), or read the [positioning + FAQ](https://agent-coherence.dev/rag/).
+
 ## Status
 
 **`v0.9.3` released — bounded, durable version retention + read-at-version, plus coordinator lifecycle hardening.** The coordinator can now retain a bounded history of committed versions and serve any retained `(artifact, version)` via `read_at_version(...)` — opt-in `RetentionPolicy(max_versions=K, max_age_seconds=T)`, **off by default**; durable across restart for in-process embedders behind an automatic, atomic SQLite `v1 → v2` upgrade. Read-at-version is off-protocol (no MESI grant, no fence capture) and model-checked in `formal/tla/Retention.tla`. Also: watchdog late-completion/degraded-read hardening (A6/A7), spawn/idle lifecycle fixes (L1/L3/L5), the read-generation fence's absent-operand semantics reconciled with the spec, and a reproducible temporal-cost sweep with a token/prompt-cache-dollar translation. See [CHANGELOG.md](CHANGELOG.md).
-
-**`v0.9.2` released — closes a silent lost-update in `CoherentVolume.write_cas` under high same-key write contention.** A peer commit landing between `write_cas`'s `reacquire()` and its version read could pair stale bytes with a fresh version and win the CAS, silently dropping the peer's update on disk (the protocol-level `NoLostUpdate` invariant still held — the bug was below it, in the demo write path). Each retry now derives its `(bytes, version)` comparand from one hash-checked read, so the split is structurally unrepresentable. Also: an additive `hash_differs` signal on the `/hooks/pre-read` fresh-SHARED path (with a `fresh_shared_hash_mismatch_total` counter), and a coordinator fix that preserves the fresh-path `version` field when a preemption notice rides along. See [CHANGELOG.md](CHANGELOG.md).
-
-**`v0.9.1` released — the optimistic commit-CAS write path and the read-generation fence.** Concurrent same-key writes now resolve to one winner with typed, retryable conflicts (`commit_cas` / `write_cas`; `NoLostUpdate` model-checked), and a writer whose grant was reclaimed can no longer land a stale commit even with the version unchanged (`stale_read_generation`; `NoStaleApply` model-checked). SQLite stores upgrade in place — no migration step. Also: `CoherentVolume` stale-cache and grant-release fixes. See [CHANGELOG.md](CHANGELOG.md).
-
-**`v0.9.0` — crash recovery on by default, plus `CoherentVolume` and a temporal cost benchmark.** The crash-recovery default flips from `enabled=False` to **`enabled=True`**, so a bare `CCSStore()` / `CoherenceAdapterCore()` now reclaims stale grants automatically — pass `CrashRecoveryConfig(enabled=False)` to opt out. Byte-identity preservation under the default config now requires explicit `CrashRecoveryConfig(enabled=False)` to reproduce v0.8.x output.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
