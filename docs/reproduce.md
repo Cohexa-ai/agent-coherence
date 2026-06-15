@@ -34,6 +34,21 @@ bash scripts/reproduce.sh
 
 `scripts/reproduce.sh` re-runs all scenarios and verifies output against `SUMMARY.md` within ±0.5% tolerance using `tools/verify_baseline.py`.
 
+## Temporal-cost sweep (TC-1)
+
+A separate, pre-registered benchmark for the **temporal / source-drift** dimension — how many re-fetches coherence-gating avoids as a *single* agent's source changes between turns, versus an always-re-fetch baseline. Distinct from the spatial workloads above (more agents sharing one artifact); do not splice the two.
+
+```bash
+python tools/run_cost_sweep.py \
+  --rates 0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.5,0.75,1.0 \
+  --sensitivities 0,0.5,1.0 --runs 50 \
+  --output benchmarks/results/cost_sweep_published.json
+python tools/plot_cost_sweep.py    # → benchmarks/results/cost_sweep_savings_curve.svg
+python tools/cost_to_tokens.py     # token/$ translation, under stated assumptions
+```
+
+The seeded sweep reproduces the committed `benchmarks/results/cost_sweep_published.json` byte-for-byte. The pre-registered verdict (PASS at n=50; savings ≥ 30% across all `r ≤ 0.30`; crossover `r ≈ 0.31`) and the distinguisher triage live in [`../benchmarks/cost_preregistration.md`](../benchmarks/cost_preregistration.md). The metric is **re-fetches-avoided** — a proxy / regime map, **not** a token-dollar invoice; `cost_to_tokens.py`'s dollar figures are explicitly assumption-parameterized. Shipped in `v0.9.3` (#116).
+
 ## Simulation scope
 
 The simulation models token transmission accounting, MESI state transitions, write-frequency effects, and artifact volatility.

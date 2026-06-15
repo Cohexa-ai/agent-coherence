@@ -63,9 +63,20 @@ Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` run
 
 *Measured on real LangGraph graphs; see [docs/reproduce.md](docs/reproduce.md) and the [user guide](docs/guide.md#real-workload-benchmarks).*
 
+Those are the **spatial** savings (more agents sharing one artifact). The **temporal** dimension — a single agent whose source drifts between its turns — has its own pre-registered benchmark, **TC-1** (#116): a reproducible savings-regime map of how many re-fetches coherence-gating avoids as the change-rate rises. The metric is *re-fetches-avoided* — a proxy, a regime map, **not** a token/dollar invoice. Reproduce with `python tools/run_cost_sweep.py`; the locked verdict + numbers (PASS at n=50, crossover r≈0.31) live in [`benchmarks/cost_preregistration.md`](benchmarks/cost_preregistration.md). Shipped in `v0.9.3`.
+
+## RAG & shared agent memory
+
+RAG corpora and agent memory are **shared mutable state**, so the stale-read→write lost update lands there too — and *a consistent store doesn't save you*: the staleness is in the **agent's cached view of a record**, not the store. Two agents read a record at v1; one writes v2; the other, still on its v1, writes an edit computed from v1 and clobbers v2. `agent-coherence` keeps the readers honest: `CCSStore` is a drop-in for `langgraph.store` (and composes with Mem0, Letta, LlamaIndex, a vector store, or a plain file via `CoherentVolume`) — it stores no vectors and does no ranking; it's the consistency layer underneath whatever you already use to retrieve and remember.
+
+- **Runnable, deterministic demo** (offline, no keys): `python -m examples.coherent_volume.main` reproduces the documented lost update, then prevents it.
+- **Honest scope:** writes that go through the coordinator are caught. Auto-watching an *unmanaged external source* that changes with no coordinator write (a hand-edited file, an out-of-band re-index) is the source-watcher case — **on the roadmap, demand-gated, not shipped today.**
+- **Positioning + FAQ:** [agent-coherence.dev/rag](https://agent-coherence.dev/rag/).
+
 ---
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
+- 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
 - 🧮 [Formal verification](formal/tla/README.md) — the five TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share

@@ -738,6 +738,18 @@ rate). The high-churn workload has 4 writes and 8 reads (50% hit rate).
 For the simulation-based results from the paper (84–95% savings), see
 [REPRODUCE.md](REPRODUCE.md).
 
+### Temporal cost: source drift between turns (TC-1)
+
+The table above is the **spatial** dimension — savings grow with more agents sharing one artifact. The **temporal** dimension is orthogonal: a *single* agent (a RAG/memory reader) whose source drifts between its turns, where coherence-gating avoids re-fetching a chunk that didn't change. TC-1 is the pre-registered benchmark for it — a savings-regime map across change-rate × answer-sensitivity:
+
+```bash
+python tools/run_cost_sweep.py --rates 0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.5,0.75,1.0 \
+  --sensitivities 0,0.5,1.0 --runs 50 --output benchmarks/results/cost_sweep_published.json
+python tools/plot_cost_sweep.py    # savings-vs-change-rate curve
+```
+
+PASS at n=50: savings stay ≥ 30% while the source changes fewer than ~3 turns in 10 (`r ≤ 0.30`), crossing below 30% at `r ≈ 0.31` and falling to 0 at constant churn. The metric is **re-fetches-avoided** — a proxy / regime map, not a token-dollar invoice (`tools/cost_to_tokens.py` gives an assumption-parameterized dollar translation). Verdict + distinguisher triage: [`../benchmarks/cost_preregistration.md`](../benchmarks/cost_preregistration.md). **Don't splice these numbers into the spatial table above.** Shipped in `v0.9.3` (#116).
+
 ---
 
 ## Benchmarking your own workload
