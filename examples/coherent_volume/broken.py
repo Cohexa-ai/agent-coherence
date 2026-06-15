@@ -6,8 +6,8 @@
 Two agents each update a shared total. Both read the same starting value; agent
 A commits its update; then agent B commits an update it computed from the value
 it read *before* A's commit. B's write silently overwrites A's — the classic
-lost update (the OpenViktor cron shape: read, compute, write-back-from-the-old-
-read). No coordinator is involved; that is the point. ``fixed.py`` shows the
+lost update (the cron / heartbeat-write shape: read, compute, write-back-from-
+the-old-read). No coordinator is involved; that is the point. ``fixed.py`` shows the
 same sequence denied and recovered through CoherentVolume.
 
 Deterministic and offline — sequenced, not raced.
