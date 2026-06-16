@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Replay CLI resolve mode — the wired ``read_at_version`` consumer (Unit 6 / R5b).

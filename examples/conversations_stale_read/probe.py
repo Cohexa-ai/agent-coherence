@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Q6 consistency probe (Phase 0 / Unit 1) — gate for the OpenAI/Mistral demo.

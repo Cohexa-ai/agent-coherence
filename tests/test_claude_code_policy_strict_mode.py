@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Tests for TrackedArtifactPolicy strict-mode opt-in (v0.2 plan Unit 1, KTD-O).
