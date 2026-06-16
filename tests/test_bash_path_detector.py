@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 
 """Tests for the Bash file-path detector (v0.1.1 KTD-N H4 mitigation).
 

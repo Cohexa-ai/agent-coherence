@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Token optimization layer for multi-agent LangGraph systems — cut shared-artifact token costs via MESI cache coherence, one import change"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Arbiter contributors" }]
+authors = [{ name = "agent-coherence contributors" }]
 keywords = ["multi-agent", "llm", "cache-coherence", "mesi", "token-efficiency", "agents"]
 classifiers = [
   "Development Status :: 3 - Alpha",
