@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """CI drift check: compare benchmarks/results/cost_sweep.json against benchmarks/expected_cost.json.

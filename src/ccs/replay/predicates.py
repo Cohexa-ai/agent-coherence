@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Replay invariant predicates — Core 4 + SKIPPED dispatch (Unit 4 of D v1).

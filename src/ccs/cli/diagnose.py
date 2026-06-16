@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """CLI entrypoint for ``ccs-diagnose`` (Unit 7 — pipeline integration).

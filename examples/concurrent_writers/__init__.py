@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Concurrent lost-update demo for the v0.9.1 commit-CAS write path (Epic Piece #6).
