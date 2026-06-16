@@ -53,13 +53,11 @@ and cross-host coordination are out of scope.
 
 ## Why this shape is worth a demo
 
-The divergent-view failure is real and recurring in agent-memory trackers, e.g.
-[`thedotmack/claude-mem#2909`](https://github.com/thedotmack/claude-mem/issues/2909)
-(no cross-session isolation — all sessions' observations mixed at injection
-because context is filtered by project, never session) and
-[`#2821`](https://github.com/thedotmack/claude-mem/issues/2821) (parallel sessions
-silently drop observations under lock contention). It is the one shape the other
-demos and the Mem0 probe do not frame.
+The divergent-view failure is real and recurring in agent-memory systems: sessions
+losing cross-session isolation (observations from separate sessions mixed at
+injection because context is filtered by project, never by session), and parallel
+sessions silently dropping observations under lock contention. It is the one shape
+the other demos do not frame.
 
 ## The cost side effect
 
