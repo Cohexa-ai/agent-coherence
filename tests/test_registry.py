@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Tests for the in-memory ArtifactRegistry OCC commit-CAS (plan Unit 2).

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Minimal deny-site audit log — appends strict-mode denial events as

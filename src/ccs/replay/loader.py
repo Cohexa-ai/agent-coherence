@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Trace loader — merge engine + corruption detection (Unit 3 of D v1).

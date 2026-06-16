@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Artifact Ownership Map computation for ``ccs-diagnose`` (Unit 5 helper).

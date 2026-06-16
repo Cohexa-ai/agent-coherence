@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
 """Canonical benchmark runner for paper Table 1 reproduction checks."""

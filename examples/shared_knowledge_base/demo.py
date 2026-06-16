@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["agent-coherence>=0.9.0"]
 # ///
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 #
 # Run it (no repo checkout, no API keys, offline):
