@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["agent-coherence>=0.9.0"]
 # ///
-# Copyright (c) 2026 Arbiter contributors.
+# Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 #
 # Run it (no repo checkout, no API keys, offline):
@@ -56,8 +56,8 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import CoherenceError
 
 # The shared decision record both sessions read and write their conclusion to —
-# the durable cross-session memory. Think: a claude-mem observation store, a Mem0
-# fact, a Letta memory block, a team decisions.md a research fleet writes back to.
+# the durable cross-session memory: an observation store, a memory record, or a
+# team decisions.md that a research fleet reads and writes back to.
 _REL = "memory/db_decision.md"
 _SEED = "# Decision: database engine\nStatus: open (no decision recorded yet)\n"
 
@@ -226,9 +226,9 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-# The divergent-view failure mode is real and recurring in agent-memory trackers,
-# e.g. claude-mem #2909 (no cross-session isolation — sessions' observations mixed)
-# and #2821 (parallel sessions silently drop observations). Sibling demo (lost
+# The divergent-view failure mode is real and recurring in agent-memory systems:
+# sessions losing cross-session isolation (observations from separate sessions
+# mixed), and parallel sessions silently dropping observations. Sibling demo (lost
 # update, write-clobber):
 #   https://github.com/hipvlady/agent-coherence/tree/main/examples/shared_knowledge_base
 # RAG / shared-agent-memory positioning:
