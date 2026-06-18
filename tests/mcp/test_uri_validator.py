@@ -135,3 +135,17 @@ def test_new_nonexistent_file_allowed(tmp_path: Path) -> None:
     """A write target that does not exist yet validates (realpath resolves the
     existing prefix and stays within root)."""
     assert validate_uri("data/brand_new.txt", root=tmp_path) == "data/brand_new.txt"
+
+
+def test_symlink_to_coherence_dir_rejected(tmp_path: Path) -> None:
+    """A within-root symlink whose target RESOLVES into .coherence must be rejected
+    even though its key (parts[0]) is not '.coherence' and it stays within root —
+    otherwise the coordinator secret/state is readable through the symlink."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    coherence = ws / ".coherence"
+    coherence.mkdir()
+    (coherence / "hook.secret").write_text("secret")
+    (ws / "data").symlink_to(coherence, target_is_directory=True)
+    with pytest.raises(UriValidationError):
+        validate_uri("data/hook.secret", root=ws)

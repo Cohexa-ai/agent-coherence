@@ -85,6 +85,17 @@ def _reject_path_escape(root: Path, key: str) -> None:
     target_real = os.path.realpath(Path(root) / key)
     if not _is_within(target_real, root_real):
         raise UriValidationError("path escapes the workspace root (traversal or symlink)")
+    # The string-level .coherence check (_targets_coherence_state) inspects the
+    # KEY; a symlink whose target RESOLVES into .coherence (e.g. `data` ->
+    # `.coherence`) has parts[0] == "data" (passes that check) and stays within
+    # root (passes containment). Re-check the RESOLVED path so coordinator state
+    # (state.db, hook.secret, server.pid, *.yaml) can never be read through a
+    # symlink, even by a sandboxed agent that cannot reach .coherence directly.
+    coherence_real = os.path.realpath(os.path.join(root_real, _COHERENCE_DIR))
+    if _is_within(target_real, coherence_real):
+        raise UriValidationError(
+            "path resolves into coordinator state (.coherence/**) via a symlink"
+        )
 
 
 def _is_within(candidate: str, root: str) -> bool:
