@@ -249,7 +249,7 @@ class CoherentVolume:
         identities (``reacquire``/``_after_fork`` re-mint ``_session_id`` while
         the lock-free op path reads it). This guard makes that misuse LOUD rather
         than silently corrupting: a second thread entering while another holds the
-        guard raises ``CoherenceError``.
+        guard raises ``InternalConcurrencyError`` (a ``CoherenceError`` subclass).
 
         Re-entrant for the SAME thread so internal nesting works (``write_cas``
         calls :meth:`reacquire`, which calls :meth:`read`): the owning thread
@@ -426,7 +426,8 @@ class CoherentVolume:
             return None
         try:
             status = _coordinator_get(self._endpoint, "/status")
-        except Exception:  # best-effort; any failure → unknown
+        except Exception as exc:  # best-effort; any failure → unknown
+            logger.debug("coordinator_status probe failed: %s", exc)
             return None
         return status if isinstance(status, dict) else None
 
@@ -492,8 +493,9 @@ class CoherentVolume:
         Prevents the **sequential** stale-read→write lost update: if a peer
         committed a newer version since this instance last read, this instance
         is ``INVALID`` and the coordinator denies the write (``pre-edit``). The
-        deny is surfaced as ``CoherenceError`` carrying the coordinator's
-        byte-stable reason VERBATIM. **A deny always raises, in both
+        deny is surfaced as ``StaleView`` (pre-edit) or ``CommitPreempted``
+        (post-edit preempt) — both ``CoherenceError`` subclasses — carrying the
+        coordinator's byte-stable reason VERBATIM. **A deny always raises, in both
         ``on_error`` modes** — the deny is enforcement working, not an
         infrastructure failure; recover via :meth:`reacquire` and write from the
         fresh bytes.
@@ -656,8 +658,8 @@ class CoherentVolume:
         stale-denied comparand read (the transient window where a peer's commit
         landed but its disk write hasn't) does NOT consume the commit budget;
         instead CONSECUTIVE denied reads are separately bounded (also at
-        ``MAX_CAS_REACQUIRES + 1``) and raise ``CoherenceError`` if the view
-        never clears. Both terminals are the honest fail-closed outcome,
+        ``MAX_CAS_REACQUIRES + 1``) and raise ``ViewWedged`` (a ``CoherenceError``
+        subclass) if the view never clears. Both terminals are the honest fail-closed outcome,
         **never** a silent lost update: the invariant this method guarantees is
         *final == start + every applied delta, OR a typed raise* — a successful
         return always means the update landed.

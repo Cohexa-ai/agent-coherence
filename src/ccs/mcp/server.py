@@ -105,8 +105,9 @@ _STATUS_DESC = (
 )
 
 _WRITE_CAS_DESC = (
-    "Concurrent same-key write via compare-and-set. You read (swg_read returns a "
-    "version), MERGE, then call swg_write_cas(path, expected_version, "
+    "Concurrent same-key write via compare-and-set. You read (swg_read returns the "
+    "version comparand; swg_reacquire does NOT — it is for swg_write recovery), "
+    "MERGE, then call swg_write_cas(path, expected_version, "
     "new_content). Stale-write-rejected: if a peer committed since your read, the "
     "CAS is a TYPED CONFLICT (reason=version_mismatch, current_version returned) "
     "— NOT an auto-merge; re-read at current_version, re-merge, and retry. The "
@@ -206,6 +207,8 @@ def _do_read(volume: CoherentVolume, config: SessionConfig, path: str) -> CallTo
         return _client_error_result("file_not_found", "check_path", str(exc))
     except CoherenceError as exc:
         return deny_result(exc)
+    except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
+        return _client_error_result("io_error", "none", str(exc))
     text = _decode_text(data)
     if text is None:
         return _client_error_result("binary_unsupported", "use_text", f"{key} is not UTF-8 text (v1 guards text only)")
@@ -225,6 +228,8 @@ def _do_write(volume: CoherentVolume, config: SessionConfig, path: str, content:
         volume.write(key, content.encode("utf-8"))
     except CoherenceError as exc:
         return deny_result(exc)
+    except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
+        return _client_error_result("io_error", "none", str(exc))
     return _ok_result({"ok": True, "path": key}, f"wrote {key}")
 
 
@@ -241,6 +246,8 @@ def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> C
         return _client_error_result("file_not_found", "check_path", str(exc))
     except CoherenceError as exc:
         return deny_result(exc)
+    except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
+        return _client_error_result("io_error", "none", str(exc))
     text = _decode_text(data)
     if text is None:
         return _client_error_result("binary_unsupported", "use_text", f"{key} is not UTF-8 text (v1 guards text only)")
@@ -280,8 +287,12 @@ def _do_write_cas(
             )
         conflicts[key] = count
         return deny_result(exc)
+    except FileNotFoundError as exc:
+        return _client_error_result("file_not_found", "check_path", str(exc))
     except CoherenceError as exc:
         return deny_result(exc)
+    except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
+        return _client_error_result("io_error", "none", str(exc))
     conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
     return _ok_result({"ok": True, "path": key}, f"committed {key}")
 

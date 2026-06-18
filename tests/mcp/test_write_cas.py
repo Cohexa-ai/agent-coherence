@@ -199,3 +199,45 @@ def test_write_cas_description_states_cooperating_caveat() -> None:
     assert "livelock-proof" in _WRITE_CAS_DESC
     assert "version_mismatch" in _WRITE_CAS_DESC
     assert "auto-merge" in _WRITE_CAS_DESC
+
+
+# --- fail-closed + counter semantics -----------------------------------------
+
+
+def test_write_cas_missing_file_is_file_not_found(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A CAS on a non-existent file is a non-deny client error (file_not_found),
+    not an escaped FileNotFoundError."""
+    (tmp_path / "data").mkdir()
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        result = _do_write_cas(vol, config, {}, "data/nope.txt", 0, "x")
+        assert result.isError is True
+        assert result.structuredContent["reason"] == "file_not_found"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_counter_resets_after_a_win(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A win mid-streak resets the per-path conflict counter — a subsequent
+    conflict starts fresh at 1, not at the prior streak."""
+    _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        conflicts: dict[str, int] = {}
+        # expected_version=0 always conflicts against a v>0 file.
+        for _ in range(MAX_CAS_CONFLICTS - 1):
+            assert _do_write_cas(vol, config, conflicts, _PATH, 0, "x").structuredContent["reason"] == "version_mismatch"
+        assert conflicts[_PATH] == MAX_CAS_CONFLICTS - 1
+
+        # A win resets the streak ...
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        assert _do_write_cas(vol, config, conflicts, _PATH, version, "won").isError is False
+        assert _PATH not in conflicts
+
+        # ... so the next conflict starts at 1, not near the exhaustion bound.
+        assert _do_write_cas(vol, config, conflicts, _PATH, 0, "x").structuredContent["reason"] == "version_mismatch"
+        assert conflicts[_PATH] == 1
+    finally:
+        stop_coordinator(tmp_path)

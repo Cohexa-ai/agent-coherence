@@ -197,3 +197,47 @@ def test_instructions_state_forbidden_and_trust_boundary() -> None:
     assert "auto-merge" in text
     assert "trust boundary" in text
     assert "single-uid" in text
+
+
+# --- fail-closed: unattached read/reacquire + IO errors ----------------------
+
+
+def test_read_unattached_fails_closed(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    _seed(tmp_path, content=b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        vol._endpoint = None
+        result = _do_read(vol, config, "data/shared.txt")
+        assert result.isError is True
+        assert result.structuredContent["reason"] == "coordinator_unavailable"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_unattached_fails_closed(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    _seed(tmp_path, content=b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        vol._endpoint = None
+        result = _do_reacquire(vol, config, "data/shared.txt")
+        assert result.isError is True
+        assert result.structuredContent["reason"] == "coordinator_unavailable"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_os_error_fails_closed(tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch) -> None:
+    """A non-CoherenceError OSError (disk full / permission) from the underlying
+    write must fail closed as a tool error, never escape to FastMCP."""
+    _seed(tmp_path, content=b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        monkeypatch.setattr(vol, "write", lambda *a, **k: (_ for _ in ()).throw(PermissionError("disk")))
+        result = _do_write(vol, config, "data/shared.txt", "x")
+        assert result.isError is True
+        assert result.structuredContent["reason"] == "io_error"
+    finally:
+        stop_coordinator(tmp_path)
