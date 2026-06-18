@@ -81,7 +81,10 @@ diagnose = ["agent-coherence[langgraph]", "jinja2>=3.1", "langchain-core>=0.2"]
 openai = ["openai>=2.0", "httpx>=0.27"]
 openai-agents = ["agent-coherence[openai]", "openai-agents>=0.17,<0.18"]
 mistral = ["mistralai>=2.0"]
-all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral]"]
+# MCP-C v1: the stale-write-guard-fs stdio MCP server (ccs.mcp). The official
+# `mcp` SDK is the only new runtime dep; v2-alpha renames FastMCP, so pin <2.
+mcp = ["mcp>=1.27,<2"]
+all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral,mcp]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
