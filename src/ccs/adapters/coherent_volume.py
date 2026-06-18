@@ -66,11 +66,17 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
     CoherenceDegradedWarning,
     CoherenceError,
+    CommitPreempted,
+    CommitUnconfirmed,
+    InternalConcurrencyError,
+    StaleView,
+    ViewWedged,
 )
 
 logger = logging.getLogger(__name__)
@@ -254,7 +260,10 @@ class CoherentVolume:
         ident = threading.get_ident()
         with self._guard_meta_lock:
             if self._guard_owner_ident is not None and self._guard_owner_ident != ident:
-                raise CoherenceError(
+                # A server-misuse bug (the MCP server serializes tool access), not
+                # an agent-recoverable deny — typed so the mapper never relays it
+                # as a retryable stale view.
+                raise InternalConcurrencyError(
                     "CoherentVolume is single-threaded; concurrent use detected. "
                     "One operation at a time per instance — use one instance per "
                     "thread (an in-flight read/write/write_cas can re-mint identity "
@@ -719,7 +728,7 @@ class CoherentVolume:
                 last_current_version = max(last_current_version, expected_version)
                 denied_streak += 1
                 if denied_streak > MAX_CAS_REACQUIRES:
-                    raise CoherenceError(
+                    raise ViewWedged(
                         f"OCC comparand read of {rel} stayed strict-denied across "
                         f"{denied_streak} consecutive reads under re-minted "
                         "identities; cannot establish a clean (bytes, version) "
@@ -760,7 +769,7 @@ class CoherentVolume:
                 # is handled below ("raise"). on_error governs only whether the
                 # infra failure already warned (degrade) or raised (strict) inside
                 # _post; either way an unconfirmed CAS must read as failure.
-                raise CoherenceError(
+                raise CommitUnconfirmed(
                     f"OCC commit of {rel} could not be confirmed (coordinator "
                     "transport failed mid-commit); the write did not land. "
                     "reacquire() and retry from the fresh bytes."
@@ -791,7 +800,19 @@ class CoherentVolume:
                 continue
             # outcome == "raise": a deny, corruption, or the fail-closed
             # commit_unconfirmed degrade body — ALWAYS raises in both modes.
-            # Nothing was written to disk (the CAS did not win).
+            # Nothing was written to disk (the CAS did not win). Type the terminal
+            # so the MCP deny mapper classifies by exception type, not a substring
+            # of the (verbatim) coordinator prose:
+            #  - commit_unconfirmed degrade body → CommitUnconfirmed (re-read, retry
+            #    only if absent — the false-negative-ack window);
+            #  - a permission-style deny → StaleView (recoverable by reacquire);
+            #  - anything else (corruption: commit_cas_corruption / expected>current)
+            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+                raise CommitUnconfirmed(self._deny_reason(resp))
+            hook_output = resp.get("hookSpecificOutput")
+            if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
+                raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
 
     # --- coordinator I/O helpers --------------------------------------------
@@ -1030,7 +1051,15 @@ class CoherentVolume:
         if not isinstance(resp, dict):
             return
         if resp.get("ok") is False:
-            raise CoherenceError(self._deny_reason(resp))
+            # Type the deny by phase so the MCP mapper classifies by exception
+            # type, not a substring of the (verbatim) coordinator prose. A
+            # pre-edit INVALID deny is a recoverable stale view; a post-edit
+            # ok:false is a mid-write preempt/reclaim — the atomic write (:523)
+            # already hit disk un-versioned, so it is a distinct terminal that
+            # needs reconcile, not a bare retry.
+            if phase == "post-edit":
+                raise CommitPreempted(self._deny_reason(resp))
+            raise StaleView(self._deny_reason(resp))
         if resp.get("degraded"):
             self._fail_closed_or_degrade(
                 f"coordinator watchdog timeout on {phase} for {rel}"

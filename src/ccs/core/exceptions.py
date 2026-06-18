@@ -137,6 +137,27 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 # Renaming the value is a wire break; add, do not mutate.
 CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 
+# ---------------------------------------------------------------------------
+# MCP-C deny vocabulary (stale-write-guard-fs, 2026-06-18 plan, Unit 1)
+# ---------------------------------------------------------------------------
+#
+# Each fail-closed coherence terminal carries a typed ``.reason`` CONSTANT on its
+# class (below). The MCP deny mapper (``ccs.mcp.deny``) classifies by exception
+# TYPE and reads ``.reason`` — NEVER a substring of the message, which stays the
+# byte-stable coordinator ``permissionDecisionReason`` prose (the model's retry
+# loop depends on that stability, auto-memory
+# ``project_cc_strict_mode_retry_hazard``; the typed-signal-not-substring house
+# rule). Renaming a value is a wire break; add, do not mutate.
+STALE_VIEW_REASON = "stale_view"
+COMMIT_PREEMPTED_REASON = "commit_preempted"
+VIEW_WEDGED_REASON = "view_wedged"
+COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
+CAS_EXHAUSTED_REASON = "cas_exhausted"
+INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
+# Type B — synthesized by the mapper (no adapter raise-site) when the volume is
+# unattached / coordinator transport failed; the write is NOT version-committed.
+COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
+
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
@@ -217,7 +238,13 @@ class CasRetriesExhausted(CoherenceError):
 
     A subclass of :class:`CoherenceError` so the deny-always-raises consumers
     (CoherentVolume / CCSStore strict mode) already treat it as a hard failure.
+
+    Carries :data:`CAS_EXHAUSTED_REASON` (MCP-C Unit 1) so the deny mapper
+    classifies it by type; the wire reason ``cas_exhausted`` is deliberately
+    distinct from the ``cas_retries_exhausted`` prose token in the message.
     """
+
+    reason = CAS_EXHAUSTED_REASON
 
     def __init__(self, artifact_id: object, attempts: int, last_current_version: int) -> None:
         super().__init__(
@@ -228,6 +255,56 @@ class CasRetriesExhausted(CoherenceError):
         self.artifact_id = artifact_id
         self.attempts = attempts
         self.last_current_version = last_current_version
+
+
+class StaleView(CoherenceError):
+    """Pre-edit deny (MCP-C Unit 1): this instance's view is INVALID — a peer
+    committed a newer version, so the coordinator denied the write BEFORE any
+    disk mutation. Recoverable: ``reacquire()`` for fresh bytes, then write FROM
+    them. Carries :data:`STALE_VIEW_REASON`; the message stays the verbatim
+    coordinator ``permissionDecisionReason`` (matched by type, not substring)."""
+
+    reason = STALE_VIEW_REASON
+
+
+class CommitPreempted(CoherenceError):
+    """Post-edit deny (MCP-C Unit 1): the EXCLUSIVE grant was preempted /
+    sweep-reclaimed AFTER the atomic disk write but BEFORE the commit landed, so
+    the bytes may already be on disk *un-versioned* (disk ahead of the
+    coordinator version). NOT only a concurrent edge — a lone sequential writer's
+    grant can age out mid-write (crash-recovery sweep, default-on). Recover by
+    re-reading fresh bytes and reconciling the pending buffer (agent-driven; v1
+    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`."""
+
+    reason = COMMIT_PREEMPTED_REASON
+
+
+class ViewWedged(CoherenceError):
+    """OCC comparand wedged (MCP-C Unit 1): a ``write_cas`` comparand read stayed
+    strict-denied across the bounded reacquire streak — the view never cleared to
+    a usable state. Not retry-eligible in-loop: wait or escalate. Carries
+    :data:`VIEW_WEDGED_REASON`."""
+
+    reason = VIEW_WEDGED_REASON
+
+
+class CommitUnconfirmed(CoherenceError):
+    """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
+    mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
+    not have landed; reconcile by re-reading, then retry only if absent. Carries
+    :data:`COMMIT_UNCONFIRMED_REASON`."""
+
+    reason = COMMIT_UNCONFIRMED_REASON
+
+
+class InternalConcurrencyError(CoherenceError):
+    """The single-op guard fired (MCP-C Unit 1): one CoherentVolume instance was
+    used concurrently from another thread — a SERVER misuse bug (the MCP server
+    serializes tool access), never an agent-recoverable deny. Mapped to
+    :data:`INTERNAL_CONCURRENCY_REASON`, distinct from ``stale_view`` so it is
+    never relayed to the model as a retryable view."""
+
+    reason = INTERNAL_CONCURRENCY_REASON
 
 
 class ScenarioValidationError(CoherenceError):
