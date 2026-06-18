@@ -23,15 +23,15 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ccs.adapters.claude_code.lifecycle import stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.core.exceptions import CoherenceError
-from ccs.mcp.deny import coordinator_unavailable_result, deny_result
+from ccs.core.exceptions import CasVersionConflict, CoherenceError
+from ccs.mcp.deny import cas_exhausted_result, coordinator_unavailable_result, deny_result
 from ccs.mcp.session import SessionConfig, build_volume
 from ccs.mcp.status import build_status
 from ccs.mcp.uri import UriValidationError, validate_uri
@@ -104,7 +104,22 @@ _STATUS_DESC = (
     "setup is NOT distinguishable in v1)." + _SCOPE_CLAUSE
 )
 
+_WRITE_CAS_DESC = (
+    "Concurrent same-key write via compare-and-set. You read (swg_read returns a "
+    "version), MERGE, then call swg_write_cas(path, expected_version, "
+    "new_content). Stale-write-rejected: if a peer committed since your read, the "
+    "CAS is a TYPED CONFLICT (reason=version_mismatch, current_version returned) "
+    "— NOT an auto-merge; re-read at current_version, re-merge, and retry. The "
+    "per-session conflict counter bounds only a COOPERATING agent (one session, "
+    "stops on retryable=false); it is NOT livelock-proof against a fresh session "
+    "or one that ignores retryable=false." + _SCOPE_CLAUSE
+)
+
 _REACQUIRE_NOTE = "write FROM these exact bytes — the server enforces version lineage, not content derivation"
+
+# The per-session bound on consecutive CAS conflicts for one path (the
+# cooperating-agent livelock guard). Mirrors the adapter's MAX_CAS_REACQUIRES=8.
+MAX_CAS_CONFLICTS = 8
 
 
 @dataclass
@@ -118,6 +133,9 @@ class ServerContext:
     volume: CoherentVolume
     config: SessionConfig
     lock: asyncio.Lock
+    # path → consecutive CAS-conflict count, the cooperating-agent livelock bound
+    # for swg_write_cas (reset on a win; survives only within one stdio session).
+    cas_conflicts: dict[str, int] = field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -234,6 +252,40 @@ def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     return _ok_result(status, f"coordinator={status['coordinator']}")
 
 
+def _do_write_cas(
+    volume: CoherentVolume,
+    config: SessionConfig,
+    conflicts: dict[str, int],
+    path: str,
+    expected_version: int,
+    new_content: str,
+) -> CallToolResult:
+    try:
+        key = validate_uri(path, root=config.root)
+    except UriValidationError as exc:
+        return _client_error_result("invalid_path", "fix_path", str(exc))
+    if not volume.is_attached:
+        return coordinator_unavailable_result(f"coordinator unattached; refusing CAS of {key}")
+    try:
+        volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
+    except CasVersionConflict as exc:
+        # Bound a COOPERATING agent's retry loop: too many consecutive conflicts
+        # on one path in this session → tell it to stop (retryable=false).
+        count = conflicts.get(key, 0) + 1
+        if count > MAX_CAS_CONFLICTS:
+            conflicts.pop(key, None)
+            return cas_exhausted_result(
+                f"{key}: {count} consecutive CAS conflicts in this session — stop "
+                "(the cooperating-agent livelock bound; coordinator-side fencing is v1.1)"
+            )
+        conflicts[key] = count
+        return deny_result(exc)
+    except CoherenceError as exc:
+        return deny_result(exc)
+    conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
+    return _ok_result({"ok": True, "path": key}, f"committed {key}")
+
+
 # --- registration ------------------------------------------------------------
 
 
@@ -290,6 +342,17 @@ def register_tools(server: FastMCP) -> None:
         sctx = _server_context(ctx)
         async with sctx.lock:
             return _do_status(sctx.volume, sctx.config)
+
+    @server.tool(
+        name="swg_write_cas",
+        description=_WRITE_CAS_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_write_cas(path: str, expected_version: int, new_content: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_write_cas(sctx.volume, sctx.config, sctx.cas_conflicts, path, expected_version, new_content)
 
 
 def build_server() -> FastMCP:

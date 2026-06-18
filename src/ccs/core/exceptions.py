@@ -154,6 +154,10 @@ VIEW_WEDGED_REASON = "view_wedged"
 COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
 CAS_EXHAUSTED_REASON = "cas_exhausted"
 INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
+# Option-A single-shot CAS (MCP-C Unit 5): the caller's expected_version no
+# longer matches the coordinator's current version. Typed-conflict, NOT
+# auto-merge — the agent re-reads at current_version, re-merges, and retries.
+VERSION_MISMATCH_REASON = "version_mismatch"
 # Type B — synthesized by the mapper (no adapter raise-site) when the volume is
 # unattached / coordinator transport failed; the write is NOT version-committed.
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
@@ -305,6 +309,26 @@ class InternalConcurrencyError(CoherenceError):
     never relayed to the model as a retryable view."""
 
     reason = INTERNAL_CONCURRENCY_REASON
+
+
+class CasVersionConflict(CoherenceError):
+    """Option-A CAS rejected (MCP-C Unit 5): the caller's ``expected_version`` no
+    longer matches the coordinator's current version — a peer committed in
+    between, OR the caller's comparand was stale. Typed-conflict, NOT auto-merge:
+    NO write landed; the agent re-reads at ``current_version``, re-merges, and
+    retries. Carries both versions so the client can re-CAS without another read.
+    """
+
+    reason = VERSION_MISMATCH_REASON
+
+    def __init__(self, artifact_id: object, expected_version: int, current_version: int) -> None:
+        super().__init__(
+            f"version_mismatch artifact={artifact_id} expected={expected_version} "
+            f"current={current_version} (no write landed; re-read at current and re-merge)"
+        )
+        self.artifact_id = artifact_id
+        self.expected_version = expected_version
+        self.current_version = current_version
 
 
 class ScenarioValidationError(CoherenceError):

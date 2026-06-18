@@ -70,6 +70,7 @@ from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
     CommitPreempted,
@@ -831,6 +832,92 @@ class CoherentVolume:
             if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
                 raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
+
+    def write_cas_at(
+        self,
+        path: str | os.PathLike[str],
+        expected_version: int,
+        new_content: bytes | bytearray,
+    ) -> None:
+        """Single-shot, version-checked CAS (Option A — the MCP ``swg_write_cas``).
+
+        Commit ``new_content`` IFF the coordinator's current version ==
+        ``expected_version``. Unlike :meth:`write_cas` (which auto-retries by
+        re-deriving from the latest bytes), this does NOT retry and does NOT
+        re-derive: a stale ``expected_version`` raises
+        :class:`~ccs.core.exceptions.CasVersionConflict` carrying the current
+        version — the AGENT re-reads, re-merges, and retries
+        (typed-conflict, not auto-merge). This is the correct primitive for an
+        agent that already merged against a specific version it read: it never
+        commits content derived from version V over a peer's later V+1 (the
+        split-comparand lost update; ``coherent-volume-write-cas-split-comparand``).
+
+        The CAS commits against the AGENT's ``expected_version``, NOT a re-read
+        one, so a peer winning the version between the comparand read and the
+        commit is rejected as a conflict — never a silent overwrite. ``new_content``
+        touches disk ONLY on a confirmed win.
+        """
+        if not isinstance(new_content, (bytes, bytearray)):
+            raise TypeError(f"new_content must be bytes, got {type(new_content).__name__}")
+        with self._single_op_guard():
+            self._write_cas_at_impl(path, int(expected_version), bytes(new_content))
+
+    def _write_cas_at_impl(
+        self, path: str | os.PathLike[str], expected_version: int, new_content: bytes
+    ) -> None:
+        self._ensure_attached()
+        abs_path, rel = self._to_relative(path)
+        if self._endpoint is None:
+            # Strict-only construction prevents this for the server; fail closed
+            # rather than best-effort writing an unversioned blob.
+            raise CoherenceError(
+                f"cannot CAS {rel}: coordinator endpoint unavailable (fail-closed)"
+            )
+        # Re-mint first / read second: a hash-checked None-state read establishes
+        # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
+        # re-create the split-comparand hole — KTD-LU).
+        self._remint()
+        _current_bytes, current_version, stale_denied = self._read_with_version(rel)
+        if stale_denied:
+            # The comparand view is INVALID / the disk lags a just-landed commit;
+            # the agent must reacquire / re-read before it can CAS.
+            raise ViewWedged(
+                f"OCC comparand read of {rel} is strict-denied; cannot establish a "
+                "clean (bytes, version) view to CAS from. reacquire() / re-read first."
+            )
+        if current_version != expected_version:
+            # Stale expected_version → typed conflict; NO write, NO server retry.
+            raise CasVersionConflict(rel, expected_version, current_version)
+        new_hash = self._sha256_bytes(new_content)
+        resp = self._post(
+            "/hooks/post-edit-cas",
+            {
+                "session_id": self._session_id,
+                "path": rel,
+                "success": True,
+                "content_hash": new_hash,
+                "expected_version": expected_version,
+            },
+        )
+        if resp is None:
+            raise CommitUnconfirmed(
+                f"OCC commit of {rel} could not be confirmed (coordinator transport "
+                "failed mid-commit); the write did not land. re-read and retry."
+            )
+        outcome = self._classify_cas_response(resp)
+        if outcome == "win":
+            self._atomic_write(abs_path, new_content)  # confirmed → persist
+            self._last_committed_hash[rel] = new_hash
+            return
+        if outcome == "conflict":
+            # A peer won the version between our read and the CAS → typed conflict.
+            raise CasVersionConflict(
+                rel, expected_version, self._cas_current_version(resp, current_version)
+            )
+        # outcome == "raise": corruption or the commit_unconfirmed degrade body.
+        if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(self._deny_reason(resp))
+        raise CoherenceError(self._deny_reason(resp))
 
     # --- coordinator I/O helpers --------------------------------------------
 

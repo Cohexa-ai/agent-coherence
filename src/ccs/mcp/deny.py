@@ -33,8 +33,11 @@ from dataclasses import dataclass
 from mcp.types import CallToolResult, TextContent
 
 from ccs.core.exceptions import (
+    CAS_EXHAUSTED_REASON,
     COORDINATOR_UNAVAILABLE_REASON,
+    VERSION_MISMATCH_REASON,
     CasRetriesExhausted,
+    CasVersionConflict,
     CommitPreempted,
     CommitUnconfirmed,
     InternalConcurrencyError,
@@ -71,25 +74,37 @@ _TERMINALS: dict[type, _Terminal] = {
 _UNRECOGNIZED = _Terminal("internal_error", "none", False)
 
 
-def _result(terminal: _Terminal, detail: str) -> CallToolResult:
+def _result(terminal: _Terminal, detail: str, extra: dict | None = None) -> CallToolResult:
     """Build the non-ignorable tool result. ``detail`` is the verbatim deny prose,
     carried in BOTH ``structuredContent`` (structured clients) and the text
-    content (clients that surface only the text channel still see the deny)."""
+    content (clients that surface only the text channel still see the deny).
+    ``extra`` merges terminal-specific fields (e.g. the CAS versions)."""
+    structured = {
+        "reason": terminal.reason,
+        "recover": terminal.recover,
+        "retryable": terminal.retryable,
+        "detail": detail,
+    }
+    if extra:
+        structured.update(extra)
     return CallToolResult(
         isError=True,
         content=[TextContent(type="text", text=detail)],
-        structuredContent={
-            "reason": terminal.reason,
-            "recover": terminal.recover,
-            "retryable": terminal.retryable,
-            "detail": detail,
-        },
+        structuredContent=structured,
     )
 
 
 def deny_result(exc: BaseException) -> CallToolResult:
     """Map a coherence terminal (Type A) to a non-ignorable ``isError`` result,
     preserving the coordinator deny text verbatim in ``detail``."""
+    if isinstance(exc, CasVersionConflict):
+        # Surface both versions so the agent can re-read at current_version and
+        # re-CAS without another round-trip. Typed-conflict, NOT auto-merge.
+        return _result(
+            _Terminal(VERSION_MISMATCH_REASON, "read_then_merge", False),
+            str(exc),
+            {"expected_version": exc.expected_version, "current_version": exc.current_version},
+        )
     terminal = _TERMINALS.get(type(exc), _UNRECOGNIZED)
     return _result(terminal, str(exc))
 
@@ -102,3 +117,12 @@ def coordinator_unavailable_result(detail: str) -> CallToolResult:
         _Terminal(COORDINATOR_UNAVAILABLE_REASON, "retry_later", False),
         detail,
     )
+
+
+def cas_exhausted_result(detail: str) -> CallToolResult:
+    """Synthesized: the per-session conflict counter bounded a COOPERATING agent
+    (too many consecutive version_mismatch conflicts on one path). ``retryable``
+    is false so a cooperating agent stops. The no-livelock bound is scoped to
+    cooperating agents — a fresh session or one that ignores ``retryable:false``
+    resets it (coordinator-side fencing → v1.1)."""
+    return _result(_Terminal(CAS_EXHAUSTED_REASON, "stop", False), detail)
