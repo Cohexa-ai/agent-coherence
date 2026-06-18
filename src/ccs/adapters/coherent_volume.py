@@ -412,6 +412,23 @@ class CoherentVolume:
             return summary[key]
         return status.get(key)
 
+    def coordinator_status(self) -> dict | None:
+        """The coordinator ``/status`` document, or ``None`` if unattached or the
+        status surface is unreachable.
+
+        Best-effort (any failure → ``None``). The MCP ``swg_status`` tool uses it
+        to split ``off`` (reachable, no strict patterns) from ``unknown``
+        (unreachable) — a distinction :meth:`strict_mode_active` collapses to
+        ``False`` — and to read the tracked-artifact versions for ``per_path``.
+        """
+        if self._endpoint is None:
+            return None
+        try:
+            status = _coordinator_get(self._endpoint, "/status")
+        except Exception:  # best-effort; any failure → unknown
+            return None
+        return status if isinstance(status, dict) else None
+
     # --- read / write / reacquire contract (Unit 2) -------------------------
 
     def read(self, path: str | os.PathLike[str]) -> bytes:
@@ -909,6 +926,19 @@ class CoherentVolume:
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
             return None  # reached only in degrade mode
+
+    def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
+        """Read current bytes + the coordinator's authoritative version.
+
+        The version is the OCC comparand an Option-A writer (the MCP
+        ``swg_write_cas`` tool) passes back as ``expected_version``. Like
+        :meth:`read`, a sticky-INVALID instance still returns fresh bytes and the
+        version reflects the peer's commit; the instance stays INVALID until
+        :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
+        """
+        with self._single_op_guard():
+            data, version, _stale_denied = self._read_with_version(path)
+            return data, version
 
     def _read_with_version(self, rel: str) -> tuple[bytes, int, bool]:
         """OCC helper: register a SHARED view and return
