@@ -25,8 +25,10 @@ import pytest
 
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
+    _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
     CoordinatorHTTPServer,
+    _is_recent_self_commit_lag,
     session_to_agent_id,
 )
 from ccs.core.states import MESIState
@@ -377,6 +379,57 @@ def test_pre_read_fresh_shared_hash_mismatch_increments_counter(
                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                  "content_hash": _hash("out-of-band-edit")})
     assert coordinator._fresh_shared_hash_mismatch_total == before + 1
+
+
+# ----------------------------------------------------------------------
+# Survivor #6 v1 — _is_recent_self_commit_lag (R2): the commit→disk-write
+# lag-exclusion predicate. A SHARED-holder hash mismatch is the benign lag
+# (NOT a foreign edit) iff THIS session is the artifact's RECENT last
+# committer — the registry advanced the canonical hash (e.g. a commit_cas
+# WIN that leaves the writer SHARED) but the agent has not yet flushed the
+# new bytes to disk. Anything else is a genuine out-of-band edit → deny.
+# ----------------------------------------------------------------------
+
+_CSRV = "ccs.adapters.claude_code.coordinator_server"
+
+
+def _patch_last_writer(monkeypatch, *, writer, ts) -> None:
+    monkeypatch.setattr(f"{_CSRV}._last_writer_for", lambda coord, aid: writer)
+    monkeypatch.setattr(f"{_CSRV}._last_writer_unix_ts", lambda coord, aid: ts)
+
+
+def test_lag_true_for_recent_self_commit(coordinator, monkeypatch) -> None:
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC - 0.1
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+
+
+def test_lag_false_for_stale_self_commit(coordinator, monkeypatch) -> None:
+    """last_writer == self but the commit is OLD => something rewrote disk
+    since => correctly FOREIGN (the recency clause is load-bearing)."""
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is False
+
+
+def test_lag_false_for_other_writer(coordinator, monkeypatch) -> None:
+    _patch_last_writer(monkeypatch, writer=_sid("s2"), ts=1000.0)
+    assert _is_recent_self_commit_lag(
+        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+
+
+def test_lag_false_for_no_writer(coordinator, monkeypatch) -> None:
+    _patch_last_writer(monkeypatch, writer=None, ts=None)
+    assert _is_recent_self_commit_lag(
+        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+
+
+def test_lag_false_for_missing_updated_at(coordinator, monkeypatch) -> None:
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=None)
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=1000.1) is False
 
 
 def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
