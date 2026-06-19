@@ -153,11 +153,16 @@ class CoherentVolume:
         *,
         managed: tuple[str, ...] = (),
         on_error: Literal["strict", "degrade"] = "strict",
+        on_stale_read: Literal["allow", "raise"] = "allow",
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
         if on_error not in ("strict", "degrade"):
             raise ValueError(f"on_error must be 'strict' or 'degrade', got {on_error!r}")
+        if on_stale_read not in ("allow", "raise"):
+            raise ValueError(
+                f"on_stale_read must be 'allow' or 'raise', got {on_stale_read!r}"
+            )
 
         self._root = Path(root).resolve()
         # Managed globs are coordinator-policy patterns (parent-repo-relative,
@@ -165,6 +170,7 @@ class CoherentVolume:
         # INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
         self._managed: tuple[str, ...] = tuple(managed)
         self._on_error = on_error
+        self._on_stale_read = on_stale_read
         self._config = config
         self._bind_host = bind_host
 
@@ -461,7 +467,9 @@ class CoherentVolume:
         with self._single_op_guard():
             return self._read_impl(path)
 
-    def _read_impl(self, path: str | os.PathLike[str]) -> bytes:
+    def _read_impl(
+        self, path: str | os.PathLike[str], *, _enforce_stale: bool = True
+    ) -> bytes:
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         # Stat before registering so a missing file raises rather than seeding a
@@ -485,6 +493,21 @@ class CoherentVolume:
                 self._fail_closed_or_degrade(
                     f"coordinator watchdog timeout during read of {rel}"
                 )
+            elif _enforce_stale and self._on_stale_read == "raise":
+                # PH-A read-surface instance (opt-in): surface a strict
+                # foreign-edit / stale-view deny as StaleView so the caller can
+                # abort or reacquire(), instead of silently returning current
+                # bytes. Default ("allow") keeps the back-compat swallow.
+                # reacquire()'s recovery read passes _enforce_stale=False so
+                # recovery is never blocked.
+                hook_output = (
+                    resp.get("hookSpecificOutput") if isinstance(resp, dict) else None
+                )
+                if (
+                    isinstance(hook_output, dict)
+                    and hook_output.get("permissionDecision") == "deny"
+                ):
+                    raise StaleView(self._deny_reason(resp))
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
@@ -599,7 +622,11 @@ class CoherentVolume:
         """
         self._remint()  # fresh identity -> no INVALID; has committed nothing
         # MANDATORY fresh read under the new identity -> SHARED@current.
-        return self.read(path)
+        # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
+        # reacquire after a foreign edit returns the current bytes rather than
+        # re-raising and blocking recovery.
+        with self._single_op_guard():
+            return self._read_impl(path, _enforce_stale=False)
 
     def _remint(self) -> None:
         """Re-mint coordinator identity (shed ``INVALID`` + any invalidation
