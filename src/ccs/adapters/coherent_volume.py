@@ -66,11 +66,18 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
+    CommitPreempted,
+    CommitUnconfirmed,
+    InternalConcurrencyError,
+    StaleView,
+    ViewWedged,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,7 +249,7 @@ class CoherentVolume:
         identities (``reacquire``/``_after_fork`` re-mint ``_session_id`` while
         the lock-free op path reads it). This guard makes that misuse LOUD rather
         than silently corrupting: a second thread entering while another holds the
-        guard raises ``CoherenceError``.
+        guard raises ``InternalConcurrencyError`` (a ``CoherenceError`` subclass).
 
         Re-entrant for the SAME thread so internal nesting works (``write_cas``
         calls :meth:`reacquire`, which calls :meth:`read`): the owning thread
@@ -254,7 +261,10 @@ class CoherentVolume:
         ident = threading.get_ident()
         with self._guard_meta_lock:
             if self._guard_owner_ident is not None and self._guard_owner_ident != ident:
-                raise CoherenceError(
+                # A server-misuse bug (the MCP server serializes tool access), not
+                # an agent-recoverable deny — typed so the mapper never relays it
+                # as a retryable stale view.
+                raise InternalConcurrencyError(
                     "CoherentVolume is single-threaded; concurrent use detected. "
                     "One operation at a time per instance — use one instance per "
                     "thread (an in-flight read/write/write_cas can re-mint identity "
@@ -403,6 +413,24 @@ class CoherentVolume:
             return summary[key]
         return status.get(key)
 
+    def coordinator_status(self) -> dict | None:
+        """The coordinator ``/status`` document, or ``None`` if unattached or the
+        status surface is unreachable.
+
+        Best-effort (any failure → ``None``). The MCP ``swg_status`` tool uses it
+        to split ``off`` (reachable, no strict patterns) from ``unknown``
+        (unreachable) — a distinction :meth:`strict_mode_active` collapses to
+        ``False`` — and to read the tracked-artifact versions for ``per_path``.
+        """
+        if self._endpoint is None:
+            return None
+        try:
+            status = _coordinator_get(self._endpoint, "/status")
+        except Exception as exc:  # best-effort; any failure → unknown
+            logger.debug("coordinator_status probe failed: %s", exc)
+            return None
+        return status if isinstance(status, dict) else None
+
     # --- read / write / reacquire contract (Unit 2) -------------------------
 
     def read(self, path: str | os.PathLike[str]) -> bytes:
@@ -465,8 +493,9 @@ class CoherentVolume:
         Prevents the **sequential** stale-read→write lost update: if a peer
         committed a newer version since this instance last read, this instance
         is ``INVALID`` and the coordinator denies the write (``pre-edit``). The
-        deny is surfaced as ``CoherenceError`` carrying the coordinator's
-        byte-stable reason VERBATIM. **A deny always raises, in both
+        deny is surfaced as ``StaleView`` (pre-edit) or ``CommitPreempted``
+        (post-edit preempt) — both ``CoherenceError`` subclasses — carrying the
+        coordinator's byte-stable reason VERBATIM. **A deny always raises, in both
         ``on_error`` modes** — the deny is enforcement working, not an
         infrastructure failure; recover via :meth:`reacquire` and write from the
         fresh bytes.
@@ -629,8 +658,8 @@ class CoherentVolume:
         stale-denied comparand read (the transient window where a peer's commit
         landed but its disk write hasn't) does NOT consume the commit budget;
         instead CONSECUTIVE denied reads are separately bounded (also at
-        ``MAX_CAS_REACQUIRES + 1``) and raise ``CoherenceError`` if the view
-        never clears. Both terminals are the honest fail-closed outcome,
+        ``MAX_CAS_REACQUIRES + 1``) and raise ``ViewWedged`` (a ``CoherenceError``
+        subclass) if the view never clears. Both terminals are the honest fail-closed outcome,
         **never** a silent lost update: the invariant this method guarantees is
         *final == start + every applied delta, OR a typed raise* — a successful
         return always means the update landed.
@@ -719,7 +748,7 @@ class CoherentVolume:
                 last_current_version = max(last_current_version, expected_version)
                 denied_streak += 1
                 if denied_streak > MAX_CAS_REACQUIRES:
-                    raise CoherenceError(
+                    raise ViewWedged(
                         f"OCC comparand read of {rel} stayed strict-denied across "
                         f"{denied_streak} consecutive reads under re-minted "
                         "identities; cannot establish a clean (bytes, version) "
@@ -760,7 +789,7 @@ class CoherentVolume:
                 # is handled below ("raise"). on_error governs only whether the
                 # infra failure already warned (degrade) or raised (strict) inside
                 # _post; either way an unconfirmed CAS must read as failure.
-                raise CoherenceError(
+                raise CommitUnconfirmed(
                     f"OCC commit of {rel} could not be confirmed (coordinator "
                     "transport failed mid-commit); the write did not land. "
                     "reacquire() and retry from the fresh bytes."
@@ -791,8 +820,106 @@ class CoherentVolume:
                 continue
             # outcome == "raise": a deny, corruption, or the fail-closed
             # commit_unconfirmed degrade body — ALWAYS raises in both modes.
-            # Nothing was written to disk (the CAS did not win).
+            # Nothing was written to disk (the CAS did not win). Type the terminal
+            # so the MCP deny mapper classifies by exception type, not a substring
+            # of the (verbatim) coordinator prose:
+            #  - commit_unconfirmed degrade body → CommitUnconfirmed (re-read, retry
+            #    only if absent — the false-negative-ack window);
+            #  - a permission-style deny → StaleView (recoverable by reacquire);
+            #  - anything else (corruption: commit_cas_corruption / expected>current)
+            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+                raise CommitUnconfirmed(self._deny_reason(resp))
+            hook_output = resp.get("hookSpecificOutput")
+            if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
+                raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
+
+    def write_cas_at(
+        self,
+        path: str | os.PathLike[str],
+        expected_version: int,
+        new_content: bytes | bytearray,
+    ) -> None:
+        """Single-shot, version-checked CAS (Option A — the MCP ``swg_write_cas``).
+
+        Commit ``new_content`` IFF the coordinator's current version ==
+        ``expected_version``. Unlike :meth:`write_cas` (which auto-retries by
+        re-deriving from the latest bytes), this does NOT retry and does NOT
+        re-derive: a stale ``expected_version`` raises
+        :class:`~ccs.core.exceptions.CasVersionConflict` carrying the current
+        version — the AGENT re-reads, re-merges, and retries
+        (typed-conflict, not auto-merge). This is the correct primitive for an
+        agent that already merged against a specific version it read: it never
+        commits content derived from version V over a peer's later V+1 (the
+        split-comparand lost update; ``coherent-volume-write-cas-split-comparand``).
+
+        The CAS commits against the AGENT's ``expected_version``, NOT a re-read
+        one, so a peer winning the version between the comparand read and the
+        commit is rejected as a conflict — never a silent overwrite. ``new_content``
+        touches disk ONLY on a confirmed win.
+        """
+        if not isinstance(new_content, (bytes, bytearray)):
+            raise TypeError(f"new_content must be bytes, got {type(new_content).__name__}")
+        with self._single_op_guard():
+            self._write_cas_at_impl(path, int(expected_version), bytes(new_content))
+
+    def _write_cas_at_impl(
+        self, path: str | os.PathLike[str], expected_version: int, new_content: bytes
+    ) -> None:
+        self._ensure_attached()
+        abs_path, rel = self._to_relative(path)
+        if self._endpoint is None:
+            # Strict-only construction prevents this for the server; fail closed
+            # rather than best-effort writing an unversioned blob.
+            raise CoherenceError(
+                f"cannot CAS {rel}: coordinator endpoint unavailable (fail-closed)"
+            )
+        # Re-mint first / read second: a hash-checked None-state read establishes
+        # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
+        # re-create the split-comparand hole — KTD-LU).
+        self._remint()
+        _current_bytes, current_version, stale_denied = self._read_with_version(rel)
+        if stale_denied:
+            # The comparand view is INVALID / the disk lags a just-landed commit;
+            # the agent must reacquire / re-read before it can CAS.
+            raise ViewWedged(
+                f"OCC comparand read of {rel} is strict-denied; cannot establish a "
+                "clean (bytes, version) view to CAS from. reacquire() / re-read first."
+            )
+        if current_version != expected_version:
+            # Stale expected_version → typed conflict; NO write, NO server retry.
+            raise CasVersionConflict(rel, expected_version, current_version)
+        new_hash = self._sha256_bytes(new_content)
+        resp = self._post(
+            "/hooks/post-edit-cas",
+            {
+                "session_id": self._session_id,
+                "path": rel,
+                "success": True,
+                "content_hash": new_hash,
+                "expected_version": expected_version,
+            },
+        )
+        if resp is None:
+            raise CommitUnconfirmed(
+                f"OCC commit of {rel} could not be confirmed (coordinator transport "
+                "failed mid-commit); the write did not land. re-read and retry."
+            )
+        outcome = self._classify_cas_response(resp)
+        if outcome == "win":
+            self._atomic_write(abs_path, new_content)  # confirmed → persist
+            self._last_committed_hash[rel] = new_hash
+            return
+        if outcome == "conflict":
+            # A peer won the version between our read and the CAS → typed conflict.
+            raise CasVersionConflict(
+                rel, expected_version, self._cas_current_version(resp, current_version)
+            )
+        # outcome == "raise": corruption or the commit_unconfirmed degrade body.
+        if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(self._deny_reason(resp))
+        raise CoherenceError(self._deny_reason(resp))
 
     # --- coordinator I/O helpers --------------------------------------------
 
@@ -888,6 +1015,19 @@ class CoherentVolume:
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
             return None  # reached only in degrade mode
+
+    def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
+        """Read current bytes + the coordinator's authoritative version.
+
+        The version is the OCC comparand an Option-A writer (the MCP
+        ``swg_write_cas`` tool) passes back as ``expected_version``. Like
+        :meth:`read`, a sticky-INVALID instance still returns fresh bytes and the
+        version reflects the peer's commit; the instance stays INVALID until
+        :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
+        """
+        with self._single_op_guard():
+            data, version, _stale_denied = self._read_with_version(path)
+            return data, version
 
     def _read_with_version(self, rel: str) -> tuple[bytes, int, bool]:
         """OCC helper: register a SHARED view and return
@@ -1030,7 +1170,15 @@ class CoherentVolume:
         if not isinstance(resp, dict):
             return
         if resp.get("ok") is False:
-            raise CoherenceError(self._deny_reason(resp))
+            # Type the deny by phase so the MCP mapper classifies by exception
+            # type, not a substring of the (verbatim) coordinator prose. A
+            # pre-edit INVALID deny is a recoverable stale view; a post-edit
+            # ok:false is a mid-write preempt/reclaim — the atomic write (:523)
+            # already hit disk un-versioned, so it is a distinct terminal that
+            # needs reconcile, not a bare retry.
+            if phase == "post-edit":
+                raise CommitPreempted(self._deny_reason(resp))
+            raise StaleView(self._deny_reason(resp))
         if resp.get("degraded"):
             self._fail_closed_or_degrade(
                 f"coordinator watchdog timeout on {phase} for {rel}"
