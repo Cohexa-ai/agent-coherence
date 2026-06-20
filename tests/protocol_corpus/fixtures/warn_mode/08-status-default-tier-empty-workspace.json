@@ -33,6 +33,7 @@
       "intra_task_acquire_release_total": 0,
       "policy_summary": "<IGNORED>",
       "sessions": "<IGNORED>",
+      "shared_foreign_lag_suppressed_total": 0,
       "stale_warning_emitted_total": 0,
       "stale_warning_reread_total": 0,
       "strict_mode_denials_total": 0,

@@ -287,6 +287,15 @@ def validate_content_hash(content_hash: Any, *, required: bool) -> str | None:
 # fresh-SHARED mismatch signal must not fire against either.
 _F_SENTINEL_CONTENT_HASH = "f" * 64
 
+# Survivor #6 v1 (R2): a SHARED-holder hash mismatch is treated as the benign
+# commit→disk-write lag (not a foreign edit) only when THIS session's own
+# commit is within this window of the read. Generous on purpose — the flush
+# after a commit_cas WIN is normally sub-second, so a value well above that
+# avoids false-denies during a slow flush, at the cost of a narrow
+# false-negative (a foreign edit within the window of a same-session commit).
+# The fresh_shared_hash_mismatch counter remains the regression guard.
+_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0
+
 
 # ----------------------------------------------------------------------
 # Server shell
@@ -482,6 +491,12 @@ class CoordinatorHTTPServer:
         # plugin path is fail-open); this counter sizes the
         # false-positive rate before any strict-mode deny knob is added.
         self._fresh_shared_hash_mismatch_total: int = 0
+        # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
+        # mismatch on a strict path was SUPPRESSED as the benign
+        # commit→disk-write lag (this session's own recent commit) rather than
+        # denied as a foreign edit. Pairs with strict_mode_denials_total to let
+        # an operator size the lag-window (5s) false-negative exposure.
+        self._shared_foreign_lag_suppressed_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -809,6 +824,14 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._fresh_shared_hash_mismatch_total += 1
 
+    def increment_shared_foreign_lag_suppressed(self) -> None:
+        """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
+        strict path is suppressed as the benign commit→disk-write lag (this
+        session's own recent commit) instead of denied. Lets an operator size
+        the lag-window false-negative rate. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._shared_foreign_lag_suppressed_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
@@ -904,6 +927,7 @@ class CoordinatorHTTPServer:
             "audit_log_mode_drift_total": self._audit_log_mode_drift_total,
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
+            "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1370,6 +1394,55 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 and content_hash != artifact.content_hash
             ):
                 coordinator.increment_fresh_shared_hash_mismatch()
+                # Survivor #6 v1: promote the SHARED-holder mismatch from a
+                # fail-open allow to a strict-mode deny. A still-SHARED reader
+                # proves no peer commit since its grant, so the mismatch is this
+                # session's own disk diverging from the canonical: either its
+                # own un-flushed recent commit (the benign commit→disk-write
+                # lag, R2 — suppress) or a foreign out-of-band edit (deny).
+                # reacquire() forces the fresh re-read; KTD-T leaves the grant
+                # untouched so retries re-deny byte-stably (no INVALID needed).
+                if coordinator.policy.is_strict_mode(path):
+                    # Capture one clock read for the whole deny decision so the
+                    # lag gate and every summary timestamp share an instant —
+                    # no intra-block skew, and the deny reason stays stable
+                    # within the call (KTD-P).
+                    _now = _payloads.now_unix()
+                    if _is_recent_self_commit_lag(
+                        coordinator, artifact_id, session_id, now_unix=_now,
+                    ):
+                        # Benign commit→disk-write lag (R2): count the
+                        # suppression so operators can size the lag-window
+                        # false-negative rate, then fall through to the
+                        # warn-mode hash_differs allow.
+                        coordinator.increment_shared_foreign_lag_suppressed()
+                    else:
+                        shared_summary: _payloads.StaleSummary = {
+                            "path": path,
+                            "current_version": artifact.version,
+                            # A SHARED holder was granted on the current
+                            # version; that is the version it last saw.
+                            "prior_version_seen_by_session": artifact.version,
+                            "last_writer_session_id": (
+                                _last_writer_for(coordinator, artifact_id)
+                                or "<unknown>"
+                            ),
+                            "last_writer_at_unix_ts": (
+                                _last_writer_unix_ts(coordinator, artifact_id)
+                                or _now
+                            ),
+                            "warning_generated_at_unix_ts": _now,
+                            "hash_differs": True,
+                        }
+                        return _emit_pre_read_strict_deny(
+                            coordinator,
+                            agent_id=agent_id,
+                            session_id=session_id,
+                            artifact_id=artifact_id,
+                            path=path,
+                            summary=shared_summary,
+                            source="pre_read_shared_hash_deny",
+                        )
                 fresh["hash_differs"] = True
             return fresh
 
@@ -1459,24 +1532,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 or (agent_state is None and hash_differs)
             )
         ):
-            coordinator.increment_stale_warning_emitted()
-            coordinator.mark_stale_warned(agent_id, artifact_id)
-            # v0.2 Unit 4 telemetry: counter + audit-log append + record
-            # session/path for route-around detection in pre-bash/pre-grep.
-            coordinator.increment_strict_mode_denial()
-            coordinator.record_strict_deny(session_id, path)
-            if not _audit_log.append_strict_deny(
-                coordinator.coordinator_root,
-                agent_id=session_id, path=path, tool="Read",
-            ):
-                coordinator.increment_audit_log_mode_drift()
-            return {
-                "hookSpecificOutput": _payloads.emit_strict_deny(
-                    source="pre_read_strict_deny", summary=summary,
-                ),
-                "status": "stale",
-                "summary": summary,
-            }
+            return _emit_pre_read_strict_deny(
+                coordinator,
+                agent_id=agent_id,
+                session_id=session_id,
+                artifact_id=artifact_id,
+                path=path,
+                summary=summary,
+                source="pre_read_strict_deny",
+            )
 
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
         coordinator.registry.set_agent_state(
@@ -3107,6 +3171,69 @@ def _last_writer_unix_ts(
     accessor on SqliteArtifactRegistry instead of reaching into ``_conn``
     + ``_lock`` directly. Layer violation closed."""
     return coordinator.registry.get_artifact_updated_at(artifact_id)
+
+
+def _emit_pre_read_strict_deny(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    agent_id: UUID,
+    session_id: str,
+    artifact_id: UUID,
+    path: str,
+    summary: _payloads.StaleSummary,
+    source: str,
+) -> dict:
+    """Single source of truth for emitting a pre-read strict-mode deny, used by
+    both deny arms: the INVALID/None-grant path and the Survivor #6
+    SHARED-holder foreign-edit path. Bumps the stale-warning + strict-denial
+    telemetry, marks the (agent, artifact) pair for KTD-J re-read detection,
+    records the (session, path) for pre-bash/pre-grep route-around, appends the
+    audit row (counting mode drift on failure), and returns the byte-stable
+    deny payload. Keeping both arms here means their telemetry and KTD-T
+    byte-stable deny text cannot drift apart."""
+    coordinator.increment_stale_warning_emitted()
+    coordinator.mark_stale_warned(agent_id, artifact_id)
+    coordinator.increment_strict_mode_denial()
+    coordinator.record_strict_deny(session_id, path)
+    if not _audit_log.append_strict_deny(
+        coordinator.coordinator_root, agent_id=session_id, path=path, tool="Read",
+    ):
+        coordinator.increment_audit_log_mode_drift()
+    return {
+        "hookSpecificOutput": _payloads.emit_strict_deny(
+            source=source, summary=summary,
+        ),
+        "status": "stale",
+        "summary": summary,
+    }
+
+
+def _is_recent_self_commit_lag(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    session_id: str,
+    *,
+    now_unix: float,
+) -> bool:
+    """Survivor #6 v1 (R2): is a SHARED-holder hash mismatch the benign
+    commit→disk-write lag rather than a foreign edit?
+
+    A still-SHARED reader proves no peer commit landed since its grant (a peer
+    commit invalidates every non-INVALID peer), so the canonical hash is the
+    reader's own granted-version hash and a disk-hash mismatch is this
+    session's own disk diverging. That is the legitimate lag iff THIS session
+    is the artifact's last committer AND that commit is recent — the registry
+    advanced the canonical hash (e.g. a commit_cas WIN that leaves the writer
+    SHARED) but the agent has not yet flushed the new bytes to disk. Any other
+    last_writer, no last_writer, or a stale self-commit (something rewrote disk
+    since) is a genuine out-of-band edit and must be denied.
+    """
+    if _last_writer_for(coordinator, artifact_id) != session_id:
+        return False
+    updated_at = _last_writer_unix_ts(coordinator, artifact_id)
+    if updated_at is None:
+        return False
+    return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:
