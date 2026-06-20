@@ -1440,3 +1440,41 @@ def test_reacquire_recovers_under_on_stale_read_raise(
         assert vol.reacquire("data/x.txt") == b"v2"  # recovery does not raise
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_on_stale_read_raise_does_not_fire_on_unmanaged_path(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """on_stale_read='raise' only surfaces a STRICT-mode deny. A foreign edit to a
+    path OUTSIDE the managed (strict) globs must NOT raise — the coordinator fires
+    the deny only when is_strict_mode(path) is True."""
+    target = _seed_file(tmp_path, rel="notes/x.txt", content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        assert vol.read("notes/x.txt") == b"v1"  # not under managed -> not strict
+        target.write_bytes(b"v2")                # foreign edit on a non-strict path
+        assert vol.read("notes/x.txt") == b"v2"  # no raise: returns fresh bytes
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_on_stale_read_raise_independent_of_on_error_degrade(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """on_stale_read and on_error govern independent branches: a foreign-edit deny
+    still raises StaleView under on_error='degrade' (degrade governs infra
+    failures, not the semantic stale-view deny)."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",),
+        on_error="degrade", on_stale_read="raise", config=fast_cfg,
+    )
+    try:
+        assert vol.read("data/x.txt") == b"v1"
+        target.write_bytes(b"v2")
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")
+    finally:
+        stop_coordinator(tmp_path)

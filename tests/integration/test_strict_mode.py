@@ -285,6 +285,78 @@ def test_pre_read_strict_shared_recent_self_commit_lag_allows(
     assert body == {"status": "fresh", "version": 1, "hash_differs": True}
 
 
+def test_pre_read_strict_shared_foreign_edit_records_telemetry(
+    strict_coordinator, strict_client: _Client,
+) -> None:
+    """The SHARED-holder foreign-edit deny fires the SAME telemetry as the INVALID
+    deny (shared _emit_pre_read_strict_deny helper): bump strict_mode_denials_total
+    and record the (session, path) for route-around. Guards a refactor that returns
+    the right HTTP body but drops the side-effects."""
+    before = strict_coordinator._strict_mode_denials_total
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert strict_coordinator._strict_mode_denials_total == before + 1
+    assert strict_coordinator.check_strict_deny_route_around(_sid("s1"), "CLAUDE.md") is True
+
+
+def test_pre_read_strict_shared_lag_suppression_increments_counter(
+    strict_coordinator, strict_client: _Client, monkeypatch,
+) -> None:
+    """The R2 lag-suppression path bumps shared_foreign_lag_suppressed_total so an
+    operator can size the lag-window false-negative rate, and still falls through
+    to the warn-mode allow (no deny)."""
+    import ccs.adapters.claude_code.coordinator_server as _csrv
+
+    before = strict_coordinator._shared_foreign_lag_suppressed_total
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: _sid("s1"))
+    monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+    assert strict_coordinator._shared_foreign_lag_suppressed_total == before + 1
+
+
+def test_pre_read_strict_remint_after_foreign_edit_still_denies(
+    strict_client: _Client,
+) -> None:
+    """RR-2 refutation: after a foreign edit the canonical never advances (no
+    commit), so a re-minted identity (the OCC write_cas remint, modeled as a fresh
+    session) reading the foreign bytes is DENIED, not silently granted
+    fresh-SHARED. There is no clean SHARED@foreign state for a later fresh-SHARED
+    read to skip-check, and a repeat read keeps denying."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s2"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    status2, body2 = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s2"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status2 == 200
+    assert body2["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_pre_edit_strict_tracked_stale_denies(strict_client: _Client) -> None:
     """Edit on a strict + tracked + stale artifact returns deny (the Edit/Write
     surface — pre-edit handles both per the hooks.json matcher Edit|Write)."""

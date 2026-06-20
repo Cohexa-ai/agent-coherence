@@ -432,6 +432,16 @@ def test_lag_false_for_missing_updated_at(coordinator, monkeypatch) -> None:
     assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=1000.1) is False
 
 
+def test_lag_true_at_exact_window_boundary(coordinator, monkeypatch) -> None:
+    """`<=` boundary: a self-commit EXACTLY at the window edge is still treated as
+    lag (the fail-safe direction). Pins the operator choice against a silent flip
+    to `<`."""
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+
+
 def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
     """fresh_shared_hash_mismatch_total visible in /status?detail=metrics
     so an operator can size the false-positive rate before any
@@ -440,6 +450,16 @@ def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Clie
     assert status == 200
     assert "fresh_shared_hash_mismatch_total" in body
     assert isinstance(body["fresh_shared_hash_mismatch_total"], int)
+
+
+def test_status_metrics_exposes_shared_foreign_lag_suppressed_counter(client: _Client) -> None:
+    """shared_foreign_lag_suppressed_total visible in /status?detail=metrics so an
+    operator can size the lag-window (5s) false-negative rate against
+    strict_mode_denials_total."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "shared_foreign_lag_suppressed_total" in body
+    assert isinstance(body["shared_foreign_lag_suppressed_total"], int)
 
 
 # ----------------------------------------------------------------------

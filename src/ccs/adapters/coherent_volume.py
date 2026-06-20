@@ -137,6 +137,18 @@ class CoherentVolume:
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
 
+    ``on_stale_read`` (read surface):
+
+    - ``"allow"`` (default): a strict-mode foreign-edit / stale-view deny on
+      :meth:`read` is swallowed — read returns the current on-disk bytes
+      (back-compatible; the coordinator still detects, denies, counts, and
+      audits the foreign edit).
+    - ``"raise"``: that same deny surfaces as
+      :class:`~ccs.core.exceptions.StaleView` so the caller can abort or
+      :meth:`reacquire` instead of silently acting on the foreign bytes.
+      Independent of ``on_error`` (which governs only infra failures);
+      :meth:`reacquire`'s recovery read always bypasses it.
+
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
     verified only coarsely (the coordinator's ``/status`` exposes a strict-pattern
@@ -445,8 +457,12 @@ class CoherentVolume:
         Always returns the current on-disk bytes. The ``pre-read`` call records
         this instance as a SHARED reader@hash on the coordinator — that is what
         makes a *later* peer write invalidate this instance (the sequential
-        stale-read→write guard). A stale-read response never makes ``read()``
-        raise: returning current bytes is always safe.
+        stale-read→write guard). Under the default ``on_stale_read="allow"`` a
+        stale-read response never makes ``read()`` raise (returning current
+        bytes is always safe); under ``on_stale_read="raise"`` a strict-mode
+        foreign-edit / stale-view deny raises
+        :class:`~ccs.core.exceptions.StaleView` instead — recover via
+        :meth:`reacquire`.
 
         The strict deny is **sticky** (KTD-T): if this instance is already
         ``INVALID`` on a strict path, ``pre-read`` does NOT re-grant SHARED, so
@@ -619,6 +635,10 @@ class CoherentVolume:
 
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
+
+        Always returns the current bytes without raising, even under
+        ``on_stale_read="raise"`` — recovery must never be blocked by the deny
+        that triggered it.
         """
         self._remint()  # fresh identity -> no INVALID; has committed nothing
         # MANDATORY fresh read under the new identity -> SHARED@current.
@@ -1404,6 +1424,7 @@ def install(
     *,
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
+    on_stale_read: Literal["allow", "raise"] = "allow",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> CoherentVolume:
@@ -1417,7 +1438,8 @@ def install(
     if _shim_state is not None:
         return _shim_state.volume
     volume = CoherentVolume(
-        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+        root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
+        config=config, bind_host=bind_host,
     )
     original_open = builtins.open  # is io.open (same object) at install time
     wrapper = _make_open_wrapper(volume, original_open)
@@ -1443,6 +1465,7 @@ def coherent_workspace(
     *,
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
+    on_stale_read: Literal["allow", "raise"] = "allow",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> Iterator[CoherentVolume]:
@@ -1456,7 +1479,8 @@ def coherent_workspace(
     """
     already_installed = _shim_state is not None
     volume = install(
-        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+        root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
+        config=config, bind_host=bind_host,
     )
     try:
         yield volume
