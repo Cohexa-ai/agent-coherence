@@ -241,3 +241,26 @@ def test_write_cas_counter_resets_after_a_win(tmp_path: Path, fast_cfg: Lifecycl
         assert conflicts[_PATH] == 1
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- SB-23: foreign-edit-at-write via swg_write -------------------------------
+
+
+def test_swg_write_denies_foreign_edit(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """SB-23 via swg_write: a plain write that would clobber a foreign / out-of-band
+    edit (no peer commit — the disk changed OUTSIDE the coordinator) is the
+    recoverable ``stale_view`` deny, not a silent overwrite."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(vol, config, _PATH)               # seeds the SB-23 baseline
+        target.write_bytes(b"foreign-v2")          # out-of-band edit (not via the volume)
+        denied = _do_write(vol, config, _PATH, "clobber")
+        assert denied.isError is True
+        sc = denied.structuredContent
+        assert sc["reason"] == "stale_view"
+        assert sc["recover"] == "reacquire"
+        assert target.read_bytes() == b"foreign-v2"  # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
