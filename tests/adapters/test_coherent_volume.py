@@ -1478,3 +1478,159 @@ def test_on_stale_read_raise_independent_of_on_error_degrade(
             vol.read("data/x.txt")
     finally:
         stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# SB-23 pre-write content-CAS (on_stale_write): deny a write that would
+# clobber a foreign / out-of-band edit since the last read/write.
+# ----------------------------------------------------------------------
+
+
+def test_on_stale_write_invalid_value_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="bogus")
+
+
+def test_write_denies_foreign_edit_by_default(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Default on_stale_write='raise': a write whose target was edited out-of-band
+    since the last read is denied (StaleView) and does NOT clobber the foreign bytes."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.read("data/x.txt") == b"v1"   # seeds baseline = hash(v1)
+        target.write_bytes(b"v2")                # FOREIGN edit (not via the volume)
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"v3")
+        assert target.read_bytes() == b"v2"      # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_guard_seeded_by_read_only(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The read seeds the baseline even with no prior write — a first-read-then-write
+    still guards (confirms read-seeding, not write, drives the guard)."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")                   # first access, never written
+        target.write_bytes(b"foreign")
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"mine")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_succeeds_when_disk_unchanged_and_advances_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """No foreign edit: the write proceeds; the own write advances the baseline so a
+    second consecutive write does not false-deny."""
+    _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        vol.write("data/x.txt", b"v2")           # disk matches baseline -> proceeds
+        assert (tmp_path / "data/x.txt").read_bytes() == b"v2"
+        vol.write("data/x.txt", b"v3")           # own write advanced baseline -> no false deny
+        assert (tmp_path / "data/x.txt").read_bytes() == b"v3"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_after_sb23_deny_then_write_succeeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """After a foreign-edit deny, reacquire() re-seeds the baseline so the rebuilt
+    write succeeds (no false deny after recovery)."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"v2")
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"clobber")
+        assert vol.reacquire("data/x.txt") == b"v2"   # re-seeds baseline = hash(v2)
+        vol.write("data/x.txt", b"v3-from-v2")        # rebuilt from fresh -> succeeds
+        assert target.read_bytes() == b"v3-from-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_on_stale_write_allow_proceeds_and_clobbers(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """on_stale_write='allow' restores pre-SB-23 behavior: the foreign edit is not
+    raised; the write proceeds and clobbers."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg
+    )
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"v2")
+        vol.write("data/x.txt", b"v3")           # no raise; clobbers v2
+        assert target.read_bytes() == b"v3"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_after_foreign_delete_proceeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Foreign delete: the re-hash returns None (absent file) -> no-baseline skip; the
+    write proceeds as a normal create (R6)."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        target.unlink()                          # FOREIGN delete
+        vol.write("data/x.txt", b"recreated")    # None disk hash -> no deny
+        assert target.read_bytes() == b"recreated"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_post_edit_preempt_still_advances_observed_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch
+) -> None:
+    """R5: if the atomic write lands but the post-edit POST then preempts, the
+    observed baseline must STILL be advanced (the bytes are on disk) so the instance
+    does not self-false-deny on a later write."""
+    from ccs.core.exceptions import CommitPreempted
+
+    _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        orig_check = vol._check_grant
+
+        def fake_check_grant(resp, rel, *, phase):
+            if phase == "post-edit":
+                raise CommitPreempted("simulated preempt")
+            return orig_check(resp, rel, phase=phase)
+
+        monkeypatch.setattr(vol, "_check_grant", fake_check_grant)
+        with pytest.raises(CoherenceError):
+            vol.write("data/x.txt", b"v2")
+        # Bytes landed AND the observed baseline advanced to hash(v2).
+        assert (tmp_path / "data/x.txt").read_bytes() == b"v2"
+        assert vol._last_observed_hash["data/x.txt"] == vol._sha256_bytes(b"v2")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_install_forwards_on_stale_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """install()/coherent_workspace() forward on_stale_write to the volume."""
+    _seed_file(tmp_path, content=b"v1")
+    vol = install(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
+    try:
+        assert vol._on_stale_write == "allow"
+    finally:
+        uninstall()
+        stop_coordinator(tmp_path)

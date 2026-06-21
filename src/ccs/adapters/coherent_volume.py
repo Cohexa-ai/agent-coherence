@@ -103,6 +103,14 @@ __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 #   read resets the streak.
 MAX_CAS_REACQUIRES = 8
 
+# SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
+# model's retry loop sees identical text each attempt (KTD-P), and distinct from
+# the coordinator's INVALID-deny prose so the two are not conflated.
+_SB23_STALE_WRITE_REASON = (
+    "stale write blocked: the file on disk changed since this view was read "
+    "(out-of-band edit). reacquire() and rebuild the write from the fresh bytes."
+)
+
 
 class CoherentVolume:
     """Coherent shared workspace for a single-host agent fleet (v1).
@@ -149,6 +157,21 @@ class CoherentVolume:
       Independent of ``on_error`` (which governs only infra failures);
       :meth:`reacquire`'s recovery read always bypasses it.
 
+    ``on_stale_write`` (write surface — SB-23 content-CAS):
+
+    - ``"raise"`` (default): at :meth:`write`, if the file on disk changed since
+      this instance last read/wrote it (a foreign / out-of-band edit), the write
+      is denied with :class:`~ccs.core.exceptions.StaleView` rather than silently
+      clobbering it — :meth:`reacquire` and rebuild from the fresh bytes. The safe
+      default *guards*, because a write is a data-loss surface (the inverse of
+      ``on_stale_read``, where returning bytes is always safe).
+    - ``"allow"``: the foreign edit is not raised; the write proceeds and clobbers
+      (pre-SB-23 behavior). Adapter-local: fires on a strict (managed-globs) volume
+      whenever a per-path baseline exists, independent of ``on_error`` / coordinator
+      attachment. A non-strict volume is exempt — there a coordinated peer commit
+      can change the disk without an INVALID deny, so a mismatch is not necessarily
+      foreign.
+
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
     verified only coarsely (the coordinator's ``/status`` exposes a strict-pattern
@@ -166,6 +189,7 @@ class CoherentVolume:
         managed: tuple[str, ...] = (),
         on_error: Literal["strict", "degrade"] = "strict",
         on_stale_read: Literal["allow", "raise"] = "allow",
+        on_stale_write: Literal["allow", "raise"] = "raise",
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
@@ -175,6 +199,10 @@ class CoherentVolume:
             raise ValueError(
                 f"on_stale_read must be 'allow' or 'raise', got {on_stale_read!r}"
             )
+        if on_stale_write not in ("allow", "raise"):
+            raise ValueError(
+                f"on_stale_write must be 'allow' or 'raise', got {on_stale_write!r}"
+            )
 
         self._root = Path(root).resolve()
         # Managed globs are coordinator-policy patterns (parent-repo-relative,
@@ -183,6 +211,7 @@ class CoherentVolume:
         self._managed: tuple[str, ...] = tuple(managed)
         self._on_error = on_error
         self._on_stale_read = on_stale_read
+        self._on_stale_write = on_stale_write
         self._config = config
         self._bind_host = bind_host
 
@@ -205,6 +234,12 @@ class CoherentVolume:
         # Per-path commit hashes for the Unit 2 write no-op-skip; declared here so
         # the fork handler and reacquire() can reset it.
         self._last_committed_hash: dict[str, str] = {}
+        # SB-23 content-CAS baseline: the hash this instance last OBSERVED on disk
+        # per path (seeded on read, advanced on its own writes). SEPARATE from
+        # _last_committed_hash (own-write hashes for the no-op-skip fast path). At
+        # write time a current disk hash that differs from this baseline is a
+        # foreign / out-of-band edit. Cleared on remint/fork alongside the sibling.
+        self._last_observed_hash: dict[str, str] = {}
 
         self._mint_identity()
         # A forked child must not share the parent's identity (single-writer
@@ -231,6 +266,7 @@ class CoherentVolume:
             self._endpoint = None
             self._needs_reattach = True
             self._last_committed_hash.clear()
+            self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
 
     def _ensure_attached(self) -> None:
         """Lazily re-attach after a fork dropped the endpoint.
@@ -493,13 +529,16 @@ class CoherentVolume:
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
+        content_hash = self._sha256_bytes(data)
+        # SB-23: seed the foreign-edit baseline with what we just observed on disk.
+        self._last_observed_hash[rel] = content_hash
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
                 {
                     "session_id": self._session_id,
                     "path": rel,
-                    "content_hash": self._sha256_bytes(data),
+                    "content_hash": content_hash,
                 },
             )
             # A stale / strict-deny response is expected and changes nothing here
@@ -561,9 +600,14 @@ class CoherentVolume:
 
         if self._endpoint is None:
             # Unattached / degraded coordinator (strict already raised at
-            # construction). Degrade mode: best-effort write, no enforcement.
+            # construction). Degrade mode: best-effort write, no coordinator
+            # enforcement — but the SB-23 content-CAS is adapter-local, so it still
+            # fires (gated by on_stale_write, independent of on_error).
+            self._check_foreign_edit(rel, abs_path)
             self._atomic_write(abs_path, data)
-            self._last_committed_hash[rel] = self._sha256_bytes(data)
+            written = self._sha256_bytes(data)
+            self._last_committed_hash[rel] = written
+            self._last_observed_hash[rel] = written  # SB-23: own write advances baseline
             return
 
         # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
@@ -578,17 +622,24 @@ class CoherentVolume:
         # file) would otherwise orphan the grant until the crash-recovery sweep.
         try:
             new_hash = self._sha256_bytes(data)
+            # SB-23 content-CAS: re-hash disk under the held grant and deny a write
+            # whose target diverged on disk since this instance last observed it (a
+            # foreign edit). Returns the disk hash so the no-op-skip below reuses it
+            # (one disk read, hoisted out of the former short-circuit).
+            disk_hash = self._check_foreign_edit(rel, abs_path)
             # No-op skip: skip the os.replace (and its fsync) only when the file
             # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
-            # gate (it skips the disk read on the common "bytes changed" write); the
-            # CURRENT on-disk hash is the authority, because the cached belief alone
-            # can be stale across a peer commit (see _disk_hash for the full why).
+            # gate; the CURRENT on-disk hash is the authority (see _disk_hash).
             already_on_disk = (
                 self._last_committed_hash.get(rel) == new_hash
-                and self._disk_hash(abs_path) == new_hash
+                and disk_hash == new_hash
             )
             if not already_on_disk:
                 self._atomic_write(abs_path, data)
+            # SB-23 (R5): advance the observed baseline as soon as the bytes are on
+            # disk — BEFORE the post-edit POST — so a post-edit preempt cannot leave
+            # a stale baseline that self-false-denies this instance's next write.
+            self._last_observed_hash[rel] = new_hash
         except Exception:
             # Release the grant so it is not orphaned until the sweep, then
             # re-raise the original error. Best-effort release — a release failure
@@ -669,6 +720,7 @@ class CoherentVolume:
         with self._lock:
             self._session_id = str(uuid.uuid4())  # fresh identity -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
+            self._last_observed_hash.clear()  # SB-23: baselines belong to the old identity
 
     def write_cas(
         self,
@@ -755,7 +807,9 @@ class CoherentVolume:
             current = self._current_bytes_or_empty(_abs_path)
             data = bytes(make_content(current))
             self._atomic_write(_abs_path, data)
-            self._last_committed_hash[rel] = self._sha256_bytes(data)
+            written = self._sha256_bytes(data)
+            self._last_committed_hash[rel] = written
+            self._last_observed_hash[rel] = written  # SB-23: own write advances baseline
             return
 
         last_current_version = -1
@@ -846,6 +900,7 @@ class CoherentVolume:
             if outcome == "win":
                 self._atomic_write(_abs_path, data)  # confirmed → persist
                 self._last_committed_hash[rel] = new_hash
+                self._last_observed_hash[rel] = new_hash  # SB-23: own write advances baseline
                 return
             if outcome == "conflict":
                 last_current_version = self._cas_current_version(resp, last_current_version)
@@ -957,6 +1012,7 @@ class CoherentVolume:
         if outcome == "win":
             self._atomic_write(abs_path, new_content)  # confirmed → persist
             self._last_committed_hash[rel] = new_hash
+            self._last_observed_hash[rel] = new_hash  # SB-23: own write advances baseline
             return
         if outcome == "conflict":
             # A peer won the version between our read and the CAS → typed conflict.
@@ -1025,6 +1081,37 @@ class CoherentVolume:
             return CoherentVolume._sha256_bytes(CoherentVolume._read_file_bytes(abs_path))
         except OSError:
             return None
+
+    def _check_foreign_edit(self, rel: str, abs_path: Path) -> str | None:
+        """SB-23 content-CAS. Hash the current on-disk file; if the disk diverged
+        from the baseline this instance last observed for ``rel`` (a foreign /
+        out-of-band edit), raise :class:`StaleView` under ``on_stale_write="raise"``
+        so the caller :meth:`reacquire`s instead of clobbering the foreign bytes.
+        ``on_stale_write="allow"`` falls through (proceed and clobber — pre-SB-23
+        behavior).
+
+        Gated on a **strict** (managed) volume. The check is only sound there: on a
+        strict path a peer commit would have DENIED at pre-edit, so reaching this
+        check means no peer commit landed and a disk mismatch is genuinely foreign.
+        On a tracked-but-non-strict path pre-edit re-grants over a peer commit, so a
+        disk mismatch could be that coordinated peer write — not foreign — and must
+        NOT be denied (the no-op-skip handles it). A missing baseline (never-read
+        path) or an absent file (foreign delete) is a no-baseline skip.
+
+        Returns the disk hash (or ``None`` if absent) so the caller reuses it for
+        the write no-op-skip without a second disk read — returned regardless of the
+        gate, since the no-op-skip needs it on non-strict volumes too."""
+        disk_hash = self._disk_hash(abs_path)
+        baseline = self._last_observed_hash.get(rel)
+        if (
+            self._managed  # SB-23 fires only on a strict-coherence volume (see above)
+            and baseline is not None
+            and disk_hash is not None
+            and disk_hash != baseline
+            and self._on_stale_write == "raise"
+        ):
+            raise StaleView(_SB23_STALE_WRITE_REASON)
+        return disk_hash
 
     def _atomic_write(self, abs_path: Path, data: bytes) -> None:
         """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT
@@ -1101,6 +1188,9 @@ class CoherentVolume:
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
+        content_hash = self._sha256_bytes(data)
+        # SB-23: the OCC read path also seeds the foreign-edit baseline.
+        self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
         if self._endpoint is not None:
@@ -1109,7 +1199,7 @@ class CoherentVolume:
                 {
                     "session_id": self._session_id,
                     "path": _rel,
-                    "content_hash": self._sha256_bytes(data),
+                    "content_hash": content_hash,
                 },
             )
             if isinstance(resp, dict):
@@ -1425,6 +1515,7 @@ def install(
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
     on_stale_read: Literal["allow", "raise"] = "allow",
+    on_stale_write: Literal["allow", "raise"] = "raise",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> CoherentVolume:
@@ -1439,7 +1530,7 @@ def install(
         return _shim_state.volume
     volume = CoherentVolume(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
-        config=config, bind_host=bind_host,
+        on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     original_open = builtins.open  # is io.open (same object) at install time
     wrapper = _make_open_wrapper(volume, original_open)
@@ -1466,6 +1557,7 @@ def coherent_workspace(
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
     on_stale_read: Literal["allow", "raise"] = "allow",
+    on_stale_write: Literal["allow", "raise"] = "raise",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> Iterator[CoherentVolume]:
@@ -1480,7 +1572,7 @@ def coherent_workspace(
     already_installed = _shim_state is not None
     volume = install(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
-        config=config, bind_host=bind_host,
+        on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     try:
         yield volume
