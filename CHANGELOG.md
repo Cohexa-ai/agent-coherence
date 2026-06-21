@@ -6,6 +6,23 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- `CoherentVolume(on_stale_write=...)` — a pre-write content-CAS that denies a
+  write which would clobber a foreign / out-of-band edit (the file on disk changed
+  since this instance last read/wrote a managed path), surfaced as `StaleView`;
+  recover via `reacquire()`. Plumbed through `install()` / `coherent_workspace()`.
+  The MCP `swg_write` tool surfaces it as a typed `stale_view` deny.
+
+### Changed
+
+- **`CoherentVolume.write()` now guards by default** (`on_stale_write="raise"`): a
+  write to a managed path whose on-disk bytes changed out-of-band since the last
+  read/write raises `StaleView` instead of silently overwriting. Set
+  `on_stale_write="allow"` to restore the prior clobber. (`write()` already raised
+  `StaleView` on the INVALID-stale pre-edit; this extends it to the foreign-edit
+  case.)
+
 ## [0.9.3] - 2026-06-14
 
 ### Added

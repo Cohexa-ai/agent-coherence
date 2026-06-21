@@ -1653,3 +1653,131 @@ def test_write_unmanaged_path_in_managed_volume_proceeds(
         assert target.read_bytes() == b"v3"
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_remint_preserves_other_paths_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A re-mint (here via reacquire of a DIFFERENT path) must NOT clear the
+    foreign-edit baseline of OTHER managed paths — observed-disk hashes are
+    disk-scoped, not identity-scoped. Otherwise every write_cas conflict (which
+    re-mints) would blind SB-23 on all other previously-read paths."""
+    a = _seed_file(tmp_path, rel="data/a.txt", content=b"a1")
+    _seed_file(tmp_path, rel="data/b.txt", content=b"b1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/a.txt")               # seed A's baseline
+        vol.read("data/b.txt")               # seed B's baseline
+        vol.reacquire("data/b.txt")          # re-mints; A's baseline must SURVIVE
+        a.write_bytes(b"foreign-a2")         # foreign edit on A
+        with pytest.raises(StaleView):
+            vol.write("data/a.txt", b"a3")   # A's baseline survived -> deny
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_denies_foreign_edit_independent_of_on_error_degrade(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """SB-23 is adapter-local: the foreign-edit deny fires regardless of on_error
+    (the guard does not need the coordinator). Write-side mirror of
+    test_on_stale_read_raise_independent_of_on_error_degrade."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+    )
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"v2")
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"v3")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_after_write_cas_win_no_false_deny(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A write_cas win advances the observed baseline, so a following plain write on
+    the same path (no foreign edit) does NOT false-deny."""
+    _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write_cas("data/x.txt", lambda cur: cur + b"-cas")  # win -> advances baseline
+        vol.write("data/x.txt", b"plain-after-cas")             # no foreign edit -> succeeds
+        assert (tmp_path / "data/x.txt").read_bytes() == b"plain-after-cas"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_seeds_baseline_then_plain_write_denies_foreign_edit(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The OCC read path seeds the baseline: after a write_cas win, a foreign edit
+    then a plain write is denied (confirms the OCC-read seeding feeds the guard)."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write_cas("data/x.txt", lambda cur: b"v2")   # win; baseline=hash(v2), disk=v2
+        target.write_bytes(b"foreign-v3")                # foreign edit
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"v4")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_managed_path_without_prior_read_proceeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """No baseline (a managed path never read through this volume) -> SB-23 skips;
+    the write proceeds (the guard needs a prior observation to compare against)."""
+    _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/x.txt", b"v2")   # never read -> no baseline -> proceeds
+        assert (tmp_path / "data/x.txt").read_bytes() == b"v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_stale_write_deny_reason_is_byte_stable(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The foreign-edit deny raises with the exact static _STALE_WRITE_DENY_REASON
+    constant — no path/hash/timestamp interpolation, so a model's retry loop sees
+    identical text every time (KTD-P). Regression pin against future interpolation."""
+    from ccs.adapters.coherent_volume import _STALE_WRITE_DENY_REASON
+
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"v2")
+        with pytest.raises(StaleView) as exc:
+            vol.write("data/x.txt", b"v3")
+        assert str(exc.value) == _STALE_WRITE_DENY_REASON  # static, no interpolation
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_on_foreign_edit_wedges_not_stale_view(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """SB-23 scope boundary: write_cas is version-CAS, not content-CAS — it does NOT
+    raise StaleView. But on a strict path it is NOT unguarded: the read-side hash
+    deny makes write_cas's comparand read (_read_with_version) fail closed, so a
+    pre-existing foreign edit WEDGES the CAS (ViewWedged after the reacquire budget)
+    rather than silently clobbering it. Pins both: SB-23's content-CAS guards only
+    the plain write() path, and write_cas still fails closed (no silent loss)."""
+    from ccs.core.exceptions import ViewWedged
+
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"foreign-v2")    # foreign edit (coordinator version unchanged)
+        with pytest.raises(ViewWedged):      # fail-closed — NOT StaleView, NOT a clobber
+            vol.write_cas("data/x.txt", lambda cur: cur + b"-cas")
+        assert target.read_bytes() == b"foreign-v2"  # foreign edit intact (not clobbered)
+    finally:
+        stop_coordinator(tmp_path)
