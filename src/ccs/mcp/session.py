@@ -55,11 +55,16 @@ def build_volume(config: SessionConfig) -> CoherentVolume:
     Construction self-spawns/attaches the coordinator and RAISES (fail-closed) if
     it cannot attach or enable strict — the server then refuses to start.
     ``idle_shutdown_sec=0`` keeps the coordinator alive for the server's lifetime.
+    ``on_stale_write='raise'`` (SB-23) is the write-surface complement to strict
+    mode: a ``swg_write`` that would clobber a foreign / out-of-band edit is denied
+    rather than silently overwriting it. It is the constructor default; set
+    explicitly here to match the strict-only honesty floor.
     """
     volume = CoherentVolume(
         config.root,
         managed=config.managed,
         on_error="strict",
+        on_stale_write="raise",
         config=LifecycleConfig(idle_shutdown_sec=0),
     )
     # Strict construction guarantees attachment (else it raised); assert loudly so

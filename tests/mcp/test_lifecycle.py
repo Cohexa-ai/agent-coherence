@@ -91,6 +91,8 @@ def test_build_volume_is_strict_only(tmp_path: Path) -> None:
         # The server never constructs a degrade-mode volume (the fail-open hole).
         assert volume._on_error == "strict"
         assert volume.strict_mode_active() is True
+        # The write-surface guard is armed too (foreign-edit clobber -> stale_view).
+        assert volume._on_stale_write == "raise"
     finally:
         stop_coordinator(tmp_path)
 

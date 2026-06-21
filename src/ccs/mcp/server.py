@@ -49,9 +49,10 @@ when two or more agents share a mutable file. It enforces VERSION LINEAGE via a
 local coherence coordinator; it does NOT merge content for you.
 
 Two guarantees, both single-host and fail-closed:
-  1. Sequential stale-overwrite — if a peer committed a newer version, swg_write
-     is DENIED (reason=stale_view). Recover with swg_reacquire, then write FROM
-     the fresh bytes it returns.
+  1. Sequential stale-overwrite — swg_write is DENIED (reason=stale_view) if the
+     file changed since you read it: either a peer committed a newer version OR it
+     was edited out-of-band (an editor, another tool, a shell script). Recover with
+     swg_reacquire, then write FROM the fresh bytes it returns.
   2. Concurrent same-key lost-update — swg_write_cas(path, expected_version,
      new_content) rejects a stale compare-and-set as a TYPED CONFLICT (not an
      auto-merge): you read, merge, and retry; the server never merges for you.
@@ -87,10 +88,10 @@ _READ_DESC = (
 )
 _WRITE_DESC = (
     "Write a workspace text file (acquire -> write -> commit). DENIED with "
-    "reason=stale_view if a peer committed a newer version: recover with "
-    "swg_reacquire, then write FROM its bytes. A mid-write preempt returns "
-    "reason=commit_preempted (disk may hold un-versioned bytes; "
-    "reacquire_and_reconcile)." + _SCOPE_CLAUSE
+    "reason=stale_view if the file changed since you read it — a peer commit OR an "
+    "out-of-band edit (another tool/editor): recover with swg_reacquire, then write "
+    "FROM its bytes. A mid-write preempt returns reason=commit_preempted (disk may "
+    "hold un-versioned bytes; reacquire_and_reconcile)." + _SCOPE_CLAUSE
 )
 _REACQUIRE_DESC = (
     "Recover from a stale_view deny: re-mint identity and return the CURRENT "

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ccs.adapters.claude_code.policy import _matches_any
+from ccs.adapters.claude_code.policy import matches_any
 
 if TYPE_CHECKING:
     from ccs.adapters.coherent_volume import CoherentVolume
@@ -72,7 +72,7 @@ def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:
         path = artifact.get("path")
         if not isinstance(path, str):
             continue
-        enforced = _matches_any(path, config.managed)
+        enforced = matches_any(path, config.managed)
         per_path[path] = {
             "version": artifact.get("version"),
             "status": "enforced" if enforced else "not_registered",
