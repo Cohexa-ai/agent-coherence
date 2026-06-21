@@ -166,11 +166,11 @@ class CoherentVolume:
       default *guards*, because a write is a data-loss surface (the inverse of
       ``on_stale_read``, where returning bytes is always safe).
     - ``"allow"``: the foreign edit is not raised; the write proceeds and clobbers
-      (pre-SB-23 behavior). Adapter-local: fires on a strict (managed-globs) volume
+      (pre-SB-23 behavior). Adapter-local: fires for a **managed (strict) path**
       whenever a per-path baseline exists, independent of ``on_error`` / coordinator
-      attachment. A non-strict volume is exempt — there a coordinated peer commit
-      can change the disk without an INVALID deny, so a mismatch is not necessarily
-      foreign.
+      attachment. An unmanaged or tracked-but-non-strict path is exempt — there a
+      coordinated peer change can hit the disk without an INVALID deny, so a
+      mismatch is not necessarily foreign.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
@@ -1090,13 +1090,14 @@ class CoherentVolume:
         ``on_stale_write="allow"`` falls through (proceed and clobber — pre-SB-23
         behavior).
 
-        Gated on a **strict** (managed) volume. The check is only sound there: on a
-        strict path a peer commit would have DENIED at pre-edit, so reaching this
-        check means no peer commit landed and a disk mismatch is genuinely foreign.
-        On a tracked-but-non-strict path pre-edit re-grants over a peer commit, so a
-        disk mismatch could be that coordinated peer write — not foreign — and must
-        NOT be denied (the no-op-skip handles it). A missing baseline (never-read
-        path) or an absent file (foreign delete) is a no-baseline skip.
+        Gated on a **managed (strict) path** — ``rel`` matched against this volume's
+        managed globs. The check is only sound there: on a strict path a peer commit
+        would have DENIED at pre-edit, so reaching this check means no peer commit
+        landed and a disk mismatch is genuinely foreign. On a path this volume does
+        NOT manage (untracked, or tracked-but-non-strict) pre-edit re-grants over a
+        peer write, so a disk mismatch could be that coordinated change — not
+        foreign — and must NOT be denied (the no-op-skip handles it). A missing
+        baseline (never-read path) or an absent file (foreign delete) also skips.
 
         Returns the disk hash (or ``None`` if absent) so the caller reuses it for
         the write no-op-skip without a second disk read — returned regardless of the
@@ -1104,7 +1105,12 @@ class CoherentVolume:
         disk_hash = self._disk_hash(abs_path)
         baseline = self._last_observed_hash.get(rel)
         if (
-            self._managed  # SB-23 fires only on a strict-coherence volume (see above)
+            # Only for a path THIS volume manages (strict). Matching `rel` against
+            # the managed globs with the coordinator's own matcher keeps SB-23's
+            # scope identical to is_strict_mode — a volume that manages other globs
+            # but writes an unmanaged path does NOT fire (the unmanaged path is not
+            # strict, so a coordinated change there would not have denied either).
+            _matches_any(rel, self._managed)
             and baseline is not None
             and disk_hash is not None
             and disk_hash != baseline

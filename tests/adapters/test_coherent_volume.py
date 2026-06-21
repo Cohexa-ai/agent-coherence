@@ -1634,3 +1634,22 @@ def test_install_forwards_on_stale_write(
     finally:
         uninstall()
         stop_coordinator(tmp_path)
+
+
+def test_write_unmanaged_path_in_managed_volume_proceeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """SB-23 fires only for a path THIS volume manages. A volume managing other/**
+    that reads+writes data/... (unmanaged here) does NOT deny a divergent disk —
+    that path is not strict, so a coordinated change there is not necessarily a
+    foreign edit (the bool(managed) gate would wrongly fire; the per-path match
+    must not)."""
+    target = _seed_file(tmp_path, rel="data/x.txt", content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("other/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")                   # seeds a baseline, but data/** is unmanaged
+        target.write_bytes(b"v2")                # divergent disk on an unmanaged path
+        vol.write("data/x.txt", b"v3")           # SB-23 does NOT fire -> proceeds
+        assert target.read_bytes() == b"v3"
+    finally:
+        stop_coordinator(tmp_path)
