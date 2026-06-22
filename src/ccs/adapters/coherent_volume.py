@@ -77,6 +77,7 @@ from ccs.core.exceptions import (
     CommitPreempted,
     CommitUnconfirmed,
     InternalConcurrencyError,
+    RemoteAuthFailed,
     StaleView,
     ViewWedged,
 )
@@ -391,10 +392,16 @@ class CoherentVolume:
             self._fail_closed_or_degrade(f"remote coordinator unreachable: {exc}")
             self._endpoint = None
             return
-        except urllib.error.HTTPError:
-            # Reachable but non-2xx (e.g. 401/403): the coordinator is up; the
-            # actual read/write op surfaces the typed deny / auth failure (R2).
-            pass
+        except urllib.error.HTTPError as exc:
+            # R2: a 401 at attach is a wrong/missing secret — fail loud + closed.
+            if exc.code == 401:
+                raise RemoteAuthFailed(
+                    "remote coordinator rejected the bearer token (401) at attach; "
+                    "the remote secret (CCS_REMOTE_SECRET_FILE) does not match the "
+                    "coordinator's hook.secret"
+                ) from exc
+            # Reachable, other non-2xx (e.g. 403): the coordinator is up; the
+            # actual read/write op surfaces the typed deny (R2).
         self._endpoint = endpoint
 
     # --- spawn-with-strict --------------------------------------------------
@@ -1234,7 +1241,21 @@ class CoherentVolume:
         ``None``). Otherwise returns the parsed 200 body."""
         try:
             return _coordinator_post(self._endpoint, endpoint_path, payload)
-        except (CoordinatorUnavailable, urllib.error.HTTPError) as exc:
+        except urllib.error.HTTPError as exc:
+            # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
+            # with a distinct type, never the generic degrade path (which a
+            # degrade-mode local client could swallow).
+            if self._remote_endpoint is not None and exc.code == 401:
+                raise RemoteAuthFailed(
+                    "remote coordinator rejected the bearer token (401); the remote "
+                    "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
+                    "hook.secret"
+                ) from exc
+            self._fail_closed_or_degrade(
+                f"coordinator request to {endpoint_path} failed: {exc}"
+            )
+            return None  # reached only in degrade mode
+        except CoordinatorUnavailable as exc:
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
