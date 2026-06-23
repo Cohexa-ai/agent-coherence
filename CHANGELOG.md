@@ -4,15 +4,42 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.10.0] - 2026-06-23
+
+Foreign-edit coordination on both the read and the write surface, plus the
+`stale-write-guard-fs` MCP server. A managed file edited out-of-band (a human, a
+script, a tool not on the coordinator) is now caught when an agent re-reads it
+*and* when an agent writes over it.
 
 ### Added
 
-- `CoherentVolume(on_stale_write=...)` — a pre-write content-CAS that denies a
-  write which would clobber a foreign / out-of-band edit (the file on disk changed
-  since this instance last read/wrote a managed path), surfaced as `StaleView`;
+- **MCP-C v1 — the `stale-write-guard-fs` MCP server.** A stdio
+  [Model Context Protocol](https://modelcontextprotocol.io) server
+  (`pip install agent-coherence[mcp]`; `stale-write-guard-fs` console script) that
+  exposes the shipped single-host `CoherentVolume` coordination to any MCP client
+  over five tools: `swg_read`, `swg_write`, `swg_reacquire`, `swg_write_cas`
+  (single-shot version-checked CAS), and a 3-state `swg_status` (`on` / `off` /
+  `unknown`). Per-session coordinator binding; a URI→key validator that rejects
+  path traversal, `.coherence` access, and symlinks resolving into `.coherence`
+  (info-disclosure); a typed deny-contract mapper that renders coherence terminals
+  (e.g. `stale_view`) with `recover: reacquire`; fail-closed on IO errors.
+  Strict / managed-path scoped. Ships with a red→green front-door demo (with a
+  negative control); the MCP suite runs in CI (skipped on installs without the
+  `mcp` extra).
+- **Read-time foreign-edit deny (`on_stale_read`).** A SHARED holder that re-reads
+  a managed file whose on-disk bytes changed out-of-band is now denied in strict
+  mode — promoting the prior fail-open `hash_differs` advisory to an enforced deny.
+  Opt in client-side with `CoherentVolume(on_stale_read="raise")` to surface it as
+  `StaleView`; recover via `reacquire()`. A benign self-commit→disk-write lag
+  window is suppressed (`shared_foreign_lag_suppressed_total` counter) so an
+  instance never denies its own just-written bytes.
+- **Pre-write content-CAS (`on_stale_write`).** `CoherentVolume(on_stale_write=…)`
+  denies a write that would clobber a foreign / out-of-band edit (the managed file
+  on disk changed since this instance last read/wrote it), surfaced as `StaleView`;
   recover via `reacquire()`. Plumbed through `install()` / `coherent_workspace()`.
   The MCP `swg_write` tool surfaces it as a typed `stale_view` deny.
+- Vendor-neutral example demos: a shared-knowledge-base lost-update demo and a
+  divergent-session memory-coherence demo (`examples/`).
 
 ### Changed
 
@@ -22,6 +49,10 @@ Alpha — APIs may change before `v1.0`.
   `on_stale_write="allow"` to restore the prior clobber. (`write()` already raised
   `StaleView` on the INVALID-stale pre-edit; this extends it to the foreign-edit
   case.)
+- **Strict mode now enforces read-time foreign-edit detection** (server-side): the
+  coordinator denies a SHARED holder's re-read of a managed file whose supplied
+  content hash diverges from the canonical, where it previously only advised. A
+  behavior change for strict-mode deployments only; non-strict paths are unaffected.
 
 ## [0.9.3] - 2026-06-14
 
