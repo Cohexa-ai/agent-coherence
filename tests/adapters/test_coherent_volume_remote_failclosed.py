@@ -80,3 +80,16 @@ def test_degraded_200_body_fails_closed_on_read(tmp_path: Path, monkeypatch: pyt
     )
     with pytest.raises(CoherenceError):
         vol.read_with_version("f.txt")
+
+
+def test_attach_403_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Hardening: any non-2xx at the attach probe (e.g. 403 Host mismatch) fails
+    CLOSED at construction rather than deferring the misconfig to the first op."""
+    def probe_403(ep, path, **k):
+        raise _http_error(403)
+
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    monkeypatch.setattr(cv, "_coordinator_get", probe_403)
+    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret")
+    with pytest.raises(CoherenceError):
+        CoherentVolume(tmp_path, on_error="strict", remote_endpoint=remote)

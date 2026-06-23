@@ -119,3 +119,16 @@ def test_from_env_non_numeric_port_is_none():
         env={"CCS_REMOTE_COORDINATOR": "1", "CCS_REMOTE_PORT": "notaport"}
     )
     assert cfg.port is None
+
+
+def test_secret_file_symlink_is_rejected(tmp_path):
+    # Hardening: a symlinked secret file is refused (O_NOFOLLOW) so an attacker
+    # who can set CCS_REMOTE_SECRET_FILE cannot repoint it at another file.
+    real = tmp_path / "real.secret"
+    real.write_text("s3cr3t", encoding="utf-8")
+    link = tmp_path / "link.secret"
+    link.symlink_to(real)
+    cfg = RemoteCoordinatorConfig.from_env(
+        env={"CCS_REMOTE_COORDINATOR": "1", "CCS_REMOTE_SECRET_FILE": str(link)}
+    )
+    assert cfg.secret is None

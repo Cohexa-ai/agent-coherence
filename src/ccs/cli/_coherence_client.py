@@ -252,24 +252,30 @@ class RemoteCoordinatorConfig:
     def _read_secret(env: dict[str, str]) -> str | None:
         """Read the bearer from ``CCS_REMOTE_SECRET_FILE`` (not an inline env var).
 
-        Warns (does not fail — cooperative trust) if the file is group/world
-        accessible; the local ``hook.secret`` is created 0600, so a wider mode on
-        the remote copy means the provisioning channel widened the exposure.
+        Hardened: refuses to follow a symlinked secret file (``O_NOFOLLOW`` — an
+        attacker able to set the env var could otherwise repoint it at any
+        readable file), and warns if the file is group/world-accessible (``0600``
+        expected, like the local ``hook.secret``). Fails closed (returns ``None``)
+        on any error.
         """
         secret_path = (env.get("CCS_REMOTE_SECRET_FILE") or "").strip()
         if not secret_path:
             return None
         try:
-            path = Path(secret_path)
-            mode = path.stat().st_mode
-            if mode & 0o077:
-                logger.warning(
-                    "CCS_REMOTE_SECRET_FILE %s is group/world-accessible (mode %o); "
-                    "tighten it to 0600",
-                    secret_path,
-                    mode & 0o777,
-                )
-            secret = path.read_text(encoding="utf-8").strip()
+            fd = os.open(secret_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None  # missing, or a symlink (ELOOP) — fail closed
+        try:
+            with os.fdopen(fd, encoding="utf-8") as handle:
+                mode = os.fstat(handle.fileno()).st_mode
+                if mode & 0o077:
+                    logger.warning(
+                        "CCS_REMOTE_SECRET_FILE %s is group/world-accessible (mode %o); "
+                        "tighten it to 0600",
+                        secret_path,
+                        mode & 0o777,
+                    )
+                secret = handle.read().strip()
         except OSError:
             return None
         return secret or None

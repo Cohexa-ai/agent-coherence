@@ -400,8 +400,13 @@ class CoherentVolume:
                     "the remote secret (CCS_REMOTE_SECRET_FILE) does not match the "
                     "coordinator's hook.secret"
                 ) from exc
-            # Reachable, other non-2xx (e.g. 403): the coordinator is up; the
-            # actual read/write op surfaces the typed deny (R2).
+            # Any other non-2xx at attach (403 Host mismatch, 503 draining, ...)
+            # fails CLOSED here rather than deferring a misconfig to the first op.
+            self._fail_closed_or_degrade(
+                f"remote coordinator returned HTTP {exc.code} at attach"
+            )
+            self._endpoint = None
+            return
         self._endpoint = endpoint
 
     # --- spawn-with-strict --------------------------------------------------
