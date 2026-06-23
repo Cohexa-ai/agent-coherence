@@ -81,3 +81,12 @@ def test_coordinator_rejects_bad_bind_host(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         CoordinatorHTTPServer(tmp_path, bind_host="10.0.0.5")  # non-loopback, flag off
+
+
+def test_coordinator_cli_has_bind_host_flag():
+    """The coordinator CLI exposes --bind-host (default loopback) so the README's
+    documented cross-host command actually works."""
+    from ccs.cli.coherence_coordinator import build_parser
+
+    assert build_parser().parse_args([]).bind_host == "127.0.0.1"
+    assert build_parser().parse_args(["--bind-host", "10.0.0.5"]).bind_host == "10.0.0.5"

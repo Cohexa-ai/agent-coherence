@@ -15,6 +15,15 @@ If you find any outbound traffic from this package in v0, please [open a
 security advisory](https://github.com/hipvlady/agent-coherence/security/advisories)
 — it would be a bug.
 
+**Cross-host mode (default OFF).** Setting `CCS_REMOTE_COORDINATOR=1` and pointing
+a `CoherentVolume` at a remote coordinator (`CCS_REMOTE_HOST` / `CCS_REMOTE_PORT` /
+`CCS_REMOTE_SECRET_FILE`) makes the client open HTTP connections to that
+**user-configured, private-range coordinator endpoint** — never the internet, and
+no telemetry. This is the only network traffic the library generates, it is opt-in,
+and the coordinator only binds beyond loopback to an RFC-1918/4193 address (see the
+cross-host demo, `examples/cross_host/`). With the flag unset the zero-outbound
+posture above is unchanged.
+
 ## Env-var kill switches
 
 Set any of these to a truthy value (`1`, `true`, `yes`) to disable
