@@ -34,6 +34,23 @@ if importlib.util.find_spec("openai") is None or importlib.util.find_spec("mistr
     collect_ignore_glob.append("test_*_live.py")
 
 
+def _mcp_server_available() -> bool:
+    # find_spec on a submodule raises ModuleNotFoundError when an ancestor is
+    # absent (mcp missing, OR a partial transitive mcp without mcp.server).
+    try:
+        return importlib.util.find_spec("mcp.server.fastmcp") is not None
+    except ModuleNotFoundError:
+        return False
+
+
+# The front-door demo test imports `examples.mcp_stale_write_guard`, which imports
+# `ccs.mcp.server` -> the `mcp` SDK (the `[mcp]` extra). Skip it on a bare install
+# (the tests/mcp/ package carries its own conftest guard for the rest). CI's Tests
+# job installs `.[...,mcp]` so it runs there.
+if not _mcp_server_available():
+    collect_ignore_glob.append("test_mcp_front_door_demo.py")
+
+
 def pytest_configure(config):
     """Neutralize the v0.9.0 transitional RuntimeWarning at COLLECTION time.
 

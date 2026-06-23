@@ -1,0 +1,188 @@
+"""Unit 2 — coordinator lifecycle, fail-closed binding, stdout purity, serialization.
+
+The server owns the coordinator for its lifetime: constructing the per-session
+volume self-spawns/attaches (strict-only, fail-closed); the lifespan calls
+``stop_coordinator`` on exit and never double-spawns. Two invariants are
+load-bearing: the JSON-RPC stdout channel must stay byte-clean (the coordinator
+subprocess's stdout must not leak to fd 1), and ``import ccs.mcp`` must work
+without the optional ``mcp`` SDK (lazy package).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.mcp.server import build_server, lifespan
+from ccs.mcp.session import SessionConfig, build_volume
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture
+def fast_cfg() -> LifecycleConfig:
+    """Coordinator config tuned for fast tests (no idle shutdown)."""
+    return LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0.1,
+        notice_evict_max_age_sec=1.0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.05,
+        connect_retry_attempts=10,
+        connect_retry_interval_sec=0.05,
+    )
+
+
+def _seed(tmp_path: Path, rel: str = "data/shared.txt", content: bytes = b"v1") -> Path:
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
+def _subprocess_env(tmp_path: Path, managed: str = "data/**") -> dict[str, str]:
+    return {
+        **os.environ,
+        "PYTHONPATH": str(REPO_ROOT / "src"),
+        "SWG_ROOT": str(tmp_path),
+        "SWG_MANAGED": managed,
+    }
+
+
+# --- happy path: attach + strict + clean stop --------------------------------
+
+
+def test_lifespan_attaches_strict_and_stops(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path)
+    server = build_server()
+
+    async def go() -> None:
+        async with lifespan(server) as ctx:
+            assert ctx.volume.is_attached
+            assert ctx.volume.strict_mode_active() is True
+            assert not ctx.volume.is_degraded
+            assert ctx.config.root == tmp_path.resolve()
+            assert ctx.config.managed == ("data/**",)
+
+    asyncio.run(go())
+    # The lifespan's finally already stopped the coordinator; a second stop in
+    # THIS process reports False (nothing left for us to stop).
+    assert stop_coordinator(tmp_path) is False
+
+
+# --- strict-only construction (no degrade-mode volume) -----------------------
+
+
+def test_build_volume_is_strict_only(tmp_path: Path) -> None:
+    config = SessionConfig(root=tmp_path, managed=("data/**",))
+    _seed(tmp_path)
+    volume = build_volume(config)
+    try:
+        assert volume.is_attached
+        # The server never constructs a degrade-mode volume (the fail-open hole).
+        assert volume._on_error == "strict"
+        assert volume.strict_mode_active() is True
+        # The write-surface guard is armed too (foreign-edit clobber -> stale_view).
+        assert volume._on_stale_write == "raise"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- serialization: concurrent coroutines do not trip the A5 thread-guard -----
+
+
+def test_concurrent_volume_access_serializes_without_a5(tmp_path: Path, monkeypatch) -> None:
+    """Three overlapping coroutines each touch the one shared volume under the
+    lock. The volume's A5 guard raises on a *different thread*; serialized
+    main-thread access under the lock must never trip it."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path, content=b"v1")
+    server = build_server()
+
+    async def go() -> list[bytes]:
+        async with lifespan(server) as ctx:
+
+            async def op() -> bytes:
+                async with ctx.lock:
+                    return ctx.volume.read("data/shared.txt")
+
+            return await asyncio.gather(op(), op(), op())
+
+    results = asyncio.run(go())
+    assert results == [b"v1", b"v1", b"v1"]
+    assert stop_coordinator(tmp_path) is False
+
+
+# --- stdout purity (fd-level, via a real subprocess) -------------------------
+
+
+def test_lifespan_keeps_stdout_byte_clean(tmp_path: Path) -> None:
+    """Enter the lifespan (spawns a real coordinator) and exit, in a subprocess
+    whose REAL fd 1 we capture. Nothing — not the server, not the spawned
+    coordinator subprocess — may write to stdout (the JSON-RPC channel)."""
+    _seed(tmp_path)
+    script = textwrap.dedent(
+        """
+        import asyncio
+        from ccs.mcp.server import build_server, lifespan
+
+        async def go():
+            async with lifespan(build_server()) as ctx:
+                assert ctx.volume.is_attached
+
+        asyncio.run(go())
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=_subprocess_env(tmp_path),
+        timeout=60,
+    )
+    assert result.returncode == 0, f"subprocess failed:\n{result.stderr}"
+    assert result.stdout == "", f"stdout polluted (JSON-RPC channel): {result.stdout!r}"
+
+
+# --- lazy package: import ccs.mcp without the mcp SDK ------------------------
+
+
+def test_import_ccs_mcp_does_not_require_mcp_sdk() -> None:
+    """``import ccs.mcp`` must succeed even when the optional ``mcp`` SDK is
+    unimportable — the package is lazy (only ``deny``/``server`` pull it in)."""
+    script = textwrap.dedent(
+        """
+        import sys
+        import importlib.abc
+
+        class _BlockMcp(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path, target=None):
+                if name == "mcp" or name.startswith("mcp."):
+                    raise ImportError("mcp SDK blocked for the lazy-import test")
+                return None
+
+        sys.meta_path.insert(0, _BlockMcp())
+        import ccs.mcp  # must NOT import mcp
+        assert "mcp" not in sys.modules, "ccs.mcp eagerly imported the mcp SDK"
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        timeout=30,
+    )
+    assert result.returncode == 0, f"lazy import failed:\n{result.stderr}"
+    assert "ok" in result.stdout

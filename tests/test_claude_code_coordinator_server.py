@@ -25,8 +25,10 @@ import pytest
 
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
+    _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
     CoordinatorHTTPServer,
+    _is_recent_self_commit_lag,
     session_to_agent_id,
 )
 from ccs.core.states import MESIState
@@ -379,6 +381,67 @@ def test_pre_read_fresh_shared_hash_mismatch_increments_counter(
     assert coordinator._fresh_shared_hash_mismatch_total == before + 1
 
 
+# ----------------------------------------------------------------------
+# Survivor #6 v1 — _is_recent_self_commit_lag (R2): the commit→disk-write
+# lag-exclusion predicate. A SHARED-holder hash mismatch is the benign lag
+# (NOT a foreign edit) iff THIS session is the artifact's RECENT last
+# committer — the registry advanced the canonical hash (e.g. a commit_cas
+# WIN that leaves the writer SHARED) but the agent has not yet flushed the
+# new bytes to disk. Anything else is a genuine out-of-band edit → deny.
+# ----------------------------------------------------------------------
+
+_CSRV = "ccs.adapters.claude_code.coordinator_server"
+
+
+def _patch_last_writer(monkeypatch, *, writer, ts) -> None:
+    monkeypatch.setattr(f"{_CSRV}._last_writer_for", lambda coord, aid: writer)
+    monkeypatch.setattr(f"{_CSRV}._last_writer_unix_ts", lambda coord, aid: ts)
+
+
+def test_lag_true_for_recent_self_commit(coordinator, monkeypatch) -> None:
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC - 0.1
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+
+
+def test_lag_false_for_stale_self_commit(coordinator, monkeypatch) -> None:
+    """last_writer == self but the commit is OLD => something rewrote disk
+    since => correctly FOREIGN (the recency clause is load-bearing)."""
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is False
+
+
+def test_lag_false_for_other_writer(coordinator, monkeypatch) -> None:
+    _patch_last_writer(monkeypatch, writer=_sid("s2"), ts=1000.0)
+    assert _is_recent_self_commit_lag(
+        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+
+
+def test_lag_false_for_no_writer(coordinator, monkeypatch) -> None:
+    _patch_last_writer(monkeypatch, writer=None, ts=None)
+    assert _is_recent_self_commit_lag(
+        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+
+
+def test_lag_false_for_missing_updated_at(coordinator, monkeypatch) -> None:
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=None)
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=1000.1) is False
+
+
+def test_lag_true_at_exact_window_boundary(coordinator, monkeypatch) -> None:
+    """`<=` boundary: a self-commit EXACTLY at the window edge is still treated as
+    lag (the fail-safe direction). Pins the operator choice against a silent flip
+    to `<`."""
+    sid = _sid("s1")
+    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+
+
 def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
     """fresh_shared_hash_mismatch_total visible in /status?detail=metrics
     so an operator can size the false-positive rate before any
@@ -387,6 +450,16 @@ def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Clie
     assert status == 200
     assert "fresh_shared_hash_mismatch_total" in body
     assert isinstance(body["fresh_shared_hash_mismatch_total"], int)
+
+
+def test_status_metrics_exposes_shared_foreign_lag_suppressed_counter(client: _Client) -> None:
+    """shared_foreign_lag_suppressed_total visible in /status?detail=metrics so an
+    operator can size the lag-window (5s) false-negative rate against
+    strict_mode_denials_total."""
+    status, body = client.get("/status?detail=metrics")
+    assert status == 200
+    assert "shared_foreign_lag_suppressed_total" in body
+    assert isinstance(body["shared_foreign_lag_suppressed_total"], int)
 
 
 # ----------------------------------------------------------------------

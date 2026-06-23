@@ -25,6 +25,7 @@ _LAYER_BY_NAMESPACE = {
     "validation": "interface",
     "diagnose": "interface",
     "replay": "interface",
+    "mcp": "interface",
 }
 
 _ALLOWED_LAYER_IMPORTS = {

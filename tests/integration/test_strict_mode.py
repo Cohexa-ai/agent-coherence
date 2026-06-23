@@ -25,6 +25,7 @@ Covers (per plan Unit 2 Test scenarios):
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -186,6 +187,174 @@ def test_pre_read_strict_tracked_stale_denies(strict_client: _Client) -> None:
     reason = out["permissionDecisionReason"]
     assert "CLAUDE.md" in reason
     assert "Re-read" in reason
+
+
+# ----------------------------------------------------------------------
+# Survivor #6 v1 — SHARED-holder foreign-edit strict deny (read surface).
+# Promotes the former fail-open allow for a SHARED holder whose supplied
+# disk hash mismatches the canonical (an out-of-band / foreign edit), while
+# preserving warn-mode, the sentinel guard, and the commit→disk-write-lag
+# exclusion (R2).
+# ----------------------------------------------------------------------
+
+
+def test_pre_read_strict_shared_foreign_edit_denies(strict_client: _Client) -> None:
+    """A still-SHARED reader (no peer commit since its grant) whose disk hash
+    mismatches the canonical, with no commit through the coordinator (foreign
+    edit), is DENIED in strict mode. last_writer is unset, so the lag-exclusion
+    does not apply — this is the Dropbox out-of-band-edit case."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert out["hookEventName"] == "PreToolUse"
+    assert "CLAUDE.md" in out["permissionDecisionReason"]
+    assert "Re-read" in out["permissionDecisionReason"]
+
+
+def test_pre_read_warn_shared_foreign_edit_still_allows(strict_client: _Client) -> None:
+    """Warn-mode unchanged: on a tracked-but-NOT-strict path the SHARED-holder
+    mismatch stays a fail-open allow + hash_differs (R1 warn preserved)."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
+def test_pre_read_strict_shared_sentinel_never_denies(
+    strict_coordinator, strict_client: _Client,
+) -> None:
+    """The launch-gate sentinel canonical ("f"*64) carries no content claim;
+    a SHARED-holder re-read against it must not deny even in strict mode (the
+    != _F_SENTINEL_CONTENT_HASH guard survives the promotion)."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    art_id = strict_coordinator.registry.lookup_artifact_id_by_name("CLAUDE.md")
+    assert art_id is not None
+    art = strict_coordinator.registry.get_artifact(art_id)
+    strict_coordinator.registry.set_artifact_and_content(
+        art_id, dataclasses.replace(art, content_hash="f" * 64), "",
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_pre_read_strict_shared_recent_self_commit_lag_allows(
+    strict_client: _Client, monkeypatch,
+) -> None:
+    """FP-lag negative control (MANDATORY): a SHARED holder whose mismatch is
+    its OWN recent commit (registry canonical advanced via a commit_cas WIN,
+    disk not yet flushed) must NOT be denied — it falls through to the
+    warn-mode allow. Distinguishes the benign commit→disk-write lag from a
+    foreign edit. Without this exclusion a normal OCC-WIN-then-reread would
+    false-deny."""
+    import ccs.adapters.claude_code.coordinator_server as _csrv
+
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    # Make CLAUDE.md appear as this session's just-now commit (the lag shape).
+    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: _sid("s1"))
+    monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    # Lag-excluded: no deny, falls through to the warn-mode allow + hash_differs.
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
+def test_pre_read_strict_shared_foreign_edit_records_telemetry(
+    strict_coordinator, strict_client: _Client,
+) -> None:
+    """The SHARED-holder foreign-edit deny fires the SAME telemetry as the INVALID
+    deny (shared _emit_pre_read_strict_deny helper): bump strict_mode_denials_total
+    and record the (session, path) for route-around. Guards a refactor that returns
+    the right HTTP body but drops the side-effects."""
+    before = strict_coordinator._strict_mode_denials_total
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert strict_coordinator._strict_mode_denials_total == before + 1
+    assert strict_coordinator.check_strict_deny_route_around(_sid("s1"), "CLAUDE.md") is True
+
+
+def test_pre_read_strict_shared_lag_suppression_increments_counter(
+    strict_coordinator, strict_client: _Client, monkeypatch,
+) -> None:
+    """The R2 lag-suppression path bumps shared_foreign_lag_suppressed_total so an
+    operator can size the lag-window false-negative rate, and still falls through
+    to the warn-mode allow (no deny)."""
+    import ccs.adapters.claude_code.coordinator_server as _csrv
+
+    before = strict_coordinator._shared_foreign_lag_suppressed_total
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: _sid("s1"))
+    monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+    assert strict_coordinator._shared_foreign_lag_suppressed_total == before + 1
+
+
+def test_pre_read_strict_remint_after_foreign_edit_still_denies(
+    strict_client: _Client,
+) -> None:
+    """RR-2 refutation: after a foreign edit the canonical never advances (no
+    commit), so a re-minted identity (the OCC write_cas remint, modeled as a fresh
+    session) reading the foreign bytes is DENIED, not silently granted
+    fresh-SHARED. There is no clean SHARED@foreign state for a later fresh-SHARED
+    read to skip-check, and a repeat read keeps denying."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s2"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    status2, body2 = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s2"), "path": "CLAUDE.md", "content_hash": _hash("foreign-v2")},
+    )
+    assert status2 == 200
+    assert body2["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_pre_edit_strict_tracked_stale_denies(strict_client: _Client) -> None:

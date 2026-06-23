@@ -179,12 +179,12 @@ class TrackedArtifactPolicy:
         # the string-build loop for ``**`` patterns.
         cache = self._compiled_patterns
         tracked = (
-            _matches_any(normalized, self.tracked_patterns, cache)
-            or _matches_any(normalized, self.user_added_patterns, cache)
+            matches_any(normalized, self.tracked_patterns, cache)
+            or matches_any(normalized, self.user_added_patterns, cache)
         )
         if not tracked:
             return False
-        if _matches_any(normalized, self.ignored_patterns, cache):
+        if matches_any(normalized, self.ignored_patterns, cache):
             return False
         return True
 
@@ -209,7 +209,7 @@ class TrackedArtifactPolicy:
         normalized = _normalize_relative(parent_relative_path)
         if normalized is None:
             return False
-        return _matches_any(normalized, self.strict_mode_paths, self._compiled_patterns)
+        return matches_any(normalized, self.strict_mode_paths, self._compiled_patterns)
 
     def count_strict_mode_matches(self, candidate_paths: Iterable[str]) -> int:
         """Count how many of ``candidate_paths`` are in strict mode.
@@ -291,7 +291,7 @@ def _normalize_relative(p: str) -> str | None:
     return cleaned
 
 
-def _matches_any(
+def matches_any(
     path: str,
     patterns: Iterable[str],
     compiled: dict[str, re.Pattern[str]] | None = None,

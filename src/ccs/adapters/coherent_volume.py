@@ -53,7 +53,7 @@ from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file,
     tcp_probe,
 )
-from ccs.adapters.claude_code.policy import _matches_any
+from ccs.adapters.claude_code.policy import matches_any
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
@@ -66,11 +66,18 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
+    CommitPreempted,
+    CommitUnconfirmed,
+    InternalConcurrencyError,
+    StaleView,
+    ViewWedged,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +102,14 @@ __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 #   wedged coordinator / perpetually lagging disk — must not spin). A clean
 #   read resets the streak.
 MAX_CAS_REACQUIRES = 8
+
+# SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
+# model's retry loop sees identical text each attempt (KTD-P), and distinct from
+# the coordinator's INVALID-deny prose so the two are not conflated.
+_STALE_WRITE_DENY_REASON = (
+    "stale write blocked: the file on disk changed since this view was read "
+    "(out-of-band edit). reacquire() and rebuild the write from the fresh bytes."
+)
 
 
 class CoherentVolume:
@@ -130,6 +145,33 @@ class CoherentVolume:
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
 
+    ``on_stale_read`` (read surface):
+
+    - ``"allow"`` (default): a strict-mode foreign-edit / stale-view deny on
+      :meth:`read` is swallowed — read returns the current on-disk bytes
+      (back-compatible; the coordinator still detects, denies, counts, and
+      audits the foreign edit).
+    - ``"raise"``: that same deny surfaces as
+      :class:`~ccs.core.exceptions.StaleView` so the caller can abort or
+      :meth:`reacquire` instead of silently acting on the foreign bytes.
+      Independent of ``on_error`` (which governs only infra failures);
+      :meth:`reacquire`'s recovery read always bypasses it.
+
+    ``on_stale_write`` (write surface — SB-23 content-CAS):
+
+    - ``"raise"`` (default): at :meth:`write`, if the file on disk changed since
+      this instance last read/wrote it (a foreign / out-of-band edit), the write
+      is denied with :class:`~ccs.core.exceptions.StaleView` rather than silently
+      clobbering it — :meth:`reacquire` and rebuild from the fresh bytes. The safe
+      default *guards*, because a write is a data-loss surface (the inverse of
+      ``on_stale_read``, where returning bytes is always safe).
+    - ``"allow"``: the foreign edit is not raised; the write proceeds and clobbers
+      (pre-SB-23 behavior). Adapter-local: fires for a **managed (strict) path**
+      whenever a per-path baseline exists, independent of ``on_error`` / coordinator
+      attachment. An unmanaged or tracked-but-non-strict path is exempt — there a
+      coordinated peer change can hit the disk without an INVALID deny, so a
+      mismatch is not necessarily foreign.
+
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
     verified only coarsely (the coordinator's ``/status`` exposes a strict-pattern
@@ -146,11 +188,21 @@ class CoherentVolume:
         *,
         managed: tuple[str, ...] = (),
         on_error: Literal["strict", "degrade"] = "strict",
+        on_stale_read: Literal["allow", "raise"] = "allow",
+        on_stale_write: Literal["allow", "raise"] = "raise",
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
         if on_error not in ("strict", "degrade"):
             raise ValueError(f"on_error must be 'strict' or 'degrade', got {on_error!r}")
+        if on_stale_read not in ("allow", "raise"):
+            raise ValueError(
+                f"on_stale_read must be 'allow' or 'raise', got {on_stale_read!r}"
+            )
+        if on_stale_write not in ("allow", "raise"):
+            raise ValueError(
+                f"on_stale_write must be 'allow' or 'raise', got {on_stale_write!r}"
+            )
 
         self._root = Path(root).resolve()
         # Managed globs are coordinator-policy patterns (parent-repo-relative,
@@ -158,6 +210,8 @@ class CoherentVolume:
         # INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
         self._managed: tuple[str, ...] = tuple(managed)
         self._on_error = on_error
+        self._on_stale_read = on_stale_read
+        self._on_stale_write = on_stale_write
         self._config = config
         self._bind_host = bind_host
 
@@ -180,6 +234,12 @@ class CoherentVolume:
         # Per-path commit hashes for the Unit 2 write no-op-skip; declared here so
         # the fork handler and reacquire() can reset it.
         self._last_committed_hash: dict[str, str] = {}
+        # SB-23 content-CAS baseline: the hash this instance last OBSERVED on disk
+        # per path (seeded on read, advanced on its own writes). SEPARATE from
+        # _last_committed_hash (own-write hashes for the no-op-skip fast path). At
+        # write time a current disk hash that differs from this baseline is a
+        # foreign / out-of-band edit. Cleared on remint/fork alongside the sibling.
+        self._last_observed_hash: dict[str, str] = {}
 
         self._mint_identity()
         # A forked child must not share the parent's identity (single-writer
@@ -206,6 +266,7 @@ class CoherentVolume:
             self._endpoint = None
             self._needs_reattach = True
             self._last_committed_hash.clear()
+            self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
 
     def _ensure_attached(self) -> None:
         """Lazily re-attach after a fork dropped the endpoint.
@@ -242,7 +303,7 @@ class CoherentVolume:
         identities (``reacquire``/``_after_fork`` re-mint ``_session_id`` while
         the lock-free op path reads it). This guard makes that misuse LOUD rather
         than silently corrupting: a second thread entering while another holds the
-        guard raises ``CoherenceError``.
+        guard raises ``InternalConcurrencyError`` (a ``CoherenceError`` subclass).
 
         Re-entrant for the SAME thread so internal nesting works (``write_cas``
         calls :meth:`reacquire`, which calls :meth:`read`): the owning thread
@@ -254,7 +315,10 @@ class CoherentVolume:
         ident = threading.get_ident()
         with self._guard_meta_lock:
             if self._guard_owner_ident is not None and self._guard_owner_ident != ident:
-                raise CoherenceError(
+                # A server-misuse bug (the MCP server serializes tool access), not
+                # an agent-recoverable deny — typed so the mapper never relays it
+                # as a retryable stale view.
+                raise InternalConcurrencyError(
                     "CoherentVolume is single-threaded; concurrent use detected. "
                     "One operation at a time per instance — use one instance per "
                     "thread (an in-flight read/write/write_cas can re-mint identity "
@@ -403,6 +467,24 @@ class CoherentVolume:
             return summary[key]
         return status.get(key)
 
+    def coordinator_status(self) -> dict | None:
+        """The coordinator ``/status`` document, or ``None`` if unattached or the
+        status surface is unreachable.
+
+        Best-effort (any failure → ``None``). The MCP ``swg_status`` tool uses it
+        to split ``off`` (reachable, no strict patterns) from ``unknown``
+        (unreachable) — a distinction :meth:`strict_mode_active` collapses to
+        ``False`` — and to read the tracked-artifact versions for ``per_path``.
+        """
+        if self._endpoint is None:
+            return None
+        try:
+            status = _coordinator_get(self._endpoint, "/status")
+        except Exception as exc:  # best-effort; any failure → unknown
+            logger.debug("coordinator_status probe failed: %s", exc)
+            return None
+        return status if isinstance(status, dict) else None
+
     # --- read / write / reacquire contract (Unit 2) -------------------------
 
     def read(self, path: str | os.PathLike[str]) -> bytes:
@@ -411,8 +493,12 @@ class CoherentVolume:
         Always returns the current on-disk bytes. The ``pre-read`` call records
         this instance as a SHARED reader@hash on the coordinator — that is what
         makes a *later* peer write invalidate this instance (the sequential
-        stale-read→write guard). A stale-read response never makes ``read()``
-        raise: returning current bytes is always safe.
+        stale-read→write guard). Under the default ``on_stale_read="allow"`` a
+        stale-read response never makes ``read()`` raise (returning current
+        bytes is always safe); under ``on_stale_read="raise"`` a strict-mode
+        foreign-edit / stale-view deny raises
+        :class:`~ccs.core.exceptions.StaleView` instead — recover via
+        :meth:`reacquire`.
 
         The strict deny is **sticky** (KTD-T): if this instance is already
         ``INVALID`` on a strict path, ``pre-read`` does NOT re-grant SHARED, so
@@ -433,7 +519,9 @@ class CoherentVolume:
         with self._single_op_guard():
             return self._read_impl(path)
 
-    def _read_impl(self, path: str | os.PathLike[str]) -> bytes:
+    def _read_impl(
+        self, path: str | os.PathLike[str], *, _enforce_stale: bool = True
+    ) -> bytes:
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         # Stat before registering so a missing file raises rather than seeding a
@@ -441,13 +529,16 @@ class CoherentVolume:
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
+        content_hash = self._sha256_bytes(data)
+        # SB-23: seed the foreign-edit baseline with what we just observed on disk.
+        self._last_observed_hash[rel] = content_hash
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
                 {
                     "session_id": self._session_id,
                     "path": rel,
-                    "content_hash": self._sha256_bytes(data),
+                    "content_hash": content_hash,
                 },
             )
             # A stale / strict-deny response is expected and changes nothing here
@@ -457,6 +548,21 @@ class CoherentVolume:
                 self._fail_closed_or_degrade(
                     f"coordinator watchdog timeout during read of {rel}"
                 )
+            elif _enforce_stale and self._on_stale_read == "raise":
+                # PH-A read-surface instance (opt-in): surface a strict
+                # foreign-edit / stale-view deny as StaleView so the caller can
+                # abort or reacquire(), instead of silently returning current
+                # bytes. Default ("allow") keeps the back-compat swallow.
+                # reacquire()'s recovery read passes _enforce_stale=False so
+                # recovery is never blocked.
+                hook_output = (
+                    resp.get("hookSpecificOutput") if isinstance(resp, dict) else None
+                )
+                if (
+                    isinstance(hook_output, dict)
+                    and hook_output.get("permissionDecision") == "deny"
+                ):
+                    raise StaleView(self._deny_reason(resp))
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
@@ -465,11 +571,25 @@ class CoherentVolume:
         Prevents the **sequential** stale-read→write lost update: if a peer
         committed a newer version since this instance last read, this instance
         is ``INVALID`` and the coordinator denies the write (``pre-edit``). The
-        deny is surfaced as ``CoherenceError`` carrying the coordinator's
-        byte-stable reason VERBATIM. **A deny always raises, in both
+        deny is surfaced as ``StaleView`` (pre-edit) or ``CommitPreempted``
+        (post-edit preempt) — both ``CoherenceError`` subclasses — carrying the
+        coordinator's byte-stable reason VERBATIM. **A deny always raises, in both
         ``on_error`` modes** — the deny is enforcement working, not an
         infrastructure failure; recover via :meth:`reacquire` and write from the
         fresh bytes.
+
+        Also prevents the **foreign-edit clobber** (content-CAS, write surface):
+        on a managed (strict) path, if the file on disk changed out-of-band since
+        this instance last read/wrote it, the write is denied with
+        :class:`~ccs.core.exceptions.StaleView` rather than silently overwriting
+        it. Governed by ``on_stale_write`` (default ``"raise"`` — a write is a
+        data-loss surface, so the safe default GUARDS, the inverse of
+        ``on_stale_read``; ``"allow"`` opts out and restores the prior clobber).
+        Fires adapter-locally, independent of ``on_error``. Recover via
+        :meth:`reacquire`. (Catch as ``ccs.core.exceptions.StaleView``.) A caller
+        that loops ``reacquire`` + ``write`` against a fast out-of-band editor must
+        bound its OWN retries — there is no built-in cap here (unlike
+        :meth:`write_cas`'s ``MAX_CAS_REACQUIRES``).
 
         Does NOT prevent concurrent racing writers (this is
         single-writer-by-invalidation, not a mutex) nor a caller that ignores
@@ -493,9 +613,12 @@ class CoherentVolume:
 
         if self._endpoint is None:
             # Unattached / degraded coordinator (strict already raised at
-            # construction). Degrade mode: best-effort write, no enforcement.
+            # construction). Degrade mode: best-effort write, no coordinator
+            # enforcement — but the SB-23 content-CAS is adapter-local, so it still
+            # fires (gated by on_stale_write, independent of on_error).
+            self._check_foreign_edit(rel, self._disk_hash(abs_path))
             self._atomic_write(abs_path, data)
-            self._last_committed_hash[rel] = self._sha256_bytes(data)
+            self._record_own_write(rel, self._sha256_bytes(data))
             return
 
         # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
@@ -510,17 +633,28 @@ class CoherentVolume:
         # file) would otherwise orphan the grant until the crash-recovery sweep.
         try:
             new_hash = self._sha256_bytes(data)
+            # SB-23 content-CAS: re-hash disk ONCE under the held grant, deny a write
+            # whose target diverged on disk since this instance last observed it (a
+            # foreign edit), then reuse the same disk hash for the no-op-skip below
+            # (hoisted out of the former short-circuit — one disk read, not two).
+            disk_hash = self._disk_hash(abs_path)
+            self._check_foreign_edit(rel, disk_hash)
             # No-op skip: skip the os.replace (and its fsync) only when the file
             # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
-            # gate (it skips the disk read on the common "bytes changed" write); the
-            # CURRENT on-disk hash is the authority, because the cached belief alone
-            # can be stale across a peer commit (see _disk_hash for the full why).
+            # gate; the CURRENT on-disk hash is the authority (see _disk_hash).
             already_on_disk = (
                 self._last_committed_hash.get(rel) == new_hash
-                and self._disk_hash(abs_path) == new_hash
+                and disk_hash == new_hash
             )
             if not already_on_disk:
                 self._atomic_write(abs_path, data)
+            # SB-23: advance the observed baseline as soon as the bytes are on disk
+            # — BEFORE the post-edit POST — so a post-edit preempt cannot leave a
+            # stale baseline that self-false-denies this instance's next write. This
+            # is DELIBERATELY split from the _last_committed_hash advance below (after
+            # the post-edit POST); the other own-write sites advance both caches
+            # together, so do not "fix" this into a pair — the ordering is load-bearing.
+            self._last_observed_hash[rel] = new_hash
         except Exception:
             # Release the grant so it is not orphaned until the sweep, then
             # re-raise the original error. Best-effort release — a release failure
@@ -567,10 +701,18 @@ class CoherentVolume:
 
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
+
+        Always returns the current bytes without raising, even under
+        ``on_stale_read="raise"`` — recovery must never be blocked by the deny
+        that triggered it.
         """
         self._remint()  # fresh identity -> no INVALID; has committed nothing
         # MANDATORY fresh read under the new identity -> SHARED@current.
-        return self.read(path)
+        # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
+        # reacquire after a foreign edit returns the current bytes rather than
+        # re-raising and blocking recovery.
+        with self._single_op_guard():
+            return self._read_impl(path, _enforce_stale=False)
 
     def _remint(self) -> None:
         """Re-mint coordinator identity (shed ``INVALID`` + any invalidation
@@ -593,6 +735,14 @@ class CoherentVolume:
         with self._lock:
             self._session_id = str(uuid.uuid4())  # fresh identity -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
+            # SB-23: do NOT clear _last_observed_hash here. The observed-disk
+            # baselines are DISK-scoped (what disk looked like when this instance
+            # last read/wrote a path), not identity-scoped — a re-mint changes the
+            # coordinator identity but not the disk. Clearing them would blind the
+            # foreign-edit guard on every OTHER path after a write_cas conflict
+            # remint (the CAS path is re-seeded by the loop's next _read_with_version
+            # anyway). _after_fork still clears them — a forked child is a new
+            # process that must re-establish its own view.
 
     def write_cas(
         self,
@@ -629,8 +779,8 @@ class CoherentVolume:
         stale-denied comparand read (the transient window where a peer's commit
         landed but its disk write hasn't) does NOT consume the commit budget;
         instead CONSECUTIVE denied reads are separately bounded (also at
-        ``MAX_CAS_REACQUIRES + 1``) and raise ``CoherenceError`` if the view
-        never clears. Both terminals are the honest fail-closed outcome,
+        ``MAX_CAS_REACQUIRES + 1``) and raise ``ViewWedged`` (a ``CoherenceError``
+        subclass) if the view never clears. Both terminals are the honest fail-closed outcome,
         **never** a silent lost update: the invariant this method guarantees is
         *final == start + every applied delta, OR a typed raise* — a successful
         return always means the update landed.
@@ -679,7 +829,7 @@ class CoherentVolume:
             current = self._current_bytes_or_empty(_abs_path)
             data = bytes(make_content(current))
             self._atomic_write(_abs_path, data)
-            self._last_committed_hash[rel] = self._sha256_bytes(data)
+            self._record_own_write(rel, self._sha256_bytes(data))
             return
 
         last_current_version = -1
@@ -719,7 +869,7 @@ class CoherentVolume:
                 last_current_version = max(last_current_version, expected_version)
                 denied_streak += 1
                 if denied_streak > MAX_CAS_REACQUIRES:
-                    raise CoherenceError(
+                    raise ViewWedged(
                         f"OCC comparand read of {rel} stayed strict-denied across "
                         f"{denied_streak} consecutive reads under re-minted "
                         "identities; cannot establish a clean (bytes, version) "
@@ -760,7 +910,7 @@ class CoherentVolume:
                 # is handled below ("raise"). on_error governs only whether the
                 # infra failure already warned (degrade) or raised (strict) inside
                 # _post; either way an unconfirmed CAS must read as failure.
-                raise CoherenceError(
+                raise CommitUnconfirmed(
                     f"OCC commit of {rel} could not be confirmed (coordinator "
                     "transport failed mid-commit); the write did not land. "
                     "reacquire() and retry from the fresh bytes."
@@ -768,8 +918,15 @@ class CoherentVolume:
 
             outcome = self._classify_cas_response(resp)
             if outcome == "win":
+                # SB-23 scope (v1): write_cas is VERSION-CAS, not content-CAS, and
+                # does NOT raise StaleView. It is not unguarded, though: on a strict
+                # path the read-side hash deny makes the comparand read
+                # (_read_with_version) fail closed on a foreign edit, so write_cas
+                # WEDGES (ViewWedged) rather than clobbering. SB-23's content-CAS
+                # guards only plain write(). _record_own_write still advances the
+                # observed baseline so a LATER plain write() on this path is consistent.
                 self._atomic_write(_abs_path, data)  # confirmed → persist
-                self._last_committed_hash[rel] = new_hash
+                self._record_own_write(rel, new_hash)
                 return
             if outcome == "conflict":
                 last_current_version = self._cas_current_version(resp, last_current_version)
@@ -791,8 +948,106 @@ class CoherentVolume:
                 continue
             # outcome == "raise": a deny, corruption, or the fail-closed
             # commit_unconfirmed degrade body — ALWAYS raises in both modes.
-            # Nothing was written to disk (the CAS did not win).
+            # Nothing was written to disk (the CAS did not win). Type the terminal
+            # so the MCP deny mapper classifies by exception type, not a substring
+            # of the (verbatim) coordinator prose:
+            #  - commit_unconfirmed degrade body → CommitUnconfirmed (re-read, retry
+            #    only if absent — the false-negative-ack window);
+            #  - a permission-style deny → StaleView (recoverable by reacquire);
+            #  - anything else (corruption: commit_cas_corruption / expected>current)
+            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+                raise CommitUnconfirmed(self._deny_reason(resp))
+            hook_output = resp.get("hookSpecificOutput")
+            if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
+                raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
+
+    def write_cas_at(
+        self,
+        path: str | os.PathLike[str],
+        expected_version: int,
+        new_content: bytes | bytearray,
+    ) -> None:
+        """Single-shot, version-checked CAS (Option A — the MCP ``swg_write_cas``).
+
+        Commit ``new_content`` IFF the coordinator's current version ==
+        ``expected_version``. Unlike :meth:`write_cas` (which auto-retries by
+        re-deriving from the latest bytes), this does NOT retry and does NOT
+        re-derive: a stale ``expected_version`` raises
+        :class:`~ccs.core.exceptions.CasVersionConflict` carrying the current
+        version — the AGENT re-reads, re-merges, and retries
+        (typed-conflict, not auto-merge). This is the correct primitive for an
+        agent that already merged against a specific version it read: it never
+        commits content derived from version V over a peer's later V+1 (the
+        split-comparand lost update; ``coherent-volume-write-cas-split-comparand``).
+
+        The CAS commits against the AGENT's ``expected_version``, NOT a re-read
+        one, so a peer winning the version between the comparand read and the
+        commit is rejected as a conflict — never a silent overwrite. ``new_content``
+        touches disk ONLY on a confirmed win.
+        """
+        if not isinstance(new_content, (bytes, bytearray)):
+            raise TypeError(f"new_content must be bytes, got {type(new_content).__name__}")
+        with self._single_op_guard():
+            self._write_cas_at_impl(path, int(expected_version), bytes(new_content))
+
+    def _write_cas_at_impl(
+        self, path: str | os.PathLike[str], expected_version: int, new_content: bytes
+    ) -> None:
+        self._ensure_attached()
+        abs_path, rel = self._to_relative(path)
+        if self._endpoint is None:
+            # Strict-only construction prevents this for the server; fail closed
+            # rather than best-effort writing an unversioned blob.
+            raise CoherenceError(
+                f"cannot CAS {rel}: coordinator endpoint unavailable (fail-closed)"
+            )
+        # Re-mint first / read second: a hash-checked None-state read establishes
+        # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
+        # re-create the split-comparand hole — KTD-LU).
+        self._remint()
+        _current_bytes, current_version, stale_denied = self._read_with_version(rel)
+        if stale_denied:
+            # The comparand view is INVALID / the disk lags a just-landed commit;
+            # the agent must reacquire / re-read before it can CAS.
+            raise ViewWedged(
+                f"OCC comparand read of {rel} is strict-denied; cannot establish a "
+                "clean (bytes, version) view to CAS from. reacquire() / re-read first."
+            )
+        if current_version != expected_version:
+            # Stale expected_version → typed conflict; NO write, NO server retry.
+            raise CasVersionConflict(rel, expected_version, current_version)
+        new_hash = self._sha256_bytes(new_content)
+        resp = self._post(
+            "/hooks/post-edit-cas",
+            {
+                "session_id": self._session_id,
+                "path": rel,
+                "success": True,
+                "content_hash": new_hash,
+                "expected_version": expected_version,
+            },
+        )
+        if resp is None:
+            raise CommitUnconfirmed(
+                f"OCC commit of {rel} could not be confirmed (coordinator transport "
+                "failed mid-commit); the write did not land. re-read and retry."
+            )
+        outcome = self._classify_cas_response(resp)
+        if outcome == "win":
+            self._atomic_write(abs_path, new_content)  # confirmed → persist
+            self._record_own_write(rel, new_hash)
+            return
+        if outcome == "conflict":
+            # A peer won the version between our read and the CAS → typed conflict.
+            raise CasVersionConflict(
+                rel, expected_version, self._cas_current_version(resp, current_version)
+            )
+        # outcome == "raise": corruption or the commit_unconfirmed degrade body.
+        if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(self._deny_reason(resp))
+        raise CoherenceError(self._deny_reason(resp))
 
     # --- coordinator I/O helpers --------------------------------------------
 
@@ -852,6 +1107,41 @@ class CoherentVolume:
         except OSError:
             return None
 
+    def _check_foreign_edit(self, rel: str, disk_hash: str | None) -> None:
+        """SB-23 content-CAS predicate. Given the CURRENT on-disk hash for ``rel``,
+        raise :class:`StaleView` under ``on_stale_write="raise"`` if the disk diverged
+        from the baseline this instance last observed (a foreign / out-of-band edit),
+        so the caller :meth:`reacquire`s instead of clobbering the foreign bytes.
+        ``on_stale_write="allow"`` is a no-op (proceed and clobber — pre-SB-23
+        behavior). A missing baseline (never-read path) or an absent file
+        (``disk_hash is None`` — a foreign delete) also no-ops.
+
+        Gated on a **managed (strict) path** — ``rel`` matched against this volume's
+        managed globs. The check is only sound there: on a strict path a peer commit
+        would have DENIED at pre-edit, so reaching this check means no peer commit
+        landed and a disk mismatch is genuinely foreign. On a path this volume does
+        NOT manage (untracked, or tracked-but-non-strict) pre-edit re-grants over a
+        peer write, so a disk mismatch could be that coordinated change — not foreign
+        — and must NOT be denied (the no-op-skip handles it). The caller fetches
+        ``disk_hash`` once via :meth:`_disk_hash` and reuses it for the no-op-skip."""
+        baseline = self._last_observed_hash.get(rel)
+        diverged = (
+            baseline is not None and disk_hash is not None and disk_hash != baseline
+        )
+        # matches_any (the glob scan) is evaluated last — the cheap checks short-circuit.
+        if diverged and self._on_stale_write == "raise" and matches_any(rel, self._managed):
+            raise StaleView(_STALE_WRITE_DENY_REASON)
+
+    def _record_own_write(self, rel: str, content_hash: str) -> None:
+        """This instance just put ``content_hash`` bytes on disk for ``rel`` — advance
+        BOTH per-path caches together: ``_last_committed_hash`` (the no-op-skip
+        fast-path gate) and ``_last_observed_hash`` (the SB-23 foreign-edit baseline).
+        Use at the own-write sites where the two advance in lockstep. The main
+        :meth:`write` path advances them SEPARATELY (observed before the post-edit
+        POST, committed after — see :meth:`_write_impl`), so it does NOT use this."""
+        self._last_committed_hash[rel] = content_hash
+        self._last_observed_hash[rel] = content_hash
+
     def _atomic_write(self, abs_path: Path, data: bytes) -> None:
         """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT
         ``builtins.open``), so the volume's own I/O is never self-intercepted by
@@ -889,6 +1179,19 @@ class CoherentVolume:
             )
             return None  # reached only in degrade mode
 
+    def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
+        """Read current bytes + the coordinator's authoritative version.
+
+        The version is the OCC comparand an Option-A writer (the MCP
+        ``swg_write_cas`` tool) passes back as ``expected_version``. Like
+        :meth:`read`, a sticky-INVALID instance still returns fresh bytes and the
+        version reflects the peer's commit; the instance stays INVALID until
+        :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
+        """
+        with self._single_op_guard():
+            data, version, _stale_denied = self._read_with_version(path)
+            return data, version
+
     def _read_with_version(self, rel: str) -> tuple[bytes, int, bool]:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied)``.
@@ -914,6 +1217,9 @@ class CoherentVolume:
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
+        content_hash = self._sha256_bytes(data)
+        # SB-23: the OCC read path also seeds the foreign-edit baseline.
+        self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
         if self._endpoint is not None:
@@ -922,7 +1228,7 @@ class CoherentVolume:
                 {
                     "session_id": self._session_id,
                     "path": _rel,
-                    "content_hash": self._sha256_bytes(data),
+                    "content_hash": content_hash,
                 },
             )
             if isinstance(resp, dict):
@@ -1030,7 +1336,15 @@ class CoherentVolume:
         if not isinstance(resp, dict):
             return
         if resp.get("ok") is False:
-            raise CoherenceError(self._deny_reason(resp))
+            # Type the deny by phase so the MCP mapper classifies by exception
+            # type, not a substring of the (verbatim) coordinator prose. A
+            # pre-edit INVALID deny is a recoverable stale view; a post-edit
+            # ok:false is a mid-write preempt/reclaim — the atomic write (:523)
+            # already hit disk un-versioned, so it is a distinct terminal that
+            # needs reconcile, not a bare retry.
+            if phase == "post-edit":
+                raise CommitPreempted(self._deny_reason(resp))
+            raise StaleView(self._deny_reason(resp))
         if resp.get("degraded"):
             self._fail_closed_or_degrade(
                 f"coordinator watchdog timeout on {phase} for {rel}"
@@ -1198,7 +1512,7 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
         return None
     # Use the coordinator's own glob matcher so the shim's notion of "managed" is
     # exactly the coordinator's tracked set (handles ``**`` segment globs).
-    return rel if _matches_any(rel, volume._managed) else None
+    return rel if matches_any(rel, volume._managed) else None
 
 
 def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Callable:
@@ -1229,6 +1543,8 @@ def install(
     *,
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
+    on_stale_read: Literal["allow", "raise"] = "allow",
+    on_stale_write: Literal["allow", "raise"] = "raise",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> CoherentVolume:
@@ -1242,7 +1558,8 @@ def install(
     if _shim_state is not None:
         return _shim_state.volume
     volume = CoherentVolume(
-        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+        root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
+        on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     original_open = builtins.open  # is io.open (same object) at install time
     wrapper = _make_open_wrapper(volume, original_open)
@@ -1268,6 +1585,8 @@ def coherent_workspace(
     *,
     managed: tuple[str, ...] = (),
     on_error: Literal["strict", "degrade"] = "strict",
+    on_stale_read: Literal["allow", "raise"] = "allow",
+    on_stale_write: Literal["allow", "raise"] = "raise",
     config: LifecycleConfig | None = None,
     bind_host: str = "127.0.0.1",
 ) -> Iterator[CoherentVolume]:
@@ -1281,7 +1600,8 @@ def coherent_workspace(
     """
     already_installed = _shim_state is not None
     volume = install(
-        root, managed=managed, on_error=on_error, config=config, bind_host=bind_host
+        root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
+        on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     try:
         yield volume
