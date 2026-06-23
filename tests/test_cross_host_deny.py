@@ -96,3 +96,55 @@ def test_slice1_cross_endpoint_deny_and_recover(
         vol_a.write_cas_at("shared.txt", v_a2, b"from-a-2")
     finally:
         stop_coordinator(coord_root)
+
+
+def test_slice2_effect_gate_across_hosts(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice-2 (R4): an effect gated on config@vN FIRES when config is unchanged
+    and is HELD when config advanced under it — across the endpoint, on the
+    shipped read_with_version primitive."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    root_b = tmp_path / "b"
+    root_b.mkdir()
+
+    ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["config.json"]})
+
+        def remote():
+            return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
+
+        vol_a = CoherentVolume(
+            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
+        )
+        vol_b = CoherentVolume(
+            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
+        )
+        (root_a / "config.json").write_text('{"v": 0}', encoding="utf-8")
+        (root_b / "config.json").write_text('{"v": 0}', encoding="utf-8")
+
+        # A reads config -> the version its effect decision depends on.
+        _c, v_decision = vol_a.read_with_version("config.json")
+
+        def effect_fires(decision_version: int) -> bool:
+            """Gate the effect on config still being at the decision version."""
+            _cur, current = vol_a.read_with_version("config.json")
+            return current == decision_version
+
+        # Unchanged config -> the gate FIRES.
+        assert effect_fires(v_decision) is True
+
+        # B advances config under A.
+        _cb, v_b = vol_b.read_with_version("config.json")
+        vol_b.write_cas_at("config.json", v_b, b'{"v": 1}')
+
+        # Config moved -> the gate HOLDS the effect (not fired on stale input).
+        assert effect_fires(v_decision) is False
+    finally:
+        stop_coordinator(coord_root)

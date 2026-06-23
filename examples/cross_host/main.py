@@ -50,6 +50,7 @@ from ccs.cli._coherence_client import (
 from ccs.core.exceptions import CoherenceError
 
 SHARED_KEY = "shared.txt"
+CONFIG_KEY = "config.json"
 
 
 def _log(msg: str) -> None:
@@ -102,9 +103,55 @@ def _run_demo(make_endpoint) -> bool:
         return True
 
 
+def _run_effect_gate(make_endpoint) -> bool:
+    """Slice 2: an effect gated on config@vN FIRES when config is unchanged and
+    is HELD when config advanced under it. Returns True iff both hold."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root_a = Path(tmp) / "a"
+        root_b = Path(tmp) / "b"
+        root_a.mkdir(parents=True, exist_ok=True)
+        root_b.mkdir(parents=True, exist_ok=True)
+        (root_a / CONFIG_KEY).write_text('{"v": 0}', encoding="utf-8")
+        (root_b / CONFIG_KEY).write_text('{"v": 0}', encoding="utf-8")
+        vol_a = CoherentVolume(
+            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=make_endpoint()
+        )
+        vol_b = CoherentVolume(
+            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=make_endpoint()
+        )
+        _c, v_decision = vol_a.read_with_version(CONFIG_KEY)
+
+        def fires() -> bool:
+            """The effect fires only if config is still at the decision version."""
+            _cur, current = vol_a.read_with_version(CONFIG_KEY)
+            return current == v_decision
+
+        if not fires():
+            _log("  ✗ effect-gate held even though config was unchanged")
+            return False
+        _log(f"  ✓ config@{v_decision} unchanged → effect would FIRE")
+
+        _cb, v_b = vol_b.read_with_version(CONFIG_KEY)
+        vol_b.write_cas_at(CONFIG_KEY, v_b, b'{"v": 1}')
+        if fires():
+            _log("  ✗ effect-gate FIRED on a stale config — coherence FAILED")
+            return False
+        _log("  ✓ config advanced under A → effect HELD (not fired on stale input)")
+        return True
+
+
 def _track(endpoint) -> None:
-    """Make the shared key TRACKED on the coordinator (so it is versioned)."""
-    _cc_post(endpoint, "/policy/track", {"paths": [SHARED_KEY]})
+    """Track the demo keys on the coordinator (so they are versioned)."""
+    _cc_post(endpoint, "/policy/track", {"paths": [SHARED_KEY, CONFIG_KEY]})
+
+
+def _run_slices(make_endpoint) -> bool:
+    """Run slice 1 (deny + recover) then slice 2 (effect-gate)."""
+    _log("Slice 1 — artifact-coordination (stale write denied across the endpoint):")
+    slice1 = _run_demo(make_endpoint)
+    _log("Slice 2 — effect-ordering (gate an effect on config@vN):")
+    slice2 = _run_effect_gate(make_endpoint)
+    return slice1 and slice2
 
 
 def main() -> int:
@@ -120,7 +167,7 @@ def main() -> int:
             return resolve_remote_endpoint(remote.host, remote.port, remote.secret)
 
         _track(make_ep())
-        ok = _run_demo(make_ep)
+        ok = _run_slices(make_ep)
     else:
         # Local smoke: spawn a loopback coordinator, run both clients here.
         os.environ.setdefault("CCS_REMOTE_COORDINATOR", "1")  # remote-mode clients on loopback
@@ -136,7 +183,7 @@ def main() -> int:
                 def make_ep():
                     return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
 
-                ok = _run_demo(make_ep)
+                ok = _run_slices(make_ep)
             finally:
                 stop_coordinator(coord_root)
 
