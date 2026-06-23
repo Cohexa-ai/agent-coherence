@@ -49,13 +49,31 @@ python examples/cross_host/main.py
 The client connects (never spawning a local coordinator), runs A/B, and exits
 `0` on a denied-then-recovered stale write.
 
+### Docker (recommended — genuine cross-container, one command, verified)
+
+Two containers on a private-range bridge — **separate network namespaces, real
+RFC-1918 IPs** — with one centralized coordinator. This is the genuine cross-host
+topology (not loopback) and runs anywhere Docker does:
+
+```
+bash examples/cross_host/docker/run.sh
+# or: docker compose -f examples/cross_host/docker/docker-compose.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+```
+
+The coordinator binds to `172.28.0.2` (RFC-1918, validated) and serves; the client
+connects from a *separate container* with `Host: 172.28.0.2` — exercising the
+validated-bind allowlist branch for real, never spawning a local coordinator. The
+bearer secret + port travel via a shared `.coherence` volume. Exit `0` on a
+denied-then-recovered run. (Verified output: slice-1 deny + recover, slice-2
+fire/hold.)
+
 ### Linux netns variant
 
-The same two roles run in two network namespaces joined by a `veth` pair (the
-coordinator's namespace holds the RFC-1918 address). Requires `CAP_NET_ADMIN`
-(root). A one-command `run_netns.sh` wrapper is a follow-up to add and **verify
-on a Linux host** — it is intentionally omitted here rather than shipped
-unverified (this demo was authored on macOS, where netns does not exist).
+The same two roles also run in two `ip netns` joined by a `veth` pair (requires
+`CAP_NET_ADMIN`). The Docker path above is the maintained one-command runner that
+proves the same boundary with less host-specific setup; the raw-netns wrapper is
+left as a Linux-host exercise.
 
 ## Security boundary (R7)
 
