@@ -266,7 +266,7 @@ def test_slice2_effect_gate_across_hosts(
 # ---------------------------------------------------------------------------
 # Negative controls — codify the baselines the demo's --baseline flag runs.
 #
-# These tests assert that the FAILURES we claim CCS prevents are real and
+# These tests assert that the FAILURES this library prevents are real and
 # reproducible. If a future library change quietly made the baseline 'work',
 # the demo's contrast would erode and we would notice here first.
 # ---------------------------------------------------------------------------
