@@ -57,6 +57,7 @@ from ccs.adapters.claude_code.policy import matches_any
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    RemoteCoordinatorConfig,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
@@ -76,6 +77,7 @@ from ccs.core.exceptions import (
     CommitPreempted,
     CommitUnconfirmed,
     InternalConcurrencyError,
+    RemoteAuthFailed,
     StaleView,
     ViewWedged,
 )
@@ -192,6 +194,7 @@ class CoherentVolume:
         on_stale_write: Literal["allow", "raise"] = "raise",
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
+        remote_endpoint: CoordinatorEndpoint | None = None,
     ) -> None:
         if on_error not in ("strict", "degrade"):
             raise ValueError(f"on_error must be 'strict' or 'degrade', got {on_error!r}")
@@ -203,6 +206,25 @@ class CoherentVolume:
             raise ValueError(
                 f"on_stale_write must be 'allow' or 'raise', got {on_stale_write!r}"
             )
+        if remote_endpoint is not None:
+            # Cross-host demo path (R0b). Defense-in-depth: remote mode is gated by
+            # the default-OFF flag, is strict-only (an unreachable coordinator must
+            # fail closed, never degrade-open), and is coordinator-version-only —
+            # no managed globs, because strict mode is load-once-at-spawn and cannot
+            # be enabled on a coordinator this client did not spawn.
+            if not RemoteCoordinatorConfig.from_env().enabled:
+                raise ValueError(
+                    "remote_endpoint requires the CCS_REMOTE_COORDINATOR env flag"
+                )
+            if on_error != "strict":
+                raise ValueError(
+                    "remote coordinator mode is strict-only (on_error must be 'strict')"
+                )
+            if managed:
+                raise ValueError(
+                    "remote coordinator mode is coordinator-version-only; managed globs "
+                    "are not supported cross-host in v1"
+                )
 
         self._root = Path(root).resolve()
         # Managed globs are coordinator-policy patterns (parent-repo-relative,
@@ -214,6 +236,10 @@ class CoherentVolume:
         self._on_stale_write = on_stale_write
         self._config = config
         self._bind_host = bind_host
+        # Cross-host demo: when set, attach connects to THIS endpoint and never
+        # spawns a local coordinator (R0b / plan C1). Preserved across fork so the
+        # child re-attaches to the same remote coordinator under a fresh identity.
+        self._remote_endpoint = remote_endpoint
 
         self._lock = threading.Lock()
         # A5: single-instance concurrency guard, SEPARATE from self._lock (which
@@ -246,7 +272,7 @@ class CoherentVolume:
         # would conflate them) or its cached endpoint/connection.
         os.register_at_fork(after_in_child=self._after_fork)
 
-        self._attach_with_strict()
+        self._attach()
 
     # --- identity -----------------------------------------------------------
 
@@ -279,7 +305,7 @@ class CoherentVolume:
         """
         if self._endpoint is None and self._needs_reattach:
             self._needs_reattach = False
-            self._attach_with_strict()
+            self._attach()
 
     @property
     def session_id(self) -> str:
@@ -335,6 +361,56 @@ class CoherentVolume:
                 if self._guard_depth <= 0:
                     self._guard_depth = 0
                     self._guard_owner_ident = None
+
+    # --- attach dispatch ----------------------------------------------------
+
+    def _attach(self) -> None:
+        """Dispatch attach: local spawn-with-strict, or remote connect-only.
+
+        Remote mode (the cross-host demo) NEVER spawns a local coordinator."""
+        if self._remote_endpoint is not None:
+            self._attach_remote()
+        else:
+            self._attach_with_strict()
+
+    def _attach_remote(self) -> None:
+        """Connect-only attach to a REMOTE coordinator — never spawn (plan C1).
+
+        The endpoint was supplied explicitly, so we set it directly and read
+        nothing from the local ``.coherence/`` directory. We do NOT call
+        ``connect_or_spawn``: a remote client with no local ``server.pid`` would
+        otherwise spawn a second, LOCAL coordinator and silently split this writer
+        and its peer onto different coordinators — the demo would "work" for the
+        wrong reason. A remote coordinator we cannot reach fails closed (remote
+        mode is strict-only). Response-body semantics (deny / degrade / 401) are
+        enforced on the actual read/write ops (R2)."""
+        endpoint = self._remote_endpoint
+        try:
+            _coordinator_get(endpoint, "/status")
+        except CoordinatorUnavailable as exc:
+            # Transport failure = unreachable -> fail closed (strict raises, so the
+            # lines below are unreachable today). They are kept defensively: if a
+            # future non-strict remote mode ever lets _fail_closed_or_degrade return
+            # instead of raise, we must stay DETACHED, never attached to a dead endpoint.
+            self._fail_closed_or_degrade(f"remote coordinator unreachable: {exc}")
+            self._endpoint = None
+            return
+        except urllib.error.HTTPError as exc:
+            # R2: a 401 at attach is a wrong/missing secret — fail loud + closed.
+            if exc.code == 401:
+                raise RemoteAuthFailed(
+                    "remote coordinator rejected the bearer token (401) at attach; "
+                    "the remote secret (CCS_REMOTE_SECRET_FILE) does not match the "
+                    "coordinator's hook.secret"
+                ) from exc
+            # Any other non-2xx at attach (403 Host mismatch, 503 draining, ...)
+            # fails CLOSED here rather than deferring a misconfig to the first op.
+            self._fail_closed_or_degrade(
+                f"remote coordinator returned HTTP {exc.code} at attach"
+            )
+            self._endpoint = None
+            return
+        self._endpoint = endpoint
 
     # --- spawn-with-strict --------------------------------------------------
 
@@ -1173,7 +1249,21 @@ class CoherentVolume:
         ``None``). Otherwise returns the parsed 200 body."""
         try:
             return _coordinator_post(self._endpoint, endpoint_path, payload)
-        except (CoordinatorUnavailable, urllib.error.HTTPError) as exc:
+        except urllib.error.HTTPError as exc:
+            # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
+            # with a distinct type, never the generic degrade path (which a
+            # degrade-mode local client could swallow).
+            if self._remote_endpoint is not None and exc.code == 401:
+                raise RemoteAuthFailed(
+                    "remote coordinator rejected the bearer token (401); the remote "
+                    "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
+                    "hook.secret"
+                ) from exc
+            self._fail_closed_or_degrade(
+                f"coordinator request to {endpoint_path} failed: {exc}"
+            )
+            return None  # reached only in degrade mode
+        except CoordinatorUnavailable as exc:
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )

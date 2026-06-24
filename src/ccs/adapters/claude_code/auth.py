@@ -28,6 +28,7 @@ Threat model:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -58,6 +59,83 @@ chance to make progress before we re-poll."""
 
 _BEARER_PREFIX = "Bearer "
 _HOST_ALLOWLIST: frozenset[str] = frozenset({"localhost", "127.0.0.1"})
+
+#: Truthy env values that opt into cross-host mode (mirrors the client flag).
+_REMOTE_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+#: Explicit private-range networks a cross-host coordinator may bind to. We
+#: range-check explicitly because ``ipaddress.is_private`` returns True for BOTH
+#: ``0.0.0.0`` and loopback aliases (e.g. 127.0.0.2) — admitting either would
+#: defeat the bind guard. Loopback, link-local (169.254/16) and CGNAT (100.64/10)
+#: are deliberately excluded here (loopback is handled separately).
+_PRIVATE_V4_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_PRIVATE_V6_NET = ipaddress.ip_network("fc00::/7")
+
+
+def _remote_flag_enabled() -> bool:
+    """True when CCS_REMOTE_COORDINATOR opts into cross-host mode (default OFF)."""
+    return (
+        os.environ.get("CCS_REMOTE_COORDINATOR", "").strip().lower()
+        in _REMOTE_TRUTHY_ENV_VALUES
+    )
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for the always-allowed loopback names (localhost / 127.0.0.1)."""
+    return host in _HOST_ALLOWLIST
+
+
+def _is_private_range(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 4:
+        return any(ip in net for net in _PRIVATE_V4_NETS)
+    return ip in _PRIVATE_V6_NET
+
+
+def validate_bind_host(host: str) -> None:
+    """Validate a coordinator bind address (raise ``ValueError`` if disallowed).
+
+    Loopback (localhost / 127.0.0.1) is always allowed. Any other address
+    requires the cross-host opt-in (``CCS_REMOTE_COORDINATOR``) AND must be an
+    explicit RFC-1918/4193 private-range IP. ``0.0.0.0`` / wildcard, loopback
+    aliases (127.0.0.2), link-local (169.254/16), CGNAT (100.64/10) and public
+    addresses are all rejected — binding to any of them would expose the
+    coordinator beyond the intended private network.
+    """
+    if is_loopback_host(host):
+        return
+    if not _remote_flag_enabled():
+        raise ValueError(
+            f"refusing to bind the coordinator to {host!r} beyond loopback; set "
+            "CCS_REMOTE_COORDINATOR to opt into cross-host mode"
+        )
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError(f"bind host {host!r} is not a valid IP address") from exc
+    if ip.is_unspecified:
+        raise ValueError(f"refusing to bind the coordinator to the wildcard address {host!r}")
+    if not _is_private_range(ip):
+        raise ValueError(
+            f"bind host {host!r} is not an RFC-1918/4193 private-range address "
+            "(loopback aliases, link-local, CGNAT and public addresses are rejected)"
+        )
+
+
+def build_host_allowlist(bind_host: str) -> frozenset[str]:
+    """The Host-header allowlist for a coordinator bound to ``bind_host``.
+
+    Always includes loopback; for a validated non-loopback bind it also admits
+    that exact host. Validates ``bind_host`` (raises on a disallowed bind), so a
+    coordinator constructed with a bad bind fails loud at construction.
+    """
+    validate_bind_host(bind_host)
+    if is_loopback_host(bind_host):
+        return _HOST_ALLOWLIST
+    return _HOST_ALLOWLIST | {bind_host}
 
 
 class EnsureSecretError(RuntimeError):
@@ -169,16 +247,58 @@ def verify_bearer(authorization_header: str | None, expected_secret: str) -> boo
     return hmac.compare_digest(presented, expected_secret)
 
 
-def verify_host(host_header: str | None) -> bool:
-    """Reject Host headers that don't resolve to localhost/127.0.0.1.
+def _host_from_header(host_header: str) -> str:
+    """Extract the host from a Host header, stripping any ``:port`` suffix.
+
+    Handles bracketed IPv6 literals (``[fc00::1]:8080`` → ``fc00::1``) as well as
+    IPv4/hostname forms (``127.0.0.1:54321`` → ``127.0.0.1``). Returns the raw
+    header unchanged when it is malformed — no closing ``]``, or junk between
+    ``]`` and the ``:port`` — so it matches no allowlist entry and verify_host
+    fails closed. Deliberately does NOT trim whitespace/control characters: a real
+    Host header arrives already-clean from http.server, and tolerating padding
+    here would admit values like ``localhost\\r`` that the exact check must reject.
+    """
+    if host_header.startswith("["):
+        end = host_header.find("]")
+        if end == -1:
+            return host_header  # no closing bracket -> malformed -> fail closed
+        rest = host_header[end + 1 :]
+        if rest and not rest.startswith(":"):
+            return host_header  # junk after "]" before the port -> fail closed
+        return host_header[1:end]
+    return host_header.split(":", 1)[0]
+
+
+def verify_host(host_header: str | None, allowlist: frozenset[str] = _HOST_ALLOWLIST) -> bool:
+    """Reject Host headers not in ``allowlist`` (default: localhost/127.0.0.1).
 
     Block DNS rebinding: an attacker page at attacker.com resolves
     attacker.com → 127.0.0.1, browser sends ``Host: attacker.com``, server
-    must reject. We allow ``localhost`` and ``127.0.0.1``, with or without
-    a port suffix.
+    must reject. The cross-host coordinator passes a wider allowlist
+    ({loopback, validated bind_host}); every other host still 403s. Allows the
+    allowlisted names with or without a port suffix, including bracketed IPv6.
     """
     if not host_header:
         return False
-    # Strip port suffix if present (e.g., "127.0.0.1:54321")
-    hostname = host_header.split(":", 1)[0]
-    return hostname in _HOST_ALLOWLIST
+    hostname = _host_from_header(host_header)
+    if hostname in allowlist:
+        return True
+    # IP literals: match on the normalized address so equivalent spellings
+    # (e.g. fc00::1 vs fc00:0:0:0:0:0:0:1) resolve to the same allowlist entry.
+    # Non-IP names (localhost, attacker.com) only match via the exact check
+    # above — this never widens admission to a host not already in the allowlist.
+    try:
+        candidate = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    # IPv4-mapped IPv6 (::ffff:127.0.0.1) and scope-id forms are rejected here
+    # by construction: ipaddress compares unequal across IPv4Address/IPv6Address
+    # and across differing scope ids. Do NOT add an .ipv4_mapped unwrap — that
+    # would let a mapped Host alias an allowlisted IPv4 entry.
+    for entry in allowlist:
+        try:
+            if ipaddress.ip_address(entry) == candidate:
+                return True
+        except ValueError:
+            continue
+    return False
