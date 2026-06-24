@@ -11,6 +11,7 @@ tests/test_claude_code_bind_validation.py.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,127 @@ def test_slice1_cross_endpoint_deny_and_recover(
         assert v_a2 > v_a
         vol_a.write_cas_at("shared.txt", v_a2, b"from-a-2")
         assert (root_a / "shared.txt").read_bytes() == b"from-a-2"
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_untracked_key_is_not_versioned_so_deny_passes_vacuously(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard: WITHOUT /policy/track the shared key is never versioned (stays
+    version 0), so the version-CAS cannot detect a stale write — A silently
+    overwrites B's commit, NO CasVersionConflict is raised. This is WHY the demo
+    and the deny test must track the key first; it pins the vacuous-pass failure
+    mode so a dropped track() call can't quietly defeat the deny."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    root_b = tmp_path / "b"
+    root_b.mkdir()
+
+    ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        # Deliberately DO NOT track "shared.txt" — the contrast with the deny test.
+
+        def remote():
+            return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
+
+        vol_a = CoherentVolume(
+            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
+        )
+        vol_b = CoherentVolume(
+            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
+        )
+        (root_a / "shared.txt").write_text("v0", encoding="utf-8")
+        (root_b / "shared.txt").write_text("v0", encoding="utf-8")
+
+        _data_a, v_a = vol_a.read_with_version("shared.txt")
+        _data_b, v_b = vol_b.read_with_version("shared.txt")
+        assert v_a == 0 and v_b == 0  # untracked -> never versioned
+
+        vol_b.write_cas_at("shared.txt", v_b, b"from-b")
+        # A's "stale" write is NOT denied (the version never moved off 0): A's
+        # bytes silently win — the lost update the deny test prevents via tracking.
+        vol_a.write_cas_at("shared.txt", v_a, b"from-a")
+        assert (root_a / "shared.txt").read_bytes() == b"from-a"
+    finally:
+        stop_coordinator(coord_root)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A REMOTE-mode volume forked into a child re-attaches to the SAME remote
+    coordinator (connect-only, never spawn): the child re-mints identity, takes
+    the _attach_remote path, and creates NO local server.pid under its own root.
+
+    The child's first post-fork read returns its re-seeded baseline (version 0),
+    so a bare CAS write would be DENIED — fork safety, not a silent overwrite.
+    Recovery is reacquire() (re-mint + mandatory fresh read); only then does the
+    child's write land through the shared coordinator (the parent sees it)."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root = tmp_path / "a"
+    root.mkdir()
+
+    ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["shared.txt"]})
+        remote = resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
+        vol = CoherentVolume(
+            root, on_error="strict", on_stale_write="allow", remote_endpoint=remote
+        )
+        (root / "shared.txt").write_text("v0", encoding="utf-8")
+        _d, v_parent = vol.read_with_version("shared.txt")  # parent attaches
+        parent_id = vol.session_id
+
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child: first op must re-attach to the remote coordinator
+            os.close(read_fd)
+            try:
+                # First op post-fork: read_with_version returns the re-seeded
+                # baseline (0) and does NOT itself re-attach (documented safe
+                # fallback — a CAS against version 0 loses cleanly, never silently).
+                _dc, v_first = vol.read_with_version("shared.txt")
+                # Recovery: reacquire() re-mints identity + does a mandatory fresh
+                # read, which re-attaches to the remote coordinator (connect-only).
+                vol.reacquire("shared.txt")
+                local_pid = (root / ".coherence" / "server.pid").exists()
+                facts = f"{vol.session_id}|{vol.is_attached}|{local_pid}|{vol._endpoint.port}|{v_first}"
+                _df, v_fresh = vol.read_with_version("shared.txt")
+                vol.write_cas_at("shared.txt", v_fresh, b"from-child")
+                msg = f"{facts}|ok"
+            except Exception as exc:  # noqa: BLE001 - report any failure to the parent
+                msg = f"ERR:{exc!r}"
+            try:
+                os.write(write_fd, msg.encode("utf-8"))
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        # parent (child os._exit'd above and never reaches the finally below)
+        os.close(write_fd)
+        raw = os.read(read_fd, 256).decode("utf-8")
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert not raw.startswith("ERR:"), raw
+        child_id, attached, local_pid, child_port, first_v, recovered = raw.split("|")
+        assert child_id != parent_id  # re-minted identity
+        assert attached == "True"  # re-attached
+        assert local_pid == "False"  # connect-only: NEVER spawned a local coordinator
+        assert int(child_port) == ep.port  # to the SAME remote coordinator
+        assert int(first_v) == 0  # re-seeded baseline (fork safety: bare CAS would deny)
+        assert recovered == "ok"  # reacquire() recovery path succeeded
+        # The recovered write landed through the shared coordinator.
+        _d2, v_after = vol.read_with_version("shared.txt")
+        assert v_after > v_parent
+        assert (root / "shared.txt").read_bytes() == b"from-child"
     finally:
         stop_coordinator(coord_root)
 
