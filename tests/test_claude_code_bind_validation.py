@@ -74,6 +74,62 @@ def test_verify_host_default_allowlist_unchanged():
     assert verify_host(None) is False
 
 
+def test_build_allowlist_adds_validated_ipv6_bind_host(monkeypatch):
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    allow = build_host_allowlist("fc00::1")  # RFC-4193 unique-local
+    assert "fc00::1" in allow
+    assert {"localhost", "127.0.0.1"} <= allow
+
+
+def test_verify_host_accepts_bracketed_ipv6():
+    """A Host header for an IPv6 bind is bracketed ([addr]:port). The port-strip
+    must parse the bracket form, not split on the address's own colons."""
+    allow = frozenset({"localhost", "127.0.0.1", "fc00::1"})
+    assert verify_host("[fc00::1]:8080", allow) is True
+    assert verify_host("[fc00::1]", allow) is True  # no explicit port
+
+
+def test_verify_host_rejects_other_bracketed_ipv6():
+    """Relaxing to admit one IPv6 bind must NOT admit a different IPv6 host."""
+    allow = frozenset({"localhost", "127.0.0.1", "fc00::1"})
+    assert verify_host("[fc00::2]:8080", allow) is False
+    assert verify_host("[::1]:8080", allow) is False  # not in allowlist
+
+
+def test_verify_host_matches_equivalent_ipv6_spelling():
+    """Equivalent IPv6 spellings (expanded vs compressed) resolve to the same
+    allowlist entry — matching is on the normalized address, not the raw string."""
+    allow = frozenset({"localhost", "127.0.0.1", "fc00::1"})
+    assert verify_host("[fc00:0:0:0:0:0:0:1]:8080", allow) is True
+
+
+def test_verify_host_rejects_malformed_bracket_and_hostname():
+    """Fail-closed: a malformed bracket or a DNS-rebind hostname is rejected."""
+    allow = frozenset({"localhost", "127.0.0.1", "fc00::1"})
+    assert verify_host("[fc00::1", allow) is False  # missing closing bracket
+    assert verify_host("[fc00::1]junk:8080", allow) is False  # junk after "]"
+    assert verify_host("attacker.example.com", allow) is False  # DNS-rebind guard
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "[::ffff:127.0.0.1]:8080",  # IPv4-mapped IPv6 must NOT alias 127.0.0.1
+        "[fc00::1%eth0]:8080",  # scope id must NOT match the non-scoped entry
+        "2130706433",  # integer form of 127.0.0.1
+        "0177.0.0.1",  # octal IPv4
+        "127.1",  # abbreviated IPv4
+        "localhost\r",  # trailing control char (no longer stripped)
+    ],
+)
+def test_verify_host_rejects_ip_aliasing_and_malformed_forms(host):
+    """Security: the normalized-IP fallback admits ONLY a host whose canonical IP
+    is an allowlist entry — never an aliased/mapped/scoped/alt-radix spelling of
+    one, and never a control-char-padded name."""
+    allow = frozenset({"localhost", "127.0.0.1", "fc00::1"})
+    assert verify_host(host, allow) is False
+
+
 def test_coordinator_rejects_bad_bind_host(tmp_path, monkeypatch):
     """Constructing a coordinator with a disallowed bind raises at construction."""
     monkeypatch.delenv("CCS_REMOTE_COORDINATOR", raising=False)

@@ -247,6 +247,28 @@ def verify_bearer(authorization_header: str | None, expected_secret: str) -> boo
     return hmac.compare_digest(presented, expected_secret)
 
 
+def _host_from_header(host_header: str) -> str:
+    """Extract the host from a Host header, stripping any ``:port`` suffix.
+
+    Handles bracketed IPv6 literals (``[fc00::1]:8080`` → ``fc00::1``) as well as
+    IPv4/hostname forms (``127.0.0.1:54321`` → ``127.0.0.1``). Returns the raw
+    header unchanged when it is malformed — no closing ``]``, or junk between
+    ``]`` and the ``:port`` — so it matches no allowlist entry and verify_host
+    fails closed. Deliberately does NOT trim whitespace/control characters: a real
+    Host header arrives already-clean from http.server, and tolerating padding
+    here would admit values like ``localhost\\r`` that the exact check must reject.
+    """
+    if host_header.startswith("["):
+        end = host_header.find("]")
+        if end == -1:
+            return host_header  # no closing bracket -> malformed -> fail closed
+        rest = host_header[end + 1 :]
+        if rest and not rest.startswith(":"):
+            return host_header  # junk after "]" before the port -> fail closed
+        return host_header[1:end]
+    return host_header.split(":", 1)[0]
+
+
 def verify_host(host_header: str | None, allowlist: frozenset[str] = _HOST_ALLOWLIST) -> bool:
     """Reject Host headers not in ``allowlist`` (default: localhost/127.0.0.1).
 
@@ -254,10 +276,29 @@ def verify_host(host_header: str | None, allowlist: frozenset[str] = _HOST_ALLOW
     attacker.com → 127.0.0.1, browser sends ``Host: attacker.com``, server
     must reject. The cross-host coordinator passes a wider allowlist
     ({loopback, validated bind_host}); every other host still 403s. Allows the
-    allowlisted names with or without a port suffix.
+    allowlisted names with or without a port suffix, including bracketed IPv6.
     """
     if not host_header:
         return False
-    # Strip port suffix if present (e.g., "127.0.0.1:54321")
-    hostname = host_header.split(":", 1)[0]
-    return hostname in allowlist
+    hostname = _host_from_header(host_header)
+    if hostname in allowlist:
+        return True
+    # IP literals: match on the normalized address so equivalent spellings
+    # (e.g. fc00::1 vs fc00:0:0:0:0:0:0:1) resolve to the same allowlist entry.
+    # Non-IP names (localhost, attacker.com) only match via the exact check
+    # above — this never widens admission to a host not already in the allowlist.
+    try:
+        candidate = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    # IPv4-mapped IPv6 (::ffff:127.0.0.1) and scope-id forms are rejected here
+    # by construction: ipaddress compares unequal across IPv4Address/IPv6Address
+    # and across differing scope ids. Do NOT add an .ipv4_mapped unwrap — that
+    # would let a mapped Host alias an allowlisted IPv4 entry.
+    for entry in allowlist:
+        try:
+            if ipaddress.ip_address(entry) == candidate:
+                return True
+        except ValueError:
+            continue
+    return False
