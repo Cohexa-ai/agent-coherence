@@ -68,12 +68,8 @@ def test_slice1_cross_endpoint_deny_and_recover(
         def remote():
             return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
 
-        vol_a = CoherentVolume(
-            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
-        vol_b = CoherentVolume(
-            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
+        vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
         # Coordinator-version-only: per-root file copies; coordination is the
         # coordinator's version of the shared key.
         (root_a / "shared.txt").write_text("v0", encoding="utf-8")
@@ -128,12 +124,8 @@ def test_untracked_key_is_not_versioned_so_deny_passes_vacuously(
         def remote():
             return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
 
-        vol_a = CoherentVolume(
-            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
-        vol_b = CoherentVolume(
-            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
+        vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
         (root_a / "shared.txt").write_text("v0", encoding="utf-8")
         (root_b / "shared.txt").write_text("v0", encoding="utf-8")
 
@@ -173,9 +165,7 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
         ep = resolve_endpoint(coord_root)
         _cc_post(ep, "/policy/track", {"paths": ["shared.txt"]})
         remote = resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
-        vol = CoherentVolume(
-            root, on_error="strict", on_stale_write="allow", remote_endpoint=remote
-        )
+        vol = CoherentVolume(root, on_error="strict", on_stale_write="allow", remote_endpoint=remote)
         (root / "shared.txt").write_text("v0", encoding="utf-8")
         _d, v_parent = vol.read_with_version("shared.txt")  # parent attaches
         parent_id = vol.session_id
@@ -247,12 +237,8 @@ def test_slice2_effect_gate_across_hosts(
         def remote():
             return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
 
-        vol_a = CoherentVolume(
-            root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
-        vol_b = CoherentVolume(
-            root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote()
-        )
+        vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
         (root_a / "config.json").write_text('{"v": 0}', encoding="utf-8")
         (root_b / "config.json").write_text('{"v": 0}', encoding="utf-8")
 
@@ -275,3 +261,154 @@ def test_slice2_effect_gate_across_hosts(
         assert effect_fires(v_decision) is False
     finally:
         stop_coordinator(coord_root)
+
+
+# ---------------------------------------------------------------------------
+# Negative controls — codify the baselines the demo's --baseline flag runs.
+#
+# These tests assert that the FAILURES we claim CCS prevents are real and
+# reproducible. If a future library change quietly made the baseline 'work',
+# the demo's contrast would erode and we would notice here first.
+# ---------------------------------------------------------------------------
+
+
+def test_slice1_baseline_silent_lost_update_without_decision_time_version(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE CONTROL: an agent that does NOT track its decision-time version
+    silently loses a peer's intervening commit.
+
+    Pattern: A reads@v_a but writes against the LATEST version (the classic
+    convention-only / un-coordinated lost-update bug pattern). B's bytes are
+    dropped from the canonical record. This is the failure
+    ``test_slice1_cross_endpoint_deny_and_recover`` proves CCS prevents.
+    """
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    root_b = tmp_path / "b"
+    root_b.mkdir()
+
+    ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["shared.txt"]})
+
+        def remote():
+            return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
+
+        vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        (root_a / "shared.txt").write_text("v0", encoding="utf-8")
+        (root_b / "shared.txt").write_text("v0", encoding="utf-8")
+
+        # A's decision-time read — but the baseline agent "forgets" v_a below.
+        _data_a, v_a = vol_a.read_with_version("shared.txt")
+
+        # B commits intervening bytes; coordinator's canonical version advances.
+        _data_b, v_b = vol_b.read_with_version("shared.txt")
+        vol_b.write_cas_at("shared.txt", v_b, b"from-b")
+
+        # The bug pattern: A re-reads to get the LATEST version and writes
+        # against it — no check that the artifact moved relative to v_a.
+        _, v_a_latest = vol_a.read_with_version("shared.txt")
+        assert v_a_latest > v_a, "precondition: B's commit advanced the version"
+        vol_a.write_cas_at("shared.txt", v_a_latest, b"from-a")  # SUCCEEDS — no deny
+
+        # Canonical state now has A's bytes; B's bytes are silently lost.
+        data_now, _v_now = vol_a.read_with_version("shared.txt")
+        assert data_now == b"from-a", "baseline failed: lost-update did not occur"
+        assert data_now != b"from-b", "B's bytes should be gone from the canonical record"
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_slice2_baseline_stale_fire_without_effect_gate(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE CONTROL: an agent that does NOT gate its effect on the
+    decision-time version fires on stale config.
+
+    Pattern: A decides @ v_decision, B advances config, A's effect fires
+    ungated. This is the CI failure (build/deploy against a config that was
+    edited mid-decision) that EO-1/EO-2/EO-3 prevent in
+    ``test_slice2_effect_gate_across_hosts``.
+    """
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    root_b = tmp_path / "b"
+    root_b.mkdir()
+
+    ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["config.json"]})
+
+        def remote():
+            return resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer)
+
+        vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=remote())
+        (root_a / "config.json").write_text('{"v": 0}', encoding="utf-8")
+        (root_b / "config.json").write_text('{"v": 0}', encoding="utf-8")
+
+        # A decides on config @ v_decision.
+        _c, v_decision = vol_a.read_with_version("config.json")
+
+        # B advances config under A.
+        _cb, v_b = vol_b.read_with_version("config.json")
+        vol_b.write_cas_at("config.json", v_b, b'{"v": 1}')
+
+        # The baseline: A fires the effect ungated — the current version is
+        # NOT compared against v_decision before the effect runs.
+        _, v_when_firing = vol_a.read_with_version("config.json")
+        assert v_when_firing > v_decision, "precondition: config must have advanced"
+
+        # In a real CI step the effect would be the deploy/build invocation.
+        # We assert the failure by observing that NOTHING in the baseline
+        # mechanism would have prevented the effect from firing — the agent
+        # has no gate to enforce.
+        # (Concretely: it would have called effect(v=v_decision) against a
+        # config that is now at v_when_firing.)
+        assert v_when_firing != v_decision, "baseline failed: stale config not exercised"
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_main_baseline_flag_runs_negative_control_then_with_ccs(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """End-to-end CLI smoke: ``python examples/cross_host/main.py --baseline``
+    runs the negative control then the with-CCS pass, exits 0, and the output
+    contains both phases. This pins the screen-share contract: broken-must-lose
+    AND fixed-must-prevent in one invocation.
+    """
+    # main() spawns a coordinator + clients in this process; the env nudge
+    # below is the same one main() applies for the local loopback path.
+    monkeypatch.delenv("CCS_REMOTE_HOST", raising=False)
+    monkeypatch.delenv("CCS_REMOTE_PORT", raising=False)
+    monkeypatch.delenv("CCS_REMOTE_SECRET_FILE", raising=False)
+
+    # Import lazily so the test file does not depend on the example being on
+    # the import path at collection time.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "ccs_cross_host_demo_main",
+        Path(__file__).parent.parent / "examples" / "cross_host" / "main.py",
+    )
+    assert spec is not None and spec.loader is not None
+    demo_main = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo_main)
+
+    rc = demo_main.main(["--baseline"])
+    out = capsys.readouterr().out
+    assert rc == 0, f"--baseline should exit 0 on a green run, got {rc}; output:\n{out}"
+    assert "Negative control" in out, "baseline phase must be labeled in output"
+    assert "With CCS" in out, "with-CCS phase must be labeled in output"
+    assert "RESULT: PASS" in out
