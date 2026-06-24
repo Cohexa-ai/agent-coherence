@@ -4,6 +4,42 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [0.10.1] - 2026-06-24
+
+A fully opt-in **cross-host coordination demo** (default-off `CCS_REMOTE_COORDINATOR`)
+plus a library fix to the coordinator's Host-allowlist for IPv6 binds. The default
+loopback path is byte-unchanged; all cross-host behavior is gated by the flag.
+
+### Added
+
+- **Cross-host coordination demo (`examples/cross_host/`), default-off.** Two
+  clients coordinate one centralized coordinator across a host boundary: a stale
+  write is denied by version-CAS *across the boundary* and the loser recovers via
+  re-read + retry (slice 1, artifact-coordination); an effect gated on `config@vN`
+  fires only when the config is unchanged and is held when it advanced (slice 2,
+  effect-ordering). A `--baseline` negative-control mode runs the silent-lost-update
+  and stale-effect-fire failures first, so the deny/HOLD is measured against its
+  absence (`broken-must-lose AND fixed-must-prevent`). Loopback smoke runs anywhere;
+  a Docker two-container runner (separate network namespaces, RFC-1918 bridge) and a
+  Linux netns path exercise a genuine host boundary.
+- **Opt-in remote-coordinator transport (experimental, demo-grade).** Gated entirely
+  by `CCS_REMOTE_COORDINATOR` (default off): `CoherentVolume(remote_endpoint=…)`
+  connect-only / never-spawn mode; a file-based bearer secret (`CCS_REMOTE_SECRET_FILE`,
+  read with `O_NOFOLLOW`); a typed `RemoteAuthFailed`; and an
+  `agent-coherence-coordinator --bind-host` flag with explicit RFC-1918/4193 bind
+  validation plus a configurable Host-allowlist. Strict-only and fail-closed (deny /
+  degrade / 401 / non-2xx all raise). The default loopback path is byte-unchanged.
+
+### Fixed
+
+- **Host-allowlist now parses bracketed IPv6 literals.** `verify_host` previously
+  split on the first `:`, mangling `[fc00::1]:port` so every IPv6 Host was rejected.
+  It now extracts the bracketed literal (rejecting junk after `]`), declines to trim
+  whitespace/control characters, and matches IP entries on their normalized form so
+  equivalent spellings resolve to the same allowlist entry. The loopback/IPv4 path is
+  byte-unchanged and DNS-rebind protection is preserved (no aliased / IPv4-mapped /
+  scoped / alt-radix spelling can admit a non-allowlisted host).
+
 ## [0.10.0] - 2026-06-23
 
 Foreign-edit coordination on both the read and the write surface, plus the
