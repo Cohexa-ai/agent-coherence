@@ -1,4 +1,4 @@
-# Genuine cross-host slice-1/slice-2 demo: two containers (separate network
+# Genuine cross-host demo (both scenarios): two containers (separate network
 # namespaces) on a private-range bridge, one centralized coordinator.
 #   coordinator (172.28.0.2) — binds beyond loopback, serves; the shared .coherence
 #                              volume carries the bearer secret + port to the client.

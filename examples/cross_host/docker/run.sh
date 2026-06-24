@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Genuine cross-container slice-1/slice-2 demo: two containers (separate network
+# Genuine cross-container demo (both scenarios): two containers (separate network
 # namespaces) on a private-range bridge, one centralized coordinator. Exits with
 # the client's code (0 = stale write denied then recovered).
 set -uo pipefail
