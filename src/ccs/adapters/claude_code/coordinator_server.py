@@ -52,6 +52,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code.auth import (
+    build_host_allowlist,
     ensure_secret,
     verify_bearer,
     verify_host,
@@ -321,6 +322,11 @@ class CoordinatorHTTPServer:
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
         self.bind_host = bind_host
+        # Host-header allowlist: loopback always, plus a validated non-loopback
+        # bind (cross-host demo). Validates bind_host here at construction — a
+        # disallowed bind (wildcard, loopback alias, link-local, CGNAT, public, or
+        # non-loopback without the CCS_REMOTE_COORDINATOR opt-in) raises.
+        self.host_allowlist = build_host_allowlist(bind_host)
         # Monotonic reference points (NOT wall-clock): idle/uptime deltas must
         # survive NTP steps and suspend/resume (finding L5). time.time() stays
         # reserved for operator-facing absolute timestamps elsewhere.
@@ -1148,7 +1154,7 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                 coordinator.mark_request()
 
                 # Auth + Host check on every endpoint
-                if not verify_host(self.headers.get("Host")):
+                if not verify_host(self.headers.get("Host"), coordinator.host_allowlist):
                     self._json(403, {"error": "host header not allowlisted"})
                     logger.warning(
                         "rejected request with bad Host: %r", self.headers.get("Host")

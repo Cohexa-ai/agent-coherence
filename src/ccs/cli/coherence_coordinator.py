@@ -88,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Suppress the 'port=N' line on stdout (still exits 0 on success).",
     )
     parser.add_argument(
+        "--bind-host",
+        default="127.0.0.1",
+        help=(
+            "Address to bind the coordinator to (default: 127.0.0.1). A non-loopback "
+            "private-range address (RFC-1918) enables the cross-host demo and requires "
+            "CCS_REMOTE_COORDINATOR=1; wildcard / public / loopback-alias are rejected."
+        ),
+    )
+    parser.add_argument(
         "--prepare-for-migration",
         action="store_true",
         help=(
@@ -122,7 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Daemonized worker mode: bind + serve, then block forever so the
     # daemon HTTP/sweep/idle threads stay alive.
     if args._daemonized:
-        return _run_daemonized(root)
+        return _run_daemonized(root, bind_host=args.bind_host)
 
     # Unit 8 (Decision 1): release-all-grants + shutdown for backend
     # switch safety. Routed through the running coordinator so we
@@ -135,7 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Test mode: keep the legacy in-process behavior so test_claude_code_cli
     # can spawn + assert in the same Python process. Not for users.
     if args.no_detach:
-        port = ensure_coordinator(root)
+        port = ensure_coordinator(root, bind_host=args.bind_host)
         if port == -1:
             err("agent-coherence-coordinator: coordinator could not be spawned")
             return 2
@@ -153,7 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # No live coordinator — fork a detached child to run it.
-    return _spawn_detached(root, quiet=args.quiet)
+    return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
 
 
 def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
@@ -241,12 +250,12 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
     return 0
 
 
-def _run_daemonized(root: Path) -> int:
+def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:
     """Internal worker — called via ``--_daemonized``. Run the coordinator
     and block indefinitely. Exits on SIGTERM (sent by stop_coordinator)
     or natural idle-shutdown (lifecycle's idle loop also detaches via
     ``return`` in its loop, leaving the main thread to block here)."""
-    port = ensure_coordinator(root)
+    port = ensure_coordinator(root, bind_host=bind_host)
     if port == -1:
         return 2
 
@@ -265,7 +274,7 @@ def _run_daemonized(root: Path) -> int:
     return 0
 
 
-def _spawn_detached(root: Path, *, quiet: bool) -> int:
+def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") -> int:
     """Spawn a detached child running the daemonized worker, then poll
     the port file until the child writes it (or timeout)."""
     pid_file = root / ".coherence" / "server.pid"
@@ -278,7 +287,7 @@ def _spawn_detached(root: Path, *, quiet: bool) -> int:
         subprocess.Popen(
             [
                 sys.executable, "-m", "ccs.cli.coherence_coordinator",
-                "--_daemonized", "--root", str(root),
+                "--_daemonized", "--root", str(root), "--bind-host", bind_host,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

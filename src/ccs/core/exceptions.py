@@ -292,6 +292,15 @@ class ViewWedged(CoherenceError):
     reason = VIEW_WEDGED_REASON
 
 
+class RemoteAuthFailed(CoherenceError):
+    """Remote-coordinator bearer auth rejected (cross-host demo, R2): the
+    coordinator returned ``401`` for the supplied secret. A misconfiguration —
+    the remote ``CCS_REMOTE_SECRET_FILE`` does not match the coordinator's
+    ``hook.secret`` — NOT an infra hiccup. It fails LOUD and CLOSED, typed
+    distinctly from a watchdog-timeout degrade or a stale-view deny, so a remote
+    client never silently degrades past a wrong secret."""
+
+
 class CommitUnconfirmed(CoherenceError):
     """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
     mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may

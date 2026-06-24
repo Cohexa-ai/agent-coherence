@@ -1,0 +1,54 @@
+# Genuine cross-host slice-1/slice-2 demo: two containers (separate network
+# namespaces) on a private-range bridge, one centralized coordinator.
+#   coordinator (172.28.0.2) — binds beyond loopback, serves; the shared .coherence
+#                              volume carries the bearer secret + port to the client.
+#   client                   — connects to 172.28.0.2 (never spawns), runs the demo.
+# Run:  docker compose up --build --abort-on-container-exit --exit-code-from client
+services:
+  coordinator:
+    build:
+      context: ../../..
+      dockerfile: examples/cross_host/docker/Dockerfile
+    networks:
+      cohnet:
+        ipv4_address: 172.28.0.2
+    volumes:
+      - coordstate:/coord/.coherence
+    command:
+      - python
+      - -m
+      - ccs.cli.coherence_coordinator
+      - --_daemonized
+      - --root
+      - /coord
+      - --bind-host
+      - 172.28.0.2
+
+  client:
+    build:
+      context: ../../..
+      dockerfile: examples/cross_host/docker/Dockerfile
+    depends_on:
+      - coordinator
+    networks:
+      - cohnet
+    volumes:
+      - coordstate:/coord/.coherence:ro
+    environment:
+      # Also set in the image (Dockerfile ENV); declared here so the cross-host
+      # intent is explicit and the demo never silently falls back to loopback.
+      CCS_REMOTE_COORDINATOR: "1"
+      CCS_REMOTE_HOST: 172.28.0.2
+      CCS_REMOTE_SECRET_FILE: /coord/.coherence/hook.secret
+    command:
+      - python
+      - /app/examples/cross_host/docker/client_entry.py
+
+networks:
+  cohnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  coordstate:

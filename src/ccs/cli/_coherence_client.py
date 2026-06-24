@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -136,14 +137,20 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
 
 @dataclass(frozen=True)
 class CoordinatorEndpoint:
-    """Resolved (port, bearer_token) pair for the local coordinator."""
+    """Resolved (host, port, bearer_token) for a coordinator.
+
+    ``host`` defaults to loopback so the local path is byte-unchanged; the
+    cross-host demo (gated by :class:`RemoteCoordinatorConfig`) supplies a
+    routable host via :func:`resolve_remote_endpoint`.
+    """
 
     port: int
     bearer: str
+    host: str = "127.0.0.1"
 
     @property
     def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://{self.host}:{self.port}"
 
 
 class CoordinatorUnavailable(Exception):
@@ -188,6 +195,94 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     return CoordinatorEndpoint(port=port, bearer=bearer)
 
 
+def resolve_remote_endpoint(host: str, port: int, secret: str) -> CoordinatorEndpoint:
+    """Build an endpoint for a REMOTE coordinator (cross-host demo).
+
+    Unlike :func:`resolve_endpoint`, this reads nothing from the local
+    ``.coherence/`` directory — host, port, and the bearer secret are supplied
+    by the caller (typically via :meth:`RemoteCoordinatorConfig.from_env`).
+    Gated by :class:`RemoteCoordinatorConfig`; never used on the loopback-only
+    local path.
+    """
+    if not host:
+        raise CoordinatorUnavailable("remote coordinator host is empty")
+    if not secret:
+        raise CoordinatorUnavailable("remote coordinator bearer secret is empty")
+    return CoordinatorEndpoint(port=port, bearer=secret, host=host)
+
+
+#: Truthy env values that enable cross-host remote mode (mirrors the
+#: telemetry kill-switch parser). Everything else (incl. "" and "0") is OFF.
+_REMOTE_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+@dataclass(frozen=True)
+class RemoteCoordinatorConfig:
+    """Default-OFF gate for cross-host remote-coordinator mode.
+
+    Absent the ``CCS_REMOTE_COORDINATOR`` env flag, :meth:`from_env` returns a
+    disabled config and every existing loopback-only behavior is byte-unchanged
+    — the cross-host relaxation never reaches local users.
+
+    Secret channel: the bearer is read from a FILE whose path is given by
+    ``CCS_REMOTE_SECRET_FILE`` — never inline in an env var, which would leak in
+    ``ps`` / ``docker inspect`` (the R7 security pass owns this). The file
+    mirrors the local ``hook.secret`` (mode 0600, mounted into the remote
+    container).
+    """
+
+    enabled: bool
+    host: str | None = None
+    port: int | None = None
+    secret: str | None = None
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> RemoteCoordinatorConfig:
+        """Parse the cross-host flag from the environment (default OFF)."""
+        env = os.environ if env is None else env
+        flag = env.get("CCS_REMOTE_COORDINATOR", "").strip().lower()
+        if flag not in _REMOTE_TRUTHY_ENV_VALUES:
+            return cls(enabled=False)
+        host = (env.get("CCS_REMOTE_HOST") or "").strip() or None
+        port_raw = (env.get("CCS_REMOTE_PORT") or "").strip()
+        port = int(port_raw) if port_raw.isdigit() else None
+        if port is not None and not (1 <= port <= 65535):
+            port = None  # out of TCP range -> treat as unset (fail closed downstream)
+        return cls(enabled=True, host=host, port=port, secret=cls._read_secret(env))
+
+    @staticmethod
+    def _read_secret(env: dict[str, str]) -> str | None:
+        """Read the bearer from ``CCS_REMOTE_SECRET_FILE`` (not an inline env var).
+
+        Hardened: refuses to follow a symlinked secret file (``O_NOFOLLOW`` — an
+        attacker able to set the env var could otherwise repoint it at any
+        readable file), and warns if the file is group/world-accessible (``0600``
+        expected, like the local ``hook.secret``). Fails closed (returns ``None``)
+        on any error.
+        """
+        secret_path = (env.get("CCS_REMOTE_SECRET_FILE") or "").strip()
+        if not secret_path:
+            return None
+        try:
+            fd = os.open(secret_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None  # missing, or a symlink (ELOOP) — fail closed
+        try:
+            with os.fdopen(fd, encoding="utf-8") as handle:
+                mode = os.fstat(handle.fileno()).st_mode
+                if mode & 0o077:
+                    logger.warning(
+                        "CCS_REMOTE_SECRET_FILE %s is group/world-accessible (mode %o); "
+                        "tighten it to 0600",
+                        secret_path,
+                        mode & 0o777,
+                    )
+                secret = handle.read().strip()
+        except OSError:
+            return None
+        return secret or None
+
+
 def get(
     endpoint: CoordinatorEndpoint,
     path: str,
@@ -204,7 +299,7 @@ def get(
     that header here."""
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
-        "Host": "127.0.0.1",
+        "Host": endpoint.host,
     }
     if extra_headers:
         headers.update(extra_headers)
@@ -232,7 +327,7 @@ def post(
     payload = json.dumps(body).encode("utf-8")
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
-        "Host": "127.0.0.1",
+        "Host": endpoint.host,
         "Content-Type": "application/json",
     }
     if extra_headers:
