@@ -166,10 +166,24 @@ def main() -> int:
         def make_ep():
             return resolve_remote_endpoint(remote.host, remote.port, remote.secret)
 
-        _track(make_ep())
-        ok = _run_slices(make_ep)
+        try:
+            _track(make_ep())
+            ok = _run_slices(make_ep)
+        except (OSError, CoherenceError) as exc:
+            # Coordinator unreachable / auth failure -> a clean FAIL verdict,
+            # never a raw traceback that reads as a crash rather than a deny.
+            _log(f"Cross-host coordinator unreachable or rejected the client: {exc}")
+            ok = False
     else:
         # Local smoke: spawn a loopback coordinator, run both clients here.
+        # Guard against the silent-loopback footgun: CCS_REMOTE_HOST set but the
+        # gate flag off means we are NOT testing a host boundary — say so loudly.
+        if os.environ.get("CCS_REMOTE_HOST"):
+            _log(
+                "WARNING: CCS_REMOTE_HOST is set but CCS_REMOTE_COORDINATOR is off "
+                "→ running LOCAL loopback smoke, not cross-host. Set "
+                "CCS_REMOTE_COORDINATOR=1 to reach the remote coordinator."
+            )
         os.environ.setdefault("CCS_REMOTE_COORDINATOR", "1")  # remote-mode clients on loopback
         _log("Local smoke (loopback, one process) — proves the mechanism, not a host boundary")
         with tempfile.TemporaryDirectory() as tmp:

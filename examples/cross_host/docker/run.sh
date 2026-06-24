@@ -5,6 +5,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
+# Clean slate: drop any coordstate volume left by an interrupted prior run, so
+# the client never reads a stale server.pid / port from a dead coordinator.
+docker compose down -v >/dev/null 2>&1 || true
 docker compose up --build --abort-on-container-exit --exit-code-from client
 code=$?
 docker compose down -v >/dev/null 2>&1 || true

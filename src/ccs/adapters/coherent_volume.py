@@ -388,7 +388,10 @@ class CoherentVolume:
         try:
             _coordinator_get(endpoint, "/status")
         except CoordinatorUnavailable as exc:
-            # Transport failure = unreachable -> fail closed (strict raises).
+            # Transport failure = unreachable -> fail closed (strict raises, so the
+            # lines below are unreachable today). They are kept defensively: if a
+            # future non-strict remote mode ever lets _fail_closed_or_degrade return
+            # instead of raise, we must stay DETACHED, never attached to a dead endpoint.
             self._fail_closed_or_degrade(f"remote coordinator unreachable: {exc}")
             self._endpoint = None
             return

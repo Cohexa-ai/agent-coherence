@@ -35,6 +35,9 @@ services:
     volumes:
       - coordstate:/coord/.coherence:ro
     environment:
+      # Also set in the image (Dockerfile ENV); declared here so the cross-host
+      # intent is explicit and the demo never silently falls back to loopback.
+      CCS_REMOTE_COORDINATOR: "1"
       CCS_REMOTE_HOST: 172.28.0.2
       CCS_REMOTE_SECRET_FILE: /coord/.coherence/hook.secret
     command:

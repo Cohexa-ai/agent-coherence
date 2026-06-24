@@ -246,6 +246,8 @@ class RemoteCoordinatorConfig:
         host = (env.get("CCS_REMOTE_HOST") or "").strip() or None
         port_raw = (env.get("CCS_REMOTE_PORT") or "").strip()
         port = int(port_raw) if port_raw.isdigit() else None
+        if port is not None and not (1 <= port <= 65535):
+            port = None  # out of TCP range -> treat as unset (fail closed downstream)
         return cls(enabled=True, host=host, port=port, secret=cls._read_secret(env))
 
     @staticmethod

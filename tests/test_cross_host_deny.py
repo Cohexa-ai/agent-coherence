@@ -28,7 +28,7 @@ from ccs.cli._coherence_client import (
     resolve_endpoint,
     resolve_remote_endpoint,
 )
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import CasVersionConflict
 
 
 @pytest.fixture
@@ -86,14 +86,19 @@ def test_slice1_cross_endpoint_deny_and_recover(
         vol_b.write_cas_at("shared.txt", v_b, b"from-b")
 
         # A's write against its now-stale version is DENIED across the endpoint
-        # (a typed CoherenceError: version-mismatch / invalidated view).
-        with pytest.raises(CoherenceError):
+        # (the typed version-CAS conflict, NOT just any CoherenceError — pin the
+        # exact type and the carried versions so the deny can't pass on an
+        # unrelated failure).
+        with pytest.raises(CasVersionConflict) as deny:
             vol_a.write_cas_at("shared.txt", v_a, b"from-a")
+        assert deny.value.expected_version == v_a
+        assert deny.value.current_version > v_a
 
         # A recovers: re-read -> fresh version -> retry succeeds (no silent loss).
         _data_a2, v_a2 = vol_a.read_with_version("shared.txt")
         assert v_a2 > v_a
         vol_a.write_cas_at("shared.txt", v_a2, b"from-a-2")
+        assert (root_a / "shared.txt").read_bytes() == b"from-a-2"
     finally:
         stop_coordinator(coord_root)
 
