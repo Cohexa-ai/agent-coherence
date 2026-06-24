@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
-"""Cross-host coherence demo — slice 1 (artifact-coordination) + slice 2
-(effect-ordering), with an optional negative-control (--baseline) mode.
+"""Cross-host coherence demo — Scenario 1 (stale-write deny) + Scenario 2
+(effect ordering), with an optional negative-control (--baseline) mode.
 
 Two clients coordinate ONE coordinator over the network: a stale write is denied
 by version-CAS *across the host boundary*, and the loser recovers via re-read +
 retry — no silent lost update.
 
-Topology (honest scope): a SINGLE centralized coordinator (SPOF, single-region);
-NOT distributed/HA. Coordinator-version-only: the shared artifact is TRACKED on
-the coordinator (so it is versioned) but NOT strict — the deny is the OCC
-version-CAS; no strict read-enforcement is needed.
+Topology (honest scope): a SINGLE centralized coordinator (a single point of
+failure, single-region); not distributed/HA. Coordinator-version-only: the shared
+artifact is TRACKED on the coordinator (so it is versioned) but NOT strict — the
+deny is the optimistic version-CAS; no strict read-enforcement is needed.
 
 Run modes:
   - Local (default): with no CCS_REMOTE_HOST set, this spawns a loopback
@@ -25,17 +25,16 @@ Run modes:
 
 CLI:
   - python examples/cross_host/main.py
-        Runs the with-CCS demo only (slice 1 deny + recover, slice 2 fire/hold).
-        Exit 0 iff the with-CCS contract holds.
+        Runs the with-coordination demo only (Scenario 1 deny + recover,
+        Scenario 2 fire/hold). Exit 0 iff the with-coordination contract holds.
   - python examples/cross_host/main.py --baseline
-        Runs the negative control FIRST (silent lost update for slice 1, stale
-        effect fire for slice 2 — the failure modes we claim CCS prevents),
-        then the with-CCS demo. Exit 0 iff broken-must-lose AND fixed-must-prevent.
-        This is the honest screen-share contract: the deny is measured against
-        its absence, not asserted.
+        Runs the negative control FIRST (silent lost update for Scenario 1, stale
+        effect fire for Scenario 2 — the failure modes this library prevents),
+        then the with-coordination demo. Exit 0 iff broken-must-lose AND
+        fixed-must-prevent: the deny is measured against its absence, not asserted.
 
-Exit code: 0 iff the honest contract holds (deny + recover with CCS — and, with
---baseline, ALSO silent loss + stale fire without CCS); 1 otherwise.
+Exit code: 0 iff the honest contract holds (deny + recover with coordination —
+and, with --baseline, ALSO silent loss + stale fire without it); 1 otherwise.
 """
 
 from __future__ import annotations
@@ -73,8 +72,8 @@ def _log(msg: str) -> None:
 def _make_vols(tmp: str, make_endpoint, seed_a: bytes | None = None, seed_b: bytes | None = None):
     """Two CoherentVolumes on separate roots, both attached to the coordinator.
 
-    Same setup for every scene; the baseline-vs-with-CCS contrast is in HOW the
-    clients then use the volume API, not in the volume construction itself.
+    Same setup for every scene; the baseline-vs-with-coordination contrast is in
+    HOW the clients then use the volume API, not in the volume construction itself.
     """
     root_a = Path(tmp) / "a"
     root_b = Path(tmp) / "b"
@@ -90,8 +89,8 @@ def _make_vols(tmp: str, make_endpoint, seed_a: bytes | None = None, seed_b: byt
 
 
 def _run_demo(make_endpoint) -> bool:
-    """Slice 1 (with CCS): A reads@vN; B commits@vN+1; A's stale write is denied;
-    A recovers. Returns True iff denied-then-recovered.
+    """Scenario 1 (with coordination): A reads@vN; B commits@vN+1; A's stale write
+    is denied; A recovers. Returns True iff denied-then-recovered.
     """
     with tempfile.TemporaryDirectory() as tmp:
         vol_a, vol_b = _make_vols(tmp, make_endpoint, seed_a=b"v0", seed_b=b"v0")
@@ -120,15 +119,15 @@ def _run_demo(make_endpoint) -> bool:
 
 
 def _run_demo_baseline(make_endpoint) -> bool:
-    """Slice 1 (NEGATIVE CONTROL — no version-CAS discipline):
+    """Scenario 1 (negative control — no version-CAS discipline):
     A reads@vN but DOES NOT track its decision-time version; B commits@vN+1;
     A re-reads the current version right before writing and commits against it
     (the classic convention-only / un-coordinated lost-update bug pattern). B's
     bytes are silently lost.
 
-    Returns True iff the lost update occurred as expected — i.e., the failure we
-    claim CCS prevents is real and reproducible. This makes the deny in
-    ``_run_demo`` meaningful (measured against its absence, not asserted).
+    Returns True iff the lost update occurred as expected — i.e., the failure this
+    library prevents is real and reproducible. This makes the deny in ``_run_demo``
+    meaningful (measured against its absence, not asserted).
     """
     with tempfile.TemporaryDirectory() as tmp:
         vol_a, vol_b = _make_vols(tmp, make_endpoint, seed_a=b"v0", seed_b=b"v0")
@@ -157,14 +156,13 @@ def _run_demo_baseline(make_endpoint) -> bool:
 
 
 def _run_effect_gate(make_endpoint) -> bool:
-    """Slice 2 (with CCS): an effect gated on config@vN FIRES when config is
-    unchanged and is HELD when config advanced under it. Returns True iff both
-    hold.
+    """Scenario 2 (with coordination): an effect gated on config@vN FIRES when
+    config is unchanged and is HELD when config advanced under it. Returns True
+    iff both hold.
 
-    Maps to north-star Epic — Effect-Ordering primitives (all shipped):
-      EO-1 ``read_at_version``      — read the gating artifact's version
-      EO-2 version-gated effect     — gate the effect on the decision-time version
-      EO-3 Deny → HOLD              — stale gate holds the effect; no fire on stale input
+    The effect ordering has three steps: read the gating artifact's version;
+    gate the effect on that decision-time version; and on a stale gate, hold the
+    effect (never fire on stale input).
     """
     with tempfile.TemporaryDirectory() as tmp:
         root_a = Path(tmp) / "a"
@@ -176,7 +174,7 @@ def _run_effect_gate(make_endpoint) -> bool:
         vol_a = CoherentVolume(root_a, on_error="strict", on_stale_write="allow", remote_endpoint=make_endpoint())
         vol_b = CoherentVolume(root_b, on_error="strict", on_stale_write="allow", remote_endpoint=make_endpoint())
         _c, v_decision = vol_a.read_with_version(CONFIG_KEY)
-        _log(f"  EO-1 ‹read_at_version›: A read {CONFIG_KEY} @ v{v_decision}")
+        _log(f"  A read {CONFIG_KEY} @ v{v_decision} (the version the effect depends on)")
 
         def fires() -> bool:
             """The effect fires only if config is still at the decision version."""
@@ -186,7 +184,7 @@ def _run_effect_gate(make_endpoint) -> bool:
         if not fires():
             _log("  ✗ effect-gate held even though config was unchanged")
             return False
-        _log(f"  EO-2 ‹version-gated effect›: config unchanged @ v{v_decision} → effect would FIRE")
+        _log(f"  ✓ config unchanged @ v{v_decision} → effect would FIRE")
 
         _cb, v_b = vol_b.read_with_version(CONFIG_KEY)
         vol_b.write_cas_at(CONFIG_KEY, v_b, b'{"v": 1}')
@@ -194,19 +192,19 @@ def _run_effect_gate(make_endpoint) -> bool:
         if fires():
             _log("  ✗ effect-gate FIRED on a stale config — coherence FAILED")
             return False
-        _log("  ✓ EO-3 ‹HOLD›: config advanced under A → effect HELD (not fired on stale input)")
+        _log("  ✓ config advanced under A → effect HELD (not fired on stale input)")
         return True
 
 
 def _run_effect_gate_baseline(make_endpoint) -> bool:
-    """Slice 2 (NEGATIVE CONTROL — no effect-gate):
+    """Scenario 2 (negative control — no effect gate):
     A "fires" the effect against the latest config without gating on its
     decision-time version. The effect fires on stale config — a silent stale
     execution (the CI failure pattern where a build runs against a config that
     was edited while the runner was deciding).
 
     Returns True iff the stale fire occurred as expected — codifying the failure
-    that EO-1..EO-3 prevent.
+    that the effect gate prevents.
     """
     with tempfile.TemporaryDirectory() as tmp:
         root_a = Path(tmp) / "a"
@@ -245,47 +243,47 @@ def _track(endpoint) -> None:
 
 
 def _run_slices(make_endpoint, *, baseline: bool) -> bool:
-    """Run the slices end-to-end.
+    """Run both scenarios end-to-end.
 
-    Default (baseline=False): with-CCS only — slice 1 deny+recover, slice 2 EO
-    fire/HOLD. Exit 0 iff both with-CCS contracts hold.
+    Default (baseline=False): with-coordination only — Scenario 1 deny+recover,
+    Scenario 2 effect fire/HOLD. Exit 0 iff both with-coordination contracts hold.
 
-    --baseline (baseline=True): negative control FIRST — slice 1 silent loss,
-    slice 2 stale fire (the failures we claim CCS prevents); then the with-CCS
-    pass. Exit 0 iff broken-must-lose AND fixed-must-prevent — the screen-share
-    contract that makes the deny meaningful, not asserted.
+    --baseline (baseline=True): negative control FIRST — Scenario 1 silent loss,
+    Scenario 2 stale fire (the failures this library prevents); then the
+    with-coordination pass. Exit 0 iff broken-must-lose AND fixed-must-prevent —
+    so the deny is measured against its absence, not asserted.
     """
     if baseline:
         _log("=== Negative control — agents WITHOUT version-CAS discipline ===")
-        _log("Slice 1 baseline — un-coordinated write (the silent lost update we prevent):")
+        _log("Scenario 1 baseline — un-coordinated write (the silent lost update we prevent):")
         b1 = _run_demo_baseline(make_endpoint)
-        _log("Slice 2 baseline — un-gated effect (the stale fire EO-1..EO-3 prevents):")
+        _log("Scenario 2 baseline — un-gated effect (the stale fire the effect gate prevents):")
         b2 = _run_effect_gate_baseline(make_endpoint)
         if not (b1 and b2):
             _log("  ✗ baseline did not reproduce the failure — the negative control is broken")
             return False
         _log("")
 
-    _log("=== With CCS — version-CAS spine + effect-ordering ===")
-    _log("Slice 1 — artifact-coordination (stale write denied across the endpoint):")
-    slice1 = _run_demo(make_endpoint)
-    _log("Slice 2 — effect-ordering (EO-1..EO-3: gate effect on config@vN):")
-    slice2 = _run_effect_gate(make_endpoint)
-    return slice1 and slice2
+    _log("=== With coordination — version-CAS spine + effect ordering ===")
+    _log("Scenario 1 — artifact coordination (stale write denied across the endpoint):")
+    scenario1 = _run_demo(make_endpoint)
+    _log("Scenario 2 — effect ordering (gate the effect on config@vN):")
+    scenario2 = _run_effect_gate(make_endpoint)
+    return scenario1 and scenario2
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="examples/cross_host/main.py",
-        description=("Cross-host coherence demo — slice 1 + slice 2, with optional negative-control mode."),
+        description=("Cross-host coherence demo — two scenarios, with optional negative-control mode."),
     )
     parser.add_argument(
         "--baseline",
         action="store_true",
         help=(
             "Run the negative control FIRST (silent lost update + stale fire), "
-            "then the with-CCS demo. Exit 0 iff broken-must-lose AND "
-            "fixed-must-prevent — the honest screen-share contract."
+            "then the with-coordination demo. Exit 0 iff broken-must-lose AND "
+            "fixed-must-prevent — so the deny is measured against its absence."
         ),
     )
     return parser.parse_args(argv)

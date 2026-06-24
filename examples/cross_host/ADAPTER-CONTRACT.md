@@ -1,21 +1,17 @@
-# Substrate-adapter contract (DX-3)
+# Substrate-adapter contract
 
 The cross-host demo claims: *"same protocol, two topologies."* This document
-makes that claim **testable** — defines the version-CAS contract any substrate
-adapter must satisfy, lists the shipped implementations, and points at the
-parity test that proves both adapters exhibit the same deny semantics against
-the same scenario.
+makes that claim **testable** — it defines the version-CAS contract any substrate
+adapter must satisfy, lists the shipped implementations, and points at the parity
+test that proves both adapters exhibit the same deny semantics against the same
+scenario.
 
 ## Why this exists
 
 Without a written contract, "the protocol is the same, only the substrate
-differs" is an assertion. With this contract + the parity test, it's a *passing
-test* — the version-CAS surface that prevents the silent lost update is shown
-to generalize beyond any single substrate, on the same shipped primitives.
-
-Anchored to the north-star [Slices + the path](../../docs/bizops/north-star-research-agenda.md) §
-DX-3 ("Pluggable artifact substrate — the *same* protocol drives ≥2 adapters")
-and the cross-host pilot one-pager § "Honest scope" NR-2.
+differs" is an assertion. With this contract plus the parity test, it is a
+*passing test* — the version-CAS surface that prevents the silent lost update is
+shown to generalize beyond any single substrate, on the same shipped primitives.
 
 ## The contract
 
@@ -63,11 +59,11 @@ is exercised by the LangGraph integration tests.
 ### Why this matters for cross-host
 
 Adapter-substrate independence is **half the cross-host story** (the other half
-is the networked coordinator itself, NR-1). A file-on-volume vendor and a
-KV-store vendor coordinate concurrent writes through the *same* version-CAS
-protocol; the substrate adapter abstracts the bytes, the coordinator owns the
-version. A pilot can pick whichever substrate matches its workload without
-buying into a different coordination model.
+is the networked coordinator itself — a single centralized coordinator). A
+file-on-volume project and a KV-store project coordinate concurrent writes
+through the *same* version-CAS protocol; the substrate adapter abstracts the
+bytes, the coordinator owns the version. A team can pick whichever substrate
+matches its workload without buying into a different coordination model.
 
 ## Parity test
 
@@ -95,23 +91,23 @@ The test asserts both adapters:
 - successfully recover after A re-reads + retries against the fresh version.
 
 If a future adapter is added, this test grows by one parametrized case — the
-contract stays the same, the parity claim stays testable, and the demo's
-DX-3 ("same protocol, two topologies") stops being asserted and starts being
-proved.
+contract stays the same, the parity claim stays testable, and the "same
+protocol, two topologies" claim stops being asserted and starts being proved.
 
 ## What this contract is NOT
 
 - **Not a transport spec** — the contract defines the version-CAS *surface*,
   not how `read`/`write` reach the coordinator (HTTP, in-process, FUSE, MCP all
-  qualify; the cross-host demo's NR-2 names which one is in-scope today).
+  qualify). The demo names which transport is in scope today — see its
+  "Honest scope" section.
 - **Not a strict-mode spec** — the version-CAS deny is independent of strict
   mode's read-fence; both shipped adapters version-CAS write-deny without
-  needing strict-mode enforcement (the cross-host demo runs `tracked != strict`
-  per the README, NR-2).
+  needing strict-mode enforcement. The cross-host demo runs with the shared key
+  *tracked* but *not strict* (see the README).
 - **Not a durability spec** — `synchronous=FULL` durability is a separate
   axis from version-CAS atomicity. A future adapter that backs onto a durable
   log adds durability without changing the CAS surface this contract defines.
-- **Not a snapshot/transaction spec** — multi-key consistent reads (SB-17)
-  and atomic multi-key publish (SB-18) are *additional* surfaces on top of
-  this contract, gated behind separate demand signals. The slice-1 +
-  slice-2 demo lives strictly inside this contract.
+- **Not a snapshot/transaction spec** — multi-key consistent reads and atomic
+  multi-key publish are *additional* surfaces on top of this contract, each
+  gated behind its own demand. The two demo scenarios live strictly inside this
+  contract.

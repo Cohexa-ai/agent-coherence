@@ -1,4 +1,4 @@
-"""Cross-substrate adapter parity test (DX-3): same protocol, two adapters.
+"""Cross-substrate adapter parity test: same protocol, two adapters.
 
 Documents the version-CAS contract in
 ``examples/cross_host/ADAPTER-CONTRACT.md`` and proves it as a passing test
@@ -8,10 +8,9 @@ satisfying the same Protocol is exercised in-process. Both must reject A's
 stale write with a typed ``CoherenceError`` and let A recover via re-read +
 retry.
 
-This is the demo's "DX-3 (Pluggable substrate adapters — same protocol, two
-topologies)" claim made testable. A future adapter (HTTP MCP, SQL, blob store)
-gets added here as one more parametrize case; the protocol surface and the
-recover-by-reread invariant stay the same.
+This makes the demo's "same protocol, two topologies" claim testable. A future
+adapter (HTTP MCP, SQL, blob store) gets added here as one more parametrize
+case; the protocol surface and the recover-by-reread invariant stay the same.
 """
 
 from __future__ import annotations
@@ -150,7 +149,7 @@ def memory_kv_adapter_pair():
 
 
 def _scenario_deny_then_recover(a: CoherenceAdapter, b: CoherenceAdapter) -> None:
-    """The slice-1 scenario, written once against the contract surface.
+    """The stale-write-deny scenario, written once against the contract surface.
 
     Both adapters must:
       1. Surface a decision-time version on read.

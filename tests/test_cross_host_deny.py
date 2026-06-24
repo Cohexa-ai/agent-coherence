@@ -1,4 +1,4 @@
-"""Unit 5 (R3): slice-1 cross-host deny + recover.
+"""Scenario 1 cross-host deny + recover.
 
 This loopback integration test proves the full chain end-to-end on a real socket
 (runnable on any platform): two remote-endpoint clients (never-spawn) coordinate
@@ -218,9 +218,9 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
 def test_slice2_effect_gate_across_hosts(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Slice-2 (R4): an effect gated on config@vN FIRES when config is unchanged
-    and is HELD when config advanced under it — across the endpoint, on the
-    shipped read_with_version primitive."""
+    """Scenario 2 effect ordering: an effect gated on config@vN FIRES when config
+    is unchanged and is HELD when config advanced under it — across the endpoint,
+    on the shipped read_with_version primitive."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     coord_root = tmp_path / "coord"
     coord_root.mkdir()
@@ -266,7 +266,7 @@ def test_slice2_effect_gate_across_hosts(
 # ---------------------------------------------------------------------------
 # Negative controls — codify the baselines the demo's --baseline flag runs.
 #
-# These tests assert that the FAILURES we claim CCS prevents are real and
+# These tests assert that the FAILURES this library prevents are real and
 # reproducible. If a future library change quietly made the baseline 'work',
 # the demo's contrast would erode and we would notice here first.
 # ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ def test_slice1_baseline_silent_lost_update_without_decision_time_version(
     Pattern: A reads@v_a but writes against the LATEST version (the classic
     convention-only / un-coordinated lost-update bug pattern). B's bytes are
     dropped from the canonical record. This is the failure
-    ``test_slice1_cross_endpoint_deny_and_recover`` proves CCS prevents.
+    ``test_slice1_cross_endpoint_deny_and_recover`` proves this library prevents.
     """
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     coord_root = tmp_path / "coord"
@@ -333,8 +333,8 @@ def test_slice2_baseline_stale_fire_without_effect_gate(
 
     Pattern: A decides @ v_decision, B advances config, A's effect fires
     ungated. This is the CI failure (build/deploy against a config that was
-    edited mid-decision) that EO-1/EO-2/EO-3 prevent in
-    ``test_slice2_effect_gate_across_hosts``.
+    edited mid-decision) that the version-CAS effect gate in
+    ``test_slice2_effect_gate_across_hosts`` prevents.
     """
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     coord_root = tmp_path / "coord"
@@ -384,8 +384,8 @@ def test_main_baseline_flag_runs_negative_control_then_with_ccs(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     """End-to-end CLI smoke: ``python examples/cross_host/main.py --baseline``
-    runs the negative control then the with-CCS pass, exits 0, and the output
-    contains both phases. This pins the screen-share contract: broken-must-lose
+    runs the negative control then the with-coordination pass, exits 0, and the
+    output contains both phases. This pins the honest contract: broken-must-lose
     AND fixed-must-prevent in one invocation.
     """
     # main() spawns a coordinator + clients in this process; the env nudge
@@ -410,5 +410,5 @@ def test_main_baseline_flag_runs_negative_control_then_with_ccs(
     out = capsys.readouterr().out
     assert rc == 0, f"--baseline should exit 0 on a green run, got {rc}; output:\n{out}"
     assert "Negative control" in out, "baseline phase must be labeled in output"
-    assert "With CCS" in out, "with-CCS phase must be labeled in output"
+    assert "With coordination" in out, "with-coordination phase must be labeled in output"
     assert "RESULT: PASS" in out
