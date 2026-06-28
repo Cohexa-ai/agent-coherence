@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Mapping, Optional
 from uuid import UUID, uuid4
 
 from .states import MESIState, TransientState
@@ -153,6 +153,56 @@ class VersionedReadRejection:
     requested_version: int
     current_version: int | None
     coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class SnapshotSession:
+    """A consistent multi-artifact snapshot session (SB-17 / TX-1, Unit 2 / R1).
+
+    The WIN return of :meth:`CoordinatorService.begin_session` — a frozen value
+    object (the ``VersionedContent`` typed-return discipline) that pins a
+    coherent CUT of the read-set: a ``{artifact_id: version}`` vector captured at
+    ONE linearization point so no peer commit is *partially* visible within the
+    set (no cross-artifact read skew). The capture is non-mutating (it mints no
+    MESI grant and captures no ``read_generation`` — a reader is not an owner).
+
+    **R11 BINDING CONSTRAINT — the cut is an INSPECTABLE per-artifact map, NOT
+    an opaque handle.** ``cut`` exposes every pinned ``(artifact_id, version)``
+    pair by design: the paper SB-18 atomic multi-publish signature
+    (``commit_all(session_token, writes) -> MultiCommitResult``) is constructible
+    from v1 *only* because each artifact's ``expected_version`` can be read out
+    of this map. An opaque token that hid the per-artifact versions would leave
+    SB-18 no public way to obtain the expected-versions vector → foreclosed.
+    Unit 2 freezes this inspectable shape; Unit 9's harness re-checks it
+    mechanically. Do NOT replace ``cut`` with an opaque handle.
+
+    Field semantics:
+
+    - ``session_token`` is the server-minted, owner-bound session identity
+      (``secrets.token_urlsafe``; R13). It is NOT a snapshot handle — the cut is
+      carried inspectably in ``cut`` — it identifies the SESSION (for later
+      ``session.read`` / ``session.commit`` / heartbeat / release calls) and is
+      bound to the creating caller's identity at mint time.
+    - ``cut`` is the pinned version-vector ``{artifact_id: version}`` — the
+      consistent cut, one entry per read-set member, captured atomically. This is
+      the load-bearing inspectable surface (see the R11 note above).
+    - ``coordinator_epoch`` is the store's epoch, stamped to mirror
+      :class:`VersionedContent` / :class:`VersionedReadRejection` so a consumer
+      can pin which store-incarnation captured the cut (a durable sqlite session
+      survives restart only within the same epoch; an in-memory session does
+      not survive at all — R6).
+    - ``retain_versions`` is the deployment branch indicator: ``True`` when the
+      store retains bodies durably (the LAZY serve branch — Unit 3 serves pinned
+      bytes from ``artifact_versions``); ``False`` for the ``content=None`` /
+      retention-off ICP (the EAGER serve branch is resolved at the serve layer
+      in Unit 3, not here). Unit 2 records the branch; it captures the
+      version-MAP only and does NOT capture bytes in the coordinator.
+    """
+
+    session_token: str
+    cut: Mapping[UUID, int]
+    coordinator_epoch: str
+    retain_versions: bool
 
 
 @dataclass(frozen=True)

@@ -805,7 +805,8 @@ def _build_pre_fence_db(db_path: Path, art_id: str, ag_id: str) -> None:
 
 def test_fresh_db_has_fence_schema(db_path: Path) -> None:
     """A freshly initialized db carries the fence columns + coordinator_epoch
-    inline in the v2 schema (Unit 3: fresh dbs are created at v2 directly)."""
+    inline in the v2 schema AND the v3 ``session_pins`` table (a fresh db is
+    created at the latest schema directly)."""
     with SqliteArtifactRegistry(db_path) as reg:
         art_cols = {r[1] for r in reg._conn.execute("PRAGMA table_info(artifacts)").fetchall()}
         state_cols = {
@@ -814,16 +815,25 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         assert "owner_generation" in art_cols
         assert "read_generation" in state_cols
         assert reg._coordinator_epoch
-        # v1->v2 is the repo's first real schema bump (Unit 3): a fresh db is v2.
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        tables = {
+            r[0] for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        # The v3 session-pin table (SB-17 Unit 2) is present on a fresh db.
+        assert "session_pins" in tables
+        # SB-17 Unit 2 bumped the schema to v3; a fresh db is created at v3.
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
+        assert SCHEMA_USER_VERSION == 3
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
-    """A pre-fence v1 db migrates to v2 on open (Unit 3): it gains the fence
-    columns + coordinator_epoch (the subsumed fence shim) AND the new
-    artifact_versions table, with user_version stamped 2. Existing rows backfill
-    to owner_generation = 0 / read_generation = NULL, and prior meta is
-    preserved. Re-open is the write-free v2 path; the epoch is stable."""
+    """A pre-fence v1 db migrates all the way to v3 on open (chained
+    v1->v2->v3): it gains the fence columns + coordinator_epoch (the subsumed
+    fence shim), the v2 artifact_versions table, AND the v3 session_pins table,
+    with user_version stamped 3. Existing rows backfill to owner_generation = 0 /
+    read_generation = NULL, and prior meta is preserved. Re-open is the
+    write-free v3 path; the epoch is stable."""
     art_id, ag_id = str(uuid4()), str(uuid4())
     _build_pre_fence_db(db_path, art_id, ag_id)
 
@@ -841,6 +851,8 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
             ).fetchall()
         }
         assert "artifact_versions" in tables
+        # The chained v2->v3 step also created the session_pins table.
+        assert "session_pins" in tables
         # Existing rows backfill: artifact -> 0, grant -> NULL (absent operand).
         assert (
             reg._conn.execute(
@@ -856,9 +868,9 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
             ).fetchone()[0]
             is None
         )
-        # Epoch seeded + loaded; user_version stamped to 2 by the migration.
+        # Epoch seeded + loaded; user_version stamped to 3 by the chained migration.
         assert reg._coordinator_epoch
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         # Prior meta preserved (no clobber of instance_id / sequence_number).
         assert reg._instance_id == "fixed-instance"
         assert reg._seq == 7
@@ -1012,9 +1024,9 @@ def test_set_artifact_and_content_fence_rejects_stale_committer(db_path: Path) -
 
 def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
     """A v1 db whose fence COLUMNS exist but whose coordinator_epoch was never
-    seeded (one wild v1 variant) migrates to v2 cleanly: the migration's
-    table_info guards skip the duplicate column ALTERs and the INSERT OR IGNORE
-    seeds the missing epoch, while stamping user_version to 2."""
+    seeded (one wild v1 variant) migrates cleanly (chained v1->v2->v3): the
+    migration's table_info guards skip the duplicate column ALTERs and the
+    INSERT OR IGNORE seeds the missing epoch, while stamping user_version to 3."""
     import sqlite3
 
     # hex ids: the registry's lookups key on UUID.hex (the pre-fence builder
@@ -1031,7 +1043,7 @@ def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
 
     with SqliteArtifactRegistry(db_path) as reg:
         assert reg._coordinator_epoch  # seeded on this open
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert reg.get_owner_generation(UUID(art_id)) == 0
 
 
@@ -1241,7 +1253,8 @@ class TestDurableRetentionRoundTrip:
 
 class TestWildV1Migration:
     """R2: the four wild v1 variants ({±fence cols} x {±pending_notices}) each
-    migrate to v2 in one transaction with data intact + complete schema."""
+    migrate (chained v1->v2->v3) in one open with data intact + complete schema
+    (artifact_versions from v2, session_pins from v3)."""
 
     @pytest.mark.parametrize("fence", [True, False])
     @pytest.mark.parametrize("notices", [True, False])
@@ -1250,14 +1263,16 @@ class TestWildV1Migration:
     ) -> None:
         art_id, ag_id = _build_raw_v1_db(db_path, fence=fence, notices=notices)
         with SqliteArtifactRegistry(db_path) as reg:
-            # user_version stamped 2; complete schema guaranteed.
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            # Chained migration stamps v3; complete schema guaranteed.
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
             tables = {
                 r[0] for r in reg._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            assert {"artifact_versions", "pending_notices"}.issubset(tables)
+            assert {
+                "artifact_versions", "pending_notices", "session_pins"
+            }.issubset(tables)
             art_cols = {
                 r[1] for r in reg._conn.execute(
                     "PRAGMA table_info(artifacts)"
@@ -1297,7 +1312,8 @@ class TestWildV1Migration:
     def test_half_migrated_db_completes_cleanly(self, db_path: Path) -> None:
         # Characterization: a db with the v2 table already present but
         # user_version still 1 (a crashed prior migration whose stamp never
-        # committed) must complete to v2, never "table already exists".
+        # committed) must complete via the chained v1->v2->v3 path to v3, never
+        # "table already exists".
         _build_raw_v1_db(db_path, fence=True, notices=True)
         conn = sqlite3.connect(str(db_path))
         conn.execute(_ARTIFACT_VERSIONS_DDL)  # table present; user_version still 1
@@ -1305,12 +1321,12 @@ class TestWildV1Migration:
         conn.close()
         # Open via the normal path: must not raise OperationalError.
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
     def test_half_migrated_db_missing_stamp_recovers(self, db_path: Path) -> None:
-        # The classic learnings case generalized to v2: all v2 tables present but
+        # The classic learnings case generalized: all v2 tables present but
         # user_version left at 1. The migration's IF-NOT-EXISTS / table_info
-        # guards make it idempotent — clean completion, no error.
+        # guards make it idempotent — clean completion through to v3, no error.
         _build_raw_v1_db(db_path, fence=True, notices=True)
         conn = sqlite3.connect(str(db_path))
         conn.execute(_ARTIFACT_VERSIONS_DDL)
@@ -1318,7 +1334,7 @@ class TestWildV1Migration:
         conn.close()
         reg = SqliteArtifactRegistry(db_path)  # must not raise
         try:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         finally:
             reg.close()
 
@@ -1333,13 +1349,15 @@ class TestWildV1Migration:
         # assert the in-txn user_version re-check no-ops with ZERO DDL.
         art_id, _ = _build_raw_v1_db(db_path, fence=True, notices=True)
         with SqliteArtifactRegistry(db_path) as winner:
-            assert winner._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert winner._conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
         statements: list[str] = []
 
         def loser_initialize(self, instance_id):
-            # The loser's stale dispatch: call the migration directly against
-            # the already-v2 db, tracing every statement it executes.
+            # The loser's stale dispatch: call the v1->v2 migration directly
+            # against the already-migrated (v3) db, tracing every statement. The
+            # v1->v2 loser-guard (>= _V2_USER_VERSION) sees v3 and short-circuits
+            # with zero DDL before any ALTER/CREATE could re-run.
             self._conn.set_trace_callback(statements.append)
             try:
                 self._migrate_v1_to_v2(instance_id)
@@ -1353,7 +1371,7 @@ class TestWildV1Migration:
             # The loser rehydrated normally (meta loaded, data intact) ...
             assert loser.instance_id == "wild-v1"
             assert loser.get_artifact(UUID(art_id)) is not None
-            assert loser._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert loser._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         # ... and performed NO DDL: the in-txn re-check exited before any
         # ALTER/CREATE could re-run against the migrated schema.
         ddl = [
@@ -1496,10 +1514,11 @@ class TestCrossRuntimeGuard:
     def test_genuine_v1_migrates_and_stamps_python(self, db_path: Path) -> None:
         # The documented residual risk, accepted by design: a v1 db is
         # byte-identical between the two runtimes, so it is NOT blocked — the
-        # normal v1->v2 migration proceeds and stamps OUR lineage marker.
+        # normal chained v1->v2->v3 migration proceeds and stamps OUR lineage
+        # marker.
         art_id, _ = _build_raw_v1_db(db_path, fence=False, notices=False)
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
             assert reg.get_artifact(UUID(art_id)) is not None
             stamp = reg._conn.execute(
                 "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
@@ -1519,14 +1538,16 @@ class TestCrossRuntimeGuard:
         with SqliteArtifactRegistry(db_path) as reg:
             _retain_artifact(reg, content="x")
         with SqliteArtifactRegistry(db_path) as rw:
-            assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         with SqliteArtifactRegistry(db_path, read_only=True) as ro:
             assert ro.instance_id
 
     def test_pre_stamp_python_v2_opens_fine(self, db_path: Path) -> None:
-        # Back-compat: a Python-v2 db written BEFORE the schema_runtime marker
-        # shipped has no stamp at all. Absence is NOT foreign (the v2 open
-        # path is write-free, so the stamp is never backfilled either).
+        # Back-compat: a Python db written BEFORE the schema_runtime marker
+        # shipped has no stamp at all. Absence is NOT foreign (the steady-state
+        # v3 open path is write-free, so the stamp is never backfilled either).
+        # The structural session_pins probe (present on a Python-v3 db) keeps the
+        # un-stamped db classified as native, never foreign.
         with SqliteArtifactRegistry(db_path):
             pass
         conn = sqlite3.connect(str(db_path))
@@ -1536,8 +1557,8 @@ class TestCrossRuntimeGuard:
         finally:
             conn.close()
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 2
-            # Still un-stamped: the steady-state v2 open performs no writes.
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            # Still un-stamped: the steady-state v3 open performs no writes.
             assert reg._conn.execute(
                 "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
             ).fetchone() is None

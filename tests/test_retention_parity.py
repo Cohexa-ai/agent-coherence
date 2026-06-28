@@ -72,6 +72,7 @@ from ccs.core.exceptions import (
 from ccs.core.states import MESIState
 from ccs.core.types import (
     Artifact,
+    SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
 )
@@ -570,3 +571,155 @@ class TestStrBytesRoundTripAcrossRegistries:
                 assert isinstance(out.content, py_type)
         finally:
             sql.close()
+
+
+# ===========================================================================
+# D — Snapshot consistent-cut capture parity (SB-17 / TX-1, Unit 2)
+# ===========================================================================
+
+
+def _snap_pair(
+    tmp_path: Path, name: str, policy: RetentionPolicy | None = None
+) -> tuple[ArtifactRegistry, SqliteArtifactRegistry]:
+    """An in-memory + sqlite pair for snapshot-capture parity. Retention is OFF
+    by default (the version-map-only / content=None branch); a policy switches
+    both arms to the lazy retain_versions=True branch."""
+    retain = policy is not None
+    return (
+        ArtifactRegistry(retain_versions=retain, retention_policy=policy),
+        SqliteArtifactRegistry(
+            tmp_path / name, retain_versions=retain, retention_policy=policy
+        ),
+    )
+
+
+class TestSnapshotCaptureParity:
+    """``capture_version_vector`` behaves IDENTICALLY on both registries except
+    restart-survival (sqlite persists pins; in-memory does not). The divergence
+    is ASSERTED, never masked (success criterion + R6)."""
+
+    def test_capture_and_unknown_id_reject_identical(self, tmp_path: Path) -> None:
+        # One identical sequence on both arms: register {A,B}, capture {A,B} →
+        # same cut; then capture {A, unknown} → same typed rejection. Compared as
+        # registry-agnostic normal forms.
+        mem, sql = _snap_pair(tmp_path, "snap_parity.db")
+        try:
+            # Use FIXED ids so the cut maps are directly comparable across arms.
+            a = UUID(int=0xA)
+            b = UUID(int=0xB)
+            unknown = UUID(int=0xDEAD)
+
+            def run(reg) -> tuple:
+                art_a = Artifact(id=a, name="a.md", version=1, content_hash="h")
+                art_b = Artifact(id=b, name="b.md", version=1, content_hash="h")
+                reg.register_artifact(art_a, content="a1")
+                reg.register_artifact(art_b, content="b1")
+                # peer bumps A to v2 before the capture → coherent cut {A:2,B:1}.
+                _commit(reg, a, 2, "a2")
+                ok = reg.capture_version_vector([a, b], session_token="tok-ok")
+                bad = reg.capture_version_vector([a, unknown], session_token="tok-bad")
+                return ok, bad
+
+            mem_ok, mem_bad = run(mem)
+            sql_ok, sql_bad = run(sql)
+
+            # The WIN cut is identical across registries.
+            assert mem_ok == sql_ok == {a: 2, b: 1}
+            # The rejection is the same wire-stable reason + offending id.
+            for bad in (mem_bad, sql_bad):
+                assert isinstance(bad, VersionedReadRejection)
+                assert bad.reason == UNKNOWN_ARTIFACT_REASON
+                assert bad.artifact_id == unknown
+                assert bad.current_version is None
+        finally:
+            sql.close()
+
+    def test_gc_hold_then_release_parity(self, tmp_path: Path) -> None:
+        # Identical pin-hold-then-collectible behavior on both arms under K=1.
+        policy = RetentionPolicy(max_versions=1)
+        mem, sql = _snap_pair(tmp_path, "snap_gc_parity.db", policy)
+        try:
+            a = UUID(int=0xCAFE)
+
+            def run(reg) -> tuple:
+                art = Artifact(id=a, name="plan.md", version=1, content_hash="h")
+                reg.register_artifact(art, content="v1")  # current=1, retain on
+                # Pin v1 while current.
+                cut = reg.capture_version_vector([a], session_token="held")
+                assert cut == {a: 1}
+                writer = uuid4()
+                _commit_cas(reg, a, writer, 1, "v2")  # K=1 {2} + pin{1}
+                held = reg.get_content_at_version(a, 1)  # must survive (pinned)
+                reg.release_session("held")
+                _commit_cas(reg, a, writer, 2, "v3")  # K=1 evicts v1 now
+                after = reg.get_content_at_version(a, 1)  # collectible → None
+                return held, after
+
+            assert run(mem) == run(sql) == ("v1", None)
+        finally:
+            sql.close()
+
+    def test_restart_survival_divergence_asserted_not_masked(
+        self, tmp_path: Path
+    ) -> None:
+        # THE DELIBERATE DIVERGENCE (R6): sqlite pins survive a registry reopen on
+        # the same db file; an in-memory registry is process-scoped, so a fresh
+        # instance starts with NO pins. Asserted explicitly so a regression that
+        # accidentally made them agree (either direction) is caught.
+        policy = RetentionPolicy(max_versions=1)
+        a = UUID(int=0xF00D)
+        db = tmp_path / "snap_restart.db"
+
+        # --- sqlite arm: pin survives reopen ---
+        sql1 = SqliteArtifactRegistry(db, retain_versions=True, retention_policy=policy)
+        try:
+            art = Artifact(id=a, name="plan.md", version=1, content_hash="h")
+            sql1.register_artifact(art, content="v1")
+            assert sql1.capture_version_vector([a], session_token="survivor") == {a: 1}
+        finally:
+            sql1.close()
+        # Reopen a SECOND handle (the "restart"): the pin row is still there, so a
+        # K=1-evicting commit must STILL hold v1 (the durable exemption survived).
+        sql2 = SqliteArtifactRegistry(db, retain_versions=True, retention_policy=policy)
+        try:
+            writer = uuid4()
+            _commit_cas(sql2, a, writer, 1, "v2")  # K=1 {2}; pin{1} from the reopen
+            assert sql2.get_content_at_version(a, 1) == "v1", (
+                "sqlite pin did NOT survive restart — R6 durability regressed"
+            )
+        finally:
+            sql2.close()
+
+        # --- in-memory arm: a fresh instance has NO pins (process-scoped) ---
+        mem1 = ArtifactRegistry(
+            retain_versions=True, retention_policy=policy
+        )
+        art = Artifact(id=a, name="plan.md", version=1, content_hash="h")
+        mem1.register_artifact(art, content="v1")
+        assert mem1.capture_version_vector([a], session_token="ephemeral") == {a: 1}
+        # A FRESH in-memory registry is the "restart": no shared store, no pins.
+        mem2 = ArtifactRegistry(
+            retain_versions=True, retention_policy=policy
+        )
+        art2 = Artifact(id=a, name="plan.md", version=1, content_hash="h")
+        mem2.register_artifact(art2, content="v1")
+        writer = uuid4()
+        _commit_cas(mem2, a, writer, 1, "v2")  # K=1 {2}; NO pin survived to mem2
+        assert mem2.get_content_at_version(a, 1) is None, (
+            "in-memory pins unexpectedly survived a fresh instance — the "
+            "process-scoped contract (R6) was violated"
+        )
+
+
+def _commit_cas(reg, artifact_id: UUID, writer: UUID, expected: int, body: str) -> None:
+    """A peer OCC commit via the registry ``commit_cas`` WIN (captures history)
+    — shared by the snapshot-capture parity tests."""
+    reg.set_agent_state(artifact_id, writer, MESIState.SHARED, tick=1)
+    reg.commit_cas(
+        artifact_id,
+        writer,
+        expected_version=expected,
+        content_hash="h",
+        content=body,
+        tick=2,
+    )

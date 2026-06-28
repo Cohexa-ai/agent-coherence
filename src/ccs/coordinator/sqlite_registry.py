@@ -93,11 +93,17 @@ from ccs.core.exceptions import (
     STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
+    UNKNOWN_ARTIFACT_REASON,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact, CasCorruption, ConflictDetail
+from ccs.core.types import (
+    Artifact,
+    CasCorruption,
+    ConflictDetail,
+    VersionedReadRejection,
+)
 
 from .retention import RetentionPolicy, collectible_versions
 
@@ -107,18 +113,40 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 2
+SCHEMA_USER_VERSION = 3
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
-**v1 -> v2 is the repo's FIRST real schema bump** (plan item N v1, Unit 3): it
-adds the durable ``artifact_versions`` table and — because the fence columns +
-``coordinator_epoch`` seed AND the ``pending_notices`` table both shipped as
-additive no-version-bump shims — idempotently subsumes BOTH shims so that
-``user_version=2`` GUARANTEES the complete schema from every wild v1 variant.
+**v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
+idempotently subsumed the fence-column + ``pending_notices`` no-version-bump
+shims, so ``user_version=2`` GUARANTEES the complete v2 schema from every wild
+v1 variant.
+
+**v2 -> v3** (SB-17 / TX-1, Unit 2 / R1) adds the durable ``session_pins``
+table (one row per ``(session_token, artifact_id)`` pinned version) so a
+snapshot session's cut survives a coordinator restart (R6, sqlite-only). The
+migration is idempotent (``CREATE TABLE IF NOT EXISTS`` + an in-txn version
+stamp) and additive — it touches NO existing table, so the v2->v3 step is
+purely a new-surface add.
+
+**CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
+(agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
+ledger: its v3 is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — a
+DIFFERENT schema than this repo's v3. A Node coordinator opening a Python-v3 db
+(or vice-versa) must DETECT and REJECT rather than silently misread; the
+``schema_runtime`` lineage stamp + the structural ``session_pins``-presence
+probe in ``_reject_foreign_ledger_db`` enforce that fail-closed posture.
+
 After migration the normal open path performs **no writes** (no shim ALTERs,
 no IF-NOT-EXISTS), which is the prerequisite that makes the read-only open mode
-implementable. See ``_migrate_v1_to_v2`` and
+implementable. See ``_migrate_v1_to_v2`` / ``_migrate_v2_to_v3`` and
 ``docs/solutions/runtime-errors/sqlite-schema-init-non-atomic-leaves-unbootable-db-2026-05-18.md``."""
+
+_V2_USER_VERSION = 2
+"""The intermediate v2 stamp the v1->v2 migration writes (before the chained
+v2->v3 step advances to ``SCHEMA_USER_VERSION``). Pinned as a literal because
+the v1->v2 migration must NOT jump straight to the current
+``SCHEMA_USER_VERSION`` — it lands the v2 schema, then ``_migrate_v2_to_v3``
+adds ``session_pins`` and stamps v3. A v1 db therefore steps 1 -> 2 -> 3."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -151,6 +179,29 @@ CREATE TABLE artifact_versions (
     captured_at REAL NOT NULL,
     PRIMARY KEY (artifact_id, version),
     FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+)
+"""
+
+# Durable snapshot-session pin table (SB-17 / TX-1, Unit 2 / R1, R4). One row
+# per (session_token, artifact_id) pinned version — the persisted mirror of the
+# in-memory ``_session_pins`` dict. A live session's pinned version is exempt
+# from the inline retention GC (the exemptions seam) until ``release_session``
+# deletes its rows. Restart-survival is the whole point of the durable mirror
+# (R6, sqlite-only): a coordinator restart re-reads the live pins so the cut is
+# still held. NO foreign key to ``artifacts`` ON DELETE CASCADE here on
+# PURPOSE: a pin must OUTLIVE a transient absence of its artifact only as far as
+# the artifact actually exists — but the version-vector capture already
+# rejected unknown ids before inserting, and the read-serve / liveness fail-
+# closed path (Units 3/5) is what handles an artifact deleted out from under a
+# live pin (typed SessionInvalidated, never wrong bytes). Keeping the pin table
+# independent of the artifacts FK avoids a silent cascade-delete masking that
+# fail-closed signal.
+_SESSION_PINS_DDL = """
+CREATE TABLE session_pins (
+    session_token TEXT NOT NULL,
+    artifact_id   TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    PRIMARY KEY (session_token, artifact_id)
 )
 """
 
@@ -197,6 +248,12 @@ _SCHEMA_RUNTIME_STAMP = "python"
 # no mutation). ``CasCorruption`` is the impossible-state sentinel the service
 # maps to ``CoherenceError``. None of these is raised by the registry.
 CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
+
+# Snapshot consistent-cut capture result (SB-17 / TX-1, Unit 2 / R1) — parity
+# with ArtifactRegistry.capture_version_vector. WIN = the pinned cut
+# ``{artifact_id: version}``; an unknown id = VersionedReadRejection
+# (``unknown_artifact``) with NO pins inserted. Neither is raised.
+CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
 class SchemaVersionError(RuntimeError):
@@ -476,14 +533,17 @@ class SqliteArtifactRegistry:
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE v2 schema in one atomic transaction (no shim ever runs on a
           fresh db).
-        - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2``:
-          idempotently subsumes BOTH additive shims (fence columns + epoch seed,
-          and ``pending_notices``) AND adds ``artifact_versions``, then stamps
-          ``user_version=2`` — all in ONE ``BEGIN IMMEDIATE``. The wild v1
+        - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2``
+          then ``_migrate_v2_to_v3``: idempotently subsumes BOTH additive shims
+          (fence columns + epoch seed, and ``pending_notices``), adds
+          ``artifact_versions`` (v2), and adds ``session_pins`` (v3). The wild v1
           population is a 2x2 matrix ({±fence columns} x {±pending_notices})
           because both shims shipped with no version bump; ``PRAGMA table_info``
           / ``IF NOT EXISTS`` guards make each piece apply only when missing.
-        - ``user_version == 2`` → ``_rehydrate_meta``: the WRITE-FREE open path
+        - ``user_version == 2`` → ``_migrate_v2_to_v3``: adds ``session_pins``
+          and stamps ``user_version=3`` in ONE ``BEGIN IMMEDIATE`` (additive —
+          touches no existing table).
+        - ``user_version == 3`` → ``_rehydrate_meta``: the WRITE-FREE open path
           (no ALTER, no IF-NOT-EXISTS) — the prerequisite for read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
 
@@ -494,15 +554,21 @@ class SqliteArtifactRegistry:
         with self._lock:
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
             # Cross-runtime fail-closed guard: read-only probes, BEFORE the
-            # dispatch can migrate (v1 branch) or write anything — migrating a
+            # dispatch can migrate (v1/v2 branch) or write anything — migrating a
             # Node-ledger db would corrupt the sibling coordinator's live state.
             self._reject_foreign_ledger_db(current)
             if current == 0:
                 self._apply_v2_schema(instance_id)
             elif current == 1:
+                # v1 → v2 → v3: the v1->v2 migration rehydrates meta; the chained
+                # v2->v3 step then adds session_pins and re-rehydrates. Each step
+                # is its own atomic BEGIN IMMEDIATE.
                 self._migrate_v1_to_v2(instance_id)
+                self._migrate_v2_to_v3(instance_id)
+            elif current == 2:
+                self._migrate_v2_to_v3(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v2 database — rehydrate; NO writes on this path.
+                # Existing v3 database — rehydrate; NO writes on this path.
                 self._rehydrate_meta(instance_id)
             else:
                 raise SchemaVersionError(
@@ -594,24 +660,36 @@ class SqliteArtifactRegistry:
         coordinator shares this db path but its ledger's v2 adds NO schema
         objects (pending_notices validation) and its v3 ALTERs
         ``agent_states ADD COLUMN deadline_tick``, while THIS repo's v2 adds
-        ``artifact_versions`` — the same user_version means different schemas
-        depending on the writer. Detection order (strongest marker first):
+        ``artifact_versions`` and its v3 adds ``session_pins`` — the same
+        user_version means different schemas depending on the writer. THE LEDGER
+        DIVERGENCE AT v3 IS THE SB-17 SECURITY CONCERN: a Node coordinator
+        opening this build's Python-v3 db (or this build opening a Node-v3 db)
+        must DETECT/REJECT, never silently misread. Detection order (strongest
+        marker first):
 
         1. ``registry_meta.schema_runtime`` present and foreign — the explicit
            lineage stamp, checked regardless of version (this side stamps
-           ``python``; the Node side mirrors with ``node``).
+           ``python``; the Node side mirrors with ``node``). This alone catches
+           the cross-runtime v3 collision in both directions when the stamp is
+           present (every Python db since the marker shipped carries it).
         2. ``user_version >= 3`` with ``agent_states.deadline_tick`` — the
            Node ledger's v3 ALTER. ``>= 3``, not ``== 3``: a future Node v4+
-           still carries the column (columns are never dropped), and a future
-           Python v3 db is unreadable by this v2 build either way — both
-           classifications stay fail-closed and :class:`CrossRuntimeSchemaError`
-           IS a :class:`SchemaVersionError` for catch-sites. Literal ``3``
-           (the Node ledger's version), deliberately not SCHEMA_USER_VERSION.
+           still carries the column (columns are never dropped). A genuine
+           Python-v3 db NEVER carries ``deadline_tick`` (this repo's v3 adds
+           ``session_pins``, not that column), so this never false-positives on
+           our own v3. Literal ``3`` (the Node ledger's version), deliberately
+           not SCHEMA_USER_VERSION.
         3. ``user_version == 2`` WITHOUT ``artifact_versions`` — a Python-v2
            db ALWAYS has the table (the v1->v2 migration creates it atomically
            with the version stamp); a Node-v2 db never does. Literal ``2``:
-           the check pins user_version-2 semantics even after a future Python
-           v3 bump.
+           the check pins user_version-2 semantics even after the Python v3 bump.
+        4. ``user_version == 3`` WITHOUT ``session_pins`` — a Python-v3 db
+           ALWAYS has the table (the v2->v3 migration / fresh apply creates it
+           atomically with the v3 stamp); a Node-v3 db (whose v3 is the
+           ``deadline_tick`` ALTER) never does. This is the structural fallback
+           for a Node-v3 db whose ``deadline_tick`` probe somehow missed (and
+           defense-in-depth alongside the ``schema_runtime`` stamp). Literal
+           ``3`` — pins Python-v3 semantics.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -635,6 +713,12 @@ class SqliteArtifactRegistry:
                 "is user_version=2 without the artifact_versions table (a "
                 "Python-v2 store always has it; the Node ledger's v2 adds no "
                 "schema objects)"
+            )
+        if current == 3 and not self._has_table("session_pins"):
+            self._raise_cross_runtime(
+                "is user_version=3 without the session_pins table (a "
+                "Python-v3 store always has it; the Node ledger's v3 is the "
+                "agent_states.deadline_tick ALTER, not session_pins)"
             )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
@@ -660,7 +744,11 @@ class SqliteArtifactRegistry:
         )
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:
-        """Create the COMPLETE v2 schema + seed registry_meta. Caller holds lock.
+        """Create the COMPLETE current schema (v2 tables + the v3 ``session_pins``
+        table) + seed registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
+        Caller holds lock. (The method keeps its historical ``_apply_v2_schema``
+        name; a fresh db is always built at the latest schema directly so no
+        migration shim ever runs against it.)
 
         P1 ce-review fix (correctness): schema init must be atomic against
         SIGKILL. Earlier version ran executescript() THEN a separate PRAGMA
@@ -755,6 +843,9 @@ class SqliteArtifactRegistry:
                 """
             )
             c.execute(_ARTIFACT_VERSIONS_DDL)
+            # session_pins (v3, SB-17 Unit 2): a fresh db is created at the full
+            # current schema directly — no v2->v3 shim ever runs against it.
+            c.execute(_SESSION_PINS_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -856,10 +947,13 @@ class SqliteArtifactRegistry:
         try:
             # Concurrent-loser guard: re-check the stamp now that the write
             # lock is held. The dispatch decision was made from a pre-lock
-            # read; if a racing winner migrated in between, there is nothing
-            # left to do — COMMIT the empty txn and rehydrate like a normal
-            # v2 open. (The winner already ran the mode-tighten pass.)
-            if c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION:
+            # read; if a racing winner already advanced PAST v1 (to v2 or the
+            # current v3), the v1->v2 body has nothing left to do — COMMIT the
+            # empty txn and rehydrate. ``>= _V2_USER_VERSION`` (not ``==``)
+            # because the winner may have already chained on to v3. The caller's
+            # chained ``_migrate_v2_to_v3`` then runs its OWN loser-guarded txn,
+            # which no-ops if v3 is already stamped.
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V2_USER_VERSION:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
@@ -914,8 +1008,10 @@ class SqliteArtifactRegistry:
             c.execute(_ARTIFACT_VERSIONS_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
             # In-txn stamp: PRAGMA user_version is transactional inside an explicit
             # BEGIN; commits atomically with the DDL above. Cannot take bindings,
-            # so the int constant is interpolated.
-            c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
+            # so the int constant is interpolated. Stamps the INTERMEDIATE v2 (not
+            # the current SCHEMA_USER_VERSION) — the chained _migrate_v2_to_v3 adds
+            # session_pins and advances to v3.
+            c.execute(f"PRAGMA user_version = {_V2_USER_VERSION}")
             c.execute("COMMIT")
         except BaseException:
             try:
@@ -929,6 +1025,52 @@ class SqliteArtifactRegistry:
         # so re-apply 0600 to a possibly operator-broadened file and warn ONCE
         # that the content-storage posture changed (audit_log drift pattern).
         self._tighten_existing_db_mode_and_warn()
+
+    def _migrate_v2_to_v3(self, instance_id: str | None) -> None:
+        """Migrate a v2 db to v3 in ONE atomic transaction (SB-17 / TX-1, Unit 2).
+        Caller holds lock.
+
+        Additive-only: adds the ``session_pins`` table and stamps
+        ``user_version=SCHEMA_USER_VERSION`` — it touches NO existing table, so
+        there is no shim to subsume and no content/mode posture change (the v2->v3
+        step does not alter the disclosure surface). Same atomicity discipline as
+        ``_migrate_v1_to_v2`` (the
+        sqlite-schema-init-non-atomic-leaves-unbootable-db learning): ONE explicit
+        ``BEGIN IMMEDIATE`` wrapping the DDL + the ``PRAGMA user_version`` stamp
+        (transactional inside an explicit txn), individual ``execute()`` calls
+        (never ``executescript``), and ``except BaseException`` ROLLBACK so a
+        SIGKILL mid-migration leaves the v2 db intact for a clean re-migrate.
+
+        Concurrent-loser path: two processes can both read ``user_version == 2``
+        (a bare pre-lock read) and both land here; they serialize on the
+        ``BEGIN IMMEDIATE`` write lock. The loser re-reads ``user_version`` INSIDE
+        its txn, sees the winner already stamped v3, and no-ops (``CREATE TABLE IF
+        NOT EXISTS`` would be harmless either way, but the early COMMIT avoids
+        re-running a future non-idempotent v4 step under the same race).
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v3 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            # IF NOT EXISTS guards the half-migrated-db case (table created by a
+            # prior crashed migration whose user_version stamp never committed).
+            c.execute(
+                _SESSION_PINS_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
+            )
+            c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
 
     def _tighten_existing_db_mode_and_warn(self) -> None:
         """Re-apply 0600 to a pre-existing db whose mode an operator may have
@@ -1273,16 +1415,41 @@ class SqliteArtifactRegistry:
             (artifact_id.hex,),
         ).fetchall()
         timestamps = {int(v): float(ts) for v, ts in rows}
+        # Exemptions seam (Unit 2 — the first GC producer to populate it): every
+        # version pinned by a LIVE snapshot session for this artifact is held
+        # back from collection (R4). Read from session_pins in THIS same txn so
+        # the exemption set is consistent with the capture (a concurrent
+        # capture_version_vector / release_session serializes on the same
+        # connection lock + BEGIN IMMEDIATE).
         for dropped in collectible_versions(
             timestamps,
             current_version=version,
             policy=self._retention_policy,
             now=captured_at,
+            exemptions=self._live_pins_for_artifact_sql(artifact_id),
         ):
             c.execute(
                 "DELETE FROM artifact_versions WHERE artifact_id = ? AND version = ?",
                 (artifact_id.hex, dropped),
             )
+
+    def _live_pins_for_artifact_sql(self, artifact_id: UUID) -> set[int]:
+        """Return the versions pinned by LIVE snapshot sessions for ``artifact_id``
+        (the GC exemption set, Unit 2 / R4) from the persisted ``session_pins``
+        table. Mirrors the in-memory ``_live_pins_for_artifact`` and
+        ``Snapshot.tla``'s ``PinnedVersions(art)``.
+
+        MUST be called inside the caller's already-open ``BEGIN IMMEDIATE`` (it
+        issues a bare ``SELECT`` on ``self._conn`` with no transaction of its
+        own), so the exemption read is consistent with the capture/GC it feeds —
+        a peer ``capture_version_vector`` / ``release_session`` serializes on the
+        same connection lock and cannot half-apply between this read and the
+        GC delete."""
+        rows = self._conn.execute(
+            "SELECT version FROM session_pins WHERE artifact_id = ?",
+            (artifact_id.hex,),
+        ).fetchall()
+        return {int(r[0]) for r in rows}
 
     @property
     def coordinator_epoch(self) -> str:
@@ -1563,6 +1730,110 @@ class SqliteArtifactRegistry:
                 # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
                 # before propagation — otherwise the connection is left with an
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
+                self._conn.execute("ROLLBACK")
+                raise
+
+    # ------------------------------------------------------------------
+    # Snapshot consistent-cut capture + pin store (SB-17 / TX-1, Unit 2)
+    # ------------------------------------------------------------------
+
+    def capture_version_vector(
+        self, read_set: Iterable[UUID], session_token: str
+    ) -> CaptureResult:
+        """Atomically pin a consistent multi-artifact CUT (SB-17 / TX-1, Unit 2 /
+        R1). Written fresh from the contract — parity with
+        :meth:`ArtifactRegistry.capture_version_vector` (the two registries share
+        no base class), divergent ONLY on restart-survival (sqlite pins are
+        durable; in-memory pins are process-scoped — the parity harness asserts
+        the divergence).
+
+        ONE ``BEGIN IMMEDIATE`` under one lock acquisition does the entire
+        multi-artifact version read + row-count validation + pin insert — the
+        ``status_snapshot`` consistent-multi-artifact-read-under-one-lock pattern
+        + ``commit_cas``'s ``BEGIN IMMEDIATE``. A peer ``commit_cas`` is
+        serialized entirely before or after the whole capture, never partially
+        visible within the cut (no read skew).
+
+        Non-mutating on the coherence plane: it mints NO MESI grant and captures
+        NO ``read_generation`` (it never touches ``agent_states`` / the fence
+        path) — a reader is not an owner. It writes ONLY the ``session_pins``
+        rows (the durable mirror of the cut).
+
+        Unknown-id validation (security, F7): the captured row-count must equal
+        ``len(read_set)``. Any missing id → a typed
+        :class:`~ccs.core.types.VersionedReadRejection` (``unknown_artifact``)
+        and the txn COMMITs having inserted NO pins (no partial cut, no
+        existence-probe oracle — the rejection is decided before any pin write).
+
+        Args:
+            read_set: The artifact ids to pin into the cut. Empty → empty cut.
+            session_token: The server-minted session identity the pins key under.
+
+        Returns:
+            The pinned cut ``{artifact_id: version}`` on success, else a
+            :class:`VersionedReadRejection` (``unknown_artifact``) — no pins
+            inserted.
+        """
+        self._guard_writable()
+        ids = list(read_set)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cut: dict[UUID, int] = {}
+                missing: list[UUID] = []
+                for artifact_id in ids:
+                    row = self._conn.execute(
+                        "SELECT version FROM artifacts WHERE id = ?",
+                        (artifact_id.hex,),
+                    ).fetchone()
+                    if row is None:
+                        missing.append(artifact_id)
+                        continue
+                    cut[artifact_id] = row[0]
+                # F7: row-count == len(read_set) BEFORE any pin insert. A missing
+                # id rejects the WHOLE capture — COMMIT the (pin-free) txn and
+                # return the typed rejection. Nothing was written, so the COMMIT
+                # just releases the lock.
+                if missing:
+                    self._conn.execute("COMMIT")
+                    return VersionedReadRejection(
+                        reason=UNKNOWN_ARTIFACT_REASON,
+                        artifact_id=sorted(missing, key=lambda a: a.int)[0],
+                        requested_version=0,
+                        current_version=None,
+                        coordinator_epoch=self._coordinator_epoch,
+                    )
+                # Insert the pins atomically with the version read (same txn) so
+                # the exemptions seam sees the full cut the instant it is live.
+                # INSERT OR REPLACE: re-binding a token (should not happen — the
+                # service mints a fresh token per session) overwrites rather than
+                # raising on the (session_token, artifact_id) PK.
+                for artifact_id, version in cut.items():
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO session_pins "
+                        "(session_token, artifact_id, version) VALUES (?, ?, ?)",
+                        (session_token, artifact_id.hex, version),
+                    )
+                self._conn.execute("COMMIT")
+                return cut
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def release_session(self, session_token: str) -> None:
+        """Drop a session's pins so its pinned versions become collectible again
+        (Unit 2 / R4). Idempotent — releasing an unknown/already-released token
+        deletes zero rows (no raise), mirroring the in-memory ``dict.pop``."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "DELETE FROM session_pins WHERE session_token = ?",
+                    (session_token,),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
 

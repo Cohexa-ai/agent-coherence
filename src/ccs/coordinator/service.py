@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 from uuid import UUID
 
 from ccs.coordinator.retention import collectible_versions
@@ -36,6 +37,7 @@ from ccs.core.types import (
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
+    SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
 )
@@ -180,11 +182,24 @@ def validate_crash_recovery_config(
     )
 
 
+# Snapshot session token entropy (SB-17 / TX-1, Unit 2 / R13). 32 bytes →
+# ~43 url-safe chars; unguessable, server-minted, never client-supplied. The
+# timing-safe compare + per-call validation that consume it are Unit 7.
+_SESSION_TOKEN_BYTES = 32
+
+
 class CoordinatorService:
     """Control-plane service for artifact read/write/commit synchronization."""
 
     def __init__(self, registry: ArtifactRegistry):
         self.registry = registry
+        # Snapshot session owner-binding (SB-17 / TX-1, Unit 2 / R13):
+        # ``{session_token: owner_id}``. Populated at ``begin_session`` mint;
+        # the per-call validation that READS it (a foreign owner →
+        # SessionInvalidated, timing-safe compare) is Unit 7. Service-scoped (a
+        # restart drops the bindings — the durable pins survive on sqlite, but
+        # re-validating a post-restart token is the Unit 5 liveness concern).
+        self._session_owners: dict[str, UUID] = {}
 
     def register_artifact(
         self,
@@ -391,6 +406,12 @@ class CoordinatorService:
         # the next capture). ``current`` is exempt in collectible_versions, but
         # we already excluded version==current above, so this only ages the
         # requested historical row. ``policy is None`` ⇒ unbounded ⇒ no T axis.
+        #
+        # Unit 3: a live-session pin must ALSO suppress THIS read-side logical
+        # T-expiry (a read-serve allowance distinct from the GC-hold the Unit 2
+        # ``exemptions`` seam already provides at the GC producers), so a pinned-
+        # but-age-collectible row is still SERVED. Not implemented here — the
+        # session-scoped read path is Unit 3; Unit 2 holds the version-map only.
         if policy is not None and version in collectible_versions(
             {version: captured_at},
             current_version=current,
@@ -424,6 +445,73 @@ class CoordinatorService:
             requested_version=requested_version,
             current_version=current_version,
             coordinator_epoch=epoch,
+        )
+
+    def begin_session(
+        self,
+        *,
+        read_set: Iterable[UUID],
+        owner: UUID,
+    ) -> SnapshotSession | VersionedReadRejection:
+        """Open a consistent multi-artifact snapshot session (SB-17 / TX-1,
+        Unit 2 / R1, R13). Pins a coherent CUT of ``read_set`` at one
+        linearization point and returns an inspectable
+        :class:`~ccs.core.types.SnapshotSession`.
+
+        Orchestration (Unit 2 scope):
+
+        1. Mint a server-minted ``session_token`` (``secrets.token_urlsafe`` —
+           unguessable, never client-supplied; R9/R13) and bind it to ``owner``
+           (the creating caller's MESI agent/process identity) in
+           ``_session_owners``. (Unit 2 mints + owner-binds AT CREATION ONLY;
+           per-call token validation, timing-safe compare, caps, the
+           heartbeat-lease, and the absolute-age ceiling are LATER units 5/7.)
+        2. Call the registry's atomic ``capture_version_vector`` — the cut is
+           captured and pinned in one linearization point, non-mutating (no MESI
+           grant, no ``read_generation``). An unknown id in ``read_set`` returns
+           a typed :class:`VersionedReadRejection` (``unknown_artifact``) with NO
+           pins inserted; the token binding is then dropped (no half-open session
+           for a rejected cut).
+        3. Read ``retain_versions`` from the store (the deployment-branch
+           indicator) and return the :class:`SnapshotSession` with the
+           INSPECTABLE cut (R11).
+
+        Byte handling is explicitly NOT here (Unit 3): this captures the
+        version-MAP only and records ``retain_versions``; the eager-vs-lazy serve
+        is resolved at the serve layer. For ``content=None`` / cross-process the
+        bytes live in the data plane, not the coordinator.
+
+        Args:
+            read_set: The artifact ids to pin into the consistent cut.
+            owner: The creating caller's identity (the MESI agent/process label),
+                bound to the minted token for R13 owner-binding.
+
+        Returns:
+            A :class:`SnapshotSession` on success, else a
+            :class:`VersionedReadRejection` (``unknown_artifact``) — no session
+            opened, no pins held.
+        """
+        session_token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
+        # Owner-bind at mint (R13). Recorded BEFORE the capture so a concurrent
+        # later-unit validator never sees a pinned-but-unowned token; dropped
+        # again if the capture rejects. NOTE for Unit 7 (the per-call validator):
+        # the INVERSE window also exists — between this line and the capture
+        # below, the token is owned but PINLESS. Unit 7 must treat an owned-but-
+        # pinless token as not-yet-live (or read owner-binding + pins together),
+        # never as a valid empty session.
+        self._session_owners[session_token] = owner
+        result = self.registry.capture_version_vector(read_set, session_token)
+        if isinstance(result, VersionedReadRejection):
+            # No cut pinned (unknown id) ⇒ no session. Drop the owner binding so
+            # the rejected token cannot linger as a half-open session.
+            self._session_owners.pop(session_token, None)
+            return result
+        retain_versions, _policy = self.registry.retention_meta()
+        return SnapshotSession(
+            session_token=session_token,
+            cut=result,
+            coordinator_epoch=self.registry.coordinator_epoch,
+            retain_versions=retain_versions,
         )
 
     def write(

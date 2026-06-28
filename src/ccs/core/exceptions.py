@@ -124,9 +124,16 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 # The sibling Node coordinator (the agent-coherence-plugin repo) shares the
 # SAME ``<workspace>/.coherence/state.db`` path but maintains its OWN migration
 # ledger: its v2 adds no schema objects (pending_notices validation) and its v3
-# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — so the two ledgers
-# assign DIFFERENT meanings to ``PRAGMA user_version`` 2 and 3 on the same
-# file. ``CrossRuntimeSchemaError`` (defined in
+# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — while THIS repo's
+# v2 adds ``artifact_versions`` and its v3 (SB-17 / TX-1, Unit 2) adds
+# ``session_pins``. So the two ledgers assign DIFFERENT meanings to
+# ``PRAGMA user_version`` 2 AND 3 on the same file: a Node coordinator opening a
+# Python-v3 db (or vice-versa) must DETECT and REJECT rather than silently
+# misread the schema. The detection lives in
+# ``SqliteArtifactRegistry._reject_foreign_ledger_db`` (the ``schema_runtime``
+# lineage stamp + structural ``artifact_versions``/``session_pins`` /
+# ``deadline_tick`` probes); the Node side mirrors it.
+# ``CrossRuntimeSchemaError`` (defined in
 # ``ccs.coordinator.sqlite_registry`` because it subclasses the
 # coordinator-layer ``SchemaVersionError`` to keep existing catch-sites
 # compatible; core must not import upward) carries THIS wire-stable reason so
