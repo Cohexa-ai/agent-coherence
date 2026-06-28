@@ -280,6 +280,44 @@ class SessionReadRejection:
 
 
 @dataclass(frozen=True)
+class SessionCommitRejection:
+    """A typed :meth:`CoordinatorService.session_commit` VALIDATION rejection
+    (SB-17 / TX-1, Unit 4 / R3) — never a silent fall-through.
+
+    Returned (never raised) when the commit cannot even be ATTEMPTED against a
+    valid pin: the token has no live cut, or the artifact was not in the captured
+    read-set. It is the pre-commit gate ONLY — it is NOT how an OCC outcome is
+    surfaced. The OCC taxonomy is preserved byte-for-byte from the shipped
+    ``commit_cas``:
+
+    - a lost race → the shipped :class:`ConflictDetail` (``version_mismatch`` /
+      ``other_holder`` / ``stale_read_generation``), returned UNCHANGED;
+    - corruption (``expected_version > current``) → a RAISED ``CoherenceError``
+      (the service maps the registry's :class:`CasCorruption` sentinel), never a
+      rejection.
+
+    ``reason`` is exactly one of :data:`~ccs.core.exceptions.SESSION_COMMIT_REASONS`
+    (the SAME token/pin vocabulary as :class:`SessionReadRejection`); consumers
+    match ``reason == CONSTANT``, never on a human message.
+
+    - ``session_not_found`` — the ``session_token`` has no pinned cut (unknown,
+      never opened, or released; an in-memory restart also lands here until the
+      Unit-5 liveness taxonomy splits it).
+    - ``artifact_not_in_cut`` — the token IS a live session, but ``artifact_id``
+      was not in its captured read-set. Committing an un-pinned artifact is out
+      of scope (a session commits only against what it pinned).
+
+    **Carries NO body** by type (the no-leak discipline shared with
+    :class:`SessionReadRejection`): only the reason, the artifact id, and the
+    epoch. ``coordinator_epoch`` is ALWAYS populated.
+    """
+
+    reason: str
+    artifact_id: UUID
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
 class InvalidationSignal:
     """Lightweight invalidation signal sent to agents."""
 

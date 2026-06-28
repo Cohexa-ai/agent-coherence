@@ -12,7 +12,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.coordinator.retention import collectible_versions
 from ccs.core.exceptions import (
@@ -40,6 +40,7 @@ from ccs.core.types import (
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
+    SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
     VersionedContent,
@@ -697,6 +698,151 @@ class CoordinatorService:
             captured_at=captured_at,
             coordinator_epoch=epoch,
         )
+
+    def session_commit(
+        self,
+        session_token: str,
+        artifact_id: UUID,
+        content: bytes | str,
+        *,
+        size_tokens: int | None = None,
+        issued_at_tick: int = 0,
+    ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail | SessionCommitRejection:
+        """Validate one artifact's commit against its PINNED version via the
+        shipped ``commit_cas`` — the single-artifact OCC commit from a snapshot
+        session (SB-17 / TX-1, Unit 4 / R3).
+
+        The commit is arbitrated against the cut's pinned base: ``expected_version``
+        is ``cut[artifact_id]`` (the version captured at ``begin_session``), so a
+        commit WINS only if no peer moved the artifact since the cut was pinned.
+        This reuses the shipped ``commit_cas`` arbitration VERBATIM — no
+        re-implemented OCC, single-shot (NEVER the auto-rederive ``write_cas``
+        loop, whose split-comparand hazard a pinned base is precisely meant to
+        avoid).
+
+        **The admit-on-absent load-bearing path (R3, the reconciled fence).** The
+        commit rides a SESSION-SCOPED committer identity derived deterministically
+        from the ``session_token`` (``uuid5``), NOT the owner's MESI ``agent_id``.
+        The reason is the read-generation fence: ``commit_cas`` ADMITS a committer
+        with NO captured ``read_generation`` (version-CAS then arbitrates) and
+        REJECTS one whose PRESENT ``read_generation`` was superseded by a sweep
+        reclamation. The owner's MESI agent could be carrying such a superseded
+        ``read_generation`` from unrelated prior MESI activity — committing under
+        it would spuriously fail with ``stale_read_generation`` on a perfectly
+        healthy session. The session-derived identity has never established a fence
+        claim (no ``read_generation`` row), so admit-on-absent holds and the
+        pinned-base version-CAS is the sole arbiter. It is deterministic (stable
+        across a session's calls) and collision-free against real agent ids (a
+        ``uuid5`` over a 32-byte server-minted token namespace).
+
+        Validation (Unit 4 scope): the token must have a live pin for
+        ``artifact_id``. An unknown/released token → ``session_not_found``; a live
+        token whose cut lacks ``artifact_id`` → ``artifact_not_in_cut`` — both a
+        typed :class:`~ccs.core.types.SessionCommitRejection`, NEVER a silent
+        fall-through to a live-HEAD commit. (Per-call OWNER-binding validation — a
+        foreign owner committing into another's cut — and the caps are Unit 7; the
+        heartbeat-liveness ``session_invalidated`` axis is Unit 5. Unit 4 does the
+        token-has-pin check only.)
+
+        Outcome mapping (mirrors the shipped ``commit_cas`` orchestration exactly):
+
+        - WIN → ``(updated_artifact, invalidation_signals)``: the artifact moved
+          to ``pinned + 1`` and ``commit_cas`` ALREADY invalidated the peers
+          atomically — this method emits NO additional invalidation signal.
+        - :class:`ConflictDetail` (``version_mismatch`` / ``other_holder`` /
+          ``stale_read_generation``) → RETURNED UNCHANGED (HELD, retry-eligible;
+          nothing mutated, so no invalidation is emitted). Recover via a NEW
+          session + re-read + re-commit.
+        - corruption (``expected_version > current``) → ``commit_cas`` maps the
+          registry's :class:`CasCorruption` sentinel to a RAISED ``CoherenceError``
+          (non-retryable); ``session_commit`` lets it propagate.
+
+        **"Exactly one validated commit" (R11) is naturally enforced — no explicit
+        single-use machinery.** After a WIN the artifact advanced to ``pinned + 1``
+        but the cut still pins ``pinned``; a SECOND ``session_commit`` at the same
+        pin therefore version-mismatches (``expected_version < current``) and is
+        HELD. The pin is not consumed or rewritten here (that would foreclose the
+        SB-18 multi-commit shape, R11) — staleness does the enforcing.
+
+        Args:
+            session_token: The server-minted session identity from
+                ``begin_session``.
+            artifact_id: The pinned artifact to commit. Must be in the cut.
+            content: The new body. ``content_hash`` is derived from it
+                (``compute_content_hash``); the body is threaded to ``commit_cas``
+                so the in-memory path advances ``record.content`` on a WIN (the
+                cross-process / ``content=None`` path keeps no body — see
+                ``commit_cas``).
+            size_tokens: Optional token count to persist with the commit.
+            issued_at_tick: Logical tick for the commit (threaded to ``commit_cas``).
+
+        Returns:
+            ``(updated_artifact, signals)`` on a WIN, a :class:`ConflictDetail` on a
+            retry-eligible lost race, or a :class:`SessionCommitRejection` on a
+            validation failure — all typed RETURNS. Corruption RAISES
+            ``CoherenceError`` (via ``commit_cas``); a missing artifact under a
+            live pin also raises there (the fail-closed ``SessionInvalidated`` for
+            that race is Unit 5).
+        """
+        epoch = self.registry.coordinator_epoch
+
+        # Unit 7: per-call OWNER-binding validation goes HERE — read
+        # ``_session_owners[session_token]`` and reject a foreign caller
+        # (timing-safe compare) BEFORE the pin lookup. Unit 4 does the
+        # token-has-pin check only.
+        cut = self.registry.get_session_cut(session_token)
+        if cut is None:
+            # Unknown / released / (in-memory) post-restart token. Unit 5 splits
+            # the durable-liveness taxonomy (``session_invalidated``); Unit 4
+            # treats every no-cut token as not-found.
+            return SessionCommitRejection(
+                reason=SESSION_NOT_FOUND_REASON,
+                artifact_id=artifact_id,
+                coordinator_epoch=epoch,
+            )
+        if artifact_id not in cut:
+            # A live session, but this artifact was not pinned. Reject — NEVER
+            # commit live HEAD for an un-pinned artifact (a session commits only
+            # against what it pinned).
+            return SessionCommitRejection(
+                reason=SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+                artifact_id=artifact_id,
+                coordinator_epoch=epoch,
+            )
+
+        expected_version = cut[artifact_id]
+        committer_id = self._session_committer_id(session_token)
+        content_hash = compute_content_hash(content)
+
+        # Reuse the shipped service ``commit_cas`` orchestration VERBATIM: it owns
+        # the CasCorruption-sentinel -> raised CoherenceError mapping, returns a
+        # ConflictDetail unchanged (no mutation, no invalidation), and builds the
+        # InvalidationSignal list on a WIN. Single-shot — there is no retry loop.
+        # ``committer_id`` is fence-claimless (admit-on-absent), so the pinned
+        # ``expected_version`` is the sole arbiter.
+        return self.commit_cas(
+            agent_id=committer_id,
+            artifact_id=artifact_id,
+            expected_version=expected_version,
+            content_hash=content_hash,
+            issued_at_tick=issued_at_tick,
+            size_tokens=size_tokens,
+            content=content,
+        )
+
+    @staticmethod
+    def _session_committer_id(session_token: str) -> UUID:
+        """Derive the SESSION-SCOPED committer identity for ``session_commit``.
+
+        A deterministic ``uuid5`` over the server-minted ``session_token`` (under
+        the URL namespace). Stable across a session's commits and collision-free
+        against real MESI agent ids; crucially it has NEVER established a
+        read-generation fence claim, so ``commit_cas`` ADMITS it on absence and
+        the pinned-base version-CAS arbitrates (the R3 load-bearing path). NOT the
+        owner's MESI ``agent_id``, which could carry a superseded
+        ``read_generation`` that would spuriously trip the fence.
+        """
+        return uuid5(NAMESPACE_URL, session_token)
 
     def write(
         self,

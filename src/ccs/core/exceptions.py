@@ -119,6 +119,31 @@ SESSION_READ_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# session.commit rejection reasons (SB-17 / TX-1, Unit 4 / R3)
+# ---------------------------------------------------------------------------
+#
+# Wire-stable, ADDITIVE constants carried by
+# :class:`~ccs.core.types.SessionCommitRejection.reason` — the typed VALIDATION
+# rejection of :meth:`CoordinatorService.session_commit` (the token has no pin /
+# the artifact is not in the cut), NEVER a silent fall-through. The OCC OUTCOMES
+# are NOT here: a lost-race surfaces as the shipped :class:`ConflictDetail`
+# (returned unchanged) and corruption as a raised ``CoherenceError`` (the
+# ``commit_cas`` taxonomy, preserved byte-for-byte). This set covers ONLY the
+# pre-commit validation gate. The two reasons are SHARED with ``session_read``
+# (the same token/pin checks), so they REUSE the Unit-3 literals rather than
+# minting parallel ones — one token-validation vocabulary across the session
+# surface. ADDITIVE-only (R7): a NEW closed set, disjoint from
+# ``READ_AT_VERSION_REASONS``; consumers match ``reason == CONSTANT``, never a
+# substring. Unit 5 will ADD ``session_invalidated`` (heartbeat-liveness); until
+# then a released/unknown token is ``session_not_found``.
+SESSION_COMMIT_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_NOT_FOUND_REASON,
+        SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # read-only store-open classification signals (Unit 6 hardening)
 # ---------------------------------------------------------------------------
 #
