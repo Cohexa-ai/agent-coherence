@@ -43,6 +43,7 @@ from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
     SESSION_COMMIT_REASONS,
+    SESSION_INVALIDATED_REASON,
     SESSION_NOT_FOUND_REASON,
     STALE_READ_GENERATION_REASON,
     CoherenceError,
@@ -507,7 +508,7 @@ class TestValidationRejections:
             sql.close()
 
     @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
-    def test_released_token_is_session_not_found(
+    def test_released_token_is_session_invalidated(
         self, tmp_path: Path, arm: str
     ) -> None:
         mem, sql = _registries(tmp_path)
@@ -520,7 +521,10 @@ class TestValidationRejections:
             reg.release_session(session.session_token)  # pins dropped
             result = svc.session_commit(session.session_token, a, "X")
             assert isinstance(result, SessionCommitRejection)
-            assert result.reason == SESSION_NOT_FOUND_REASON
+            # Unit-5 taxonomy: a released (in-shape) token WAS a real session →
+            # session_invalidated (fail closed, never a live-HEAD commit), not
+            # session_not_found (which stays reachable for malformed tokens).
+            assert result.reason == SESSION_INVALIDATED_REASON
         finally:
             sql.close()
 
@@ -550,9 +554,12 @@ class TestValidationRejections:
         from the bare ``read_at_version`` surface (R7 additive-only)."""
         from ccs.core.exceptions import READ_AT_VERSION_REASONS, SESSION_READ_REASONS
 
+        # Unit 5 ADDED session_invalidated (additive, R7) — the set grew, no
+        # reason was renamed.
         assert SESSION_COMMIT_REASONS == {
             SESSION_NOT_FOUND_REASON,
             SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+            SESSION_INVALIDATED_REASON,
         }
         # Shares the token/pin vocabulary with session_read (one surface).
         assert SESSION_COMMIT_REASONS == SESSION_READ_REASONS

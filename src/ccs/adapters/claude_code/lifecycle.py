@@ -787,6 +787,30 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
                 max_hold_ticks=cfg.grant_max_hold_sec,
                 on_reclaim=_record_reclamation_notice,
             )
+            # SB-17 / TX-1 Unit 5 / R4: the session-liveness sweep — a SEPARATE
+            # axis from the grant sweep above (a snapshot session holds no MESI
+            # grant, so the grant sweep can never see it). Reaps a session whose
+            # heartbeat lease has gone stale, dropping its pins so its pinned
+            # versions become collectible again; afterward a session_read /
+            # session_commit on that token fails closed with session_invalidated.
+            # Reuses the SAME staleness predicate + the grant heartbeat timeout
+            # knob. Best-effort like the rest of the sweep (the outer try guards
+            # it). A slow-but-live session that keeps heartbeating is NOT reaped.
+            # OPERATIONAL DEPENDENCY (Unit 8): the HTTP record_session_heartbeat
+            # endpoint that lets a REMOTE client refresh the lease lands in
+            # Unit 8. Until then a live session over the remote transport is
+            # implicitly bounded by grant_heartbeat_timeout_sec — it is reaped
+            # fail-closed (session_invalidated, never wrong bytes), not broken;
+            # in-process callers can already drive record_session_heartbeat
+            # directly. This only affects the remote/HTTP path pre-Unit-8.
+            reaped_sessions = coordinator.service.enforce_session_liveness(
+                current_tick=now_tick,
+                heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
+            )
+            if reaped_sessions:
+                logger.info(
+                    "sweep reaped %d stale snapshot session(s)", reaped_sessions
+                )
             evicted = coordinator.registry.evict_stale_notices(
                 max_age_sec=cfg.notice_evict_max_age_sec,
             )

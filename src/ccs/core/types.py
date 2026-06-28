@@ -258,13 +258,16 @@ class SessionReadRejection:
     :data:`~ccs.core.exceptions.SESSION_READ_REASONS`; consumers match with
     ``==``, never on a human message.
 
-    The two Unit-3 reasons (Unit 5 adds the heartbeat-liveness ``session_invalidated``
-    axis; Unit 3 treats a released/unknown token as ``session_not_found``):
+    The reasons (Unit 5 ADDED the heartbeat-liveness ``session_invalidated`` axis):
 
-    - ``session_not_found`` — the ``session_token`` has no pinned cut (unknown,
-      never opened, or released). A coordinator restart that wiped an in-memory
-      session also lands here (the durable Unit-5 liveness/restart taxonomy is a
-      later unit; here it is simply "no cut for this token").
+    - ``session_not_found`` — the ``session_token`` has no pinned cut AND does not
+      look like a server-minted token (a genuinely-never-opened / malformed
+      token). Kept reachable additively as the clearly-bogus-token signal.
+    - ``session_invalidated`` (Unit 5) — the pins are UNAVAILABLE for a token that
+      was, or still structurally looks like, a real session: reaped by the
+      session-liveness sweep (stale heartbeat), GC-raced, or wiped by an in-memory
+      coordinator restart. Fails CLOSED here so a previously-valid token is NEVER
+      served live HEAD as if still pinned (the post-restart-unknown safety case).
     - ``artifact_not_in_cut`` — the token IS a live session, but ``artifact_id``
       was not in its captured read-set. Reading an un-pinned artifact mid-session
       is out of scope (a session wanting fresh data starts a new session); it is

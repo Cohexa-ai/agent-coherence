@@ -43,6 +43,7 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    SESSION_INVALIDATED_REASON,
     SESSION_NOT_FOUND_REASON,
     SESSION_READ_REASONS,
 )
@@ -347,11 +348,16 @@ class TestSessionNotFound:
             _register(reg, a, "plan.md", "v1")
             session = svc.begin_session(read_set=[a], owner=uuid4())
             assert isinstance(session, SnapshotSession)
-            # Released → the pins are gone; the token no longer serves.
+            # Released → the pins are gone; the token no longer serves. Under the
+            # Unit-5 liveness taxonomy a released token WAS a real (in-shape)
+            # session, so it fails closed as session_invalidated ("re-establish
+            # it"), never live HEAD — distinct from a never-opened/malformed
+            # token (session_not_found). Wire-stable: session_not_found stays
+            # reachable for malformed tokens (asserted in TestSessionNotFound).
             reg.release_session(session.session_token)
             result = svc.session_read(session.session_token, a)
             assert isinstance(result, SessionReadRejection)
-            assert result.reason == SESSION_NOT_FOUND_REASON
+            assert result.reason == SESSION_INVALIDATED_REASON
         finally:
             sql.close()
 
@@ -486,7 +492,7 @@ class TestEmptyReadSetDegenerate:
         assert isinstance(result, SessionReadRejection)
         assert result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON
 
-    def test_sqlite_empty_session_rejects_session_not_found(
+    def test_sqlite_empty_session_rejects_session_invalidated(
         self, tmp_path: Path
     ) -> None:
         sql = SqliteArtifactRegistry(
@@ -501,7 +507,12 @@ class TestEmptyReadSetDegenerate:
             session = svc.begin_session(read_set=[], owner=uuid4())
             result = svc.session_read(session.session_token, a)
             assert isinstance(result, SessionReadRejection)
-            # sqlite cannot durably mark an empty live session → not_found.
-            assert result.reason == SESSION_NOT_FOUND_REASON
+            # sqlite cannot durably mark an empty live session (zero pin rows →
+            # None). Under the Unit-5 taxonomy the in-shape token classifies
+            # session_invalidated rather than session_not_found; the divergence
+            # from the in-memory arm (which keeps an empty {} and would reject
+            # artifact_not_in_cut) stays BENIGN — no artifact is servable either
+            # way, the request is fail-closed on both.
+            assert result.reason == SESSION_INVALIDATED_REASON
         finally:
             sql.close()

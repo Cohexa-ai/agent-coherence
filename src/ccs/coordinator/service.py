@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import secrets
+import string
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -23,6 +26,7 @@ from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
     RETENTION_OFF_REASON,
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    SESSION_INVALIDATED_REASON,
     SESSION_NOT_FOUND_REASON,
     UNKNOWN_ARTIFACT_REASON,
     CoherenceError,
@@ -193,6 +197,52 @@ def validate_crash_recovery_config(
 _SESSION_TOKEN_BYTES = 32
 
 
+# Server-minted session-token SHAPE (SB-17 / TX-1, Unit 5 / R4). A
+# ``secrets.token_urlsafe(32)`` is ALWAYS exactly 43 characters drawn from the
+# URL-safe base64 alphabet ([A-Za-z0-9_-], no padding). The session-liveness
+# fail-closed taxonomy uses this as the structural discriminator: a token of
+# this shape that has NO live cut was, or still looks like, a real session
+# (reaped / GC-raced / restart-wiped) → ``session_invalidated`` (fail closed,
+# never live HEAD). A token NOT of this shape is genuinely never-opened /
+# malformed → ``session_not_found``. The check is structural only (it cannot
+# prove a token was ever minted — fail-closed is the safe default for an
+# in-shape token), and it is NOT an authentication boundary (the unguessable
+# entropy + the Unit-7 owner-binding are). It exists ONLY to make the dead-vs-
+# never-opened reason split honest and survive an in-memory restart that wipes
+# every service-layer map including the tombstone.
+_SESSION_TOKEN_LEN = 43
+_SESSION_TOKEN_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
+
+# Bounded reaped-session tombstone cap (SB-17 / TX-1, Unit 5 / R4). The
+# session-liveness sweep records a reaped token here so a subsequent
+# ``session_read`` / ``session_commit`` attributes it precisely to
+# ``session_invalidated`` ("your session died") rather than relying on the shape
+# predicate alone. Capped + oldest-evicted so a long-lived coordinator cannot
+# accumulate unbounded tombstones (a reaper-amplification DoS). Eviction is
+# benign: an evicted token still classifies ``session_invalidated`` via the
+# shape predicate (every server-minted token is in-shape), so dropping the
+# tombstone entry only loses the precise "definitely reaped" attribution, never
+# the fail-closed guarantee.
+_REAPED_TOMBSTONE_CAP = 4096
+
+
+def looks_like_session_token(token: str) -> bool:
+    """Structural predicate: does ``token`` have the server-minted SHAPE?
+
+    ``True`` iff it is exactly :data:`_SESSION_TOKEN_LEN` characters, all in the
+    URL-safe base64 alphabet — the shape every ``begin_session`` token has. Used
+    ONLY by the Unit-5 fail-closed taxonomy to split a dead/restart-wiped session
+    (in-shape, no cut → ``session_invalidated``) from a genuinely-never-opened or
+    malformed token (out-of-shape → ``session_not_found``). NOT an auth check; a
+    well-formed token that was never minted still classifies invalidated, which
+    is the safe (fail-closed) default — it is never served live HEAD either way.
+    """
+    return (
+        len(token) == _SESSION_TOKEN_LEN
+        and all(ch in _SESSION_TOKEN_ALPHABET for ch in token)
+    )
+
+
 class CoordinatorService:
     """Control-plane service for artifact read/write/commit synchronization."""
 
@@ -200,11 +250,30 @@ class CoordinatorService:
         self.registry = registry
         # Snapshot session owner-binding (SB-17 / TX-1, Unit 2 / R13):
         # ``{session_token: owner_id}``. Populated at ``begin_session`` mint;
-        # the per-call validation that READS it (a foreign owner →
-        # SessionInvalidated, timing-safe compare) is Unit 7. Service-scoped (a
-        # restart drops the bindings — the durable pins survive on sqlite, but
+        # the per-CALL read/commit validation that READS it (a foreign owner →
+        # SessionInvalidated, timing-safe compare) is Unit 7. Unit 5 owner-binds
+        # ONLY the HEARTBEAT path (``record_session_heartbeat``). Service-scoped
+        # (a restart drops the bindings — the durable pins survive on sqlite, but
         # re-validating a post-restart token is the Unit 5 liveness concern).
         self._session_owners: dict[str, UUID] = {}
+        # Session heartbeat lease (SB-17 / TX-1, Unit 5 / R4):
+        # ``{session_token: last_heartbeat_tick}``. Keyed by the server-minted
+        # SESSION TOKEN, NOT the MESI ``agent_id`` — a snapshot session is NOT a
+        # MESI agent and holds no grant, so the grant sweep (which walks M∪E
+        # holders) can never see it. The session-liveness sweep is a NEW axis
+        # over THIS map. Seeded at ``begin_session`` with the creation tick so a
+        # never-yet-heartbeated session still carries a lease baseline (mirrors a
+        # grant's ``granted_at_tick``), rather than being reaped on the first
+        # sweep. Service-scoped: an in-memory restart drops the lease (and the
+        # pins), so a post-restart token has no cut and fails closed.
+        self._session_heartbeats: dict[str, int] = {}
+        # Bounded reaped-session tombstone (Unit 5 / R4): recently-reaped tokens,
+        # capped + oldest-evicted (FIFO). Lets ``session_read`` / ``session_commit``
+        # attribute a reaped token precisely to ``session_invalidated``. Eviction
+        # is benign — an evicted in-shape token still classifies invalidated via
+        # ``looks_like_session_token`` (the shape predicate), so the fail-closed
+        # guarantee never depends on the tombstone, only the precise attribution.
+        self._reaped_tombstone: "OrderedDict[str, None]" = OrderedDict()
 
     def register_artifact(
         self,
@@ -459,6 +528,7 @@ class CoordinatorService:
         *,
         read_set: Iterable[UUID],
         owner: UUID,
+        created_at_tick: int = 0,
     ) -> SnapshotSession | VersionedReadRejection:
         """Open a consistent multi-artifact snapshot session (SB-17 / TX-1,
         Unit 2 / R1, R13). Pins a coherent CUT of ``read_set`` at one
@@ -513,6 +583,12 @@ class CoordinatorService:
             # the rejected token cannot linger as a half-open session.
             self._session_owners.pop(session_token, None)
             return result
+        # Seed the heartbeat lease at the creation tick (Unit 5 / R4): a session
+        # that never heartbeats still carries a baseline so it is not reaped on
+        # the very first sweep — the lease starts now, exactly like a grant's
+        # ``granted_at_tick``. Recorded only on a SUCCESSFUL capture (a rejected
+        # capture returned above, leaving no lease and no owner binding).
+        self._session_heartbeats[session_token] = created_at_tick
         retain_versions, _policy = self.registry.retention_meta()
         return SnapshotSession(
             session_token=session_token,
@@ -605,11 +681,16 @@ class CoordinatorService:
         # BEFORE the pin lookup. Unit 3 does the token-has-pin check only.
         cut = self.registry.get_session_cut(session_token)
         if cut is None:
-            # Unknown / released / (in-memory) post-restart token. Unit 5 splits
-            # the durable-liveness taxonomy (``session_invalidated``); Unit 3
-            # treats every no-cut token as not-found.
+            # FAIL CLOSED (Unit 5 / R4): no live cut for this token — it was
+            # reaped by the session-liveness sweep, GC-raced, wiped by an
+            # in-memory restart, released, or never opened. NEVER a live-HEAD
+            # fall-through. ``_classify_no_cut_reason`` splits the wire-stable
+            # taxonomy: ``session_invalidated`` for a reaped / restart-wiped /
+            # in-shape token ("re-establish your session"), ``session_not_found``
+            # for a genuinely never-opened / malformed token. Both are typed
+            # rejections; the split only sharpens the signal.
             return SessionReadRejection(
-                reason=SESSION_NOT_FOUND_REASON,
+                reason=self._classify_no_cut_reason(session_token),
                 artifact_id=artifact_id,
                 coordinator_epoch=epoch,
             )
@@ -792,11 +873,14 @@ class CoordinatorService:
         # token-has-pin check only.
         cut = self.registry.get_session_cut(session_token)
         if cut is None:
-            # Unknown / released / (in-memory) post-restart token. Unit 5 splits
-            # the durable-liveness taxonomy (``session_invalidated``); Unit 4
-            # treats every no-cut token as not-found.
+            # FAIL CLOSED (Unit 5 / R4): no live cut for this token — reaped,
+            # GC-raced, restart-wiped, released, or never opened. NEVER a silent
+            # fall-through to a live-HEAD commit. Same wire-stable taxonomy as
+            # ``session_read``: ``session_invalidated`` for a reaped / restart-
+            # wiped / in-shape token, ``session_not_found`` for a never-opened /
+            # malformed one.
             return SessionCommitRejection(
-                reason=SESSION_NOT_FOUND_REASON,
+                reason=self._classify_no_cut_reason(session_token),
                 artifact_id=artifact_id,
                 coordinator_epoch=epoch,
             )
@@ -843,6 +927,184 @@ class CoordinatorService:
         ``read_generation`` that would spuriously trip the fence.
         """
         return uuid5(NAMESPACE_URL, session_token)
+
+    # ------------------------------------------------------------------
+    # Session pin lifetime — heartbeat lease + liveness sweep (Unit 5 / R4)
+    # ------------------------------------------------------------------
+
+    def record_session_heartbeat(
+        self, *, session_token: str, owner: UUID, now_tick: int
+    ) -> bool:
+        """Refresh a snapshot session's heartbeat LEASE (SB-17 / TX-1, Unit 5 /
+        R4). Keyed by the server-minted SESSION TOKEN, owner-bound.
+
+        A session is NOT a MESI agent — this does NOT key by ``agent_id`` and does
+        NOT reuse :meth:`record_heartbeat` (the grant-holder heartbeat). It keeps
+        the session's own lease alive so the session-liveness sweep
+        (:meth:`enforce_session_liveness`) does not reap its pins while the owner
+        is still working. Monotonic like the grant heartbeat: ``max(prev,
+        incoming)``, so a stale/replayed lower tick never moves the lease back.
+
+        **Owner-bound (R13, security).** The caller must be the session's OWNER —
+        the identity bound at ``begin_session``. A FOREIGN caller must NOT be able
+        to keep another agent's session alive (that would let an attacker pin
+        versions against GC indefinitely under someone else's session). The owner
+        check is TIMING-SAFE: it compares the bound owner and the supplied
+        ``owner`` via :func:`hmac.compare_digest` over their stable 16-byte
+        big-endian encoding, so a foreign caller learns nothing from response
+        timing about how much of the id matched. A mismatch is rejected and the
+        lease is NOT refreshed.
+
+        Heartbeating an unknown / released / restart-wiped token is a typed
+        NO-OP: it returns ``False`` (never a crash, never a resurrection — a dead
+        session cannot be revived by a heartbeat; re-establish it via
+        ``begin_session``). It also does NOT create a lease for a token with no
+        owner binding, so a heartbeat cannot conjure a live lease for a
+        cut-less token.
+
+        Args:
+            session_token: The server-minted token from ``begin_session``.
+            owner: The caller's identity; must match the bound owner (timing-safe).
+            now_tick: The heartbeat tick (``>= 0``). Applied as ``max(prev,
+                incoming)``.
+
+        Returns:
+            ``True`` if the lease was refreshed (known token, owner matched),
+            else ``False`` (unknown/released/wiped token, or a foreign caller —
+            indistinguishable to the caller by design: a foreign caller is not
+            told whether the token exists).
+        """
+        if now_tick < 0:
+            raise ValueError("now_tick must be >= 0")
+        bound_owner = self._session_owners.get(session_token)
+        if bound_owner is None:
+            # Unknown / released / restart-wiped token: no owner binding ⇒ no
+            # lease to refresh. Typed no-op (never a crash, never a new lease).
+            return False
+        # Timing-safe owner-binding check (R13): compare over the stable 16-byte
+        # big-endian UUID encoding. A foreign caller cannot keep another's
+        # session alive AND cannot probe id-match progress via response timing.
+        if not hmac.compare_digest(
+            bound_owner.bytes, owner.bytes
+        ):
+            return False
+        prev = self._session_heartbeats.get(session_token)
+        if prev is None or now_tick > prev:
+            self._session_heartbeats[session_token] = now_tick
+        return True
+
+    def enforce_session_liveness(
+        self,
+        *,
+        current_tick: int,
+        heartbeat_timeout_ticks: int,
+    ) -> int:
+        """Reap snapshot sessions whose heartbeat lease has gone stale — the NEW
+        session-liveness sweep AXIS (SB-17 / TX-1, Unit 5 / R4).
+
+        Distinct from :meth:`enforce_stable_grant_timeouts`: that sweep walks
+        only M∪E GRANT-HOLDERS, and a snapshot session holds NO grant, so it is
+        invisible to the grant sweep. This sweep ENUMERATES SESSIONS (the
+        owner-bound token set) and reaps any whose lease is stale, reusing the
+        SAME heartbeat-staleness predicate SHAPE as the grant sweep (``current -
+        last_hb >= timeout``, with ``>=`` matching ADV-02) and the same
+        ``CrashRecoveryConfig`` knob (``heartbeat_timeout_ticks``). It does NOT
+        reuse ``max_hold_ticks`` — the absolute-age ceiling that a live heartbeat
+        must not exempt is Unit 7 (a SEPARATE cap), not the liveness lease.
+
+        Reaping a session: :meth:`registry.release_session` drops its pins (so its
+        pinned versions become collectible again), then its owner binding and
+        heartbeat lease are cleared and the token is recorded in the bounded
+        reaped tombstone. After reaping, a ``session_read`` / ``session_commit``
+        on that token fails closed with ``session_invalidated`` (the cut is gone).
+
+        A slow-but-LIVE session — one heartbeated within ``heartbeat_timeout_ticks``
+        — is NOT reaped. This is a PREDICATE on the lease, not a hard TTL: a
+        long-running session that keeps heartbeating survives indefinitely
+        (the absolute-age ceiling that overrides even a live heartbeat is the
+        SEPARATE Unit-7 cap).
+
+        Args:
+            current_tick: The sweep's logical clock (monotonic ticks, as the
+                grant sweep uses).
+            heartbeat_timeout_ticks: Reap any session whose lease is at least
+                this many ticks stale (or that somehow has no lease — defensive).
+
+        Returns:
+            The number of sessions reaped.
+        """
+        if heartbeat_timeout_ticks < 1:
+            raise ValueError("heartbeat_timeout_ticks must be >= 1")
+
+        # Snapshot the token set first — reaping mutates ``_session_owners`` /
+        # ``_session_heartbeats`` under the loop, so iterate a stable copy.
+        tokens = list(self._session_owners.keys())
+        reaped = 0
+        for session_token in tokens:
+            last_hb = self._session_heartbeats.get(session_token)
+            # Same staleness predicate SHAPE as the grant sweep (``>=`` per
+            # ADV-02). A missing lease (should not happen — begin_session seeds
+            # one) is treated as stale, defensively, so a leaseless session is
+            # never immortal.
+            stale = (
+                last_hb is None
+                or (current_tick - last_hb) >= heartbeat_timeout_ticks
+            )
+            if not stale:
+                continue
+            self._reap_session(session_token)
+            reaped += 1
+        return reaped
+
+    def _reap_session(self, session_token: str) -> None:
+        """Drop a session's pins + lease + owner binding and tombstone the token
+        (Unit 5 / R4). The single reap path so the order is consistent: release
+        the pins FIRST (the registry is the durable/authoritative pin store, so a
+        crash mid-reap leaves no live-pin-without-lease leak on sqlite), then
+        clear the service-layer lease + owner binding, then tombstone."""
+        # Pins first: the registry release is idempotent (unknown token → no-op),
+        # so a double-reap or a restart-wiped pin set is harmless.
+        self.registry.release_session(session_token)
+        self._session_heartbeats.pop(session_token, None)
+        self._session_owners.pop(session_token, None)
+        self._tombstone_token(session_token)
+
+    def _tombstone_token(self, session_token: str) -> None:
+        """Record a reaped token in the bounded FIFO tombstone (Unit 5 / R4).
+        Capped at :data:`_REAPED_TOMBSTONE_CAP`; the oldest entry is evicted when
+        full. Eviction is benign — an evicted in-shape token still classifies
+        ``session_invalidated`` via :func:`looks_like_session_token`, so the
+        fail-closed guarantee never depends on tombstone residency."""
+        # Move-to-end keeps the most-recently-reaped tokens; popitem(last=False)
+        # evicts the oldest (FIFO) when over the cap.
+        self._reaped_tombstone[session_token] = None
+        self._reaped_tombstone.move_to_end(session_token)
+        while len(self._reaped_tombstone) > _REAPED_TOMBSTONE_CAP:
+            self._reaped_tombstone.popitem(last=False)
+
+    def _classify_no_cut_reason(self, session_token: str) -> str:
+        """Classify a token that has NO live cut into the wire-stable fail-closed
+        reason (Unit 5 / R4). FAIL CLOSED in every branch — this only sharpens
+        the SIGNAL, never serves live HEAD.
+
+        - In the reaped tombstone → ``session_invalidated`` (definitely reaped
+          this process: "your session died, re-establish it").
+        - Shaped like a server-minted token (``looks_like_session_token``) →
+          ``session_invalidated``. This is the POST-RESTART-UNKNOWN safety case:
+          an in-memory restart wiped ``_session_pins`` (and the tombstone), so a
+          previously-valid token now has no cut — but it WAS a real session, so it
+          must fail closed as invalidated, NEVER served live HEAD as if pinned. A
+          well-formed-but-never-minted token also lands here (fail-closed is the
+          safe default for an in-shape token; it is rejected either way).
+        - Otherwise (out-of-shape / malformed) → ``session_not_found``: a
+          genuinely never-opened token. Kept reachable additively so a clearly
+          bogus token is still distinguishable.
+        """
+        if session_token in self._reaped_tombstone:
+            return SESSION_INVALIDATED_REASON
+        if looks_like_session_token(session_token):
+            return SESSION_INVALIDATED_REASON
+        return SESSION_NOT_FOUND_REASON
 
     def write(
         self,
