@@ -88,6 +88,37 @@ READ_AT_VERSION_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# session.read rejection reasons (SB-17 / TX-1, Unit 3 / R2)
+# ---------------------------------------------------------------------------
+#
+# Wire-stable, ADDITIVE constants carried by
+# :class:`~ccs.core.types.SessionReadRejection.reason`. ADDITIVE-only (R7): a NEW
+# closed set, never folded into ``READ_AT_VERSION_REASONS`` — ``session_read`` is
+# a distinct surface from the bare ``read_at_version`` history read. Consumers
+# match ``reason == CONSTANT`` against :data:`SESSION_READ_REASONS`, never on a
+# human message (the typed-signal-not-substring house rule). Unit 5 will ADD the
+# heartbeat-liveness ``session_invalidated`` reason (a released/unknown token is
+# ``session_not_found`` until then).
+SESSION_NOT_FOUND_REASON = "session_not_found"
+"""The ``session_token`` has no pinned cut — unknown, never opened, or released
+(``release_session``). A coordinator restart that wiped an in-memory session also
+lands here in Unit 3 (the durable Unit-5 liveness/restart taxonomy is later)."""
+
+SESSION_ARTIFACT_NOT_IN_CUT_REASON = "artifact_not_in_cut"
+"""The token is a live session but the artifact was NOT in its captured read-set.
+Reading an un-pinned artifact mid-session is out of scope and is REJECTED here,
+never served from live HEAD (the no-fall-through guarantee)."""
+
+# The closed set every ``session_read`` consumer matches against. ADDITIVE-only:
+# disjoint from ``READ_AT_VERSION_REASONS`` (a separate surface, R7).
+SESSION_READ_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_NOT_FOUND_REASON,
+        SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # read-only store-open classification signals (Unit 6 hardening)
 # ---------------------------------------------------------------------------
 #

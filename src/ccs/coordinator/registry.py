@@ -746,6 +746,23 @@ class ArtifactRegistry:
         with self._capture_lock:
             self._session_pins.pop(session_token, None)
 
+    def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
+        """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,
+        or ``None`` if the token has no live cut (SB-17 / TX-1, Unit 3 / R2).
+
+        The single accessor ``session_read`` needs to (a) tell a known token from
+        an unknown/released one (``None`` ⇒ ``session_not_found``) and (b) read
+        the per-artifact pinned version for the serve. Returns a COPY so a caller
+        cannot mutate the live pin store. Parity with
+        :meth:`SqliteArtifactRegistry.get_session_cut` (the two registries share
+        no base class); divergent only on restart-survival (in-memory pins are
+        process-scoped — a restart drops them and a post-restart token reads as
+        ``None``, the Unit-5 fail-closed concern). Taken under ``_capture_lock``
+        so a concurrent capture/release sees a consistent pin store."""
+        with self._capture_lock:
+            pins = self._session_pins.get(session_token)
+            return dict(pins) if pins is not None else None
+
     def _emit_state_log(
         self,
         *,

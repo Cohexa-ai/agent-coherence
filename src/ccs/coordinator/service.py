@@ -22,6 +22,8 @@ from ccs.core.exceptions import (
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     RETENTION_OFF_REASON,
+    SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    SESSION_NOT_FOUND_REASON,
     UNKNOWN_ARTIFACT_REASON,
     CoherenceError,
     OccCallerTransientError,
@@ -34,9 +36,11 @@ from ccs.core.types import (
     Artifact,
     CasCorruption,
     ConflictDetail,
+    DataPlaneDeferredRead,
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
+    SessionReadRejection,
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
@@ -407,11 +411,13 @@ class CoordinatorService:
         # we already excluded version==current above, so this only ages the
         # requested historical row. ``policy is None`` ⇒ unbounded ⇒ no T axis.
         #
-        # Unit 3: a live-session pin must ALSO suppress THIS read-side logical
-        # T-expiry (a read-serve allowance distinct from the GC-hold the Unit 2
-        # ``exemptions`` seam already provides at the GC producers), so a pinned-
-        # but-age-collectible row is still SERVED. Not implemented here — the
-        # session-scoped read path is Unit 3; Unit 2 holds the version-map only.
+        # Unit 3 (DONE): the read-serve allowance — a live-session pin suppresses
+        # this read-side logical T-expiry so a pinned-but-age-collectible row is
+        # still SERVED — lives in ``session_read`` (the session-scoped path), NOT
+        # here. The bare ``read_at_version`` deliberately keeps ages-out semantics
+        # (no live session, no allowance); ``session_read`` passes the pinned
+        # version as its OWN ``exemptions`` to this same seam. (The GC-HOLD
+        # exemption — distinct — was wired by Unit 2 at the GC producers.)
         if policy is not None and version in collectible_versions(
             {version: captured_at},
             current_version=current,
@@ -512,6 +518,184 @@ class CoordinatorService:
             cut=result,
             coordinator_epoch=self.registry.coordinator_epoch,
             retain_versions=retain_versions,
+        )
+
+    def session_read(
+        self,
+        session_token: str,
+        artifact_id: UUID,
+    ) -> VersionedContent | DataPlaneDeferredRead | SessionReadRejection:
+        """Serve an artifact's PINNED version from a live snapshot session — the
+        non-mutating read from the consistent cut (SB-17 / TX-1, Unit 3 / R2).
+
+        A NEW service path, NOT an extension of ``read_at_version`` (which is the
+        bare history read with its own frozen 6-reason contract and its
+        deliberate ``version == current`` REJECTION). The two surfaces have
+        OPPOSITE rules for the current version — bare ``read_at_version`` rejects
+        it; ``session_read`` SERVES it — and a different validation gate (a live
+        pin, not raw retention state). Threading session-awareness through
+        ``read_at_version`` would entangle those contracts and muddy the
+        ``current_version`` rejection a pinned test pins; a separate path keeps
+        each surface honest. ``begin_session`` is the coherence event that earns
+        the pinned-version serve (including ``version == current``), so the
+        allowance is scoped to a valid live session here.
+
+        **Non-mutating (R2, the shipped invariant):** like ``read_at_version``,
+        this calls NONE of ``set_agent_state`` / ``set_agent_transient`` / grant /
+        invalidation code. It only READS the registry (``get_session_cut`` /
+        ``get_artifact`` / ``retention_meta`` / ``get_version_record`` /
+        ``coordinator_epoch``) and builds frozen returns, so it mints NO MESI
+        grant and captures NO ``read_generation`` (read-gen capture lives ONLY in
+        ``set_agent_state``). A reader is not an owner.
+
+        Bytes source — the deployment-dependent rule resolved at the serve layer
+        (KTD), keyed off the session's branch (``retain_versions``, recorded at
+        ``begin_session``):
+
+        - **LAZY (``retain_versions=True``)** — the coordinator HAS bodies in
+          history. Serve the PINNED version's body from ``get_version_record``
+          (the retained-history accessor): the current version's body is captured
+          into history at commit, so it serves BOTH ``pinned == current`` AND
+          ``pinned < current`` uniformly. The TRANSITION is automatic — once a
+          peer commits past the pin, ``current`` advances but the pinned row
+          persists in history, so the SAME ``get_version_record(pinned)`` keeps
+          serving the pinned bytes (re-read ``current`` each call, never cache
+          the branch). **Read-serve allowance (the Unit-3 obligation):** the
+          pinned version is passed as its OWN ``exemptions`` to the T-expiry
+          ``collectible_versions`` seam, so a pinned-but-age-collectible row is
+          STILL SERVED (distinct from the GC-hold the Unit-2 exemptions seam
+          already provides at the GC producers — this lifts the read-side LOGICAL
+          T-expiry that ``read_at_version`` would apply). A genuinely absent body
+          (``content=None`` committed even under retain=True, or a GC race)
+          degrades to the data-plane-deferred result, never a crash or wrong
+          bytes.
+        - **EAGER (``retain_versions=False`` / ``content=None`` ICP)** — the
+          coordinator holds NO body for the pinned version (bodies live in the
+          CoherentVolume data plane). Return a typed
+          :class:`~ccs.core.types.DataPlaneDeferredRead` carrying the pinned
+          version + epoch (+ ``content_hash`` when known) — the honest "ask the
+          data plane for the bytes" signal. The actual eager byte serve is
+          **Unit 6 (CoherentVolume)**; this method never reads the data plane.
+
+        Validation (Unit 3 scope): the token must have a live pin for
+        ``artifact_id``. An unknown/released token → ``session_not_found``; a live
+        token whose cut lacks ``artifact_id`` → ``artifact_not_in_cut`` — both
+        typed :class:`~ccs.core.types.SessionReadRejection`, NEVER a live-HEAD
+        fall-through. (Per-call OWNER-binding validation — a foreign owner reading
+        another's cut — is Unit 7; the heartbeat-liveness ``session_invalidated``
+        axis is Unit 5. Unit 3 does the token-has-pin check only.)
+
+        Args:
+            session_token: The server-minted session identity from
+                ``begin_session``.
+            artifact_id: The artifact to read at its pinned version.
+
+        Returns:
+            :class:`VersionedContent` (coordinator-held pinned bytes),
+            :class:`DataPlaneDeferredRead` (bytes live in the data plane), or a
+            :class:`SessionReadRejection` (no valid pin) — all typed RETURNS,
+            never an exception.
+        """
+        epoch = self.registry.coordinator_epoch
+
+        # Unit 7: per-call OWNER-binding validation goes HERE — read
+        # ``_session_owners[session_token]`` and reject a foreign caller
+        # (timing-safe compare) with the Unit-5 ``session_invalidated`` reason
+        # BEFORE the pin lookup. Unit 3 does the token-has-pin check only.
+        cut = self.registry.get_session_cut(session_token)
+        if cut is None:
+            # Unknown / released / (in-memory) post-restart token. Unit 5 splits
+            # the durable-liveness taxonomy (``session_invalidated``); Unit 3
+            # treats every no-cut token as not-found.
+            return SessionReadRejection(
+                reason=SESSION_NOT_FOUND_REASON,
+                artifact_id=artifact_id,
+                coordinator_epoch=epoch,
+            )
+        if artifact_id not in cut:
+            # A live session, but this artifact was not pinned. Reject — NEVER
+            # serve live HEAD for an un-pinned artifact (out of scope: a session
+            # wanting fresh data starts a new session).
+            return SessionReadRejection(
+                reason=SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+                artifact_id=artifact_id,
+                coordinator_epoch=epoch,
+            )
+        pinned = cut[artifact_id]
+
+        # Read ``current`` ONCE (the per-call linearization snapshot) so the
+        # branch routing and the deferred-hash hint are decided against one view.
+        # The artifact may have been deleted out from under a live pin (the
+        # session_pins table deliberately has NO cascade FK); that fail-closed
+        # path is Unit 5 (``SessionInvalidated``). Until then a missing artifact
+        # under a live pin degrades to data-plane-deferred (never wrong bytes).
+        artifact = self.registry.get_artifact(artifact_id)
+        current = artifact.version if artifact is not None else None
+        # The pinned version's hash is knowable only when it is STILL current
+        # (the artifacts table holds the current hash only); a superseded pin's
+        # hash is not separately retained on the coordinator.
+        pinned_hash = (
+            artifact.content_hash
+            if artifact is not None and current == pinned
+            else None
+        )
+
+        retain_versions, policy = self.registry.retention_meta()
+        if not retain_versions:
+            # EAGER branch: the coordinator never retained a body for the pinned
+            # version — the canonical bytes live in the data plane. Honest typed
+            # deferral (pinned coordinates only, NO bytes); the data-plane serve
+            # is Unit 6.
+            return DataPlaneDeferredRead(
+                artifact_id=artifact_id,
+                version=pinned,
+                content_hash=pinned_hash,
+                coordinator_epoch=epoch,
+            )
+
+        # LAZY branch: serve the pinned version's body from retained history
+        # (the current version's body is captured into history at commit, so
+        # this serves both pinned==current and pinned<current). A genuinely
+        # absent body (content=None under retain=True, or a GC race) is NOT a
+        # crash — degrade to the data-plane-deferred signal.
+        record = self.registry.get_version_record(artifact_id, pinned)
+        if record is None:
+            return DataPlaneDeferredRead(
+                artifact_id=artifact_id,
+                version=pinned,
+                content_hash=pinned_hash,
+                coordinator_epoch=epoch,
+            )
+        content, captured_at = record
+
+        # Read-serve allowance (the Unit-3 obligation): the pinned version is its
+        # OWN exemption to the read-side LOGICAL T-expiry, so a pinned-but-age-
+        # collectible row is STILL served. Because ``pinned`` is always in
+        # ``exemptions``, ``collectible_versions`` can never mark it — the call is
+        # kept (rather than skipped) to make the allowance explicit and to age
+        # NOTHING else here. ``policy is None`` ⇒ unbounded ⇒ no T axis. This is
+        # the read-serve counterpart to the Unit-2 GC-hold ``exemptions`` seam.
+        if policy is not None and current is not None:
+            _served_despite_age = pinned not in collectible_versions(
+                {pinned: captured_at},
+                current_version=current,
+                policy=policy,
+                now=time.time(),
+                exemptions={pinned},
+            )
+            # Invariant by construction: a self-exempt version is never
+            # collectible. Asserting documents intent without a runtime branch.
+            assert _served_despite_age, (
+                "pinned version unexpectedly collectible despite self-exemption "
+                "(the read-serve allowance regressed)"
+            )
+
+        return VersionedContent(
+            artifact_id=artifact_id,
+            version=pinned,
+            content=content,
+            captured_at=captured_at,
+            coordinator_epoch=epoch,
         )
 
     def write(

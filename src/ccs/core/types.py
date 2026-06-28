@@ -206,6 +206,80 @@ class SnapshotSession:
 
 
 @dataclass(frozen=True)
+class DataPlaneDeferredRead:
+    """A pinned-version read the COORDINATOR cannot serve bytes for — the bytes
+    live in the data plane (SB-17 / TX-1, Unit 3 / R2, the EAGER branch).
+
+    The honest, typed signal of :meth:`CoordinatorService.session_read` when the
+    session pins a real version but the coordinator holds NO body for it: the
+    ``retain_versions=False`` / ``commit_cas(content=None)`` ICP, where bodies
+    are never persisted in ``artifact_versions`` and the canonical bytes live in
+    the CoherentVolume data plane. This is NOT an error and NOT a crash — it
+    carries the pinned ``version`` + ``coordinator_epoch`` (+ ``content_hash`` if
+    the registry knows it) so the caller can fetch the exact pinned bytes from
+    the data plane. The actual data-plane byte serve is **Unit 6
+    (CoherentVolume)** — this result is the boundary signal "coordinator pinned
+    the version; ask the data plane for the bytes."
+
+    **Carries NO body** by type (mirrors the :class:`VersionedReadRejection`
+    no-leak discipline): only the pinned coordinates a data-plane fetch needs.
+    The distinction from a rejection is deliberate — a rejection means "no valid
+    pin"; this means "valid pin, bytes elsewhere".
+
+    Field semantics:
+
+    - ``artifact_id`` / ``version`` are the PINNED coordinates (the cut entry),
+      not the current ones — the data plane must be asked for exactly this
+      version's bytes.
+    - ``content_hash`` is the pinned version's hash when the registry knows it
+      (the artifact metadata carries a hash even when the body is not retained),
+      else ``None`` — a hint the data-plane fetch can verify against; never a
+      body.
+    - ``coordinator_epoch`` is the store's epoch, stamped to mirror
+      :class:`VersionedContent` / :class:`SnapshotSession` so the caller can pin
+      which store-incarnation captured the cut.
+    """
+
+    artifact_id: UUID
+    version: int
+    content_hash: str | None
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class SessionReadRejection:
+    """A typed :meth:`CoordinatorService.session_read` rejection (SB-17 / TX-1,
+    Unit 3 / R2) — never a live-HEAD fall-through.
+
+    The non-serve return when the call cannot be honored against a valid pin: a
+    typed RETURN (the ``ConflictDetail`` / ``VersionedReadRejection`` discipline),
+    never an exception and NEVER the current bytes served as if pinned. ``reason``
+    is exactly one of the wire-stable constants in
+    :data:`~ccs.core.exceptions.SESSION_READ_REASONS`; consumers match with
+    ``==``, never on a human message.
+
+    The two Unit-3 reasons (Unit 5 adds the heartbeat-liveness ``session_invalidated``
+    axis; Unit 3 treats a released/unknown token as ``session_not_found``):
+
+    - ``session_not_found`` — the ``session_token`` has no pinned cut (unknown,
+      never opened, or released). A coordinator restart that wiped an in-memory
+      session also lands here (the durable Unit-5 liveness/restart taxonomy is a
+      later unit; here it is simply "no cut for this token").
+    - ``artifact_not_in_cut`` — the token IS a live session, but ``artifact_id``
+      was not in its captured read-set. Reading an un-pinned artifact mid-session
+      is out of scope (a session wanting fresh data starts a new session); it is
+      rejected here, NOT served from live HEAD.
+
+    **Carries NO body** by type (the no-leak discipline): only the reason, the
+    artifact id, and the epoch. ``coordinator_epoch`` is ALWAYS populated.
+    """
+
+    reason: str
+    artifact_id: UUID
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
 class InvalidationSignal:
     """Lightweight invalidation signal sent to agents."""
 

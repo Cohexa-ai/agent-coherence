@@ -1837,6 +1837,37 @@ class SqliteArtifactRegistry:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
+        """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,
+        or ``None`` if the token has no live pin rows (SB-17 / TX-1, Unit 3 / R2).
+
+        The single accessor ``session_read`` needs to (a) tell a known token from
+        an unknown/released one (``None`` ⇒ ``session_not_found``) and (b) read
+        the per-artifact pinned version for the serve. Reads the durable
+        ``session_pins`` table under one lock, so a coordinator RESTART correctly
+        re-serves a non-empty sqlite session (the durable mirror is the whole
+        point of R6 restart-survival), where an in-memory session would read
+        ``None`` post-restart — the asserted parity divergence.
+
+        Degenerate empty-read-set caveat (documented divergence): an empty cut
+        inserts ZERO ``session_pins`` rows, so sqlite cannot durably distinguish
+        an empty LIVE session from an unknown token — both read ``None`` here. The
+        in-memory mirror keeps an empty ``{}`` entry and returns it. This diverges
+        ONLY for a session that pinned nothing, which has no servable
+        ``session_read`` either way (no artifact is in its cut), so the
+        downstream rejection is benign on both arms (``session_not_found`` on
+        sqlite vs ``artifact_not_in_cut`` in-memory). The realistic non-empty
+        read-set is identical on both registries."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT artifact_id, version FROM session_pins "
+                "WHERE session_token = ?",
+                (session_token,),
+            ).fetchall()
+        if not rows:
+            return None
+        return {UUID(hex=r[0]): int(r[1]) for r in rows}
+
     # ------------------------------------------------------------------
     # ArtifactRegistry surface — agent state map
     # ------------------------------------------------------------------
