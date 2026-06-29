@@ -67,11 +67,13 @@ from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     CURRENT_VERSION_REASON,
     NOT_RETAINED_REASON,
+    SESSION_INVALIDATED_REASON,
     UNKNOWN_ARTIFACT_REASON,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
     Artifact,
+    SessionReadRejection,
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
@@ -723,3 +725,168 @@ def _commit_cas(reg, artifact_id: UUID, writer: UUID, expected: int, body: str) 
         content=body,
         tick=2,
     )
+
+
+# ===========================================================================
+# E — Snapshot SESSION parity through the SERVICE surface (Unit 9 / R5, R6)
+# ===========================================================================
+#
+# Section D (above, Unit 2) exercised ``capture_version_vector`` at the REGISTRY
+# level. Unit 9 adds the parity that rides the SERVICE surface a real session
+# uses — ``begin_session`` / ``session_read`` / ``get_session_cut`` — and pins
+# the in-memory↔sqlite divergence (restart-survival, R6) on BOTH arms so it is
+# ASSERTED, never masked. R5 (concurrent overlapping sessions hold independent
+# immutable cuts) is exercised identically across the two registries.
+
+
+def _register(reg, artifact_id: UUID, name: str, body: str) -> None:
+    art = Artifact(id=artifact_id, name=name, version=1, content_hash="h")
+    reg.register_artifact(art, content=body)
+
+
+class TestSnapshotSessionParityThroughService:
+    """``begin_session`` + ``session_read`` behave IDENTICALLY on both registries
+    on the NON-restart paths (capture, serve, overlap, release); the ONE
+    divergence — restart-survival — is asserted explicitly on BOTH arms (sqlite
+    survives, in-memory wiped). The success criterion + R6: divergence ASSERTED,
+    not hidden."""
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_begin_and_serve_identical_on_both_arms(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        # The non-restart happy path is registry-agnostic: begin a session over a
+        # retained store, serve the pinned bytes, and read back the cut via the
+        # service — same observable result on both arms.
+        mem, sql = _snap_pair(
+            tmp_path, "sess_serve.db", RetentionPolicy(max_versions=8)
+        )
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            a = uuid4()
+            _register(reg, a, "plan.md", "PINNED-V1")
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
+            assert isinstance(session, SnapshotSession)
+            assert dict(session.cut) == {a: 1}
+            # The pinned bytes serve identically (lazy / retain on).
+            served = svc.session_read(session.session_token, a, caller=owner)
+            assert isinstance(served, VersionedContent)
+            assert served.version == 1
+            assert served.content == "PINNED-V1"
+            # The durable/ephemeral pin is readable back through the registry on
+            # both arms while live.
+            assert svc.registry.get_session_cut(session.session_token) == {a: 1}
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_overlapping_sessions_hold_independent_immutable_cuts_R5(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        # R5: two concurrent overlapping sessions over the SAME artifact hold
+        # INDEPENDENT immutable cuts — the second session pins the moved version,
+        # the first stays at its captured version. Identical on both arms.
+        mem, sql = _snap_pair(
+            tmp_path, "sess_overlap.db", RetentionPolicy(max_versions=8)
+        )
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            a = uuid4()
+            _register(reg, a, "plan.md", "V1")
+            owner = uuid4()
+            s1 = svc.begin_session(read_set=[a], owner=owner)  # pins {a:1}
+            writer = uuid4()
+            _commit_cas(reg, a, writer, 1, "V2")  # current → 2
+            s2 = svc.begin_session(read_set=[a], owner=owner)  # pins {a:2}
+
+            assert isinstance(s1, SnapshotSession) and isinstance(s2, SnapshotSession)
+            # Independent immutable cuts: s1 still at v1, s2 at v2.
+            assert dict(s1.cut) == {a: 1}
+            assert dict(s2.cut) == {a: 2}
+            # Each serves ITS OWN pinned version (no read skew, no cross-leak).
+            r1 = svc.session_read(s1.session_token, a, caller=owner)
+            r2 = svc.session_read(s2.session_token, a, caller=owner)
+            assert isinstance(r1, VersionedContent) and r1.version == 1
+            assert r1.content == "V1"
+            assert isinstance(r2, VersionedContent) and r2.version == 2
+            assert r2.content == "V2"
+
+            # Releasing s1 must NOT disturb s2's independent cut.
+            reg.release_session(s1.session_token)
+            assert svc.registry.get_session_cut(s2.session_token) == {a: 2}
+        finally:
+            sql.close()
+
+    def test_restart_survival_divergence_both_arms_asserted(
+        self, tmp_path: Path
+    ) -> None:
+        # THE Unit-9 divergence (R6), through the SERVICE surface and asserted on
+        # BOTH arms so a regression that accidentally made them agree — in EITHER
+        # direction — is caught:
+        #   * sqlite arm: a FRESH SqliteArtifactRegistry on the same db file (the
+        #     "restart") still finds the pin → get_session_cut returns the cut AND
+        #     a session_read by the owner still SERVES the pinned bytes.
+        #   * in-memory arm: a FRESH ArtifactRegistry has NO pins → get_session_cut
+        #     is None AND session_read fails closed (session_invalidated), never a
+        #     live-HEAD serve.
+        policy = RetentionPolicy(max_versions=8)
+        a = UUID(int=0xF00D5E55)
+        owner = UUID(int=0x0114E5)
+        db = tmp_path / "sess_restart.db"
+
+        # --- sqlite arm: the pin SURVIVES a reopen (durable session_pins) ---
+        sql1 = SqliteArtifactRegistry(db, retain_versions=True, retention_policy=policy)
+        try:
+            _register(sql1, a, "plan.md", "SURVIVOR-V1")
+            session = CoordinatorService(sql1).begin_session(read_set=[a], owner=owner)
+            assert isinstance(session, SnapshotSession)
+            token = session.session_token
+        finally:
+            sql1.close()
+        # The "restart": a SECOND handle on the same file. The pin row persisted.
+        sql2 = SqliteArtifactRegistry(db, retain_versions=True, retention_policy=policy)
+        try:
+            svc2 = CoordinatorService(sql2)
+            # The cut is still readable post-restart (durable session_pins).
+            assert svc2.registry.get_session_cut(token) == {a: 1}, (
+                "sqlite session cut did NOT survive restart — R6 durability "
+                "regressed"
+            )
+            # And the owner can still SERVE the pinned bytes from the survived cut.
+            served = svc2.session_read(token, a, caller=owner)
+            assert isinstance(served, VersionedContent), (
+                "sqlite session_read did not serve after restart — the durable "
+                "pin should still be intact"
+            )
+            assert served.version == 1
+            assert served.content == "SURVIVOR-V1"
+        finally:
+            sql2.close()
+
+        # --- in-memory arm: a FRESH registry has NO pins (process-scoped) ---
+        mem1 = ArtifactRegistry(retain_versions=True, retention_policy=policy)
+        _register(mem1, a, "plan.md", "EPHEMERAL-V1")
+        ephemeral = CoordinatorService(mem1).begin_session(read_set=[a], owner=owner)
+        assert isinstance(ephemeral, SnapshotSession)
+        eph_token = ephemeral.session_token
+        # The "restart": a brand-new in-memory registry — no shared store, no pins.
+        mem2 = ArtifactRegistry(retain_versions=True, retention_policy=policy)
+        _register(mem2, a, "plan.md", "EPHEMERAL-V1")
+        svc_mem2 = CoordinatorService(mem2)
+        # The cut is GONE (process-scoped) — get_session_cut is None.
+        assert svc_mem2.registry.get_session_cut(eph_token) is None, (
+            "in-memory pins unexpectedly survived a fresh instance — the "
+            "process-scoped contract (R6) was violated"
+        )
+        # And the session correctly FAILS CLOSED — never a live-HEAD serve. The
+        # in-shape (server-minted) token classifies session_invalidated under the
+        # Unit-5 liveness taxonomy (the post-restart-unknown safety case).
+        result = svc_mem2.session_read(eph_token, a, caller=owner)
+        assert isinstance(result, SessionReadRejection), (
+            "in-memory session_read served (or crashed) after a fresh-instance "
+            "restart — it must fail closed, never serve live HEAD"
+        )
+        assert result.reason == SESSION_INVALIDATED_REASON
