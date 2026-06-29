@@ -14,7 +14,7 @@ import time
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Mapping, Optional
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.coordinator.retention import collectible_versions
@@ -31,6 +31,7 @@ from ccs.core.exceptions import (
     UNKNOWN_ARTIFACT_REASON,
     CoherenceError,
     OccCallerTransientError,
+    SessionInvalidated,
     StaleReadGeneration,
 )
 from ccs.core.hashing import compute_content_hash
@@ -41,6 +42,8 @@ from ccs.core.types import (
     CasCorruption,
     ConflictDetail,
     DataPlaneDeferredRead,
+    EffectFired,
+    EffectHeld,
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
@@ -241,6 +244,51 @@ def looks_like_session_token(token: str) -> bool:
         len(token) == _SESSION_TOKEN_LEN
         and all(ch in _SESSION_TOKEN_ALPHABET for ch in token)
     )
+
+
+class SessionView:
+    """A read-only view of a live snapshot session's PINNED cut, handed to the
+    ``effect_gate`` ``decide`` callback (SB-17 / TX-1, Unit 6 / EO-5).
+
+    The decision step reads the consistent cut — NOT live HEAD — through this thin
+    wrapper over :meth:`CoordinatorService.session_read`, so the caller's decision
+    is computed against exactly the pinned versions the gate will re-validate. It
+    is read-only by construction (it exposes no write/commit), and it FAILS CLOSED:
+    a ``session_read`` that returns a dead-session rejection
+    (``session_invalidated`` / ``session_not_found``) raises
+    :class:`SessionInvalidated` rather than letting the decision proceed on an
+    invalid cut. A ``DataPlaneDeferredRead`` (the eager / ``content=None`` branch,
+    where the coordinator holds no body) is returned as-is — the caller fetches the
+    pinned bytes from the data plane; the gate still re-validates by VERSION, which
+    is byte-source-independent.
+    """
+
+    def __init__(self, service: "CoordinatorService", session_token: str) -> None:
+        self._service = service
+        self._token = session_token
+
+    def read(
+        self, artifact_id: UUID
+    ) -> VersionedContent | DataPlaneDeferredRead:
+        """Read ``artifact_id`` at its pinned version. Fails closed on a dead
+        session or an un-pinned artifact (a typed rejection → raised
+        :class:`SessionInvalidated` / ``CoherenceError``) so a decision never runs
+        on an invalid cut."""
+        result = self._service.session_read(self._token, artifact_id)
+        if isinstance(result, SessionReadRejection):
+            if result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON:
+                # Caller misuse: reading outside the pinned read-set. Not a dead
+                # session — a hard error, never a live-HEAD fall-through.
+                raise CoherenceError(
+                    f"effect_gate decide read an un-pinned artifact "
+                    f"{artifact_id}: {result.reason}"
+                )
+            # session_invalidated / session_not_found → fail closed.
+            raise SessionInvalidated(
+                f"effect_gate decide read failed closed: {result.reason} "
+                f"(artifact={artifact_id})"
+            )
+        return result
 
 
 class CoordinatorService:
@@ -927,6 +975,270 @@ class CoordinatorService:
         ``read_generation`` that would spuriously trip the fence.
         """
         return uuid5(NAMESPACE_URL, session_token)
+
+    # ------------------------------------------------------------------
+    # Effect-gate wrapper — "fire E iff read-set R unchanged" (Unit 6 / EO-5)
+    # ------------------------------------------------------------------
+
+    def effect_gate(
+        self,
+        *,
+        read_set: Iterable[UUID],
+        owner: UUID,
+        decide: Callable[["SessionView"], object],
+        effect: Callable[[object], object] | None = None,
+        commit: tuple[UUID, bytes | str] | None = None,
+        created_at_tick: int = 0,
+        issued_at_tick: int = 0,
+        release_on_exit: bool = True,
+    ) -> EffectFired | EffectHeld:
+        """Fire an effect IFF the whole read-set is still unchanged — the
+        ergonomic EO-5 surface (SB-17 / TX-1, Unit 6 = EO-4 = SB-17 user surface).
+
+        One call composes the shipped session primitives end to end:
+
+        1. **PIN** — ``begin_session(read_set)`` captures a consistent cut at one
+           linearization point (Unit 2).
+        2. **DECIDE** — the caller's ``decide`` callback reads the PINNED cut (via
+           a :class:`SessionView` over ``session_read``, Unit 3) and computes a
+           decision (the value it returns is threaded to an escaping effect).
+        3. **RE-VALIDATE** — at the effect boundary, re-read each read-set
+           member's CURRENT version (``registry.get_artifact(id).version``) and
+           compare to the pin. If EVERY member matches → fire; if ANY moved (or
+           vanished) → **HELD** (:class:`EffectHeld`), never fire on stale input.
+        4. **FIRE** — per mode (below).
+
+        Two effect modes (exactly one of ``effect`` / ``commit`` — passing both,
+        or neither, is caller misuse → ``ValueError``):
+
+        - **ATOMIC** (``commit=(artifact_id, content)``) — the effect IS an
+          artifact write, routed through :meth:`session_commit` so the shipped
+          ``commit_cas`` arbitrates AT the pinned base in the SAME step. There is
+          NO re-validate→fire window: "unchanged" and "commit" are one atomic
+          arbitration. The pre-fire re-validate still runs as a fast HELD short
+          circuit (it spares the CAS when a peer already moved the target), but
+          the AUTHORITATIVE guard is ``commit_cas`` — even if a peer commits in
+          the instant between the re-validate and the CAS, the CAS at the pinned
+          ``expected_version`` loses cleanly and returns :class:`ConflictDetail`
+          (surfaced as :class:`EffectHeld` with ``conflict`` set). This is the
+          STRONG guarantee.
+        - **ESCAPING** (``effect=callable``) — the effect is a non-commit side
+          effect (deploy / charge / click). The gate re-validates, then fires the
+          callable. **The guarantee is "the read-set was unchanged AS OF the
+          re-validate point", NOT "as of the fire point".** A peer can commit a
+          read-set member in the residual RE-VALIDATE→FIRE window — after the
+          check passed but before the callable runs — and the gate will STILL
+          fire (it gates pre-fire and never rolls back, EO-7). This window is
+          unclosable for escaping effects and is NOT claimed away. Use ATOMIC
+          mode when the effect is an artifact write and you need the window
+          closed; use ESCAPING for genuine side effects, accepting the bound.
+
+        **Fail-closed (in-process typed path).** This gate is a pure in-process
+        coordinator method — it composes the typed session results directly and
+        is NOT the HTTP/CoherentVolume path, so there is no 200-body deny/degrade
+        to translate. A dead session at ANY step (``session_read`` /
+        ``session_commit`` returning ``session_invalidated``/``session_not_found``,
+        or the cut vanishing at re-validate) RAISES :class:`SessionInvalidated`
+        and NEVER fires. (If this gate were ever rebuilt over the
+        ``coherent_volume`` HTTP surface, BOTH the ``ok:false`` deny body and the
+        ``degraded:true`` 200 body would map to a raise — never proceed
+        best-effort on a degrade, learnings #3 ``coordinator-invalidation-not-
+        mutex``. The in-process typed path enforces the same fail-closed shape by
+        construction.)
+
+        Reason classification uses ``reason == CONSTANT`` against the wire-stable
+        session reason sets, never a substring of a human message (the
+        typed-signal-not-substring house rule).
+
+        Args:
+            read_set: The artifacts to pin into the consistent cut.
+            owner: The creating caller's identity (bound to the minted session).
+            decide: Callback ``(view) -> decision``; reads the pinned cut via
+                ``view.read(artifact_id)`` and returns a decision value. For an
+                escaping effect the decision is passed to ``effect``.
+            effect: ESCAPING mode — a side-effect callable ``(decision) -> result``
+                fired only if re-validate passes. Mutually exclusive with ``commit``.
+            commit: ATOMIC mode — ``(artifact_id, content)`` committed via
+                ``session_commit`` at the pinned base. Mutually exclusive with ``effect``.
+            created_at_tick: Logical tick for ``begin_session`` (heartbeat seed).
+            issued_at_tick: Logical tick for the ATOMIC ``session_commit``.
+            release_on_exit: If ``True`` (default), the session's pins are released
+                after the gate resolves (fire or HELD), so a one-shot gate does not
+                leak a pin until the liveness sweep reaps it. Set ``False`` to keep
+                the session live for further use.
+
+        Returns:
+            :class:`EffectFired` if the read-set was unchanged (as of re-validate,
+            or atomically for ``commit``) and the effect fired, else
+            :class:`EffectHeld` (drift detected pre-fire, or an atomic OCC loss).
+
+        Raises:
+            ValueError: neither or both of ``effect`` / ``commit`` supplied.
+            SessionInvalidated: the session died mid-gate (fail-closed; no fire).
+        """
+        if (effect is None) == (commit is None):
+            raise ValueError(
+                "effect_gate requires exactly one of effect= (escaping mode) or "
+                "commit= (atomic mode); got "
+                + ("both" if effect is not None else "neither")
+            )
+
+        read_set = list(read_set)
+        session = self.begin_session(
+            read_set=read_set, owner=owner, created_at_tick=created_at_tick
+        )
+        if isinstance(session, VersionedReadRejection):
+            # An unknown id in the read-set never opened a session; surface it as
+            # a fail-closed raise (no cut to gate against, never a silent fire).
+            raise SessionInvalidated(
+                f"effect_gate could not pin the read-set: {session.reason} "
+                f"(artifact={session.artifact_id})"
+            )
+
+        token = session.session_token
+        try:
+            # DECIDE — the caller reads the PINNED cut and computes its decision.
+            view = SessionView(self, token)
+            decision = decide(view)
+
+            if commit is not None:
+                return self._effect_gate_atomic(
+                    session=session,
+                    commit=commit,
+                    issued_at_tick=issued_at_tick,
+                )
+            assert effect is not None  # narrowed by the XOR check above
+            return self._effect_gate_escaping(
+                session=session,
+                effect=effect,
+                decision=decision,
+            )
+        finally:
+            if release_on_exit:
+                # Best-effort cleanup: drop the pins so a one-shot gate does not
+                # hold versions back from GC until the liveness sweep. Idempotent
+                # on the registry (unknown token → no-op), and the service-layer
+                # lease/owner maps are dropped too so the token cannot linger.
+                self.registry.release_session(token)
+                self._session_heartbeats.pop(token, None)
+                self._session_owners.pop(token, None)
+
+    def _revalidate_cut(
+        self, cut: Mapping[UUID, int]
+    ) -> dict[UUID, "tuple[int, int | None]"]:
+        """Re-read each pinned member's CURRENT version and return the DRIFT map.
+
+        For every ``(artifact_id, pinned)`` in ``cut``, read the live current
+        version (``registry.get_artifact(id).version``); a vanished artifact reads
+        ``None`` (deleted / GC-raced under the pin). Returns ``{artifact_id:
+        (pinned, current)}`` for ONLY the members whose ``current != pinned`` (or
+        whose artifact vanished) — an empty dict means the whole vector is
+        unchanged. This is the pre-fire re-validate vector compare; it is
+        non-mutating (a read-only ``get_artifact`` per member, no grant, no
+        ``read_generation``)."""
+        moved: dict[UUID, "tuple[int, int | None]"] = {}
+        for artifact_id, pinned in cut.items():
+            artifact = self.registry.get_artifact(artifact_id)
+            current = artifact.version if artifact is not None else None
+            if current != pinned:
+                moved[artifact_id] = (pinned, current)
+        return moved
+
+    def _effect_gate_escaping(
+        self,
+        *,
+        session: SnapshotSession,
+        effect: Callable[[object], object],
+        decision: object,
+    ) -> EffectFired | EffectHeld:
+        """ESCAPING mode — re-validate the vector, then fire the side-effect
+        callable. Documents the residual re-validate→fire window (EO-7): the
+        callable fires on a vector proven unchanged AT the re-validate point, not
+        at the fire point — a peer commit in the window is NOT caught and the
+        effect is NOT rolled back. Use ATOMIC mode to close the window."""
+        moved = self._revalidate_cut(session.cut)
+        if moved:
+            # Drift detected BEFORE firing — HELD, the side effect never runs.
+            return EffectHeld(
+                moved=moved,
+                coordinator_epoch=session.coordinator_epoch,
+            )
+
+        # The vector was unchanged AS OF this point. Everything below this line is
+        # the unclosable RE-VALIDATE→FIRE WINDOW for an escaping effect: a peer can
+        # commit a read-set member here, after the check passed, before the
+        # callable runs. The gate gates PRE-FIRE and never rolls back (EO-7), so
+        # the guarantee is "unchanged as of re-validate", NOT "as of fire". This
+        # is intrinsic to a non-commit side effect (deploy/charge/click cannot be
+        # version-CAS'd); ATOMIC mode closes it by riding ``commit_cas``.
+        result = effect(decision)
+        return EffectFired(
+            revalidated_cut=dict(session.cut),
+            coordinator_epoch=session.coordinator_epoch,
+            result=result,
+        )
+
+    def _effect_gate_atomic(
+        self,
+        *,
+        session: SnapshotSession,
+        commit: tuple[UUID, bytes | str],
+        issued_at_tick: int,
+    ) -> EffectFired | EffectHeld:
+        """ATOMIC mode — route the write through ``session_commit`` so the shipped
+        ``commit_cas`` arbitrates at the pinned base in the SAME step. NO
+        re-validate→fire window: the CAS at ``expected_version=pin`` is the
+        authoritative guard. A pre-CAS re-validate runs as a fast HELD short
+        circuit (sparing the CAS when the target already moved), but even without
+        it the CAS would lose cleanly on a raced peer commit."""
+        artifact_id, content = commit
+        # Fast pre-CAS re-validate: if the COMMIT TARGET already moved, hold
+        # before attempting the CAS. (The CAS itself is still authoritative for
+        # the no-window guarantee; this only short-circuits the common case and
+        # surfaces a uniform drift map with the escaping mode.)
+        moved = self._revalidate_cut(session.cut)
+        if artifact_id in moved:
+            return EffectHeld(
+                moved=moved,
+                coordinator_epoch=session.coordinator_epoch,
+            )
+
+        # Atomic arbitration at the pinned base. ``session_commit`` reuses the
+        # shipped ``commit_cas`` verbatim (admit-on-absent → version-CAS), maps
+        # the CasCorruption sentinel to a raised CoherenceError, and returns the
+        # ConflictDetail unchanged on a lost race. A SessionCommitRejection here
+        # means the cut died mid-gate (token/pin gone) → fail closed.
+        outcome = self.session_commit(
+            session.session_token,
+            artifact_id,
+            content,
+            issued_at_tick=issued_at_tick,
+        )
+        if isinstance(outcome, SessionCommitRejection):
+            # Fail-closed: the session is gone (reaped / restart-wiped / released)
+            # — never a silent non-fire. Raise the typed dead-session error.
+            raise SessionInvalidated(
+                f"effect_gate atomic commit failed closed: {outcome.reason} "
+                f"(artifact={outcome.artifact_id})"
+            )
+        if isinstance(outcome, ConflictDetail):
+            # Lost the OCC race AT the pinned base — HELD, nothing mutated. Carry
+            # the shipped ConflictDetail through verbatim (the same taxonomy a
+            # bare session_commit surfaces). Re-read the post-conflict drift so
+            # ``moved`` reflects what actually changed under the commit target.
+            post = self._revalidate_cut(session.cut)
+            return EffectHeld(
+                moved=post,
+                coordinator_epoch=session.coordinator_epoch,
+                conflict=outcome,
+            )
+        # WIN — (updated_artifact, signals); the commit landed atomically at the
+        # pinned base with NO window.
+        return EffectFired(
+            revalidated_cut=dict(session.cut),
+            coordinator_epoch=session.coordinator_epoch,
+            commit=outcome,
+        )
 
     # ------------------------------------------------------------------
     # Session pin lifetime — heartbeat lease + liveness sweep (Unit 5 / R4)

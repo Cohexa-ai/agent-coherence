@@ -321,6 +321,84 @@ class SessionCommitRejection:
 
 
 @dataclass(frozen=True)
+class EffectHeld:
+    """The effect-gate RE-VALIDATE step found the read-set moved — the effect was
+    NOT fired (SB-17 / TX-1, Unit 6 / EO-5).
+
+    The non-fire return of :meth:`CoordinatorService.effect_gate`: between
+    ``begin_session`` (the pin) and the effect boundary, at least one read-set
+    member's CURRENT version no longer equals its pinned version, so firing would
+    act on stale input. The gate HOLDS — it never fires an escaping effect and
+    never lets the atomic commit land — and returns this typed value. NEVER an
+    exception (the ``ConflictDetail`` discipline), and NEVER a partial fire.
+
+    Recovery is to open a NEW session, re-read the fresh cut, re-decide, and
+    re-gate — exactly like a ``version_mismatch`` HELD; the dead decision is not
+    retry-eligible in place (its inputs changed underneath it).
+
+    Field semantics:
+
+    - ``moved`` is the per-artifact drift map ``{artifact_id: (pinned, current)}``
+      for EVERY read-set member whose current version diverged from its pin — the
+      full set, not just the first, so the caller can see the whole blast radius
+      of the change it raced. ``current`` is ``None`` when the artifact vanished
+      under the live pin (a deleted/GC-raced member is also "moved" — it can no
+      longer be proven unchanged, so the gate holds fail-closed).
+    - ``conflict`` is populated ONLY for the ATOMIC (``session.commit``) mode when
+      the commit lost its OCC race AT the pinned base — the shipped
+      :class:`ConflictDetail`, carried through verbatim so the caller sees the
+      same taxonomy a bare ``session_commit`` would surface. It is ``None`` for
+      an escaping-effect HELD (no commit was attempted) and for an atomic HELD
+      caught at the pre-commit re-validate (``moved`` populated, no CAS attempted).
+    - ``coordinator_epoch`` mirrors the other session results so the caller can
+      pin which store-incarnation evaluated the gate.
+    """
+
+    moved: Mapping[UUID, "tuple[int, int | None]"]
+    coordinator_epoch: str
+    conflict: Optional["ConflictDetail"] = None
+
+
+@dataclass(frozen=True)
+class EffectFired:
+    """The effect-gate fired the effect — the read-set was unchanged AS OF the
+    re-validate point (SB-17 / TX-1, Unit 6 / EO-5).
+
+    The fire return of :meth:`CoordinatorService.effect_gate`. Its guarantee is
+    mode-dependent and stated honestly (EO-5 / EO-7):
+
+    - **ATOMIC mode** (the effect IS ``session.commit``): the commit rode the
+      shipped ``commit_cas`` at the pinned base in the SAME arbitration step, so
+      "unchanged" and "fire" are one atomic event — there is NO window. ``commit``
+      carries the ``(updated_artifact, signals)`` WIN tuple.
+    - **ESCAPING mode** (the effect is a non-commit side effect — deploy / charge
+      / click — a caller-supplied callable): the gate re-validated the whole
+      vector and THEN fired the callable. The guarantee is "the read-set was
+      unchanged **as of the re-validate point**", NOT "as of the fire point": a
+      peer can commit a read-set member in the residual RE-VALIDATE→FIRE window,
+      after the check passed but before the callable ran. The gate gates pre-fire
+      and NEVER rolls back (EO-7), so this window is unclosable for escaping
+      effects and is NOT claimed away. ``result`` carries whatever the callable
+      returned (or ``None``).
+
+    Field semantics:
+
+    - ``revalidated_cut`` is the per-artifact version map ``{artifact_id: version}``
+      proven equal to the pin at the re-validate point — the exact vector the fire
+      decision was justified against.
+    - ``commit`` is the ``session.commit`` WIN tuple in ATOMIC mode, else ``None``.
+    - ``result`` is the escaping callable's return value in ESCAPING mode, else
+      ``None``.
+    - ``coordinator_epoch`` mirrors the other session results.
+    """
+
+    revalidated_cut: Mapping[UUID, int]
+    coordinator_epoch: str
+    commit: Optional["tuple[Artifact, list[InvalidationSignal]]"] = None
+    result: object = None
+
+
+@dataclass(frozen=True)
 class InvalidationSignal:
     """Lightweight invalidation signal sent to agents."""
 
