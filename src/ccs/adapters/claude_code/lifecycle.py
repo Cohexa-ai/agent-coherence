@@ -756,14 +756,15 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     # CoordinatorHTTPServer; importing back at module load would cycle.
     from ccs.adapters.claude_code.coordinator_server import (
         SWEEP_RECLAMATION_PREEMPTER_ID,
+        monotonic_seconds,
     )
 
     coordinator = entry.coordinator
 
     def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
         """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
-        Uses wall-clock time (the notice timestamp is operator-visible
-        via the F4 prose) rather than the monotonic sweep tick."""
+        Uses float wall-clock time (the notice timestamp is operator-visible
+        via the F4 prose) rather than the integer sweep tick."""
         coordinator.registry.record_preemption_notice(
             victim_agent_id=agent_id,
             artifact_id=artifact_id,
@@ -775,7 +776,17 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
         time.sleep(cfg.sweep_interval_sec)
         if coordinator.shutting_down:
             break
-        now_tick = int(time.monotonic())
+        # The sweep tick MUST share the basis the heartbeat handlers seed from
+        # (``monotonic_seconds`` == ``int(time.time())``, wall-clock seconds): the
+        # grant heartbeat handlers, the session heartbeat, and ``begin_session``'s
+        # ``created_at_tick`` are ALL seeded from ``monotonic_seconds()``. Using
+        # ``int(time.monotonic())`` here (a boot-relative clock ~1.7e9 below
+        # wall-clock) made ``current_tick - last_hb`` permanently negative, so the
+        # transient, grant, AND session sweeps never fired over the HTTP transport
+        # (heartbeat timeouts + the absolute-age ceiling silently inoperative).
+        # Wall-clock also survives a restart — the basis ``deadline_tick`` and the
+        # session ceiling need; monotonic resets on reboot and would break those.
+        now_tick = monotonic_seconds()
         try:
             coordinator.service.enforce_transient_timeouts(
                 current_tick=now_tick,
@@ -796,13 +807,11 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             # Reuses the SAME staleness predicate + the grant heartbeat timeout
             # knob. Best-effort like the rest of the sweep (the outer try guards
             # it). A slow-but-live session that keeps heartbeating is NOT reaped.
-            # OPERATIONAL DEPENDENCY (Unit 8): the HTTP record_session_heartbeat
-            # endpoint that lets a REMOTE client refresh the lease lands in
-            # Unit 8. Until then a live session over the remote transport is
-            # implicitly bounded by grant_heartbeat_timeout_sec — it is reaped
-            # fail-closed (session_invalidated, never wrong bytes), not broken;
-            # in-process callers can already drive record_session_heartbeat
-            # directly. This only affects the remote/HTTP path pre-Unit-8.
+            # A REMOTE client refreshes its lease via the HTTP
+            # POST /session/heartbeat endpoint; an abandoned session is reaped
+            # fail-closed (session_invalidated, never wrong bytes) once the lease
+            # goes stale or the absolute-age ceiling fires, with durable-only
+            # post-restart sessions bounded by that ceiling.
             reaped_sessions = coordinator.service.enforce_session_liveness(
                 current_tick=now_tick,
                 heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,

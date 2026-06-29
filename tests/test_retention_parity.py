@@ -69,6 +69,7 @@ from ccs.core.exceptions import (
     NOT_RETAINED_REASON,
     SESSION_INVALIDATED_REASON,
     UNKNOWN_ARTIFACT_REASON,
+    SessionInvalidated,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
@@ -863,6 +864,11 @@ class TestSnapshotSessionParityThroughService:
             )
             assert served.version == 1
             assert served.content == "SURVIVOR-V1"
+            # R13 across the restart (F3): the durable owner-binding survives too,
+            # so a leaked-token FOREIGN caller is STILL rejected — survival (R6)
+            # does not open an owner-isolation hole.
+            with pytest.raises(SessionInvalidated):
+                svc2.session_read(token, a, caller=uuid4())
         finally:
             sql2.close()
 

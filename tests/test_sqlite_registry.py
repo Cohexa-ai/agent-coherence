@@ -824,7 +824,7 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         assert "session_pins" in tables
         # SB-17 Unit 2 bumped the schema to v3; a fresh db is created at v3.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 3
+        assert SCHEMA_USER_VERSION == 4
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
@@ -868,9 +868,9 @@ def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
             ).fetchone()[0]
             is None
         )
-        # Epoch seeded + loaded; user_version stamped to 3 by the chained migration.
+        # Epoch seeded + loaded; user_version stamped to current by the chained migration.
         assert reg._coordinator_epoch
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         # Prior meta preserved (no clobber of instance_id / sequence_number).
         assert reg._instance_id == "fixed-instance"
         assert reg._seq == 7
@@ -1043,7 +1043,7 @@ def test_fence_columns_present_epoch_absent_recovers(db_path: Path) -> None:
 
     with SqliteArtifactRegistry(db_path) as reg:
         assert reg._coordinator_epoch  # seeded on this open
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         assert reg.get_owner_generation(UUID(art_id)) == 0
 
 
@@ -1263,8 +1263,8 @@ class TestWildV1Migration:
     ) -> None:
         art_id, ag_id = _build_raw_v1_db(db_path, fence=fence, notices=notices)
         with SqliteArtifactRegistry(db_path) as reg:
-            # Chained migration stamps v3; complete schema guaranteed.
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            # Chained migration stamps the current version; complete schema guaranteed.
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
             tables = {
                 r[0] for r in reg._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
@@ -1321,7 +1321,7 @@ class TestWildV1Migration:
         conn.close()
         # Open via the normal path: must not raise OperationalError.
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
 
     def test_half_migrated_db_missing_stamp_recovers(self, db_path: Path) -> None:
         # The classic learnings case generalized: all v2 tables present but
@@ -1334,7 +1334,7 @@ class TestWildV1Migration:
         conn.close()
         reg = SqliteArtifactRegistry(db_path)  # must not raise
         try:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         finally:
             reg.close()
 
@@ -1349,7 +1349,7 @@ class TestWildV1Migration:
         # assert the in-txn user_version re-check no-ops with ZERO DDL.
         art_id, _ = _build_raw_v1_db(db_path, fence=True, notices=True)
         with SqliteArtifactRegistry(db_path) as winner:
-            assert winner._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert winner._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
 
         statements: list[str] = []
 
@@ -1371,7 +1371,7 @@ class TestWildV1Migration:
             # The loser rehydrated normally (meta loaded, data intact) ...
             assert loser.instance_id == "wild-v1"
             assert loser.get_artifact(UUID(art_id)) is not None
-            assert loser._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert loser._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         # ... and performed NO DDL: the in-txn re-check exited before any
         # ALTER/CREATE could re-run against the migrated schema.
         ddl = [
@@ -1518,7 +1518,7 @@ class TestCrossRuntimeGuard:
         # marker.
         art_id, _ = _build_raw_v1_db(db_path, fence=False, notices=False)
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
             assert reg.get_artifact(UUID(art_id)) is not None
             stamp = reg._conn.execute(
                 "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
@@ -1538,7 +1538,7 @@ class TestCrossRuntimeGuard:
         with SqliteArtifactRegistry(db_path) as reg:
             _retain_artifact(reg, content="x")
         with SqliteArtifactRegistry(db_path) as rw:
-            assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         with SqliteArtifactRegistry(db_path, read_only=True) as ro:
             assert ro.instance_id
 
@@ -1557,7 +1557,7 @@ class TestCrossRuntimeGuard:
         finally:
             conn.close()
         with SqliteArtifactRegistry(db_path) as reg:
-            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
             # Still un-stamped: the steady-state v3 open performs no writes.
             assert reg._conn.execute(
                 "SELECT value FROM registry_meta WHERE key = 'schema_runtime'"
@@ -2092,3 +2092,88 @@ def _versions(reg, artifact_id) -> list[int]:
             (artifact_id.hex,),
         ).fetchall()
     )
+
+
+class TestV3ToV4Migration:
+    """The durable-owner fix added ``session_meta`` + ``idx_session_pins_artifact``
+    to the schema. Earlier commits of THIS branch already stamped
+    ``user_version=3`` with ``session_pins`` but WITHOUT ``session_meta``; such a
+    db MUST migrate to v4 on open (gaining both) rather than crash on the first
+    session op with 'no such table: session_meta'. Regression for the re-review
+    P0: F3/F6 added tables to v3 in-place without bumping the schema version."""
+
+    def _revert_to_prefix_v3(self, db_path: Path) -> None:
+        """Mutate a current (v4) db on disk back to the pre-fix v3 shape:
+        ``session_pins`` present, ``session_meta`` + the artifact index ABSENT,
+        stamped ``user_version=3`` (what an earlier branch commit produced)."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DROP TABLE IF EXISTS session_meta")
+            conn.execute("DROP INDEX IF EXISTS idx_session_pins_artifact")
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_existing_v3_db_migrates_to_v4_and_session_ops_work(
+        self, db_path: Path
+    ) -> None:
+        with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+            art = _retain_artifact(reg, content="seed")
+        self._revert_to_prefix_v3(db_path)
+        # Sanity: the reverted db is a genuine pre-fix v3 (session_pins, no meta).
+        probe = sqlite3.connect(str(db_path))
+        try:
+            assert probe.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert probe.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_meta'"
+            ).fetchone() is None
+            assert probe.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_pins'"
+            ).fetchone() is not None
+        finally:
+            probe.close()
+        # Reopen with the current build → _migrate_v3_to_v4 fires (no crash).
+        with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+            assert reg._conn.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0] == SCHEMA_USER_VERSION
+            assert reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_meta'"
+            ).fetchone() is not None
+            assert reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_session_pins_artifact'"
+            ).fetchone() is not None
+            # The session op that would have crashed pre-migration now works.
+            owner = uuid4()
+            cut = reg.capture_version_vector(
+                [art.id], "tok-migrated", owner=owner, created_at_tick=5
+            )
+            assert cut == {art.id: art.version}
+            assert reg.get_session_meta("tok-migrated") == (owner, 5)
+            assert reg.session_count() == 1
+
+    def test_v2_db_chains_through_to_v4_with_session_meta(self, db_path: Path) -> None:
+        # A v2 db (artifact_versions, no session_pins/meta) chains 2 -> 3 -> 4 and
+        # ends with the FULL current schema (both session tables + the index).
+        with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+            _retain_artifact(reg, content="seed")
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DROP TABLE IF EXISTS session_meta")
+            conn.execute("DROP INDEX IF EXISTS idx_session_pins_artifact")
+            conn.execute("DROP TABLE IF EXISTS session_pins")
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        finally:
+            conn.close()
+        with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+            assert reg._conn.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0] == SCHEMA_USER_VERSION
+            for table in ("session_pins", "session_meta"):
+                assert reg._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone() is not None, table

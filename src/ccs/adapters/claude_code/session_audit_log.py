@@ -38,10 +38,15 @@ discipline):
   the append still proceeds because the data is content-free lifecycle
   metadata, not credential material.
 
-Concurrent writes: ``os.O_APPEND`` is atomic for small writes on POSIX
-(the write syscall is serialized between concurrent appenders). One JSONL
-line per write keeps each append atomic — no application-layer locking
-needed.
+Concurrent writes: ``os.O_APPEND`` advances the file offset atomically per
+``write`` syscall, but the POSIX whole-write atomicity guarantee only holds
+below ``PIPE_BUF`` (as little as 512 bytes on macOS), and a max-cardinality
+cut record exceeds that — so concurrent ``/session/begin`` appenders could
+interleave and tear a JSONL line (finding F9). A process-level
+``_AUDIT_WRITE_LOCK`` serializes the open+write+close so each record lands
+whole, regardless of size. The coordinator is single-process per host, so an
+in-process lock covers the real concurrency (multiple HTTP handler threads);
+cross-process sharing of one audit file is not a supported topology.
 """
 
 from __future__ import annotations
@@ -51,12 +56,18 @@ import json
 import logging
 import os
 import stat
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Mapping
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
+
+_AUDIT_WRITE_LOCK = threading.Lock()
+"""Serializes session-audit appends so a multi-KB record (a max-cardinality
+cut) cannot tear under concurrent ``/session/begin`` writers (finding F9).
+In-process scope — the coordinator is single-process per host."""
 
 
 _SESSION_AUDIT_LOG_FILENAME = "session-audit.log"
@@ -126,16 +137,20 @@ def _append_record(coordinator_root: Path, record: dict) -> bool:
     _check_mode_or_warn(audit_path)
     payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
     # O_NOFOLLOW: refuse to follow a symlink planted at the audit path (a
-    # same-UID adversary could otherwise redirect the append). O_APPEND is
-    # atomic for small (<PIPE_BUF) payloads on POSIX. Mode 0o600 applies only
-    # on file CREATION; an existing file keeps its mode (verified above).
+    # same-UID adversary could otherwise redirect the append). Mode 0o600
+    # applies only on file CREATION; an existing file keeps its mode (verified
+    # above). The ``_AUDIT_WRITE_LOCK`` makes the whole open+write+close
+    # atomic against concurrent in-process appenders so a record larger than
+    # PIPE_BUF cannot tear a JSONL line (finding F9); ``os.write`` of a bounded
+    # record to a regular file is a single physical write under the lock.
     flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW
     try:
-        fd = os.open(audit_path, flags, _REQUIRED_MODE)
-        try:
-            os.write(fd, payload)
-        finally:
-            os.close(fd)
+        with _AUDIT_WRITE_LOCK:
+            fd = os.open(audit_path, flags, _REQUIRED_MODE)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
         return True
     except OSError as exc:
         logger.error(

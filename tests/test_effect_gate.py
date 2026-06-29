@@ -268,37 +268,58 @@ class TestHeldOnDrift:
     def test_atomic_commit_conflict_surfaced_when_cas_loses(
         self, tmp_path: Path, arm: str
     ) -> None:
-        """An OTHER read-set member moved (not the commit target), so the fast
-        pre-CAS re-validate does NOT short-circuit the target — the CAS runs and
-        loses at the pinned base, surfacing the shipped ``ConflictDetail`` verbatim
-        inside ``EffectHeld.conflict``."""
+        """The TRUE CAS-loss branch (finding F8): the pre-CAS re-validate sees the
+        commit target as UNCHANGED (so it does NOT short-circuit), the CAS then
+        RUNS and LOSES at the pinned base, and the shipped ``ConflictDetail`` is
+        surfaced verbatim inside ``EffectHeld.conflict``. ``conflict is not None``
+        is exactly what distinguishes this from the pre-CAS short-circuit path
+        (which the prior version of this test actually exercised, leaving the CAS
+        loss branch uncovered).
+
+        Determinism: the TOCTOU window between the pre-CAS re-validate and the CAS
+        is simulated by stubbing the FIRST ``_revalidate_cut`` to report no drift,
+        then letting the REAL CAS lose against the peer-moved target."""
         mem, sql = _lazy_registries(tmp_path)
         reg = mem if arm == "in_memory" else sql
         try:
             svc = CoordinatorService(reg)
             owner = uuid4()
-            a, b = uuid4(), uuid4()
+            a = uuid4()
             _register(reg, a, "plan.md", "PLAN-V1")
-            _register(reg, b, "budget.md", "BUDGET-V1")
+
+            real_revalidate = svc._revalidate_cut
+            calls = {"n": 0}
+
+            def fake_revalidate(cut):
+                calls["n"] += 1
+                # 1st call = the pre-CAS short-circuit check: hide the drift so the
+                # CAS actually runs. Later calls (post-conflict) are the REAL drift.
+                if calls["n"] == 1:
+                    return {}
+                return real_revalidate(cut)
+
+            svc._revalidate_cut = fake_revalidate
 
             def decide(view: SessionView) -> object:
-                # Move the COMMIT TARGET 'a' so the CAS at the pinned base loses,
-                # AND the pre-CAS short-circuit fires too. To exercise the CAS
-                # losing path itself, move 'a' but assert the conflict shape.
-                _peer_commit_cas(reg, a, uuid4(), expected=1, body="PLAN-PEER")
+                # The peer moves the commit target after the pin; the stubbed
+                # pre-CAS check hides it, so the CAS at pinned base v1 loses to v2.
+                _peer_commit_cas(reg, a, uuid4(), expected=1, body="PLAN-PEER-V2")
                 return view
 
             outcome = svc.effect_gate(
-                read_set=[a, b],
-                owner=owner,
-                decide=decide,
-                commit=(a, "PLAN-MINE"),
+                read_set=[a], owner=owner, decide=decide, commit=(a, "PLAN-MINE"),
             )
 
+            assert calls["n"] == 2  # pre-CAS (hidden) THEN post-conflict (real)
             assert isinstance(outcome, EffectHeld)
-            # Either path (pre-CAS short-circuit or CAS loss) HOLDS and names 'a'.
-            assert a in outcome.moved
-            assert outcome.moved[a] == (1, 2)
+            # DISTINGUISHING assertion: the CAS ran and lost, so the shipped
+            # ConflictDetail is carried through verbatim (short-circuit → None).
+            assert outcome.conflict is not None
+            assert outcome.conflict.reason == "version_mismatch"
+            # The post-conflict re-validate names the moved target.
+            assert outcome.moved.get(a) == (1, 2)
+            # The peer's bytes stand; mine never landed (no phantom write).
+            assert reg.get_artifact(a).version == 2
         finally:
             sql.close()
 

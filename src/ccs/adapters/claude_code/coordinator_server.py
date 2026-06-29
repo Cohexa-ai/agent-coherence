@@ -34,6 +34,7 @@ Lifecycle (spawn, port-file, idle-shutdown, sweep) lives in :mod:`lifecycle`
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import logging
@@ -2686,6 +2687,28 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
+def _session_read_content_fields(content: bytes | str) -> dict:
+    """Render a pinned body for the /session/read response so the client can
+    verify the hash CLIENT-SIDE (finding F5).
+
+    A lossy ``decode("utf-8", "replace")`` corrupted non-UTF-8 bodies — the
+    replacement chars made the client's hash unable to match the pinned
+    ``content_hash``. So: serve valid-UTF-8 (incl. all text) as a plain
+    ``content`` string (the unchanged, byte-stable wire shape), and EXACT-encode
+    non-UTF-8 bytes as base64 under an explicit ``content_encoding: "base64"``
+    flag (``content_b64``) so the round-trip is lossless. ``str`` content (the
+    in-memory registry's stored text) serves directly."""
+    if isinstance(content, bytes):
+        try:
+            return {"content": content.decode("utf-8")}
+        except UnicodeDecodeError:
+            return {
+                "content_b64": base64.b64encode(content).decode("ascii"),
+                "content_encoding": "base64",
+            }
+    return {"content": content}
+
+
 def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /session/read — serve an artifact's PINNED version from a session.
 
@@ -2699,7 +2722,9 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
 
     Responses:
       - coordinator-held pinned bytes (LAZY branch) → ``{ok: true, served:
-        "content", version, content, coordinator_epoch}``
+        "content", version, content, coordinator_epoch}``. Non-UTF-8 bytes are
+        served losslessly as ``{..., content_b64, content_encoding: "base64"}``
+        instead of a (lossy) ``content`` string, so the client hash round-trips.
       - bytes live in the data plane (EAGER branch) → ``{ok: true, served:
         "data_plane_deferred", version, content_hash, coordinator_epoch}``
       - typed rejection (no valid pin) → ``{ok: false, reason, coordinator_epoch}``
@@ -2744,18 +2769,14 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             )
             return {"ok": False, "reason": exc.reason}
         if isinstance(result, VersionedContent):
-            return {
+            resp = {
                 "ok": True,
                 "served": "content",
                 "version": result.version,
-                # KTD-13 honesty: serve the body bytes back so the data plane
-                # can read its pinned version; hashing happens client-side.
-                "content": (
-                    result.content.decode("utf-8", "replace")
-                    if isinstance(result.content, bytes) else result.content
-                ),
                 "coordinator_epoch": result.coordinator_epoch,
             }
+            resp.update(_session_read_content_fields(result.content))
+            return resp
         if isinstance(result, DataPlaneDeferredRead):
             return {
                 "ok": True,
@@ -2834,6 +2855,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         try:
             result = coordinator.service.session_commit(
                 session_token, artifact_id, content, caller=caller, issued_at_tick=now,
+                abort=abort,
             )
         except SessionInvalidated as exc:
             _session_audit.append_session_invalidate(
@@ -3280,6 +3302,12 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # bump a version the imminent shutdown then strands; the client retries
     # after the coordinator restarts.
     ("POST", "/hooks/post-edit-cas"),
+    # A snapshot session.commit is a version-bumping OCC write at the pinned base
+    # — same hazard as post-edit-cas: letting it land mid-migration bumps a
+    # version the imminent shutdown then strands. Reject it draining; the client
+    # opens a fresh session + re-reads + re-commits after the restart. (begin /
+    # read / heartbeat are non-mutating and stay out of this set.)
+    ("POST", "/session/commit"),
 }
 
 

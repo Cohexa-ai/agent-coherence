@@ -170,6 +170,14 @@ class ArtifactRegistry:
         # in-memory pins do NOT survive a restart (R6; restart-survival is
         # sqlite-only), which the parity harness asserts rather than masks.
         self._session_pins: dict[str, dict[UUID, int]] = {}
+        # Durable owner-binding MIRROR (SB-17 / TX-1, R13/R6/R14):
+        # ``{session_token: (owner, created_at_tick)}``. Symmetric with
+        # :attr:`SqliteArtifactRegistry`'s ``session_meta`` table for API parity,
+        # but PROCESS-SCOPED like the pins — a fresh in-memory instance (the
+        # "restart") has none, so an in-memory session never survives a restart
+        # (the asserted divergence). Lets the sweep enumerate sessions uniformly
+        # across both registries via :meth:`all_session_meta`.
+        self._session_meta: dict[str, tuple[UUID, int]] = {}
         # Cross-artifact capture lock (Unit 2). This registry is otherwise
         # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
         # docstrings). GIL atomicity is per single dict ACCESS, which is
@@ -666,7 +674,12 @@ class ArtifactRegistry:
         return updated, invalidated
 
     def capture_version_vector(
-        self, read_set: "Iterable[UUID]", session_token: str
+        self,
+        read_set: "Iterable[UUID]",
+        session_token: str,
+        *,
+        owner: "UUID | None" = None,
+        created_at_tick: int | None = None,
     ) -> CaptureResult:
         """Atomically pin a consistent multi-artifact CUT (SB-17 / TX-1, Unit 2 /
         R1). Written fresh from the contract — parity with
@@ -737,14 +750,47 @@ class ArtifactRegistry:
             # Insert the pins atomically with the read (same lock hold) so the
             # exemptions seam sees the full cut the instant it becomes live.
             self._session_pins[session_token] = dict(cut)
+            # Mirror the durable owner-binding (R13/R6/R14) so the sweep can
+            # enumerate sessions uniformly. Recorded even for an empty cut, and
+            # only when the caller supplies an owner (direct test captures pass
+            # none and create no session-meta entry).
+            if owner is not None:
+                self._session_meta[session_token] = (owner, int(created_at_tick or 0))
             return cut
 
     def release_session(self, session_token: str) -> None:
-        """Drop a session's pins so its pinned versions become collectible again
-        (Unit 2 / R4). Idempotent — releasing an unknown/already-released token
-        is a no-op (no raise), mirroring the sqlite ``DELETE`` semantics."""
+        """Drop a session's pins AND its owner-binding mirror so its pinned
+        versions become collectible again (Unit 2 / R4). Idempotent — releasing
+        an unknown/already-released token is a no-op (no raise), mirroring the
+        sqlite ``DELETE`` semantics."""
         with self._capture_lock:
             self._session_pins.pop(session_token, None)
+            self._session_meta.pop(session_token, None)
+
+    def get_session_meta(self, session_token: str) -> "tuple[UUID, int] | None":
+        """Return ``(owner, created_at_tick)`` for ``session_token`` or ``None``
+        (SB-17 / TX-1, R13/R6/R14). Parity with
+        :meth:`SqliteArtifactRegistry.get_session_meta`; process-scoped here, so a
+        fresh in-memory instance always returns ``None`` (in-memory sessions do
+        not survive a restart — the asserted divergence)."""
+        with self._capture_lock:
+            return self._session_meta.get(session_token)
+
+    def all_session_meta(self) -> "dict[str, tuple[UUID, int]]":
+        """Return ``{session_token: (owner, created_at_tick)}`` for every live
+        session (SB-17 / TX-1, R6/R14). Parity with
+        :meth:`SqliteArtifactRegistry.all_session_meta`; the sweep enumerates this
+        UNION'd with its in-memory token set (identical here, since both are
+        process-scoped)."""
+        with self._capture_lock:
+            return dict(self._session_meta)
+
+    def session_count(self) -> int:
+        """Return the number of live sessions (SB-17 / TX-1, R14). Parity with
+        :meth:`SqliteArtifactRegistry.session_count`; process-scoped, so a fresh
+        instance is 0 (no durable survivors)."""
+        with self._capture_lock:
+            return len(self._session_meta)
 
     def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
         """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,

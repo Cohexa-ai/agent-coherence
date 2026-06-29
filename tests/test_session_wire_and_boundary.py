@@ -432,3 +432,189 @@ def test_audit_emits_begin_commit_invalidate_content_free(coordinator, client: _
     assert set(commit_rec.keys()) == {
         "ts", "event", "session", "artifact", "pinned_version", "committed_version",
     }
+
+
+# ----------------------------------------------------------------------
+# F1 — clock-domain basis: the sweep tick MUST share the wall-clock basis the
+#      heartbeat handlers seed from, else the sweep never reaps over HTTP.
+# ----------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from ccs.adapters.claude_code import lifecycle as _lifecycle  # noqa: E402
+from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
+    _session_read_content_fields,
+    monotonic_seconds,
+)
+
+
+def test_monotonic_seconds_is_wall_clock_not_monotonic() -> None:
+    # The shared tick basis — handlers seed created_at + heartbeats from this, and
+    # (after F1) the sweep reads it too — MUST be wall-clock int(time.time()), NOT
+    # int(time.monotonic()) (boot-relative, ~1.7e9 below wall-clock). The F1 bug
+    # was the sweep on the monotonic basis while seeds used wall-clock, so the
+    # staleness diff was permanently negative and nothing reaped over HTTP.
+    now = monotonic_seconds()
+    assert abs(now - int(time.time())) <= 2
+    assert abs(now - int(time.monotonic())) > 1_000_000
+
+
+def test_sweep_loop_uses_wall_clock_basis() -> None:
+    # Drive ONE iteration of the REAL _sweep_loop with stubs and capture the tick
+    # it passes to the enforce_* sweeps. It must be wall-clock (== monotonic_seconds
+    # basis) so the arithmetic against a wall-clock-seeded lease is positive. This
+    # fails if anyone reverts the sweep tick to int(time.monotonic()).
+    captured: dict = {}
+    coord = SimpleNamespace()
+
+    class _Svc:
+        def enforce_transient_timeouts(self, *, current_tick, timeout_ticks):
+            captured["transient"] = current_tick
+            return 0
+
+        def enforce_stable_grant_timeouts(
+            self, *, current_tick, heartbeat_timeout_ticks, max_hold_ticks, on_reclaim
+        ):
+            captured["grant"] = current_tick
+            return 0
+
+        def enforce_session_liveness(self, *, current_tick, heartbeat_timeout_ticks):
+            captured["session"] = current_tick
+            coord.shutting_down = True  # exit the loop after one iteration
+            return 0
+
+    class _Reg:
+        def evict_stale_notices(self, *, max_age_sec):
+            return 0
+
+        def record_preemption_notice(self, **kw):
+            pass
+
+    coord.shutting_down = False
+    coord.service = _Svc()
+    coord.registry = _Reg()
+    entry = SimpleNamespace(coordinator=coord)
+    cfg = SimpleNamespace(
+        sweep_interval_sec=0.01,
+        transient_timeout_sec=5,
+        grant_heartbeat_timeout_sec=120,
+        grant_max_hold_sec=300,
+        notice_evict_max_age_sec=600,
+    )
+
+    _lifecycle._sweep_loop(entry, cfg)
+
+    assert "session" in captured
+    # Wall-clock basis (shared with the heartbeat seeds) — NOT monotonic.
+    assert abs(captured["session"] - int(time.time())) <= 2
+    assert abs(captured["session"] - int(time.monotonic())) > 1_000_000
+    # All three sweeps ride ONE now_tick per iteration.
+    assert captured["transient"] == captured["grant"] == captured["session"]
+
+
+# ----------------------------------------------------------------------
+# F5 — /session/read serves non-UTF-8 bytes losslessly (base64), not a lossy
+#      replace-decode that would break the client-side hash round-trip.
+# ----------------------------------------------------------------------
+
+
+def test_read_content_fields_text_serves_plain_string() -> None:
+    assert _session_read_content_fields("plain text") == {"content": "plain text"}
+    assert _session_read_content_fields("héllo".encode("utf-8")) == {"content": "héllo"}
+
+
+def test_read_content_fields_non_utf8_serves_base64() -> None:
+    raw = b"\xff\xfe\x00\x01PNG\x89"  # not valid UTF-8
+    import base64 as _b64
+
+    fields = _session_read_content_fields(raw)
+    assert fields["content_encoding"] == "base64"
+    assert "content" not in fields
+    # Lossless round-trip — the client can reconstruct EXACT bytes (so its hash
+    # of the body matches the pinned content_hash; a lossy decode could not).
+    assert _b64.b64decode(fields["content_b64"]) == raw
+
+
+# ----------------------------------------------------------------------
+# Input validation — malformed session request bodies return 400 (not 500/200).
+# ----------------------------------------------------------------------
+
+
+def test_begin_non_list_read_set_returns_400(client: _Client) -> None:
+    status, _body = client.post(
+        "/session/begin", {"session_id": _sid("badrs"), "read_set": "not-a-list"}
+    )
+    assert status == 400
+
+
+def test_begin_non_string_read_set_member_returns_400(client: _Client) -> None:
+    status, _body = client.post(
+        "/session/begin", {"session_id": _sid("badrs2"), "read_set": [123]}
+    )
+    assert status == 400
+
+
+def test_read_missing_session_token_returns_400(client: _Client) -> None:
+    status, _body = client.post(
+        "/session/read", {"session_id": _sid("notok"), "path": "x.md"}
+    )
+    assert status == 400
+
+
+def test_read_empty_session_token_returns_400(client: _Client) -> None:
+    status, _body = client.post(
+        "/session/read",
+        {"session_id": _sid("emptytok"), "session_token": "", "path": "x.md"},
+    )
+    assert status == 400
+
+
+def test_commit_non_string_content_returns_400(client: _Client) -> None:
+    sid = _sid("badcontent")
+    begin = _begin(client, sid, ["bc.md"])
+    token = begin["session_token"]
+    status, _body = client.post(
+        "/session/commit",
+        {"session_id": sid, "session_token": token, "path": "bc.md", "content": 123},
+    )
+    assert status == 400
+
+
+# ----------------------------------------------------------------------
+# F7 — /session/commit is rejected (503) on a draining coordinator, like the
+#      other version-bumping writes, so a commit can't land and be stranded.
+# ----------------------------------------------------------------------
+
+
+def test_session_commit_rejected_while_draining(client: _Client, coordinator) -> None:
+    sid = _sid("drain")
+    begin = _begin(client, sid, ["drain.md"])
+    token = begin["session_token"]
+    # Enter migration-draining (what /admin/prepare-for-migration flips).
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(
+            "/session/commit",
+            {"session_id": sid, "session_token": token, "path": "drain.md", "content": "x"},
+        )
+        # A version-bumping write on a draining coordinator must be REJECTED (503),
+        # not allowed to land and be stranded by the imminent shutdown.
+        assert status == 503, body
+    finally:
+        coordinator._migration_draining = False
+
+
+def test_session_read_still_served_while_draining(client: _Client, coordinator) -> None:
+    # Non-mutating /session/read is NOT in the rejected set — it keeps serving so
+    # in-flight readers complete during the drain.
+    sid = _sid("drain-read")
+    begin = _begin(client, sid, ["dr.md"])
+    token = begin["session_token"]
+    coordinator._migration_draining = True
+    try:
+        status, _body = client.post(
+            "/session/read", {"session_id": sid, "session_token": token, "path": "dr.md"}
+        )
+        assert status == 200
+    finally:
+        coordinator._migration_draining = False

@@ -42,6 +42,7 @@ from ccs.coordinator.service import (
 )
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
+    SESSION_CAP_EXCEEDED_REASON,
     SESSION_COMMIT_REASONS,
     SESSION_INVALIDATED_REASON,
     SESSION_NOT_FOUND_REASON,
@@ -55,6 +56,7 @@ from ccs.core.types import (
     SessionReadRejection,
     SnapshotSession,
     VersionedContent,
+    VersionedReadRejection,
 )
 
 # Timing constants — fixed logical ticks (no wall-clock sleeps).
@@ -606,3 +608,196 @@ class TestGcRaceFailsClosedNotWrongBytes:
         # NEVER a wrong-bytes VersionedContent; degrades to the typed deferral.
         assert isinstance(r, DataPlaneDeferredRead)
         assert r.version == 1
+
+
+# ===========================================================================
+# F3 (Option B) — durable owner-binding: a sqlite session survives a restart
+#     WITH its owner, so R6 (survival) and R13 (owner isolation) BOTH hold;
+#     a durable-only survivor is bounded by the absolute-age ceiling (R14).
+# ===========================================================================
+
+
+def _lazy_sqlite(tmp_path: Path, name: str) -> SqliteArtifactRegistry:
+    return SqliteArtifactRegistry(
+        tmp_path / name, retain_versions=True, retention_policy=RetentionPolicy(max_versions=8)
+    )
+
+
+class TestDurableOwnerSurvivesRestart:
+    def test_foreign_caller_rejected_after_restart(self, tmp_path: Path) -> None:
+        # The R13 hole F3 found: post-restart the in-memory owner-binding is wiped,
+        # so a leaked-token foreign caller could read a SURVIVED cut. With the
+        # durable owner, the legit owner is still served (R6) and the foreigner is
+        # rejected (R13).
+        db_name = "durable_owner.db"
+        owner, attacker, a = uuid4(), uuid4(), uuid4()
+        sql1 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            _register(sql1, a, "plan.md", "OWNED-V1")
+            tok = CoordinatorService(sql1).begin_session(
+                read_set=[a], owner=owner
+            ).session_token
+        finally:
+            sql1.close()
+        # Restart: a fresh service over the same db (in-memory owner-binding gone).
+        sql2 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            svc2 = CoordinatorService(sql2)
+            # R6: the legitimate owner is still served from the survived cut.
+            served = svc2.session_read(tok, a, caller=owner)
+            assert isinstance(served, VersionedContent)
+            assert served.content == "OWNED-V1"
+            # R13: a leaked-token FOREIGN caller is rejected (durable fallback).
+            with pytest.raises(SessionInvalidated):
+                svc2.session_read(tok, a, caller=attacker)
+            with pytest.raises(SessionInvalidated):
+                svc2.session_commit(tok, a, "ATTACKER", caller=attacker)
+            # ...and cannot keep the session alive via heartbeat either.
+            assert svc2.record_session_heartbeat(
+                session_token=tok, owner=attacker, now_tick=10
+            ) is False
+        finally:
+            sql2.close()
+
+    def test_pins_without_owner_fail_closed(self, tmp_path: Path) -> None:
+        # Defensive: a pins-present-but-ownerless token (the atomic capture never
+        # produces this) must FAIL CLOSED — no owner means no way to authorize.
+        reg = ArtifactRegistry(retain_versions=True)
+        svc = CoordinatorService(reg)
+        owner, a = uuid4(), uuid4()
+        _register(reg, a, "plan.md", "V1")
+        tok = svc.begin_session(read_set=[a], owner=owner).session_token
+        # Force the orphan state: pins present, BOTH owner tiers cleared.
+        svc._session_owners.pop(tok)
+        reg._session_meta.pop(tok)
+        assert reg.get_session_cut(tok) is not None
+        with pytest.raises(SessionInvalidated):
+            svc.session_read(tok, a, caller=owner)
+
+    def test_durable_only_session_bounded_by_age_ceiling(self, tmp_path: Path) -> None:
+        # A survivor whose owner never returns is invisible to an in-memory-only
+        # sweep; the UNION sweep reaps it at the absolute-age ceiling so its pins
+        # do not starve GC forever (the F3 GC-starvation half).
+        db_name = "durable_age.db"
+        owner, a = uuid4(), uuid4()
+        caps = SessionCapsConfig(absolute_age_ticks=100)
+        sql1 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            _register(sql1, a, "plan.md", "V1")
+            tok = CoordinatorService(sql1, session_caps=caps).begin_session(
+                read_set=[a], owner=owner, created_at_tick=0
+            ).session_token
+        finally:
+            sql1.close()
+        sql2 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            svc2 = CoordinatorService(sql2, session_caps=caps)
+            # Within the ceiling: the durable-only survivor is NOT reaped (R6) —
+            # heartbeat-staleness must NOT apply to a leaseless survivor.
+            assert svc2.enforce_session_liveness(
+                current_tick=99, heartbeat_timeout_ticks=_HB_TIMEOUT
+            ) == 0
+            assert isinstance(svc2.session_read(tok, a, caller=owner), VersionedContent)
+            # Past the ceiling: the union sweep reaps it (R14).
+            assert svc2.enforce_session_liveness(
+                current_tick=100, heartbeat_timeout_ticks=_HB_TIMEOUT
+            ) == 1
+            assert svc2.registry.get_session_cut(tok) is None
+            assert svc2.registry.get_session_meta(tok) is None
+            r = svc2.session_read(tok, a, caller=owner)
+            assert isinstance(r, SessionReadRejection)
+            assert r.reason == SESSION_INVALIDATED_REASON
+        finally:
+            sql2.close()
+
+    def test_owner_heartbeat_rehydrates_after_restart(self, tmp_path: Path) -> None:
+        # The owner's first post-restart heartbeat falls back to the durable owner
+        # and REHYDRATES in-memory state (owner + ORIGINAL creation tick + lease).
+        db_name = "rehydrate.db"
+        owner, a = uuid4(), uuid4()
+        caps = SessionCapsConfig(absolute_age_ticks=10_000)
+        sql1 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            _register(sql1, a, "plan.md", "V1")
+            tok = CoordinatorService(sql1, session_caps=caps).begin_session(
+                read_set=[a], owner=owner, created_at_tick=0
+            ).session_token
+        finally:
+            sql1.close()
+        sql2 = _lazy_sqlite(tmp_path, db_name)
+        try:
+            svc2 = CoordinatorService(sql2, session_caps=caps)
+            assert tok not in svc2._session_owners  # wiped by the restart
+            assert svc2.record_session_heartbeat(
+                session_token=tok, owner=owner, now_tick=500
+            ) is True
+            # Rehydrated into the in-memory maps; creation tick is the ORIGINAL 0
+            # (the absolute-age ceiling is never reset by a restart).
+            assert tok in svc2._session_owners
+            assert svc2._session_created[tok] == 0
+            # Fresh lease -> not reaped within the heartbeat window.
+            assert svc2.enforce_session_liveness(
+                current_tick=500 + _HB_TIMEOUT - 1, heartbeat_timeout_ticks=_HB_TIMEOUT
+            ) == 0
+        finally:
+            sql2.close()
+
+
+class TestAtomicSessionCap:
+    """F4: begin_session's cap-check + insert is atomic under ``_session_lock``,
+    so the live count never overshoots ``max_sessions`` — including under
+    concurrent begins (the bug the lock fixes is a check-then-act TOCTOU)."""
+
+    def test_cap_enforced_exactly_sequential(self) -> None:
+        # Cap correctness on the sequential path (does NOT exercise the lock).
+        reg = ArtifactRegistry(retain_versions=True)
+        svc = CoordinatorService(reg, session_caps=SessionCapsConfig(max_sessions=3))
+        owner, a = uuid4(), uuid4()
+        _register(reg, a, "plan.md", "V1")
+        for _ in range(3):
+            assert isinstance(
+                svc.begin_session(read_set=[a], owner=owner), SnapshotSession
+            )
+        over = svc.begin_session(read_set=[a], owner=owner)
+        assert isinstance(over, VersionedReadRejection)
+        assert over.reason == SESSION_CAP_EXCEEDED_REASON
+        assert svc.registry.session_count() == 3
+
+    def test_concurrent_begins_never_overshoot_cap(self) -> None:
+        # The REAL F4 regression: many threads race begin_session at the cap
+        # boundary. The check-then-act (count < cap, then insert) is a TOCTOU that
+        # without _session_lock lets multiple threads pass the check before any
+        # insert, overshooting the cap. With the lock, EXACTLY cap begins win,
+        # deterministically. Would fail (overshoot) if the lock were removed.
+        import threading
+
+        reg = ArtifactRegistry(retain_versions=True)
+        cap = 8
+        svc = CoordinatorService(reg, session_caps=SessionCapsConfig(max_sessions=cap))
+        owner, a = uuid4(), uuid4()
+        _register(reg, a, "plan.md", "V1")
+
+        n_threads = 32
+        start = threading.Barrier(n_threads)
+        results: list = []
+        guard = threading.Lock()
+
+        def worker() -> None:
+            start.wait()  # release all threads together to maximize contention
+            r = svc.begin_session(read_set=[a], owner=owner)
+            with guard:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        wins = [r for r in results if isinstance(r, SnapshotSession)]
+        rejects = [r for r in results if isinstance(r, VersionedReadRejection)]
+        assert len(wins) == cap, f"cap overshoot: {len(wins)} wins > {cap}"
+        assert len(rejects) == n_threads - cap
+        assert all(r.reason == SESSION_CAP_EXCEEDED_REASON for r in rejects)
+        assert svc.registry.session_count() == cap
+        assert len(svc._session_owners) == cap

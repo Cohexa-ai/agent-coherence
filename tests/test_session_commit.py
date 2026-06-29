@@ -47,6 +47,7 @@ from ccs.core.exceptions import (
     SESSION_NOT_FOUND_REASON,
     STALE_READ_GENERATION_REASON,
     CoherenceError,
+    WatchdogAbandoned,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
@@ -619,5 +620,62 @@ class TestExactlyOneValidatedCommit:
             assert second.current_version == 2
             # Only ONE commit landed: still at v2.
             assert reg.get_artifact(a).version == 2
+        finally:
+            sql.close()
+
+
+# ===========================================================================
+# F2 — watchdog abort threads into commit_cas: a timed-out commit fails closed
+#      at the registry write lock instead of landing as a phantom write.
+# ===========================================================================
+
+
+class TestWatchdogAbortFailsClosed:
+    """F2: ``session_commit`` threads its ``abort`` Event into ``commit_cas``'s
+    ``abort_guard`` (A6). A watchdog that already timed out (abort SET) makes the
+    late commit fail closed AT the registry write lock — never a phantom write
+    behind a client that already got a degraded ``commit_unconfirmed``."""
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_preset_abort_fails_closed_no_mutation(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        import threading
+
+        mem, sql = _registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner, a = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "V1")
+            tok = svc.begin_session(read_set=[a], owner=owner).session_token
+
+            abort = threading.Event()
+            abort.set()  # the handler watchdog already timed out + degraded
+            with pytest.raises(WatchdogAbandoned):
+                svc.session_commit(tok, a, "PHANTOM", caller=owner, abort=abort)
+            # No phantom write: the artifact was NOT mutated.
+            assert reg.get_artifact(a).version == 1
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_unset_abort_commits_normally(self, tmp_path: Path, arm: str) -> None:
+        # An UNSET abort (watchdog did not fire) commits normally — threading the
+        # abort must not regress the happy path.
+        import threading
+
+        mem, sql = _registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner, a = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "V1")
+            tok = svc.begin_session(read_set=[a], owner=owner).session_token
+            result = svc.session_commit(
+                tok, a, "V2", caller=owner, abort=threading.Event()
+            )
+            assert isinstance(result, tuple)
+            assert result[0].version == 2
         finally:
             sql.close()
