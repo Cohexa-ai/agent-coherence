@@ -26,8 +26,10 @@ from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
     RETENTION_OFF_REASON,
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+    SESSION_CAP_EXCEEDED_REASON,
     SESSION_INVALIDATED_REASON,
     SESSION_NOT_FOUND_REASON,
+    SESSION_READ_SET_TOO_LARGE_REASON,
     UNKNOWN_ARTIFACT_REASON,
     CoherenceError,
     OccCallerTransientError,
@@ -194,10 +196,64 @@ def validate_crash_recovery_config(
     )
 
 
+@dataclass(frozen=True)
+class SessionCapsConfig:
+    """Resource bounds for snapshot sessions (SB-17 / TX-1, Unit 7 / R14).
+
+    Security-calibrated DEFAULTS — placeholder-but-sane, NOT post-hoc tuning.
+    Each cap bounds a distinct snapshot-session DoS surface from the plan's
+    threat model; the defaults are the spec's stated values (R14). A frozen
+    dataclass mirroring :class:`CrashRecoveryConfig`'s shape so a deployment can
+    tighten the bounds (or a test set tiny ones) without touching the sweep.
+
+    Attributes:
+        max_sessions: Maximum CONCURRENT live sessions. ``begin_session`` rejects
+            opening an (N+1)th session with ``session_cap_exceeded`` (no token
+            minted, no cut pinned). Bounds the many-sessions GC-starvation DoS
+            (an attacker opening unboundedly many sessions to hold versions back
+            from GC; threat-model #2). Default 256.
+        max_read_set_cardinality: Maximum artifacts in a single ``read_set``.
+            ``begin_session`` rejects a larger read-set with ``read_set_too_large``
+            (no token minted, no cut pinned). Bounds the enormous-single-read-set
+            GC-starvation DoS (threat-model #2). Default 64.
+        absolute_age_ticks: HARD age ceiling, in logical ticks, SEPARATE from the
+            heartbeat lease. A session older than this (``current_tick -
+            created_at_tick >= absolute_age_ticks``) is reaped by
+            :meth:`CoordinatorService.enforce_session_liveness` EVEN WHEN ITS
+            HEARTBEAT IS LIVE — a live heartbeat must NOT exempt it. Bounds the
+            heartbeat-spoofing-past-the-ceiling DoS (an attacker keeping a stale
+            cut alive indefinitely via heartbeats; threat-model #3). The plan's
+            ``absolute_age_seconds=3600`` expressed in the coordinator's logical
+            tick unit (the runtime is tick-driven, no wall clock); default 3600.
+    """
+
+    max_sessions: int = 256
+    max_read_set_cardinality: int = 64
+    absolute_age_ticks: int = 3600
+
+    def __post_init__(self) -> None:
+        # Fail fast on a nonsensical cap (caller misuse), mirroring the
+        # house "validate at the boundary" rule. A cap < 1 would reject every
+        # session / read-set or never reap — both are configuration bugs.
+        if self.max_sessions < 1:
+            raise ValueError("max_sessions must be >= 1")
+        if self.max_read_set_cardinality < 1:
+            raise ValueError("max_read_set_cardinality must be >= 1")
+        if self.absolute_age_ticks < 1:
+            raise ValueError("absolute_age_ticks must be >= 1")
+
+
 # Snapshot session token entropy (SB-17 / TX-1, Unit 2 / R13). 32 bytes →
 # ~43 url-safe chars; unguessable, server-minted, never client-supplied. The
 # timing-safe compare + per-call validation that consume it are Unit 7.
 _SESSION_TOKEN_BYTES = 32
+
+# Placeholder artifact id for a ``begin_session`` cap rejection (Unit 7 / R14):
+# a cap rejection (``session_cap_exceeded`` / ``read_set_too_large``) is about the
+# WHOLE call, not any single artifact, and must leak NO member id. The
+# ``VersionedReadRejection`` carrier requires an ``artifact_id`` field, so the
+# nil UUID stands in — the consumer matches on ``reason``, never this field.
+_NIL_UUID = UUID(int=0)
 
 
 # Server-minted session-token SHAPE (SB-17 / TX-1, Unit 5 / R4). A
@@ -263,9 +319,18 @@ class SessionView:
     is byte-source-independent.
     """
 
-    def __init__(self, service: "CoordinatorService", session_token: str) -> None:
+    def __init__(
+        self,
+        service: "CoordinatorService",
+        session_token: str,
+        owner: UUID,
+    ) -> None:
         self._service = service
         self._token = session_token
+        # The session's OWNER — threaded through so the view's pinned reads pass
+        # the per-call owner validation (Unit 7 / R13). The view reads the
+        # session's OWN cut, so the caller IS the owner by construction.
+        self._owner = owner
 
     def read(
         self, artifact_id: UUID
@@ -274,7 +339,9 @@ class SessionView:
         session or an un-pinned artifact (a typed rejection → raised
         :class:`SessionInvalidated` / ``CoherenceError``) so a decision never runs
         on an invalid cut."""
-        result = self._service.session_read(self._token, artifact_id)
+        result = self._service.session_read(
+            self._token, artifact_id, caller=self._owner
+        )
         if isinstance(result, SessionReadRejection):
             if result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON:
                 # Caller misuse: reading outside the pinned read-set. Not a dead
@@ -294,16 +361,37 @@ class SessionView:
 class CoordinatorService:
     """Control-plane service for artifact read/write/commit synchronization."""
 
-    def __init__(self, registry: ArtifactRegistry):
+    def __init__(
+        self,
+        registry: ArtifactRegistry,
+        *,
+        session_caps: SessionCapsConfig | None = None,
+    ):
         self.registry = registry
+        # Snapshot session resource bounds (SB-17 / TX-1, Unit 7 / R14). Defaults
+        # to the security-calibrated :class:`SessionCapsConfig` (max_sessions,
+        # max_read_set_cardinality, absolute_age_ticks); a deployment or test may
+        # pass tighter caps. Constructor param so the bounds are configurable
+        # without touching the sweep (mirrors how ``crash_recovery`` knobs are
+        # threaded into ``enforce_stable_grant_timeouts``).
+        self.session_caps = session_caps or SessionCapsConfig()
         # Snapshot session owner-binding (SB-17 / TX-1, Unit 2 / R13):
-        # ``{session_token: owner_id}``. Populated at ``begin_session`` mint;
-        # the per-CALL read/commit validation that READS it (a foreign owner →
-        # SessionInvalidated, timing-safe compare) is Unit 7. Unit 5 owner-binds
-        # ONLY the HEARTBEAT path (``record_session_heartbeat``). Service-scoped
-        # (a restart drops the bindings — the durable pins survive on sqlite, but
-        # re-validating a post-restart token is the Unit 5 liveness concern).
+        # ``{session_token: owner_id}``. Populated at ``begin_session`` mint; the
+        # per-CALL read/commit validation that READS it (a foreign owner →
+        # SessionInvalidated, timing-safe compare) is Unit 7
+        # (:meth:`_validate_session_owner`). Unit 5 owner-binds the HEARTBEAT path
+        # (``record_session_heartbeat``). Service-scoped (a restart drops the
+        # bindings — the durable pins survive on sqlite, but re-validating a
+        # post-restart token is the Unit 5 liveness concern).
         self._session_owners: dict[str, UUID] = {}
+        # Snapshot session CREATION tick (SB-17 / TX-1, Unit 7 / R14):
+        # ``{session_token: created_at_tick}``. The absolute-age ceiling reads
+        # THIS — NOT the heartbeat lease — so a session older than
+        # ``session_caps.absolute_age_ticks`` is reaped EVEN with a fresh
+        # heartbeat (a live heartbeat must not exempt the hard ceiling,
+        # threat-model #3). Seeded at ``begin_session`` alongside the lease;
+        # dropped on reap/release with the owner + lease.
+        self._session_created: dict[str, int] = {}
         # Session heartbeat lease (SB-17 / TX-1, Unit 5 / R4):
         # ``{session_token: last_heartbeat_tick}``. Keyed by the server-minted
         # SESSION TOKEN, NOT the MESI ``agent_id`` — a snapshot session is NOT a
@@ -616,14 +704,46 @@ class CoordinatorService:
             :class:`VersionedReadRejection` (``unknown_artifact``) — no session
             opened, no pins held.
         """
+        # Resource caps (Unit 7 / R14) — enforced BEFORE any token mint or pin
+        # insert, so a rejected ``begin_session`` leaves NO half-open session
+        # (no owner binding, no lease, no pins). Typed RETURNS (the
+        # ``VersionedReadRejection`` carrier ``begin_session`` already produces),
+        # never an exception — the caps are a bounded-blast-radius surface, not a
+        # crash. ``read_set`` is materialized ONCE here (it may be a one-shot
+        # iterable) so the cardinality check and the capture see the same set.
+        read_set = list(read_set)
+        epoch = self.registry.coordinator_epoch
+        if len(read_set) > self.session_caps.max_read_set_cardinality:
+            # The enormous-single-read-set GC-starvation bound (threat-model #2).
+            # No artifact id is leaked (artifact_id=None-equivalent uses a nil
+            # UUID); the rejection is about the CARDINALITY, not any member.
+            return VersionedReadRejection(
+                reason=SESSION_READ_SET_TOO_LARGE_REASON,
+                artifact_id=_NIL_UUID,
+                requested_version=len(read_set),
+                current_version=self.session_caps.max_read_set_cardinality,
+                coordinator_epoch=epoch,
+            )
+        if len(self._session_owners) >= self.session_caps.max_sessions:
+            # The many-sessions GC-starvation bound (threat-model #2). Count the
+            # LIVE owner-bindings (one per open session); an (N+1)th is rejected
+            # until a session is released or the liveness sweep reaps a stale one.
+            return VersionedReadRejection(
+                reason=SESSION_CAP_EXCEEDED_REASON,
+                artifact_id=_NIL_UUID,
+                requested_version=len(self._session_owners),
+                current_version=self.session_caps.max_sessions,
+                coordinator_epoch=epoch,
+            )
+
         session_token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
-        # Owner-bind at mint (R13). Recorded BEFORE the capture so a concurrent
-        # later-unit validator never sees a pinned-but-unowned token; dropped
-        # again if the capture rejects. NOTE for Unit 7 (the per-call validator):
-        # the INVERSE window also exists — between this line and the capture
-        # below, the token is owned but PINLESS. Unit 7 must treat an owned-but-
-        # pinless token as not-yet-live (or read owner-binding + pins together),
-        # never as a valid empty session.
+        # Owner-bind at mint (R13). Recorded BEFORE the capture so the Unit-7
+        # per-call validator never sees a pinned-but-unowned token; dropped again
+        # if the capture rejects. The INVERSE window — between this line and the
+        # capture below, the token is owned but PINLESS — is handled by Unit 7's
+        # :meth:`_validate_session_owner`: it reads owner-binding AND the cut, and
+        # treats an owned-but-pinless token as NOT-yet-live (fail closed,
+        # ``SessionInvalidated``), never a valid empty session.
         self._session_owners[session_token] = owner
         result = self.registry.capture_version_vector(read_set, session_token)
         if isinstance(result, VersionedReadRejection):
@@ -637,6 +757,10 @@ class CoordinatorService:
         # ``granted_at_tick``. Recorded only on a SUCCESSFUL capture (a rejected
         # capture returned above, leaving no lease and no owner binding).
         self._session_heartbeats[session_token] = created_at_tick
+        # Record the CREATION tick for the absolute-age ceiling (Unit 7 / R14).
+        # The ceiling reads THIS, not the heartbeat lease, so a live-heartbeat
+        # session past the ceiling is still reaped (threat-model #3).
+        self._session_created[session_token] = created_at_tick
         retain_versions, _policy = self.registry.retention_meta()
         return SnapshotSession(
             session_token=session_token,
@@ -649,6 +773,8 @@ class CoordinatorService:
         self,
         session_token: str,
         artifact_id: UUID,
+        *,
+        caller: UUID,
     ) -> VersionedContent | DataPlaneDeferredRead | SessionReadRejection:
         """Serve an artifact's PINNED version from a live snapshot session — the
         non-mutating read from the consistent cut (SB-17 / TX-1, Unit 3 / R2).
@@ -702,18 +828,25 @@ class CoordinatorService:
           data plane for the bytes" signal. The actual eager byte serve is
           **Unit 6 (CoherentVolume)**; this method never reads the data plane.
 
-        Validation (Unit 3 scope): the token must have a live pin for
+        Validation: the caller must be the session OWNER (Unit 7 / R13,
+        timing-safe — see ``caller`` below) AND the token must have a live pin for
         ``artifact_id``. An unknown/released token → ``session_not_found``; a live
         token whose cut lacks ``artifact_id`` → ``artifact_not_in_cut`` — both
         typed :class:`~ccs.core.types.SessionReadRejection`, NEVER a live-HEAD
-        fall-through. (Per-call OWNER-binding validation — a foreign owner reading
-        another's cut — is Unit 7; the heartbeat-liveness ``session_invalidated``
-        axis is Unit 5. Unit 3 does the token-has-pin check only.)
+        fall-through. A FOREIGN caller or an OWNED-BUT-PINLESS token RAISES
+        :class:`SessionInvalidated` (Unit 7, validated BEFORE the pin lookup); the
+        heartbeat-liveness ``session_invalidated`` axis is Unit 5.
 
         Args:
             session_token: The server-minted session identity from
                 ``begin_session``.
             artifact_id: The artifact to read at its pinned version.
+            caller: The CALLER'S identity (the MESI agent/process label). Must be
+                the session's bound owner — validated timing-safe
+                (:func:`hmac.compare_digest`) against the owner bound at
+                ``begin_session``; a foreign caller fails closed
+                (:class:`SessionInvalidated`). Required (R13): a sibling MUST NOT
+                read another's cut.
 
         Returns:
             :class:`VersionedContent` (coordinator-held pinned bytes),
@@ -723,11 +856,15 @@ class CoordinatorService:
         """
         epoch = self.registry.coordinator_epoch
 
-        # Unit 7: per-call OWNER-binding validation goes HERE — read
-        # ``_session_owners[session_token]`` and reject a foreign caller
-        # (timing-safe compare) with the Unit-5 ``session_invalidated`` reason
-        # BEFORE the pin lookup. Unit 3 does the token-has-pin check only.
+        # Per-call OWNER-binding validation (Unit 7 / R13) — read the cut and the
+        # owner binding CONSISTENTLY (one cut read, passed to the validator), then
+        # fail closed BEFORE acting on the pin: a FOREIGN caller or an
+        # OWNED-BUT-PINLESS token raises :class:`SessionInvalidated` (a sibling
+        # MUST NOT read another's cut; an owned-but-pinless token is not-yet-live).
+        # A token with NO owner binding falls through to the cut-absent liveness
+        # taxonomy below (still fail-closed, never live HEAD).
         cut = self.registry.get_session_cut(session_token)
+        self._validate_session_owner(session_token, caller, cut)
         if cut is None:
             # FAIL CLOSED (Unit 5 / R4): no live cut for this token — it was
             # reaped by the session-liveness sweep, GC-raced, wiped by an
@@ -834,6 +971,7 @@ class CoordinatorService:
         artifact_id: UUID,
         content: bytes | str,
         *,
+        caller: UUID,
         size_tokens: int | None = None,
         issued_at_tick: int = 0,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail | SessionCommitRejection:
@@ -864,14 +1002,16 @@ class CoordinatorService:
         across a session's calls) and collision-free against real agent ids (a
         ``uuid5`` over a 32-byte server-minted token namespace).
 
-        Validation (Unit 4 scope): the token must have a live pin for
+        Validation: the caller must be the session OWNER (Unit 7 / R13,
+        timing-safe — see ``caller`` below) AND the token must have a live pin for
         ``artifact_id``. An unknown/released token → ``session_not_found``; a live
         token whose cut lacks ``artifact_id`` → ``artifact_not_in_cut`` — both a
         typed :class:`~ccs.core.types.SessionCommitRejection`, NEVER a silent
-        fall-through to a live-HEAD commit. (Per-call OWNER-binding validation — a
-        foreign owner committing into another's cut — and the caps are Unit 7; the
-        heartbeat-liveness ``session_invalidated`` axis is Unit 5. Unit 4 does the
-        token-has-pin check only.)
+        fall-through to a live-HEAD commit. A FOREIGN caller or an
+        OWNED-BUT-PINLESS token RAISES :class:`SessionInvalidated` (Unit 7,
+        validated BEFORE the pin lookup); the heartbeat-liveness
+        ``session_invalidated`` axis is Unit 5. (The R14 caps are enforced at
+        ``begin_session``, not here — a committed session already passed them.)
 
         Outcome mapping (mirrors the shipped ``commit_cas`` orchestration exactly):
 
@@ -897,6 +1037,12 @@ class CoordinatorService:
             session_token: The server-minted session identity from
                 ``begin_session``.
             artifact_id: The pinned artifact to commit. Must be in the cut.
+            caller: The CALLER'S identity (the MESI agent/process label). Must be
+                the session's bound owner — validated timing-safe
+                (:func:`hmac.compare_digest`) against the owner bound at
+                ``begin_session``; a foreign caller fails closed
+                (:class:`SessionInvalidated`). Required (R13): a sibling MUST NOT
+                commit into another's cut.
             content: The new body. ``content_hash`` is derived from it
                 (``compute_content_hash``); the body is threaded to ``commit_cas``
                 so the in-memory path advances ``record.content`` on a WIN (the
@@ -915,11 +1061,15 @@ class CoordinatorService:
         """
         epoch = self.registry.coordinator_epoch
 
-        # Unit 7: per-call OWNER-binding validation goes HERE — read
-        # ``_session_owners[session_token]`` and reject a foreign caller
-        # (timing-safe compare) BEFORE the pin lookup. Unit 4 does the
-        # token-has-pin check only.
+        # Per-call OWNER-binding validation (Unit 7 / R13) — read the cut and the
+        # owner binding CONSISTENTLY, then fail closed BEFORE acting on the pin: a
+        # FOREIGN caller or an OWNED-BUT-PINLESS token raises
+        # :class:`SessionInvalidated` (a sibling MUST NOT commit into another's
+        # cut; an owned-but-pinless token is not-yet-live). A token with NO owner
+        # binding falls through to the cut-absent liveness taxonomy below (still
+        # fail-closed, never a live-HEAD commit).
         cut = self.registry.get_session_cut(session_token)
+        self._validate_session_owner(session_token, caller, cut)
         if cut is None:
             # FAIL CLOSED (Unit 5 / R4): no live cut for this token — reaped,
             # GC-raced, restart-wiped, released, or never opened. NEVER a silent
@@ -961,6 +1111,71 @@ class CoordinatorService:
             size_tokens=size_tokens,
             content=content,
         )
+
+    def _validate_session_owner(
+        self,
+        session_token: str,
+        caller: UUID,
+        cut: Mapping[UUID, int] | None,
+    ) -> None:
+        """Per-call OWNER-binding validation for ``session_read`` / ``session_commit``
+        (SB-17 / TX-1, Unit 7 / R13). Fails CLOSED — raises
+        :class:`SessionInvalidated` — for a FOREIGN caller (an owner-isolation
+        violation). Returns for every non-foreign case; the cut-absent fail-closed
+        taxonomy (including the OWNED-BUT-PINLESS case) is left to the caller's
+        existing ``cut is None`` path so a single fail-closed shape governs.
+
+        Called BEFORE the pin lookup is acted on, with the cut already read by the
+        caller (so owner-binding and pins are read consistently within one call —
+        no second registry round-trip that could race the first). A SIBLING agent
+        MUST NOT read or commit another session's cut, even with a leaked token:
+        cross-agent access is OUT (R13).
+
+        The owner comparison is TIMING-SAFE: it uses :func:`hmac.compare_digest`
+        over the stable 16-byte ``UUID.bytes`` encoding (the SAME shape as the
+        Unit-5 heartbeat owner-check), NEVER ``==`` / ``in``, so a foreign caller
+        learns nothing from response timing about how much of the owner id matched.
+
+        Three outcomes:
+
+        - **No owner binding** (``bound_owner is None``) — the token was never
+          opened, was released, was reaped, or an in-memory restart wiped the
+          binding. This is NOT an owner-isolation failure (there is no owner to
+          compare against); the validator RETURNS and lets the caller's existing
+          cut-absent path classify it into the wire-stable liveness taxonomy
+          (``session_invalidated`` / ``session_not_found``). Fail-closed is
+          preserved downstream — a no-binding token always has ``cut is None``.
+        - **Foreign caller** (binding present, caller mismatches) — RAISE
+          ``SessionInvalidated``: a sibling cannot read/commit another's cut. This
+          is the ONE genuinely exceptional case — an isolation breach, raised so it
+          is never confused with a benign not-found.
+        - **Owned-but-pinless** (binding present, caller matches, but ``cut is
+          None``) — a token that is OWNED but has NO live pins (the begin_session
+          mint→capture window, or the degenerate empty-read-set sqlite session that
+          durably pins zero rows → ``get_session_cut`` returns ``None``). The
+          validator RETURNS; the caller's existing ``cut is None`` path then fails
+          CLOSED with the wire-stable ``session_invalidated`` reason
+          (:meth:`_classify_no_cut_reason` for an in-shape token) — NOT-yet-live,
+          never a valid empty session, never a live-HEAD fall-through. Returning
+          (rather than raising) keeps owned-but-pinless on the SAME typed
+          fail-closed taxonomy as every other cut-absent case (and preserves the
+          shipped Unit-3 sqlite-empty-session contract, which returns
+          ``session_invalidated`` rather than raising).
+        """
+        bound_owner = self._session_owners.get(session_token)
+        if bound_owner is None:
+            # No owner binding ⇒ not an isolation failure. The caller's cut-absent
+            # path (``_classify_no_cut_reason``) fails closed with the liveness
+            # taxonomy; nothing to validate here.
+            return
+        # Timing-safe owner-binding compare (R13): stable 16-byte UUID encoding,
+        # never ``==``. A foreign caller is rejected fail-closed and cannot probe
+        # id-match progress via response timing.
+        if not hmac.compare_digest(bound_owner.bytes, caller.bytes):
+            raise SessionInvalidated(
+                "session owner mismatch: the caller is not the session's owner "
+                "(cross-agent session access is out of scope, R13)"
+            )
 
     @staticmethod
     def _session_committer_id(session_token: str) -> UUID:
@@ -1098,12 +1313,13 @@ class CoordinatorService:
         token = session.session_token
         try:
             # DECIDE — the caller reads the PINNED cut and computes its decision.
-            view = SessionView(self, token)
+            view = SessionView(self, token, owner)
             decision = decide(view)
 
             if commit is not None:
                 return self._effect_gate_atomic(
                     session=session,
+                    owner=owner,
                     commit=commit,
                     issued_at_tick=issued_at_tick,
                 )
@@ -1122,6 +1338,7 @@ class CoordinatorService:
                 self.registry.release_session(token)
                 self._session_heartbeats.pop(token, None)
                 self._session_owners.pop(token, None)
+                self._session_created.pop(token, None)
 
     def _revalidate_cut(
         self, cut: Mapping[UUID, int]
@@ -1182,6 +1399,7 @@ class CoordinatorService:
         self,
         *,
         session: SnapshotSession,
+        owner: UUID,
         commit: tuple[UUID, bytes | str],
         issued_at_tick: int,
     ) -> EffectFired | EffectHeld:
@@ -1212,6 +1430,7 @@ class CoordinatorService:
             session.session_token,
             artifact_id,
             content,
+            caller=owner,
             issued_at_tick=issued_at_tick,
         )
         if isinstance(outcome, SessionCommitRejection):
@@ -1320,49 +1539,75 @@ class CoordinatorService:
         owner-bound token set) and reaps any whose lease is stale, reusing the
         SAME heartbeat-staleness predicate SHAPE as the grant sweep (``current -
         last_hb >= timeout``, with ``>=`` matching ADV-02) and the same
-        ``CrashRecoveryConfig`` knob (``heartbeat_timeout_ticks``). It does NOT
-        reuse ``max_hold_ticks`` — the absolute-age ceiling that a live heartbeat
-        must not exempt is Unit 7 (a SEPARATE cap), not the liveness lease.
+        ``CrashRecoveryConfig`` knob (``heartbeat_timeout_ticks``).
+
+        **TWO reap conditions, OR'd (a session is reaped if EITHER fires):**
+
+        1. **Heartbeat staleness** (the Unit-5 lease) — ``current_tick - last_hb
+           >= heartbeat_timeout_ticks``. A slow-but-LIVE session heartbeated
+           within the window survives indefinitely; this is a PREDICATE on the
+           lease, not a hard TTL.
+        2. **Absolute-age ceiling** (Unit 7 / R14, threat-model #3) —
+           ``current_tick - created_at_tick >= session_caps.absolute_age_ticks``.
+           A HARD ceiling SEPARATE from the heartbeat lease: a session older than
+           the ceiling is reaped **EVEN WHEN ITS HEARTBEAT IS LIVE** — a live
+           heartbeat MUST NOT exempt it. This bounds the heartbeat-spoofing DoS
+           (an attacker keeping a stale cut pinned indefinitely via heartbeats).
+           The age is measured from ``created_at_tick`` (seeded at
+           ``begin_session``), NOT the last heartbeat, so heartbeating never
+           resets it. This is the ONLY place the ceiling is enforced; it does NOT
+           reuse the grant sweep's ``max_hold_ticks`` (that bounds GRANTS, this
+           bounds SESSIONS).
 
         Reaping a session: :meth:`registry.release_session` drops its pins (so its
-        pinned versions become collectible again), then its owner binding and
-        heartbeat lease are cleared and the token is recorded in the bounded
-        reaped tombstone. After reaping, a ``session_read`` / ``session_commit``
-        on that token fails closed with ``session_invalidated`` (the cut is gone).
-
-        A slow-but-LIVE session — one heartbeated within ``heartbeat_timeout_ticks``
-        — is NOT reaped. This is a PREDICATE on the lease, not a hard TTL: a
-        long-running session that keeps heartbeating survives indefinitely
-        (the absolute-age ceiling that overrides even a live heartbeat is the
-        SEPARATE Unit-7 cap).
+        pinned versions become collectible again), then its owner binding,
+        heartbeat lease, and creation tick are cleared and the token is recorded
+        in the bounded reaped tombstone. After reaping, a ``session_read`` /
+        ``session_commit`` on that token fails closed with ``session_invalidated``
+        (the cut is gone).
 
         Args:
             current_tick: The sweep's logical clock (monotonic ticks, as the
-                grant sweep uses).
+                grant sweep uses). Both reap conditions are measured against it.
             heartbeat_timeout_ticks: Reap any session whose lease is at least
                 this many ticks stale (or that somehow has no lease — defensive).
+                The absolute-age ceiling (``session_caps.absolute_age_ticks``) is
+                applied INDEPENDENTLY — a fresh heartbeat does not exempt it.
 
         Returns:
-            The number of sessions reaped.
+            The number of sessions reaped (by EITHER condition).
         """
         if heartbeat_timeout_ticks < 1:
             raise ValueError("heartbeat_timeout_ticks must be >= 1")
 
+        absolute_age_ticks = self.session_caps.absolute_age_ticks
         # Snapshot the token set first — reaping mutates ``_session_owners`` /
-        # ``_session_heartbeats`` under the loop, so iterate a stable copy.
+        # ``_session_heartbeats`` / ``_session_created`` under the loop, so
+        # iterate a stable copy.
         tokens = list(self._session_owners.keys())
         reaped = 0
         for session_token in tokens:
             last_hb = self._session_heartbeats.get(session_token)
-            # Same staleness predicate SHAPE as the grant sweep (``>=`` per
-            # ADV-02). A missing lease (should not happen — begin_session seeds
-            # one) is treated as stale, defensively, so a leaseless session is
-            # never immortal.
+            # Condition 1 — heartbeat staleness. Same predicate SHAPE as the
+            # grant sweep (``>=`` per ADV-02). A missing lease (should not happen
+            # — begin_session seeds one) is treated as stale, defensively, so a
+            # leaseless session is never immortal.
             stale = (
                 last_hb is None
                 or (current_tick - last_hb) >= heartbeat_timeout_ticks
             )
-            if not stale:
+            # Condition 2 — absolute-age ceiling (Unit 7 / R14). Measured from the
+            # CREATION tick, INDEPENDENT of the heartbeat: a live-heartbeat
+            # session past the ceiling is STILL reaped (a live heartbeat must not
+            # exempt the hard ceiling, threat-model #3). A missing creation tick
+            # (should not happen — begin_session seeds one) is treated as
+            # over-age, defensively.
+            created = self._session_created.get(session_token)
+            over_age = (
+                created is None
+                or (current_tick - created) >= absolute_age_ticks
+            )
+            if not (stale or over_age):
                 continue
             self._reap_session(session_token)
             reaped += 1
@@ -1379,6 +1624,7 @@ class CoordinatorService:
         self.registry.release_session(session_token)
         self._session_heartbeats.pop(session_token, None)
         self._session_owners.pop(session_token, None)
+        self._session_created.pop(session_token, None)
         self._tombstone_token(session_token)
 
     def _tombstone_token(self, session_token: str) -> None:

@@ -30,7 +30,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.retention import RetentionPolicy
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import CoordinatorService, SessionCapsConfig
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import UNKNOWN_ARTIFACT_REASON
 from ccs.core.states import MESIState
@@ -318,7 +318,13 @@ class TestInMemoryConcurrentAtomicity:
 
     def test_concurrent_capture_never_observes_impossible_cut(self) -> None:
         reg = ArtifactRegistry()  # no retention; version-map capture only
-        svc = CoordinatorService(reg)
+        # This atomicity probe opens 4000 sessions in a tight loop and frees only
+        # the registry pins (release_session) per iteration, so the service-level
+        # owner-binding COUNT accumulates. Raise the Unit-7 max_sessions cap above
+        # the loop count so the R14 bound (default 256) does not interfere with the
+        # pre-existing read-skew probe (the caps surface is tested in
+        # tests/test_session_identity_and_caps.py).
+        svc = CoordinatorService(reg, session_caps=SessionCapsConfig(max_sessions=8192))
         a, b = uuid4(), uuid4()
         _register(reg, a, "a", "a1")
         _register(reg, b, "b", "b1")

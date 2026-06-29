@@ -111,11 +111,12 @@ class TestHappyPath:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
             assert session.cut[a] == 1
 
-            result = svc.session_commit(session.session_token, a, "V2-BODY")
+            result = svc.session_commit(session.session_token, a, "V2-BODY", caller=owner)
 
             assert isinstance(result, tuple)
             updated, signals = result
@@ -138,10 +139,11 @@ class TestHappyPath:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V7", version=7)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert session.cut[a] == 7
 
-            result = svc.session_commit(session.session_token, a, "V8")
+            result = svc.session_commit(session.session_token, a, "V8", caller=owner)
             assert isinstance(result, tuple)
             assert result[0].version == 8
         finally:
@@ -164,7 +166,8 @@ class TestHeldOnMovedBase:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())  # pins {a:1}
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)  # pins {a:1}
 
             # A peer commits 1 → 2 AFTER the cut was captured.
             _peer_commit_cas(reg, a, uuid4(), expected=1, body="PEER-V2")
@@ -172,7 +175,7 @@ class TestHeldOnMovedBase:
             before = reg.get_artifact(a)
 
             # The session commits at the now-stale pinned base (1) → HELD, RETURNED.
-            result = svc.session_commit(session.session_token, a, "MINE")
+            result = svc.session_commit(session.session_token, a, "MINE", caller=owner)
 
             assert isinstance(result, ConflictDetail)
             assert result.reason == "version_mismatch"
@@ -200,10 +203,11 @@ class TestHeldOnMovedBase:
             # A peer holding SHARED at v1 is a witness for "no peer invalidated".
             peer = uuid4()
             reg.set_agent_state(a, peer, MESIState.SHARED, tick=0)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             _peer_commit_cas(reg, a, uuid4(), expected=1, body="PEER-V2")
 
-            result = svc.session_commit(session.session_token, a, "MINE")
+            result = svc.session_commit(session.session_token, a, "MINE", caller=owner)
 
             assert isinstance(result, ConflictDetail)
             # The result type itself carries no signals list — a held commit
@@ -233,7 +237,8 @@ class TestCorruptionRaisesAtServiceLayer:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V5", version=5)
-            session = svc.begin_session(read_set=[a], owner=uuid4())  # pins {a:5}
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)  # pins {a:5}
             assert session.cut[a] == 5
 
             # Rewind current (5 → 3) BELOW the pin so expected(5) > current(3).
@@ -241,7 +246,7 @@ class TestCorruptionRaisesAtServiceLayer:
             _register(reg, a, "plan.md", "V3", version=3)
 
             with pytest.raises(CoherenceError) as excinfo:
-                svc.session_commit(session.session_token, a, "X")
+                svc.session_commit(session.session_token, a, "X", caller=owner)
             # The raise is the corruption mapping, not a generic precondition.
             assert "corruption" in str(excinfo.value).lower()
         finally:
@@ -261,7 +266,8 @@ class TestCorruptionRaisesAtServiceLayer:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V5", version=5)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             reg.remove_artifact(a)
             _register(reg, a, "plan.md", "V3", version=3)
 
@@ -281,7 +287,7 @@ class TestCorruptionRaisesAtServiceLayer:
 
             # SERVICE layer: raises for the same corruption.
             with pytest.raises(CoherenceError):
-                svc.session_commit(session.session_token, a, "X")
+                svc.session_commit(session.session_token, a, "X", caller=owner)
         finally:
             sql.close()
 
@@ -305,13 +311,14 @@ class TestAdmitOnAbsent:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
 
             committer = uuid5(NAMESPACE_URL, session.session_token)
             # Precondition of the load-bearing path: the committer is fence-claimless.
             assert reg.get_read_generation(a, committer) is None
 
-            result = svc.session_commit(session.session_token, a, "V2")
+            result = svc.session_commit(session.session_token, a, "V2", caller=owner)
             assert isinstance(result, tuple)
             assert result[0].version == 2
         finally:
@@ -358,7 +365,7 @@ class TestAdmitOnAbsent:
             # A session whose OWNER is that same agent still WINS, because the
             # session-scoped committer is fence-claimless (admit-on-absent).
             session = svc.begin_session(read_set=[a], owner=owner)
-            result = svc.session_commit(session.session_token, a, "SESSION-WINS")
+            result = svc.session_commit(session.session_token, a, "SESSION-WINS", caller=owner)
             assert isinstance(result, tuple), f"expected WIN, got {result!r}"
             assert result[0].version == 2
         finally:
@@ -388,9 +395,10 @@ class TestTaxonomyPreserved:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             _peer_commit_cas(reg, a, uuid4(), expected=1, body="V2")
-            result = svc.session_commit(session.session_token, a, "X")
+            result = svc.session_commit(session.session_token, a, "X", caller=owner)
             assert isinstance(result, ConflictDetail)
             assert result.reason == "version_mismatch"
         finally:
@@ -406,11 +414,12 @@ class TestTaxonomyPreserved:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())  # pins {a:1}
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)  # pins {a:1}
             # A pessimistic peer takes EXCLUSIVE at the still-pinned version.
             reg.set_agent_state(a, uuid4(), MESIState.EXCLUSIVE, trigger="write", tick=1)
 
-            result = svc.session_commit(session.session_token, a, "X")
+            result = svc.session_commit(session.session_token, a, "X", caller=owner)
             assert isinstance(result, ConflictDetail)
             assert result.reason == "other_holder"
             assert result.current_version == 1
@@ -433,7 +442,8 @@ class TestTaxonomyPreserved:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             committer = uuid5(NAMESPACE_URL, session.session_token)
 
             # Plant a fence claim ON the committer id, then supersede it.
@@ -445,7 +455,7 @@ class TestTaxonomyPreserved:
             assert reg.get_read_generation(a, committer) == 0
             assert reg.get_owner_generation(a) == 1
 
-            result = svc.session_commit(session.session_token, a, "X")
+            result = svc.session_commit(session.session_token, a, "X", caller=owner)
             assert isinstance(result, ConflictDetail)
             assert result.reason == STALE_READ_GENERATION_REASON
         finally:
@@ -464,17 +474,20 @@ class TestTaxonomyPreserved:
             # version_mismatch
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            s = svc.begin_session(read_set=[a], owner=uuid4())
+            owner_a = uuid4()
+            s = svc.begin_session(read_set=[a], owner=owner_a)
             _peer_commit_cas(reg, a, uuid4(), expected=1, body="V2")
-            r1 = svc.session_commit(s.session_token, a, "X")
+            r1 = svc.session_commit(s.session_token, a, "X", caller=owner_a)
             # other_holder
             b = uuid4()
             _register(reg, b, "q", "V1", version=1)
-            s2 = svc.begin_session(read_set=[b], owner=uuid4())
+            owner_b = uuid4()
+            s2 = svc.begin_session(read_set=[b], owner=owner_b)
             reg.set_agent_state(b, uuid4(), MESIState.EXCLUSIVE, trigger="write", tick=1)
-            r2 = svc.session_commit(s2.session_token, b, "X")
-            # validation rejection
-            r3 = svc.session_commit("unknown", a, "X")
+            r2 = svc.session_commit(s2.session_token, b, "X", caller=owner_b)
+            # validation rejection (no owner binding for "unknown" → caller is
+            # irrelevant; the cut-absent path classifies it).
+            r3 = svc.session_commit("unknown", a, "X", caller=uuid4())
 
             for r in (r1, r2, r3):
                 assert not isinstance(r, tuple), f"unexpected signal-bearing win: {r!r}"
@@ -496,7 +509,8 @@ class TestValidationRejections:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            result = svc.session_commit("never-minted-token", a, "X")
+            # No owner binding for this token → owner validation is a no-op.
+            result = svc.session_commit("never-minted-token", a, "X", caller=uuid4())
             assert isinstance(result, SessionCommitRejection)
             assert result.reason == SESSION_NOT_FOUND_REASON
             assert result.reason in SESSION_COMMIT_REASONS
@@ -517,9 +531,10 @@ class TestValidationRejections:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             reg.release_session(session.session_token)  # pins dropped
-            result = svc.session_commit(session.session_token, a, "X")
+            result = svc.session_commit(session.session_token, a, "X", caller=owner)
             assert isinstance(result, SessionCommitRejection)
             # Unit-5 taxonomy: a released (in-shape) token WAS a real session →
             # session_invalidated (fail closed, never a live-HEAD commit), not
@@ -538,9 +553,10 @@ class TestValidationRejections:
             b = uuid4()
             _register(reg, a, "plan.md", "VA", version=1)
             _register(reg, b, "budget.md", "VB", version=1)
-            session = svc.begin_session(read_set=[b], owner=uuid4())  # pins {b}
+            owner = uuid4()
+            session = svc.begin_session(read_set=[b], owner=owner)  # pins {b}
             # Commit an artifact NOT in the cut → rejected, never live-HEAD commit.
-            result = svc.session_commit(session.session_token, a, "X")
+            result = svc.session_commit(session.session_token, a, "X", caller=owner)
             assert isinstance(result, SessionCommitRejection)
             assert result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON
             assert result.artifact_id == a
@@ -587,16 +603,17 @@ class TestExactlyOneValidatedCommit:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "p", "V1", version=1)
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
 
-            first = svc.session_commit(session.session_token, a, "V2")
+            first = svc.session_commit(session.session_token, a, "V2", caller=owner)
             assert isinstance(first, tuple)
             assert first[0].version == 2
 
             # The pin still records version 1; a second commit is HELD.
             assert session.cut[a] == 1
             assert svc.registry.get_session_cut(session.session_token)[a] == 1
-            second = svc.session_commit(session.session_token, a, "V3")
+            second = svc.session_commit(session.session_token, a, "V3", caller=owner)
             assert isinstance(second, ConflictDetail)
             assert second.reason == "version_mismatch"
             assert second.current_version == 2

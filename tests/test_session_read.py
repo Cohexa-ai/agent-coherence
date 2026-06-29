@@ -119,10 +119,11 @@ class TestLazyHappyPath:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "PINNED-V1")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
 
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, VersionedContent)
             assert result.version == 1
             assert result.content == "PINNED-V1"
@@ -152,12 +153,13 @@ class TestPinnedEqualsCurrentIsServed:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "CURRENT-BODY")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
             # The pin equals current (no peer commit yet).
             assert session.cut[a] == reg.get_artifact(a).version == 1
 
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             # SERVED — not a SessionReadRejection, not a current_version reject.
             assert isinstance(result, VersionedContent)
             assert result.version == 1
@@ -206,13 +208,14 @@ class TestTransitionAcrossPeerCommit:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "budget.md", "PIN-V1")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
             # FIXED-STALE BUFFER literal — never re-read from the moving registry.
             pinned_body = "PIN-V1"
 
             # Pre-commit: pinned == current, served from current.
-            r1 = svc.session_read(session.session_token, a)
+            r1 = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(r1, VersionedContent)
             assert r1.version == 1 and r1.content == pinned_body
 
@@ -222,7 +225,7 @@ class TestTransitionAcrossPeerCommit:
             assert reg.get_artifact(a).version == 2
 
             # Re-routed to history — STILL the pinned v1 bytes, NOT the peer's v2.
-            r2 = svc.session_read(session.session_token, a)
+            r2 = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(r2, VersionedContent)
             assert r2.version == 1, "served the moved version, not the pin"
             assert r2.content == pinned_body, "served peer bytes (read skew!)"
@@ -254,7 +257,7 @@ class TestNonMutating:
             assert isinstance(session, SnapshotSession)
 
             state_before = reg.get_state_map(a)
-            svc.session_read(session.session_token, a)
+            svc.session_read(session.session_token, a, caller=owner)
             state_after = reg.get_state_map(a)
 
             # No grant was minted for ANY agent — the read is not an acquire.
@@ -273,9 +276,10 @@ class TestNonMutating:
             svc = CoordinatorService(mem)
             a = uuid4()
             _register(mem, a, "plan.md", "v1")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             for _ in range(5):
-                svc.session_read(session.session_token, a)
+                svc.session_read(session.session_token, a, caller=owner)
             assert mem.get_state_map(a) == {}
         finally:
             sql.close()
@@ -299,10 +303,11 @@ class TestArtifactNotInCut:
             pinned, unpinned = uuid4(), uuid4()
             _register(reg, pinned, "plan.md", "in-cut")
             _register(reg, unpinned, "secret.md", "NOT-in-cut-LIVE-HEAD")
-            session = svc.begin_session(read_set=[pinned], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[pinned], owner=owner)
             assert isinstance(session, SnapshotSession)
 
-            result = svc.session_read(session.session_token, unpinned)
+            result = svc.session_read(session.session_token, unpinned, caller=owner)
             assert isinstance(result, SessionReadRejection)
             assert result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON
             assert result.reason in SESSION_READ_REASONS
@@ -331,7 +336,10 @@ class TestSessionNotFound:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "v1")
-            result = svc.session_read("never-minted-token", a)
+            # No owner binding for this token → owner validation is a no-op; the
+            # cut-absent path classifies it (session_not_found for a malformed
+            # token). The caller id is irrelevant when there is no binding.
+            result = svc.session_read("never-minted-token", a, caller=uuid4())
             assert isinstance(result, SessionReadRejection)
             assert result.reason == SESSION_NOT_FOUND_REASON
             assert result.coordinator_epoch == reg.coordinator_epoch
@@ -346,7 +354,8 @@ class TestSessionNotFound:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "v1")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
             # Released → the pins are gone; the token no longer serves. Under the
             # Unit-5 liveness taxonomy a released token WAS a real (in-shape)
@@ -355,7 +364,7 @@ class TestSessionNotFound:
             # token (session_not_found). Wire-stable: session_not_found stays
             # reachable for malformed tokens (asserted in TestSessionNotFound).
             reg.release_session(session.session_token)
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, SessionReadRejection)
             assert result.reason == SESSION_INVALIDATED_REASON
         finally:
@@ -380,11 +389,12 @@ class TestDataPlaneDeferred:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "config.json", "body-lives-in-data-plane")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert isinstance(session, SnapshotSession)
             assert session.retain_versions is False
 
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, DataPlaneDeferredRead)
             assert result.version == 1  # the PINNED version
             assert result.artifact_id == a
@@ -411,10 +421,11 @@ class TestDataPlaneDeferred:
             _commit_cas(sql, a, writer, expected=1, body=None)
             assert sql.get_artifact(a).version == 2
             # Pin the bodyless v2 (current).
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert session.cut[a] == 2
 
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, DataPlaneDeferredRead)
             assert result.version == 2
         finally:
@@ -447,7 +458,8 @@ class TestTExpiryAllowance:
             svc = CoordinatorService(reg)
             a = uuid4()
             _register(reg, a, "plan.md", "AGED-PIN-V1")
-            session = svc.begin_session(read_set=[a], owner=uuid4())
+            owner = uuid4()
+            session = svc.begin_session(read_set=[a], owner=owner)
             assert session.cut[a] == 1
 
             writer = uuid4()
@@ -456,7 +468,7 @@ class TestTExpiryAllowance:
 
             # Contrast: the bare read_at_version reports it collectible
             # (not_retained) for in-memory — the pin allowance is what differs.
-            result = svc.session_read(session.session_token, a)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, VersionedContent), (
                 "pinned-but-age-collectible row was not served (allowance "
                 "regressed)"
@@ -487,8 +499,9 @@ class TestEmptyReadSetDegenerate:
         svc = CoordinatorService(mem)
         a = uuid4()
         _register(mem, a, "plan.md", "v1")
-        session = svc.begin_session(read_set=[], owner=uuid4())
-        result = svc.session_read(session.session_token, a)
+        owner = uuid4()
+        session = svc.begin_session(read_set=[], owner=owner)
+        result = svc.session_read(session.session_token, a, caller=owner)
         assert isinstance(result, SessionReadRejection)
         assert result.reason == SESSION_ARTIFACT_NOT_IN_CUT_REASON
 
@@ -504,8 +517,9 @@ class TestEmptyReadSetDegenerate:
             svc = CoordinatorService(sql)
             a = uuid4()
             _register(sql, a, "plan.md", "v1")
-            session = svc.begin_session(read_set=[], owner=uuid4())
-            result = svc.session_read(session.session_token, a)
+            owner = uuid4()
+            session = svc.begin_session(read_set=[], owner=owner)
+            result = svc.session_read(session.session_token, a, caller=owner)
             assert isinstance(result, SessionReadRejection)
             # sqlite cannot durably mark an empty live session (zero pin rows →
             # None). Under the Unit-5 taxonomy the in-shape token classifies

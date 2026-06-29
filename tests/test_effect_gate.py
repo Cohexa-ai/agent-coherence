@@ -365,7 +365,7 @@ class TestFailClosed:
 
             def decide(view: SessionView) -> object:
                 # Reap after the decision read but before the commit fires.
-                svc.session_read(view._token, a)  # a valid pinned read first
+                svc.session_read(view._token, a, caller=owner)  # a valid pinned read first
                 svc.enforce_session_liveness(
                     current_tick=_HB_TIMEOUT + 1,
                     heartbeat_timeout_ticks=_HB_TIMEOUT,
@@ -518,7 +518,7 @@ class TestReasonClassification:
 
         # The session's cut still pins v1; session_commit at pin 1 vs current 2
         # returns the shipped ConflictDetail(version_mismatch).
-        result = svc.session_commit(session.session_token, a, "PLAN-MINE")
+        result = svc.session_commit(session.session_token, a, "PLAN-MINE", caller=owner)
         assert isinstance(result, ConflictDetail)
         assert result.reason == VERSION_MISMATCH_REASON  # exact constant, not substring
 

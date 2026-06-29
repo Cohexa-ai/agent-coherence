@@ -179,6 +179,51 @@ SESSION_COMMIT_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# begin_session resource-cap rejection reasons (SB-17 / TX-1, Unit 7 / R14)
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE (R7): the resource-bound rejections of
+# :meth:`CoordinatorService.begin_session`. ``begin_session`` already returns a
+# typed :class:`~ccs.core.types.VersionedReadRejection` for an unknown id
+# (``unknown_artifact``); these two reasons EXTEND that typed-return surface for
+# the R14 caps that bound the snapshot blast radius (security-calibrated DEFAULTS,
+# not post-hoc tuning):
+#
+#   * ``session_cap_exceeded`` — opening this session would exceed
+#     ``max_sessions`` concurrent sessions (the many-sessions GC-starvation DoS
+#     bound, threat-model #2). No token minted, no cut pinned.
+#   * ``read_set_too_large`` — the ``read_set`` cardinality exceeds
+#     ``max_read_set_cardinality`` (the enormous-single-read-set GC-starvation
+#     bound, threat-model #2). No token minted, no cut pinned.
+#
+# Both are PRE-CAPTURE rejections (fail BEFORE any token mint / pin insert), so a
+# rejected ``begin_session`` leaves NO half-open session. They reuse the
+# ``VersionedReadRejection`` carrier (the same typed return ``begin_session``
+# already produces) rather than minting a parallel rejection type. Wire-stable:
+# ADD, never rename; consumers match ``reason == CONSTANT``, never a substring.
+SESSION_CAP_EXCEEDED_REASON = "session_cap_exceeded"
+"""``begin_session`` would exceed ``max_sessions`` concurrent sessions (R14). No
+token minted, no cut pinned — the caller retries after a session is released or
+reaped. Bounds the many-sessions GC-starvation DoS (threat-model #2)."""
+
+SESSION_READ_SET_TOO_LARGE_REASON = "read_set_too_large"
+"""``begin_session``'s ``read_set`` exceeds ``max_read_set_cardinality`` (R14). No
+token minted, no cut pinned. Bounds the enormous-single-read-set GC-starvation
+DoS (threat-model #2)."""
+
+# The closed set every ``begin_session`` cap-rejection consumer matches against.
+# ADDITIVE-only (R7): disjoint from ``READ_AT_VERSION_REASONS`` /
+# ``SESSION_READ_REASONS`` / ``SESSION_COMMIT_REASONS``. ``begin_session`` may
+# ALSO return ``unknown_artifact`` (the Unit-2 capture rejection), which stays in
+# ``READ_AT_VERSION_REASONS``; these are the NET-NEW cap reasons only.
+SESSION_BEGIN_CAP_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_CAP_EXCEEDED_REASON,
+        SESSION_READ_SET_TOO_LARGE_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # read-only store-open classification signals (Unit 6 hardening)
 # ---------------------------------------------------------------------------
 #

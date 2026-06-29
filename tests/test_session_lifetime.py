@@ -37,6 +37,7 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.retention import RetentionPolicy
 from ccs.coordinator.service import (
     CoordinatorService,
+    SessionCapsConfig,
     looks_like_session_token,
 )
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
@@ -127,11 +128,11 @@ class TestLiveHeartbeatNotReaped:
             assert reaped == 0
 
             # read still serves the pinned bytes; commit still wins.
-            r = svc.session_read(tok, a)
+            r = svc.session_read(tok, a, caller=owner)
             assert isinstance(r, VersionedContent)
             assert r.content == "PINNED-V1"
 
-            result = svc.session_commit(tok, a, "NEW-V2")
+            result = svc.session_commit(tok, a, "NEW-V2", caller=owner)
             assert isinstance(result, tuple)  # WIN -> (artifact, signals)
             updated, _signals = result
             assert updated.version == 2
@@ -157,7 +158,7 @@ class TestLiveHeartbeatNotReaped:
             assert svc.enforce_session_liveness(
                 current_tick=50 + _HB_TIMEOUT - 1, heartbeat_timeout_ticks=_HB_TIMEOUT
             ) == 0
-            assert isinstance(svc.session_read(tok, a), VersionedContent)
+            assert isinstance(svc.session_read(tok, a, caller=owner), VersionedContent)
 
             # Past the window from the baseline -> reaped.
             assert svc.enforce_session_liveness(
@@ -201,13 +202,13 @@ class TestStaleHeartbeatReaped:
             assert reg.get_session_cut(tok) is None
 
             # FAIL CLOSED on read: session_invalidated, never live HEAD.
-            r = svc.session_read(tok, a)
+            r = svc.session_read(tok, a, caller=owner)
             assert isinstance(r, SessionReadRejection)
             assert r.reason == SESSION_INVALIDATED_REASON
             assert r.reason in SESSION_READ_REASONS
 
             # FAIL CLOSED on commit: session_invalidated.
-            rc = svc.session_commit(tok, a, "WOULD-BE-V2")
+            rc = svc.session_commit(tok, a, "WOULD-BE-V2", caller=owner)
             assert isinstance(rc, SessionCommitRejection)
             assert rc.reason == SESSION_INVALIDATED_REASON
             assert rc.reason in SESSION_COMMIT_REASONS
@@ -238,7 +239,7 @@ class TestStaleHeartbeatReaped:
             # While LIVE the pinned version is exempt (a peer commit past it does
             # not collect v1 — the session can still read it).
             _peer_commit_cas(reg, a, uuid4(), expected=1, body="V2")
-            assert svc.session_read(session.session_token, a).content == "V1"
+            assert svc.session_read(session.session_token, a, caller=owner).content == "V1"
             assert pinned in _live_pins(reg, a)
 
             # Reap -> the pin is dropped from the exemption set.
@@ -290,13 +291,13 @@ class TestRestartFailsClosed:
 
         # The old token has no cut in the fresh process. It MUST fail closed as
         # session_invalidated (it was a real session) — never serve live HEAD.
-        r = svc2.session_read(tok, a2)
+        r = svc2.session_read(tok, a2, caller=owner)
         assert isinstance(r, SessionReadRejection)
         assert r.reason == SESSION_INVALIDATED_REASON
         # Crucially: NOT served as VersionedContent of the fresh head.
         assert not isinstance(r, VersionedContent)
 
-        rc = svc2.session_commit(tok, a2, "WOULD-BE")
+        rc = svc2.session_commit(tok, a2, "WOULD-BE", caller=owner)
         assert isinstance(rc, SessionCommitRejection)
         assert rc.reason == SESSION_INVALIDATED_REASON
 
@@ -309,7 +310,7 @@ class TestRestartFailsClosed:
         _register(reg, a, "plan.md", "HEAD")
 
         for bogus in ["", "short", "not-a-real-token", "x" * 100]:
-            r = svc.session_read(bogus, a)
+            r = svc.session_read(bogus, a, caller=uuid4())
             assert isinstance(r, SessionReadRejection)
             assert r.reason == SESSION_NOT_FOUND_REASON, bogus
             # Still fail-closed (never live HEAD), just a different signal.
@@ -327,7 +328,14 @@ class TestSlowButLiveNotReaped:
         self, tmp_path: Path
     ) -> None:
         reg = ArtifactRegistry(retain_versions=True)
-        svc = CoordinatorService(reg)
+        # Isolate the LEASE predicate from the Unit-7 absolute-age ceiling: set the
+        # ceiling well past this run's final tick (49 * _HB_TIMEOUT) so only the
+        # heartbeat lease can reap. The ceiling itself is exercised separately in
+        # tests/test_session_identity_and_caps.py.
+        svc = CoordinatorService(
+            reg,
+            session_caps=SessionCapsConfig(absolute_age_ticks=100 * _HB_TIMEOUT),
+        )
         owner = uuid4()
         a = uuid4()
         _register(reg, a, "plan.md", "BODY")
@@ -337,7 +345,7 @@ class TestSlowButLiveNotReaped:
         # March far past a naive "absolute TTL": as long as the session keeps
         # heartbeating within the window, it is never reaped — the predicate is
         # on the LEASE, not a hard age ceiling (that ceiling is the separate
-        # Unit-7 cap, not exercised here).
+        # Unit-7 cap, exercised in the identity/caps suite).
         last = 0
         for step in range(1, 50):  # 49 windows past creation — way past 1 TTL.
             tick = step * _HB_TIMEOUT  # exactly one timeout per step
@@ -352,7 +360,7 @@ class TestSlowButLiveNotReaped:
             last = tick
         assert last == 49 * _HB_TIMEOUT
         # Still serving after the long run.
-        assert isinstance(svc.session_read(tok, a), VersionedContent)
+        assert isinstance(svc.session_read(tok, a, caller=owner), VersionedContent)
 
 
 # ===========================================================================
@@ -395,7 +403,7 @@ class TestLiveSessionDeadAgent:
         ) == 0
 
         # Pins survive; the read still serves the pinned bytes.
-        r = svc.session_read(tok, a)
+        r = svc.session_read(tok, a, caller=owner)
         assert isinstance(r, VersionedContent)
         assert r.content == "PINNED"
 
@@ -450,7 +458,7 @@ class TestOwnerBoundHeartbeat:
         assert svc.enforce_session_liveness(
             current_tick=10 + _HB_TIMEOUT, heartbeat_timeout_ticks=_HB_TIMEOUT
         ) == 1
-        r = svc.session_read(tok, a)
+        r = svc.session_read(tok, a, caller=owner)
         assert isinstance(r, SessionReadRejection)
         assert r.reason == SESSION_INVALIDATED_REASON
 
@@ -477,7 +485,7 @@ class TestOwnerBoundHeartbeat:
             session_token=tok, owner=owner, now_tick=10_001
         ) is False
         # Still dead.
-        r = svc.session_read(tok, a)
+        r = svc.session_read(tok, a, caller=owner)
         assert isinstance(r, SessionReadRejection)
         assert r.reason == SESSION_INVALIDATED_REASON
 
@@ -594,7 +602,7 @@ class TestGcRaceFailsClosedNotWrongBytes:
         record.version_history.pop(1, None)
         record.version_captured_at.pop(1, None)
 
-        r = svc.session_read(session.session_token, a)
+        r = svc.session_read(session.session_token, a, caller=owner)
         # NEVER a wrong-bytes VersionedContent; degrades to the typed deferral.
         assert isinstance(r, DataPlaneDeferredRead)
         assert r.version == 1
