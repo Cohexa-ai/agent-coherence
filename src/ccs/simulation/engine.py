@@ -212,6 +212,16 @@ class SimulationEngine:
                         max_hold_ticks=self._crash_recovery.max_hold_ticks,
                     )
                 )
+                # SB-17 / TX-1 Unit 5 / R4: the session-liveness sweep is a NEW
+                # axis (the grant sweep above can't see a grantless snapshot
+                # session). Gated by the SAME ``crash_recovery.enabled`` flag and
+                # the SAME heartbeat-staleness knob. The simulation engine opens
+                # no snapshot sessions, so this is a no-op here (zero sessions) —
+                # wired for parity with the live coordinator sweep cadence.
+                self._coordinator.enforce_session_liveness(
+                    current_tick=now,
+                    heartbeat_timeout_ticks=self._crash_recovery.heartbeat_timeout_ticks,
+                )
             self._clock.advance()
 
         # Drain messages that become due exactly at final tick.

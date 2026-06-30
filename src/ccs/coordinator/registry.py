@@ -9,16 +9,22 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Optional, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeAlias
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
     STALE_READ_GENERATION_REASON,
+    UNKNOWN_ARTIFACT_REASON,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact, CasCorruption, ConflictDetail
+from ccs.core.types import (
+    Artifact,
+    CasCorruption,
+    ConflictDetail,
+    VersionedReadRejection,
+)
 
 from .retention import RetentionPolicy, collectible_versions
 
@@ -52,6 +58,13 @@ CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
 # impossible state = CasCorruption. None is raised by the registry.
 CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
+
+# Snapshot consistent-cut capture result (SB-17 / TX-1, Unit 2 / R1) — parity
+# with SqliteArtifactRegistry.capture_version_vector. WIN = the pinned cut
+# ``{artifact_id: version}``; a read_set with an unknown id =
+# VersionedReadRejection(reason=UNKNOWN_ARTIFACT) and NO pins inserted (no
+# partial cut, no existence-probe oracle). Neither is raised by the registry.
+CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
 @dataclass
@@ -150,6 +163,34 @@ class ArtifactRegistry:
         # keeps the four pinned v0.5/recorder suites green. A policy is an
         # explicit opt-in to BOUNDED retention: GC runs only when this is set.
         self._retention_policy = retention_policy
+        # Snapshot session pin store (SB-17 / TX-1, Unit 2 / R1, R4):
+        # ``{session_token: {artifact_id: pinned_version}}``. The version a live
+        # session pins is exempt from the inline retention GC (the exemptions
+        # seam) until ``release_session`` drops it. Process-scoped only —
+        # in-memory pins do NOT survive a restart (R6; restart-survival is
+        # sqlite-only), which the parity harness asserts rather than masks.
+        self._session_pins: dict[str, dict[UUID, int]] = {}
+        # Durable owner-binding MIRROR (SB-17 / TX-1, R13/R6/R14):
+        # ``{session_token: (owner, created_at_tick)}``. Symmetric with
+        # :attr:`SqliteArtifactRegistry`'s ``session_meta`` table for API parity,
+        # but PROCESS-SCOPED like the pins — a fresh in-memory instance (the
+        # "restart") has none, so an in-memory session never survives a restart
+        # (the asserted divergence). Lets the sweep enumerate sessions uniformly
+        # across both registries via :meth:`all_session_meta`.
+        self._session_meta: dict[str, tuple[UUID, int]] = {}
+        # Cross-artifact capture lock (Unit 2). This registry is otherwise
+        # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
+        # docstrings). GIL atomicity is per single dict ACCESS, which is
+        # INSUFFICIENT across N artifacts: a multi-artifact capture reads N
+        # versions then inserts the pin set, and a peer commit interleaving those
+        # reads would yield a torn (read-skewed) cut. This dedicated RLock makes
+        # ONLY the capture/release multi-artifact critical sections atomic; the
+        # existing per-access paths stay lock-free. It also guards the pin-store
+        # dict against an inline-GC exemption read racing a release (both take
+        # this lock), so there is no deadlock: capture/release never call back
+        # into a path that re-takes a DIFFERENT lock, and the GC exemption read
+        # is a short, self-contained critical section.
+        self._capture_lock = threading.RLock()
 
     def _capture_version(
         self, record: ArtifactRecord, version: int, content: bytes | str
@@ -163,32 +204,65 @@ class ArtifactRegistry:
         marks (the current version always survives; unbounded mode skips GC
         entirely, preserving today's semantics).
 
-        Lock-free posture (registry contract): this is plain GIL-atomic dict
-        mutation. The store-then-drop is a sequence of individual dict ops, each
-        atomic under the GIL; a concurrent reader of ``get_content_at_version``
-        sees a consistent value at any single dict access. No locks, no
-        ``BEGIN IMMEDIATE``.
+        Lock-free posture (registry contract): the version-history dict ops are
+        plain GIL-atomic; a concurrent reader of ``get_content_at_version`` sees
+        a consistent value at any single dict access, no ``BEGIN IMMEDIATE``.
+        Caveat (Unit 2): the exemptions read below re-enters ``_capture_lock``
+        via ``_live_pins_for_artifact``. This method is ALWAYS invoked from
+        within an already-held ``_capture_lock`` (the version-move apply in
+        ``commit_cas`` / ``set_artifact_and_content`` / ``register_artifact``),
+        so the RLock re-entry is harmless and the dict ops stay GIL-atomic.
         """
         captured_at = time.time()  # one wall-clock read: stamp == GC reference.
         record.version_history[version] = content
         record.version_captured_at[version] = captured_at
         if self._retention_policy is None:
             return  # unbounded mode (retain_versions=True, no policy): no GC.
+        # Exemptions seam (Unit 2 — the first GC producer to populate it): a
+        # version pinned by ANY live snapshot session for this artifact is held
+        # back from collection until its session is released (R4). Without this,
+        # a bounded K/T policy could collect a pinned version out from under a
+        # live cut, breaking the consistent-read guarantee.
         for dropped in collectible_versions(
             record.version_captured_at,
             current_version=version,
             policy=self._retention_policy,
             now=captured_at,
+            exemptions=self._live_pins_for_artifact(record.artifact.id),
         ):
             record.version_history.pop(dropped, None)
             record.version_captured_at.pop(dropped, None)
 
+    def _live_pins_for_artifact(self, artifact_id: UUID) -> set[int]:
+        """Return the versions pinned by LIVE snapshot sessions for ``artifact_id``
+        — the GC exemption set the inline retention GC honors (Unit 2 / R4).
+
+        Mirrors ``Snapshot.tla``'s ``PinnedVersions(art)``. Taken under the
+        capture lock so a concurrent ``capture_version_vector`` / ``release_session``
+        sees a consistent pin store; the returned set is a plain snapshot the GC
+        loop consumes after the lock is released. A session pins at most one
+        version per artifact (the cut is a map), so the union is naturally
+        deduplicated by the set."""
+        with self._capture_lock:
+            return {
+                pins[artifact_id]
+                for pins in self._session_pins.values()
+                if artifact_id in pins
+            }
+
     def register_artifact(self, artifact: Artifact, content: str) -> None:
-        """Insert artifact record into registry."""
+        """Insert artifact record into registry.
+
+        The version-establishing mutation is performed under ``_capture_lock``
+        (Unit 2): a concurrent ``capture_version_vector`` reads N artifact
+        versions + inserts the pin set under that same lock, so registering /
+        moving a version cannot interleave a multi-artifact capture and tear its
+        cut (read skew). The lock-free READ accessors are untouched."""
         record = ArtifactRecord(artifact=artifact, content=content)
-        if self._retain_versions:
-            self._capture_version(record, artifact.version, content)
-        self._records[artifact.id] = record
+        with self._capture_lock:
+            if self._retain_versions:
+                self._capture_version(record, artifact.version, content)
+            self._records[artifact.id] = record
 
     def has_artifact(self, artifact_id: UUID) -> bool:
         """Return whether an artifact exists in registry."""
@@ -282,11 +356,15 @@ class ArtifactRegistry:
                     f"artifact={artifact_id} read_gen={read_gen} "
                     f"owner_gen={record.owner_generation}"
                 )
-        if self._retain_versions:
-            self._capture_version(record, artifact.version, content)
-        record.artifact = artifact
-        record.content = content
-        record.last_writer = last_writer
+        # Version-moving mutation under _capture_lock (Unit 2): serializes with
+        # a concurrent multi-artifact capture so the cut cannot observe this
+        # artifact moved while a peer in the same read-set is not (read skew).
+        with self._capture_lock:
+            if self._retain_versions:
+                self._capture_version(record, artifact.version, content)
+            record.artifact = artifact
+            record.content = content
+            record.last_writer = last_writer
 
     def get_content_at_version(self, artifact_id: UUID, version: int) -> str | bytes | None:
         """Return content for a specific version, if retained.
@@ -549,25 +627,33 @@ class ArtifactRegistry:
             size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
             depends_on=record.artifact.depends_on,
         )
-        # Content coherence: when the caller threaded the winning body, advance
-        # record.content to it so a peer re-fetch reads the NEW content at the new
-        # version (without this, version + content_hash bump but the body stays
-        # stale). content is None on the cross-process / sqlite path (no content
-        # stored) — keep the prior body unchanged there.
-        if content is not None:
-            record.content = content
-        # Retention capture joins this APPLIED block (after every state_log emit
-        # succeeded) so a callback raise above cannot leave phantom history —
-        # parity with the stage-then-apply discipline for the MESI mutations.
-        # content=None SKIPS capture entirely (R-fix): the old code retained the
-        # OLD body under the NEW version when content was None — a latent
-        # history-poisoning bug only observable through retention reads. Now an
-        # unsupplied body simply means "no snapshot for this version"; a later
-        # read of next_version misses (None), rather than returning stale bytes.
-        if self._retain_versions and content is not None:
-            self._capture_version(record, next_version, content)
-        record.artifact = updated
-        record.last_writer = agent_id
+        # The version-move apply runs under _capture_lock (Unit 2): the WIN
+        # advances record.artifact.version, and a concurrent multi-artifact
+        # capture reads N versions under that same lock — so this commit cannot
+        # tear a cut (read skew) by moving one read-set member while the capture
+        # has already read its peers. The lock is an RLock, so the nested
+        # _capture_version re-enters freely. The non-WIN branches above mutate
+        # nothing, so they need no lock; only this apply does.
+        with self._capture_lock:
+            # Content coherence: when the caller threaded the winning body,
+            # advance record.content to it so a peer re-fetch reads the NEW
+            # content at the new version (without this, version + content_hash
+            # bump but the body stays stale). content is None on the cross-process
+            # / sqlite path (no content stored) — keep the prior body unchanged.
+            if content is not None:
+                record.content = content
+            # Retention capture joins this APPLIED block (after every state_log
+            # emit succeeded) so a callback raise above cannot leave phantom
+            # history — parity with the stage-then-apply discipline for the MESI
+            # mutations. content=None SKIPS capture entirely (R-fix): the old code
+            # retained the OLD body under the NEW version when content was None —
+            # a latent history-poisoning bug only observable through retention
+            # reads. Now an unsupplied body simply means "no snapshot for this
+            # version"; a later read of next_version misses (None).
+            if self._retain_versions and content is not None:
+                self._capture_version(record, next_version, content)
+            record.artifact = updated
+            record.last_writer = agent_id
 
         invalidated: list[UUID] = []
         for peer_id, peer_from in peers:
@@ -586,6 +672,142 @@ class ArtifactRegistry:
         record.state_by_agent[agent_id] = MESIState.SHARED
 
         return updated, invalidated
+
+    def capture_version_vector(
+        self,
+        read_set: "Iterable[UUID]",
+        session_token: str,
+        *,
+        owner: "UUID | None" = None,
+        created_at_tick: int | None = None,
+    ) -> CaptureResult:
+        """Atomically pin a consistent multi-artifact CUT (SB-17 / TX-1, Unit 2 /
+        R1). Written fresh from the contract — parity with
+        :meth:`SqliteArtifactRegistry.capture_version_vector` (the two registries
+        share no base class), divergent ONLY on restart-survival (in-memory pins
+        are process-scoped; the parity harness asserts the divergence).
+
+        Captures ``{artifact_id: current_version}`` for every id in ``read_set``
+        at ONE linearization point and records the pins under ``session_token``
+        so the inline retention GC exempts those versions (R4). Non-mutating: it
+        mints NO MESI grant and captures NO ``read_generation`` (it never calls
+        ``set_agent_state`` / the fence-capture path) — a reader is not an owner.
+
+        Atomicity (the cross-artifact lock, Unit 2): GIL per-access atomicity is
+        per single dict access, which is insufficient across N artifacts. The
+        multi-artifact version read AND the pin insert run under
+        ``_capture_lock`` so a peer ``commit_cas`` cannot interleave the reads
+        and yield a torn (read-skewed) cut. The existing per-access paths stay
+        lock-free.
+
+        Unknown-id validation (security, F7): the captured row-count must equal
+        ``len(read_set)``. Any missing id → a typed
+        :class:`~ccs.core.types.VersionedReadRejection` reusing the
+        ``unknown_artifact`` reason, with NO pins inserted (no partial cut, no
+        existence-probe oracle — the rejection is decided before any pin write).
+        The first missing id (sorted for determinism) names the rejection.
+
+        Args:
+            read_set: The artifact ids to pin into the cut. An empty read_set
+                pins an empty cut (a degenerate-but-valid session).
+            session_token: The server-minted session identity the pins are keyed
+                under (owner-binding is the service layer's concern; the registry
+                only keys the pin store by this token).
+
+        Returns:
+            The pinned cut ``{artifact_id: version}`` on success, else a
+            :class:`VersionedReadRejection` (``unknown_artifact``) — no pins
+            inserted.
+        """
+        ids = list(read_set)
+        with self._capture_lock:
+            # ONE linearization point: read every current version while holding
+            # the capture lock. Every version-moving write — commit_cas WIN,
+            # set_artifact_and_content, register_artifact — ALSO takes
+            # _capture_lock around its apply, so a peer write is serialized
+            # entirely before or after this whole capture, never partially
+            # visible within the cut. The atomicity depends on BOTH sides taking
+            # the lock; do NOT remove it from either side.
+            cut: dict[UUID, int] = {}
+            missing: list[UUID] = []
+            for artifact_id in ids:
+                record = self._records.get(artifact_id)
+                if record is None:
+                    missing.append(artifact_id)
+                    continue
+                cut[artifact_id] = record.artifact.version
+            # F7: validate row-count == len(read_set) BEFORE any pin insert. A
+            # missing id rejects the WHOLE capture (no partial cut). Decided
+            # inside the lock but it inserts nothing on this branch.
+            if missing:
+                return VersionedReadRejection(
+                    reason=UNKNOWN_ARTIFACT_REASON,
+                    artifact_id=sorted(missing, key=lambda a: a.int)[0],
+                    requested_version=0,
+                    current_version=None,
+                    coordinator_epoch=self._coordinator_epoch,
+                )
+            # Insert the pins atomically with the read (same lock hold) so the
+            # exemptions seam sees the full cut the instant it becomes live.
+            self._session_pins[session_token] = dict(cut)
+            # Mirror the durable owner-binding (R13/R6/R14) so the sweep can
+            # enumerate sessions uniformly. Recorded even for an empty cut, and
+            # only when the caller supplies an owner (direct test captures pass
+            # none and create no session-meta entry).
+            if owner is not None:
+                self._session_meta[session_token] = (owner, int(created_at_tick or 0))
+            return cut
+
+    def release_session(self, session_token: str) -> None:
+        """Drop a session's pins AND its owner-binding mirror so its pinned
+        versions become collectible again (Unit 2 / R4). Idempotent — releasing
+        an unknown/already-released token is a no-op (no raise), mirroring the
+        sqlite ``DELETE`` semantics."""
+        with self._capture_lock:
+            self._session_pins.pop(session_token, None)
+            self._session_meta.pop(session_token, None)
+
+    def get_session_meta(self, session_token: str) -> "tuple[UUID, int] | None":
+        """Return ``(owner, created_at_tick)`` for ``session_token`` or ``None``
+        (SB-17 / TX-1, R13/R6/R14). Parity with
+        :meth:`SqliteArtifactRegistry.get_session_meta`; process-scoped here, so a
+        fresh in-memory instance always returns ``None`` (in-memory sessions do
+        not survive a restart — the asserted divergence)."""
+        with self._capture_lock:
+            return self._session_meta.get(session_token)
+
+    def all_session_meta(self) -> "dict[str, tuple[UUID, int]]":
+        """Return ``{session_token: (owner, created_at_tick)}`` for every live
+        session (SB-17 / TX-1, R6/R14). Parity with
+        :meth:`SqliteArtifactRegistry.all_session_meta`; the sweep enumerates this
+        UNION'd with its in-memory token set (identical here, since both are
+        process-scoped)."""
+        with self._capture_lock:
+            return dict(self._session_meta)
+
+    def session_count(self) -> int:
+        """Return the number of live sessions (SB-17 / TX-1, R14). Parity with
+        :meth:`SqliteArtifactRegistry.session_count`; process-scoped, so a fresh
+        instance is 0 (no durable survivors)."""
+        with self._capture_lock:
+            return len(self._session_meta)
+
+    def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
+        """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,
+        or ``None`` if the token has no live cut (SB-17 / TX-1, Unit 3 / R2).
+
+        The single accessor ``session_read`` needs to (a) tell a known token from
+        an unknown/released one (``None`` ⇒ ``session_not_found``) and (b) read
+        the per-artifact pinned version for the serve. Returns a COPY so a caller
+        cannot mutate the live pin store. Parity with
+        :meth:`SqliteArtifactRegistry.get_session_cut` (the two registries share
+        no base class); divergent only on restart-survival (in-memory pins are
+        process-scoped — a restart drops them and a post-restart token reads as
+        ``None``, the Unit-5 fail-closed concern). Taken under ``_capture_lock``
+        so a concurrent capture/release sees a consistent pin store."""
+        with self._capture_lock:
+            pins = self._session_pins.get(session_token)
+            return dict(pins) if pins is not None else None
 
     def _emit_state_log(
         self,

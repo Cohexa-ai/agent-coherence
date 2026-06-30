@@ -88,6 +88,142 @@ READ_AT_VERSION_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# session.read rejection reasons (SB-17 / TX-1, Unit 3 / R2)
+# ---------------------------------------------------------------------------
+#
+# Wire-stable, ADDITIVE constants carried by
+# :class:`~ccs.core.types.SessionReadRejection.reason`. ADDITIVE-only (R7): a NEW
+# closed set, never folded into ``READ_AT_VERSION_REASONS`` — ``session_read`` is
+# a distinct surface from the bare ``read_at_version`` history read. Consumers
+# match ``reason == CONSTANT`` against :data:`SESSION_READ_REASONS`, never on a
+# human message (the typed-signal-not-substring house rule). Unit 5 ADDED the
+# heartbeat-liveness ``session_invalidated`` reason (a reaped / restart-wiped
+# token lands there; a never-opened/malformed token stays ``session_not_found``).
+SESSION_NOT_FOUND_REASON = "session_not_found"
+"""The ``session_token`` has no pinned cut — unknown, never opened, or released
+(``release_session``). A coordinator restart that wiped an in-memory session also
+lands here in Unit 3 (the durable Unit-5 liveness/restart taxonomy is later)."""
+
+SESSION_ARTIFACT_NOT_IN_CUT_REASON = "artifact_not_in_cut"
+"""The token is a live session but the artifact was NOT in its captured read-set.
+Reading an un-pinned artifact mid-session is out of scope and is REJECTED here,
+never served from live HEAD (the no-fall-through guarantee)."""
+
+# ---------------------------------------------------------------------------
+# session liveness / fail-closed reason (SB-17 / TX-1, Unit 5 / R4)
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE (R7): the heartbeat-liveness fail-closed reason. A session whose pins
+# are UNAVAILABLE — reaped by the session-liveness sweep (stale heartbeat),
+# GC-raced, or wiped by an in-memory coordinator restart — fails CLOSED with
+# this reason, NEVER a live-HEAD fall-through. It is deliberately DISTINCT from
+# ``session_not_found``:
+#
+#   * ``session_invalidated`` — "your session DIED; re-establish it." The token
+#     WAS (or structurally still looks like) a real server-minted session, but
+#     its cut is gone. Returned for a token that is (a) in the bounded reaped-
+#     tombstone, or (b) shaped like a server-minted token (the
+#     ``looks_like_session_token`` format predicate) yet has no live cut — the
+#     post-restart-unknown case MUST land here so a previously-valid token is
+#     never served live HEAD as if still pinned.
+#   * ``session_not_found`` — a genuinely-never-opened / malformed token (does
+#     not match the server-minted format and is not in the tombstone). Kept
+#     reachable additively so a clearly-bogus token is still distinguishable.
+#
+# Both are fail-closed (typed rejection, never live HEAD); the split only sharpens
+# the operator/agent signal ("re-establish" vs "this was never a session"). Wire-
+# stable: ADD, never rename ``session_not_found``; consumers match
+# ``reason == CONSTANT``, never a substring.
+SESSION_INVALIDATED_REASON = "session_invalidated"
+"""A live session's pins are unavailable — reaped (stale heartbeat), GC-raced, or
+wiped by an in-memory restart. Fails CLOSED (never live HEAD). Distinct from
+``session_not_found`` (a never-opened/malformed token): a token that was, or
+still structurally looks like, a real server-minted session lands HERE so it is
+never mistaken for a fresh empty session and served live HEAD."""
+
+# The closed set every ``session_read`` consumer matches against. ADDITIVE-only:
+# disjoint from ``READ_AT_VERSION_REASONS`` (a separate surface, R7).
+SESSION_READ_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_NOT_FOUND_REASON,
+        SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+        SESSION_INVALIDATED_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# session.commit rejection reasons (SB-17 / TX-1, Unit 4 / R3)
+# ---------------------------------------------------------------------------
+#
+# Wire-stable, ADDITIVE constants carried by
+# :class:`~ccs.core.types.SessionCommitRejection.reason` — the typed VALIDATION
+# rejection of :meth:`CoordinatorService.session_commit` (the token has no pin /
+# the artifact is not in the cut), NEVER a silent fall-through. The OCC OUTCOMES
+# are NOT here: a lost-race surfaces as the shipped :class:`ConflictDetail`
+# (returned unchanged) and corruption as a raised ``CoherenceError`` (the
+# ``commit_cas`` taxonomy, preserved byte-for-byte). This set covers ONLY the
+# pre-commit validation gate. The two reasons are SHARED with ``session_read``
+# (the same token/pin checks), so they REUSE the Unit-3 literals rather than
+# minting parallel ones — one token-validation vocabulary across the session
+# surface. ADDITIVE-only (R7): a NEW closed set, disjoint from
+# ``READ_AT_VERSION_REASONS``; consumers match ``reason == CONSTANT``, never a
+# substring. Unit 5 ADDED ``session_invalidated`` (heartbeat-liveness): a reaped /
+# restart-wiped token lands there; a never-opened/malformed one stays
+# ``session_not_found``.
+SESSION_COMMIT_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_NOT_FOUND_REASON,
+        SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+        SESSION_INVALIDATED_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# begin_session resource-cap rejection reasons (SB-17 / TX-1, Unit 7 / R14)
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE (R7): the resource-bound rejections of
+# :meth:`CoordinatorService.begin_session`. ``begin_session`` already returns a
+# typed :class:`~ccs.core.types.VersionedReadRejection` for an unknown id
+# (``unknown_artifact``); these two reasons EXTEND that typed-return surface for
+# the R14 caps that bound the snapshot blast radius (security-calibrated DEFAULTS,
+# not post-hoc tuning):
+#
+#   * ``session_cap_exceeded`` — opening this session would exceed
+#     ``max_sessions`` concurrent sessions (the many-sessions GC-starvation DoS
+#     bound, threat-model #2). No token minted, no cut pinned.
+#   * ``read_set_too_large`` — the ``read_set`` cardinality exceeds
+#     ``max_read_set_cardinality`` (the enormous-single-read-set GC-starvation
+#     bound, threat-model #2). No token minted, no cut pinned.
+#
+# Both are PRE-CAPTURE rejections (fail BEFORE any token mint / pin insert), so a
+# rejected ``begin_session`` leaves NO half-open session. They reuse the
+# ``VersionedReadRejection`` carrier (the same typed return ``begin_session``
+# already produces) rather than minting a parallel rejection type. Wire-stable:
+# ADD, never rename; consumers match ``reason == CONSTANT``, never a substring.
+SESSION_CAP_EXCEEDED_REASON = "session_cap_exceeded"
+"""``begin_session`` would exceed ``max_sessions`` concurrent sessions (R14). No
+token minted, no cut pinned — the caller retries after a session is released or
+reaped. Bounds the many-sessions GC-starvation DoS (threat-model #2)."""
+
+SESSION_READ_SET_TOO_LARGE_REASON = "read_set_too_large"
+"""``begin_session``'s ``read_set`` exceeds ``max_read_set_cardinality`` (R14). No
+token minted, no cut pinned. Bounds the enormous-single-read-set GC-starvation
+DoS (threat-model #2)."""
+
+# The closed set every ``begin_session`` cap-rejection consumer matches against.
+# ADDITIVE-only (R7): disjoint from ``READ_AT_VERSION_REASONS`` /
+# ``SESSION_READ_REASONS`` / ``SESSION_COMMIT_REASONS``. ``begin_session`` may
+# ALSO return ``unknown_artifact`` (the Unit-2 capture rejection), which stays in
+# ``READ_AT_VERSION_REASONS``; these are the NET-NEW cap reasons only.
+SESSION_BEGIN_CAP_REASONS: frozenset[str] = frozenset(
+    {
+        SESSION_CAP_EXCEEDED_REASON,
+        SESSION_READ_SET_TOO_LARGE_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # read-only store-open classification signals (Unit 6 hardening)
 # ---------------------------------------------------------------------------
 #
@@ -124,9 +260,16 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 # The sibling Node coordinator (the agent-coherence-plugin repo) shares the
 # SAME ``<workspace>/.coherence/state.db`` path but maintains its OWN migration
 # ledger: its v2 adds no schema objects (pending_notices validation) and its v3
-# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — so the two ledgers
-# assign DIFFERENT meanings to ``PRAGMA user_version`` 2 and 3 on the same
-# file. ``CrossRuntimeSchemaError`` (defined in
+# is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — while THIS repo's
+# v2 adds ``artifact_versions`` and its v3 (SB-17 / TX-1, Unit 2) adds
+# ``session_pins``. So the two ledgers assign DIFFERENT meanings to
+# ``PRAGMA user_version`` 2 AND 3 on the same file: a Node coordinator opening a
+# Python-v3 db (or vice-versa) must DETECT and REJECT rather than silently
+# misread the schema. The detection lives in
+# ``SqliteArtifactRegistry._reject_foreign_ledger_db`` (the ``schema_runtime``
+# lineage stamp + structural ``artifact_versions``/``session_pins`` /
+# ``deadline_tick`` probes); the Node side mirrors it.
+# ``CrossRuntimeSchemaError`` (defined in
 # ``ccs.coordinator.sqlite_registry`` because it subclasses the
 # coordinator-layer ``SchemaVersionError`` to keep existing catch-sites
 # compatible; core must not import upward) carries THIS wire-stable reason so
@@ -195,6 +338,31 @@ class OccCallerTransientError(CoherenceError):
     artifact-not-found branches of ``commit_cas`` stay plain
     :class:`CoherenceError`; only the transient precondition is retry-eligible.
     """
+
+
+class SessionInvalidated(CoherenceError):
+    """A snapshot session's pins are unavailable — fail-closed (SB-17 / TX-1,
+    Unit 5 / R4). The session-liveness sweep reaped it (stale heartbeat), a GC
+    race dropped a pinned body, or an in-memory coordinator restart wiped the
+    pin store. The session can no longer serve its consistent cut, so any
+    ``session_read`` / ``session_commit`` against it MUST fail closed — NEVER a
+    live-HEAD fall-through.
+
+    Carries :data:`SESSION_INVALIDATED_REASON` so a consumer classifies it by
+    type / ``.reason`` (the typed-signal-not-substring house rule), distinct from
+    a generic :class:`CoherenceError`. The service-layer ``session_read`` /
+    ``session_commit`` surface returns the typed REJECTION
+    (:class:`~ccs.core.types.SessionReadRejection` /
+    :class:`~ccs.core.types.SessionCommitRejection`) carrying this same reason
+    rather than raising, mirroring the ``ConflictDetail`` discipline; this
+    exception is the raise-form for callers (e.g. an effect-gate, Unit 6) that
+    want a hard failure on a dead session.
+
+    Recovery is to OPEN A NEW SESSION (re-establish the cut + re-read), exactly
+    like a ``version_mismatch`` HELD — the dead cut is not retry-eligible in
+    place."""
+
+    reason = SESSION_INVALIDATED_REASON
 
 
 class CoherenceDegradedWarning(UserWarning):

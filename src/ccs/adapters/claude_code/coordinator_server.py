@@ -34,6 +34,7 @@ Lifecycle (spawn, port-file, idle-shutdown, sweep) lives in :mod:`lifecycle`
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import logging
@@ -51,6 +52,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
+from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
     build_host_allowlist,
     ensure_secret,
@@ -63,14 +65,24 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
+    SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
     CoherenceError,
     OccCallerTransientError,
+    SessionInvalidated,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
 from ccs.core.states import MESIState
-from ccs.core.types import ConflictDetail
+from ccs.core.types import (
+    ConflictDetail,
+    DataPlaneDeferredRead,
+    SessionCommitRejection,
+    SessionReadRejection,
+    SnapshotSession,
+    VersionedContent,
+    VersionedReadRejection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +168,14 @@ to read into memory. Matches MAX_POLICY_YAML_BYTES — generous for the
 ~1 KB hook payloads we actually expect, tight enough that a hostile or
 buggy client cannot OOM the coordinator with a single oversized body.
 Validated BEFORE rfile.read so we never allocate the offending buffer."""
+
+MAX_SESSION_READ_SET_PATHS = 64
+"""SB-17 Unit 8 (R14 wire mirror): cap on the number of read-set paths
+``POST /session/begin`` accepts in one request, mirroring the service's
+``SessionCapsConfig.max_read_set_cardinality`` default. A boundary reject
+(loud 400) keeps a hostile client from forcing the path→id resolution loop
+to walk an unbounded list before the service's own cap fires. The service
+cap remains authoritative; this is defense-in-depth at the wire."""
 
 
 def _resolve_coordinator_version() -> str:
@@ -2535,6 +2555,393 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     _run_or_degrade(req, coordinator, work)
 
 
+# ----------------------------------------------------------------------
+# Snapshot-session endpoints (SB-17 / TX-1, Unit 8 — R7 / R9 / R10a)
+# ----------------------------------------------------------------------
+#
+# Four ADDITIVE routes — registered in the central ``_ROUTES`` table so they
+# ride the SAME ``verify_bearer`` + ``verify_host`` seam every other endpoint
+# uses (the dispatcher applies auth before any handler runs; there is NO
+# parallel router). All four derive the CALLER/OWNER identity SERVER-SIDE from
+# the authenticated ``session_id`` via :func:`session_to_agent_id` — the same
+# agent-identity mechanism the hook endpoints use — and NEVER from a
+# client-supplied identity field. This is the R9 server-capture boundary lock:
+#
+#   * ``begin_session`` captures the cut SERVER-SIDE; the client cannot supply a
+#     cut / pinned versions.
+#   * ``/session/read`` and ``/session/commit`` carry ONLY the ``session_token``
+#     (+ artifact path / content). Any client-supplied ``cut`` / ``pinned_*`` /
+#     ``owner`` / ``caller`` field is IGNORED — the server reads the pinned cut
+#     from the registry by token and derives the owner from the authenticated
+#     session. A forged / replayed token CANNOT forge or bypass the server-side
+#     capture: a token with no live cut fails closed (``session_invalidated`` /
+#     ``session_not_found``), and a foreign caller raises ``SessionInvalidated``.
+#   * The day a client legitimately carries the cut is CROSS-HOST — out of scope
+#     here; the boundary-lock test FAILS if anyone wires a client-carried cut in.
+
+
+def _session_owner_from_request(
+    coordinator: CoordinatorHTTPServer, session_id: str
+) -> UUID:
+    """Derive the session OWNER/CALLER identity SERVER-SIDE from the
+    authenticated ``session_id`` (R9 / R13). Reuses the SAME
+    :func:`session_to_agent_id` derivation the hook endpoints use via
+    ``register_session`` — the identity comes from AUTH (the validated
+    ``session_id``), NEVER a client-supplied ``owner``/``caller`` field. Also
+    registers the session so status/name lookups stay consistent with the hook
+    surface."""
+    return coordinator.register_session(session_id)
+
+
+def _resolve_read_set(
+    coordinator: CoordinatorHTTPServer, paths: list[str]
+) -> list[UUID]:
+    """Resolve repo-relative read-set paths to artifact UUIDs, seeding a v1
+    row (KTD-9 first-observation, mirroring ``/hooks/pre-read``) for any path
+    not yet known. Non-mutating w.r.t. coherence STATE for already-known
+    artifacts (it only looks them up); a first-observation seed registers the
+    artifact row exactly as pre-read does. The returned id order matches the
+    input path order so the begin handler can render a path-keyed cut."""
+    ids: list[UUID] = []
+    for path in paths:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+        ids.append(artifact_id)
+    return ids
+
+
+def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /session/begin — open a consistent multi-artifact snapshot session.
+
+    Request: ``{session_id, read_set: [<repo-rel path>, ...]}``.
+
+    The CALLER/OWNER is derived SERVER-SIDE from ``session_id`` (R9/R13) — the
+    client does NOT supply an owner. The server resolves each read-set PATH to
+    an artifact id (seeding first-observations like pre-read), captures the cut
+    via ``service.begin_session``, and returns the server-minted
+    ``session_token`` plus the INSPECTABLE path-keyed cut. The bytes are never
+    captured here (version-map only); ``retain_versions`` tells the client which
+    serve branch a later ``/session/read`` resolves.
+
+    Responses:
+      - WIN → ``{ok: true, session_token, cut: {path: version}, coordinator_epoch,
+        retain_versions}``
+      - typed rejection (unknown id / caps) → ``{ok: false, reason, ...}``
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    read_set = body.get("read_set")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(read_set, list) or not all(isinstance(p, str) for p in read_set):
+        req._json(400, {"error": "read_set must be a list of repo-relative path strings"})
+        return
+    if len(read_set) > MAX_SESSION_READ_SET_PATHS:
+        req._json(400, {"error": f"read_set exceeds {MAX_SESSION_READ_SET_PATHS} paths"})
+        return
+    for path in read_set:
+        path_err = validate_path(path)
+        if path_err:
+            req._json(400, {"error": path_err})
+            return
+
+    # OWNER derived from AUTH, never a client field (R9/R13).
+    owner = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        read_set_ids = _resolve_read_set(coordinator, read_set)
+        # Keep a path↔id map so the response renders the cut path-keyed (the
+        # client speaks paths; artifact UUIDs stay server-internal).
+        id_to_path = {aid: path for aid, path in zip(read_set_ids, read_set)}
+        result = coordinator.service.begin_session(
+            read_set=read_set_ids, owner=owner, created_at_tick=now,
+        )
+        if isinstance(result, VersionedReadRejection):
+            # Typed cap / unknown-id rejection — NO session opened, no pins.
+            return {"ok": False, "reason": result.reason}
+        assert isinstance(result, SnapshotSession)
+        # Content-free audit (R10a): begin event with ids + pinned versions.
+        _session_audit.append_session_begin(
+            coordinator.coordinator_root,
+            session_token=result.session_token,
+            cut=result.cut,
+        )
+        cut_by_path = {
+            id_to_path.get(aid, str(aid)): version
+            for aid, version in result.cut.items()
+        }
+        return {
+            "ok": True,
+            "session_token": result.session_token,
+            "cut": cut_by_path,
+            "coordinator_epoch": result.coordinator_epoch,
+            "retain_versions": result.retain_versions,
+        }
+
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+
+
+def _session_read_content_fields(content: bytes | str) -> dict:
+    """Render a pinned body for the /session/read response so the client can
+    verify the hash CLIENT-SIDE (finding F5).
+
+    A lossy ``decode("utf-8", "replace")`` corrupted non-UTF-8 bodies — the
+    replacement chars made the client's hash unable to match the pinned
+    ``content_hash``. So: serve valid-UTF-8 (incl. all text) as a plain
+    ``content`` string (the unchanged, byte-stable wire shape), and EXACT-encode
+    non-UTF-8 bytes as base64 under an explicit ``content_encoding: "base64"``
+    flag (``content_b64``) so the round-trip is lossless. ``str`` content (the
+    in-memory registry's stored text) serves directly."""
+    if isinstance(content, bytes):
+        try:
+            return {"content": content.decode("utf-8")}
+        except UnicodeDecodeError:
+            return {
+                "content_b64": base64.b64encode(content).decode("ascii"),
+                "content_encoding": "base64",
+            }
+    return {"content": content}
+
+
+def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /session/read — serve an artifact's PINNED version from a session.
+
+    Request: ``{session_id, session_token, path}``.
+
+    R9 boundary lock: the request carries ONLY the ``session_token`` + ``path``
+    — NO client-supplied cut / pinned version / owner. The server reads the
+    pinned version from the registry by token and derives the caller from the
+    authenticated ``session_id``. A forged/replayed token or a foreign caller
+    cannot forge or bypass the server-side capture.
+
+    Responses:
+      - coordinator-held pinned bytes (LAZY branch) → ``{ok: true, served:
+        "content", version, content, coordinator_epoch}``. Non-UTF-8 bytes are
+        served losslessly as ``{..., content_b64, content_encoding: "base64"}``
+        instead of a (lossy) ``content`` string, so the client hash round-trips.
+      - bytes live in the data plane (EAGER branch) → ``{ok: true, served:
+        "data_plane_deferred", version, content_hash, coordinator_epoch}``
+      - typed rejection (no valid pin) → ``{ok: false, reason, coordinator_epoch}``
+      - foreign caller / dead session → ``{ok: false, reason: "session_invalidated"}``
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    session_token = body.get("session_token")
+    path = body.get("path", "")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(session_token, str) or not session_token:
+        req._json(400, {"error": "missing or invalid session_token"})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        req._json(400, {"error": path_err})
+        return
+
+    caller = _session_owner_from_request(coordinator, session_id)
+
+    def work() -> dict:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            # Unknown path → cannot be in any cut. Mirror the service's
+            # not-in-cut signal rather than seeding a row a read can't serve.
+            return {"ok": False, "reason": "artifact_not_in_cut"}
+        try:
+            result = coordinator.service.session_read(
+                session_token, artifact_id, caller=caller,
+            )
+        except SessionInvalidated as exc:
+            # Foreign caller / fenced-off session — fail closed. Content-free
+            # invalidate audit (R10a).
+            _session_audit.append_session_invalidate(
+                coordinator.coordinator_root,
+                session_token=session_token, reason=exc.reason,
+            )
+            return {"ok": False, "reason": exc.reason}
+        if isinstance(result, VersionedContent):
+            resp = {
+                "ok": True,
+                "served": "content",
+                "version": result.version,
+                "coordinator_epoch": result.coordinator_epoch,
+            }
+            resp.update(_session_read_content_fields(result.content))
+            return resp
+        if isinstance(result, DataPlaneDeferredRead):
+            return {
+                "ok": True,
+                "served": "data_plane_deferred",
+                "version": result.version,
+                "content_hash": result.content_hash,
+                "coordinator_epoch": result.coordinator_epoch,
+            }
+        assert isinstance(result, SessionReadRejection)
+        if result.reason == SESSION_INVALIDATED_REASON:
+            _session_audit.append_session_invalidate(
+                coordinator.coordinator_root,
+                session_token=session_token, reason=result.reason,
+            )
+        return {
+            "ok": False,
+            "reason": result.reason,
+            "coordinator_epoch": result.coordinator_epoch,
+        }
+
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+
+
+def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /session/commit — single-artifact OCC commit against the pinned base.
+
+    Request: ``{session_id, session_token, path, content}``.
+
+    R9 boundary lock: the request carries ONLY ``session_token`` + ``path`` +
+    ``content`` — NO client-supplied cut / pinned version / expected_version /
+    owner. The pinned ``expected_version`` is read SERVER-SIDE from the cut
+    (``service.session_commit`` sources it from ``cut[artifact_id]``); a client
+    cannot drive the CAS with a forged comparand. The caller is derived from the
+    authenticated ``session_id``.
+
+    Responses (preserving the shipped ``commit_cas`` taxonomy):
+      - WIN → ``{ok: true, version: N+1, coordinator_epoch}``
+      - retry-eligible ``ConflictDetail`` (HELD) → ``{ok: false, reason, current_version}``
+      - typed validation rejection → ``{ok: false, reason, coordinator_epoch}``
+      - corruption / foreign caller / dead session → ``{ok: false, reason}`` (raised
+        ``CoherenceError`` / ``SessionInvalidated`` mapped to a fail-closed body)
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    session_token = body.get("session_token")
+    path = body.get("path", "")
+    content = body.get("content")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(session_token, str) or not session_token:
+        req._json(400, {"error": "missing or invalid session_token"})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        req._json(400, {"error": path_err})
+        return
+    if not isinstance(content, str):
+        req._json(400, {"error": "content must be a string"})
+        return
+
+    caller = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            return {"ok": False, "reason": "artifact_not_in_cut"}
+        # Read the pinned base BEFORE the commit so the content-free audit can
+        # record (pinned_version, committed_version) on a WIN. Server-side only.
+        cut = coordinator.registry.get_session_cut(session_token)
+        pinned_version = cut.get(artifact_id) if cut else None
+        try:
+            result = coordinator.service.session_commit(
+                session_token, artifact_id, content, caller=caller, issued_at_tick=now,
+                abort=abort,
+            )
+        except SessionInvalidated as exc:
+            _session_audit.append_session_invalidate(
+                coordinator.coordinator_root,
+                session_token=session_token, reason=exc.reason,
+            )
+            return {"ok": False, "reason": exc.reason}
+        except CoherenceError as exc:
+            # Corruption (expected_version > current) — non-retryable. The
+            # client raises on this {ok: false, reason} body.
+            return {"ok": False, "reason": str(exc)}
+        if isinstance(result, ConflictDetail):
+            # HELD: nothing mutated. Byte-stable typed conflict the client maps
+            # to "open a new session + re-read + retry".
+            return {
+                "ok": False,
+                "reason": result.reason,
+                "current_version": result.current_version,
+            }
+        if isinstance(result, SessionCommitRejection):
+            if result.reason == SESSION_INVALIDATED_REASON:
+                _session_audit.append_session_invalidate(
+                    coordinator.coordinator_root,
+                    session_token=session_token, reason=result.reason,
+                )
+            return {
+                "ok": False,
+                "reason": result.reason,
+                "coordinator_epoch": result.coordinator_epoch,
+            }
+        updated, _signals = result
+        # Content-free commit audit (R10a): ids + versions, no body / no hash.
+        _session_audit.append_session_commit(
+            coordinator.coordinator_root,
+            session_token=session_token,
+            artifact_id=artifact_id,
+            pinned_version=pinned_version if pinned_version is not None else updated.version - 1,
+            committed_version=updated.version,
+        )
+        return {
+            "ok": True,
+            "version": updated.version,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    # Fail-closed degrade: a timed-out session.commit must NOT read as success
+    # (mirror the OCC commit endpoint — a degraded commit is a definite reject).
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
+
+
+def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /session/heartbeat — refresh a session's heartbeat lease (R4).
+
+    Request: ``{session_id, session_token}``.
+
+    The OWNER is derived from the authenticated ``session_id`` — a foreign
+    caller cannot keep another agent's session alive (the service enforces the
+    timing-safe owner-binding and returns False on mismatch; the response does
+    NOT reveal whether the token exists). ``{ok: true, refreshed: bool}``.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    session_token = body.get("session_token")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(session_token, str) or not session_token:
+        req._json(400, {"error": "missing or invalid session_token"})
+        return
+
+    owner = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        refreshed = coordinator.service.record_session_heartbeat(
+            session_token=session_token, owner=owner, now_tick=now,
+        )
+        return {"ok": True, "refreshed": refreshed}
+
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+
+
 def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
@@ -2868,6 +3275,13 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-grep"): _handle_pre_grep,
     ("POST", "/policy/track"): _handle_policy_track,
     ("POST", "/policy/untrack"): _handle_policy_untrack,
+    # SB-17 / TX-1 Unit 8 — snapshot-session endpoints. Registered HERE so they
+    # ride the central verify_bearer + verify_host seam the dispatcher applies
+    # to every route (NO parallel router; R9 / Unit 8 endpoint-auth obligation).
+    ("POST", "/session/begin"): _handle_session_begin,
+    ("POST", "/session/read"): _handle_session_read,
+    ("POST", "/session/commit"): _handle_session_commit,
+    ("POST", "/session/heartbeat"): _handle_session_heartbeat,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
 }
@@ -2888,6 +3302,12 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # bump a version the imminent shutdown then strands; the client retries
     # after the coordinator restarts.
     ("POST", "/hooks/post-edit-cas"),
+    # A snapshot session.commit is a version-bumping OCC write at the pinned base
+    # — same hazard as post-edit-cas: letting it land mid-migration bumps a
+    # version the imminent shutdown then strands. Reject it draining; the client
+    # opens a fresh session + re-reads + re-commits after the restart. (begin /
+    # read / heartbeat are non-mutating and stay out of this set.)
+    ("POST", "/session/commit"),
 }
 
 
