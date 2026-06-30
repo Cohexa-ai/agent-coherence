@@ -1,7 +1,7 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""Full-surface conformance contract for the registry Protocols (Phase 1).
+"""Full-surface conformance contract for the registry Protocols.
 
 Before the Phase-1 extraction the two registries
 (:class:`~ccs.coordinator.registry.ArtifactRegistry` and
@@ -242,6 +242,23 @@ def test_incomplete_stub_is_not_registry_base() -> None:
     instance = _AlmostRegistry()
     assert not hasattr(instance, omitted)
     assert not isinstance(instance, RegistryBase)
+
+
+def test_full_base_but_incomplete_extended_is_not_sqlite_extended() -> None:
+    """A class with every RegistryBase method AND every SqliteExtended method
+    EXCEPT one is RegistryBase but NOT SqliteExtended — the extended surface
+    discriminates too, not just the base."""
+
+    class _AlmostSqlite:
+        pass
+
+    omitted = "status_snapshot"
+    for name in BASE_METHODS | (EXTENDED_ONLY_METHODS - {omitted}):
+        setattr(_AlmostSqlite, name, lambda self, *a, **k: None)
+
+    instance = _AlmostSqlite()
+    assert isinstance(instance, RegistryBase)  # full base surface present
+    assert not isinstance(instance, SqliteExtended)  # missing one extended method
 
 
 # ---------------------------------------------------------------------------

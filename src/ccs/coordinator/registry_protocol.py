@@ -4,19 +4,19 @@
 """Structural Protocols for the coordinator's artifact registries.
 
 This module holds the registry CONTRACT the service layer depends on, extracted
-in Phase 1 of the cross-host production-HA journey (PURE REFACTOR — zero
-behavior change). Before this extraction the two registries
-(:class:`ccs.coordinator.registry.ArtifactRegistry` in-memory and
+as a pure refactor (zero behavior change). Before this extraction the two
+registries (:class:`ccs.coordinator.registry.ArtifactRegistry` in-memory and
 :class:`ccs.coordinator.sqlite_registry.SqliteArtifactRegistry` durable) were
 duck-typed with NO shared interface; their parity was asserted piecemeal in
 tests.
 
-The two Protocols below name that shared surface explicitly:
+The two Protocols below name that shared surface explicitly (the authoritative
+method set is the one pinned by ``tests/test_registry_protocol_parity.py``):
 
-- :class:`RegistryBase` — the 34 methods :class:`CoordinatorService` (the
-  service layer) depends on. ``ArtifactRegistry`` and ``SqliteArtifactRegistry``
-  both satisfy it.
-- :class:`SqliteExtended` — ``RegistryBase`` plus the 13 SQLite-backed methods
+- :class:`RegistryBase` — the methods :class:`CoordinatorService` (the service
+  layer) depends on. ``ArtifactRegistry`` and ``SqliteArtifactRegistry`` both
+  satisfy it.
+- :class:`SqliteExtended` — ``RegistryBase`` plus the SQLite-backed methods
   ``coordinator_server.py`` depends on (preemption notices, prefix lookups,
   ``resolve_or_register``, ``status_snapshot``, connection ``close``). Only
   ``SqliteArtifactRegistry`` satisfies it today.
@@ -46,34 +46,54 @@ from .retention import RetentionPolicy
 
 # Contract return types — DEFINED here in the contract module and re-exported by
 # the concrete registries (registry.py / sqlite_registry.py import them back).
-# They ARE part of the contract (the return types of its methods); Phase 1
+# They ARE part of the contract (the return types of its methods); this module
 # deduplicated them here (each registry previously defined its own identical copy).
 ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
 # impossible state = CasCorruption. None is raised by the registry.
 CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
-# Snapshot consistent-cut capture (SB-17 / TX-1): WIN = the pinned cut
+# Snapshot consistent-cut capture: WIN = the pinned cut
 # {artifact_id: version}; a read_set with an unknown id = VersionedReadRejection,
 # NO pins inserted. Neither is raised by the registry.
 CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
+
+# Shared registry trigger constants — DEFINED here (canonical) and re-exported by
+# both registries, which previously each kept an identical copy pinned equal by
+# the dual-registry parity test.
+#
+# RECLAIM_TRIGGERS: the coordinator-side EVICTION triggers (the stable-grant
+# sweep's reclaim_heartbeat / reclaim_max_hold + the transient-timeout fail-safe
+# "timeout"). An M/E -> INVALID transition carrying one of these bumps the
+# artifact's owner_generation (the read-generation fence): the claim was revoked
+# WITHOUT a version move, which version-CAS cannot see. Any other
+# (peer-invalidation) INVALID does NOT bump — that path moves the version, so
+# version-CAS already catches a stale write.
+RECLAIM_TRIGGERS: frozenset[str] = frozenset(
+    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
+)
+# CLAIM_CAPTURE_TRIGGERS: triggers marking a GENUINE content read for
+# read-generation capture (the E/M-acquire capture is keyed on the state
+# transition, not the trigger). Service.fetch() emits "fetch"; renaming it
+# without updating this would silently disable capture on reads.
+CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 
 @runtime_checkable
 class RegistryBase(Protocol):
     """The registry contract the service layer (:class:`CoordinatorService`)
-    depends on — the 34 methods shared by both the in-memory and SQLite-backed
+    depends on — the methods shared by both the in-memory and SQLite-backed
     registries.
 
-    Extracted in Phase 1 as a PURE REFACTOR (no behavior change): it names the
+    Extracted as a pure refactor (no behavior change): it names the
     previously-implicit duck-type both registries already satisfied. The
     in-memory :class:`~ccs.coordinator.registry.ArtifactRegistry` is the
     canonical shape; the durable
     :class:`~ccs.coordinator.sqlite_registry.SqliteArtifactRegistry` mirrors it.
 
     Note on :meth:`get_content`: the in-memory registry returns ``Optional[str]``
-    while the SQLite registry returns ``Optional[bytes]`` (the KTD-13 contract
-    divergence — SQLite returns ``b""`` for known artifacts). The honest union
-    return type is therefore ``str | bytes | None``.
+    while the SQLite registry returns ``Optional[bytes]`` (it returns ``b""`` for
+    known artifacts). The honest union return type is therefore
+    ``str | bytes | None``.
     """
 
     def abort_guard(self, abort: "Event | None" = None) -> AbstractContextManager[None]:
@@ -230,14 +250,14 @@ class RegistryBase(Protocol):
 @runtime_checkable
 class SqliteExtended(RegistryBase, Protocol):
     """The extended registry surface ``coordinator_server.py`` depends on —
-    :class:`RegistryBase` plus the 13 methods that only the SQLite-backed
+    :class:`RegistryBase` plus the methods that only the SQLite-backed
     registry (:class:`~ccs.coordinator.sqlite_registry.SqliteArtifactRegistry`)
     provides today.
 
     These cover the durable-store-only concerns: connection ``close``, durable
     name/prefix lookups, the preemption-notice surface (record/peek/pop/evict),
     ``resolve_or_register`` first-observation seeding, and the ``status_snapshot``
-    batch. Extracted in Phase 1 as a PURE REFACTOR (no behavior change).
+    batch. Extracted as a pure refactor (no behavior change).
     """
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:

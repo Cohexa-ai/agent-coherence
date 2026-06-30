@@ -27,35 +27,20 @@ from ccs.core.types import (
 )
 
 # The registry contract return types (ReclamationSlot / CasResult / CaptureResult)
-# live in the Protocol module (Phase 1 dedup); re-exported here so existing
-# `from .registry import CasResult` importers keep working.
-from .registry_protocol import CaptureResult, CasResult, ReclamationSlot
+# live in the Protocol module (deduplicated there); re-exported here to keep
+# `ccs.coordinator.registry.CasResult` a stable public import path.
+from .registry_protocol import (
+    CLAIM_CAPTURE_TRIGGERS,
+    RECLAIM_TRIGGERS,
+    CaptureResult,
+    CasResult,
+    ReclamationSlot,
+)
 from .retention import RetentionPolicy, collectible_versions
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
-
-# The coordinator-side EVICTION triggers: the stable-grant sweep
-# (CoordinatorService.enforce_stable_grant_timeouts -> reclaim_heartbeat /
-# reclaim_max_hold) and the transient-timeout fail-safe
-# (enforce_transient_timeouts -> "timeout"). An M/E -> INVALID transition
-# carrying one of these bumps the artifact's owner_generation (the
-# read-generation fence) -- the holder's claim was revoked WITHOUT a version
-# move, which is exactly what version-CAS cannot see. A peer-invalidation
-# INVALID (any other trigger) does NOT bump: that path moves the version, so
-# version-CAS already catches a stale write. Duplicated in
-# SqliteArtifactRegistry; pinned equal by the parity test.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset(
-    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
-)
-
-# Triggers that mark a GENUINE content read for read-generation capture (the
-# E/M-acquire capture is keyed on the state transition, not the trigger).
-# Service.fetch() emits "fetch"; a rename there without updating this constant
-# would silently disable capture on reads -- pinned equal across registries by
-# the parity test, same discipline as RECLAIM_TRIGGERS.
-CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 
 @dataclass

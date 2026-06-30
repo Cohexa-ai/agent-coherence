@@ -106,9 +106,15 @@ from ccs.core.types import (
 )
 
 # Contract return types (ReclamationSlot / CasResult / CaptureResult) live in the
-# Protocol module (Phase 1 dedup); re-exported here so existing
-# `from .sqlite_registry import CasResult` importers keep working.
-from .registry_protocol import CaptureResult, CasResult, ReclamationSlot
+# Protocol module (deduplicated there); re-exported here to keep
+# `ccs.coordinator.sqlite_registry.CasResult` a stable public import path.
+from .registry_protocol import (
+    CLAIM_CAPTURE_TRIGGERS,
+    RECLAIM_TRIGGERS,
+    CaptureResult,
+    CasResult,
+    ReclamationSlot,
+)
 from .retention import RetentionPolicy, collectible_versions
 
 logger = logging.getLogger(__name__)
@@ -252,20 +258,6 @@ CREATE TABLE session_meta (
     created_at_tick INTEGER NOT NULL
 )
 """
-
-# Coordinator-side eviction triggers (the stable-grant sweep's two reclaim
-# triggers + the transient-timeout fail-safe) — an M/E -> INVALID carrying one
-# of these bumps the artifact's owner_generation (read-generation fence): the
-# claim was revoked without a version move, which version-CAS cannot see.
-# Duplicated from registry.py (the two registries share no base class); the
-# dual-registry parity test pins them equal.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset(
-    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
-)
-
-# Genuine-content-read triggers for read-generation capture (mirrors
-# registry.py; pinned equal by the parity test). Service.fetch() emits "fetch".
-CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
