@@ -141,3 +141,86 @@ def test_vanished_input_holds(tmp_path: Path, fast_cfg: LifecycleConfig) -> None
         assert fired == []
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- Fast unit tests of gate()'s pure logic (a stub volume, no coordinator) ----
+
+
+class _StubVolume:
+    """A minimal CoherentVolume stand-in for gate()'s pure logic: successive
+    read_with_version calls yield scripted (bytes, version) pairs, or raise."""
+
+    def __init__(self, reads: list) -> None:
+        self._reads = list(reads)
+        self._i = 0
+
+    def read_with_version(self, path: str) -> tuple[bytes, int]:
+        item = self._reads[self._i]
+        self._i += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_gate_fires_on_stub_unchanged() -> None:
+    fired: list[str] = []
+
+    def effect(x: str) -> str:
+        fired.append(x)
+        return "ok"
+
+    result = gate(
+        _StubVolume([(b"cfg", 5), (b"cfg", 5)]),
+        "p",
+        decide=lambda d: "go",
+        effect=effect,
+    )
+    assert result == "ok"
+    assert fired == ["go"]
+
+
+def test_gate_holds_on_stub_moved() -> None:
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5), (b"cfg", 6)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_version == 5
+    assert exc.value.current_version == 6
+
+
+def test_gate_holds_on_unconfirmed_version() -> None:
+    """Fail-closed: an unresolved version (0 -- a degraded / degrade-mode read)
+    HOLDs rather than firing on input the coordinator never confirmed."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 0), (b"cfg", 0)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_version == 0
+
+
+def test_gate_holds_on_vanish_carries_none_current() -> None:
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5), FileNotFoundError()]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.current_version is None
+
+
+def test_gate_requires_callable_decide() -> None:
+    with pytest.raises(TypeError):
+        gate(_StubVolume([(b"x", 1)]), "p", decide=None, effect=lambda x: x)  # type: ignore[arg-type]

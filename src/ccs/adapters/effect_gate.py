@@ -58,10 +58,11 @@ def gate(
        the OCC comparand come from the same read -- the split-comparand
        discipline that keeps a stale-derived decision from firing).
     2. ``decision = decide(bytes)``.
-    3. Re-read the current version at the effect boundary. If it moved (or the
-       file vanished) the gate HOLDs: it raises ``StaleView`` carrying
-       ``expected_version`` and ``current_version``, and the effect NEVER runs on
-       stale input.
+    3. Re-read the current version at the effect boundary. If it moved, the file
+       vanished, or the coordinator could not confirm the version (a degraded
+       read surfaces version ``0``), the gate HOLDs: it raises ``StaleView``
+       carrying ``expected_version`` and ``current_version``, and the effect
+       NEVER runs on unconfirmed or stale input.
     4. Otherwise fire ``effect(decision)`` and return its result.
 
     Escaping effects only, single-host, ordering-not-rollback. The
@@ -86,6 +87,8 @@ def gate(
             effect did not run. Recover via ``volume.reacquire(path)`` then
             re-decide.
     """
+    if not callable(decide):
+        raise TypeError("gate() requires a callable decide=")
     if not callable(effect):
         raise TypeError("gate() requires a callable effect=")
 
@@ -97,7 +100,14 @@ def gate(
     except FileNotFoundError:
         raise _held(path, expected_version, None) from None
 
-    if current_version != expected_version:
+    # HOLD unless the coordinator CONFIRMED an unchanged version. Version 0 is the
+    # "could not resolve" sentinel (an older/degraded coordinator, or a
+    # degrade-mode volume whose read did not fail closed); firing on it would act
+    # on input the coordinator never confirmed. Treating an unconfirmed version as
+    # a HOLD keeps the gate fail-closed by construction, independent of the
+    # volume's on_error mode.
+    unconfirmed = expected_version == 0 or current_version == 0
+    if unconfirmed or current_version != expected_version:
         raise _held(path, expected_version, current_version)
 
     # Re-validate passed: fire. The residual re-validate -> fire window is
@@ -111,10 +121,16 @@ def _held(
     expected_version: int,
     current_version: int | None,
 ) -> StaleView:
-    """Build the HOLD exception, carrying the drift, for a moved/vanished input."""
-    moved = "vanished" if current_version is None else f"moved to v{current_version}"
+    """Build the HOLD exception, carrying the drift, for a moved / vanished /
+    unconfirmed input."""
+    if current_version is None:
+        detail = "vanished"
+    elif expected_version == 0 or current_version == 0:
+        detail = "could not be confirmed (coordinator degraded or unresolved)"
+    else:
+        detail = f"moved to v{current_version}"
     exc = StaleView(
-        f"effect held: {os.fspath(path)} {moved} since it was read at "
+        f"effect held: {os.fspath(path)} {detail} since it was read at "
         f"v{expected_version}; effect not fired (reacquire and re-decide)"
     )
     exc.expected_version = expected_version
