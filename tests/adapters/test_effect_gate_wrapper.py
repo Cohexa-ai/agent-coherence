@@ -102,7 +102,9 @@ def test_escaping_effect_held_when_input_advanced(
             gate(vol_a, REL, decide=decide, effect=effect)
 
         assert fired == []  # the effect never fired on stale input
-        assert exc_info.value.expected_version != exc_info.value.current_version
+        # the peer's single write advanced the version by exactly one (monotonic),
+        # so pin the specific drift, not merely that the two versions differ.
+        assert exc_info.value.current_version == exc_info.value.expected_version + 1
     finally:
         stop_coordinator(tmp_path)
 
@@ -219,6 +221,45 @@ def test_gate_holds_on_vanish_carries_none_current() -> None:
         )
     assert fired == []
     assert exc.value.current_version is None
+
+
+def test_gate_holds_when_capture_read_degraded() -> None:
+    """Fail-closed on the FIRST operand of the guard: a degraded capture read
+    (version 0) HOLDs even though the re-read resolved to a real version."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 0), (b"cfg", 5)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_version == 0
+
+
+def test_gate_holds_when_revalidate_read_degraded() -> None:
+    """Fail-closed on the SECOND operand: a real capture (v5) whose re-read
+    degrades to version 0 HOLDs -- the exact degrade-mode race the guard closes.
+    This asymmetric case distinguishes the ``or`` guard from an ``and`` (which
+    would fire on the unconfirmed re-read: a fail-OPEN regression)."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5), (b"cfg", 0)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_version == 5
+    assert exc.value.current_version == 0
+
+
+def test_gate_requires_callable_effect() -> None:
+    """The explicit non-callable ``effect`` guard (distinct from omitting it)."""
+    with pytest.raises(TypeError):
+        gate(_StubVolume([(b"x", 1)]), "p", decide=lambda d: "go", effect=5)  # type: ignore[arg-type]
 
 
 def test_gate_requires_callable_decide() -> None:
