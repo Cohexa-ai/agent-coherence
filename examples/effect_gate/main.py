@@ -4,9 +4,9 @@
 
 An agent reads shared config, decides a deploy, and gates the deploy on the config
 version it decided from. If a peer moves the config first, the gate HOLDs the
-deploy (it never fires on stale input); the agent reacquires fresh config,
-re-decides, and fires. Single-host, offline, no API keys — spawns a local
-coordinator subprocess.
+deploy (rather than firing it on the config that moved); the agent reacquires
+fresh config, re-decides, and fires. Single-host, offline, no API keys — spawns
+a local coordinator subprocess.
 
     python -m examples.effect_gate.main             # the with-gate demo
     python -m examples.effect_gate.main --baseline  # negative control first (no gate -> stale deploy fires)

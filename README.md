@@ -133,7 +133,7 @@ with coherent_workspace(workspace_root, managed=("plans/**",)):
 
 ## Effect-ordering gate
 
-Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a shell command) computed from inputs they read earlier. If the input moved in between, the effect fires on stale state. `gate()` closes that: it captures the input's version at decision time, re-reads at the effect boundary, and fires only if the input is unchanged — otherwise it holds the effect before it runs.
+Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a shell command) computed from inputs they read earlier. If the input moved in between, the effect fires on stale state. `gate()` narrows that window: it captures the input's version at decision time, re-reads at the effect boundary, and fires only if the input is unchanged at that re-read — otherwise it holds the effect before it runs.
 
 ```python
 from ccs.adapters import CoherentVolume, gate
@@ -147,7 +147,7 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 
 It's plain Python, so the same call drops into a LangGraph node, a CrewAI task, or a raw script unchanged.
 
-**Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a coherent-cut operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it prevents.
+**Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a coherent-cut operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it catches.
 
 ## Status
 
