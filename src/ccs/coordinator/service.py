@@ -56,7 +56,7 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
-from .registry import ArtifactRegistry
+from .registry_protocol import RegistryBase
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +363,7 @@ class CoordinatorService:
 
     def __init__(
         self,
-        registry: ArtifactRegistry,
+        registry: RegistryBase,
         *,
         session_caps: SessionCapsConfig | None = None,
     ):

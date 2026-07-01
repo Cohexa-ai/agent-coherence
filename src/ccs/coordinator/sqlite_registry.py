@@ -84,7 +84,7 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, NoReturn, Optional, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NoReturn, Optional
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -105,6 +105,16 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
+# Contract return types (ReclamationSlot / CasResult / CaptureResult) live in the
+# Protocol module (deduplicated there); re-exported here to keep
+# `ccs.coordinator.sqlite_registry.CasResult` a stable public import path.
+from .registry_protocol import (
+    CLAIM_CAPTURE_TRIGGERS,
+    RECLAIM_TRIGGERS,
+    CaptureResult,
+    CasResult,
+    ReclamationSlot,
+)
 from .retention import RetentionPolicy, collectible_versions
 
 logger = logging.getLogger(__name__)
@@ -177,7 +187,6 @@ never exists at a broader umask mode; the migration re-applies it (and warns
 once) to an operator-broadened pre-existing db. Mirrors
 ``adapters/claude_code/audit_log.py:_REQUIRED_MODE``."""
 
-ReclamationSlot: TypeAlias = tuple[str, int]
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
 # Durable version-retention table (plan item N v1, Unit 3). One row per
@@ -250,20 +259,6 @@ CREATE TABLE session_meta (
 )
 """
 
-# Coordinator-side eviction triggers (the stable-grant sweep's two reclaim
-# triggers + the transient-timeout fail-safe) — an M/E -> INVALID carrying one
-# of these bumps the artifact's owner_generation (read-generation fence): the
-# claim was revoked without a version move, which version-CAS cannot see.
-# Duplicated from registry.py (the two registries share no base class); the
-# dual-registry parity test pins them equal.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset(
-    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
-)
-
-# Genuine-content-read triggers for read-generation capture (mirrors
-# registry.py; pinned equal by the parity test). Service.fetch() emits "fetch".
-CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
-
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
 # unbounded mode (retain_versions=True + policy=None → enabled with NULL axes):
@@ -287,18 +282,6 @@ _META_RETENTION_MAX_AGE_SECONDS = "retention_max_age_seconds"
 _META_SCHEMA_RUNTIME = "schema_runtime"
 _SCHEMA_RUNTIME_STAMP = "python"
 
-# OCC commit-CAS result (plan Unit 2). A WIN is ``(updated_artifact,
-# invalidated_agent_ids)`` — the service layer turns the id list into
-# ``InvalidationSignal``s. A loss is a typed ``ConflictDetail`` (retry-eligible,
-# no mutation). ``CasCorruption`` is the impossible-state sentinel the service
-# maps to ``CoherenceError``. None of these is raised by the registry.
-CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
-
-# Snapshot consistent-cut capture result (SB-17 / TX-1, Unit 2 / R1) — parity
-# with ArtifactRegistry.capture_version_vector. WIN = the pinned cut
-# ``{artifact_id: version}``; an unknown id = VersionedReadRejection
-# (``unknown_artifact``) with NO pins inserted. Neither is raised.
-CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
 class SchemaVersionError(RuntimeError):
@@ -3208,3 +3191,15 @@ class SqliteArtifactRegistry:
         )
         last_writer_id = UUID(hex=row[4]) if row[4] else None
         return _ArtifactRow(artifact=artifact, last_writer_id=last_writer_id)
+
+
+if TYPE_CHECKING:
+    # Static conformance assertion (Phase 1, zero runtime change): a type checker
+    # rejects this if ``SqliteArtifactRegistry`` ever drifts from the
+    # ``SqliteExtended`` contract ``coordinator_server.py`` depends on. Structural
+    # (no runtime inheritance); no import cycle (registry_protocol imports only
+    # domain types).
+    from .registry_protocol import SqliteExtended
+
+    def _conforms(r: SqliteArtifactRegistry) -> SqliteExtended:
+        return r

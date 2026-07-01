@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, Optional, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -26,45 +26,21 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
+# The registry contract return types (ReclamationSlot / CasResult / CaptureResult)
+# live in the Protocol module (deduplicated there); re-exported here to keep
+# `ccs.coordinator.registry.CasResult` a stable public import path.
+from .registry_protocol import (
+    CLAIM_CAPTURE_TRIGGERS,
+    RECLAIM_TRIGGERS,
+    CaptureResult,
+    CasResult,
+    ReclamationSlot,
+)
 from .retention import RetentionPolicy, collectible_versions
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 
-ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
-
-# The coordinator-side EVICTION triggers: the stable-grant sweep
-# (CoordinatorService.enforce_stable_grant_timeouts -> reclaim_heartbeat /
-# reclaim_max_hold) and the transient-timeout fail-safe
-# (enforce_transient_timeouts -> "timeout"). An M/E -> INVALID transition
-# carrying one of these bumps the artifact's owner_generation (the
-# read-generation fence) -- the holder's claim was revoked WITHOUT a version
-# move, which is exactly what version-CAS cannot see. A peer-invalidation
-# INVALID (any other trigger) does NOT bump: that path moves the version, so
-# version-CAS already catches a stale write. Duplicated in
-# SqliteArtifactRegistry; pinned equal by the parity test.
-RECLAIM_TRIGGERS: frozenset[str] = frozenset(
-    {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
-)
-
-# Triggers that mark a GENUINE content read for read-generation capture (the
-# E/M-acquire capture is keyed on the state transition, not the trigger).
-# Service.fetch() emits "fetch"; a rename there without updating this constant
-# would silently disable capture on reads -- pinned equal across registries by
-# the parity test, same discipline as RECLAIM_TRIGGERS.
-CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
-
-# OCC commit-CAS result (plan Unit 2) — parity with SqliteArtifactRegistry.
-# WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
-# impossible state = CasCorruption. None is raised by the registry.
-CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
-
-# Snapshot consistent-cut capture result (SB-17 / TX-1, Unit 2 / R1) — parity
-# with SqliteArtifactRegistry.capture_version_vector. WIN = the pinned cut
-# ``{artifact_id: version}``; a read_set with an unknown id =
-# VersionedReadRejection(reason=UNKNOWN_ARTIFACT) and NO pins inserted (no
-# partial cut, no existence-probe oracle). Neither is raised by the registry.
-CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
 @dataclass
@@ -921,3 +897,14 @@ class ArtifactRegistry:
             for agent_id, state in self._records[artifact_id].state_by_agent.items()
             if state != MESIState.INVALID
         ]
+
+
+if TYPE_CHECKING:
+    # Static conformance assertion (Phase 1, zero runtime change): a type checker
+    # rejects this if ``ArtifactRegistry`` ever drifts from the ``RegistryBase``
+    # contract the service layer depends on. Structural (no runtime inheritance);
+    # no import cycle (registry_protocol imports only domain types).
+    from .registry_protocol import RegistryBase
+
+    def _conforms(r: ArtifactRegistry) -> RegistryBase:
+        return r
