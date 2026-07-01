@@ -12,7 +12,9 @@ module pins the WHOLE surface:
 - both registries are ``isinstance`` of :class:`RegistryBase`, and the SQLite one
   is additionally ``isinstance`` of :class:`SqliteExtended`;
 - the exact expected method names (34 base + 13 extended) are present + callable
-  on each registry;
+  on each registry, and the base **property** members (e.g. ``coordinator_epoch``)
+  are present as properties — the callable checks cannot see them, so they are
+  pinned separately;
 - each registry method's parameter STRUCTURE (names, kinds, defaults — annotation
   strings ignored, since ``from __future__ import annotations`` stringifies them
   and they legitimately differ, e.g. ``get_content``'s ``str`` vs ``bytes``)
@@ -97,6 +99,13 @@ EXTENDED_ONLY_METHODS = frozenset(
         "status_snapshot",
     }
 )
+
+# Property members of the base contract. The method checks below filter by
+# callable(), so a ``@property`` is structurally invisible to them; pin
+# properties explicitly so a backend typed against RegistryBase cannot omit one,
+# pass ``isinstance``, and still fail at runtime (e.g. ``coordinator_epoch`` on
+# the read-fence path).
+BASE_PROPERTIES = frozenset({"coordinator_epoch"})
 
 
 @pytest.fixture
@@ -186,6 +195,40 @@ def test_protocol_surface_matches_expected_names() -> None:
     }
     assert base_names == BASE_METHODS
     assert extended_names == BASE_METHODS | EXTENDED_ONLY_METHODS
+    base_props = {
+        n
+        for n in dir(RegistryBase)
+        if not n.startswith("_") and isinstance(getattr(RegistryBase, n, None), property)
+    }
+    assert base_props == BASE_PROPERTIES
+
+
+# ---------------------------------------------------------------------------
+# Property members — the non-callable contract surface (coordinator_epoch, …).
+# The method checks filter by callable(), so a @property is invisible to them;
+# pinned separately so a RegistryBase-typed backend cannot omit one silently.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(BASE_PROPERTIES))
+def test_base_property_declared_on_protocol(name: str) -> None:
+    assert isinstance(getattr(RegistryBase, name, None), property)
+
+
+@pytest.mark.parametrize("name", sorted(BASE_PROPERTIES))
+def test_base_property_present_on_inmem(
+    inmem_registry: ArtifactRegistry, name: str
+) -> None:
+    assert isinstance(getattr(type(inmem_registry), name, None), property)
+    assert isinstance(getattr(inmem_registry, name), str)
+
+
+@pytest.mark.parametrize("name", sorted(BASE_PROPERTIES))
+def test_base_property_present_on_sqlite(
+    sqlite_registry: SqliteArtifactRegistry, name: str
+) -> None:
+    assert isinstance(getattr(type(sqlite_registry), name, None), property)
+    assert isinstance(getattr(sqlite_registry, name), str)
 
 
 # ---------------------------------------------------------------------------
@@ -255,10 +298,31 @@ def test_full_base_but_incomplete_extended_is_not_sqlite_extended() -> None:
     omitted = "status_snapshot"
     for name in BASE_METHODS | (EXTENDED_ONLY_METHODS - {omitted}):
         setattr(_AlmostSqlite, name, lambda self, *a, **k: None)
+    for prop in BASE_PROPERTIES:  # full base surface includes the property members
+        setattr(_AlmostSqlite, prop, property(lambda self: "epoch-0"))
 
     instance = _AlmostSqlite()
     assert isinstance(instance, RegistryBase)  # full base surface present
     assert not isinstance(instance, SqliteExtended)  # missing one extended method
+
+
+def test_stub_missing_base_property_is_not_registry_base() -> None:
+    """A class with every base METHOD but missing a base @property
+    (``coordinator_epoch``) is NOT RegistryBase — the property is part of the
+    contract, so a future backend cannot omit it and still pass ``isinstance``.
+    This is the regression guard for the gap where the Protocol declared only
+    methods and a conforming-per-isinstance backend would AttributeError on the
+    first fence read."""
+
+    class _NoEpoch:
+        pass
+
+    for name in BASE_METHODS:
+        setattr(_NoEpoch, name, lambda self, *a, **k: None)
+    # deliberately omit BASE_PROPERTIES (coordinator_epoch)
+    instance = _NoEpoch()
+    assert not any(hasattr(instance, p) for p in BASE_PROPERTIES)
+    assert not isinstance(instance, RegistryBase)
 
 
 # ---------------------------------------------------------------------------

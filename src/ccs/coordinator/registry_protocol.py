@@ -132,6 +132,16 @@ class RegistryBase(Protocol):
     ) -> CasResult:
         ...
 
+    @property
+    def coordinator_epoch(self) -> str:
+        """Fence token identifying this coordinator incarnation. A ``@property``
+        on both registries; read by :class:`CoordinatorService` on the read-fence
+        and session paths (``read_at_version`` / ``begin_session`` /
+        ``session_read`` / ``session_commit``). Declared here so a backend typed
+        against ``RegistryBase`` cannot omit it and pass ``isinstance`` yet fail
+        at the first fence read."""
+        ...
+
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         ...
 
