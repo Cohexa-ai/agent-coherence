@@ -1019,6 +1019,31 @@ from ccs.coordinator.service import CrashRecoveryConfig
 from ccs.adapters import OpenAIAgentsAdapter, CoherenceSession
 ```
 
+### `gate(volume, path, *, decide, effect)`
+
+Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input version it was decided from. `gate()` captures the input's version, runs `decide`, re-reads at the effect boundary, and fires `effect` only if the input is unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs.
+
+```python
+from ccs.adapters import CoherentVolume, gate
+
+vol = CoherentVolume(workspace_root, managed=("deploy/**",))
+
+# fires run_deploy(plan) only if deploy/config.txt is unchanged since decide() read it;
+# else raises StaleView before the deploy runs — reacquire() and re-decide.
+gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `volume` | `CoherentVolume` | A volume attached to the coordinator that tracks `path`. |
+| `path` | `str \| os.PathLike[str]` | The workspace-relative managed artifact whose version gates the effect. |
+| `decide` | `Callable[[bytes], D]` | Keyword-only. Reads the captured bytes and returns a decision passed to `effect`. |
+| `effect` | `Callable[[D], R]` | Keyword-only. The escaping side effect; fired only if the input is unchanged at the re-read. |
+
+Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version` — if the input moved, vanished, or could not be confirmed; recover with `volume.reacquire(path)`, then re-decide and re-gate.
+
+**Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
+
 ---
 
 ## Low-level adapter API
