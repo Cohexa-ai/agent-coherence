@@ -12,6 +12,8 @@ explicit operator assertion, not an in-band TLS signal.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from ccs.cli._coherence_client import (
@@ -24,12 +26,9 @@ from ccs.core.exceptions import CoherenceError, InsecureTransportRefused
 
 
 # --- loopback passes freely (no ack, byte-unchanged) -----------------------
-# Includes 127.0.0.0/8, ::1, and IPv4-mapped loopback (::ffff:127.0.0.1) — the last
-# is genuinely loopback (ipaddress.is_loopback unwraps the mapped IPv4), traffic
-# never leaves the host, so no ack is needed.
-@pytest.mark.parametrize(
-    "host", ["127.0.0.1", "localhost", "::1", "127.0.0.5", "::ffff:127.0.0.1"]
-)
+# 127.0.0.0/8 and ::1. IPv4-mapped loopback (::ffff:127.0.0.1) is deliberately NOT
+# here — it is classified non-loopback (fail-closed); see the refused matrix below.
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.0.5"])
 def test_loopback_passes_without_ack(host: str) -> None:
     ep = resolve_remote_endpoint(host, 8080, "secret", env={})
     assert isinstance(ep, CoordinatorEndpoint)
@@ -37,10 +36,19 @@ def test_loopback_passes_without_ack(host: str) -> None:
 
 
 # --- non-loopback without ack is refused (fail closed) ---------------------
-# A non-IP hostname and a mapped-PUBLIC address (::ffff:8.8.8.8, is_loopback False)
-# are correctly non-loopback — no bypass via the mapped form.
+# A non-IP hostname, a mapped-PUBLIC address (::ffff:8.8.8.8), AND a mapped-LOOPBACK
+# form (::ffff:127.0.0.1) all fail closed: mapped IPv6 forms are classified
+# non-loopback deterministically (stdlib is_loopback for the mapped form varies
+# across CPython patch releases), so the ack is required regardless of interpreter.
 @pytest.mark.parametrize(
-    "host", ["10.0.0.5", "172.28.0.2", "coordinator.internal", "::ffff:8.8.8.8"]
+    "host",
+    [
+        "10.0.0.5",
+        "172.28.0.2",
+        "coordinator.internal",
+        "::ffff:8.8.8.8",
+        "::ffff:127.0.0.1",
+    ],
 )
 def test_non_loopback_without_ack_refused(host: str) -> None:
     with pytest.raises(InsecureTransportRefused):
@@ -111,3 +119,30 @@ def test_from_env_nonloopback_without_ack_is_guarded_on_mint(
     assert cfg.enabled and cfg.host == "10.0.0.5"
     with pytest.raises(InsecureTransportRefused):
         resolve_remote_endpoint(cfg.host, cfg.port or 8080, "secret")
+
+
+# --- base_url brackets IPv6 literals so the authority parses ----------------
+# A loopback ::1 passes the guard, so its endpoint must yield a *usable* URL —
+# http://[::1]:8080, not the ambiguous http://::1:8080 (urllib misparses the port).
+@pytest.mark.parametrize(
+    ("host", "env", "expected"),
+    [
+        ("::1", {}, "http://[::1]:8080"),  # loopback IPv6, no ack
+        ("2001:db8::1", {"CCS_REMOTE_INSECURE": "1"}, "http://[2001:db8::1]:8080"),
+        ("127.0.0.1", {}, "http://127.0.0.1:8080"),  # IPv4 stays unbracketed
+    ],
+)
+def test_base_url_brackets_ipv6(host: str, env: dict, expected: str) -> None:
+    ep = resolve_remote_endpoint(host, 8080, "secret", env=env)
+    assert ep.base_url == expected
+
+
+# --- the acknowledgement log line names the host, never the secret (R3) -----
+def test_ack_log_names_host_never_secret(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "topsecret-bearer-value"
+    with caplog.at_level(logging.WARNING):
+        resolve_remote_endpoint(
+            "10.0.0.5", 8080, secret, env={"CCS_REMOTE_INSECURE": "1"}
+        )
+    assert secret not in caplog.text
+    assert "10.0.0.5" in caplog.text

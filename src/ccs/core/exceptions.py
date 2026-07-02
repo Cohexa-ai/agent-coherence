@@ -479,7 +479,9 @@ class InsecureTransportRefused(CoherenceError):
     client fails LOUD and CLOSED: set ``CCS_REMOTE_INSECURE=1`` to acknowledge the
     link is secured out-of-band, or point at a loopback host. This *reduces* the
     silent-plaintext footgun; it does not *guarantee* the link is encrypted (the
-    ack is an operator assertion). Carries the offending ``host``."""
+    ack is an operator assertion). The guard is evaluated once, when the endpoint is
+    minted (per process / instance) — not re-checked per request. Carries the
+    offending ``host``."""
 
     def __init__(self, host: str) -> None:
         super().__init__(
