@@ -17,6 +17,7 @@ print a one-line human message + exit 1 rather than dump a stack trace.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
+from ccs.core.exceptions import InsecureTransportRefused
 
 logger = logging.getLogger(__name__)
 
@@ -195,19 +197,68 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     return CoordinatorEndpoint(port=port, bearer=bearer)
 
 
-def resolve_remote_endpoint(host: str, port: int, secret: str) -> CoordinatorEndpoint:
+def _is_loopback_transport_host(host: str) -> bool:
+    """True for hosts that may receive a bearer over plaintext HTTP WITHOUT an ack.
+
+    Broader than the Host-allowlist :func:`~ccs.adapters.claude_code.auth.is_loopback_host`:
+    covers ``127.0.0.0/8`` and ``::1`` (via :mod:`ipaddress`) plus ``"localhost"``.
+    ``ipaddress.is_loopback`` also correctly resolves IPv4-mapped forms — mapped
+    loopback (``::ffff:127.0.0.1``) is loopback, while mapped-public
+    (``::ffff:8.8.8.8``) is not, so there is no bypass. A non-IP hostname (a name we
+    cannot classify) is treated as NON-loopback, so the guard fails closed on it.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _guard_plaintext_bearer(host: str, env: dict[str, str]) -> None:
+    """Fail closed on a plaintext bearer to a non-loopback host (Phase-1.5 guard).
+
+    The remote transport is always ``http://`` (encryption is operator-provided
+    out-of-band — WireGuard or a TLS-terminating proxy), so there is no in-band TLS
+    signal. For a non-loopback host the operator must set ``CCS_REMOTE_INSECURE``
+    (truthy) to acknowledge the link is secured, or the bearer is never sent
+    (:class:`InsecureTransportRefused`). Reduces-not-eliminates: it removes the
+    SILENT plaintext-bearer footgun, not the operator's duty to secure the link.
+    """
+    if _is_loopback_transport_host(host):
+        return
+    if env.get("CCS_REMOTE_INSECURE", "").strip().lower() in _REMOTE_TRUTHY_ENV_VALUES:
+        # Names host/posture only — never the bearer/secret value.
+        logger.warning(
+            "sending a bearer to non-loopback host %r over plaintext HTTP "
+            "(CCS_REMOTE_INSECURE acknowledged — ensure the link is encrypted)",
+            host,
+        )
+        return
+    raise InsecureTransportRefused(host)
+
+
+def resolve_remote_endpoint(
+    host: str, port: int, secret: str, *, env: dict[str, str] | None = None
+) -> CoordinatorEndpoint:
     """Build an endpoint for a REMOTE coordinator (cross-host demo).
 
     Unlike :func:`resolve_endpoint`, this reads nothing from the local
     ``.coherence/`` directory — host, port, and the bearer secret are supplied
     by the caller (typically via :meth:`RemoteCoordinatorConfig.from_env`).
-    Gated by :class:`RemoteCoordinatorConfig`; never used on the loopback-only
-    local path.
+    Gated by :class:`RemoteCoordinatorConfig`.
+
+    Fail-closed transport guard: for a NON-loopback host the bearer is only sent
+    when ``CCS_REMOTE_INSECURE`` (read from ``env``, default ``os.environ``) is
+    truthy — otherwise :class:`InsecureTransportRefused` is raised (the transport
+    is plaintext HTTP; the ack acknowledges an out-of-band-secured link). Loopback
+    is byte-unchanged.
     """
     if not host:
         raise CoordinatorUnavailable("remote coordinator host is empty")
     if not secret:
         raise CoordinatorUnavailable("remote coordinator bearer secret is empty")
+    _guard_plaintext_bearer(host, os.environ if env is None else env)
     return CoordinatorEndpoint(port=port, bearer=secret, host=host)
 
 

@@ -469,6 +469,28 @@ class RemoteAuthFailed(CoherenceError):
     client never silently degrades past a wrong secret."""
 
 
+class InsecureTransportRefused(CoherenceError):
+    """Refused to send a bearer token to a NON-loopback coordinator over plaintext
+    HTTP without an explicit operator acknowledgement (Phase-1.5 client-side guard).
+
+    The remote transport is always ``http://`` — encryption (WireGuard / a TLS
+    terminating proxy) is provided out-of-band by the operator, so there is no
+    in-band TLS signal. Rather than silently leak the bearer to a routed host, the
+    client fails LOUD and CLOSED: set ``CCS_REMOTE_INSECURE=1`` to acknowledge the
+    link is secured out-of-band, or point at a loopback host. This *reduces* the
+    silent-plaintext footgun; it does not *guarantee* the link is encrypted (the
+    ack is an operator assertion). Carries the offending ``host``."""
+
+    def __init__(self, host: str) -> None:
+        super().__init__(
+            f"refusing to send a bearer token to non-loopback host {host!r} over "
+            "plaintext HTTP; set CCS_REMOTE_INSECURE=1 to acknowledge the link is "
+            "secured out-of-band (e.g. WireGuard / a TLS-terminating proxy), or use "
+            "a loopback coordinator"
+        )
+        self.host = host
+
+
 class CommitUnconfirmed(CoherenceError):
     """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
     mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
