@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Mapping, Optional
 from uuid import UUID, uuid4
 
 from .states import MESIState, TransientState
@@ -153,6 +153,249 @@ class VersionedReadRejection:
     requested_version: int
     current_version: int | None
     coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class SnapshotSession:
+    """A consistent multi-artifact snapshot session (SB-17 / TX-1, Unit 2 / R1).
+
+    The WIN return of :meth:`CoordinatorService.begin_session` — a frozen value
+    object (the ``VersionedContent`` typed-return discipline) that pins a
+    coherent CUT of the read-set: a ``{artifact_id: version}`` vector captured at
+    ONE linearization point so no peer commit is *partially* visible within the
+    set (no cross-artifact read skew). The capture is non-mutating (it mints no
+    MESI grant and captures no ``read_generation`` — a reader is not an owner).
+
+    **R11 BINDING CONSTRAINT — the cut is an INSPECTABLE per-artifact map, NOT
+    an opaque handle.** ``cut`` exposes every pinned ``(artifact_id, version)``
+    pair by design: the paper SB-18 atomic multi-publish signature
+    (``commit_all(session_token, writes) -> MultiCommitResult``) is constructible
+    from v1 *only* because each artifact's ``expected_version`` can be read out
+    of this map. An opaque token that hid the per-artifact versions would leave
+    SB-18 no public way to obtain the expected-versions vector → foreclosed.
+    Unit 2 freezes this inspectable shape; Unit 9's harness re-checks it
+    mechanically. Do NOT replace ``cut`` with an opaque handle.
+
+    Field semantics:
+
+    - ``session_token`` is the server-minted, owner-bound session identity
+      (``secrets.token_urlsafe``; R13). It is NOT a snapshot handle — the cut is
+      carried inspectably in ``cut`` — it identifies the SESSION (for later
+      ``session.read`` / ``session.commit`` / heartbeat / release calls) and is
+      bound to the creating caller's identity at mint time.
+    - ``cut`` is the pinned version-vector ``{artifact_id: version}`` — the
+      consistent cut, one entry per read-set member, captured atomically. This is
+      the load-bearing inspectable surface (see the R11 note above).
+    - ``coordinator_epoch`` is the store's epoch, stamped to mirror
+      :class:`VersionedContent` / :class:`VersionedReadRejection` so a consumer
+      can pin which store-incarnation captured the cut (a durable sqlite session
+      survives restart only within the same epoch; an in-memory session does
+      not survive at all — R6).
+    - ``retain_versions`` is the deployment branch indicator: ``True`` when the
+      store retains bodies durably (the LAZY serve branch — Unit 3 serves pinned
+      bytes from ``artifact_versions``); ``False`` for the ``content=None`` /
+      retention-off ICP (the EAGER serve branch is resolved at the serve layer
+      in Unit 3, not here). Unit 2 records the branch; it captures the
+      version-MAP only and does NOT capture bytes in the coordinator.
+    """
+
+    session_token: str
+    cut: Mapping[UUID, int]
+    coordinator_epoch: str
+    retain_versions: bool
+
+
+@dataclass(frozen=True)
+class DataPlaneDeferredRead:
+    """A pinned-version read the COORDINATOR cannot serve bytes for — the bytes
+    live in the data plane (SB-17 / TX-1, Unit 3 / R2, the EAGER branch).
+
+    The honest, typed signal of :meth:`CoordinatorService.session_read` when the
+    session pins a real version but the coordinator holds NO body for it: the
+    ``retain_versions=False`` / ``commit_cas(content=None)`` ICP, where bodies
+    are never persisted in ``artifact_versions`` and the canonical bytes live in
+    the CoherentVolume data plane. This is NOT an error and NOT a crash — it
+    carries the pinned ``version`` + ``coordinator_epoch`` (+ ``content_hash`` if
+    the registry knows it) so the caller can fetch the exact pinned bytes from
+    the data plane. The actual data-plane byte serve is **Unit 6
+    (CoherentVolume)** — this result is the boundary signal "coordinator pinned
+    the version; ask the data plane for the bytes."
+
+    **Carries NO body** by type (mirrors the :class:`VersionedReadRejection`
+    no-leak discipline): only the pinned coordinates a data-plane fetch needs.
+    The distinction from a rejection is deliberate — a rejection means "no valid
+    pin"; this means "valid pin, bytes elsewhere".
+
+    Field semantics:
+
+    - ``artifact_id`` / ``version`` are the PINNED coordinates (the cut entry),
+      not the current ones — the data plane must be asked for exactly this
+      version's bytes.
+    - ``content_hash`` is the pinned version's hash when the registry knows it
+      (the artifact metadata carries a hash even when the body is not retained),
+      else ``None`` — a hint the data-plane fetch can verify against; never a
+      body.
+    - ``coordinator_epoch`` is the store's epoch, stamped to mirror
+      :class:`VersionedContent` / :class:`SnapshotSession` so the caller can pin
+      which store-incarnation captured the cut.
+    """
+
+    artifact_id: UUID
+    version: int
+    content_hash: str | None
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class SessionReadRejection:
+    """A typed :meth:`CoordinatorService.session_read` rejection (SB-17 / TX-1,
+    Unit 3 / R2) — never a live-HEAD fall-through.
+
+    The non-serve return when the call cannot be honored against a valid pin: a
+    typed RETURN (the ``ConflictDetail`` / ``VersionedReadRejection`` discipline),
+    never an exception and NEVER the current bytes served as if pinned. ``reason``
+    is exactly one of the wire-stable constants in
+    :data:`~ccs.core.exceptions.SESSION_READ_REASONS`; consumers match with
+    ``==``, never on a human message.
+
+    The reasons (Unit 5 ADDED the heartbeat-liveness ``session_invalidated`` axis):
+
+    - ``session_not_found`` — the ``session_token`` has no pinned cut AND does not
+      look like a server-minted token (a genuinely-never-opened / malformed
+      token). Kept reachable additively as the clearly-bogus-token signal.
+    - ``session_invalidated`` (Unit 5) — the pins are UNAVAILABLE for a token that
+      was, or still structurally looks like, a real session: reaped by the
+      session-liveness sweep (stale heartbeat), GC-raced, or wiped by an in-memory
+      coordinator restart. Fails CLOSED here so a previously-valid token is NEVER
+      served live HEAD as if still pinned (the post-restart-unknown safety case).
+    - ``artifact_not_in_cut`` — the token IS a live session, but ``artifact_id``
+      was not in its captured read-set. Reading an un-pinned artifact mid-session
+      is out of scope (a session wanting fresh data starts a new session); it is
+      rejected here, NOT served from live HEAD.
+
+    **Carries NO body** by type (the no-leak discipline): only the reason, the
+    artifact id, and the epoch. ``coordinator_epoch`` is ALWAYS populated.
+    """
+
+    reason: str
+    artifact_id: UUID
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class SessionCommitRejection:
+    """A typed :meth:`CoordinatorService.session_commit` VALIDATION rejection
+    (SB-17 / TX-1, Unit 4 / R3) — never a silent fall-through.
+
+    Returned (never raised) when the commit cannot even be ATTEMPTED against a
+    valid pin: the token has no live cut, or the artifact was not in the captured
+    read-set. It is the pre-commit gate ONLY — it is NOT how an OCC outcome is
+    surfaced. The OCC taxonomy is preserved byte-for-byte from the shipped
+    ``commit_cas``:
+
+    - a lost race → the shipped :class:`ConflictDetail` (``version_mismatch`` /
+      ``other_holder`` / ``stale_read_generation``), returned UNCHANGED;
+    - corruption (``expected_version > current``) → a RAISED ``CoherenceError``
+      (the service maps the registry's :class:`CasCorruption` sentinel), never a
+      rejection.
+
+    ``reason`` is exactly one of :data:`~ccs.core.exceptions.SESSION_COMMIT_REASONS`
+    (the SAME token/pin vocabulary as :class:`SessionReadRejection`); consumers
+    match ``reason == CONSTANT``, never on a human message.
+
+    - ``session_not_found`` — the ``session_token`` has no pinned cut (unknown,
+      never opened, or released; an in-memory restart also lands here until the
+      Unit-5 liveness taxonomy splits it).
+    - ``artifact_not_in_cut`` — the token IS a live session, but ``artifact_id``
+      was not in its captured read-set. Committing an un-pinned artifact is out
+      of scope (a session commits only against what it pinned).
+
+    **Carries NO body** by type (the no-leak discipline shared with
+    :class:`SessionReadRejection`): only the reason, the artifact id, and the
+    epoch. ``coordinator_epoch`` is ALWAYS populated.
+    """
+
+    reason: str
+    artifact_id: UUID
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class EffectHeld:
+    """The effect-gate RE-VALIDATE step found the read-set moved — the effect was
+    NOT fired (SB-17 / TX-1, Unit 6 / EO-5).
+
+    The non-fire return of :meth:`CoordinatorService.effect_gate`: between
+    ``begin_session`` (the pin) and the effect boundary, at least one read-set
+    member's CURRENT version no longer equals its pinned version, so firing would
+    act on stale input. The gate HOLDS — it never fires an escaping effect and
+    never lets the atomic commit land — and returns this typed value. NEVER an
+    exception (the ``ConflictDetail`` discipline), and NEVER a partial fire.
+
+    Recovery is to open a NEW session, re-read the fresh cut, re-decide, and
+    re-gate — exactly like a ``version_mismatch`` HELD; the dead decision is not
+    retry-eligible in place (its inputs changed underneath it).
+
+    Field semantics:
+
+    - ``moved`` is the per-artifact drift map ``{artifact_id: (pinned, current)}``
+      for EVERY read-set member whose current version diverged from its pin — the
+      full set, not just the first, so the caller can see the whole blast radius
+      of the change it raced. ``current`` is ``None`` when the artifact vanished
+      under the live pin (a deleted/GC-raced member is also "moved" — it can no
+      longer be proven unchanged, so the gate holds fail-closed).
+    - ``conflict`` is populated ONLY for the ATOMIC (``session.commit``) mode when
+      the commit lost its OCC race AT the pinned base — the shipped
+      :class:`ConflictDetail`, carried through verbatim so the caller sees the
+      same taxonomy a bare ``session_commit`` would surface. It is ``None`` for
+      an escaping-effect HELD (no commit was attempted) and for an atomic HELD
+      caught at the pre-commit re-validate (``moved`` populated, no CAS attempted).
+    - ``coordinator_epoch`` mirrors the other session results so the caller can
+      pin which store-incarnation evaluated the gate.
+    """
+
+    moved: Mapping[UUID, "tuple[int, int | None]"]
+    coordinator_epoch: str
+    conflict: Optional["ConflictDetail"] = None
+
+
+@dataclass(frozen=True)
+class EffectFired:
+    """The effect-gate fired the effect — the read-set was unchanged AS OF the
+    re-validate point (SB-17 / TX-1, Unit 6 / EO-5).
+
+    The fire return of :meth:`CoordinatorService.effect_gate`. Its guarantee is
+    mode-dependent and stated honestly (EO-5 / EO-7):
+
+    - **ATOMIC mode** (the effect IS ``session.commit``): the commit rode the
+      shipped ``commit_cas`` at the pinned base in the SAME arbitration step, so
+      "unchanged" and "fire" are one atomic event — there is NO window. ``commit``
+      carries the ``(updated_artifact, signals)`` WIN tuple.
+    - **ESCAPING mode** (the effect is a non-commit side effect — deploy / charge
+      / click — a caller-supplied callable): the gate re-validated the whole
+      vector and THEN fired the callable. The guarantee is "the read-set was
+      unchanged **as of the re-validate point**", NOT "as of the fire point": a
+      peer can commit a read-set member in the residual RE-VALIDATE→FIRE window,
+      after the check passed but before the callable ran. The gate gates pre-fire
+      and NEVER rolls back (EO-7), so this window is unclosable for escaping
+      effects and is NOT claimed away. ``result`` carries whatever the callable
+      returned (or ``None``).
+
+    Field semantics:
+
+    - ``revalidated_cut`` is the per-artifact version map ``{artifact_id: version}``
+      proven equal to the pin at the re-validate point — the exact vector the fire
+      decision was justified against.
+    - ``commit`` is the ``session.commit`` WIN tuple in ATOMIC mode, else ``None``.
+    - ``result`` is the escaping callable's return value in ESCAPING mode, else
+      ``None``.
+    - ``coordinator_epoch`` mirrors the other session results.
+    """
+
+    revalidated_cut: Mapping[UUID, int]
+    coordinator_epoch: str
+    commit: Optional["tuple[Artifact, list[InvalidationSignal]]"] = None
+    result: object = None
 
 
 @dataclass(frozen=True)

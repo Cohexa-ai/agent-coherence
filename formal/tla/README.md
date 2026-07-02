@@ -1,6 +1,6 @@
 # TLA+ Formal Verification
 
-TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, and bounded version retention with read-at-version.
+TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, and consistent multi-artifact snapshot sessions.
 
 ## What is modeled
 
@@ -14,6 +14,7 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 - **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to `commit_cas` in `src/ccs/coordinator/`.
 - **Read-generation fence (Fencing)** — a per-artifact ownership epoch (`ownerGeneration`) bumped atomically on every sweep reclamation, captured into `readGeneration` when an agent establishes its write-claim (`ObserveGenAction` — deliberately decoupled so the sweep can interleave between capture and commit), and enforced by a generation-guarded commit (`FencingCommitAction`): a writer whose captured generation was superseded by a reclamation is rejected even when the version is unchanged — the reclaim-zombie write the version CAS cannot see. Corresponds to `owner_generation` / `read_generation` in `src/ccs/coordinator/`.
 - **Bounded version retention + read-at-version (Retention)** — a per-artifact K-bounded history of committed versions (`history`, content abstracted as the version number), extended and garbage-collected atomically inside the fence-guarded commit (`RetentionCommitAction` — commit + retain + K-GC are one action, mirroring the same-transaction capture discipline), plus an off-protocol read-at-version request (`VersionedReadAction`) proven to be a protocol no-op. Every inherited invariant is re-checked with retention composed in — safety **preservation**, not behavioral equivalence (no refinement mapping). Corresponds to the retention capture points and `CoordinatorService.read_at_version` (plan: `docs/plans/2026-06-10-001-feat-version-retention-read-at-version-plan.md`).
+- **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — cross-artifact write skew is SB-18, out of scope. The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer (plan: `docs/plans/2026-06-26-002-feat-read-side-transaction-snapshot-plan.md`).
 
 ## What is deliberately out of scope
 
@@ -29,6 +30,8 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 | `register_artifact` | No register action exists anywhere in the chain; Retention's initial state retains version 1, covering the trivial case. Per-capture-point coverage is owned by the Python parity suite |
 | Retention policy changes across runs | `MaxRetained` (K) is a per-run CONSTANT; a re-opened store is equivalent to a fresh bounded store. Policy persistence/toggles are owned by Python tests |
 | Behavioral equivalence (refinement mapping) | `Retention.tla` proves safety **preservation** — the inherited invariants re-checked with retention enabled — not behavioral equivalence to Fencing, which would need a refinement mapping |
+| Cross-artifact WRITE skew (atomic multi-artifact commit) | `Snapshot.tla` models only single-artifact commits and proves READ-skew freedom; atomic multi-artifact write — two sessions each reading a coherent cut and each committing one artifact — is SB-18, deferred. The model asserts nothing about cross-artifact write atomicity |
+| Session read-serve / `session.commit` paths | The session read is a pure lookup of the pinned `snapshot[s]`; `session.commit` rides the inherited version-CAS. Neither adds protocol state, so both are owned by the Python suite (plan Units 3/4); `Snapshot.tla` models the cut and its GC-safety |
 | Full liveness proofs | TLC checks safety invariants; liveness is not checked (bounded models make temporal liveness checks infeasible at this scale). OCC's progress / no-starvation obligation is likewise discharged as a safety property (`NoLostUpdate` + a clean no-op conflict) plus a prose argument, not a temporal check. The Retention action property `[][...]_v` is a safety-shaped action check, not a liveness check |
 
 ## File layout
@@ -50,6 +53,9 @@ formal/tla/
 ├── Retention.tla           # amendment: EXTENDS Fencing, adds bounded retention + read-at-version
 ├── Retention.cfg           # TLC config: 3 agents (local deep runs)
 ├── Retention_CI.cfg        # TLC config: 2 agents, MaxRetained=2 (CI, fits 5-min budget)
+├── Snapshot.tla            # amendment: EXTENDS Retention, adds consistent multi-artifact snapshot sessions
+├── Snapshot.cfg            # TLC config: 2 agents, 2 artifacts (local deep runs)
+├── Snapshot_CI.cfg         # TLC config: 1 agent, 2 artifacts, MaxTicks=2 (CI; cross-artifact cut needs >= 2 artifacts)
 ├── lib/
 │   └── tla2tools.jar       # committed TLC binary (see version below)
 └── README.md               # this file
@@ -58,7 +64,7 @@ formal/tla/
 ## Running TLC
 
 ```bash
-# All five specs (recommended)
+# All six specs (recommended)
 make tla-check
 
 # Individual models
@@ -76,6 +82,9 @@ java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
 
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/Retention_CI.cfg formal/tla/Retention.tla -workers auto
+
+java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
+  -config formal/tla/Snapshot_CI.cfg formal/tla/Snapshot.tla -workers auto
 ```
 
 Requires Java 17+. CI uses Temurin via `actions/setup-java`.
@@ -84,18 +93,20 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 
 | ID | TLA+ Name | Checked In | Description |
 |----|-----------|-----------|-------------|
-| I1 | `SingleWriter` | All five | At most one agent holds M∪E per artifact |
-| I2 | `MonotonicVersion` | All five | Artifact version never decreases (≥ 1) |
-| — | `TypeOK` / `CRTypeOK` / `OCCTypeOK` / `FencingTypeOK` / `RetentionTypeOK` | All five | State variables have correct types and bounds (Retention additionally pins the history domain ⊆ `1..MaxVersion`, row count ≤ `MaxRetained`, and the marker-is-the-version content abstraction) |
-| I3 | `SweepExclusivity` | CrashRecovery, OCC, Fencing, Retention | No (agent, artifact) reclaimed twice in one tick |
-| I4 | `TriggerExclusivity` | CrashRecovery, OCC, Fencing, Retention | Each reclamation has exactly one trigger |
-| I5 | `TickMonotonicity` | CrashRecovery, OCC, Fencing, Retention | `lastHeartbeat` never decreases |
-| I6 | `SlotPreservedThroughSHARED` | CrashRecovery, OCC, Fencing, Retention | Reclamation slot persists across I→S, cleared only on I→M∪E |
+| I1 | `SingleWriter` | All six | At most one agent holds M∪E per artifact |
+| I2 | `MonotonicVersion` | All six | Artifact version never decreases (≥ 1) |
+| — | `TypeOK` / `CRTypeOK` / `OCCTypeOK` / `FencingTypeOK` / `RetentionTypeOK` / `SnapshotTypeOK` | All six | State variables have correct types and bounds (Retention pins the history domain ⊆ `1..MaxVersion`, row count ≤ `MaxRetained`, and the marker-is-the-version abstraction; Snapshot relaxes the row-count bound to `MaxRetained + |Sessions|` for the exemptions seam and types the session vars) |
+| I3 | `SweepExclusivity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | No (agent, artifact) reclaimed twice in one tick |
+| I4 | `TriggerExclusivity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | Each reclamation has exactly one trigger |
+| I5 | `TickMonotonicity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | `lastHeartbeat` never decreases |
+| I6 | `SlotPreservedThroughSHARED` | CrashRecovery, OCC, Fencing, Retention, Snapshot | Reclamation slot persists across I→S, cleared only on I→M∪E |
 | — | `NoLostUpdate` | OCC | No successful `commit_cas` ever landed on a stale observed version — the concurrent lost-update is prevented |
-| — | `ReadGenBounded` | Fencing, Retention | A captured read-generation never exceeds the artifact's current ownership epoch |
-| — | `NoStaleApply` | Fencing, Retention | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
-| — | `NoCollectedRead` | Retention | No versioned read ever observed a hole inside the promised K-window strictly below the current version — the GC never collects what the bounded-retention contract promises (current version included, by construction) |
+| — | `ReadGenBounded` | Fencing, Retention, Snapshot | A captured read-generation never exceeds the artifact's current ownership epoch |
+| — | `NoStaleApply` | Fencing, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
+| — | `NoCollectedRead` | Retention, Snapshot | No versioned read ever observed a hole inside the promised K-window strictly below the current version — the GC never collects what the bounded-retention contract promises (current version included, by construction) |
 | — | `ReadAtVersionIsProtocolNoOp` | Retention (action property, cfg `PROPERTY`) | `[][VersionedReadAction => UNCHANGED fenceVars]_retentionVars` — any transition satisfying the read action changes no MESI/crash-recovery/fence variable. A state invariant cannot express this: a fence-refreshing read is extensionally identical to a legitimate `ObserveGenAction`, so only an action-level check can catch it |
+| — | `NoReadSkewWithinCut` | Snapshot | No commit ever interleaved a partially-captured session — every session reads a coherent multi-artifact cut. Atomic capture makes a partial cut unreachable (vacuous-TRUE in the correct spec); the split mutant (recipe 9) gives it teeth — the `staleApply`/`collectedRead` sticky-flag idiom |
+| — | `PinAlwaysRetained` | Snapshot | Every version a live session pinned is still in the artifact's retained history — the K-bounded GC never collects a pin out from under its session (the exemptions seam: `SnapRetainAndCollect` keeps window ∪ live-session pins; recipe 10 gives it teeth) |
 
 I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 
@@ -123,6 +134,11 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `VersionedReadAction` | `CoordinatorService.read_at_version()` — off-protocol read; never calls `set_agent_state`/`set_agent_transient`, so no fence capture and no MESI transition (plan Unit 4) |
 | `NoCollectedRead` | bounded-retention parity suite (`tests/test_retention.py`, plan Units 2–5) |
 | `ReadAtVersionIsProtocolNoOp` | fence non-capture + MESI non-interaction regression tests (plan Unit 4) |
+| `BeginSessionAction` | `begin_session(read_set)` — the atomic consistent-cut capture; non-mutating, mints no MESI grant (plan Unit 2) |
+| `EndSessionAction` | session end / heartbeat-stale release — the pin-lifetime release that re-enables collection (plan Unit 5) |
+| `SnapRetainAndCollect` | `collectible_versions(exemptions=…)` — the K-GC keeping the window ∪ live-session pins (the exemptions seam, plan Unit 2) |
+| `NoReadSkewWithinCut` | the consistent-cut regression suite — atomic capture across peer commits (plan Units 2–3) |
+| `PinAlwaysRetained` | the exemptions-seam + session-liveness sweep tests (plan Units 2/5) |
 
 The model abstracts away transient states — the implementation's
 `enforce_transient_timeouts` and transient-skip rule in the sweep are not modeled.
@@ -139,7 +155,7 @@ non-decreasing) holds regardless of the bound.
 
 ## CI time budget
 
-Target: **5 minutes** total across the five specs (measured 4min 32s sequential on a machine that reproduces the reference Fencing time — snug; treat further spec additions as needing their own budget review).
+Target: **5 minutes** total across the six specs (the original five measured 4min 32s sequential on the reference machine; Snapshot adds ~18s reference-equivalent on a tight 1-agent × 2-artifact config — see the Snapshot note below). The budget stays snug; treat further spec additions as needing their own budget review.
 
 | Model | Config | Agents | Artifacts | MaxTicks | Distinct States | Wall Time |
 |-------|--------|--------|-----------|----------|----------------|-----------|
@@ -152,6 +168,8 @@ Target: **5 minutes** total across the five specs (measured 4min 32s sequential 
 | Fencing (local) | `Fencing.cfg` | 3 | 1 | 6 | — | minutes |
 | Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 2,832,014 | ~115s |
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
+| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 375,180 | ~18s |
+| Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
 
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)
@@ -161,6 +179,8 @@ but zero state-space dimensions. The local 3-agent config is overnight-class, no
 quick check: measured ≥95M distinct states (703M generated, queue still growing) at the
 40-minute mark on 8 cores — and since the distinct space equals Fencing's, that is also
 the true size of `Fencing.cfg`'s local space.
+
+Snapshot **inverts** the usual CI shape — **1 agent × 2 artifacts** (the other CI specs are 2 agents × 1 artifact). Read skew is a cross-artifact phenomenon, so ≥ 2 artifacts is mandatory; the agent-contention re-check of the inherited fence invariants is already discharged by the other specs and by the local `Snapshot.cfg` (2 agents). The CI config also disables the sweep (`HeartbeatTimeout` > `MaxTicks`) — the session machinery is fence-uniform and adds no sweep interaction, so suppressing it keeps the run to ~18s without losing Snapshot-specific coverage. The local `Snapshot.cfg` (2 agents, `MaxTicks=4`, sweeps on) is the deep composition check and the home for the mutant recipes.
 
 CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=6) to fit the budget.
 The full 3-agent config (`CrashRecovery.cfg`) is for local deep runs:
@@ -241,7 +261,28 @@ and confirm TLC finds a counterexample:
    and a read inside the K-window observes the never-retained version.
    (Verified 2026-06-11: violation found in ~2s, 4,485 states generated.)
 
+9. **Snapshot read-skew mutation (split the atomic capture)**: In `Snapshot.tla`,
+   replace `BeginSessionAction`'s one-step capture with a per-artifact capture —
+   `\E s \in Sessions, art \in Artifacts : ~sessionLive[s] /\ snapshot[s][art] = None`
+   `/\ snapshot' = [snapshot EXCEPT ![s][art] = version[art]] /\ sessionLive' =`
+   `[sessionLive EXCEPT ![s] = (\A a \in Artifacts : a = art \/ snapshot[s][a] /= None)]`
+   `/\ UNCHANGED <<retentionVars, readSkew>>`. Run TLC on `Snapshot_CI.cfg`. TLC
+   should fail with a `NoReadSkewWithinCut` violation: a commit interleaves a
+   partially-captured session — the exact read-skew window the atomic capture
+   excludes, which no inherited invariant can see. (Verified 2026-06-28:
+   violation found in ~1s, 238 distinct states.)
+
+10. **Snapshot exemption-drop mutation (GC eats a pin)**: In `Snapshot.tla`,
+   change `SnapRetainAndCollect`'s `keepDom` from
+   `(DOMAIN extended) \cap (window \cup PinnedVersions(art))` to
+   `(DOMAIN extended) \cap window` (the GC ignores live-session pins). Run TLC on
+   `Snapshot_CI.cfg`. TLC should fail with a `PinAlwaysRetained` violation once a
+   commit slides the K-window past a pinned version — the exemptions seam the
+   correct GC honors. (Verified 2026-06-28: violation found in ~1s, 821 distinct
+   states.)
+
 These mutations are run manually during development to validate TLC's
-bug-detection capability. The mutated files are not committed. Recipes 5–8
-run TLC directly on `Retention_CI.cfg` (mutating `Retention.tla` cannot affect
-the other four specs, so the full `make tla-check` adds nothing).
+bug-detection capability. The mutated files are not committed. Recipes 5–10
+run TLC directly on their amendment's CI config (`Retention_CI.cfg` /
+`Snapshot_CI.cfg`); mutating one amendment cannot affect the other specs, so the
+full `make tla-check` adds nothing.

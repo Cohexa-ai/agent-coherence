@@ -78,6 +78,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
 - 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
 - 🗂️ [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files) — `CoherentVolume`, the data-plane appliance for plain files shared across processes
+- 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input version it decided from
 - 🧮 [Formal verification](formal/tla/README.md) — the five TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
@@ -130,9 +131,27 @@ with coherent_workspace(workspace_root, managed=("plans/**",)):
 
 **Scope, honestly.** v1 prevents the **sequential** stale-read→write lost update for a single-host fleet sharing one workspace (A reads v1, B reads v1, A commits v2, B's stale write is denied → B re-reads). It does **not** serialize concurrent racing writers, nor catch an agent that re-reads fresh bytes and then writes a buffer computed from older ones. The `open()` shim is convenience, not the contract: it covers `open()`/`pathlib` text+binary read/write, but not raw `os.open`, subprocess redirection, `mmap`, or append/update modes — those delegate to the original `open()` unchanged. Run it yourself: `python -m examples.coherent_volume.main` (offline, deterministic, no keys), or read the [positioning + FAQ](https://agent-coherence.dev/rag/).
 
+## Effect-ordering gate
+
+Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a shell command) computed from inputs they read earlier. If the input moved in between, the effect fires on stale state. `gate()` narrows that window: it captures the input's version at decision time, re-reads at the effect boundary, and fires only if the input is unchanged at that re-read — otherwise it holds the effect before it runs.
+
+```python
+from ccs.adapters import CoherentVolume, gate
+
+vol = CoherentVolume(workspace_root, managed=("deploy/**",))
+
+# fires run_deploy(plan) only if deploy/config.txt is unchanged since decide() read it;
+# else raises StaleView before the deploy runs — reacquire() and re-decide.
+gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
+```
+
+It's plain Python, so the same call drops into a LangGraph node, a CrewAI task, or a raw script unchanged.
+
+**Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a coherent-cut operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it catches.
+
 ## Status
 
-**`v0.10.1` released — an opt-in cross-host coordination demo (default-off) plus a bracketed-IPv6 fix to the coordinator's Host-allowlist.** A new, fully opt-in demo (`CCS_REMOTE_COORDINATOR`, default off) coordinates two clients across a host boundary against one centralized coordinator: a stale write is denied by version-CAS *across the boundary* and the loser recovers via re-read + retry (slice 1), and an effect gated on `config@vN` fires only when the config is unchanged (slice 2) — with a `--baseline` negative-control mode that runs the silent-lost-update / stale-fire failures first, so the deny is measured against its absence. Library fix: the coordinator's Host-allowlist check (`verify_host`) now parses bracketed IPv6 literals (`[fc00::1]:port`) and matches IP literals on their normalized form, with the loopback/IPv4 path byte-unchanged and DNS-rebind protection preserved. All cross-host behavior is gated by the flag; the default loopback path is unchanged. See [CHANGELOG.md](CHANGELOG.md).
+**`v0.11.0` released — read-side transaction snapshots, the builder-facing `gate()` effect wrapper, and a fail-closed plaintext-bearer guard for cross-host mode.** A coordinated session now pins a consistent cut of the tracked artifacts and serves reads from it, so an agent that reads several artifacts never sees a torn mix of old and new versions while other writers advance them — reads serve only from the pinned cut (an unpinned artifact is refused, never served live), commits validate against the pinned base, and a stale/lost session fails closed rather than falling through to live state (prevents read-skew, not write-skew). `gate()` (`from ccs.adapters import gate`) orders an effect on the input it was computed from: it captures the input's version at decision time and fires only if the input is unchanged at the effect boundary, otherwise holding the effect before it runs. In cross-host mode the client now refuses to send its bearer token to a non-loopback host over plaintext HTTP unless `CCS_REMOTE_INSECURE=1` acknowledges an out-of-band-secured link (typed `InsecureTransportRefused`). The default single-host loopback path is byte-unchanged; all cross-host behavior stays gated by `CCS_REMOTE_COORDINATOR`. See [CHANGELOG.md](CHANGELOG.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 

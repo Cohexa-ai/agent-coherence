@@ -23,6 +23,12 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("http://10.0.0.5:8080/x", code, "err", {}, None)
 
 
+# These tests exercise 401 / degraded-body fail-closed semantics for a REMOTE
+# (non-loopback) host — NOT the plaintext-transport guard — so each resolve call
+# acknowledges the test-only insecure link explicitly (deliberate per-call ack).
+_INSECURE_ACK = {"CCS_REMOTE_INSECURE": "1"}
+
+
 def _remote_volume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, probe=None
 ) -> CoherentVolume:
@@ -31,7 +37,7 @@ def _remote_volume(
     monkeypatch.setattr(
         cv, "_coordinator_get", probe or (lambda ep, path, **k: {"ok": True})
     )
-    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret")
+    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret", env=_INSECURE_ACK)
     return CoherentVolume(tmp_path, on_error="strict", remote_endpoint=remote)
 
 
@@ -56,7 +62,7 @@ def test_attach_401_raises_remote_auth_failed(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     monkeypatch.setattr(cv, "_coordinator_get", probe_401)
-    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret")
+    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret", env=_INSECURE_ACK)
     with pytest.raises(RemoteAuthFailed):
         CoherentVolume(tmp_path, on_error="strict", remote_endpoint=remote)
 
@@ -90,6 +96,6 @@ def test_attach_403_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     monkeypatch.setattr(cv, "_coordinator_get", probe_403)
-    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret")
+    remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret", env=_INSECURE_ACK)
     with pytest.raises(CoherenceError):
         CoherentVolume(tmp_path, on_error="strict", remote_endpoint=remote)

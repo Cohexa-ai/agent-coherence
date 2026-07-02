@@ -4,6 +4,74 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [0.11.0] - 2026-07-02
+
+A read-side consistency layer that prevents read-skew within a coordinated
+session, a builder-facing `gate()` wrapper that orders effects on the inputs they
+were computed from, and a fail-closed guard that refuses to send a bearer token
+over plaintext HTTP to a non-loopback host. The default single-host loopback path
+is unchanged; all cross-host behavior stays gated by `CCS_REMOTE_COORDINATOR`.
+
+### Added
+
+- **Read-side transaction snapshots (coordinator).** A session pins a consistent
+  cut of the tracked artifacts and serves reads from that cut, so an agent that
+  reads several artifacts never sees a torn mix of old and new versions (read-skew)
+  even while other writers advance those artifacts in the background. Reads
+  (`session_read`) are non-mutating and serve **only** from the pinned cut — an
+  artifact that was not in the captured read-set is refused, never silently served
+  from live state. Commits (`session_commit`) validate optimistically against the
+  pinned base. Pins have a bounded lifetime backed by a heartbeat lease and a
+  liveness sweep: a session whose heartbeat goes stale (or that is lost to a
+  coordinator restart) fails **closed** with a typed "session invalidated" signal —
+  never a fall-through to live state. Exposed over HTTP session endpoints with
+  per-session identity, isolation, and caps, plus a content-free audit trail. This
+  prevents read-skew; it does not add write-skew prevention (concurrent writers
+  still resolve through version-CAS).
+- **`gate()` — builder-facing effect-ordering wrapper.** `from ccs.adapters import
+  gate`. Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a
+  shell command) computed from inputs they read earlier. `gate(vol, path,
+  decide=..., effect=...)` captures the input's version at decision time, re-reads
+  at the effect boundary, and fires the effect only if the input is unchanged —
+  otherwise it holds the effect (raising `StaleView`) before it runs. Plain Python,
+  so the same call drops into a LangGraph node, a CrewAI task, or a raw script
+  unchanged. It *orders* effects, it does not roll them back (fires pre-effect,
+  single-host, cooperative). Run it: `python -m examples.effect_gate.main` (offline,
+  deterministic; add `--baseline` to see the stale fire it catches).
+- **Fail-closed plaintext-bearer guard (cross-host mode).** The remote transport is
+  plaintext HTTP — encryption is the operator's out-of-band responsibility (a
+  WireGuard tunnel or a TLS-terminating proxy). The client now refuses to send its
+  bearer token to a non-loopback host unless `CCS_REMOTE_INSECURE=1` acknowledges
+  the link is secured out-of-band, raising a typed `InsecureTransportRefused`
+  otherwise — turning a silent plaintext-bearer footgun into an explicit opt-in.
+  Loopback is byte-unchanged and the default-off `CCS_REMOTE_COORDINATOR` gating is
+  unchanged. It *reduces* the silent footgun; it does not guarantee encryption. Set
+  the acknowledgement **narrowly** (per-invocation / per-compose-service), never in
+  a persistent global shell profile.
+
+### Changed
+
+- **Registry contract extracted behind a Protocol.** The coordinator's
+  durable-registry surface is now defined by a `RegistryBase` / `SqliteExtended`
+  Protocol pair, so an alternative backend can conform structurally without
+  subclassing. Internal refactor; no user-facing API change. The durable SQLite
+  state store gains a schema migration for per-session owner isolation (existing
+  databases migrate on open, preserving `0600` permissions).
+
+### Fixed
+
+- **`gate()` holds on an unconfirmed (degraded) version.** When the coordinator
+  returns a degraded/unconfirmed version at the effect boundary, `gate()` now holds
+  the effect (fail-closed) rather than firing on an unverified input; the `decide`
+  input is validated up front.
+- **`StaleView` exposes `expected_version` / `current_version` uniformly**
+  (defaulting to `None`), so callers can inspect the version mismatch consistently
+  across the read and gate paths.
+- **Deterministic IPv6 handling in the transport guard.** IPv4-mapped IPv6 forms
+  (`::ffff:127.0.0.1`) are classified as non-loopback deterministically (independent
+  of the interpreter's patch version), and `CoordinatorEndpoint.base_url` brackets
+  IPv6 literals (`http://[::1]:port`) so an IPv6 host yields a valid URL.
+
 ## [0.10.1] - 2026-06-24
 
 A fully opt-in **cross-host coordination demo** (default-off `CCS_REMOTE_COORDINATOR`)
