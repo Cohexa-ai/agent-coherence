@@ -434,9 +434,17 @@ class StaleView(CoherenceError):
     committed a newer version, so the coordinator denied the write BEFORE any
     disk mutation. Recoverable: ``reacquire()`` for fresh bytes, then write FROM
     them. Carries :data:`STALE_VIEW_REASON`; the message stays the verbatim
-    coordinator ``permissionDecisionReason`` (matched by type, not substring)."""
+    coordinator ``permissionDecisionReason`` (matched by type, not substring).
+
+    ``expected_version`` / ``current_version`` carry the captured-vs-current
+    drift when raised by ``adapters.effect_gate.gate()``; on every other raise
+    path (the coordinator deny sites) both stay ``None``, so a generic
+    ``except StaleView`` handler reads them uniformly."""
 
     reason = STALE_VIEW_REASON
+    #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
+    expected_version: int | None = None
+    current_version: int | None = None
 
 
 class CommitPreempted(CoherenceError):
