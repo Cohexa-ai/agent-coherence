@@ -83,11 +83,18 @@ export CCS_REMOTE_COORDINATOR=1
 export CCS_REMOTE_HOST=10.0.0.1
 export CCS_REMOTE_PORT=<port from host 1>
 export CCS_REMOTE_SECRET_FILE=/path/to/mounted/hook.secret   # provisioned out-of-band; never inline
+export CCS_REMOTE_INSECURE=1   # acknowledge the plaintext-HTTP bearer over your encrypted link (see Security boundary)
 python examples/cross_host/main.py
 ```
 
 The client connects (never spawning a local coordinator), runs both clients (A
-and B), and exits `0` on a denied-then-recovered stale write.
+and B), and exits `0` on a denied-then-recovered stale write. The same two roles
+run under the "Linux netns variant" below — set `CCS_REMOTE_INSECURE=1` there too.
+
+`CCS_REMOTE_HOST` is non-loopback, so the client **fails closed** and refuses to
+send its bearer over plaintext HTTP unless you set `CCS_REMOTE_INSECURE=1` — the
+explicit acknowledgement that *you* have secured the link out-of-band (the
+encrypted tunnel above). A loopback host needs no acknowledgement.
 
 ### Docker (recommended — genuine cross-container, one command, verified)
 
@@ -122,3 +129,14 @@ validated to RFC-1918/4193 (wildcard, loopback aliases, link-local, CGNAT, and
 public addresses are all rejected); the bearer secret is provisioned via a
 confidential channel (never an inline env var — it would leak in `ps` /
 `docker inspect`); and the link is encrypted.
+
+**Plaintext-bearer guard (fail-closed).** The transport is plaintext HTTP — the
+coordinator has no TLS; encryption is *your* out-of-band responsibility (a
+WireGuard tunnel, a TLS-terminating proxy, or the isolated Docker bridge here). To
+stop a silent leak, the client **refuses to send the bearer to a non-loopback host
+unless you set `CCS_REMOTE_INSECURE=1`** — an explicit acknowledgement that the
+link is secured. It *reduces* the silent-plaintext footgun; it does not *guarantee*
+encryption. Set it **narrowly** (per-invocation or per-compose-service), not in a
+persistent global shell profile — a forgotten global ack would blanket-acknowledge
+every future non-loopback host. Production hardening (TLS/mTLS termination) is
+tracked separately.
