@@ -19,7 +19,7 @@ import pytest
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import gate
-from ccs.core.exceptions import StaleView
+from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, StaleView
 
 REL = "data/config.txt"
 
@@ -141,6 +141,77 @@ def test_vanished_input_holds(tmp_path: Path, fast_cfg: LifecycleConfig) -> None
         with pytest.raises(StaleView):
             gate(vol, REL, decide=decide, effect=effect)
         assert fired == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_gate_holds_end_to_end_when_coordinator_degrades(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """End-to-end degrade: a real coordinator taken down between capture and
+    re-validate surfaces version 0 (degrade mode, fail-closed), so the gate
+    HOLDs and the escaping effect never fires on an unconfirmed input."""
+    _seed(tmp_path)
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+    )
+    try:
+        vol.write(REL, b"config-v1")
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            stop_coordinator(tmp_path)  # coordinator down before the re-validate read
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.warns(CoherenceDegradedWarning), pytest.raises(StaleView):
+            gate(vol, REL, decide=decide, effect=effect)
+        assert fired == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_gate_propagates_infra_error_in_strict_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Strict mode: an infra failure during the re-validate read raises a raw
+    CoherenceError (NOT a StaleView HOLD), which propagates through gate()
+    unmodified -- the effect still never fires."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict default
+    try:
+        vol.write(REL, b"config-v1")
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            stop_coordinator(tmp_path)
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(CoherenceError) as exc_info:
+            gate(vol, REL, decide=decide, effect=effect)
+        assert not isinstance(exc_info.value, StaleView)  # infra failure, not a HOLD
+        assert fired == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_gate_accepts_pathlib_path(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """gate() accepts an os.PathLike input (pathlib.Path), not only str, and
+    fires when unchanged -- exercising the PathLike type through the real
+    read_with_version round-trip."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(REL, b"config-v1")
+        result = gate(vol, Path(REL), decide=lambda d: "go", effect=lambda x: f"{x}-fired")
+        assert result == "go-fired"
     finally:
         stop_coordinator(tmp_path)
 
