@@ -40,6 +40,10 @@ services:
       CCS_REMOTE_COORDINATOR: "1"
       CCS_REMOTE_HOST: 172.28.0.2
       CCS_REMOTE_SECRET_FILE: /coord/.coherence/hook.secret
+      # 172.28.0.2 is non-loopback: the client refuses to send its bearer over
+      # plaintext HTTP unless we acknowledge the link is secured out-of-band. Here
+      # that link is the isolated private-range Docker bridge — declared explicitly.
+      CCS_REMOTE_INSECURE: "1"
     command:
       - python
       - /app/examples/cross_host/docker/client_entry.py

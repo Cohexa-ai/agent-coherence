@@ -57,7 +57,11 @@ def test_request_host_header_follows_endpoint_host(monkeypatch, method):
 # --- resolve_remote_endpoint -----------------------------------------------
 
 def test_resolve_remote_endpoint_builds_endpoint():
-    ep = resolve_remote_endpoint("10.0.0.5", 8080, "s3cr3t")
+    # This test exercises endpoint plumbing for a REMOTE host, not the transport
+    # guard — acknowledge the (test-only) plaintext link so the mint is not refused.
+    ep = resolve_remote_endpoint(
+        "10.0.0.5", 8080, "s3cr3t", env={"CCS_REMOTE_INSECURE": "1"}
+    )
     assert (ep.host, ep.port, ep.bearer) == ("10.0.0.5", 8080, "s3cr3t")
     assert ep.base_url == "http://10.0.0.5:8080"
 

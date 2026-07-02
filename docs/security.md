@@ -24,6 +24,19 @@ and the coordinator only binds beyond loopback to an RFC-1918/4193 address (see 
 cross-host demo, `examples/cross_host/`). With the flag unset the zero-outbound
 posture above is unchanged.
 
+**Plaintext-bearer guard (fail-closed, cross-host mode).** The remote transport is
+plaintext HTTP — the coordinator terminates no TLS, so encryption is the operator's
+out-of-band responsibility (a WireGuard tunnel or a TLS-terminating proxy). To stop
+a bearer from silently crossing an unencrypted routed link, the client **refuses to
+send it to a non-loopback host unless `CCS_REMOTE_INSECURE=1`** is set — an explicit
+acknowledgement that the link is secured out-of-band (a typed
+`InsecureTransportRefused` is raised otherwise). Loopback is unaffected. This
+*reduces* the silent-plaintext footgun; it does **not** guarantee encryption. Set
+the ack **narrowly** (per-invocation / per-compose-service), never in a persistent
+global shell profile — a forgotten global ack would blanket-acknowledge every
+future non-loopback host. Production TLS/mTLS termination is a separate hardening
+step.
+
 ## Env-var kill switches
 
 Set any of these to a truthy value (`1`, `true`, `yes`) to disable
