@@ -224,7 +224,7 @@ def test_gate_holds_on_vanish_carries_none_current() -> None:
 
 
 def test_gate_holds_when_capture_read_degraded() -> None:
-    """Fail-closed on the FIRST operand of the guard: a degraded capture read
+    """Degrade-mode capture: a capture read that could not be confirmed
     (version 0) HOLDs even though the re-read resolved to a real version."""
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
@@ -239,10 +239,12 @@ def test_gate_holds_when_capture_read_degraded() -> None:
 
 
 def test_gate_holds_when_revalidate_read_degraded() -> None:
-    """Fail-closed on the SECOND operand: a real capture (v5) whose re-read
-    degrades to version 0 HOLDs -- the exact degrade-mode race the guard closes.
-    This asymmetric case distinguishes the ``or`` guard from an ``and`` (which
-    would fire on the unconfirmed re-read: a fail-OPEN regression)."""
+    """Degrade-mode re-read: a real capture (v5) whose re-read degrades to
+    version 0 HOLDs -- the degrade-mode race the fail-closed guard covers.
+    The ``unconfirmed`` term itself is pinned by the (0,0) case in
+    test_gate_holds_on_unconfirmed_version (dropping the term fails that test);
+    ``or`` vs ``and`` on the term is behaviorally equivalent across gate()'s
+    reachable version domain, so no black-box test distinguishes them."""
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
@@ -265,3 +267,25 @@ def test_gate_requires_callable_effect() -> None:
 def test_gate_requires_callable_decide() -> None:
     with pytest.raises(TypeError):
         gate(_StubVolume([(b"x", 1)]), "p", decide=None, effect=lambda x: x)  # type: ignore[arg-type]
+
+
+def test_gate_hold_tolerates_non_pathlike_path() -> None:
+    """The HOLD message builds via os.fspath() but falls back to str(), so a
+    duck-typed volume with a non-PathLike path still raises StaleView rather than
+    a masking TypeError (a real CoherentVolume rejects such a path earlier)."""
+    with pytest.raises(StaleView):
+        gate(
+            _StubVolume([(b"cfg", 5), (b"cfg", 6)]),
+            12345,  # type: ignore[arg-type]
+            decide=lambda d: "go",
+            effect=lambda x: x,
+        )
+
+
+def test_bare_stale_view_exposes_none_version_attrs() -> None:
+    """A StaleView raised without drift (the coordinator deny sites) still
+    exposes expected_version/current_version as None, so a generic
+    ``except StaleView`` handler reads the same shape gate() raises."""
+    exc = StaleView("peer committed a newer version")
+    assert exc.expected_version is None
+    assert exc.current_version is None

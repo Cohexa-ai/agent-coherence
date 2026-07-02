@@ -129,8 +129,14 @@ def _held(
         detail = "could not be confirmed (coordinator degraded or unresolved)"
     else:
         detail = f"moved to v{current_version}"
+    # A real CoherentVolume rejects a non-PathLike path before gate() runs, but
+    # volume is duck-typed at runtime -- never let fspath() mask the HOLD.
+    try:
+        target = os.fspath(path)
+    except TypeError:
+        target = str(path)
     exc = StaleView(
-        f"effect held: {os.fspath(path)} {detail} since it was read at "
+        f"effect held: {target} {detail} since it was read at "
         f"v{expected_version}; effect not fired (reacquire and re-decide)"
     )
     exc.expected_version = expected_version
