@@ -546,8 +546,8 @@ data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh re
 | Parameter | Default | Meaning |
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
-| `managed` | — | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"degrade"` | `"strict"` raises on any coordination failure instead of degrading to plain IO |
+| `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 
@@ -559,7 +559,9 @@ file, runs your `make_content` closure on the current bytes, and commits only if
 the version is unchanged. The loser of a race gets the winner's value re-fed to
 its closure through a bounded retry — one writer wins each round and no update is
 silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
-content)`, commits against an explicit version with no retry loop.
+content)`, commits against an explicit version with no retry loop. See the race
+live: `python -m examples.concurrent_writers.main` runs two threads through the
+identical update — a plain file loses one write, `write_cas` preserves both.
 
 ### Foreign-edit guards
 
@@ -595,6 +597,21 @@ API is the supported contract; the shim is a convenience.
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.
 
+### Cross-host mode (experimental, default off)
+
+Everything above is single-host. An experimental, demo-grade remote mode — gated
+entirely by `CCS_REMOTE_COORDINATOR=1` (default off, loopback path byte-unchanged)
+— lets a volume connect to a coordinator on another host: `CCS_REMOTE_HOST` /
+`CCS_REMOTE_PORT` name the endpoint, and the bearer secret arrives via
+`CCS_REMOTE_SECRET_FILE` (a mounted file — never an inline env var). The transport
+is plaintext HTTP, so encryption is your out-of-band responsibility (a WireGuard
+tunnel or a TLS-terminating proxy); to stop a silent leak, the client **refuses to
+send the bearer to a non-loopback host unless `CCS_REMOTE_INSECURE=1`**
+acknowledges the link is secured, raising a typed `InsecureTransportRefused`
+otherwise. Setup, the Docker two-container runner, and the full security boundary
+live in [`examples/cross_host/README.md`](../examples/cross_host/README.md) and
+[the security guide](security.md).
+
 ## Multi-artifact snapshot sessions
 
 An agent that reads *several* artifacts one at a time can see a torn combination:
@@ -608,9 +625,13 @@ Over HTTP, against a running coordinator (the same one `CoherentVolume` spawns):
 | Endpoint | Request | Result |
 |---|---|---|
 | `POST /session/begin` | `{session_id, read_set: ["plans/plan.md", …]}` | `{session_token, cut: {path: version}, coordinator_epoch, retain_versions}` |
-| `POST /session/read` | `{session_token, path}` | the artifact at its **pinned** version — never a newer one |
-| `POST /session/commit` | `{session_token, path, content}` | wins only if no peer moved the artifact since the cut was pinned |
-| `POST /session/heartbeat` | `{session_token}` | keeps the session's lease alive |
+| `POST /session/read` | `{session_id, session_token, path}` | the artifact at its **pinned** version — never a newer one |
+| `POST /session/commit` | `{session_id, session_token, path, content}` | wins only if no peer moved the artifact since the cut was pinned |
+| `POST /session/heartbeat` | `{session_id, session_token}` | keeps the session's lease alive |
+
+Every session call carries both identifiers: `session_id` (your client identity,
+from which the server derives the caller) and the server-minted `session_token`
+(the handle to the pinned cut).
 
 The `session_token` is server-minted and unguessable; the cut is an inspectable
 `{path: version}` map, so you can see exactly which versions your session is
@@ -634,7 +655,8 @@ Semantics, precisely:
   lease. A session whose heartbeat lapses — or that is lost to a coordinator
   restart — is invalidated: later reads return a typed `session_invalidated`
   rejection telling the agent to re-establish, never a quiet fall-through to
-  whatever is current.
+  whatever is current. A token that was never a session at all (malformed, or
+  never opened) is distinguished as `session_not_found`.
 - **Bytes vs versions.** When the coordinator retains version bodies
   ([version retention](#version-retention-and-read-at-version)), a session read
   serves the pinned bytes directly. Otherwise it returns the pinned version and
@@ -673,8 +695,9 @@ Register it with your MCP client (the exact file depends on the client):
 }
 ```
 
-`SWG_ROOT` selects the workspace (defaulting to the server's working directory);
-the whole workspace is guarded unless the managed set is narrowed.
+`SWG_ROOT` selects the workspace (defaulting to the server's working directory).
+By default the whole workspace is guarded; narrow it with `SWG_MANAGED`, a
+comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
@@ -852,6 +875,11 @@ All examples are runnable with `python -m examples.<name>.main` from the project
 | Research pipeline | `python -m examples.research_pipeline.main` | 4-agent, 3 artifacts, 60% hit rate |
 | Shared codebase | `python -m examples.shared_codebase.main` | 4-agent code review, 37.6% savings, benchmark output |
 | Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
+| Coherent volume | `python -m examples.coherent_volume.main` | Sequential stale-write deny + recovery on plain files (offline, no keys) |
+| Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
+| Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
+| MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
+| Cross-host | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
 
 ### Code review pipeline
 
@@ -911,7 +939,7 @@ invalidations, more misses. The planning workload has 1 write and 12 reads (75% 
 rate). The high-churn workload has 4 writes and 8 reads (50% hit rate).
 
 For the simulation-based results from the paper (84–95% savings), see
-[REPRODUCE.md](REPRODUCE.md).
+[reproduce.md](reproduce.md).
 
 ### Temporal cost: source drift between turns (TC-1)
 
@@ -1145,7 +1173,7 @@ YAML scenarios in `benchmarks/scenarios/` define a deterministic workload
 (agent count, artifacts, write probability, network latency/loss, strategy
 config). Output is a `StrategyComparisonReport` printed to stdout — useful
 when you want protocol-only numbers without spinning up a real LangGraph
-graph. See [REPRODUCE.md](REPRODUCE.md) for the simulation methodology behind
+graph. See [reproduce.md](reproduce.md) for the simulation methodology behind
 the paper's headline numbers.
 
 ### `ccs-check-architecture`

@@ -2,7 +2,7 @@
 
 **`agent-coherence` makes "agent A silently clobbered agent B's `plan.md`" impossible — a vendor-neutral MESI + optimistic-concurrency coordinator for agent state, with the safety invariants machine-checked in TLA+.**
 
-Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One reads it and works; meanwhile a peer commits a newer version; the first writes back anyway. Last write wins, the peer's work is silently gone, nothing errors, and every downstream decision builds on the wrong version. `agent-coherence` turns that silent clobber into a loud, typed refusal: MESI-style ownership and invalidation over shared artifacts, optimistic commit-CAS for concurrent writers, and a read-generation fence for crash-reclaimed ones — a stale write is denied or returned as a retryable conflict, never silently applied. Same library, same protocol, across LangGraph, CrewAI, AutoGen, the OpenAI Agents SDK, plain files shared across processes (`CoherentVolume`), any MCP client (the bundled `stale-write-guard-fs` server), and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
+Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One reads it and works; meanwhile a peer commits a newer version; the first writes back anyway. Last write wins, the peer's work is silently gone, nothing errors, and every downstream decision builds on the wrong version. `agent-coherence` turns that silent clobber into a loud, typed refusal: MESI-style ownership and invalidation over shared artifacts, optimistic commit-CAS for concurrent writers, and a read-generation fence for crash-reclaimed ones — a stale write is denied or returned as a retryable conflict, never silently applied. Same library, same protocol, across LangGraph, CrewAI, AutoGen, the OpenAI Agents SDK, plain files shared across processes (`CoherentVolume`), any MCP client (the `stale-write-guard-fs` server, via the `mcp` extra), and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
 
 [![CI](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml/badge.svg)](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agent-coherence)](https://pypi.org/project/agent-coherence/)
@@ -181,7 +181,7 @@ pip install "agent-coherence[mcp]"
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
-The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).
+The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory; the whole workspace is guarded unless `SWG_MANAGED` — a comma-separated glob list — narrows it), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).
 
 **Scope, honestly.** Same contract as the volume it wraps: single-host, managed paths, cooperative — it guards agents that route file access through the tools; it cannot see edits made around them (those are caught at the next tool call on that file by the foreign-edit guards).
 
@@ -212,10 +212,11 @@ Against a running coordinator (the same one `CoherentVolume` spawns), over HTTP:
 ```text
 POST /session/begin      {session_id, read_set: ["plans/plan.md", "config/app.json"]}
                          → {session_token, cut: {path: version}, …}
-POST /session/read       serve an artifact at its PINNED version — never a newer one
-POST /session/commit     single-artifact optimistic commit against the pinned base —
-                         wins only if no peer moved the artifact since the cut
-POST /session/heartbeat  keep the session's lease alive
+POST /session/read       {session_id, session_token, path}
+                         → the artifact at its PINNED version — never a newer one
+POST /session/commit     {session_id, session_token, path, content}
+                         → wins only if no peer moved the artifact since the cut
+POST /session/heartbeat  {session_id, session_token} — keep the session's lease alive
 ```
 
 Or in-process: `CoordinatorService.begin_session(read_set=…, owner=…)` → `session_read(…)` / `session_commit(…)`. The cut is an inspectable `{artifact: version}` map, not an opaque handle — you can read exactly which versions your session is pinned to.
