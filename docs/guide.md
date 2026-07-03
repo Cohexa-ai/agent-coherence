@@ -27,19 +27,22 @@ full command-line toolset, and the API reference.
 7. [Content audit log](#content-audit-log)
 8. [Crash recovery](#crash-recovery)
 9. [Version retention and read-at-version](#version-retention-and-read-at-version)
-10. [Inline benchmark mode](#inline-benchmark-mode)
-11. [Telemetry](#telemetry)
-12. [Graceful degradation](#graceful-degradation)
-13. [Examples](#examples)
-14. [Real-workload benchmarks](#real-workload-benchmarks)
-15. [Benchmarking your own workload](#benchmarking-your-own-workload)
-16. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-17. [Replay (v0.8.2+)](#replay-v082)
-18. [Command-line tools](#command-line-tools)
-19. [API reference](#api-reference)
-20. [Low-level adapter API](#low-level-adapter-api)
-21. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-22. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+10. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
+11. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+12. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+13. [Inline benchmark mode](#inline-benchmark-mode)
+14. [Telemetry](#telemetry)
+15. [Graceful degradation](#graceful-degradation)
+16. [Examples](#examples)
+17. [Real-workload benchmarks](#real-workload-benchmarks)
+18. [Benchmarking your own workload](#benchmarking-your-own-workload)
+19. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+20. [Replay (v0.8.2+)](#replay-v082)
+21. [Command-line tools](#command-line-tools)
+22. [API reference](#api-reference)
+23. [Low-level adapter API](#low-level-adapter-api)
+24. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+25. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -66,11 +69,14 @@ pip install "agent-coherence[langgraph,langsmith]"
 # OpenAI Agents SDK adapter (experimental, 0.x)
 pip install "agent-coherence[openai-agents]"
 
-# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral)
+# stale-write-guard-fs MCP server (coordinated file access for any MCP client)
+pip install "agent-coherence[mcp]"
+
+# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral + mcp)
 pip install "agent-coherence[all]"
 ```
 
-For security-sensitive installs with full transitive hash pinning, see [SECURITY.md](SECURITY.md#hash-pinned-install-for-security-sensitive-users) and the bundled `requirements-diagnose.txt`.
+For security-sensitive installs with full transitive hash pinning, see [the security guide](security.md#hash-pinned-install-for-security-sensitive-users) and the bundled `requirements-diagnose.txt`.
 
 ---
 
@@ -517,6 +523,175 @@ older retained version still commits a fence-legal write of stale meaning — th
 coherence guarantee is "write from the bytes your latest read returned," and
 read-at-version makes an older version easy to fetch, so keep writes anchored to
 the current read.
+
+## Coherent workspace (`CoherentVolume`)
+
+`CoherentVolume` brings the coherence guarantee to **plain files on disk** — no
+framework required. It is an out-of-process coordinator *client*: it spawns (or
+attaches to) a local coordinator over SQLite-WAL and routes reads and writes
+through it. Your content stays on the real filesystem; the coordinator holds only
+per-file MESI state, a content hash, and a version. Point a second volume in
+another process at the same workspace and it attaches to the same coordinator, so
+every process on the host shares one coherent view.
+
+```python
+from ccs.adapters.coherent_volume import CoherentVolume
+
+vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
+data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
+vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
+data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh read
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
+| `managed` | — | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
+| `on_error` | `"degrade"` | `"strict"` raises on any coordination failure instead of degrading to plain IO |
+| `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
+| `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+
+### Concurrent writers: `write_cas`
+
+Plain `write()` denies the *sequential* stale view. For **concurrent** same-key
+contention, `write_cas(path, make_content)` is the optimistic path: it reads the
+file, runs your `make_content` closure on the current bytes, and commits only if
+the version is unchanged. The loser of a race gets the winner's value re-fed to
+its closure through a bounded retry — one writer wins each round and no update is
+silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
+content)`, commits against an explicit version with no retry loop.
+
+### Foreign-edit guards
+
+Files also change *outside* the fleet — a human edit, a formatter, a regenerating
+script. The volume checks a content hash at both boundaries:
+
+- **Write boundary (on by default).** If a managed file's on-disk bytes changed
+  out-of-band since this volume last read or wrote them, `write()` raises
+  `StaleView` instead of clobbering the foreign edit. Recover with `reacquire()`:
+  fresh read → re-derive → re-write.
+- **Read boundary (opt-in).** With `on_stale_read="raise"`, re-reading a managed
+  file whose bytes changed out-of-band raises `StaleView` instead of returning
+  bytes the rest of your state wasn't computed from. In strict mode the
+  coordinator enforces the same check server-side.
+
+A volume never denies its own just-written bytes: the benign window between a
+commit and its disk write is recognized and suppressed.
+
+These guards are **content-hash checks at the volume boundary** — best-effort
+point-in-time detection, not filesystem interception. An edit that bypasses the
+volume is caught at the *next* volume read or write of that file, not blocked as
+it happens.
+
+### The `open()` shim (demo-grade)
+
+For code you'd rather not rewrite, `coherent_workspace()` / `install()` patch
+`open()` and `pathlib` so managed-path opens route through the volume unchanged.
+It covers text and binary read/write via `open()`/`pathlib` — not raw `os.open`,
+subprocess redirection, `mmap`, or append/update modes, which delegate to the
+original `open()` unchanged. The explicit `read`/`write`/`reacquire`/`write_cas`
+API is the supported contract; the shim is a convenience.
+
+Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
+no keys) — it reproduces the silent lost update, then prevents it.
+
+## Multi-artifact snapshot sessions
+
+An agent that reads *several* artifacts one at a time can see a torn combination:
+`plan.md` from before a peer's commit and `config.json` from after it. Each
+individual read was current; the set never coexisted — read-skew. A **snapshot
+session** pins a consistent cut of the artifacts you name, captured at a single
+point, and serves every session read from that cut while peers keep writing.
+
+Over HTTP, against a running coordinator (the same one `CoherentVolume` spawns):
+
+| Endpoint | Request | Result |
+|---|---|---|
+| `POST /session/begin` | `{session_id, read_set: ["plans/plan.md", …]}` | `{session_token, cut: {path: version}, coordinator_epoch, retain_versions}` |
+| `POST /session/read` | `{session_token, path}` | the artifact at its **pinned** version — never a newer one |
+| `POST /session/commit` | `{session_token, path, content}` | wins only if no peer moved the artifact since the cut was pinned |
+| `POST /session/heartbeat` | `{session_token}` | keeps the session's lease alive |
+
+The `session_token` is server-minted and unguessable; the cut is an inspectable
+`{path: version}` map, so you can see exactly which versions your session is
+pinned to. In-process, the same surface is
+`CoordinatorService.begin_session(read_set=…, owner=…)` →
+`session_read(session_token, artifact_id, caller=…)` →
+`session_commit(session_token, artifact_id, content, caller=…)`.
+
+Semantics, precisely:
+
+- **Reads serve only from the cut.** An artifact that was *not* in the pinned
+  read-set is refused with a typed rejection (`artifact_not_in_cut`) — never
+  silently served from live state.
+- **Reads are non-mutating.** A session read grants no ownership and blocks no
+  writer; peers keep committing while you read.
+- **Commits validate against the pinned base.** `session_commit` is a
+  single-artifact optimistic commit: it wins only if the artifact's version still
+  equals the cut's pinned version, and returns a typed, retryable conflict
+  otherwise.
+- **Sessions fail closed.** Pins have a bounded lifetime backed by a heartbeat
+  lease. A session whose heartbeat lapses — or that is lost to a coordinator
+  restart — is invalidated: later reads return a typed `session_invalidated`
+  rejection telling the agent to re-establish, never a quiet fall-through to
+  whatever is current.
+- **Bytes vs versions.** When the coordinator retains version bodies
+  ([version retention](#version-retention-and-read-at-version)), a session read
+  serves the pinned bytes directly. Otherwise it returns the pinned version and
+  content hash as a typed signal, and the caller fetches the exact pinned bytes
+  from its own data plane.
+
+The no-torn-read property is model-checked: `NoReadSkewWithinCut` and
+`PinAlwaysRetained` in `formal/tla/Snapshot.tla`, run by `make tla-check` in CI.
+
+**Honesty boundary.** Snapshot sessions prevent **read-skew** — torn reads across
+artifacts. They do not add write-skew prevention: commits validate per-artifact
+against the pinned base, so two sessions that read one cut and write *different*
+artifacts can still interleave. Single coordinator, single host.
+
+## `stale-write-guard-fs` MCP server
+
+The coherent-workspace guarantee for agents that speak
+[Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor,
+or a custom runtime — with no Python integration. The server wraps
+`CoherentVolume` and exposes coordinated file access over stdio:
+
+```bash
+pip install "agent-coherence[mcp]"
+```
+
+Register it with your MCP client (the exact file depends on the client):
+
+```json
+{
+  "mcpServers": {
+    "stale-write-guard-fs": {
+      "command": "stale-write-guard-fs",
+      "env": { "SWG_ROOT": "/path/to/shared/workspace" }
+    }
+  }
+}
+```
+
+`SWG_ROOT` selects the workspace (defaulting to the server's working directory);
+the whole workspace is guarded unless the managed set is narrowed.
+
+| Tool | What it does |
+|---|---|
+| `swg_read` | Tracked read — registers the agent's view of the file |
+| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
+| `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
+| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+
+Denials are machine-readable: an agent parses the typed payload (for example
+`reason: stale_view`, `recover: reacquire`) and self-heals instead of retrying
+blindly. The server validates every file URI — path traversal and any access to
+the coordinator's own state directory are rejected — and fails closed on IO
+errors. Strict-mode, managed-path scoped.
+
+Run the red→green demo: `python -m examples.mcp_stale_write_guard.main`
+(offline, deterministic, no keys).
 
 ## Inline benchmark mode
 
