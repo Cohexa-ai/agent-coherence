@@ -5,11 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-coherence"
 dynamic = ["version"]
-description = "Token optimization layer for multi-agent LangGraph systems — cut shared-artifact token costs via MESI cache coherence, one import change"
+description = "Vendor-neutral MESI + optimistic-concurrency coordinator for multi-agent state — a stale write is denied or returned as a typed conflict, never silently applied; safety invariants model-checked in TLA+"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "agent-coherence contributors" }]
-keywords = ["multi-agent", "llm", "cache-coherence", "mesi", "token-efficiency", "agents"]
+keywords = [
+  "multi-agent",
+  "agents",
+  "llm",
+  "cache-coherence",
+  "mesi",
+  "optimistic-concurrency",
+  "lost-update",
+  "consistency",
+  "coordination",
+  "mcp",
+  "langgraph",
+  "crewai",
+  "token-efficiency",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -17,6 +31,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
 ]
 requires-python = ">=3.11"
 dependencies = ["pyyaml>=6.0"]
@@ -27,36 +42,31 @@ ccs-compare = "ccs.cli.compare:main"
 ccs-check-architecture = "ccs.hardening.architecture:main"
 ccs-benchmark = "ccs.cli.benchmark:main"
 ccs-diagnose = "ccs.cli.diagnose:main"
-# Claude Code coordinator console scripts (Unit 6 / R1, R4). The plugin's
-# bin/ensure-coordinator shim wraps the first; the latter three back the
-# /agent-coherence {status,track,untrack} slash commands documented in
-# origin §11.
+# Claude Code coordinator console scripts. The plugin's bin/ensure-coordinator
+# shim wraps the first; the latter three back the /agent-coherence
+# {status,track,untrack} slash commands.
 agent-coherence-coordinator = "ccs.cli.coherence_coordinator:main"
 agent-coherence-status = "ccs.cli.coherence_status:main"
 agent-coherence-track = "ccs.cli.coherence_track:main"
 agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
-# Unit 9 (R19): scans workspace CLAUDE.md for prose tool-class rules
-# ("use rg, not grep", "never sudo") and proposes permissions.deny
-# entries. Flag-only by default; --apply writes to settings.local.json
-# after a confirmation prompt.
+# Scans workspace CLAUDE.md for prose tool-class rules ("use rg, not grep",
+# "never sudo") and proposes permissions.deny entries. Flag-only by default;
+# --apply writes to settings.local.json after a confirmation prompt.
 agent-coherence-migrate-rules = "ccs.cli.coherence_migrate_rules:main"
-# v0.2 plan Unit 3 (KTD-R): stricter sibling to migrate-rules. STDOUT only
-# (never writes), symlink-contained (canonical-path containment check),
-# never invokes an LLM, never scans files outside the workspace root.
-# Intended for security-sensitive operators who want the helper output
-# but not the auto-apply surface.
+# Stricter sibling to migrate-rules. STDOUT only (never writes),
+# symlink-contained (canonical-path containment check), never invokes an LLM,
+# never scans files outside the workspace root. Intended for security-sensitive
+# operators who want the helper output but not the auto-apply surface.
 agent-coherence-migrate-deny = "ccs.adapters.claude_code.migrate_deny:main"
-# Phase E.0 probe 2A surfaced that CC v2.1.131 rejects hooks.json URLs
-# containing ${COHERENCE_PORT} at LOAD TIME. HTTP-type hooks are not viable;
-# the plugin uses command-type hooks that invoke this client, which reads
-# .coherence/server.pid directly. See docs/probes/2026-05-17-*.md.
+# Claude Code rejects hooks.json URLs containing ${COHERENCE_PORT} at LOAD
+# TIME, so HTTP-type hooks are not viable; the plugin uses command-type hooks
+# that invoke this client, which reads .coherence/server.pid directly.
 agent-coherence-hook-client = "ccs.cli.coherence_hook_client:main"
-# D v1 Unit 5: invariant replay CLI. Walks a captured session directory
-# through the predicate engine (single-writer / monotonic-version /
-# stale-read / lost-write) and emits human or JSON findings. Exit-code
-# mapping per docs/proposals/replay_trace_format.md §7.3.
+# Invariant replay CLI. Walks a captured session directory through the
+# predicate engine (single-writer / monotonic-version / stale-read /
+# lost-write) and emits human or JSON findings with per-reason exit codes.
 agent-coherence-replay = "ccs.cli.coherence_replay:main"
-# MCP-C v1: the stale-write-guard-fs stdio MCP server (requires the `mcp` extra).
+# The stale-write-guard-fs stdio MCP server (requires the `mcp` extra).
 # Single-host coherence guard over CoherentVolume; configured via SWG_ROOT /
 # SWG_MANAGED. See src/ccs/mcp/.
 stale-write-guard-fs = "ccs.mcp.server:main"
@@ -80,13 +90,13 @@ benchmark = ["langchain-core>=0.2"]
 diagnose = ["agent-coherence[langgraph]", "jinja2>=3.1", "langchain-core>=0.2"]
 # OpenAI stack: `openai` carries the Conversations client + raw httpx for the
 # demo broken case; `openai-agents` (pinned <0.18 — 0.x surface churns) is the
-# Phase-2 adapter dep and composes the `openai` extra. `mistral` is the second
-# Conversations vendor for the stale-read demo/probe.
+# Agents SDK adapter dep and composes the `openai` extra. `mistral` is the
+# second Conversations vendor for the stale-read demo.
 openai = ["openai>=2.0", "httpx>=0.27"]
 openai-agents = ["agent-coherence[openai]", "openai-agents>=0.17,<0.18"]
 mistral = ["mistralai>=2.0"]
-# MCP-C v1: the stale-write-guard-fs stdio MCP server (ccs.mcp). The official
-# `mcp` SDK is the only new runtime dep; v2-alpha renames FastMCP, so pin <2.
+# The stale-write-guard-fs stdio MCP server (ccs.mcp). The official `mcp` SDK
+# is the only new runtime dep; v2-alpha renames FastMCP, so pin <2.
 mcp = ["mcp>=1.27,<2"]
 all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral,mcp]"]
 
@@ -99,12 +109,12 @@ pythonpath = ["src", "."]
 # whose name shadows a top-level package — for example, do NOT create
 # ``tests/examples/`` (would shadow the real ``examples/`` package).
 markers = [
-    "launch_gate: Unit 9 hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
-    "launch_gate_pilot: Unit 9 pilot run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
-    "launch_gate_strict: v0.2 Unit 5 multi-model strict-mode launch gate (10 scenarios × {haiku, sonnet, opus} × 2 consecutive runs). Requires live claude CLI; ~$8-13/cycle × 2 = ~$16-26 per full gate run. Operator runs once consecutively before tagging v0.2.0. Run via `pytest -m launch_gate_strict`.",
-    "launch_gate_pilot_matrix: v0.2 Unit 5 per-PR cheap pilot (1 scenario × {haiku, sonnet, opus}). Requires live claude CLI; ~$0.50 per run. Run via `pytest -m launch_gate_pilot_matrix`.",
-    "protocol_corpus: v0.2 Unit 7 cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
-    "live_api: OpenAI/Mistral Conversations live-API tests (Q6 probe + adapter smoke). Requires OPENAI_API_KEY and/or MISTRAL_API_KEY and the `[openai,mistral]` extras; ~$10 per full probe run. Excluded from default `pytest -q`. Run via `pytest -m live_api`.",
+    "launch_gate: Hard launch-gate. Requires live claude CLI; ~$4/run. Run via `pytest -m launch_gate`.",
+    "launch_gate_pilot: Pilot launch-gate run (N=4, one per category). Requires live claude CLI; ~$0.40. Run via `pytest -m launch_gate_pilot`.",
+    "launch_gate_strict: Multi-model strict-mode launch gate (10 scenarios × {haiku, sonnet, opus} × 2 consecutive runs). Requires live claude CLI; ~$8-13/cycle × 2 = ~$16-26 per full gate run. Operator runs once consecutively before a strict-mode release. Run via `pytest -m launch_gate_strict`.",
+    "launch_gate_pilot_matrix: Per-PR cheap launch-gate pilot (1 scenario × {haiku, sonnet, opus}). Requires live claude CLI; ~$0.50 per run. Run via `pytest -m launch_gate_pilot_matrix`.",
+    "protocol_corpus: Cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
+    "live_api: OpenAI/Mistral Conversations live-API tests (stale-read probe + adapter smoke). Requires OPENAI_API_KEY and/or MISTRAL_API_KEY and the `[openai,mistral]` extras; ~$10 per full probe run. Excluded from default `pytest -q`. Run via `pytest -m live_api`.",
 ]
 # Skip launch_gate + protocol_corpus + live_api markers in default unit test
 # runs. live_api makes paid network calls and needs credentials; keep it opt-in
@@ -125,6 +135,9 @@ where = ["src"]
 Homepage = "https://github.com/hipvlady/agent-coherence"
 Repository = "https://github.com/hipvlady/agent-coherence"
 Issues = "https://github.com/hipvlady/agent-coherence/issues"
+Documentation = "https://github.com/hipvlady/agent-coherence/blob/main/docs/guide.md"
+Changelog = "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md"
+Paper = "https://arxiv.org/abs/2603.15183"
 
 [tool.ruff]
 line-length = 120
