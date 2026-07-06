@@ -501,6 +501,76 @@ class InsecureTransportRefused(CoherenceError):
         self.host = host
 
 
+class TlsVerificationFailed(CoherenceError):
+    """The coordinator's TLS certificate did not verify against the trusted CA
+    (Unit-1 client-side ``https://`` guard).
+
+    Raised when a verified-TLS request fails certificate validation — a wrong /
+    untrusted signing CA, a hostname/IP-SAN mismatch (e.g. a DNS-only cert on an
+    IP-literal endpoint), an expired cert, or any other
+    :class:`ssl.SSLCertVerificationError`. The client *always* verifies (there is
+    no insecure ``https`` mode), so this fails LOUD and CLOSED: the bearer is NOT
+    retried over plaintext and no request body reaches the peer — the handshake
+    dies before the HTTP exchange. Distinct from :class:`CoordinatorUnavailable`
+    (a network hiccup that a caller might treat as transient); a verification
+    failure is a trust decision, never a degrade. Carries the offending
+    ``host``."""
+
+    def __init__(self, host: str, detail: str = "") -> None:
+        suffix = f": {detail}" if detail else ""
+        super().__init__(
+            f"TLS certificate verification failed for coordinator host {host!r}"
+            f"{suffix}; the bearer was NOT sent — check the server certificate and "
+            "the trusted CA (CCS_REMOTE_CA_FILE), then retry"
+        )
+        self.host = host
+        self.detail = detail
+
+
+class TlsConfigError(CoherenceError):
+    """The TLS client configuration is unusable (Unit-1 factory guard).
+
+    Raised at SSL-context build time for an operator misconfiguration of the
+    CA-trust anchor: ``CCS_REMOTE_CA_FILE`` names a path that is missing,
+    unreadable, a symlink (refused via ``O_NOFOLLOW`` — a swapped trust anchor is
+    the same attack class as a swapped bearer file), group/world-*writable*, or
+    not valid PEM. Fails CLOSED with an actionable message naming the path rather
+    than surfacing a raw :class:`ssl.SSLError` / :class:`OSError`. Also raised if
+    the built context ever fails its own hardening invariant
+    (``check_hostname`` + ``CERT_REQUIRED``) — that guards against a future edit
+    silently weakening verification. Carries the CA ``path`` (when applicable)
+    and a human ``reason``."""
+
+    def __init__(self, reason: str, *, path: str | None = None) -> None:
+        super().__init__(reason)
+        self.path = path
+        self.reason = reason
+
+
+class RedirectRefused(CoherenceError):
+    """The coordinator responded with a 3xx redirect; the client refuses to
+    follow it (Unit-1 no-redirects-ever policy).
+
+    The client talks to ONE fixed, operator-configured coordinator endpoint — no
+    redirect is ever legitimate. A bare ``urlopen`` would auto-follow and
+    urllib's default redirect handler *copies the Authorization header onto the
+    new hop* before application code can intervene, so the bearer would ride an
+    attacker-chosen URL. The client therefore refuses ANY 3xx (both ``http`` and
+    ``https`` endpoints) before a second request is made — the bearer never
+    leaves the configured endpoint. Carries the attempted ``location`` and
+    ``status``."""
+
+    def __init__(self, location: str, status: int | None = None) -> None:
+        status_part = f" ({status})" if status is not None else ""
+        super().__init__(
+            f"coordinator returned a redirect{status_part} to {location!r}; refusing "
+            "to follow — the coordinator is one fixed endpoint and following a "
+            "redirect would leak the bearer onto another host"
+        )
+        self.location = location
+        self.status = status
+
+
 class CommitUnconfirmed(CoherenceError):
     """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
     mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
