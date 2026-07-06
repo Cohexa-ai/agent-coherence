@@ -347,16 +347,30 @@ def _is_loopback_transport_host(host: str) -> bool:
     return ip.is_loopback
 
 
-def _guard_plaintext_bearer(host: str, env: Mapping[str, str]) -> None:
+def _guard_plaintext_bearer(host: str, env: Mapping[str, str], scheme: str = "http") -> None:
     """Fail closed on a plaintext bearer to a non-loopback host (Phase-1.5 guard).
 
-    The remote transport is always ``http://`` (encryption is operator-provided
-    out-of-band — WireGuard or a TLS-terminating proxy), so there is no in-band TLS
-    signal. For a non-loopback host the operator must set ``CCS_REMOTE_INSECURE``
-    (truthy) to acknowledge the link is secured, or the bearer is never sent
-    (:class:`InsecureTransportRefused`). Reduces-not-eliminates: it removes the
-    SILENT plaintext-bearer footgun, not the operator's duty to secure the link.
+    ``scheme == "https"`` is the verified-TLS positive signal (Unit 2): in THIS
+    client ``https`` ALWAYS means enforced certificate verification
+    (:func:`build_tls_context` has no insecure-https mode — the footgun rule), so
+    the bearer rides an in-band-trusted link. The guard passes at mint with NO ack
+    and NO warning, short-circuiting BEFORE the ack branch — the ack is irrelevant
+    when verification is enforced (an ``https`` endpoint with ``CCS_REMOTE_INSECURE``
+    also set emits no plaintext warning). This retires the permanent-
+    ``CCS_REMOTE_INSECURE=1`` wart for TLS-fronted deployments. If that "https ⇒
+    verified" invariant ever weakened, this positive signal would regress — it is
+    asserted in :func:`build_tls_context`.
+
+    The ``http`` path is byte-unchanged. The remote transport there is plaintext
+    (encryption is operator-provided out-of-band — WireGuard or a TLS-terminating
+    proxy), so there is no in-band TLS signal. For a non-loopback host the operator
+    must set ``CCS_REMOTE_INSECURE`` (truthy) to acknowledge the link is secured, or
+    the bearer is never sent (:class:`InsecureTransportRefused`). Reduces-not-
+    eliminates: it removes the SILENT plaintext-bearer footgun, not the operator's
+    duty to secure the link.
     """
+    if scheme == "https":
+        return
     if _is_loopback_transport_host(host):
         return
     if env.get("CCS_REMOTE_INSECURE", "").strip().lower() in _REMOTE_TRUTHY_ENV_VALUES:
@@ -391,19 +405,19 @@ def resolve_remote_endpoint(
     changing any existing caller. ``scheme="https"`` selects the verified-TLS
     request path in :func:`_execute`.
 
-    Fail-closed transport guard: for a NON-loopback host the bearer is only sent
-    when ``CCS_REMOTE_INSECURE`` (read from ``env``, default ``os.environ``) is
-    truthy — otherwise :class:`InsecureTransportRefused` is raised (the transport
-    is plaintext HTTP; the ack acknowledges an out-of-band-secured link). Loopback
-    is byte-unchanged. (Unit 2 will consult ``scheme`` inside the guard so a
-    verified-TLS endpoint passes without the ack; this unit only threads it
-    through — the guard decision is unchanged here.)
+    Fail-closed transport guard: an ``https`` endpoint (verified TLS — there is no
+    insecure ``https`` mode) passes at mint with NO ack; for a plaintext ``http``
+    NON-loopback host the bearer is only sent when ``CCS_REMOTE_INSECURE`` (read
+    from ``env``, default ``os.environ``) is truthy — otherwise
+    :class:`InsecureTransportRefused` is raised (the ack acknowledges an
+    out-of-band-secured link). Loopback ``http`` is byte-unchanged. See
+    :func:`_guard_plaintext_bearer` for the verified-TLS positive signal (Unit 2).
     """
     if not host:
         raise CoordinatorUnavailable("remote coordinator host is empty")
     if not secret:
         raise CoordinatorUnavailable("remote coordinator bearer secret is empty")
-    _guard_plaintext_bearer(host, os.environ if env is None else env)
+    _guard_plaintext_bearer(host, os.environ if env is None else env, scheme)
     return CoordinatorEndpoint(
         port=port, bearer=secret, host=host, scheme=scheme, ca_file=ca_file
     )
