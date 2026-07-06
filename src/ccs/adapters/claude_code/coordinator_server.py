@@ -54,6 +54,7 @@ from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
+    assert_serve_transport_acknowledged,
     build_host_allowlist,
     ensure_secret,
     verify_bearer,
@@ -347,6 +348,14 @@ class CoordinatorHTTPServer:
         # disallowed bind (wildcard, loopback alias, link-local, CGNAT, public, or
         # non-loopback without the CCS_REMOTE_COORDINATOR opt-in) raises.
         self.host_allowlist = build_host_allowlist(bind_host)
+        # Unit 3 / R5: fail-closed transport symmetry with the client's #135
+        # plaintext-bearer guard. A routed (non-loopback) bind serves the bearer
+        # secret on the wire, so it must either assert a TLS-terminating front
+        # (CCS_TLS_TERMINATED) or explicitly acknowledge the insecure link
+        # (CCS_SERVE_INSECURE), else construction raises ValueError. Loopback binds
+        # read neither env and are byte-unchanged. Runs before the socket bind so a
+        # routed coordinator without an ack never opens a listening socket.
+        assert_serve_transport_acknowledged(bind_host)
         # Monotonic reference points (NOT wall-clock): idle/uptime deltas must
         # survive NTP steps and suspend/resume (finding L5). time.time() stays
         # reserved for operator-facing absolute timestamps elsewhere.

@@ -125,12 +125,82 @@ def validate_bind_host(host: str) -> None:
         )
 
 
+#: Server-side transport-posture env vars (Unit 3 / R5). ``CCS_TLS_TERMINATED``
+#: asserts a TLS-terminating front sits ahead of the coordinator (posture INFO);
+#: ``CCS_SERVE_INSECURE`` is the explicit plaintext-link acknowledgement (WARNING),
+#: the mirror of the client's ``CCS_REMOTE_INSECURE``. Both parse against the same
+#: truthy set as ``CCS_REMOTE_COORDINATOR`` (:data:`_REMOTE_TRUTHY_ENV_VALUES`).
+_TLS_TERMINATED_ENV = "CCS_TLS_TERMINATED"
+_SERVE_INSECURE_ENV = "CCS_SERVE_INSECURE"
+
+
+def _serve_env_enabled(name: str) -> bool:
+    """True when the named transport-posture env var is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in _REMOTE_TRUTHY_ENV_VALUES
+
+
+def assert_serve_transport_acknowledged(bind_host: str) -> None:
+    """Fail-closed guard: refuse to serve on a routed bind without a transport ack.
+
+    Symmetry with the client's ``CCS_REMOTE_INSECURE`` plaintext-bearer guard
+    (#135): the coordinator authenticates hook requests with a bearer secret, so
+    serving them on a routed (non-loopback) bind over plaintext exposes the
+    bearer on the wire. This guard refuses to construct such a server unless the
+    operator either asserts a TLS-terminating front is present
+    (``CCS_TLS_TERMINATED``) or explicitly acknowledges the insecure link
+    (``CCS_SERVE_INSECURE``).
+
+    Loopback binds read NEITHER env and return immediately (byte-unchanged; no
+    log). The bind host must already have passed :func:`validate_bind_host`
+    (non-loopback ⇒ CCS_REMOTE_COORDINATOR-gated private-range IP); this guard
+    reuses that loopback classification rather than re-deriving one, so the
+    client and server never drift.
+
+    Precedence: if BOTH envs are set the TLS assertion wins the log line (a
+    single INFO posture line, no double-warn). Raises :class:`ValueError` (the
+    established construction-time bind-rejection idiom of
+    :func:`build_host_allowlist`) naming both envs when neither is set.
+    """
+    if is_loopback_host(bind_host):
+        return
+    if _serve_env_enabled(_TLS_TERMINATED_ENV):
+        # Assertion wins even when CCS_SERVE_INSECURE is also set (no double-warn).
+        # Names the bind host + posture only — there is no secret in scope here.
+        logger.info(
+            "serving the coordinator on routed bind %r; %s asserted "
+            "(a TLS-terminating front is expected ahead of the coordinator)",
+            bind_host,
+            _TLS_TERMINATED_ENV,
+        )
+        return
+    if _serve_env_enabled(_SERVE_INSECURE_ENV):
+        logger.warning(
+            "serving the coordinator bearer on routed bind %r over plaintext HTTP "
+            "(%s acknowledged — ensure the link is encrypted out-of-band)",
+            bind_host,
+            _SERVE_INSECURE_ENV,
+        )
+        return
+    raise ValueError(
+        f"refusing to serve the coordinator bearer on routed bind {bind_host!r} "
+        f"over plaintext HTTP; set {_TLS_TERMINATED_ENV} to assert a "
+        f"TLS-terminating front, or {_SERVE_INSECURE_ENV} to acknowledge an "
+        "out-of-band-secured link"
+    )
+
+
 def build_host_allowlist(bind_host: str) -> frozenset[str]:
     """The Host-header allowlist for a coordinator bound to ``bind_host``.
 
     Always includes loopback; for a validated non-loopback bind it also admits
     that exact host. Validates ``bind_host`` (raises on a disallowed bind), so a
     coordinator constructed with a bad bind fails loud at construction.
+
+    This function stays a pure address→allowlist derivation (no env-driven
+    transport-posture side effects). The routed-bind transport acknowledgement is
+    a distinct concern enforced by :func:`assert_serve_transport_acknowledged` at
+    the coordinator construction path — keeping the two separable lets callers
+    that only need the allowlist derive it without a live transport-posture env.
     """
     validate_bind_host(bind_host)
     if is_loopback_host(bind_host):
