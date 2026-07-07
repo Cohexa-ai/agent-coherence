@@ -46,6 +46,7 @@ from ccs.cli._coherence_client import (
     resolve_remote_endpoint,
 )
 from ccs.core.exceptions import (
+    InsecureTransportRefused,
     RedirectRefused,
     TlsConfigError,
     TlsVerificationFailed,
@@ -92,6 +93,13 @@ class TestTlsContextFactory:
         assert ctx.check_hostname is True
         assert ctx.verify_mode == ssl.CERT_REQUIRED
 
+    def test_default_context_disables_legacy_cn_fallback(self) -> None:
+        # SAN-only tightening: the legacy Common Name fallback is off, so a cert
+        # with no matching SAN is rejected even if its CN matches (this is what
+        # makes the DNS-only-SAN-on-IP-endpoint case fail closed).
+        ctx = build_tls_context()
+        assert getattr(ctx, "hostname_checks_common_name", False) is False
+
     def test_default_context_pins_tls12_floor(self) -> None:
         ctx = build_tls_context()
         assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
@@ -119,6 +127,18 @@ class TestTlsContextFactory:
         with pytest.raises(TlsConfigError) as exc:
             build_tls_context(ca_file=str(garbage))
         assert str(garbage) in str(exc.value)
+
+    def test_non_utf8_ca_file_raises_tls_config_error_naming_path(
+        self, tmp_path: Path
+    ) -> None:
+        # Non-UTF-8 bytes exercise the UnicodeDecodeError branch in the CA reader
+        # (distinct from the valid-UTF-8-but-not-PEM SSLError branch above); it
+        # must fail closed as a typed TlsConfigError, never a raw UnicodeDecodeError.
+        binary = tmp_path / "binary-ca.pem"
+        binary.write_bytes(b"\xff\xfe\x00\x01not a cert")
+        with pytest.raises(TlsConfigError) as exc:
+            build_tls_context(ca_file=str(binary))
+        assert str(binary) in str(exc.value)
 
     def test_symlinked_ca_file_is_refused(self, tmp_path: Path) -> None:
         real = tmp_path / "real-ca.pem"
@@ -508,22 +528,26 @@ class TestRedirectRefusal:
             redirecting.shutdown()
             target.shutdown()
 
-    def test_http_endpoint_3xx_is_also_refused(self, tmp_path: Path) -> None:
-        # Redirect refusal is scheme-agnostic: a plaintext http endpoint that
-        # 3xxes is refused too (the coordinator is one fixed endpoint).
+    @pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+    def test_http_endpoint_3xx_is_also_refused(self, code: int) -> None:
+        # Redirect refusal is scheme-agnostic AND uniform across 3xx codes: any
+        # 3xx from a plaintext http endpoint is refused (the coordinator is one
+        # fixed endpoint). 308 in particular has no stdlib redirect method — the
+        # _NoRedirectHandler.http_error_308 alias makes it a typed refusal too.
         class _PlainHandler(http.server.BaseHTTPRequestHandler):
             seen: list[str | None] = []
+            status = 302
 
             def do_GET(self) -> None:  # noqa: N802
                 type(self).seen.append(self.headers.get("Authorization"))
-                self.send_response(302)
+                self.send_response(type(self).status)
                 self.send_header("Location", "http://127.0.0.1:1/elsewhere")
                 self.end_headers()
 
             def log_message(self, *a: object) -> None:
                 pass
 
-        scoped = type("_ScopedPlain", (_PlainHandler,), {"seen": []})
+        scoped = type("_ScopedPlain", (_PlainHandler,), {"seen": [], "status": code})
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), scoped)
         port = srv.socket.getsockname()[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -568,6 +592,42 @@ class TestFromEnvIntegration:
             assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
         finally:
             srv.shutdown()
+
+
+# ===========================================================================
+# Regression: the cross-host demo's TLS resolution pattern (examples/cross_host/
+# main.py) must thread scheme/ca_file from from_env into resolve_remote_endpoint.
+# Pure-function (no socket) — pins the exact contract a review caught main.py
+# violating: an https routed host needs NO CCS_REMOTE_INSECURE ack.
+# ===========================================================================
+
+
+class TestTlsSatisfiesGuardForRoutedHost:
+    def test_from_env_tls_routed_host_resolves_without_insecure_ack(self) -> None:
+        cfg = RemoteCoordinatorConfig.from_env(
+            env={
+                "CCS_REMOTE_COORDINATOR": "1",
+                "CCS_REMOTE_TLS": "1",
+                "CCS_REMOTE_HOST": "10.0.0.5",
+                "CCS_REMOTE_PORT": "8443",
+            }
+        )
+        assert cfg.scheme == "https"
+        # Threaded (what main.py now does): the verified-TLS scheme satisfies the
+        # guard for a routed host with NO ack — resolves cleanly.
+        ep = resolve_remote_endpoint(
+            cfg.host, cfg.port, "s3cr3t", scheme=cfg.scheme, ca_file=cfg.ca_file, env={}
+        )
+        assert ep.base_url == "https://10.0.0.5:8443"
+        assert ep.scheme == "https"
+
+    def test_dropping_the_scheme_thread_through_reproduces_the_bug(self) -> None:
+        # The signature of the main.py bug: without scheme= the endpoint defaults
+        # to http, so a routed host without the ack is refused. This is exactly
+        # what a caller following the TLS docs would hit if the thread-through
+        # were dropped — kept as a guard against regressing it.
+        with pytest.raises(InsecureTransportRefused):
+            resolve_remote_endpoint("10.0.0.5", 8443, "s3cr3t", env={})
 
 
 # ===========================================================================

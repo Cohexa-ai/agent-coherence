@@ -583,6 +583,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     ):  # noqa: ANN001, ANN201 - matches the stdlib handler signature
         raise RedirectRefused(newurl, status=code)
 
+    # urllib's HTTPRedirectHandler routes 301/302/303/307 through
+    # ``redirect_request`` but has NO ``http_error_308`` method, so a 308 would
+    # otherwise surface as a bare ``HTTPError`` (still not followed — the bearer
+    # never rides it — but untyped). Alias it to the 302 path so a 308 is a
+    # typed ``RedirectRefused`` too, making "refuse ANY 3xx" literally true.
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
+
 
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
     """A private opener whose redirect handler refuses every 3xx.
