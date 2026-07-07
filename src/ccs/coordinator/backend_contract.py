@@ -191,12 +191,16 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
     ),
     MemberContract(
         "record_last_reclamation",
-        MemberClass.ATOMIC_CLASS,
+        MemberClass.INDEPENDENT,
         "base",
-        "Records the (trigger, tick) reclamation slot ATOMICALLY with the "
-        "M/E->INVALID grant reclaim in the same-lock enforce_stable_grant_timeouts "
-        "sweep. Read back by commit to explain a reclaimed-grant failure. Part of "
-        "the sweep leg of the boundary's single-process serialization.",
+        "Records the (trigger, tick) reclamation slot during the same-lock "
+        "enforce_stable_grant_timeouts sweep, in its OWN transaction — a serialized "
+        "follow-on AFTER the M/E->INVALID reclaim, NOT one atomic RMW with it "
+        "(verified: set_agent_state and record_last_reclamation each open their own "
+        "BEGIN IMMEDIATE, called consecutively by the sweep). Read back by commit "
+        "only to explain a reclaimed-grant failure — a diagnostic write a backend "
+        "makes individually durable, not part of the single-writer boundary "
+        "(cf. the heartbeat record, likewise INDEPENDENT).",
     ),
     # ---- ATOMIC_CLASS reads consumed INSIDE the boundary -------------------
     MemberContract(

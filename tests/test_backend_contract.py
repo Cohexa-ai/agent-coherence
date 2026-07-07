@@ -121,7 +121,6 @@ def test_the_atomic_class_boundary_members_are_classified_atomic() -> None:
         "clear_agent_transient",
         "capture_version_vector",
         "abort_guard",
-        "record_last_reclamation",
         "get_state_map",
     }
     actual_atomic = {
