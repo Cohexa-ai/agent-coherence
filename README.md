@@ -9,6 +9,9 @@ Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One 
 [![arXiv](https://img.shields.io/badge/arXiv-2603.15183-b31b1b)](https://arxiv.org/abs/2603.15183)
 [![Discussions](https://img.shields.io/github/discussions/hipvlady/agent-coherence)](https://github.com/hipvlady/agent-coherence/discussions)
 
+<!-- MCP Registry — PyPI ownership tag for the stale-write-guard-fs server -->
+`mcp-name: io.github.hipvlady/stale-write-guard-fs`
+
 ```bash
 pip install "agent-coherence[langgraph]"        # LangGraph drop-in
 pip install "agent-coherence[crewai]"           # CrewAI adapter
