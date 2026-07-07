@@ -92,19 +92,21 @@ class CasCorruption:
 class MultiCommitResult:
     """The WIN aggregate of an atomic multi-artifact publish (SB-18 / commit_all).
 
-    Returned (never raised) by the registry ``commit_all`` primitive and the
-    service orchestration when EVERY member of the write-set committed as one
-    unit. ``versions`` maps each artifact id to its NEW (post-bump) version — the
-    N-artifact analog of ``CasResult``'s single ``version``. All-or-nothing: a
-    ``MultiCommitResult`` means every member advanced; a partial batch is never a
-    reachable outcome (``NoPartialPublish``, ``AtomicPublish.tla``).
-
-    ``coordinator_epoch`` is stamped so a caller can pin which store-incarnation
-    served the commit, exactly as the single-artifact CAS WIN does.
+    Returned (never raised) by the registry ``commit_all`` primitive when EVERY
+    member of the write-set committed as one unit. ``versions`` maps each
+    artifact id to its NEW (post-bump) version — the N-artifact analog of
+    ``CasResult``'s single ``version``. ``invalidated`` is the aggregated set of
+    peer agent ids whose cached views the batch invalidated — the caller (the
+    service) publishes these to the event bus AFTER the apply commits, never
+    mid-batch (broadcast-after-commit). All-or-nothing: a ``MultiCommitResult``
+    means every member advanced; a partial batch is never a reachable outcome
+    (``NoPartialPublish``, ``AtomicPublish.tla``). The registry return carries no
+    ``coordinator_epoch`` — the service stamps that onto the wire response, exactly
+    as the single-artifact CAS path does.
     """
 
     versions: Mapping[UUID, int]
-    coordinator_epoch: str
+    invalidated: tuple[UUID, ...]
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,20 @@ class MultiCommitConflict:
     """
 
     per_artifact: Mapping[UUID, ConflictDetail]
+
+
+@dataclass(frozen=True)
+class CommitAllEntry:
+    """One member of an atomic multi-artifact publish write-set (SB-18 /
+    commit_all). The per-artifact analog of ``commit_cas``'s keyword args —
+    a single-shot version-checked comparand the caller supplies; the primitive
+    NEVER re-reads or re-derives it (the split-comparand discipline).
+    """
+
+    expected_version: int
+    content_hash: str
+    size_tokens: int | None = None
+    content: bytes | str | None = None
 
 
 @dataclass(frozen=True)
