@@ -89,6 +89,48 @@ class CasCorruption:
 
 
 @dataclass(frozen=True)
+class MultiCommitResult:
+    """The WIN aggregate of an atomic multi-artifact publish (SB-18 / commit_all).
+
+    Returned (never raised) by the registry ``commit_all`` primitive and the
+    service orchestration when EVERY member of the write-set committed as one
+    unit. ``versions`` maps each artifact id to its NEW (post-bump) version — the
+    N-artifact analog of ``CasResult``'s single ``version``. All-or-nothing: a
+    ``MultiCommitResult`` means every member advanced; a partial batch is never a
+    reachable outcome (``NoPartialPublish``, ``AtomicPublish.tla``).
+
+    ``coordinator_epoch`` is stamped so a caller can pin which store-incarnation
+    served the commit, exactly as the single-artifact CAS WIN does.
+    """
+
+    versions: Mapping[UUID, int]
+    coordinator_epoch: str
+
+
+@dataclass(frozen=True)
+class MultiCommitConflict:
+    """The all-or-nothing HELD aggregate of an atomic multi-artifact publish
+    (SB-18 / commit_all).
+
+    Returned (never raised) by the registry ``commit_all`` primitive when ANY
+    member of the write-set was blocked, so ZERO members were mutated (the
+    all-or-nothing bail). ``per_artifact`` names each FAILING member's own typed
+    :class:`ConflictDetail` reason (``version_mismatch`` / ``other_holder`` /
+    ``stale_read_generation``) independently — one held vector can fail different
+    members for different reasons in a single call, so the aggregate carries a
+    typed per-member reason map, never a flattened prose message (the
+    typed-signal-not-substring house rule). The caller re-reads the named members
+    at their ``current_version`` and re-publishes.
+
+    Promoted from the frozen paper design's ``_PaperMultiCommitConflict``
+    (``tests/test_sb18_non_foreclosure.py``) — same shape, composing the shipped
+    ``ConflictDetail`` verbatim.
+    """
+
+    per_artifact: Mapping[UUID, ConflictDetail]
+
+
+@dataclass(frozen=True)
 class VersionedContent:
     """A successfully resolved retained version (plan item N v1, Unit 4 / R5).
 
