@@ -37,6 +37,21 @@ def test_endpoint_remote_host_in_base_url():
     assert ep.base_url == "http://10.0.0.5:8080"
 
 
+def test_endpoint_scheme_defaults_to_http():
+    # Unit 1 additive field: the default scheme keeps the loopback/plaintext
+    # path byte-unchanged.
+    ep = CoordinatorEndpoint(port=8080, bearer="deadbeef", host="10.0.0.5")
+    assert ep.scheme == "http"
+    assert ep.ca_file is None
+
+
+def test_endpoint_https_scheme_renders_https_base_url():
+    ep = CoordinatorEndpoint(
+        port=8443, bearer="deadbeef", host="10.0.0.5", scheme="https"
+    )
+    assert ep.base_url == "https://10.0.0.5:8443"
+
+
 @pytest.mark.parametrize("method", ["get", "post"])
 def test_request_host_header_follows_endpoint_host(monkeypatch, method):
     captured: dict[str, str | None] = {}

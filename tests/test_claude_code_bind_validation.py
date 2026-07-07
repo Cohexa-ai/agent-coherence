@@ -146,3 +146,128 @@ def test_coordinator_cli_has_bind_host_flag():
 
     assert build_parser().parse_args([]).bind_host == "127.0.0.1"
     assert build_parser().parse_args(["--bind-host", "10.0.0.5"]).bind_host == "10.0.0.5"
+
+
+# ---------------------------------------------------------------------------
+# Unit 3 (R5): coordinator-side routed-bind TLS/insecure-ack guard.
+#
+# Fail-closed symmetry with the client's #135 plaintext-bearer guard: a
+# non-loopback (private-range, already CCS_REMOTE_COORDINATOR-gated) bind must
+# either assert a TLS-terminating front (CCS_TLS_TERMINATED) or explicitly
+# acknowledge the insecure link (CCS_SERVE_INSECURE); otherwise construction
+# raises. Loopback binds read NEITHER env and are byte-unchanged.
+# ---------------------------------------------------------------------------
+
+from ccs.adapters.claude_code.auth import assert_serve_transport_acknowledged
+
+
+def _clear_serve_envs(monkeypatch):
+    monkeypatch.delenv("CCS_TLS_TERMINATED", raising=False)
+    monkeypatch.delenv("CCS_SERVE_INSECURE", raising=False)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_serve_guard_loopback_reads_no_env(host, monkeypatch, caplog):
+    """Loopback: the guard returns without reading either env and logs nothing."""
+    # Set BOTH to truthy — a loopback bind must ignore them entirely (byte-unchanged).
+    monkeypatch.setenv("CCS_TLS_TERMINATED", "1")
+    monkeypatch.setenv("CCS_SERVE_INSECURE", "1")
+    with caplog.at_level("INFO", logger="ccs.adapters.claude_code.auth"):
+        assert_serve_transport_acknowledged(host)  # no raise
+    assert caplog.records == []
+
+
+def test_serve_guard_tls_terminated_logs_posture(monkeypatch, caplog):
+    """Private-range bind + CCS_TLS_TERMINATED=1 → passes with an INFO posture log."""
+    _clear_serve_envs(monkeypatch)
+    monkeypatch.setenv("CCS_TLS_TERMINATED", "1")
+    with caplog.at_level("INFO", logger="ccs.adapters.claude_code.auth"):
+        assert_serve_transport_acknowledged("10.0.0.5")  # no raise
+    assert any(r.levelname == "INFO" for r in caplog.records)
+    assert "CCS_TLS_TERMINATED" in caplog.text
+    assert "10.0.0.5" in caplog.text
+    # The bind host is named; the guard never logs a secret (there is none here).
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_serve_guard_serve_insecure_logs_warning(monkeypatch, caplog):
+    """Private-range bind + CCS_SERVE_INSECURE=1 → passes with a WARNING."""
+    _clear_serve_envs(monkeypatch)
+    monkeypatch.setenv("CCS_SERVE_INSECURE", "1")
+    with caplog.at_level("WARNING", logger="ccs.adapters.claude_code.auth"):
+        assert_serve_transport_acknowledged("10.0.0.5")  # no raise
+    assert any(r.levelname == "WARNING" for r in caplog.records)
+    assert "CCS_SERVE_INSECURE" in caplog.text
+    assert "10.0.0.5" in caplog.text
+
+
+def test_serve_guard_neither_env_raises_and_names_both(monkeypatch):
+    """Private-range bind + neither env → raises; message names BOTH envs actionably."""
+    _clear_serve_envs(monkeypatch)
+    with pytest.raises(ValueError) as excinfo:
+        assert_serve_transport_acknowledged("10.0.0.5")
+    message = str(excinfo.value)
+    assert "CCS_TLS_TERMINATED" in message
+    assert "CCS_SERVE_INSECURE" in message
+    assert "10.0.0.5" in message
+
+
+def test_serve_guard_both_envs_assertion_wins_single_log(monkeypatch, caplog):
+    """Both envs set → passes; the TLS assertion wins the log (INFO, no WARNING)."""
+    _clear_serve_envs(monkeypatch)
+    monkeypatch.setenv("CCS_TLS_TERMINATED", "1")
+    monkeypatch.setenv("CCS_SERVE_INSECURE", "1")
+    with caplog.at_level("INFO", logger="ccs.adapters.claude_code.auth"):
+        assert_serve_transport_acknowledged("10.0.0.5")  # no raise
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(info_records) == 1  # single posture line, no double-warn
+    assert warn_records == []
+    assert "CCS_TLS_TERMINATED" in caplog.text
+
+
+@pytest.mark.parametrize("falsey", ["0", "false", "no", "off", "", "  ", "nope"])
+def test_serve_guard_falsey_values_behave_as_unset(falsey, monkeypatch):
+    """Falsey/empty values are treated as unset → private-range bind still raises."""
+    _clear_serve_envs(monkeypatch)
+    monkeypatch.setenv("CCS_TLS_TERMINATED", falsey)
+    monkeypatch.setenv("CCS_SERVE_INSECURE", falsey)
+    with pytest.raises(ValueError):
+        assert_serve_transport_acknowledged("10.0.0.5")
+
+
+def test_coordinator_routed_bind_requires_serve_ack(tmp_path, monkeypatch):
+    """A routed bind with the cross-host flag on but NO transport ack raises at
+    construction — fail-closed symmetry with the client guard."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    _clear_serve_envs(monkeypatch)
+    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+
+    with pytest.raises(ValueError, match="CCS_TLS_TERMINATED"):
+        CoordinatorHTTPServer(tmp_path, bind_host="10.0.0.5")
+
+
+def test_coordinator_routed_bind_constructs_with_insecure_ack(tmp_path, monkeypatch):
+    """A routed bind constructs once CCS_SERVE_INSECURE acknowledges the link.
+
+    Uses 127.0.0.1 for the actual socket bind (port 0) so the test is
+    platform-agnostic, but drives the guard by pre-validating the routed host:
+    the guard path is exercised in the function-level tests above; here we assert
+    the routed construction path does not raise once the ack is present.
+    """
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    _clear_serve_envs(monkeypatch)
+    monkeypatch.setenv("CCS_SERVE_INSECURE", "1")
+    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+
+    # A private-range bind cannot open a real socket on most CI hosts, so we
+    # assert the guard admits it by construction up to the socket bind. The
+    # OSError from the unbindable address (if any) is distinct from the guard's
+    # ValueError; a ValueError here would mean the ack was not honored.
+    try:
+        server = CoordinatorHTTPServer(tmp_path, bind_host="10.0.0.5")
+    except ValueError:  # pragma: no cover - would signal the ack was ignored
+        raise
+    except OSError:
+        return  # address not assignable on this host — guard already passed
+    server.shutdown()
