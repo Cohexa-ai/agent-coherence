@@ -102,28 +102,31 @@ def _registries(tmp_path: Path):
 # ===========================================================================
 
 
-class TestSb18IsNotPrebuilt:
-    """R11 forbids pre-building SB-18; v1 must only NOT foreclose it. Pin that no
-    paper SB-18 symbol leaked into the runtime surface — the harness asserts a
-    DESIGN property of the frozen types, never a shipped multi-commit op."""
+class TestSb18NowShipping:
+    """SB-18 (``commit_all``) is now SHIPPING — un-gated 2026-07-07 by the founder
+    substrate bet. The former "is NOT prebuilt" fence is RETIRED here, flipped to
+    POSITIVE existence checks per this file's own note ("if SB-18 ever ships, this
+    fence is what tells us to retire it"). The rest of the suite (the
+    inspectable-cut substrate the write side builds on) still holds verbatim."""
 
-    def test_no_commit_all_on_the_service(self) -> None:
-        # The paper signature is ``session.commit_all`` — it must NOT exist yet.
-        assert not hasattr(CoordinatorService, "commit_all"), (
-            "commit_all leaked into the service — SB-18 was pre-built, violating "
-            "R11 (v1 must only NOT foreclose it)"
-        )
-
-    def test_no_multi_commit_result_types_in_core(self) -> None:
-        # The paper aggregates (MultiCommitResult / MultiCommitConflict) must not
-        # exist in the frozen core types — they are SB-18's, deferred to Gate A2.
+    def test_multi_commit_types_exist_in_core(self) -> None:
+        # The paper aggregates promoted into the frozen core types (Unit 1).
         import ccs.core.types as core_types
 
-        for paper_only in ("MultiCommitResult", "MultiCommitConflict"):
-            assert not hasattr(core_types, paper_only), (
-                f"{paper_only} leaked into ccs.core.types — SB-18 aggregate was "
-                f"pre-built, violating R11"
+        for shipped in ("MultiCommitResult", "MultiCommitConflict", "CommitAllEntry"):
+            assert hasattr(core_types, shipped), (
+                f"{shipped} missing from ccs.core.types — SB-18 shipped; this "
+                f"aggregate must exist"
             )
+
+    def test_commit_all_on_both_registries(self) -> None:
+        # The atomic multi-artifact publish primitive now exists on BOTH backends
+        # (the correctness core; the service/session surface lands in Unit 3).
+        from ccs.coordinator.registry import ArtifactRegistry
+        from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+        assert hasattr(ArtifactRegistry, "commit_all")
+        assert hasattr(SqliteArtifactRegistry, "commit_all")
 
 
 # ===========================================================================

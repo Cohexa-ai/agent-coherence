@@ -134,6 +134,18 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "and maps the three outcomes; the arbitration itself is atomic here.",
     ),
     MemberContract(
+        "commit_all",
+        MemberClass.ATOMIC_CLASS,
+        "base",
+        "THE N-artifact atomic boundary (SB-18). commit_all runs CHECK-all "
+        "(version-CAS + other_holder + fence per member) then applies EVERY member "
+        "or NONE, in one serialized step (sqlite: one BEGIN IMMEDIATE; in-memory: "
+        "one _capture_lock hold with snapshot-restore). All-or-nothing -- a partial "
+        "batch is never observable (NoPartialPublish). Returns a MultiCasResult; "
+        "the aggregated invalidation broadcasts only after the commit. A genuinely "
+        "new atomic op, never a loop of commit_cas.",
+    ),
+    MemberContract(
         "set_artifact_and_content",
         MemberClass.ATOMIC_CLASS,
         "base",
