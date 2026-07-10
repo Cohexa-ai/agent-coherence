@@ -773,7 +773,7 @@ class ArtifactRegistry:
         # ---- APPLY (total): snapshot every affected record, apply all N under one
         # _capture_lock hold, and RESTORE ALL on any raise — a mid-apply exception
         # can never leave a partial batch (the plan's total-apply hardening). ----
-        invalidated: list[UUID] = []
+        invalidated: dict[UUID, list[UUID]] = {}
         versions: dict[UUID, int] = {}
         with self._capture_lock:
             snapshots = [
@@ -795,11 +795,14 @@ class ArtifactRegistry:
                         self._capture_version(record, next_version, entry.content)
                     record.artifact = updated
                     record.last_writer = agent_id
+                    member_invalidated: list[UUID] = []
                     for peer_id, peer_from in peers:
                         record.state_by_agent[peer_id] = MESIState.INVALID
                         if peer_from in _M_OR_E_STATES:
                             record.granted_at_tick_by_agent.pop(peer_id, None)
-                        invalidated.append(peer_id)
+                        member_invalidated.append(peer_id)
+                    if member_invalidated:
+                        invalidated[art_id] = member_invalidated
                     record.state_by_agent[agent_id] = MESIState.SHARED
                     versions[art_id] = next_version
             except Exception:
@@ -814,8 +817,11 @@ class ArtifactRegistry:
                 raise
 
         # BROADCAST is the caller's (service) responsibility, AFTER this returns —
-        # the invalidated set is published to the event bus only post-commit.
-        return MultiCommitResult(versions=versions, invalidated=tuple(invalidated))
+        # the per-artifact invalidations are published to the event bus only post-commit.
+        return MultiCommitResult(
+            versions=versions,
+            invalidated={art: tuple(peers) for art, peers in invalidated.items()},
+        )
 
     def capture_version_vector(
         self,

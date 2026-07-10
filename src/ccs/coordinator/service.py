@@ -42,6 +42,7 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
     Artifact,
     CasCorruption,
+    CommitAllEntry,
     ConflictDetail,
     DataPlaneDeferredRead,
     EffectFired,
@@ -49,6 +50,8 @@ from ccs.core.types import (
     FetchRequest,
     FetchResponse,
     InvalidationSignal,
+    MultiCommitConflict,
+    MultiCommitResult,
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
@@ -2150,6 +2153,147 @@ class CoordinatorService:
         ]
         self._validate_single_writer(artifact_id)
         return updated, signals
+
+    def commit_all(
+        self,
+        *,
+        agent_id: UUID,
+        writes: Mapping[UUID, CommitAllEntry],
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
+        """Atomic multi-artifact publish (SB-18) under the A6 abort guard.
+
+        The batch analog of :meth:`commit_cas` — all-or-nothing over the caller's
+        write-set. A single check-point at the registry write lock (abort_guard);
+        the registry does CHECK-all / total-apply, and this method owns the D4
+        precondition layer + the ``InvalidationSignal`` construction. The signals
+        are RETURNED for the caller to publish to the event bus AFTER the commit
+        (broadcast-after-commit — never mid-batch).
+        """
+        with self.registry.abort_guard(abort):
+            return self._commit_all_impl(
+                agent_id=agent_id, writes=writes, issued_at_tick=issued_at_tick
+            )
+
+    def _commit_all_impl(
+        self,
+        *,
+        agent_id: UUID,
+        writes: Mapping[UUID, CommitAllEntry],
+        issued_at_tick: int = 0,
+    ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
+        if not writes:
+            raise CoherenceError("commit_all requires a non-empty write-set")
+        # D4 precondition layer (per member, all-or-nothing): each artifact must
+        # exist, the caller must not be mid-transient, and must be SHARED/INVALID
+        # (an M/E holder is a pessimistic writer — use commit()). One failing member
+        # refuses the WHOLE batch before any mutation.
+        for artifact_id in writes:
+            self._require_artifact(artifact_id)
+            if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
+                raise OccCallerTransientError(
+                    f"commit_all_not_allowed agent={agent_id} artifact={artifact_id} "
+                    f"reason={OCC_CALLER_TRANSIENT_REASON}"
+                )
+            state = self.registry.get_agent_state(artifact_id, agent_id)
+            if state in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+                raise CoherenceError(
+                    f"commit_all_not_allowed agent={agent_id} artifact={artifact_id} "
+                    f"state={state} reason=occ_is_shared_or_invalid_only "
+                    f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
+                )
+
+        result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
+
+        if isinstance(result, CasCorruption):
+            raise CoherenceError(
+                f"commit_all_corruption agent={agent_id} "
+                f"current_version={result.current_version} (a member's "
+                f"expected_version > current — corruption or multi-coordinator violation)"
+            )
+        if isinstance(result, MultiCommitConflict):
+            # Typed all-or-nothing HELD: nothing mutated, no invalidation signals.
+            return result
+
+        # WIN: one InvalidationSignal per (member artifact, invalidated peer),
+        # published to the event bus AFTER the commit (broadcast-after-commit).
+        signals: list[InvalidationSignal] = []
+        for art_id, new_version in result.versions.items():
+            for _peer in result.invalidated.get(art_id, ()):
+                signals.append(
+                    InvalidationSignal(
+                        artifact_id=art_id,
+                        new_version=new_version,
+                        issued_at_tick=issued_at_tick,
+                        issuer_agent_id=agent_id,
+                    )
+                )
+            self._validate_single_writer(art_id)
+        return result, signals
+
+    def session_commit_all(
+        self,
+        session_token: str,
+        writes: Mapping[UUID, "tuple[bytes | str, int | None]"],
+        *,
+        caller: UUID,
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> (
+        tuple[MultiCommitResult, list[InvalidationSignal]]
+        | MultiCommitConflict
+        | SessionCommitRejection
+    ):
+        """Atomic multi-artifact publish against a session's PINNED cut (SB-18, R5).
+
+        The thin session convenience over :meth:`commit_all`: each member's
+        ``expected_version`` is sourced from ``cut[artifact_id]`` (the version
+        pinned at ``begin_session``), so the comparands all come from ONE
+        serialization point — the only fractured-read-safe path for size > 1. It
+        adds NO atomicity logic; the commit rides ``commit_all`` under the same
+        session-derived, fence-claimless committer identity as ``session_commit``
+        (admit-on-absent). ``writes`` maps each artifact to ``(content, size_tokens)``.
+
+        Validation mirrors ``session_commit`` (all-or-nothing): a foreign caller or
+        owned-but-pinless token raises ``SessionInvalidated``; a missing cut →
+        ``session_not_found`` / ``session_invalidated``; a member NOT in the cut →
+        ``artifact_not_in_cut`` (the whole batch is rejected). Outcome maps
+        ``commit_all`` verbatim (WIN → ``(result, signals)``; HELD →
+        ``MultiCommitConflict``; corruption RAISES).
+        """
+        if not writes:
+            raise CoherenceError("session_commit_all requires a non-empty write-set")
+        epoch = self.registry.coordinator_epoch
+        cut = self.registry.get_session_cut(session_token)
+        self._validate_session_owner(session_token, caller, cut)
+        if cut is None:
+            return SessionCommitRejection(
+                reason=self._classify_no_cut_reason(session_token),
+                artifact_id=next(iter(writes)),
+                coordinator_epoch=epoch,
+            )
+        for artifact_id in writes:
+            if artifact_id not in cut:
+                return SessionCommitRejection(
+                    reason=SESSION_ARTIFACT_NOT_IN_CUT_REASON,
+                    artifact_id=artifact_id,
+                    coordinator_epoch=epoch,
+                )
+
+        committer_id = self._session_committer_id(session_token)
+        batch = {
+            artifact_id: CommitAllEntry(
+                expected_version=cut[artifact_id],
+                content_hash=compute_content_hash(content),
+                size_tokens=size_tokens,
+                content=content,
+            )
+            for artifact_id, (content, size_tokens) in writes.items()
+        }
+        return self.commit_all(
+            agent_id=committer_id, writes=batch, issued_at_tick=issued_at_tick, abort=abort
+        )
 
     def invalidate(
         self,

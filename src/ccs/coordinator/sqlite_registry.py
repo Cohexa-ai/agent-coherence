@@ -2907,10 +2907,11 @@ class SqliteArtifactRegistry:
                     return MultiCommitConflict(per_artifact=dict(conflicts))
 
                 # ---- WIN: apply every member atomically in this one txn ----
-                invalidated: list[UUID] = []
+                invalidated: dict[UUID, list[UUID]] = {}
                 versions: dict[UUID, int] = {}
                 for art_id, entry in writes.items():
                     current, current_size_tokens = current_by[art_id]
+                    member_invalidated: list[UUID] = []
                     next_version = current + 1
                     resolved_size = (
                         current_size_tokens if entry.size_tokens is None else entry.size_tokens
@@ -2939,7 +2940,9 @@ class SqliteArtifactRegistry:
                             to_state=MESIState.INVALID, trigger=trigger, tick=tick,
                             version=next_version, content_hash=None,
                         )
-                        invalidated.append(UUID(hex=peer_hex))
+                        member_invalidated.append(UUID(hex=peer_hex))
+                    if member_invalidated:
+                        invalidated[art_id] = member_invalidated
                     committer_row = self._conn.execute(
                         "SELECT state, granted_at_tick FROM agent_states "
                         "WHERE artifact_id = ? AND agent_id = ?",
@@ -2977,7 +2980,10 @@ class SqliteArtifactRegistry:
                     self._seq -= seq_incremented_count
                 raise
 
-            return MultiCommitResult(versions=versions, invalidated=tuple(invalidated))
+            return MultiCommitResult(
+                versions=versions,
+                invalidated={art: tuple(peers) for art, peers in invalidated.items()},
+            )
 
     def _emit_state_log(
         self,

@@ -155,5 +155,6 @@ def test_commit_all_win_invalidates_peers_of_every_member(registry):
         tick=2,
     )
     assert isinstance(result, MultiCommitResult)
-    assert peer in result.invalidated
+    # per-artifact invalidation: the peer cached `a`, so it is invalidated for a.id
+    assert peer in result.invalidated[a.id]
     assert registry.get_agent_state(a.id, peer) == MESIState.INVALID

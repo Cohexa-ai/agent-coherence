@@ -95,18 +95,19 @@ class MultiCommitResult:
     Returned (never raised) by the registry ``commit_all`` primitive when EVERY
     member of the write-set committed as one unit. ``versions`` maps each
     artifact id to its NEW (post-bump) version — the N-artifact analog of
-    ``CasResult``'s single ``version``. ``invalidated`` is the aggregated set of
-    peer agent ids whose cached views the batch invalidated — the caller (the
-    service) publishes these to the event bus AFTER the apply commits, never
-    mid-batch (broadcast-after-commit). All-or-nothing: a ``MultiCommitResult``
-    means every member advanced; a partial batch is never a reachable outcome
+    ``CasResult``'s single ``version``. ``invalidated`` maps each member artifact id
+    to the peer agent ids whose cached views that member's commit invalidated — the
+    caller (the service) builds one ``InvalidationSignal`` per (artifact, peer) and
+    publishes them to the event bus AFTER the apply commits, never mid-batch
+    (broadcast-after-commit). All-or-nothing: a ``MultiCommitResult`` means every
+    member advanced; a partial batch is never a reachable outcome
     (``NoPartialPublish``, ``AtomicPublish.tla``). The registry return carries no
     ``coordinator_epoch`` — the service stamps that onto the wire response, exactly
     as the single-artifact CAS path does.
     """
 
     versions: Mapping[UUID, int]
-    invalidated: tuple[UUID, ...]
+    invalidated: Mapping[UUID, tuple[UUID, ...]]
 
 
 @dataclass(frozen=True)
