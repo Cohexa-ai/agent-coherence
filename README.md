@@ -84,7 +84,8 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 🔌 [MCP server](#mcp-server-stale-write-guard-fs) — `stale-write-guard-fs`, the same guarantee for any MCP client, no Python integration required
 - 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input version it decided from
 - 📸 [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) — read several artifacts as one consistent cut; no torn reads
-- 🧮 [Formal verification](formal/tla/README.md) — the six TLA+ specs, invariant ↔ implementation map, mutant recipes
+- 📦 [Atomic multi-file publish](#atomic-multi-file-publish) — `atomic_publish`, land a set of files all-or-nothing; never a torn pair
+- 🧮 [Formal verification](formal/tla/README.md) — the TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
@@ -224,6 +225,27 @@ Or in-process: `CoordinatorService.begin_session(read_set=…, owner=…)` → `
 Fail-closed by construction: reading an artifact that was **not** in the pinned read-set is refused with a typed rejection — never silently served from live state. Sessions have a bounded lifetime backed by a heartbeat lease: a session whose heartbeat lapses, or that is lost to a coordinator restart, is invalidated — later reads get a typed "session invalidated" rejection telling the agent to re-establish, never a quiet fall-through to whatever is current. Model-checked: `NoReadSkewWithinCut` and `PinAlwaysRetained` ([`formal/tla/Snapshot.tla`](formal/tla/Snapshot.tla)).
 
 **Scope, honestly.** This prevents **read-skew** — torn reads across artifacts. It does not add write-skew prevention: commits validate per-artifact against the pinned base through the same optimistic CAS as `write_cas`, so two sessions that read one cut and write *different* artifacts can still interleave. Single coordinator, single host. When the coordinator retains version bodies it serves the pinned bytes directly; otherwise it returns the pinned version and content hash as a typed signal and the caller fetches the bytes from its own data plane.
+
+## Atomic multi-file publish
+
+`write_cas_at` lands one file if it hasn't moved. But an agent often edits a *set* of files that must stay consistent — a plan and its manifest, a config split across files — and must land them **together or not at all**, never a torn pair where one file references another that already changed. `atomic_publish` is that all-or-nothing batch:
+
+```python
+from ccs.adapters import CoherentVolume
+
+vol = CoherentVolume(workspace_root, managed=("proj/**",))
+
+# lands BOTH files iff each is still at the version the agent read; otherwise the
+# WHOLE publish is held (StaleView / CasVersionConflict) with NO file written.
+versions = vol.atomic_publish([
+    ("proj/plan.md",     plan_version,     new_plan_bytes),
+    ("proj/manifest.md", manifest_version, new_manifest_bytes),
+])   # -> {"proj/plan.md": 2, "proj/manifest.md": 3}
+```
+
+Either every member's version advances and every file is written, or a moved member holds the whole batch and nothing is written — a torn commit is never a reachable state, formally specified as the `NoPartialPublish` invariant in [`formal/tla/AtomicPublish.tla`](formal/tla/AtomicPublish.tla). A single-file publish takes the direct CAS path; a multi-file publish opens a [snapshot session](#multi-artifact-snapshot-sessions) so the versions it checks are captured at one point (no member read across a peer commit). Run it: `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add `--baseline` to see the file-by-file torn pair it prevents.
+
+**Scope, honestly.** All-or-nothing holds at the coordinator commit; on a win the client then materializes each file with an atomic `os.replace`. It is single-host and cooperative — the agent opts in. The multi-file path adds a small capture→commit window (the session open), and a peer winning that window **holds** the publish rather than tearing it; recovery is a re-read of the fresh versions, never a buffer computed before the hold. This is all-or-nothing *publish* of a file set — not rollback of effects that already escaped, and not write-skew prevention across sessions.
 
 ## Status
 

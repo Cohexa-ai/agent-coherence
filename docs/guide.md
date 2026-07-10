@@ -404,7 +404,7 @@ exceed `lease_ttl_ticks`. Equal or smaller values raise `ValueError` at startup.
 With `enabled=False` (the opt-out — the v0.9.0 default is `enabled=True`),
 `heartbeat()` and `recover()` are silent no-ops and the sweep never runs.
 State-transition log output is then byte-identical to a build without crash
-recovery (R5). Note the inversion: omitting the `crash_recovery=` argument no
+recovery. Note the inversion: omitting the `crash_recovery=` argument no
 longer reproduces that output — pass `CrashRecoveryConfig(enabled=False)`
 explicitly to get it.
 
@@ -562,6 +562,33 @@ silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
 content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
+
+### Atomic multi-file publish: `atomic_publish`
+
+`write_cas_at` lands one file. When an agent edits a *set* of files that must stay
+consistent — a plan and its manifest, a config split across files —
+`atomic_publish` lands them **all-or-nothing**:
+
+```python
+versions = vol.atomic_publish([
+    ("proj/plan.md",     plan_version,     new_plan_bytes),
+    ("proj/manifest.md", manifest_version, new_manifest_bytes),
+])   # -> {"proj/plan.md": 2, "proj/manifest.md": 3}
+```
+
+Each member commits only if it is still at the `expected_version` you pass; if
+every member matches, all versions advance and every file is written, and if any
+member moved, the **whole** publish is held (`StaleView` / `CasVersionConflict`)
+with **no file written** — a torn half-published set is never a reachable state. A
+single-member call takes the direct CAS path; a multi-member call opens a
+[snapshot session](#multi-artifact-snapshot-sessions) so the versions it checks
+are captured at one point (no member read across a peer commit), which adds a
+small capture→commit window — a peer winning it holds the publish rather than
+tearing it. Recover the same way as a denied write: `reacquire()`, re-read the
+fresh versions, and re-publish from them. A single-member publish accepts
+arbitrary bytes; a multi-member publish requires UTF-8 text content. Run it:
+`python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
+`--baseline` to see the file-by-file torn pair it prevents.
 
 ### Foreign-edit guards
 

@@ -1,6 +1,6 @@
 # TLA+ Formal Verification
 
-TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, and consistent multi-artifact snapshot sessions.
+TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, consistent multi-artifact snapshot sessions, and atomic multi-artifact publish.
 
 ## What is modeled
 
@@ -14,7 +14,8 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 - **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to `commit_cas` in `src/ccs/coordinator/`.
 - **Read-generation fence (Fencing)** — a per-artifact ownership epoch (`ownerGeneration`) bumped atomically on every sweep reclamation, captured into `readGeneration` when an agent establishes its write-claim (`ObserveGenAction` — deliberately decoupled so the sweep can interleave between capture and commit), and enforced by a generation-guarded commit (`FencingCommitAction`): a writer whose captured generation was superseded by a reclamation is rejected even when the version is unchanged — the reclaim-zombie write the version CAS cannot see. Corresponds to `owner_generation` / `read_generation` in `src/ccs/coordinator/`.
 - **Bounded version retention + read-at-version (Retention)** — a per-artifact K-bounded history of committed versions (`history`, content abstracted as the version number), extended and garbage-collected atomically inside the fence-guarded commit (`RetentionCommitAction` — commit + retain + K-GC are one action, mirroring the same-transaction capture discipline), plus an off-protocol read-at-version request (`VersionedReadAction`) proven to be a protocol no-op. Every inherited invariant is re-checked with retention composed in — safety **preservation**, not behavioral equivalence (no refinement mapping). Corresponds to the retention capture points and `CoordinatorService.read_at_version` (plan: `docs/plans/2026-06-10-001-feat-version-retention-read-at-version-plan.md`).
-- **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — cross-artifact write skew is SB-18, out of scope. The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer (plan: `docs/plans/2026-06-26-002-feat-read-side-transaction-snapshot-plan.md`).
+- **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — atomic multi-artifact *publish* is modeled separately in `AtomicPublish.tla` (below). The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer (plan: `docs/plans/2026-06-26-002-feat-read-side-transaction-snapshot-plan.md`).
+- **Atomic multi-artifact publish (AtomicPublish)** — a write-set-quantified commit action (no other spec in the chain has one; all inherited commits are single-`(agent, artifact)`): a batch of members either all advance to their next version atomically or none do (`NoPartialPublish`), and no peer observes an INVALID for a member of a batch that did not commit (broadcast-after-commit). `EXTENDS OCC` — the write race lives in the version-CAS, which keeps the state space lighter than extending Snapshot. Corresponds to `commit_all` in `src/ccs/coordinator/`. **Held out of the `make tla-check` CI sweep:** the write-set state space (≈ 2^|Artifacts| × MaxVersion^|Artifacts|) exceeds the 5-minute CI budget on the reference machine; the spec parses and the invariant is checkable on a smaller/longer local run, with CI-budget convergence tuning tracked as a follow-up (plan: `docs/plans/2026-07-07-001-feat-sb18-multi-artifact-atomic-transactions-plan.md`).
 
 ## What is deliberately out of scope
 
@@ -30,7 +31,7 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 | `register_artifact` | No register action exists anywhere in the chain; Retention's initial state retains version 1, covering the trivial case. Per-capture-point coverage is owned by the Python parity suite |
 | Retention policy changes across runs | `MaxRetained` (K) is a per-run CONSTANT; a re-opened store is equivalent to a fresh bounded store. Policy persistence/toggles are owned by Python tests |
 | Behavioral equivalence (refinement mapping) | `Retention.tla` proves safety **preservation** — the inherited invariants re-checked with retention enabled — not behavioral equivalence to Fencing, which would need a refinement mapping |
-| Cross-artifact WRITE skew (atomic multi-artifact commit) | `Snapshot.tla` models only single-artifact commits and proves READ-skew freedom; atomic multi-artifact write — two sessions each reading a coherent cut and each committing one artifact — is SB-18, deferred. The model asserts nothing about cross-artifact write atomicity |
+| Cross-**session** write skew (two sessions each read a coherent cut, then each commit a *different* artifact, interleaving) | Session commits validate per-artifact against the pinned base through the inherited version-CAS; a serialization anomaly across two sessions writing disjoint artifacts is not prevented. Distinct from atomic multi-artifact *publish* (one agent committing N artifacts as a unit), which **is** modeled — see `AtomicPublish.tla` / `NoPartialPublish` above |
 | Session read-serve / `session.commit` paths | The session read is a pure lookup of the pinned `snapshot[s]`; `session.commit` rides the inherited version-CAS. Neither adds protocol state, so both are owned by the Python suite (plan Units 3/4); `Snapshot.tla` models the cut and its GC-safety |
 | Full liveness proofs | TLC checks safety invariants; liveness is not checked (bounded models make temporal liveness checks infeasible at this scale). OCC's progress / no-starvation obligation is likewise discharged as a safety property (`NoLostUpdate` + a clean no-op conflict) plus a prose argument, not a temporal check. The Retention action property `[][...]_v` is a safety-shaped action check, not a liveness check |
 
@@ -56,6 +57,9 @@ formal/tla/
 ├── Snapshot.tla            # amendment: EXTENDS Retention, adds consistent multi-artifact snapshot sessions
 ├── Snapshot.cfg            # TLC config: 2 agents, 2 artifacts (local deep runs)
 ├── Snapshot_CI.cfg         # TLC config: 1 agent, 2 artifacts, MaxTicks=2 (CI; cross-artifact cut needs >= 2 artifacts)
+├── AtomicPublish.tla       # amendment: EXTENDS OCC, adds the write-set-quantified atomic commit (NoPartialPublish)
+├── AtomicPublish.cfg       # TLC config: 2 agents, 2 artifacts (local deep runs)
+├── AtomicPublish_CI.cfg    # TLC config: 2 agents, 2 artifacts (held out of make tla-check pending convergence tuning)
 ├── lib/
 │   └── tla2tools.jar       # committed TLC binary (see version below)
 └── README.md               # this file
@@ -107,6 +111,7 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `ReadAtVersionIsProtocolNoOp` | Retention (action property, cfg `PROPERTY`) | `[][VersionedReadAction => UNCHANGED fenceVars]_retentionVars` — any transition satisfying the read action changes no MESI/crash-recovery/fence variable. A state invariant cannot express this: a fence-refreshing read is extensionally identical to a legitimate `ObserveGenAction`, so only an action-level check can catch it |
 | — | `NoReadSkewWithinCut` | Snapshot | No commit ever interleaved a partially-captured session — every session reads a coherent multi-artifact cut. Atomic capture makes a partial cut unreachable (vacuous-TRUE in the correct spec); the split mutant (recipe 9) gives it teeth — the `staleApply`/`collectedRead` sticky-flag idiom |
 | — | `PinAlwaysRetained` | Snapshot | Every version a live session pinned is still in the artifact's retained history — the K-bounded GC never collects a pin out from under its session (the exemptions seam: `SnapRetainAndCollect` keeps window ∪ live-session pins; recipe 10 gives it teeth) |
+| — | `NoPartialPublish` | AtomicPublish (not in the CI sweep — see CI time budget) | No reachable state where a strict, non-empty subset of a batch's members advanced, and no peer observes an INVALID for a member of a batch that did not commit — a torn multi-artifact publish is unreachable. The split mutant (recipe 11) gives it teeth |
 
 I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 
@@ -155,7 +160,7 @@ non-decreasing) holds regardless of the bound.
 
 ## CI time budget
 
-Target: **5 minutes** total across the six specs (the original five measured 4min 32s sequential on the reference machine; Snapshot adds ~18s reference-equivalent on a tight 1-agent × 2-artifact config — see the Snapshot note below). The budget stays snug; treat further spec additions as needing their own budget review.
+Target: **5 minutes** total across the six specs run in CI (the original five measured 4min 32s sequential on the reference machine; Snapshot adds ~18s reference-equivalent on a tight 1-agent × 2-artifact config — see the Snapshot note below). The budget stays snug; treat further spec additions as needing their own budget review. `AtomicPublish.tla` is a seventh spec deliberately **held out of this budget** — its write-set state space does not converge inside the 5-minute target on the reference machine, so `make tla-check` does not run it (convergence tuning is a tracked follow-up).
 
 | Model | Config | Agents | Artifacts | MaxTicks | Distinct States | Wall Time |
 |-------|--------|--------|-----------|----------|----------------|-----------|
@@ -281,8 +286,21 @@ and confirm TLC finds a counterexample:
    correct GC honors. (Verified 2026-06-28: violation found in ~1s, 821 distinct
    states.)
 
+11. **AtomicPublish torn-batch mutation (apply the passing subset)**: In
+   `AtomicPublish.tla`, relax `CommitAllAction`'s WIN guard from `winners = ws`
+   to `winners /= {}` and apply `winners` instead of `ws` (so a batch where only
+   a strict subset of members pass still commits that subset). Run TLC directly
+   on `AtomicPublish.cfg` (or `AtomicPublish_CI.cfg`). TLC should fail with a
+   `NoPartialPublish` violation, showing a trace where one member of a batch
+   advanced while another was held — the torn publish the atomic apply excludes.
+   A companion mutant **AP-2** (delete the `observedVersion[ag][art] = version[art]`
+   version-CAS line in `MemberCommits`) lets a stale member land in a batch and
+   fails the inherited `NoLostUpdate`. Because `AtomicPublish` is held out of the
+   CI budget (see CI time budget), run these locally rather than via
+   `make tla-check`; they are not yet part of the CI-verified recipe set.
+
 These mutations are run manually during development to validate TLC's
 bug-detection capability. The mutated files are not committed. Recipes 5–10
 run TLC directly on their amendment's CI config (`Retention_CI.cfg` /
-`Snapshot_CI.cfg`); mutating one amendment cannot affect the other specs, so the
-full `make tla-check` adds nothing.
+`Snapshot_CI.cfg`); recipe 11 runs on `AtomicPublish.cfg`. Mutating one amendment
+cannot affect the other specs, so the full `make tla-check` adds nothing.
