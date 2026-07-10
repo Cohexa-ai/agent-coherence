@@ -1,0 +1,288 @@
+# Copyright (c) 2026 agent-coherence contributors.
+# The Coherence Protocol for AI Agents
+"""CoherentVolume.atomic_publish — SB-18 all-or-nothing multi-artifact publish.
+
+Real-coordinator two-writer tests (the ``_pair`` + fixed-stale-buffer shape from
+test_coherent_volume.py). The load-bearing property: either every member of the
+write-set lands or none does, and a torn intermediate is never on disk.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from ccs.adapters.claude_code.lifecycle import (
+    LifecycleConfig,
+    stop_coordinator,
+)
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.core.exceptions import CasVersionConflict, StaleView
+
+
+@pytest.fixture
+def fast_cfg() -> LifecycleConfig:
+    return LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0.1,
+        notice_evict_max_age_sec=1.0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.05,
+        connect_retry_attempts=10,
+        connect_retry_interval_sec=0.05,
+    )
+
+
+def _seed(tmp_path: Path, rel: str, content: bytes) -> Path:
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
+def _pair(tmp_path: Path, cfg: LifecycleConfig) -> tuple[CoherentVolume, CoherentVolume]:
+    vol_a = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
+    vol_b = CoherentVolume(tmp_path, managed=("data/**",), config=cfg)
+    return vol_a, vol_b
+
+
+# ----------------------------------------------------------------------
+# Happy path — every member lands atomically, versions returned
+# ----------------------------------------------------------------------
+
+
+def test_multi_publish_writes_every_member(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        versions = vol_a.atomic_publish(
+            [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+        )
+        assert versions == {"data/a.txt": 2, "data/b.txt": 2}
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v2"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_single_publish_uses_standalone_and_returns_version(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A size-1 write-set takes the standalone CAS path (no session) and still
+    returns the new version keyed by path."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        versions = vol_a.atomic_publish([("data/a.txt", 1, b"a-v2")])
+        assert versions == {"data/a.txt": 2}
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_str_and_bytes_content_both_publish(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.atomic_publish([("data/a.txt", 1, "a-v2"), ("data/b.txt", 1, b"b-v2")])
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v2"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# All-or-nothing — one moved member holds the WHOLE publish, zero mutation
+# ----------------------------------------------------------------------
+
+
+def test_one_moved_member_holds_whole_batch_zero_files_written(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A peer moves ONE member before the publish opens its session → the caller's
+    view is stale at capture → the WHOLE publish is held and NEITHER file is
+    written (the batch fixed-stale-buffer shape)."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_b.write_cas_at("data/b.txt", 1, b"b-peer")  # b -> v2, a stays v1
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-peer"
+
+        with pytest.raises(CasVersionConflict):
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # ALL-OR-NOTHING: the passing member a was NOT written; b holds the peer's.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-peer"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_peer_commit_inside_capture_commit_window_is_held(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The widened-window race: a peer commits a member AFTER the cut is pinned but
+    BEFORE session/commit_all. The pinned comparand version-mismatches at the
+    registry → HELD (StaleView), and NO file is written."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        real_post = vol_a._post
+
+        def racing_post(endpoint_path: str, payload: dict):
+            # Land a peer commit on b.txt in the window between begin (cut pinned)
+            # and commit_all — the exact race the session path is exposed to.
+            if endpoint_path == "/session/commit_all":
+                vol_b.write_cas_at("data/b.txt", 1, b"b-peer-raced")
+            return real_post(endpoint_path, payload)
+
+        vol_a._post = racing_post
+        with pytest.raises(StaleView):
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # All-or-nothing: neither file written; b holds the peer's raced bytes.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-peer-raced"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_single_publish_stale_raises_cas_conflict(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_b.write_cas_at("data/a.txt", 1, b"a-peer")  # a -> v2
+        with pytest.raises(CasVersionConflict):
+            vol_a.atomic_publish([("data/a.txt", 1, b"a-v2")])
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-peer"  # not clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# Recovery — reacquire + re-read fresh versions, then re-publish succeeds
+# ----------------------------------------------------------------------
+
+
+def test_publish_recovers_after_hold(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_b.write_cas_at("data/b.txt", 1, b"b-peer")  # b -> v2
+        with pytest.raises(CasVersionConflict):
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # Recover: re-read the fresh versions, then re-publish against them.
+        _a_bytes, a_ver = vol_a.read_with_version("data/a.txt")
+        _b_bytes, b_ver = vol_a.read_with_version("data/b.txt")
+        versions = vol_a.atomic_publish(
+            [("data/a.txt", a_ver, b"a-final"), ("data/b.txt", b_ver, b"b-final")]
+        )
+        assert versions == {"data/a.txt": a_ver + 1, "data/b.txt": b_ver + 1}
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-final"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-final"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# Input validation — fail loud before any coordinator I/O
+# ----------------------------------------------------------------------
+
+
+def test_empty_write_set_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(ValueError):
+            vol.atomic_publish([])
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_duplicate_path_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(ValueError):
+            vol.atomic_publish([("data/a.txt", 1, b"x"), ("data/a.txt", 1, b"y")])
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_same_bytes_member_is_still_written_and_bumped(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A member whose new bytes equal its current bytes is NOT skipped — it is
+    still written and its version bumped, so disk never diverges from the
+    coordinator's recorded hash."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        versions = vol_a.atomic_publish(
+            [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v1")]  # b unchanged
+        )
+        assert versions == {"data/a.txt": 2, "data/b.txt": 2}
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_injected_error_mid_publish_releases_the_op_guard(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A non-OSError raised mid-publish propagates but leaves NO orphan: the
+    single-op guard is released, so the instance is not wedged for the next op."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        real_write = vol_a._atomic_write
+        calls = {"n": 0}
+
+        def boom(abs_path, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("injected mid-publish failure")
+            return real_write(abs_path, data)
+
+        vol_a._atomic_write = boom
+        with pytest.raises(RuntimeError):
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # Guard released despite the raise — a later op does not trip the guard.
+        vol_a._atomic_write = real_write
+        _bytes, version = vol_a.read_with_version("data/a.txt")
+        assert isinstance(version, int)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_multi_non_utf8_member_raises_before_io(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(ValueError):
+            vol.atomic_publish(
+                [("data/a.txt", 1, b"ok"), ("data/b.txt", 1, b"\xff\xfe")]
+            )
+        # Failed before any coordinator I/O → nothing on disk changed.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)

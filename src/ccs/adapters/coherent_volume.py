@@ -41,7 +41,7 @@ import threading
 import urllib.error
 import uuid
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -111,6 +111,15 @@ MAX_CAS_REACQUIRES = 8
 _STALE_WRITE_DENY_REASON = (
     "stale write blocked: the file on disk changed since this view was read "
     "(out-of-band edit). reacquire() and rebuild the write from the fresh bytes."
+)
+
+# SB-18 atomic-publish HELD message. Byte-stable (no path/version interpolation)
+# so a model's retry loop sees identical text each attempt (KTD-P). The specific
+# member drift travels on StaleView.expected_version / .current_version instead.
+_PUBLISH_HELD_REASON = (
+    "atomic publish held: a peer committed a member of this write-set since it "
+    "was read, so the batch was NOT published (all-or-nothing — no file was "
+    "written). reacquire() and rebuild the publish from the fresh versions."
 )
 
 
@@ -1070,7 +1079,7 @@ class CoherentVolume:
 
     def _write_cas_at_impl(
         self, path: str | os.PathLike[str], expected_version: int, new_content: bytes
-    ) -> None:
+    ) -> int:
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         if self._endpoint is None:
@@ -1114,7 +1123,9 @@ class CoherentVolume:
         if outcome == "win":
             self._atomic_write(abs_path, new_content)  # confirmed → persist
             self._record_own_write(rel, new_hash)
-            return
+            # The version-CAS committed against `expected_version`, so the new
+            # version is deterministically expected+1 (atomic_publish surfaces it).
+            return expected_version + 1
         if outcome == "conflict":
             # A peer won the version between our read and the CAS → typed conflict.
             raise CasVersionConflict(
@@ -1124,6 +1135,200 @@ class CoherentVolume:
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
             raise CommitUnconfirmed(self._deny_reason(resp))
         raise CoherenceError(self._deny_reason(resp))
+
+    def atomic_publish(
+        self,
+        writes: Sequence[tuple[str | os.PathLike[str], int, bytes | bytearray | str]],
+    ) -> dict[str, int]:
+        """Publish a SET of artifacts ALL-OR-NOTHING (SB-18 batch OCC).
+
+        Commit every ``(path, expected_version, content)`` as ONE unit IFF every
+        member is still at its ``expected_version``; otherwise NOTHING commits and
+        NO file is written. The multi-artifact generalization of
+        :meth:`write_cas_at` — the primitive for an agent that merged a coherent
+        SET of files against specific versions and must land them together (a plan
+        + its manifest; a config split across files) with no torn intermediate
+        state ever observable. Returns ``{path: new_version}`` for every member on
+        success.
+
+        Outcomes (a partial publish is never a reachable state):
+          - every member at its ``expected_version`` → all files written
+            atomically, new versions returned.
+          - a member is already behind at capture →
+            :class:`~ccs.core.exceptions.CasVersionConflict` (the caller's view
+            was stale before the publish began); NO file written.
+          - a peer commits a member in the capture→commit window →
+            :class:`~ccs.core.exceptions.StaleView` (HELD; recover via
+            :meth:`reacquire` + re-decide + retry); NO file written.
+
+        **Sizing.** A single-member publish takes the standalone CAS path
+        (:meth:`write_cas_at`'s primitive). A multi-member publish opens a
+        consistent snapshot session over the write-set so the comparands are
+        pinned at ONE linearization point (fractured-read-safe — no member is read
+        across a peer commit), then commits them atomically. The session path adds
+        a session-open round-trip, so its capture→commit window is WIDER than a
+        single CAS's — a lost race there is HELD (``StaleView``), never a silent
+        torn publish. A multi-member set requires UTF-8 text content (the session
+        commit wire is text); a single-member publish accepts arbitrary bytes.
+
+        **Single-host, cooperative** (like the rest of the volume): recovery from
+        a HELD publish is ``reacquire`` + re-read + retry; the caller must write
+        from freshly re-read bytes, never a buffer computed before the hold.
+        """
+        entries = self._normalize_publish_writes(writes)
+        with self._single_op_guard():
+            if len(entries) == 1:
+                abs_path, rel, expected_version, disk_bytes = entries[0]
+                new_version = self._write_cas_at_impl(rel, expected_version, disk_bytes)
+                return {rel: new_version}
+            return self._atomic_publish_session_impl(entries)
+
+    def _normalize_publish_writes(
+        self,
+        writes: Sequence[tuple[str | os.PathLike[str], int, bytes | bytearray | str]],
+    ) -> list[tuple[Path, str, int, bytes]]:
+        """Validate + resolve the write-set to ``[(abs_path, rel, expected_version,
+        disk_bytes), ...]``. Rejects an empty set, a bad content type, or a
+        DUPLICATE path — a duplicate would silently collapse a member out of an
+        all-or-nothing batch, so it fails loud before any coordinator I/O."""
+        if not writes:
+            raise ValueError("atomic_publish requires a non-empty write-set")
+        resolved: list[tuple[Path, str, int, bytes]] = []
+        seen: set[str] = set()
+        for path, expected_version, content in writes:
+            if isinstance(content, str):
+                disk_bytes = content.encode("utf-8")
+            elif isinstance(content, (bytes, bytearray)):
+                disk_bytes = bytes(content)
+            else:
+                raise TypeError(
+                    f"atomic_publish content for {path!r} must be bytes or str, "
+                    f"got {type(content).__name__}"
+                )
+            abs_path, rel = self._to_relative(path)
+            if rel in seen:
+                raise ValueError(f"atomic_publish write-set has a duplicate path: {rel}")
+            seen.add(rel)
+            resolved.append((abs_path, rel, int(expected_version), disk_bytes))
+        return resolved
+
+    def _atomic_publish_session_impl(
+        self, entries: list[tuple[Path, str, int, bytes]]
+    ) -> dict[str, int]:
+        """Multi-member publish via a consistent snapshot session (size > 1).
+
+        Re-mint (split-comparand-safe), pin the write-set at ONE point via
+        ``/session/begin``, verify each pinned version still equals the caller's
+        ``expected_version`` (else the view was stale before the publish →
+        ``CasVersionConflict``, nothing committed), then ``/session/commit_all``
+        atomically. On a confirmed WIN write EVERY file (no same-bytes skip, so
+        disk can't diverge from the coordinator's recorded hash); on a HELD
+        conflict (a peer raced the window) write NONE and raise ``StaleView``.
+        """
+        self._ensure_attached()
+        if self._endpoint is None:
+            raise CoherenceError(
+                "cannot atomic_publish: coordinator endpoint unavailable (fail-closed)"
+            )
+        # Decode to the text wire BEFORE any side effect, so a non-UTF-8 member
+        # fails with zero coordinator I/O rather than mid-session.
+        try:
+            wire = [
+                {"path": rel, "content": disk_bytes.decode("utf-8")}
+                for _abs, rel, _ev, disk_bytes in entries
+            ]
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "atomic_publish of a multi-file set requires UTF-8 text content "
+                "(the snapshot-session commit wire is text); a non-UTF-8 member "
+                f"cannot be batch-published ({exc})."
+            ) from None
+
+        # Re-mint first: pin the cut under a fresh, non-INVALID identity — never
+        # reacquire()-then-trust (KTD-LU split-comparand hole).
+        self._remint()
+        begin = self._post(
+            "/session/begin",
+            {"session_id": self._session_id, "read_set": [rel for _a, rel, _e, _b in entries]},
+        )
+        if begin is None:
+            raise CommitUnconfirmed(
+                "atomic_publish could not open a snapshot session (coordinator "
+                "transport failed); nothing was published. retry."
+            )
+        if begin.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout opening the publish session"
+            )
+        if not begin.get("ok"):
+            raise CoherenceError(
+                f"atomic_publish could not pin the write-set: {self._deny_reason(begin)}"
+            )
+        cut = begin.get("cut") or {}
+        # Fractured-read-safe staleness gate: every member's pinned version must
+        # still equal the caller's expected_version. A mismatch means a peer moved
+        # that member before the session opened → the caller's view is stale; hold
+        # the WHOLE publish (nothing committed, no file written).
+        for _abs, rel, expected_version, _b in entries:
+            pinned = cut.get(rel)
+            if pinned != expected_version:
+                raise CasVersionConflict(
+                    rel, expected_version, pinned if isinstance(pinned, int) else -1
+                )
+
+        commit = self._post(
+            "/session/commit_all",
+            {
+                "session_id": self._session_id,
+                "session_token": begin.get("session_token"),
+                "writes": wire,
+            },
+        )
+        if commit is None:
+            raise CommitUnconfirmed(
+                "atomic_publish commit could not be confirmed (coordinator transport "
+                "failed mid-commit); nothing landed. re-read and retry."
+            )
+        if commit.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout committing the publish"
+            )
+        if commit.get("ok") is True:
+            versions = commit.get("versions") or {}
+            # Confirmed WIN: materialize EVERY member (no same-bytes skip → disk
+            # never diverges from the coordinator's recorded hash).
+            written: dict[str, int] = {}
+            for abs_path, rel, expected_version, disk_bytes in entries:
+                self._atomic_write(abs_path, disk_bytes)
+                self._record_own_write(rel, self._sha256_bytes(disk_bytes))
+                resolved_version = versions.get(rel)
+                written[rel] = (
+                    resolved_version
+                    if isinstance(resolved_version, int)
+                    else expected_version + 1
+                )
+            return written
+        # HELD: a peer raced the capture→commit window on ≥1 member. All-or-nothing
+        # → NOTHING was committed and NO file is written; recover via reacquire.
+        raise self._publish_hold(commit, entries)
+
+    def _publish_hold(
+        self, commit: dict, entries: list[tuple[Path, str, int, bytes]]
+    ) -> StaleView:
+        """Build the ``StaleView`` for a HELD ``session/commit_all`` — carrying the
+        first conflicting member's captured-vs-current drift (like ``gate()``) so a
+        generic ``except StaleView`` reads ``expected_version`` / ``current_version``
+        uniformly. Nothing is mutated on this path."""
+        per_artifact = commit.get("per_artifact")
+        expected_by_rel = {rel: ev for _a, rel, ev, _b in entries}
+        held = StaleView(_PUBLISH_HELD_REASON)
+        if isinstance(per_artifact, dict) and per_artifact:
+            rel, detail = next(iter(per_artifact.items()))
+            held.expected_version = expected_by_rel.get(rel)
+            if isinstance(detail, dict):
+                current = detail.get("current_version")
+                held.current_version = current if isinstance(current, int) else None
+        return held
 
     # --- coordinator I/O helpers --------------------------------------------
 
