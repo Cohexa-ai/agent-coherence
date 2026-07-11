@@ -78,6 +78,7 @@ from ccs.core.states import MESIState
 from ccs.core.types import (
     ConflictDetail,
     DataPlaneDeferredRead,
+    MultiCommitConflict,
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
@@ -2916,6 +2917,150 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
+def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /session/commit_all — atomic multi-artifact publish against the cut.
+
+    Request: ``{session_id, session_token, writes: [{path, content}, ...]}``.
+
+    The batch analog of ``/session/commit``: all-or-nothing over the write-set —
+    either every member advances or none do, and a torn batch is never
+    observable. Same R9 boundary lock: the request carries ONLY ``session_token``
+    + a list of ``{path, content}`` — NO client-supplied cut / expected_version /
+    owner. Each member's ``expected_version`` is read SERVER-SIDE from the pinned
+    cut (``service.session_commit_all`` sources it from ``cut[artifact_id]``), so
+    a client cannot drive any member's CAS with a forged comparand. The caller is
+    derived from the authenticated ``session_id``.
+
+    Responses (the batch generalization of ``/session/commit``):
+      - WIN → ``{ok: true, versions: {path: N+1, ...}, coordinator_epoch}``
+      - retry-eligible batch conflict (HELD, nothing mutated) → ``{ok: false,
+        reason: "conflict", per_artifact: {path: {reason, current_version}}}``
+      - typed session rejection → ``{ok: false, reason, coordinator_epoch}``
+      - corruption / foreign caller / dead session → ``{ok: false, reason}``
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    session_token = body.get("session_token")
+    writes = body.get("writes")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(session_token, str) or not session_token:
+        req._json(400, {"error": "missing or invalid session_token"})
+        return
+    if not isinstance(writes, list) or not writes:
+        req._json(400, {"error": "writes must be a non-empty list of {path, content}"})
+        return
+    if len(writes) > MAX_SESSION_READ_SET_PATHS:
+        req._json(400, {"error": f"writes exceeds {MAX_SESSION_READ_SET_PATHS} paths"})
+        return
+    paths: list[str] = []
+    contents: list[str] = []
+    for item in writes:
+        if not isinstance(item, dict):
+            req._json(400, {"error": "each write must be a {path, content} object"})
+            return
+        path = item.get("path", "")
+        content = item.get("content")
+        path_err = validate_path(path)
+        if path_err:
+            req._json(400, {"error": path_err})
+            return
+        if not isinstance(content, str):
+            req._json(400, {"error": "content must be a string"})
+            return
+        paths.append(path)
+        contents.append(content)
+    # A duplicate path would collapse in the id-keyed map — reject it up front so
+    # a silently-dropped member can't turn an all-or-nothing batch into a partial.
+    if len(set(paths)) != len(paths):
+        req._json(400, {"error": "writes contains duplicate paths"})
+        return
+
+    caller = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        # Resolve every path -> artifact id. An unknown path can be in no cut, so
+        # the WHOLE batch is refused (all-or-nothing) — mirror session_commit's
+        # not-in-cut signal rather than seeding a row a commit can't source.
+        path_by_id: dict[UUID, str] = {}
+        writes_map: dict[UUID, tuple[str, int | None]] = {}
+        for path, content in zip(paths, contents):
+            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            if artifact_id is None:
+                return {"ok": False, "reason": "artifact_not_in_cut"}
+            path_by_id[artifact_id] = path
+            writes_map[artifact_id] = (content, None)
+        # Pinned bases read BEFORE the commit for the content-free WIN audit.
+        cut = coordinator.registry.get_session_cut(session_token)
+        try:
+            result = coordinator.service.session_commit_all(
+                session_token, writes_map, caller=caller, issued_at_tick=now,
+                abort=abort,
+            )
+        except SessionInvalidated as exc:
+            _session_audit.append_session_invalidate(
+                coordinator.coordinator_root,
+                session_token=session_token, reason=exc.reason,
+            )
+            return {"ok": False, "reason": exc.reason}
+        except CoherenceError as exc:
+            # Corruption (a member's expected_version > current) — non-retryable.
+            return {"ok": False, "reason": str(exc)}
+        if isinstance(result, MultiCommitConflict):
+            # HELD: nothing mutated. Byte-stable typed per-member conflicts the
+            # client maps to "open a new session + re-read + retry".
+            return {
+                "ok": False,
+                "reason": "conflict",
+                "per_artifact": {
+                    path_by_id[aid]: {
+                        "reason": detail.reason,
+                        "current_version": detail.current_version,
+                    }
+                    for aid, detail in result.per_artifact.items()
+                },
+            }
+        if isinstance(result, SessionCommitRejection):
+            if result.reason == SESSION_INVALIDATED_REASON:
+                _session_audit.append_session_invalidate(
+                    coordinator.coordinator_root,
+                    session_token=session_token, reason=result.reason,
+                )
+            return {
+                "ok": False,
+                "reason": result.reason,
+                "coordinator_epoch": result.coordinator_epoch,
+            }
+        updated, _signals = result
+        # Content-free per-member commit audit (R10a): ids + versions, no body.
+        versions_by_path: dict[str, int] = {}
+        for aid, new_version in updated.versions.items():
+            pinned = cut.get(aid) if cut else None
+            _session_audit.append_session_commit(
+                coordinator.coordinator_root,
+                session_token=session_token,
+                artifact_id=aid,
+                pinned_version=pinned if pinned is not None else new_version - 1,
+                committed_version=new_version,
+            )
+            versions_by_path[path_by_id[aid]] = new_version
+        return {
+            "ok": True,
+            "versions": versions_by_path,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    # Fail-closed degrade: a timed-out batch commit must NOT read as success —
+    # same posture as /session/commit (a degraded commit is a definite reject).
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
+
+
 def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /session/heartbeat — refresh a session's heartbeat lease (R4).
 
@@ -3290,6 +3435,7 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/begin"): _handle_session_begin,
     ("POST", "/session/read"): _handle_session_read,
     ("POST", "/session/commit"): _handle_session_commit,
+    ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
@@ -3317,6 +3463,9 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # opens a fresh session + re-reads + re-commits after the restart. (begin /
     # read / heartbeat are non-mutating and stay out of this set.)
     ("POST", "/session/commit"),
+    # session.commit_all is the batch OCC write — same strand hazard as
+    # /session/commit, multiplied across the write-set. Reject it draining.
+    ("POST", "/session/commit_all"),
 }
 
 

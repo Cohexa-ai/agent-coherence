@@ -404,7 +404,7 @@ exceed `lease_ttl_ticks`. Equal or smaller values raise `ValueError` at startup.
 With `enabled=False` (the opt-out — the v0.9.0 default is `enabled=True`),
 `heartbeat()` and `recover()` are silent no-ops and the sweep never runs.
 State-transition log output is then byte-identical to a build without crash
-recovery (R5). Note the inversion: omitting the `crash_recovery=` argument no
+recovery. Note the inversion: omitting the `crash_recovery=` argument no
 longer reproduces that output — pass `CrashRecoveryConfig(enabled=False)`
 explicitly to get it.
 
@@ -562,6 +562,43 @@ silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
 content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
+
+### Atomic multi-file publish: `atomic_publish`
+
+`write_cas_at` lands one file. When an agent edits a *set* of files that must stay
+consistent — a plan and its manifest, a config split across files —
+`atomic_publish` lands them **all-or-nothing**:
+
+```python
+versions = vol.atomic_publish([
+    ("proj/plan.md",     plan_version,     new_plan_bytes),
+    ("proj/manifest.md", manifest_version, new_manifest_bytes),
+])   # -> {"proj/plan.md": 2, "proj/manifest.md": 3}
+```
+
+Each member commits only if it is still at the `expected_version` you pass; if
+every member matches, the batch **commits at the coordinator as one unit** and
+every file is then materialized, and if any member moved, the **whole** publish is
+held (`StaleView` / `CasVersionConflict`) with **nothing committed and no file
+written** — a torn *commit* is never a reachable state. A single-member call takes
+the direct CAS path; a multi-member call opens a
+[snapshot session](#multi-artifact-snapshot-sessions) so the versions it checks
+are captured at one point (no member read across a peer commit), which adds a
+small capture→commit window — a peer winning it holds the publish rather than
+tearing it. Recover the same way as a denied write: `reacquire()`, re-read the
+fresh versions, and re-publish from them. A single-member publish accepts
+arbitrary bytes; a multi-member publish requires UTF-8 text content.
+
+The all-or-nothing guarantee is at the **coordinator commit**. Disk materialization
+runs after it and is best-effort: every file is staged to a temp then renamed, so a
+disk fault fails before any rename (disk stays uniformly old) and a rename failing
+partway raises a typed `PublishMaterializationError` naming exactly which files
+landed — never a bare error implying nothing published. A crash between renames can
+still tear the on-disk set (no POSIX multi-file atomic rename exists); on that error
+the coordinator is ahead of disk, so re-read each member at its current version and
+re-materialize (don't retry the publish — it would version-mismatch). Run it:
+`python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
+`--baseline` to see the file-by-file torn pair it prevents.
 
 ### Foreign-edit guards
 

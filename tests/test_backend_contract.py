@@ -68,12 +68,12 @@ def test_member_map_covers_exactly_the_protocol_surface() -> None:
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_48_members() -> None:
-    """Pin the count explicitly: 34 base methods + 13 extended methods + 1 base
-    property = 48. Guards against a same-size add+remove that would slip past the
-    set-equality check on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 48
-    assert len(EXPECTED_MEMBERS) == 48
+def test_member_map_has_exactly_49_members() -> None:
+    """Pin the count explicitly: 35 base methods (SB-18 ``commit_all`` added) + 13
+    extended methods + 1 base property = 49. Guards against a same-size add+remove
+    that would slip past the set-equality check on cardinality alone."""
+    assert len(MEMBER_CLASSIFICATION) == 49
+    assert len(EXPECTED_MEMBERS) == 49
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:
@@ -115,6 +115,7 @@ def test_the_atomic_class_boundary_members_are_classified_atomic() -> None:
     READ_ONLY/INDEPENDENT fails."""
     expected_atomic = {
         "commit_cas",
+        "commit_all",
         "set_artifact_and_content",
         "set_agent_state",
         "set_agent_transient",
