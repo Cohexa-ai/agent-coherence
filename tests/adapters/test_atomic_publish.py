@@ -17,7 +17,12 @@ from ccs.adapters.claude_code.lifecycle import (
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.core.exceptions import CasVersionConflict, StaleView
+from ccs.core.exceptions import (
+    CasVersionConflict,
+    CoherenceError,
+    PublishMaterializationError,
+    StaleView,
+)
 
 
 @pytest.fixture
@@ -239,32 +244,76 @@ def test_same_bytes_member_is_still_written_and_bumped(
         stop_coordinator(tmp_path)
 
 
-def test_injected_error_mid_publish_releases_the_op_guard(
+def test_replace_failure_on_second_member_is_typed_and_names_landed(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """A non-OSError raised mid-publish propagates but leaves NO orphan: the
-    single-op guard is released, so the instance is not wedged for the next op."""
+    """A disk fault on the SECOND member's os.replace (after the coordinator has
+    already committed the whole batch) raises a TYPED PublishMaterializationError
+    naming exactly which members landed vs not — never a bare OSError implying
+    nothing published — and the op guard is released."""
     _seed(tmp_path, "data/a.txt", b"a-v1")
     _seed(tmp_path, "data/b.txt", b"b-v1")
     vol_a, _vol_b = _pair(tmp_path, fast_cfg)
     try:
-        real_write = vol_a._atomic_write
+        real_replace = vol_a._replace_tmp
+        calls = {"n": 0}
+
+        def boom(tmp, abs_path):
+            calls["n"] += 1
+            if calls["n"] == 2:  # a lands, b's rename faults
+                raise OSError("injected disk-full on the second rename")
+            return real_replace(tmp, abs_path)
+
+        vol_a._replace_tmp = boom
+        with pytest.raises(PublishMaterializationError) as exc:
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # The typed error names the torn set: a landed, b did not.
+        assert exc.value.landed == ("data/a.txt",)
+        assert exc.value.not_landed == ("data/b.txt",)
+        # On-disk state matches: a has the new bytes, b still holds its old bytes.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v2"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+        # Guard released despite the raise — a later op is not wedged.
+        vol_a._replace_tmp = real_replace
+        _bytes, version = vol_a.read_with_version("data/a.txt")
+        assert isinstance(version, int)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_staging_failure_leaves_disk_uniformly_old(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A disk fault while STAGING a later member (before any os.replace) leaves NO
+    member replaced — disk is uniformly old (coordinator ahead of disk, not torn)
+    — and raises PublishMaterializationError with landed empty."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        real_stage = vol_a._stage_tmp
         calls = {"n": 0}
 
         def boom(abs_path, data):
             calls["n"] += 1
-            if calls["n"] == 1:
-                raise RuntimeError("injected mid-publish failure")
-            return real_write(abs_path, data)
+            if calls["n"] == 2:  # a stages fine, b's staging faults
+                raise OSError("injected disk-full while staging the second member")
+            return real_stage(abs_path, data)
 
-        vol_a._atomic_write = boom
-        with pytest.raises(RuntimeError):
+        vol_a._stage_tmp = boom
+        with pytest.raises(PublishMaterializationError) as exc:
             vol_a.atomic_publish(
                 [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
             )
-        # Guard released despite the raise — a later op does not trip the guard.
-        vol_a._atomic_write = real_write
-        _bytes, version = vol_a.read_with_version("data/a.txt")
+        assert exc.value.landed == ()
+        assert set(exc.value.not_landed) == {"data/a.txt", "data/b.txt"}
+        # NEITHER file replaced — both hold their old bytes.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+        vol_a._stage_tmp = real_stage
+        _bytes, version = vol_a.read_with_version("data/b.txt")
         assert isinstance(version, int)
     finally:
         stop_coordinator(tmp_path)
@@ -282,6 +331,38 @@ def test_multi_non_utf8_member_raises_before_io(
                 [("data/a.txt", 1, b"ok"), ("data/b.txt", 1, b"\xff\xfe")]
             )
         # Failed before any coordinator I/O → nothing on disk changed.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_corruption_reason_is_non_retryable_not_staleview(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A corruption reason from commit_all maps to a NON-retryable CoherenceError,
+    NOT a retryable StaleView (mirrors the size-1 CAS path). Corruption is
+    unreachable via the pinned cut, so the wire body is injected directly to
+    exercise the client's error-typing dispatch (defense-in-depth)."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol_a, _vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        real_post = vol_a._post
+
+        def synth(endpoint_path, payload):
+            if endpoint_path == "/session/commit_all":
+                return {"ok": False, "reason": "commit_all_corruption agent=x current_version=9"}
+            return real_post(endpoint_path, payload)
+
+        vol_a._post = synth
+        with pytest.raises(CoherenceError) as exc:
+            vol_a.atomic_publish(
+                [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+            )
+        # Non-retryable: the plain CoherenceError, never the retryable StaleView.
+        assert not isinstance(exc.value, StaleView)
+        # Nothing written on disk.
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
     finally:

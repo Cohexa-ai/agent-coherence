@@ -784,6 +784,13 @@ class ArtifactRegistry:
                     dict(record.state_by_agent),
                     dict(record.granted_at_tick_by_agent),
                     record.last_writer,
+                    # Retention history is mutated in-place by _capture_version
+                    # (add + GC-pop); snapshot it too so a mid-apply raise restores
+                    # it, matching sqlite's ROLLBACK (which undoes the version-
+                    # history table). Cheap dict copies; retention is the only
+                    # other per-record state the apply touches.
+                    dict(record.version_history),
+                    dict(record.version_captured_at),
                 )
                 for _art, record, *_rest in staged
             ]
@@ -807,12 +814,14 @@ class ArtifactRegistry:
                     versions[art_id] = next_version
             except Exception:
                 # Total apply: restore every mutated record, roll back the logs.
-                for (rec, art_obj, content, state_by, granted, last_w) in snapshots:
+                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at) in snapshots:
                     rec.artifact = art_obj
                     rec.content = content
                     rec.state_by_agent = state_by
                     rec.granted_at_tick_by_agent = granted
                     rec.last_writer = last_w
+                    rec.version_history = ver_hist
+                    rec.version_captured_at = ver_at
                 self._seq -= emitted_here
                 raise
 

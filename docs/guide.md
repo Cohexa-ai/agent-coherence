@@ -577,16 +577,26 @@ versions = vol.atomic_publish([
 ```
 
 Each member commits only if it is still at the `expected_version` you pass; if
-every member matches, all versions advance and every file is written, and if any
-member moved, the **whole** publish is held (`StaleView` / `CasVersionConflict`)
-with **no file written** — a torn half-published set is never a reachable state. A
-single-member call takes the direct CAS path; a multi-member call opens a
+every member matches, the batch **commits at the coordinator as one unit** and
+every file is then materialized, and if any member moved, the **whole** publish is
+held (`StaleView` / `CasVersionConflict`) with **nothing committed and no file
+written** — a torn *commit* is never a reachable state. A single-member call takes
+the direct CAS path; a multi-member call opens a
 [snapshot session](#multi-artifact-snapshot-sessions) so the versions it checks
 are captured at one point (no member read across a peer commit), which adds a
 small capture→commit window — a peer winning it holds the publish rather than
 tearing it. Recover the same way as a denied write: `reacquire()`, re-read the
 fresh versions, and re-publish from them. A single-member publish accepts
-arbitrary bytes; a multi-member publish requires UTF-8 text content. Run it:
+arbitrary bytes; a multi-member publish requires UTF-8 text content.
+
+The all-or-nothing guarantee is at the **coordinator commit**. Disk materialization
+runs after it and is best-effort: every file is staged to a temp then renamed, so a
+disk fault fails before any rename (disk stays uniformly old) and a rename failing
+partway raises a typed `PublishMaterializationError` naming exactly which files
+landed — never a bare error implying nothing published. A crash between renames can
+still tear the on-disk set (no POSIX multi-file atomic rename exists); on that error
+the coordinator is ahead of disk, so re-read each member at its current version and
+re-materialize (don't retry the publish — it would version-mismatch). Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 

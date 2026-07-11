@@ -580,6 +580,36 @@ class CommitUnconfirmed(CoherenceError):
     reason = COMMIT_UNCONFIRMED_REASON
 
 
+class PublishMaterializationError(CoherenceError):
+    """An ``atomic_publish`` batch COMMITTED at the coordinator but then failed to
+    materialize to disk. The coordinator has already advanced every member's
+    version and content hash — this is NOT retryable as a fresh publish (a retry
+    would version-mismatch). ``landed`` names the members whose new bytes reached
+    disk; ``not_landed`` names the members still holding their old bytes. When
+    ``landed`` is non-empty the on-disk set is TORN relative to the coordinator;
+    when it is empty the disk is uniformly stale (coordinator ahead of disk).
+    Recover by re-reading each member at the coordinator's current version and
+    re-materializing from those bytes (never from bytes computed before the
+    publish)."""
+
+    def __init__(
+        self,
+        landed: "tuple[str, ...]",
+        not_landed: "tuple[str, ...]",
+        cause: BaseException | None = None,
+    ) -> None:
+        detail = f" ({cause})" if cause is not None else ""
+        super().__init__(
+            f"atomic_publish committed at the coordinator but disk materialization "
+            f"failed{detail}: landed={list(landed)} not_landed={list(not_landed)}. "
+            "The coordinator is ahead of disk — re-read each member at its current "
+            "version and re-materialize; do NOT retry the publish (it would "
+            "version-mismatch)."
+        )
+        self.landed = landed
+        self.not_landed = not_landed
+
+
 class InternalConcurrencyError(CoherenceError):
     """The single-op guard fired (MCP-C Unit 1): one CoherentVolume instance was
     used concurrently from another thread — a SERVER misuse bug (the MCP server
