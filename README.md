@@ -4,10 +4,10 @@
 
 Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One reads it and works; meanwhile a peer commits a newer version; the first writes back anyway. Last write wins, the peer's work is silently gone, nothing errors, and every downstream decision builds on the wrong version. `agent-coherence` turns that silent clobber into a loud, typed refusal: MESI-style ownership and invalidation over shared artifacts, optimistic commit-CAS for concurrent writers, and a read-generation fence for crash-reclaimed ones — a stale write is denied or returned as a retryable conflict, never silently applied. Same library, same protocol, across LangGraph, CrewAI, AutoGen, the OpenAI Agents SDK, plain files shared across processes (`CoherentVolume`), any MCP client (the `stale-write-guard-fs` server, via the `mcp` extra), and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
 
-[![CI](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml/badge.svg)](https://github.com/hipvlady/agent-coherence/actions/workflows/ci.yml)
+[![CI](https://github.com/Cohexa-ai/agent-coherence/actions/workflows/ci.yml/badge.svg)](https://github.com/Cohexa-ai/agent-coherence/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agent-coherence)](https://pypi.org/project/agent-coherence/)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.15183-b31b1b)](https://arxiv.org/abs/2603.15183)
-[![Discussions](https://img.shields.io/github/discussions/hipvlady/agent-coherence)](https://github.com/hipvlady/agent-coherence/discussions)
+[![Discussions](https://img.shields.io/github/discussions/Cohexa-ai/agent-coherence)](https://github.com/Cohexa-ai/agent-coherence/discussions)
 
 <!-- MCP Registry — PyPI ownership tag for the stale-write-guard-fs server -->
 `mcp-name: io.github.hipvlady/stale-write-guard-fs`
@@ -56,7 +56,7 @@ Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` run
 | **Torn multi-artifact read (read-skew)** — an agent reads several artifacts one by one while a peer commits in between; each read was individually current, but the *combination* never coexisted | session reads serve from a **pinned consistent cut**; commits validate against the pinned base; a lapsed session **fails closed** with a typed rejection, never a silent fall-through to live state | [multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) | `NoReadSkewWithinCut`, `PinAlwaysRetained` |
 | **Dead owner blocks the fleet** — a crashed agent holds EXCLUSIVE forever | the heartbeat/TTL sweep reclaims the grant (on by default) | crash-recovery sweep | sweep invariants I3–I6 |
 
-**Scope, honestly:** the guarantees hold for writers that go through the coordinator, under a single coordinator (one host). Concurrent same-key writers on one host are covered; cross-host fencing is on the roadmap, demand-gated — if you need it, [open an issue](https://github.com/hipvlady/agent-coherence/issues/new). Edits that *bypass* the coordinator entirely (a human in an editor, a formatter, a regenerating script) are caught at the workspace boundary by content-hash checks — the [foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) below, enforced by tests rather than TLA+. Specs, the invariant ↔ implementation map, and the mutant recipes live in [`formal/tla/`](formal/tla/README.md).
+**Scope, honestly:** the guarantees hold for writers that go through the coordinator, under a single coordinator (one host). Concurrent same-key writers on one host are covered; cross-host fencing is on the roadmap, demand-gated — if you need it, [open an issue](https://github.com/Cohexa-ai/agent-coherence/issues/new). Edits that *bypass* the coordinator entirely (a human in an editor, a formatter, a regenerating script) are caught at the workspace boundary by content-hash checks — the [foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) below, enforced by tests rather than TLA+. Specs, the invariant ↔ implementation map, and the mutant recipes live in [`formal/tla/`](formal/tla/README.md).
 
 **Correctness is the wedge; the token savings come with it.** Writes publish ~12-token invalidation signals instead of rebroadcasting full artifacts, so read-heavy fleets stop re-paying for state they already hold:
 
@@ -90,7 +90,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 📦 [Atomic multi-file publish](#atomic-multi-file-publish) — `atomic_publish`, land a set of files all-or-nothing; never a torn pair
 - 🧮 [Formal verification](formal/tla/README.md) — the TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
-- 🧩 [Claude Code plugin](https://github.com/hipvlady/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
+- 🧩 [Claude Code plugin](https://github.com/Cohexa-ai/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
 - 🔐 [Security & supply chain](docs/security.md) — kill switches, hash-pinned install, attestation verification, threat model
 - 📜 [Changelog](CHANGELOG.md) — version history
@@ -254,7 +254,7 @@ Either every member's version advances or none does, and a moved member holds th
 
 **`v0.11.0` released — read-side transaction snapshots, the builder-facing `gate()` effect wrapper, and a fail-closed plaintext-bearer guard for cross-host mode.** A coordinated session now pins a consistent cut of the tracked artifacts and serves reads from it, so an agent that reads several artifacts never sees a torn mix of old and new versions while other writers advance them — reads serve only from the pinned cut (an unpinned artifact is refused, never served live), commits validate against the pinned base, and a stale/lost session fails closed rather than falling through to live state (prevents read-skew, not write-skew). `gate()` (`from ccs.adapters import gate`) orders an effect on the input it was computed from: it captures the input's version at decision time and fires only if the input is unchanged at the effect boundary, otherwise holding the effect before it runs. In cross-host mode the client now refuses to send its bearer token to a non-loopback host over plaintext HTTP unless `CCS_REMOTE_INSECURE=1` acknowledges an out-of-band-secured link (typed `InsecureTransportRefused`). The default single-host loopback path is byte-unchanged; all cross-host behavior stays gated by `CCS_REMOTE_COORDINATOR`. See [CHANGELOG.md](CHANGELOG.md).
 
-See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/hipvlady/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
+See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/Cohexa-ai/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 
 ## Paper
 
@@ -278,7 +278,7 @@ arXiv:[2603.15183](https://arxiv.org/abs/2603.15183)
 
 ## Community
 
-Questions, war stories, and ideas welcome in [Discussions](https://github.com/hipvlady/agent-coherence/discussions). If you've hit a stale-read bug in a multi-agent workflow, [open an issue](https://github.com/hipvlady/agent-coherence/issues/new) — I'd like to hear about it.
+Questions, war stories, and ideas welcome in [Discussions](https://github.com/Cohexa-ai/agent-coherence/discussions). If you've hit a stale-read bug in a multi-agent workflow, [open an issue](https://github.com/Cohexa-ai/agent-coherence/issues/new) — I'd like to hear about it.
 
 ## License
 

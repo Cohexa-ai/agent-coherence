@@ -12,7 +12,7 @@ published wheel.
 requests** in v0. No submission code ships in v0.
 
 If you find any outbound traffic from this package in v0, please [open a
-security advisory](https://github.com/hipvlady/agent-coherence/security/advisories)
+security advisory](https://github.com/Cohexa-ai/agent-coherence/security/advisories)
 — it would be a bug.
 
 **Cross-host mode (default OFF).** Setting `CCS_REMOTE_COORDINATOR=1` and pointing
@@ -223,7 +223,7 @@ tied to the GitHub Actions workflow that built it. To verify before installing:
 
     pip install pypi-attestations
     pypi-attestations verify --provenance \
-        --repo hipvlady/agent-coherence \
+        --repo Cohexa-ai/agent-coherence \
         --workflow release.yml \
         agent_coherence-X.Y.Z-py3-none-any.whl
 
@@ -235,7 +235,7 @@ You can also inspect the raw signed attestation directly:
       | python3 -m json.tool
 
 The `publisher` block in each attestation bundle should report
-`{kind: GitHub, repository: hipvlady/agent-coherence, workflow: release.yml, environment: pypi}`.
+`{kind: GitHub, repository: Cohexa-ai/agent-coherence, workflow: release.yml, environment: pypi}`.
 A publisher mismatch is the signature of a Trusted Publisher misconfiguration —
 do not install if the values diverge from those above.
 
@@ -280,5 +280,5 @@ served only from the official PyPI index.
 ## Reporting security issues
 
 Open a private security advisory at
-`https://github.com/hipvlady/agent-coherence/security/advisories/new` rather
+`https://github.com/Cohexa-ai/agent-coherence/security/advisories/new` rather
 than a public issue. We aim to respond within 72 hours.

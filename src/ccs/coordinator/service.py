@@ -94,7 +94,7 @@ _V090_FIRST_USE_MESSAGE = (
     "process on the first construction regardless of the value passed; to "
     "suppress it, filter RuntimeWarning from the 'ccs.coordinator.service' "
     "logger. See CHANGELOG.md (section: [0.9.0]) at "
-    "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md "
+    "https://github.com/Cohexa-ai/agent-coherence/blob/main/CHANGELOG.md "
     "for migration details."
 )
 
