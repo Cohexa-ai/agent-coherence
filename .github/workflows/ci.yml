@@ -187,7 +187,7 @@ jobs:
       - name: Check out agent-coherence-plugin
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
-          repository: hipvlady/agent-coherence-plugin
+          repository: Cohexa-ai/agent-coherence-plugin
           ref: main
           path: _plugin_checkout
 

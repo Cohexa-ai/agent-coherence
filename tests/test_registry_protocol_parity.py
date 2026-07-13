@@ -50,6 +50,7 @@ BASE_METHODS = frozenset(
         "artifact_ids",
         "capture_version_vector",
         "clear_agent_transient",
+        "commit_all",
         "commit_cas",
         "get_agent_state",
         "get_agent_transient",

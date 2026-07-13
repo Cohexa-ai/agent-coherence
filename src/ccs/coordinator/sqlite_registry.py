@@ -84,7 +84,7 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NoReturn, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, NoReturn, Optional
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -101,7 +101,10 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
     Artifact,
     CasCorruption,
+    CommitAllEntry,
     ConflictDetail,
+    MultiCommitConflict,
+    MultiCommitResult,
     VersionedReadRejection,
 )
 
@@ -2826,6 +2829,161 @@ class SqliteArtifactRegistry:
                 size_tokens=resolved_size_tokens,
             )
             return updated, invalidated
+
+    def commit_all(
+        self,
+        agent_id: UUID,
+        writes: "Mapping[UUID, CommitAllEntry]",
+        *,
+        tick: int = 0,
+        trigger: str = "commit_all",
+    ) -> "MultiCommitResult | MultiCommitConflict | CasCorruption":
+        """Atomic multi-artifact publish (SB-18 / commit_all, Unit 2) — sqlite
+        parity with :meth:`ArtifactRegistry.commit_all`.
+
+        One ``BEGIN IMMEDIATE`` under one lock does CHECK-all → (bail with NO
+        mutation on any conflict) → apply-all → ``COMMIT``, so the transaction
+        gives all-or-nothing for free: a mid-apply raise ``ROLLBACK``s to zero
+        (the total apply). This is a genuinely new atomic multi-row registry op,
+        **NOT a loop of** :meth:`commit_cas`.
+
+        Outcomes (typed returns, never raised for a normal conflict): any member
+        corrupt (``expected_version > current``) → :class:`CasCorruption` (the
+        whole batch aborts; the service maps it to ``CoherenceError``); else any
+        member a retry-eligible conflict → :class:`MultiCommitConflict` naming
+        EVERY failing member's :class:`ConflictDetail`; else WIN →
+        :class:`MultiCommitResult` (``versions`` per member + the aggregated
+        ``invalidated`` peer set, which the service publishes to the event bus
+        AFTER the ``COMMIT`` — never mid-batch).
+        """
+        if not writes:
+            raise ValueError("commit_all requires a non-empty write-set")
+        self._guard_writable()
+        with self._lock:
+            seq_incremented_count = 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                # ---- CHECK: every member, no mutation (all-or-nothing) ----
+                conflicts: dict[UUID, ConflictDetail] = {}
+                current_by: dict[UUID, tuple[int, Any]] = {}
+                for art_id, entry in writes.items():
+                    row = self._conn.execute(
+                        "SELECT version, size_tokens FROM artifacts WHERE id = ?",
+                        (art_id.hex,),
+                    ).fetchone()
+                    if row is None:
+                        raise KeyError(f"artifact {art_id} not in registry")
+                    current = row[0]
+                    current_by[art_id] = (current, row[1])
+                    if entry.expected_version > current:
+                        self._conn.execute("COMMIT")  # nothing mutated
+                        return CasCorruption(current_version=current)
+                    if entry.expected_version < current:
+                        conflicts[art_id] = ConflictDetail("version_mismatch", current)
+                        continue
+                    other_holder = self._conn.execute(
+                        "SELECT 1 FROM agent_states WHERE artifact_id = ? AND agent_id != ? "
+                        "AND state IN (?, ?) LIMIT 1",
+                        (art_id.hex, agent_id.hex, MESIState.MODIFIED.name, MESIState.EXCLUSIVE.name),
+                    ).fetchone()
+                    if other_holder is not None:
+                        conflicts[art_id] = ConflictDetail("other_holder", current)
+                        continue
+                    rg_row = self._conn.execute(
+                        "SELECT read_generation FROM agent_states WHERE artifact_id = ? AND agent_id = ?",
+                        (art_id.hex, agent_id.hex),
+                    ).fetchone()
+                    if rg_row is not None and rg_row[0] is not None:
+                        og_row = self._conn.execute(
+                            "SELECT owner_generation FROM artifacts WHERE id = ?",
+                            (art_id.hex,),
+                        ).fetchone()
+                        if og_row is not None and rg_row[0] < og_row[0]:
+                            conflicts[art_id] = ConflictDetail("stale_read_generation", current)
+                            continue
+
+                if conflicts:
+                    self._conn.execute("COMMIT")  # read-only txn, nothing mutated
+                    return MultiCommitConflict(per_artifact=dict(conflicts))
+
+                # ---- WIN: apply every member atomically in this one txn ----
+                invalidated: dict[UUID, list[UUID]] = {}
+                versions: dict[UUID, int] = {}
+                for art_id, entry in writes.items():
+                    current, current_size_tokens = current_by[art_id]
+                    member_invalidated: list[UUID] = []
+                    next_version = current + 1
+                    resolved_size = (
+                        current_size_tokens if entry.size_tokens is None else entry.size_tokens
+                    )
+                    self._conn.execute(
+                        "UPDATE artifacts SET version = ?, content_hash = ?, size_tokens = ?, "
+                        "last_writer_id = ?, updated_at = ? WHERE id = ?",
+                        (next_version, entry.content_hash, resolved_size, agent_id.hex,
+                         time.time(), art_id.hex),
+                    )
+                    peer_rows = self._conn.execute(
+                        "SELECT agent_id, state, granted_at_tick FROM agent_states "
+                        "WHERE artifact_id = ? AND agent_id != ? AND state != ?",
+                        (art_id.hex, agent_id.hex, MESIState.INVALID.name),
+                    ).fetchall()
+                    for peer_hex, peer_state_name, peer_granted in peer_rows:
+                        peer_from = MESIState[peer_state_name]
+                        new_granted = None if peer_from in _M_OR_E_STATES else peer_granted
+                        self._conn.execute(
+                            "UPDATE agent_states SET state = ?, granted_at_tick = ? "
+                            "WHERE artifact_id = ? AND agent_id = ?",
+                            (MESIState.INVALID.name, new_granted, art_id.hex, peer_hex),
+                        )
+                        seq_incremented_count += self._emit_state_log(
+                            artifact_id=art_id, agent_id=UUID(hex=peer_hex), from_state=peer_from,
+                            to_state=MESIState.INVALID, trigger=trigger, tick=tick,
+                            version=next_version, content_hash=None,
+                        )
+                        member_invalidated.append(UUID(hex=peer_hex))
+                    if member_invalidated:
+                        invalidated[art_id] = member_invalidated
+                    committer_row = self._conn.execute(
+                        "SELECT state, granted_at_tick FROM agent_states "
+                        "WHERE artifact_id = ? AND agent_id = ?",
+                        (art_id.hex, agent_id.hex),
+                    ).fetchone()
+                    committer_from = (
+                        MESIState[committer_row[0]] if committer_row else MESIState.INVALID
+                    )
+                    if committer_row is None:
+                        self._conn.execute(
+                            "INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick, "
+                            "last_reclaim_trigger, last_reclaim_tick) VALUES (?, ?, ?, NULL, NULL, NULL)",
+                            (art_id.hex, agent_id.hex, MESIState.SHARED.name),
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE agent_states SET state = ?, granted_at_tick = ? "
+                            "WHERE artifact_id = ? AND agent_id = ?",
+                            (MESIState.SHARED.name, committer_row[1], art_id.hex, agent_id.hex),
+                        )
+                    seq_incremented_count += self._emit_state_log(
+                        artifact_id=art_id, agent_id=agent_id, from_state=committer_from,
+                        to_state=MESIState.SHARED, trigger=trigger, tick=tick,
+                        version=next_version, content_hash=entry.content_hash,
+                    )
+                    if self._retain_versions and entry.content is not None:
+                        self._capture_version_sql(art_id, next_version, entry.content)
+                    versions[art_id] = next_version
+
+                self._conn.execute("COMMIT")
+                seq_incremented_count = 0
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                if seq_incremented_count:
+                    self._seq -= seq_incremented_count
+                raise
+
+            return MultiCommitResult(
+                versions=versions,
+                invalidated={art: tuple(peers) for art, peers in invalidated.items()},
+            )
 
     def _emit_state_log(
         self,

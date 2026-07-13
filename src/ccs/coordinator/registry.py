@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Optional
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -22,7 +22,10 @@ from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
     Artifact,
     CasCorruption,
+    CommitAllEntry,
     ConflictDetail,
+    MultiCommitConflict,
+    MultiCommitResult,
     VersionedReadRejection,
 )
 
@@ -648,6 +651,186 @@ class ArtifactRegistry:
         record.state_by_agent[agent_id] = MESIState.SHARED
 
         return updated, invalidated
+
+    def commit_all(
+        self,
+        agent_id: UUID,
+        writes: "Mapping[UUID, CommitAllEntry]",
+        *,
+        tick: int = 0,
+        trigger: str = "commit_all",
+    ) -> "MultiCommitResult | MultiCommitConflict | CasCorruption":
+        """In-memory ATOMIC multi-artifact publish (SB-18 / commit_all, Unit 2).
+
+        All-or-nothing: either EVERY member of ``writes`` advances to its next
+        version, or ZERO do and the batch is HELD. This is a genuinely new atomic
+        registry op — **NOT a loop of** :meth:`commit_cas` — structured as a single
+        CHECK-all → STAGE → APPLY-total → (caller) BROADCAST-after-commit critical
+        section, so no peer ever observes a partial batch (``NoPartialPublish``,
+        ``AtomicPublish.tla``; parity with
+        :meth:`SqliteArtifactRegistry.commit_all`).
+
+        Outcomes (all typed returns, never a raise for a normal conflict):
+
+        - Any member corrupt (``expected_version > current``) → :class:`CasCorruption`
+          (the whole batch aborts; the service maps it to ``CoherenceError``).
+        - Else any member a retry-eligible conflict → :class:`MultiCommitConflict`
+          naming EVERY failing member's own :class:`ConflictDetail`
+          (``version_mismatch`` / ``other_holder`` / ``stale_read_generation``).
+        - Else WIN → :class:`MultiCommitResult` (``versions`` per member + the
+          aggregated ``invalidated`` peer set for post-commit broadcast).
+
+        CHECK is pure reads; STAGE computes every mutation; the state-log emit and
+        the APPLY both roll back in full on any raise (snapshot-then-restore), so a
+        mid-apply exception can never leave a torn batch.
+        """
+        if not writes:
+            raise ValueError("commit_all requires a non-empty write-set")
+
+        # ---- CHECK: every member, pure reads, no mutation (all-or-nothing) ----
+        conflicts: dict[UUID, ConflictDetail] = {}
+        for art_id, entry in writes.items():
+            record = self._records.get(art_id)
+            if record is None:
+                raise KeyError(f"artifact {art_id} not in registry")
+            current = record.artifact.version
+            if entry.expected_version > current:
+                # Corruption aborts the whole batch (all-or-nothing); non-retryable.
+                return CasCorruption(current_version=current)
+            if entry.expected_version < current:
+                conflicts[art_id] = ConflictDetail("version_mismatch", current)
+                continue
+            other_holder = any(
+                peer_id != agent_id and state in _M_OR_E_STATES
+                for peer_id, state in record.state_by_agent.items()
+            )
+            if other_holder:
+                conflicts[art_id] = ConflictDetail("other_holder", current)
+                continue
+            read_gen = record.read_generation_by_agent.get(agent_id)
+            if read_gen is not None and read_gen < record.owner_generation:
+                conflicts[art_id] = ConflictDetail("stale_read_generation", current)
+                continue
+
+        if conflicts:
+            return MultiCommitConflict(per_artifact=dict(conflicts))
+
+        # ---- STAGE: compute all mutations (nothing applied yet) ----
+        staged = []
+        for art_id, entry in writes.items():
+            record = self._records[art_id]
+            next_version = record.artifact.version + 1
+            committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
+            peers = [
+                (peer_id, state)
+                for peer_id, state in record.state_by_agent.items()
+                if peer_id != agent_id and state != MESIState.INVALID
+            ]
+            updated = Artifact(
+                id=art_id,
+                name=record.artifact.name,
+                version=next_version,
+                content_hash=entry.content_hash,
+                size_tokens=(
+                    entry.size_tokens
+                    if entry.size_tokens is not None
+                    else record.artifact.size_tokens
+                ),
+                depends_on=record.artifact.depends_on,
+            )
+            staged.append((art_id, record, entry, next_version, committer_from, peers, updated))
+
+        # ---- EMIT all state_log entries FIRST, across the whole batch, with a
+        # running _seq rollback total so a raise leaves the registry unmutated. ----
+        emitted_here = 0
+        try:
+            for art_id, record, entry, next_version, committer_from, peers, updated in staged:
+                for peer_id, peer_from in peers:
+                    emitted_here += self._emit_state_log(
+                        artifact_id=art_id,
+                        agent_id=peer_id,
+                        from_state=peer_from,
+                        to_state=MESIState.INVALID,
+                        trigger=trigger,
+                        tick=tick,
+                        version=next_version,
+                        content_hash=None,
+                    )
+                emitted_here += self._emit_state_log(
+                    artifact_id=art_id,
+                    agent_id=agent_id,
+                    from_state=committer_from,
+                    to_state=MESIState.SHARED,
+                    trigger=trigger,
+                    tick=tick,
+                    version=next_version,
+                    content_hash=entry.content_hash,
+                )
+        except Exception:
+            self._seq -= emitted_here
+            raise
+
+        # ---- APPLY (total): snapshot every affected record, apply all N under one
+        # _capture_lock hold, and RESTORE ALL on any raise — a mid-apply exception
+        # can never leave a partial batch (the plan's total-apply hardening). ----
+        invalidated: dict[UUID, list[UUID]] = {}
+        versions: dict[UUID, int] = {}
+        with self._capture_lock:
+            snapshots = [
+                (
+                    record,
+                    record.artifact,
+                    record.content,
+                    dict(record.state_by_agent),
+                    dict(record.granted_at_tick_by_agent),
+                    record.last_writer,
+                    # Retention history is mutated in-place by _capture_version
+                    # (add + GC-pop); snapshot it too so a mid-apply raise restores
+                    # it, matching sqlite's ROLLBACK (which undoes the version-
+                    # history table). Cheap dict copies; retention is the only
+                    # other per-record state the apply touches.
+                    dict(record.version_history),
+                    dict(record.version_captured_at),
+                )
+                for _art, record, *_rest in staged
+            ]
+            try:
+                for art_id, record, entry, next_version, committer_from, peers, updated in staged:
+                    if entry.content is not None:
+                        record.content = entry.content
+                    if self._retain_versions and entry.content is not None:
+                        self._capture_version(record, next_version, entry.content)
+                    record.artifact = updated
+                    record.last_writer = agent_id
+                    member_invalidated: list[UUID] = []
+                    for peer_id, peer_from in peers:
+                        record.state_by_agent[peer_id] = MESIState.INVALID
+                        if peer_from in _M_OR_E_STATES:
+                            record.granted_at_tick_by_agent.pop(peer_id, None)
+                        member_invalidated.append(peer_id)
+                    if member_invalidated:
+                        invalidated[art_id] = member_invalidated
+                    record.state_by_agent[agent_id] = MESIState.SHARED
+                    versions[art_id] = next_version
+            except Exception:
+                # Total apply: restore every mutated record, roll back the logs.
+                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at) in snapshots:
+                    rec.artifact = art_obj
+                    rec.content = content
+                    rec.state_by_agent = state_by
+                    rec.granted_at_tick_by_agent = granted
+                    rec.last_writer = last_w
+                    rec.version_history = ver_hist
+                    rec.version_captured_at = ver_at
+                self._seq -= emitted_here
+                raise
+
+        # BROADCAST is the caller's (service) responsibility, AFTER this returns —
+        # the per-artifact invalidations are published to the event bus only post-commit.
+        return MultiCommitResult(
+            versions=versions,
+            invalidated={art: tuple(peers) for art, peers in invalidated.items()},
+        )
 
     def capture_version_vector(
         self,

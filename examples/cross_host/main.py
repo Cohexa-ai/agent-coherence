@@ -302,7 +302,18 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"Cross-host demo against coordinator at {remote.host}:{remote.port}")
 
         def make_ep():
-            return resolve_remote_endpoint(remote.host, remote.port, remote.secret)
+            # Thread the verified-TLS surface (CCS_REMOTE_TLS / CCS_REMOTE_CA_FILE,
+            # parsed by from_env) through to the endpoint. Without this, an https
+            # deployment would fall back to scheme="http" and the guard would
+            # refuse the non-loopback bearer — i.e. the documented TLS workflow
+            # (README "Or terminate TLS in front and skip the ack") could not run.
+            return resolve_remote_endpoint(
+                remote.host,
+                remote.port,
+                remote.secret,
+                scheme=remote.scheme,
+                ca_file=remote.ca_file,
+            )
 
         try:
             _track(make_ep())

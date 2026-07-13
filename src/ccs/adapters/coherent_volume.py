@@ -41,7 +41,7 @@ import threading
 import urllib.error
 import uuid
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -77,6 +77,7 @@ from ccs.core.exceptions import (
     CommitPreempted,
     CommitUnconfirmed,
     InternalConcurrencyError,
+    PublishMaterializationError,
     RemoteAuthFailed,
     StaleView,
     ViewWedged,
@@ -111,6 +112,15 @@ MAX_CAS_REACQUIRES = 8
 _STALE_WRITE_DENY_REASON = (
     "stale write blocked: the file on disk changed since this view was read "
     "(out-of-band edit). reacquire() and rebuild the write from the fresh bytes."
+)
+
+# SB-18 atomic-publish HELD message. Byte-stable (no path/version interpolation)
+# so a model's retry loop sees identical text each attempt (KTD-P). The specific
+# member drift travels on StaleView.expected_version / .current_version instead.
+_PUBLISH_HELD_REASON = (
+    "atomic publish held: a peer committed a member of this write-set since it "
+    "was read, so the batch was NOT published (all-or-nothing — no file was "
+    "written). reacquire() and rebuild the publish from the fresh versions."
 )
 
 
@@ -1070,7 +1080,7 @@ class CoherentVolume:
 
     def _write_cas_at_impl(
         self, path: str | os.PathLike[str], expected_version: int, new_content: bytes
-    ) -> None:
+    ) -> int:
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
         if self._endpoint is None:
@@ -1114,7 +1124,9 @@ class CoherentVolume:
         if outcome == "win":
             self._atomic_write(abs_path, new_content)  # confirmed → persist
             self._record_own_write(rel, new_hash)
-            return
+            # The version-CAS committed against `expected_version`, so the new
+            # version is deterministically expected+1 (atomic_publish surfaces it).
+            return expected_version + 1
         if outcome == "conflict":
             # A peer won the version between our read and the CAS → typed conflict.
             raise CasVersionConflict(
@@ -1124,6 +1136,268 @@ class CoherentVolume:
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
             raise CommitUnconfirmed(self._deny_reason(resp))
         raise CoherenceError(self._deny_reason(resp))
+
+    def atomic_publish(
+        self,
+        writes: Sequence[tuple[str | os.PathLike[str], int, bytes | bytearray | str]],
+    ) -> dict[str, int]:
+        """Publish a SET of artifacts ALL-OR-NOTHING (SB-18 batch OCC).
+
+        Commit every ``(path, expected_version, content)`` as ONE unit IFF every
+        member is still at its ``expected_version``; otherwise NOTHING commits and
+        NO file is written. The multi-artifact generalization of
+        :meth:`write_cas_at` — the primitive for an agent that merged a coherent
+        SET of files against specific versions and must land them together (a plan
+        + its manifest; a config split across files) with no torn intermediate
+        state ever observable. Returns ``{path: new_version}`` for every member on
+        success.
+
+        Outcomes:
+          - every member at its ``expected_version`` → the batch COMMITS at the
+            coordinator as one unit, then every file is materialized to disk; new
+            versions returned.
+          - a member is already behind at capture →
+            :class:`~ccs.core.exceptions.CasVersionConflict` (the caller's view
+            was stale before the publish began); NOTHING committed, NO file written.
+          - a peer commits a member in the capture→commit window →
+            :class:`~ccs.core.exceptions.StaleView` (HELD; recover via
+            :meth:`reacquire` + re-decide + retry); NOTHING committed, NO file written.
+
+        **Atomicity boundary (read this).** The all-or-nothing guarantee is at the
+        COORDINATOR commit: either every member's version advances as one unit or
+        none does — a torn *commit* is never reachable (``NoPartialPublish``). Disk
+        materialization happens AFTER that commit and is *best-effort*: every
+        member is first staged to a durable tmp, then renamed into place, so a disk
+        fault (ENOSPC, EACCES) fails BEFORE any rename with disk uniformly old, and
+        a rename failing partway raises
+        :class:`~ccs.core.exceptions.PublishMaterializationError` naming exactly
+        which members landed. This shrinks — but a process crash between two
+        renames cannot fully eliminate — the multi-file disk window (no POSIX
+        multi-file atomic rename exists). On a ``PublishMaterializationError`` the
+        coordinator is ahead of disk; recover by re-reading each member at its
+        current version and re-materializing (never retry the publish — it would
+        version-mismatch).
+
+        **Sizing.** A single-member publish takes the standalone CAS path
+        (:meth:`write_cas_at`'s primitive). A multi-member publish opens a
+        consistent snapshot session over the write-set so the comparands are
+        pinned at ONE linearization point (fractured-read-safe — no member is read
+        across a peer commit), then commits them atomically. The session path adds
+        a session-open round-trip, so its capture→commit window is WIDER than a
+        single CAS's — a lost race there is HELD (``StaleView``), never a silent
+        torn commit. A multi-member set requires UTF-8 text content (the session
+        commit wire is text); a single-member publish accepts arbitrary bytes.
+
+        **Single-host, cooperative** (like the rest of the volume): recovery from
+        a HELD publish is ``reacquire`` + re-read + retry; the caller must write
+        from freshly re-read bytes, never a buffer computed before the hold.
+        """
+        entries = self._normalize_publish_writes(writes)
+        with self._single_op_guard():
+            if len(entries) == 1:
+                abs_path, rel, expected_version, disk_bytes = entries[0]
+                new_version = self._write_cas_at_impl(rel, expected_version, disk_bytes)
+                return {rel: new_version}
+            return self._atomic_publish_session_impl(entries)
+
+    def _normalize_publish_writes(
+        self,
+        writes: Sequence[tuple[str | os.PathLike[str], int, bytes | bytearray | str]],
+    ) -> list[tuple[Path, str, int, bytes]]:
+        """Validate + resolve the write-set to ``[(abs_path, rel, expected_version,
+        disk_bytes), ...]``. Rejects an empty set, a bad content type, or a
+        DUPLICATE path — a duplicate would silently collapse a member out of an
+        all-or-nothing batch, so it fails loud before any coordinator I/O."""
+        if not writes:
+            raise ValueError("atomic_publish requires a non-empty write-set")
+        resolved: list[tuple[Path, str, int, bytes]] = []
+        seen: set[str] = set()
+        for path, expected_version, content in writes:
+            if isinstance(content, str):
+                disk_bytes = content.encode("utf-8")
+            elif isinstance(content, (bytes, bytearray)):
+                disk_bytes = bytes(content)
+            else:
+                raise TypeError(
+                    f"atomic_publish content for {path!r} must be bytes or str, "
+                    f"got {type(content).__name__}"
+                )
+            abs_path, rel = self._to_relative(path)
+            if rel in seen:
+                raise ValueError(f"atomic_publish write-set has a duplicate path: {rel}")
+            seen.add(rel)
+            resolved.append((abs_path, rel, int(expected_version), disk_bytes))
+        return resolved
+
+    def _atomic_publish_session_impl(
+        self, entries: list[tuple[Path, str, int, bytes]]
+    ) -> dict[str, int]:
+        """Multi-member publish via a consistent snapshot session (size > 1).
+
+        Re-mint (split-comparand-safe), pin the write-set at ONE point via
+        ``/session/begin``, verify each pinned version still equals the caller's
+        ``expected_version`` (else the view was stale before the publish →
+        ``CasVersionConflict``, nothing committed), then ``/session/commit_all``
+        atomically. On a confirmed WIN write EVERY file (no same-bytes skip, so
+        disk can't diverge from the coordinator's recorded hash); on a HELD
+        conflict (a peer raced the window) write NONE and raise ``StaleView``.
+        """
+        self._ensure_attached()
+        if self._endpoint is None:
+            raise CoherenceError(
+                "cannot atomic_publish: coordinator endpoint unavailable (fail-closed)"
+            )
+        # Decode to the text wire BEFORE any side effect, so a non-UTF-8 member
+        # fails with zero coordinator I/O rather than mid-session.
+        try:
+            wire = [
+                {"path": rel, "content": disk_bytes.decode("utf-8")}
+                for _abs, rel, _ev, disk_bytes in entries
+            ]
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "atomic_publish of a multi-file set requires UTF-8 text content "
+                "(the snapshot-session commit wire is text); a non-UTF-8 member "
+                f"cannot be batch-published ({exc})."
+            ) from None
+
+        # Re-mint first: pin the cut under a fresh, non-INVALID identity — never
+        # reacquire()-then-trust (KTD-LU split-comparand hole).
+        self._remint()
+        begin = self._post(
+            "/session/begin",
+            {"session_id": self._session_id, "read_set": [rel for _a, rel, _e, _b in entries]},
+        )
+        if begin is None:
+            raise CommitUnconfirmed(
+                "atomic_publish could not open a snapshot session (coordinator "
+                "transport failed); nothing was published. retry."
+            )
+        if begin.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout opening the publish session"
+            )
+        if not begin.get("ok"):
+            raise CoherenceError(
+                f"atomic_publish could not pin the write-set: {self._deny_reason(begin)}"
+            )
+        cut = begin.get("cut") or {}
+        # Fractured-read-safe staleness gate: every member's pinned version must
+        # still equal the caller's expected_version. A mismatch means a peer moved
+        # that member before the session opened → the caller's view is stale; hold
+        # the WHOLE publish (nothing committed, no file written).
+        for _abs, rel, expected_version, _b in entries:
+            pinned = cut.get(rel)
+            if pinned != expected_version:
+                raise CasVersionConflict(
+                    rel, expected_version, pinned if isinstance(pinned, int) else -1
+                )
+
+        commit = self._post(
+            "/session/commit_all",
+            {
+                "session_id": self._session_id,
+                "session_token": begin.get("session_token"),
+                "writes": wire,
+            },
+        )
+        if commit is None:
+            raise CommitUnconfirmed(
+                "atomic_publish commit could not be confirmed (coordinator transport "
+                "failed mid-commit); nothing landed. re-read and retry."
+            )
+        if commit.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout committing the publish"
+            )
+        if commit.get("ok") is True:
+            return self._materialize_publish(entries, commit.get("versions") or {})
+        # Non-WIN. A retry-eligible batch conflict (peer raced the window) is a
+        # StaleView; a NON-retryable corruption reason must not masquerade as one
+        # (mirror the size-1 CAS path, which raises CoherenceError on corruption).
+        # Corruption is unreachable via the pinned cut (which guarantees
+        # expected <= current), so this is defense-in-depth against a future
+        # comparand source, not a currently-reachable branch.
+        reason = commit.get("reason") or ""
+        if "corruption" in reason:
+            raise CoherenceError(
+                f"atomic_publish rejected (non-retryable): {reason}"
+            )
+        # A batch conflict or a session-lifecycle rejection: recover via a fresh
+        # read/session, which a StaleView (reacquire + re-decide) drives. Nothing
+        # was committed and NO file is written.
+        raise self._publish_hold(commit, entries)
+
+    def _materialize_publish(
+        self, entries: list[tuple[Path, str, int, bytes]], versions: dict
+    ) -> dict[str, int]:
+        """Materialize a coordinator-WON batch to disk with the smallest torn
+        window: stage EVERY member's bytes to a durable tmp FIRST, then
+        ``os.replace`` them all in a tight loop. Staging every tmp before any
+        replace means a staging failure (e.g. ENOSPC) leaves disk UNIFORMLY OLD —
+        the coordinator is ahead of disk but not torn. A replace failing partway
+        tears the set (an earlier member's rename landed, a later one didn't);
+        either failure raises a typed :class:`PublishMaterializationError` naming
+        exactly which members landed vs not, so the caller can reconcile — never a
+        bare ``OSError`` implying nothing published. This shrinks, but does not
+        eliminate, the multi-file window: a process crash between two renames can
+        still tear (no POSIX multi-file atomic rename exists); the coordinator
+        commit is the atomic boundary, disk is best-effort materialization."""
+        rels = [rel for _a, rel, _e, _b in entries]
+        # ---- Stage every tmp first. A failure here means NO member is replaced. ----
+        staged: list[tuple[Path, Path, str, int, bytes]] = []
+        try:
+            for abs_path, rel, expected_version, disk_bytes in entries:
+                tmp = self._stage_tmp(abs_path, disk_bytes)
+                staged.append((tmp, abs_path, rel, expected_version, disk_bytes))
+        except OSError as exc:
+            for tmp, *_ in staged:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+            raise PublishMaterializationError(
+                landed=(), not_landed=tuple(rels), cause=exc
+            ) from exc
+        # ---- Commit every staged tmp (tight rename loop, near-atomic per file). ----
+        written: dict[str, int] = {}
+        landed: list[str] = []
+        for index, (tmp, abs_path, rel, expected_version, disk_bytes) in enumerate(staged):
+            try:
+                self._replace_tmp(tmp, abs_path)
+            except OSError as exc:
+                not_landed = [r for (_t, _a, r, _e, _b) in staged[index:]]
+                for (_t, _a, _r, _e, _b) in staged[index + 1:]:
+                    with contextlib.suppress(OSError):
+                        os.unlink(_t)
+                raise PublishMaterializationError(
+                    landed=tuple(landed), not_landed=tuple(not_landed), cause=exc
+                ) from exc
+            self._record_own_write(rel, self._sha256_bytes(disk_bytes))
+            resolved_version = versions.get(rel)
+            written[rel] = (
+                resolved_version
+                if isinstance(resolved_version, int)
+                else expected_version + 1
+            )
+            landed.append(rel)
+        return written
+
+    def _publish_hold(
+        self, commit: dict, entries: list[tuple[Path, str, int, bytes]]
+    ) -> StaleView:
+        """Build the ``StaleView`` for a HELD ``session/commit_all`` — carrying the
+        first conflicting member's captured-vs-current drift (like ``gate()``) so a
+        generic ``except StaleView`` reads ``expected_version`` / ``current_version``
+        uniformly. Nothing is mutated on this path."""
+        per_artifact = commit.get("per_artifact")
+        expected_by_rel = {rel: ev for _a, rel, ev, _b in entries}
+        held = StaleView(_PUBLISH_HELD_REASON)
+        if isinstance(per_artifact, dict) and per_artifact:
+            rel, detail = next(iter(per_artifact.items()))
+            held.expected_version = expected_by_rel.get(rel)
+            if isinstance(detail, dict):
+                current = detail.get("current_version")
+                held.current_version = current if isinstance(current, int) else None
+        return held
 
     # --- coordinator I/O helpers --------------------------------------------
 
@@ -1218,12 +1492,13 @@ class CoherentVolume:
         self._last_committed_hash[rel] = content_hash
         self._last_observed_hash[rel] = content_hash
 
-    def _atomic_write(self, abs_path: Path, data: bytes) -> None:
-        """Durable, atomic replace via raw ``os.write`` + ``os.replace`` (NOT
-        ``builtins.open``), so the volume's own I/O is never self-intercepted by
-        the ``install()`` open()-shim — an ``open(tmp, "wb")`` here would route
-        the temp file (it matches the managed glob) back through the shim and
-        recurse infinitely."""
+    def _stage_tmp(self, abs_path: Path, data: bytes) -> Path:
+        """Durably write ``data`` to a unique ``.tmp`` beside ``abs_path`` (mkdir +
+        raw ``os.write`` + ``fsync``) and return the tmp path; the caller commits
+        it with :meth:`_replace_tmp`. Uses raw ``os.write`` (NOT ``builtins.open``)
+        so the volume's own I/O is never self-intercepted by the ``install()``
+        open()-shim. Cleans up the tmp and re-raises on any ``OSError`` — the tmp
+        is not left orphaned, and nothing has touched ``abs_path`` yet."""
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = abs_path.with_name(f"{abs_path.name}.{self._session_id}.tmp")
         try:
@@ -1235,13 +1510,30 @@ class CoherentVolume:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.replace(tmp, abs_path)
         except OSError:
-            # Don't leave an orphan temp on a failed write; re-raise so write()
-            # releases the grant and propagates the error.
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
+        return tmp
+
+    def _replace_tmp(self, tmp: Path, abs_path: Path) -> None:
+        """Atomically move a staged tmp onto ``abs_path`` via ``os.replace``. On an
+        ``OSError`` the tmp is removed and the error re-raised (``abs_path`` keeps
+        its old bytes for THIS member — the rename is near-atomic, so this is the
+        smallest failure surface)."""
+        try:
+            os.replace(tmp, abs_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    def _atomic_write(self, abs_path: Path, data: bytes) -> None:
+        """Durable, atomic single-file write: stage a tmp then ``os.replace`` it.
+        The composition of :meth:`_stage_tmp` + :meth:`_replace_tmp` used by the
+        single-file write paths."""
+        tmp = self._stage_tmp(abs_path, data)
+        self._replace_tmp(tmp, abs_path)
 
     def _post(self, endpoint_path: str, payload: dict) -> dict | None:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses

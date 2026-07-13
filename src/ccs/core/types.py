@@ -89,6 +89,65 @@ class CasCorruption:
 
 
 @dataclass(frozen=True)
+class MultiCommitResult:
+    """The WIN aggregate of an atomic multi-artifact publish (SB-18 / commit_all).
+
+    Returned (never raised) by the registry ``commit_all`` primitive when EVERY
+    member of the write-set committed as one unit. ``versions`` maps each
+    artifact id to its NEW (post-bump) version — the N-artifact analog of
+    ``CasResult``'s single ``version``. ``invalidated`` maps each member artifact id
+    to the peer agent ids whose cached views that member's commit invalidated — the
+    caller (the service) builds one ``InvalidationSignal`` per (artifact, peer) and
+    publishes them to the event bus AFTER the apply commits, never mid-batch
+    (broadcast-after-commit). All-or-nothing: a ``MultiCommitResult`` means every
+    member advanced; a partial batch is never a reachable outcome
+    (``NoPartialPublish``, ``AtomicPublish.tla``). The registry return carries no
+    ``coordinator_epoch`` — the service stamps that onto the wire response, exactly
+    as the single-artifact CAS path does.
+    """
+
+    versions: Mapping[UUID, int]
+    invalidated: Mapping[UUID, tuple[UUID, ...]]
+
+
+@dataclass(frozen=True)
+class MultiCommitConflict:
+    """The all-or-nothing HELD aggregate of an atomic multi-artifact publish
+    (SB-18 / commit_all).
+
+    Returned (never raised) by the registry ``commit_all`` primitive when ANY
+    member of the write-set was blocked, so ZERO members were mutated (the
+    all-or-nothing bail). ``per_artifact`` names each FAILING member's own typed
+    :class:`ConflictDetail` reason (``version_mismatch`` / ``other_holder`` /
+    ``stale_read_generation``) independently — one held vector can fail different
+    members for different reasons in a single call, so the aggregate carries a
+    typed per-member reason map, never a flattened prose message (the
+    typed-signal-not-substring house rule). The caller re-reads the named members
+    at their ``current_version`` and re-publishes.
+
+    Promoted from the frozen paper design's ``_PaperMultiCommitConflict``
+    (``tests/test_sb18_non_foreclosure.py``) — same shape, composing the shipped
+    ``ConflictDetail`` verbatim.
+    """
+
+    per_artifact: Mapping[UUID, ConflictDetail]
+
+
+@dataclass(frozen=True)
+class CommitAllEntry:
+    """One member of an atomic multi-artifact publish write-set (SB-18 /
+    commit_all). The per-artifact analog of ``commit_cas``'s keyword args —
+    a single-shot version-checked comparand the caller supplies; the primitive
+    NEVER re-reads or re-derives it (the split-comparand discipline).
+    """
+
+    expected_version: int
+    content_hash: str
+    size_tokens: int | None = None
+    content: bytes | str | None = None
+
+
+@dataclass(frozen=True)
 class VersionedContent:
     """A successfully resolved retained version (plan item N v1, Unit 4 / R5).
 

@@ -146,3 +146,91 @@ def test_ack_log_names_host_never_secret(caplog: pytest.LogCaptureFixture) -> No
         )
     assert secret not in caplog.text
     assert "10.0.0.5" in caplog.text
+
+
+# ===========================================================================
+# Unit 2: verified-TLS positive signal (scheme=https passes the guard)
+# ===========================================================================
+#
+# In THIS client ``https`` ALWAYS means enforced certificate verification —
+# :func:`build_tls_context` has no insecure-https mode (the footgun rule). So a
+# verified-TLS endpoint carries an in-band trust signal the plaintext guard
+# lacked: it passes at mint with NO ack and NO warning, retiring the
+# permanent-``CCS_REMOTE_INSECURE=1`` wart. The ``http`` rows above are
+# byte-unchanged — the guard's plaintext refusal is not weakened.
+#
+# The matrix is scheme × host-class × ack:
+#   scheme     ∈ {https, http}
+#   host-class ∈ {loopback, routed}
+#   ack        ∈ {no-ack, ack, falsey-ack}
+# The http quadrant is already pinned by the tests above; these rows add the
+# https quadrant (always-pass) plus the one https×ack log-cleanliness edge.
+
+
+# --- https passes for every host class / ack value, with NO warning ---------
+@pytest.mark.parametrize("host", ["10.0.0.5", "coordinator.internal", "127.0.0.1", "::1"])
+@pytest.mark.parametrize("env", [{}, {"CCS_REMOTE_INSECURE": "1"}, {"CCS_REMOTE_INSECURE": "0"}])
+def test_https_passes_regardless_of_host_or_ack(
+    host: str, env: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        ep = resolve_remote_endpoint(host, 8443, "secret", scheme="https", env=env)
+    assert isinstance(ep, CoordinatorEndpoint)
+    assert ep.host == host
+    assert ep.scheme == "https"
+    # No plaintext-ack warning is ever emitted on an https path — the ack is
+    # irrelevant when verification is enforced (https short-circuits the guard
+    # before the ack branch that would otherwise WARNING).
+    assert caplog.text == ""
+
+
+# --- the new positive signal: https + routed + no ack passes, no warning ----
+def test_https_routed_no_ack_passes(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        ep = resolve_remote_endpoint(
+            "10.0.0.5", 8443, "secret", scheme="https", env={}
+        )
+    assert ep.host == "10.0.0.5"
+    assert ep.scheme == "https"
+    assert ep.base_url == "https://10.0.0.5:8443"
+    assert caplog.text == ""
+
+
+# --- https + routed + CCS_REMOTE_INSECURE=1: passes, NO ack warning, no secret
+def test_https_with_insecure_ack_emits_no_plaintext_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # https short-circuits BEFORE the ack branch, so even with the ack set the
+    # plaintext-bearer WARNING must not fire (and the secret must never appear).
+    secret = "topsecret-bearer-value"
+    with caplog.at_level(logging.WARNING):
+        ep = resolve_remote_endpoint(
+            "10.0.0.5", 8443, secret, scheme="https", env={"CCS_REMOTE_INSECURE": "1"}
+        )
+    assert ep.host == "10.0.0.5"
+    assert secret not in caplog.text
+    assert "plaintext" not in caplog.text.lower()
+    assert caplog.text == ""
+
+
+# --- ordering: empty checks fire BEFORE any guard/scheme logic, https or not -
+def test_empty_secret_raises_unavailable_even_on_https() -> None:
+    # Non-loopback host + scheme=https but empty secret -> CoordinatorUnavailable
+    # (the empty-secret check), NOT a pass via the https positive signal. Pins the
+    # #135 ordering contract: empty-input checks precede the transport guard, and
+    # the bearer is never assembled on this path.
+    with pytest.raises(CoordinatorUnavailable):
+        resolve_remote_endpoint("10.0.0.5", 8443, "", scheme="https", env={})
+
+
+def test_empty_host_raises_unavailable_even_on_https() -> None:
+    with pytest.raises(CoordinatorUnavailable):
+        resolve_remote_endpoint("", 8443, "secret", scheme="https", env={})
+
+
+# --- http rows still refuse: the plaintext guard is NOT weakened by https ----
+# Explicitly re-pin the routed-http refusal alongside the new https passes so a
+# future edit that made scheme="http" fall through would fail here too.
+def test_http_routed_no_ack_still_refused_with_explicit_scheme() -> None:
+    with pytest.raises(InsecureTransportRefused):
+        resolve_remote_endpoint("10.0.0.5", 8080, "secret", scheme="http", env={})

@@ -12,30 +12,93 @@ published wheel.
 requests** in v0. No submission code ships in v0.
 
 If you find any outbound traffic from this package in v0, please [open a
-security advisory](https://github.com/hipvlady/agent-coherence/security/advisories)
+security advisory](https://github.com/Cohexa-ai/agent-coherence/security/advisories)
 — it would be a bug.
 
 **Cross-host mode (default OFF).** Setting `CCS_REMOTE_COORDINATOR=1` and pointing
 a `CoherentVolume` at a remote coordinator (`CCS_REMOTE_HOST` / `CCS_REMOTE_PORT` /
-`CCS_REMOTE_SECRET_FILE`) makes the client open HTTP connections to that
+`CCS_REMOTE_SECRET_FILE`) makes the client open connections to that
 **user-configured, private-range coordinator endpoint** — never the internet, and
 no telemetry. This is the only network traffic the library generates, it is opt-in,
 and the coordinator only binds beyond loopback to an RFC-1918/4193 address (see the
 cross-host demo, `examples/cross_host/`). With the flag unset the zero-outbound
 posture above is unchanged.
 
-**Plaintext-bearer guard (fail-closed, cross-host mode).** The remote transport is
-plaintext HTTP — the coordinator terminates no TLS, so encryption is the operator's
-out-of-band responsibility (a WireGuard tunnel or a TLS-terminating proxy). To stop
-a bearer from silently crossing an unencrypted routed link, the client **refuses to
-send it to a non-loopback host unless `CCS_REMOTE_INSECURE=1`** is set — an explicit
-acknowledgement that the link is secured out-of-band (a typed
-`InsecureTransportRefused` is raised otherwise). Loopback is unaffected. This
-*reduces* the silent-plaintext footgun; it does **not** guarantee encryption. Set
-the ack **narrowly** (per-invocation / per-compose-service), never in a persistent
-global shell profile — a forgotten global ack would blanket-acknowledge every
-future non-loopback host. Production TLS/mTLS termination is a separate hardening
-step.
+**Client TLS (verified https).** The client can speak `https://` to a
+TLS-terminating front with **enforced certificate verification**. Set
+`CCS_REMOTE_TLS=1` to select https; the client verifies the server certificate
+and, if verification fails, **fails closed — the bearer token is never sent** over
+an unverifiable connection. There is no way to turn certificate verification off:
+an insecure-https mode simply does not exist in the client's configuration. To
+trust a private certificate authority instead of the system trust store, point
+`CCS_REMOTE_CA_FILE` at a CA-bundle file; it is loaded fail-closed — a symlinked
+bundle is refused, and a group- or world-writable bundle is refused (a trust
+anchor an attacker can rewrite is not a trust anchor). The client also **refuses
+to follow redirects**: it talks to the one coordinator endpoint you configured, so
+any redirect response is rejected rather than followed with the bearer attached.
+The loopback path is unchanged — a plain `http://` loopback endpoint behaves
+exactly as before.
+
+**CA-profile requirements for the terminating proxy (read this before you
+provision a certificate).** Coordinator endpoints are almost always IP literals
+(private-range addresses like `10.0.0.5`), and that shapes what certificate the
+TLS-terminating proxy must present:
+
+- **The certificate must carry an IP subject alternative name** matching the
+  endpoint address — for example `subjectAltName = IP:10.0.0.5`. A DNS-only
+  certificate has no name that matches an IP-literal endpoint, so verification
+  **fails closed** against it. This is the single most common cause of a
+  connection that refuses to establish.
+- **On Python 3.13 and newer the certificate must be RFC 5280-strict**, or
+  verification rejects it: it needs a subject key identifier and an authority key
+  identifier, `basicConstraints` marked critical, and an extended key usage of
+  `serverAuth`. Older certificates that older Python tolerated will be refused
+  here.
+- **Self-signed certificates are not a supported posture.** Use a private
+  certificate authority and supply its bundle via `CCS_REMOTE_CA_FILE`. A private
+  CA is what lets you mint an IP-SAN, RFC 5280-strict server certificate the
+  client will actually verify.
+
+**Plaintext-bearer guard (fail-closed, cross-host mode).** When the client is
+*not* using verified https, the remote transport is plaintext HTTP — the
+coordinator terminates no TLS itself, so encryption is the operator's out-of-band
+responsibility (a WireGuard tunnel or a TLS-terminating proxy). To stop a bearer
+from silently crossing an unencrypted routed link, the client **refuses to send it
+to a non-loopback host** over plaintext (a typed `InsecureTransportRefused` is
+raised). There are now two clean ways to satisfy the guard:
+
+- **Verified https (the clean path).** A verified-https connection satisfies the
+  guard automatically — the link is encrypted and the certificate is checked, so
+  no acknowledgement is needed. `CCS_REMOTE_INSECURE=1` is **not** required for a
+  properly TLS-fronted deployment.
+- **`CCS_REMOTE_INSECURE=1` (the narrow out-of-band case).** This remains only for
+  a *plaintext* link you have secured yourself out-of-band — a WireGuard tunnel or
+  equivalent — where you knowingly accept the bearer riding plaintext HTTP inside
+  that secured channel.
+
+Loopback is unaffected. The plaintext ack *reduces* the silent-plaintext footgun;
+it does **not** itself encrypt anything. Set the ack **narrowly** (per-invocation /
+per-compose-service), never in a persistent global shell profile — a forgotten
+global ack would blanket-acknowledge every future non-loopback host.
+
+**Coordinator-side bind guard (fail-closed).** Symmetrically, a coordinator that
+binds **beyond loopback** now refuses to serve unless the operator makes one of two
+explicit assertions:
+
+- `CCS_TLS_TERMINATED=1` — you assert a TLS-terminating front sits ahead of the
+  coordinator.
+- `CCS_SERVE_INSECURE=1` — you explicitly acknowledge an insecure (plaintext) link.
+
+With neither set, a routed bind fails at startup rather than silently serving
+bearer-authenticated requests in the clear. **These are operator assertions, not
+enforcement:** the coordinator cannot verify that a proxy is actually present or
+that the link is actually encrypted — it takes your word for it and records the
+posture in its log. They acknowledge; they do not themselves encrypt or verify.
+Loopback binds read neither variable and are unchanged. As with the client ack,
+set these **narrowly** (per-invocation / per-compose-service), never as a
+persistent global — a forgotten global assertion would blanket every future routed
+bind. Production TLS/mTLS termination is a separate hardening step; the cross-host
+mode as a whole remains experimental and default-off.
 
 ## Env-var kill switches
 
@@ -160,7 +223,7 @@ tied to the GitHub Actions workflow that built it. To verify before installing:
 
     pip install pypi-attestations
     pypi-attestations verify --provenance \
-        --repo hipvlady/agent-coherence \
+        --repo Cohexa-ai/agent-coherence \
         --workflow release.yml \
         agent_coherence-X.Y.Z-py3-none-any.whl
 
@@ -172,7 +235,7 @@ You can also inspect the raw signed attestation directly:
       | python3 -m json.tool
 
 The `publisher` block in each attestation bundle should report
-`{kind: GitHub, repository: hipvlady/agent-coherence, workflow: release.yml, environment: pypi}`.
+`{kind: GitHub, repository: Cohexa-ai/agent-coherence, workflow: release.yml, environment: pypi}`.
 A publisher mismatch is the signature of a Trusted Publisher misconfiguration —
 do not install if the values diverge from those above.
 
@@ -217,5 +280,5 @@ served only from the official PyPI index.
 ## Reporting security issues
 
 Open a private security advisory at
-`https://github.com/hipvlady/agent-coherence/security/advisories/new` rather
+`https://github.com/Cohexa-ai/agent-coherence/security/advisories/new` rather
 than a public issue. We aim to respond within 72 hours.

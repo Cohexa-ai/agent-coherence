@@ -96,6 +96,22 @@ send its bearer over plaintext HTTP unless you set `CCS_REMOTE_INSECURE=1` — t
 explicit acknowledgement that *you* have secured the link out-of-band (the
 encrypted tunnel above). A loopback host needs no acknowledgement.
 
+**Or terminate TLS in front and skip the ack.** If a TLS-terminating proxy sits in
+front of the coordinator, point the client at it with verified https instead:
+
+```
+export CCS_REMOTE_TLS=1                                       # https with enforced certificate verification
+export CCS_REMOTE_CA_FILE=/path/to/private-ca.pem            # trust your private CA (fail-closed: no symlink, not group/world-writable)
+# CCS_REMOTE_INSECURE is NOT needed — a verified-https link satisfies the guard
+```
+
+Verification is fail-closed: an unverifiable certificate means the bearer is never
+sent. Because the endpoint here is an IP literal, the proxy's certificate must
+carry an IP subject alternative name (`subjectAltName = IP:10.0.0.1`) — a DNS-only
+certificate fails closed against an IP endpoint — and on Python 3.13+ it must be
+RFC 5280-strict. Use a private CA (not a self-signed certificate) and supply it via
+`CCS_REMOTE_CA_FILE`. See the Security boundary below.
+
 ### Docker (recommended — genuine cross-container, one command, verified)
 
 Two containers on a private-range bridge — **separate network namespaces, real
@@ -130,13 +146,32 @@ public addresses are all rejected); the bearer secret is provisioned via a
 confidential channel (never an inline env var — it would leak in `ps` /
 `docker inspect`); and the link is encrypted.
 
-**Plaintext-bearer guard (fail-closed).** The transport is plaintext HTTP — the
-coordinator has no TLS; encryption is *your* out-of-band responsibility (a
-WireGuard tunnel, a TLS-terminating proxy, or the isolated Docker bridge here). To
-stop a silent leak, the client **refuses to send the bearer to a non-loopback host
-unless you set `CCS_REMOTE_INSECURE=1`** — an explicit acknowledgement that the
-link is secured. It *reduces* the silent-plaintext footgun; it does not *guarantee*
-encryption. Set it **narrowly** (per-invocation or per-compose-service), not in a
-persistent global shell profile — a forgotten global ack would blanket-acknowledge
-every future non-loopback host. Production hardening (TLS/mTLS termination) is
-tracked separately.
+**Plaintext-bearer guard (fail-closed).** Without TLS the transport is plaintext
+HTTP — the coordinator terminates no TLS itself; encryption is *your* out-of-band
+responsibility (a WireGuard tunnel, a TLS-terminating proxy, or the isolated Docker
+bridge here). To stop a silent leak, the client **refuses to send the bearer to a
+non-loopback host** over plaintext. Two clean ways to satisfy it:
+
+- **Verified https** — set `CCS_REMOTE_TLS=1` (see the Host-2 instructions above).
+  A verified-https connection satisfies the guard automatically; no
+  acknowledgement is needed. Certificate verification is enforced and fails
+  closed — the bearer is never sent over an unverifiable link — with no way to
+  turn verification off.
+- **`CCS_REMOTE_INSECURE=1`** — the narrow case: a *plaintext* link you have
+  secured yourself out-of-band. It *reduces* the silent-plaintext footgun; it does
+  not *guarantee* encryption.
+
+Set the plaintext ack **narrowly** (per-invocation or per-compose-service), not in
+a persistent global shell profile — a forgotten global ack would
+blanket-acknowledge every future non-loopback host.
+
+**Coordinator-side bind guard (fail-closed).** A coordinator that binds beyond
+loopback now refuses to start unless the operator asserts either
+`CCS_TLS_TERMINATED=1` (a TLS-terminating front is present) or
+`CCS_SERVE_INSECURE=1` (an acknowledged insecure link). These are **operator
+assertions, not enforcement** — the coordinator cannot verify a proxy is really
+there or that the link is really encrypted; it records the posture and serves. This
+demo binds beyond loopback, so it sets `CCS_SERVE_INSECURE=1` (already wired into
+the Docker compose service). Set it **narrowly** (per-compose-service), never as a
+persistent global. Production hardening (TLS/mTLS termination) is tracked
+separately; this cross-host mode remains experimental and default-off.

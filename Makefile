@@ -25,6 +25,11 @@ tla-check:  ## Run TLC model checker on MESI, CrashRecovery, OCC, Fencing, Reten
 	$(TLC) -config formal/tla/Fencing_CI.cfg formal/tla/Fencing.tla
 	$(TLC) -config formal/tla/Retention_CI.cfg formal/tla/Retention.tla
 	$(TLC) -config formal/tla/Snapshot_CI.cfg formal/tla/Snapshot.tla
+# NOTE: AtomicPublish (SB-18) is intentionally NOT in the CI sweep yet — its
+# write-set state space (2^|Artifacts| x MaxVersion^|Artifacts|) needs a bounded
+# encoding / state constraint to converge in the CI budget (plan Unit 1, deferred).
+# The spec parses + semantically validates; wire it in once the CI config is tuned:
+#   $(TLC) -config formal/tla/AtomicPublish_CI.cfg formal/tla/AtomicPublish.tla
 
 help:  ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \

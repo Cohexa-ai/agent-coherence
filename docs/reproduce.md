@@ -10,7 +10,7 @@ Results in [Token Coherence: Adapting MESI Cache Protocols to Minimize Synchroni
 ## Quick start
 
 ```bash
-git clone https://github.com/hipvlady/agent-coherence
+git clone https://github.com/Cohexa-ai/agent-coherence
 cd agent-coherence
 bash scripts/reproduce.sh
 ```

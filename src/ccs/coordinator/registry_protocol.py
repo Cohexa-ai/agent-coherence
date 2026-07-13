@@ -36,11 +36,19 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from threading import Event
-from typing import Any, Iterable, Optional, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Iterable, Mapping, Optional, Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact, CasCorruption, ConflictDetail, VersionedReadRejection
+from ccs.core.types import (
+    Artifact,
+    CasCorruption,
+    CommitAllEntry,
+    ConflictDetail,
+    MultiCommitConflict,
+    MultiCommitResult,
+    VersionedReadRejection,
+)
 
 from .retention import RetentionPolicy
 
@@ -52,6 +60,11 @@ ReclamationSlot: TypeAlias = tuple[str, int]  # (trigger, tick)
 # WIN = (updated_artifact, invalidated_agent_ids); loss = ConflictDetail;
 # impossible state = CasCorruption. None is raised by the registry.
 CasResult: TypeAlias = "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption"
+# Atomic multi-artifact publish (SB-18 / commit_all): WIN = MultiCommitResult
+# (per-member new versions + the aggregated invalidated set); any member blocked =
+# MultiCommitConflict (per-member ConflictDetail); any member corrupt = CasCorruption.
+# All-or-nothing — never a partial batch. None is raised by the registry.
+MultiCasResult: TypeAlias = "MultiCommitResult | MultiCommitConflict | CasCorruption"
 # Snapshot consistent-cut capture: WIN = the pinned cut
 # {artifact_id: version}; a read_set with an unknown id = VersionedReadRejection,
 # NO pins inserted. Neither is raised by the registry.
@@ -130,6 +143,21 @@ class RegistryBase(Protocol):
         tick: int = 0,
         trigger: str = "commit_cas",
     ) -> CasResult:
+        ...
+
+    def commit_all(
+        self,
+        agent_id: UUID,
+        writes: Mapping[UUID, CommitAllEntry],
+        *,
+        tick: int = 0,
+        trigger: str = "commit_all",
+    ) -> MultiCasResult:
+        """Atomic multi-artifact publish (SB-18 / commit_all): commit ``writes``
+        all-or-nothing — every member advances to its next version or none do and
+        the batch is HELD. A genuinely new atomic multi-row op, never a loop of
+        :meth:`commit_cas`. Implemented on BOTH backends with identical outcomes
+        (parity)."""
         ...
 
     @property

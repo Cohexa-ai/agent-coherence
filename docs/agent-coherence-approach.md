@@ -13,7 +13,7 @@ dominant pattern across the frameworks documented in the companion piece.
 
 ## The approach
 
-The [`agent-coherence`](https://github.com/hipvlady/agent-coherence) library
+The [`agent-coherence`](https://github.com/Cohexa-ai/agent-coherence) library
 provides coherence primitives for multi-agent shared state: version tracking,
 invalidation signaling, and configurable synchronization strategies (eager,
 lazy, lease-based). It implements a MESI-derived protocol adapted from CPU

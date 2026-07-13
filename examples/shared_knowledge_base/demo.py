@@ -201,8 +201,8 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 # The lost update above is reverse-engineered from a real federated fleet:
-#   https://github.com/hipvlady/agent-coherence/tree/main/examples/coherent_volume
+#   https://github.com/Cohexa-ai/agent-coherence/tree/main/examples/coherent_volume
 # RAG / shared-agent-memory positioning:
-#   https://github.com/hipvlady/agent-coherence#agent-coherence
+#   https://github.com/Cohexa-ai/agent-coherence#agent-coherence
 # Cost pre-registration (PASS at n=50, caveats kept honest):
-#   https://github.com/hipvlady/agent-coherence/blob/main/benchmarks/cost_preregistration.md
+#   https://github.com/Cohexa-ai/agent-coherence/blob/main/benchmarks/cost_preregistration.md
