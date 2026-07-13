@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-OWNER="hipvlady"
+OWNER="Cohexa-ai"
 REPO="agent-coherence"
 
 echo "==> Verifying gh auth..."

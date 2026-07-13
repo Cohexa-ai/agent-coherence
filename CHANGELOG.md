@@ -758,7 +758,7 @@ targeted for a future minor bump per the original SemVer commitment.
 
 ### Plugin compatibility
 
-- v0.2 of the [agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin)
+- v0.2 of the [agent-coherence-plugin](https://github.com/Cohexa-ai/agent-coherence-plugin)
   consumes this library via its broad-beta launch package (plan Units
   8-11). The Node coordinator does NOT ship strict mode in v0.2 —
   strict-mode workspaces must use `coherence.coordinator_backend = "python"`.
@@ -838,7 +838,7 @@ To install: `pip install agent-coherence>=0.8.0a1` or
 
 ### Added — Claude Code plugin (v0.1 alpha)
 
-The plugin lives at [hipvlady/agent-coherence-plugin](https://github.com/hipvlady/agent-coherence-plugin)
+The plugin lives at [Cohexa-ai/agent-coherence-plugin](https://github.com/Cohexa-ai/agent-coherence-plugin)
 and depends on this library for the coordinator backend. New library entry
 points wired in this release:
 
@@ -944,7 +944,7 @@ Total: 1101 passing, 2 skipped, 2 launch_gate deselected by default.
 
 ### Removed
 
-- **`ccs-check-release` console script** is no longer exposed as a `pip install` entry point. It was a maintainer-only pre-tag-push verifier that queried this repo's GitHub admin settings (hardcoded `hipvlady/agent-coherence` defaults); end users had no use case. The underlying script (`tools/check_release_readiness.py`) and its module (`ccs.hardening.release_readiness`) remain tracked — CI invokes the script directly during the release workflow preflight, and maintainers run the same path locally.
+- **`ccs-check-release` console script** is no longer exposed as a `pip install` entry point. It was a maintainer-only pre-tag-push verifier that queried this repo's GitHub admin settings (hardcoded `Cohexa-ai/agent-coherence` defaults); end users had no use case. The underlying script (`tools/check_release_readiness.py`) and its module (`ccs.hardening.release_readiness`) remain tracked — CI invokes the script directly during the release workflow preflight, and maintainers run the same path locally.
 
 ### Fixed
 
@@ -1024,8 +1024,8 @@ Total: 1101 passing, 2 skipped, 2 launch_gate deselected by default.
 - Deterministic tick-driven simulation engine with scenario YAML loader.
 - TLA+ formal model for protocol safety properties.
 
-[0.7.0]: https://github.com/hipvlady/agent-coherence/releases/tag/v0.7.0
-[0.6.0]: https://github.com/hipvlady/agent-coherence/releases/tag/v0.6.0
-[0.5.0]: https://github.com/hipvlady/agent-coherence/releases/tag/v0.5.0
-[0.4.1]: https://github.com/hipvlady/agent-coherence/releases/tag/v0.4.1
-[0.4.0]: https://github.com/hipvlady/agent-coherence/releases/tag/v0.4.0
+[0.7.0]: https://github.com/Cohexa-ai/agent-coherence/releases/tag/v0.7.0
+[0.6.0]: https://github.com/Cohexa-ai/agent-coherence/releases/tag/v0.6.0
+[0.5.0]: https://github.com/Cohexa-ai/agent-coherence/releases/tag/v0.5.0
+[0.4.1]: https://github.com/Cohexa-ai/agent-coherence/releases/tag/v0.4.1
+[0.4.0]: https://github.com/Cohexa-ai/agent-coherence/releases/tag/v0.4.0

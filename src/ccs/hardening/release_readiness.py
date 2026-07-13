@@ -30,7 +30,7 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-DEFAULT_OWNER = "hipvlady"
+DEFAULT_OWNER = "Cohexa-ai"
 DEFAULT_REPO = "agent-coherence"
 DEFAULT_ENVIRONMENT = "pypi"
 DEFAULT_BRANCH = "main"

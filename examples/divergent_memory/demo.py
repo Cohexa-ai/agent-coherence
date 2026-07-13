@@ -230,6 +230,6 @@ if __name__ == "__main__":
 # sessions losing cross-session isolation (observations from separate sessions
 # mixed), and parallel sessions silently dropping observations. Sibling demo (lost
 # update, write-clobber):
-#   https://github.com/hipvlady/agent-coherence/tree/main/examples/shared_knowledge_base
+#   https://github.com/Cohexa-ai/agent-coherence/tree/main/examples/shared_knowledge_base
 # RAG / shared-agent-memory positioning:
-#   https://github.com/hipvlady/agent-coherence#agent-coherence
+#   https://github.com/Cohexa-ai/agent-coherence#agent-coherence

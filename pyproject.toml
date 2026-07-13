@@ -72,7 +72,7 @@ agent-coherence-replay = "ccs.cli.coherence_replay:main"
 stale-write-guard-fs = "ccs.mcp.server:main"
 # Note: ccs-check-release is intentionally NOT exposed as a public console
 # script. It's a maintainer-only pre-tag-push verifier that queries this
-# repo's GitHub admin settings (hardcoded defaults to hipvlady/agent-coherence).
+# repo's GitHub admin settings (hardcoded defaults to Cohexa-ai/agent-coherence).
 # End users have no use case. CI invokes it directly via
 # `python tools/check_release_readiness.py`. Maintainers run the same path.
 
@@ -132,11 +132,11 @@ version = { attr = "ccs.__version__" }
 where = ["src"]
 
 [project.urls]
-Homepage = "https://github.com/hipvlady/agent-coherence"
-Repository = "https://github.com/hipvlady/agent-coherence"
-Issues = "https://github.com/hipvlady/agent-coherence/issues"
-Documentation = "https://github.com/hipvlady/agent-coherence/blob/main/docs/guide.md"
-Changelog = "https://github.com/hipvlady/agent-coherence/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Cohexa-ai/agent-coherence"
+Repository = "https://github.com/Cohexa-ai/agent-coherence"
+Issues = "https://github.com/Cohexa-ai/agent-coherence/issues"
+Documentation = "https://github.com/Cohexa-ai/agent-coherence/blob/main/docs/guide.md"
+Changelog = "https://github.com/Cohexa-ai/agent-coherence/blob/main/CHANGELOG.md"
 Paper = "https://arxiv.org/abs/2603.15183"
 
 [tool.ruff]
