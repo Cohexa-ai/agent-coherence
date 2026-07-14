@@ -1,8 +1,15 @@
 # `ccs-diagnose` — detect stale reads in your LangGraph graph
 
-`ccs-diagnose` attaches a passive callback to an existing LangGraph graph and classifies its write pattern (`single_writer` / `shared_artifact` / `parallel_branch` / `mixed`). It reports artifacts whose reads were handed divergent versions across nodes — divergence the runtime is already producing but never surfaces.
+`ccs-diagnose` attaches a passive callback to an existing LangGraph graph and classifies its write pattern (`single_writer` / `shared_artifact` / `parallel_branch` / `mixed_pattern` / `insufficient`). It reports artifacts whose reads were handed divergent versions across nodes — divergence the runtime is already producing but never surfaces.
 
 It runs as a **witness-quality** surface: it observes what the runtime *handed* a node, not what the node read. Upgrading to `CCSStore` lifts these observations into provable per-key attribution — same diagnose surface, no callback rewiring.
+
+**`ccs-diagnose` is detection only — it enforces nothing.** It surfaces divergence; it never denies a read or a write. What *closes* a divergence once you've seen it depends on which side the race is on:
+
+- **Read-side drift** (a peer committed a new version, your cached view went stale) → **CCSStore** provides read-side coherence: when a peer commits a new version, your cached view is invalidated so your next read is a fresh miss. It does not deny a stale write-back — `put` is not version-CAS.
+- **Write-side lost-update** (a stale writer overwriting a peer) → route writes through **CoherentVolume** or **`write_cas`**.
+
+**Scope:** `ccs-diagnose` observes a single in-process run — the versions the runtime hands nodes inside one process. Divergence that happens across separate OS processes (two hosts, or two processes over shared files) is invisible to it; for cross-process coordination over files, reach for CoherentVolume.
 
 The CLI makes **zero outbound network requests** in v0.
 
@@ -32,6 +39,9 @@ pip install "agent-coherence[diagnose]"
 
 ```bash
 ccs-diagnose --graph path/to/your_graph.py:build_graph
+
+# Or run it right now against the bundled example graph — no setup:
+ccs-diagnose --graph examples/langgraph_planner/main.py:build_graph_no_store
 ```
 
 The factory must accept zero arguments (or accept an initial state file via `--state-file`) and return a compiled LangGraph graph. The CLI runs the graph once with a passive observer and writes two reports:
@@ -120,7 +130,7 @@ Three independent kill switches suppress all telemetry-shaped output (no consent
 
 `--no-telemetry` and `--no-network` are the per-invocation equivalents.
 
-See [SECURITY.md](SECURITY.md) for the full trust contract, supply-chain threat model, and attestation-verification commands.
+See [security.md](security.md) for the full trust contract, supply-chain threat model, and attestation-verification commands.
 
 ## Calibration corpus
 

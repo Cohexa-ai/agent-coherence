@@ -1,6 +1,6 @@
 # agent-coherence
 
-**`agent-coherence` makes "agent A silently clobbered agent B's `plan.md`" impossible — a vendor-neutral MESI + optimistic-concurrency coordinator for agent state, with the safety invariants machine-checked in TLA+.**
+**`agent-coherence` stops one agent from silently clobbering another's work on a shared `plan.md`, store key, or `memory.json` — a vendor-neutral MESI + optimistic-concurrency coordinator for agent state on a single host, with the safety invariants machine-checked in TLA+.**
 
 Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One reads it and works; meanwhile a peer commits a newer version; the first writes back anyway. Last write wins, the peer's work is silently gone, nothing errors, and every downstream decision builds on the wrong version. `agent-coherence` turns that silent clobber into a loud, typed refusal: MESI-style ownership and invalidation over shared artifacts, optimistic commit-CAS for concurrent writers, and a read-generation fence for crash-reclaimed ones — a stale write is denied or returned as a retryable conflict, never silently applied. Same library, same protocol, across LangGraph, CrewAI, AutoGen, the OpenAI Agents SDK, plain files shared across processes (`CoherentVolume`), any MCP client (the `stale-write-guard-fs` server, via the `mcp` extra), and any custom orchestrator. Same behavior regardless of which model provider (Anthropic, OpenAI, Google, Mistral, open-source) the agents talk to.
 
@@ -13,6 +13,7 @@ Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One 
 `mcp-name: io.github.cohexa-ai/stale-write-guard-fs`
 
 ```bash
+# Requires Python 3.11+
 pip install "agent-coherence[langgraph]"        # LangGraph drop-in
 pip install "agent-coherence[crewai]"           # CrewAI adapter
 pip install "agent-coherence[openai-agents]"    # OpenAI Agents SDK adapter (experimental)
@@ -31,7 +32,9 @@ from ccs.adapters import CCSStore
 store = CCSStore(strategy="lazy")
 ```
 
-`store.get()`, `store.put()`, `store.search()` keep working unchanged — reads now serve the current version, and a write from a stale view can't silently land.
+`store.get()`, `store.put()`, `store.search()` keep working unchanged. `CCSStore` adds **read-side** coherence: a peer's commit invalidates your cached view, so your next read is a fresh miss. It does **not** deny a stale write-back — `put` is not version-CAS; for write-side lost-update prevention, route writes through `CoherentVolume` or `write_cas` (below).
+
+> The one-import swap assumes your store namespaces carry the agent identity in `namespace[0]` — a `(user_id, "memories")` shape would merge users onto one shared artifact. See the [namespace convention](docs/guide.md#namespace-convention).
 
 ```python
 # Plain files shared across processes / sessions — no framework required
@@ -54,7 +57,7 @@ Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` run
 | **Concurrent lost update** — two writers hit the same key and both "succeed" | exactly one wins; the loser gets a **typed conflict + bounded retry**, never a silent drop | optimistic commit-CAS (`write_cas`) | `NoLostUpdate` |
 | **Reclaim-zombie write** — a stalled writer is reclaimed by crash recovery, wakes later, and lands its stale commit; the version never moved, so a version check passes | the commit is **rejected** with a typed `stale_read_generation` conflict | read-generation fence — reclamation bumps the artifact's ownership epoch, checked atomically at commit | `NoStaleApply` |
 | **Torn multi-artifact read (read-skew)** — an agent reads several artifacts one by one while a peer commits in between; each read was individually current, but the *combination* never coexisted | session reads serve from a **pinned consistent cut**; commits validate against the pinned base; a lapsed session **fails closed** with a typed rejection, never a silent fall-through to live state | [multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) | `NoReadSkewWithinCut`, `PinAlwaysRetained` |
-| **Dead owner blocks the fleet** — a crashed agent holds EXCLUSIVE forever | the heartbeat/TTL sweep reclaims the grant (on by default) | crash-recovery sweep | sweep invariants I3–I6 |
+| **Dead owner blocks the fleet** — a crashed agent holds EXCLUSIVE forever | the heartbeat/TTL sweep reclaims the grant (on by default; best-effort, rate-limited) | crash-recovery sweep | sweep invariants I3–I6 |
 
 **Scope, honestly:** the guarantees hold for writers that go through the coordinator, under a single coordinator (one host). Concurrent same-key writers on one host are covered; cross-host fencing is on the roadmap, demand-gated — if you need it, [open an issue](https://github.com/Cohexa-ai/agent-coherence/issues/new). Edits that *bypass* the coordinator entirely (a human in an editor, a formatter, a regenerating script) are caught at the workspace boundary by content-hash checks — the [foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) below, enforced by tests rather than TLA+. Specs, the invariant ↔ implementation map, and the mutant recipes live in [`formal/tla/`](formal/tla/README.md).
 
@@ -72,7 +75,7 @@ Those are the **spatial** savings (more agents sharing one artifact). The **temp
 
 ## RAG & shared agent memory
 
-RAG corpora and agent memory are **shared mutable state**, so the stale-read→write lost update lands there too — and *a consistent store doesn't save you*: the staleness is in the **agent's cached view of a record**, not the store. Two agents read a record at v1; one writes v2; the other, still on its v1, writes an edit computed from v1 and clobbers v2. `agent-coherence` keeps the readers honest: `CCSStore` is a drop-in for `langgraph.store` (and composes with Mem0, Letta, LlamaIndex, a vector store, or a plain file via `CoherentVolume`) — it stores no vectors and does no ranking; it's the consistency layer underneath whatever you already use to retrieve and remember.
+RAG corpora and agent memory are **shared mutable state**, so the stale-read→write lost update lands there too — and *a consistent store doesn't save you*: the staleness is in the **agent's cached view of a record**, not the store. Two agents read a record at v1; one writes v2; the other, still on its v1, writes an edit computed from v1 and clobbers v2. `agent-coherence` keeps the **readers** current — `CCSStore` is a drop-in for `langgraph.store` (composing with Mem0, Letta, LlamaIndex, a vector store, or a plain file underneath whatever you already use; it stores no vectors and does no ranking), so a peer's commit invalidates the stale cached view (read-side coherence). Preventing the stale **write-back** itself is the write side — route those writes through `CoherentVolume` or `write_cas`.
 
 - **Runnable, deterministic demo** (offline, no keys): `python -m examples.coherent_volume.main` reproduces the documented lost update, then prevents it.
 - **Honest scope:** writes that go through the coordinator are caught. Auto-watching an *unmanaged external source* that changes with no coordinator write (a hand-edited file, an out-of-band re-index) is the source-watcher case — **on the roadmap, demand-gated, not shipped today.**
@@ -92,6 +95,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 🧩 [Claude Code plugin](https://github.com/Cohexa-ai/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
+- 🧭 [The MESI-derived approach](docs/agent-coherence-approach.md) — how the protocol maps each documented gap to a shipped surface, with boundaries
 - 🔐 [Security & supply chain](docs/security.md) — kill switches, hash-pinned install, attestation verification, threat model
 - 📜 [Changelog](CHANGELOG.md) — version history
 - 📄 [Paper on arXiv (2603.15183)](https://arxiv.org/abs/2603.15183) — formal protocol, TLA+ verification, simulation results
@@ -112,7 +116,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Coherent workspace** (`ccs.adapters.coherent_volume`) — the **data-plane appliance**: an out-of-process coordinator client that brings the same guarantee to plain files on disk, no framework required. See [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files).
 - **MCP server** (`ccs.mcp`) — the `stale-write-guard-fs` stdio server that exposes the coherent-workspace guarantee to any [Model Context Protocol](https://modelcontextprotocol.io) client over five `swg_*` tools. See [MCP server](#mcp-server-stale-write-guard-fs).
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
-- **Event bus** (`ccs.bus`) — pluggable transport for invalidation signals; in-memory by default, swap in Redis, Kafka, NATS, or gRPC streams for production.
+- **Event bus** (`ccs.bus`) — the transport for invalidation signals; in-memory / in-process today (`InMemoryEventBus`). Networked transports (Redis, Kafka, NATS, gRPC) for a multi-host deployment are on the roadmap, demand-gated.
 
 Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, version retention's no-collected-read, and the snapshot session's no-read-skew-within-cut — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all six specs on every push and PR.
 
@@ -252,7 +256,7 @@ Either every member's version advances or none does, and a moved member holds th
 
 ## Status
 
-**`v0.11.0` released — read-side transaction snapshots, the builder-facing `gate()` effect wrapper, and a fail-closed plaintext-bearer guard for cross-host mode.** A coordinated session now pins a consistent cut of the tracked artifacts and serves reads from it, so an agent that reads several artifacts never sees a torn mix of old and new versions while other writers advance them — reads serve only from the pinned cut (an unpinned artifact is refused, never served live), commits validate against the pinned base, and a stale/lost session fails closed rather than falling through to live state (prevents read-skew, not write-skew). `gate()` (`from ccs.adapters import gate`) orders an effect on the input it was computed from: it captures the input's version at decision time and fires only if the input is unchanged at the effect boundary, otherwise holding the effect before it runs. In cross-host mode the client now refuses to send its bearer token to a non-loopback host over plaintext HTTP unless `CCS_REMOTE_INSECURE=1` acknowledges an out-of-band-secured link (typed `InsecureTransportRefused`). The default single-host loopback path is byte-unchanged; all cross-host behavior stays gated by `CCS_REMOTE_COORDINATOR`. See [CHANGELOG.md](CHANGELOG.md).
+**`v0.12.0` released — atomic multi-artifact publish (`atomic_publish` / `commit_all`), the gate-independent TLS-transport-guard slice, and the MCP Registry manifest for `stale-write-guard-fs`. First release published from the `Cohexa-ai` organization.** `atomic_publish` commits a *set* of files all-or-nothing: either every member's version advances as one unit or none does, so a reader never sees a torn, half-applied edit. All-or-nothing is at the coordinator commit (`NoPartialPublish`, formally specified in `formal/tla/AtomicPublish.tla`); disk materialization is best-effort staged-rename after the commit. Single-host; not rollback of already-escaped effects, and not cross-session write-skew prevention. The cross-host TLS slice adds client-side certificate verification and a fail-closed plaintext-bearer refusal (`InsecureTransportRefused`), but **no networked backend is built** — routed deployment stays experimental and demand-gated. The default single-host loopback path is unchanged. See [CHANGELOG.md](CHANGELOG.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history and [releases](https://github.com/Cohexa-ai/agent-coherence/releases) for tagged artifacts. Alpha — APIs may change before `v1.0`.
 

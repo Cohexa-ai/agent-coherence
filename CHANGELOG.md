@@ -4,6 +4,64 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [0.12.0] - 2026-07-14
+
+Atomic multi-artifact publish (commit a *set* of files all-or-nothing), the
+gate-independent slice of the cross-host TLS + networked-backend groundwork, and
+the MCP Registry manifest for the `stale-write-guard-fs` server. This is the
+first release published from the **`Cohexa-ai`** GitHub organization; the default
+single-host path is unchanged.
+
+### Added
+
+- **Atomic multi-artifact publish — `atomic_publish` / `commit_all`.** Commit a
+  *set* of artifacts all-or-nothing: either every member's version advances as
+  one unit or none does, so a torn commit (some files updated, others not) is
+  never a reachable state — the N-artifact generalization of the optimistic
+  `NoLostUpdate` guarantee. Single-host, one coordinator; all-or-nothing at the
+  **coordinator commit** (disk materialization is best-effort staged-rename after
+  the commit, and a rename failing partway raises a typed
+  `PublishMaterializationError` naming exactly which files landed). Not rollback
+  of already-escaped effects, and not cross-session write-skew prevention. The
+  `NoPartialPublish` property is formally specified in
+  `formal/tla/AtomicPublish.tla` (that spec is held out of the CI `tla-check`
+  matrix; the six other specs still run on every push). Run it:
+  `python -m examples.atomic_publish.main` (offline, deterministic).
+- **TLS transport guards + backend atomic-boundary contract.** The buildable,
+  gate-independent slice of the cross-host work — **no networked backend is
+  built**; a routed production deployment stays experimental and demand-gated.
+  Adds client-side TLS with fail-closed verification (an `https://` coordinator
+  URL verifies the certificate; a plaintext bearer token to a non-loopback host
+  is refused with a typed `InsecureTransportRefused` unless explicitly
+  acknowledged), a coordinator-side fail-closed routed-bind guard, and a
+  backend-agnostic atomic-boundary contract with a Tier-1 conformance kit that
+  both the in-memory and SQLite registries pass.
+- **MCP Registry manifest (`server.json`).** The manifest to publish the
+  `stale-write-guard-fs` MCP server to the [Official MCP
+  Registry](https://registry.modelcontextprotocol.io/) — PyPI package
+  `agent-coherence`, stdio transport.
+
+### Changed
+
+- **Repository moved to the `Cohexa-ai` GitHub organization.** All in-repo
+  references now point at `Cohexa-ai/agent-coherence`, and the MCP Registry
+  namespace is `io.github.cohexa-ai/stale-write-guard-fs`. Old `hipvlady/…` URLs
+  301-redirect. This is the first release published from the org's Trusted
+  Publisher: wheels from v0.12.0 attest `Cohexa-ai/agent-coherence` (wheels
+  ≤ v0.11.0 immutably attest `hipvlady/agent-coherence`; the verification steps
+  in `docs/security.md` are now version-scoped).
+- **Documentation accuracy + completeness pass.** Clarified that `CCSStore` is
+  read-side coherence — `put` is not version-CAS and does not deny a stale
+  write-back; write-side lost-update prevention is `CoherentVolume` / `write_cas`.
+  Added `.github/SECURITY.md`, a worktree/workspace-boundary note, MCP
+  multi-session semantics, and "when you don't need this" guidance; scoped the
+  front-page headline to single-host and marked the event-bus networked
+  transports as roadmap.
+
+### Fixed
+
+- Synced `uv.lock` with the declared optional-dependency extras (`dev`, `all`).
+
 ## [0.11.0] - 2026-07-02
 
 A read-side consistency layer that prevents read-skew within a coordinated
