@@ -48,7 +48,7 @@ full command-line toolset, and the API reference.
 
 ## Installation
 
-Pick the integration extra that matches your stack. The library is the same across all of them — only the adapter surface changes.
+Requires Python 3.11+. Pick the integration extra that matches your stack. The library is the same across all of them — only the adapter surface changes.
 
 ```bash
 # LangGraph (drop-in CCSStore)
@@ -96,6 +96,31 @@ graph = builder.compile(store=store)
 
 Node code stays identical — `store.get()`, `store.put()`, and `store.search()` all
 work the same way.
+
+**What CCSStore does at the write boundary.** CCSStore provides read-side
+coherence: when a peer commits a new version, your cached view is invalidated so
+your next read is a fresh miss. It does not deny a stale write-back — `put` is not
+version-CAS. For write-side lost-update prevention (a stale writer overwriting a
+peer), route writes through [`CoherentVolume`](#coherent-workspace-coherentvolume)
+or `write_cas`.
+
+**In-process scope.** CCSStore coherence is in-process: two separate OS processes
+each constructing their own CCSStore share nothing. For cross-process coordination
+over files, use [`CoherentVolume`](#coherent-workspace-coherentvolume).
+
+**The one-import swap assumes agent-carrying namespaces.** The drop-in is one import
+change *only if* your namespaces already carry the agent identity in `namespace[0]`
+(see [Namespace convention](#namespace-convention)) — that is what lets two agents
+share one artifact while keeping private scratch private. A store keyed the
+LangGraph-memory way, `(user_id, "memories")`, would collapse every user onto one
+shared artifact, so migrate those call sites to put the agent in `namespace[0]`
+before the swap.
+
+**CCSStore and your existing store.** CCSStore's cached contents live for the
+process lifetime, not on disk — it is not a database. If you already run Mem0,
+Letta, LlamaIndex, or a LangGraph store, keep it: it stays your durability layer,
+and CCSStore adds coherence for the cached view above it (a peer write invalidates a
+stale read). It does not wrap or replace your backend's storage.
 
 ---
 
@@ -351,8 +376,8 @@ store = CCSStore(
     strategy="lazy",
     crash_recovery=CrashRecoveryConfig(
         enabled=True,
-        heartbeat_timeout_ticks=10,
-        max_hold_ticks=1000,
+        heartbeat_timeout_ticks=120,
+        max_hold_ticks=900,
     ),
 )
 ```
@@ -563,7 +588,13 @@ content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
 
-### Atomic multi-file publish: `atomic_publish`
+When a commit loses its race on the volume (or MCP) path, the raised
+`CommitPreempted` is **terminal for that attempt, not a transient to retry blindly**:
+the version the write assumed no longer holds. Recover by `reacquire()`-ing,
+re-reading the fresh version, and reconciling your change onto it before committing
+again — a plain retry of the same bytes just loses the same race.
+
+### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
 `write_cas_at` lands one file. When an agent edits a *set* of files that must stay
 consistent — a plan and its manifest, a config split across files —
@@ -633,6 +664,38 @@ API is the supported contract; the shim is a convenience.
 
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.
+
+### Worktrees and the workspace boundary
+
+`CoherentVolume` coordinates by *path under one `workspace_root`*. Two git
+worktrees of the same repo are separate directory trees, so `plans/plan.md` in
+worktree A and `plans/plan.md` in worktree B are **different physical artifacts** to
+the volume — a write in one does not invalidate the other unless both processes route
+through the *same* shared workspace root. To make per-worktree sessions coordinate,
+point every volume at one common root (for example the primary checkout). The Claude
+Code plugin does this for you: it resolves the parent repo via
+`git rev-parse --git-common-dir` so sessions in sibling worktrees share one
+coordinator (`src/ccs/adapters/claude_code/resolver.py`).
+
+### When you don't need this
+
+Coherence is worth adding only when agents actually share mutable state through a
+back channel your framework doesn't already serialize. You can skip it when:
+
+- **Every agent owns an isolated workspace.** If sessions never write the same
+  artifact — separate worktrees, separate branches, separate keys with no shared
+  root — there is no lost update to prevent. (The moment they *do* converge on one
+  file or one shared root, the race is back.)
+- **A single database already arbitrates the writes.** If your shared state is rows
+  behind one transactional store, its own transactions and row locks already give
+  you last-committer-wins with no torn state. `CoherentVolume` targets *plain files*
+  and in-memory agent state, where nothing is arbitrating.
+
+The liveness tradeoff runs the other way: a crashed holder does not deadlock the
+fleet. A stalled `MODIFIED`/`EXCLUSIVE` grant is bounded and auto-reclaimed by the
+best-effort crash-recovery sweep (per artifact, never a global lock), and the
+`write_cas` / `atomic_publish` CAS paths hold no lock at all — a loser just re-reads
+and retries.
 
 ### Cross-host mode (experimental, default off)
 
@@ -764,6 +827,18 @@ Denials are machine-readable: an agent parses the typed payload (for example
 blindly. The server validates every file URI — path traversal and any access to
 the coordinator's own state directory are rejected — and fails closed on IO
 errors. Strict-mode, managed-path scoped.
+
+**Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
+pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
+across sessions; if the coordinator's session exits, peers fail closed.
+
+**Wiring a client to prefer `swg_*` over native file tools.** Registering the
+server exposes the `swg_*` tools, but an agent will still reach for its native
+Write/Edit on a managed path unless you steer it there. Deny the native file tools
+on managed paths — through the client's permission rules or a pre-tool hook — so
+writes have to go through `swg_write` / `swg_write_cas` and inherit the stale-view
+deny. The Claude Code adapter that wires this seam ships in
+`ccs.adapters.claude_code`.
 
 Run the red→green demo: `python -m examples.mcp_stale_write_guard.main`
 (offline, deterministic, no keys).
@@ -920,18 +995,22 @@ Use these to gate alerts or health checks without keeping a separate event list.
 
 All examples are runnable with `python -m examples.<name>.main` from the project root.
 
+Correctness demos lead; the token-savings / hit-rate demos follow.
+
 | Example | Command | What it shows |
 |---------|---------|---------------|
-| LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |
-| Code review pipeline | `python -m examples.code_review.main` | 3-agent, SHARED state transitions |
-| Research pipeline | `python -m examples.research_pipeline.main` | 4-agent, 3 artifacts, 60% hit rate |
-| Shared codebase | `python -m examples.shared_codebase.main` | 4-agent code review, 37.6% savings, benchmark output |
-| Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
+| Shared knowledge base | `python -m examples.shared_knowledge_base.main` | Lost update in a shared RAG / memory corpus; `CoherentVolume` denies B's stale overwrite so both findings survive (offline, no keys) |
+| Divergent memory | `python -m examples.divergent_memory.main` | Two sessions record contradictory beliefs from a stale read; the stale write is denied fail-closed so the divergence never forms (offline, no keys) |
 | Coherent volume | `python -m examples.coherent_volume.main` | Sequential stale-write deny + recovery on plain files (offline, no keys) |
 | Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
-| Cross-host | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
+| Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
+| Cross-host (experimental) | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
+| LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |
+| Code review pipeline | `python -m examples.code_review.main` | 3-agent, SHARED state transitions |
+| Research pipeline | `python -m examples.research_pipeline.main` | 4-agent, 3 artifacts, 60% hit rate |
+| Shared codebase | `python -m examples.shared_codebase.main` | 4-agent code review, 37.6% savings, benchmark output |
 
 ### Code review pipeline
 
@@ -1312,7 +1391,7 @@ from ccs.coordinator.service import CrashRecoveryConfig
 
 adapter = LangGraphAdapter(
     strategy_name="lazy",
-    crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=10, max_hold_ticks=1000),
+    crash_recovery=CrashRecoveryConfig(enabled=True, heartbeat_timeout_ticks=120, max_hold_ticks=900),
 )
 for name in ("planner", "researcher", "executor"):
     adapter.register_agent(name, now_tick=0)

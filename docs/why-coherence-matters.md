@@ -141,11 +141,44 @@ strongly consistent the backing store is. Coherence here is about keeping the
 underneath whatever vector store, memory library (Mem0, Letta, LlamaIndex), or
 plain file you already use to retrieve and remember.
 
-The boundary is worth stating plainly. Writes that go through the coordinator
-are caught. Auto-watching an *unmanaged external source* that changes with no
-coordinator write — a hand-edited corpus file, an out-of-band re-index — is a
-separate problem (a source-watcher), not solved by keeping cached readers
-coherent.
+The boundary is worth stating plainly. CCSStore provides read-side coherence:
+when a peer commits a new version, your cached view is invalidated so your next
+read is a fresh miss. It does not deny a stale write-back — `put` is not
+version-CAS. For write-side lost-update prevention (a stale writer overwriting a
+peer), route writes through CoherentVolume or `write_cas`. Separately,
+auto-watching an *unmanaged external source* that changes with no coordinator
+write — a hand-edited corpus file, an out-of-band re-index — is a source-watcher
+problem, not solved by keeping cached readers coherent.
+
+### The same class lands on repos, configs, and CI
+
+The evidence above is Segment A — shared memory and orchestration state. The
+identical stale-read→write class also lands on a second surface: **shared
+repositories, configuration, and CI inputs** worked by more than one automated
+actor (parallel coding agents, bots, pipelines). The reports below are from
+unrelated third-party projects. They validate the failure *class*, not this
+library's mechanism, and none of them are users of it.
+
+- **Renovate [#18804](https://github.com/renovatebot/renovate/issues/18804)**:
+  the bot checks a branch as unmodified using a cached result, then rebases —
+  but the user force-pushed between the check and the write, so the rebase
+  clobbers their commits. The reporter names it directly: "a time-of-check vs
+  time-of-use bug." A cached read that has gone stale, driving a write-back.
+- **Terraform's `Saved plan is stale` error**: `terraform apply` refuses a
+  saved plan once current state has moved past the snapshot the plan was
+  computed against. The tool fails closed rather than apply a stale plan — an
+  explicit guard against the stale-read→write hazard on infrastructure state.
+- **Atlantis** (PR-driven Terraform automation) shows the same shape at team
+  scale: parallel PRs plan against a base a merged peer has already advanced,
+  so a later apply runs on a stale plan.
+- **Parallel Claude Code sessions** on one repository exhibit it directly — two
+  sessions read shared files, plans, or configs, and one writes back over a
+  version a peer already advanced.
+
+The pattern is invariant across surfaces: an automated actor reads shared state,
+does work, and writes back against a version that has since moved. As with
+Segment A, the shipped enforcement here is single-host (one coordinator);
+cross-host coordination is on the roadmap, demand-gated.
 
 ## 7. Open questions
 
@@ -155,7 +188,22 @@ Several questions remain unanswered by any framework or library:
 - **Is coherence worth its coordination cost for small agent counts?** At 2–3 agents with small shared state, full rebroadcasting may be cheaper than maintaining coherence metadata. The crossover point is not well-characterized.
 - **What isolation level does agent memory specifically need?** Section 6 argues the same read-your-writes coherence that applies to orchestration state applies to memory and RAG — the staleness is in the cached view, not the store. What remains open is whether *long-term* memory (e.g., `langmem`) needs a stronger level than ephemeral shared state — snapshot isolation across a multi-step recall, say — or whether read-your-writes suffices there too.
 
+## 8. One approach — and an invitation
+
+This document is written problem-first: it maps the gap, and names a shipped
+surface only where a claim needs an honest boundary. For one concrete approach
+to closing the gap — MESI-derived coherence over
+multi-agent shared state — see
+[How agent-coherence Fills the Gap](agent-coherence-approach.md).
+
+If you are hitting this shape in production — a stale read that lands on a
+write-back over a peer's update, on shared memory, a repo, or a config — we
+would like to hear how it shows up for you. Independent reproductions of the
+failure class are especially useful. The shipped enforcement is single-host
+(one coordinator); cross-host coordination is on the roadmap, demand-gated.
+
 ---
 
-*Last verified: May 7, 2026. All URLs were confirmed live and all claims
-checked against current source material on this date.*
+*Last verified: May 7, 2026 (Segment-A evidence). Segment-B anchors (§6) added
+and confirmed live July 14, 2026. All URLs were confirmed live and all claims
+checked against current source material on these dates.*

@@ -19,7 +19,7 @@ security advisory](https://github.com/Cohexa-ai/agent-coherence/security/advisor
 a `CoherentVolume` at a remote coordinator (`CCS_REMOTE_HOST` / `CCS_REMOTE_PORT` /
 `CCS_REMOTE_SECRET_FILE`) makes the client open connections to that
 **user-configured, private-range coordinator endpoint** — never the internet, and
-no telemetry. This is the only network traffic the library generates, it is opt-in,
+no telemetry. This is the only host-leaving traffic the library generates, it is opt-in,
 and the coordinator only binds beyond loopback to an RFC-1918/4193 address (see the
 cross-host demo, `examples/cross_host/`). With the flag unset the zero-outbound
 posture above is unchanged.
@@ -99,6 +99,19 @@ set these **narrowly** (per-invocation / per-compose-service), never as a
 persistent global — a forgotten global assertion would blanket every future routed
 bind. Production TLS/mTLS termination is a separate hardening step; the cross-host
 mode as a whole remains experimental and default-off.
+
+### MCP server network posture
+
+The `stale-write-guard-fs` MCP server (installed via the `[mcp]` extra —
+`pip install "agent-coherence[mcp]"`) speaks the Model Context Protocol over
+**stdio only**. It opens no listening sockets and makes no outbound network
+calls: a host such as Claude Desktop or Cursor spawns it as a subprocess and
+talks to it over stdin/stdout, and the server coordinates writes through an
+in-process `CoherentVolume` on the local filesystem. There is nothing to firewall
+and no endpoint to configure on this path. See the MCP sections of the
+[README](../README.md#mcp-server-stale-write-guard-fs) and the
+[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the five `swg_*`
+tools.
 
 ## Env-var kill switches
 
@@ -219,11 +232,26 @@ prefer `requirements-diagnose.txt` for reproducible installs.
 ## Verifying release attestations (PEP 740)
 
 Each wheel published to PyPI ships with a Sigstore-backed PEP 740 attestation
-tied to the GitHub Actions workflow that built it. To verify before installing:
+tied to the GitHub Actions workflow that built it. The attesting repository is
+**version-scoped** — the project moved from `hipvlady/agent-coherence` to
+`Cohexa-ai/agent-coherence`, and each already-published wheel immutably attests
+the repository it was built under:
+
+- **Wheels v0.11.0 and earlier** attest repository `hipvlady/agent-coherence`
+  (built before the org migration; same maintainer, and the old URL redirects to
+  the new org). Verify these with `--repo hipvlady/agent-coherence`.
+- **Wheels v0.12.0 and later** attest repository `Cohexa-ai/agent-coherence`
+  (published from the Cohexa-ai Trusted Publisher). Verify these with
+  `--repo Cohexa-ai/agent-coherence`.
+
+To verify before installing, pass the repository that matches the version you
+are installing:
 
     pip install pypi-attestations
+    # v0.12.0 and later  →  --repo Cohexa-ai/agent-coherence
+    # v0.11.0 and earlier →  --repo hipvlady/agent-coherence
     pypi-attestations verify --provenance \
-        --repo Cohexa-ai/agent-coherence \
+        --repo <REPO-FOR-THIS-VERSION> \
         --workflow release.yml \
         agent_coherence-X.Y.Z-py3-none-any.whl
 
@@ -235,9 +263,13 @@ You can also inspect the raw signed attestation directly:
       | python3 -m json.tool
 
 The `publisher` block in each attestation bundle should report
-`{kind: GitHub, repository: Cohexa-ai/agent-coherence, workflow: release.yml, environment: pypi}`.
-A publisher mismatch is the signature of a Trusted Publisher misconfiguration —
-do not install if the values diverge from those above.
+`{kind: GitHub, repository: <REPO-FOR-THIS-VERSION>, workflow: release.yml, environment: pypi}`,
+where `<REPO-FOR-THIS-VERSION>` is `hipvlady/agent-coherence` for wheels v0.11.0
+and earlier and `Cohexa-ai/agent-coherence` for wheels v0.12.0 and later. A
+publisher that reports neither expected value — or reports the wrong one for the
+version being installed — is the signature of a Trusted Publisher
+misconfiguration or a tampered release: do not install if the values diverge from
+the version-scoped expectation above.
 
 > **Note on `gh attestation verify`.** That command queries GitHub's SLSA
 > build-provenance attestation store, which the current release workflow does
