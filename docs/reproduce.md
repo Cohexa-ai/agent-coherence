@@ -2,6 +2,8 @@
 
 Results in [Token Coherence: Adapting MESI Cache Protocols to Minimize Synchronization Overhead in Multi-Agent LLM Systems](https://arxiv.org/abs/2603.15183) §8 are reproducible from this repository.
 
+> **Scope:** this page reproduces the **cost-proxy pipeline** — the cost/simulation axis (re-fetches avoided under coherence-gating). It does not exercise the correctness properties; for those, see [Reproducing the correctness claims](#reproducing-the-correctness-claims) below.
+
 ## Requirements
 
 - Python 3.11+
@@ -54,3 +56,16 @@ The seeded sweep reproduces the committed `benchmarks/results/cost_sweep_publish
 The simulation models token transmission accounting, MESI state transitions, write-frequency effects, and artifact volatility.
 
 It does not model LLM inference latency, real framework scheduler jitter, or event bus network RTT outside the configured simulator latency/loss parameters.
+
+## Reproducing the correctness claims
+
+The numbers above are a **cost/simulation** proxy, not a correctness proof. The coherence properties are shown by runnable examples and machine-checked models — all single-host:
+
+| What it shows | Where |
+|---------------|-------|
+| A stale write-back is denied (write-side lost-update prevention) | [`examples/coherent_volume`](../examples/coherent_volume/README.md) |
+| Concurrent writers to one artifact — the stale writer is rejected | [`examples/concurrent_writers`](../examples/concurrent_writers/README.md) |
+| `gate()` orders side effects behind a fresh read (it orders effects; it does not roll back) | [`examples/effect_gate`](../examples/effect_gate/README.md) |
+| Machine-checked TLA+ safety models (the CI-run specs and their named invariants) | [`formal/tla/`](../formal/tla/README.md) |
+
+Enforcement is single-host (one coordinator). Cross-host coordination is on the roadmap, demand-gated.
