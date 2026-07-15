@@ -39,7 +39,6 @@ the ETag round-trip and the conditional-write semantics well-defined.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Final
 
@@ -48,6 +47,8 @@ from ccs.adapters.substrate import (
     CasUnknown,
     CasWriteResult,
     CasWritten,
+    ReconcileDecision,
+    ReconcileVerdict,
     SubstrateToken,
 )
 from ccs.core.exceptions import CasVersionConflict, CoherenceError
@@ -193,101 +194,14 @@ def _cas_result_for_outcome(outcome: S3PutOutcome) -> CasWriteResult:
 
 
 # --- unknown-after-put reconciliation (the total four-arm branch) --------------
-
-
-class ReconcileVerdict(Enum):
-    """What the caller must do after an unconfirmed put, once the object is re-read.
-
-    The total four-arm branch. Every arm runs under the client-held pending intent
-    ``(T_old, intended_hash, intended_bytes, expected coordinator V)`` and does
-    exactly ONE ``get_object`` (never Head-then-Get), Region/endpoint-pinned to
-    the write's:
-
-    - ``HOLD`` — 404 (raced delete / delete-marker-current): UNCONFIRMED. Reacquire
-      and re-decide; NEVER auto re-create — a delete is itself an update. Never a
-      match against ``sha256(b"")``.
-    - ``RE_DRIVE`` — the ETag is UNMOVED (``== T_old``): the write has not landed.
-      Re-drive is eligible ONLY here and ONLY under ``If-Match=T_old`` — the
-      possibly-in-flight ghost and the re-drive carry identical bytes and the same
-      precondition, so at most one lands; a 412 loops back into this branch.
-    - ``CONVERGE`` — the ETag MOVED and the observed bytes hash to ``intended_hash``.
-      Adopt the observed ``(bytes, ETag)`` as the comparand AND still fire the
-      coordinator bump (:attr:`ReconcileDecision.bump_fires`). Convergence settles
-      the substrate leg only; the coordinator version-CAS arbitrates the
-      mine-vs-byte-identical-peer ambiguity. The surface says "converged", NEVER
-      "landed" — attribution is not claimed.
-    - ``CONFLICT`` — the ETag MOVED and the bytes DIFFER: a real peer write.
-      Reacquire and re-decide; NEVER re-drive a superseded write.
-    """
-
-    HOLD = "hold"
-    RE_DRIVE = "re_drive"
-    CONVERGE = "converge"
-    CONFLICT = "conflict"
-
-
-_VERDICT_SUMMARY: Final[dict["ReconcileVerdict", str]] = {
-    ReconcileVerdict.HOLD: (
-        "unconfirmed: the object or its token is absent (404 / delete-marker) — "
-        "reacquire and re-decide; never auto re-create (a delete is itself an update)"
-    ),
-    ReconcileVerdict.RE_DRIVE: (
-        "not confirmed yet: the ETag is unmoved, so re-drive the identical bytes "
-        "under If-Match=T_old (at most one of the in-flight ghost and the re-drive wins)"
-    ),
-    ReconcileVerdict.CONVERGE: (
-        "converged: the observed bytes are byte-identical to the intended write, so "
-        "adopt the observed ETag as the comparand and STILL fire the coordinator bump. "
-        "Attribution is not claimed — this is convergence, not confirmation"
-    ),
-    ReconcileVerdict.CONFLICT: (
-        "conflict: the ETag moved and the bytes differ — reacquire and re-decide; "
-        "never re-drive a superseded write"
-    ),
-}
-
-
-@dataclass(frozen=True)
-class ReconcileDecision:
-    """The verdict of :meth:`CoherentObject.reconcile_after_unknown` plus what the
-    reconciliation read observed.
-
-    ``observed_bytes`` / ``observed_token`` carry the consistent ``(bytes, ETag)``
-    pair from the single reconciliation read (both ``None`` on a HOLD, where the
-    object was absent). ``CONVERGE`` is the ONLY verdict on which a caller settles
-    the substrate leg without re-deriving — and even then the "did MY write land"
-    question is left to the coordinator version-CAS, never to a bare content match.
-    """
-
-    verdict: ReconcileVerdict
-    observed_bytes: bytes | None
-    observed_token: SubstrateToken | None
-
-    @property
-    def bump_fires(self) -> bool:
-        """Whether Unit 5 must STILL drive the coordinator version bump.
-
-        True on ``CONVERGE`` ONLY. Refusing to bump on a converged write (the
-        "never converge" mistake) strands the coordinator behind the substrate and
-        wedges every peer (``ViewWedged``, no v1 repair-forward); firing it on any
-        other verdict would advance the version for a write that did not land.
-        """
-        return self.verdict is ReconcileVerdict.CONVERGE
-
-    @property
-    def re_drive_token(self) -> SubstrateToken | None:
-        """The ``If-Match`` precondition to re-drive under — set only on ``RE_DRIVE``.
-
-        Equal to ``T_old`` (the ETag is unmoved). Re-driving under any other
-        precondition is forbidden; every other verdict returns ``None``.
-        """
-        return self.observed_token if self.verdict is ReconcileVerdict.RE_DRIVE else None
-
-    @property
-    def summary(self) -> str:
-        """Human-facing wording for the verdict. The ``CONVERGE`` surface says
-        "converged", never "landed" — attribution is not claimed."""
-        return _VERDICT_SUMMARY[self.verdict]
+#
+# The verdict vocabulary (:class:`ReconcileVerdict`) and the decision type
+# (:class:`ReconcileDecision`, with ``bump_fires`` / ``re_drive_token`` /
+# ``summary``) are the UNIFIED types from ``ccs.adapters.substrate`` — one
+# language shared with the Postgres arm so the cross-agent commit dispatches
+# uniformly. This binding's four-arm branch reaches HOLD (404 / delete-marker),
+# RE_DRIVE (ETag unmoved), CONVERGE (ETag moved + bytes match — the bump STILL
+# fires), and CONFLICT (ETag moved + bytes differ). Re-exported below for callers.
 
 
 # --- the binding ---------------------------------------------------------------

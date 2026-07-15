@@ -46,7 +46,6 @@ import logging
 import re
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
 from ccs.adapters.substrate import (
@@ -54,6 +53,8 @@ from ccs.adapters.substrate import (
     CasUnknown,
     CasWriteResult,
     CasWritten,
+    ReconcileDecision,
+    ReconcileVerdict,
     SubstrateToken,
 )
 from ccs.core.exceptions import (
@@ -175,46 +176,11 @@ def _is_unconfirmed_error(exc: BaseException) -> bool:
     return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
 
 
-# --- reconciliation decision (local; Unit 5 unifies with the S3 arm) --------
-
-
-class ReconcileVerdict(Enum):
-    """What the caller should do after an unconfirmed write, once the row is re-read.
-
-    - ``CONVERGE`` — the re-read proves an ``expected + 1`` version *and* the
-      intended bytes, so adopt the observed ``(bytes, token)`` and settle the
-      substrate leg. Attribution is not claimed (a byte-identical concurrent
-      peer is arbitrated by the coordinator's version-CAS); the write is
-      "converged", never "landed".
-    - ``RE_DERIVE`` — the write did not land as mine (version unmoved, or moved
-      but not to ``expected + 1``, or bytes differ). Re-read fresh, rebuild the
-      intended bytes against the current state, and retry.
-    - ``HOLD`` — the outcome is unconfirmable (the row is absent, or its version
-      is an unusable sentinel). Never treat this as a match; ``reacquire`` and
-      re-decide. Coordinator state must never advance on a HOLD.
-    """
-
-    CONVERGE = "converge"
-    RE_DERIVE = "re_derive"
-    HOLD = "hold"
-
-
-@dataclass(frozen=True)
-class ReconcileDecision:
-    """The verdict of :meth:`CoherentRow.reconcile_after_unknown` plus what was
-    observed on the re-read.
-
-    ``observed_bytes`` / ``observed_token`` carry the consistent pair from the
-    reconciliation read (both ``None`` on a HOLD, where the row was absent or its
-    version unusable). The ``CONVERGE`` verdict is the ONLY one on which a caller
-    may settle the substrate leg without re-deriving; every verdict leaves the
-    "did MY write land" question to the coordinator version-CAS, never to a bare
-    content match.
-    """
-
-    verdict: ReconcileVerdict
-    observed_bytes: bytes | None
-    observed_token: SubstrateToken | None
+# The reconciliation seam (:class:`ReconcileVerdict` / :class:`ReconcileDecision`)
+# is the UNIFIED type from ``ccs.adapters.substrate`` — one vocabulary shared with
+# the S3 arm so the cross-agent commit dispatches uniformly. This binding uses
+# only its Postgres-honest arms: CONVERGE (version ``expected + 1`` under MY
+# identity), RE_DERIVE, and HOLD. Re-exported below for callers.
 
 
 # --- provisioning DDL (emitted, never executed at runtime) ------------------
