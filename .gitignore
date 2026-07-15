@@ -10,6 +10,13 @@ docs/*
 !docs/reproduce.md
 !docs/security.md
 !docs/ccs-diagnose.md
+# docs/usage/byo-substrate.md is end-user-facing, but a bare "!" negation can't
+# re-include it while "docs/*" excludes its parent directory. Re-include the
+# directory, re-exclude its contents, then whitelist just this file — so the
+# rest of docs/usage/ stays local-only like everything else under docs/.
+!docs/usage/
+docs/usage/*
+!docs/usage/byo-substrate.md
 
 states/
 __pycache__/
