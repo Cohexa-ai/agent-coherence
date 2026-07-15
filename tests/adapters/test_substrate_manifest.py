@@ -457,6 +457,16 @@ def test_uri_dsn_hostaddr_comma_gap_checks_unpaired_host(tmp_path):
         load(tmp_path, data, resolver=resolver)
 
 
+@pytest.mark.parametrize("dsn", ["service=prod sslmode=require", "postgresql:///app?service=prod"])
+def test_pg_dsn_service_keyword_refused_fail_closed(tmp_path, dsn):
+    # service= draws host/hostaddr from a pg_service.conf this loader cannot read,
+    # so the real target is unclassifiable — refused rather than silently admitted.
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data)
+
+
 def test_keyword_dsn_inline_password_rejected(tmp_path):
     dsn = "host=db.example.com sslmode=require password=S3cr3tP@ss"
     data = {"artifacts": [pg_artifact(dsn)]}

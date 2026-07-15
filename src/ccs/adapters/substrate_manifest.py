@@ -395,11 +395,26 @@ class _PgTarget:
     hostaddrs: list[str]
     sslmode: str | None
     has_inline_password: bool
+    service: str | None = None
 
 
 def _check_pg_dsn(dsn: str, *, resolver: HostResolver, env: Mapping[str, str]) -> None:
-    """SSRF-check every dialed Postgres host and enforce TLS for a routable one."""
+    """SSRF-check every dialed Postgres host and enforce TLS for a routable one.
+
+    Fail-closed residual: libpq can also draw host/hostaddr from sources this
+    text parser cannot see — a ``service=`` entry in ``pg_service.conf`` (refused
+    here, since the real target is unclassifiable), and the ``PGHOST`` /
+    ``PGHOSTADDR`` / ``PGSERVICE`` environment variables (invisible in the DSN
+    string). An operator relying on egress control should pin host/hostaddr in
+    the manifest, not inherit them.
+    """
     target = _parse_pg_dsn(dsn)
+    if target.service is not None:
+        raise SubstrateTargetDenied(
+            f"service={target.service}",
+            "target is resolved from a pg_service.conf this loader cannot read, so "
+            "it cannot be SSRF-checked — refused (fail-closed); inline host/hostaddr",
+        )
     if target.has_inline_password:
         raise SubstrateCredentialRefused("the connection DSN carries an inline password")
     routable, network_hosts = _check_pg_hosts(target, resolver=resolver, env=env)
@@ -496,7 +511,13 @@ def _parse_pg_keywords(dsn: str) -> _PgTarget:
     hosts = [_debracket(h) for h in _split_csv(params.get("host"))]
     hostaddrs = [_debracket(h) for h in _split_csv(params.get("hostaddr"))]
     sslmode = (params.get("sslmode") or "").lower() or None
-    return _PgTarget(hosts, hostaddrs, sslmode, has_inline_password=bool(params.get("password")))
+    return _PgTarget(
+        hosts,
+        hostaddrs,
+        sslmode,
+        has_inline_password=bool(params.get("password")),
+        service=params.get("service") or None,
+    )
 
 
 def _conninfo_params(dsn: str) -> dict[str, str]:
@@ -578,7 +599,14 @@ def _parse_pg_uri(dsn: str) -> _PgTarget:
     for value in _query_all(query, "hostaddr"):
         hostaddrs += [_debracket(h) for h in _split_csv(value)]
     sslmode = _least_safe_sslmode(_query_all(query, "sslmode"))
-    return _PgTarget(hosts, hostaddrs=hostaddrs, sslmode=sslmode, has_inline_password=has_password)
+    service = next(iter(_query_all(query, "service")), None)
+    return _PgTarget(
+        hosts,
+        hostaddrs=hostaddrs,
+        sslmode=sslmode,
+        has_inline_password=has_password,
+        service=service,
+    )
 
 
 def _split_csv(value: str | None) -> list[str]:
