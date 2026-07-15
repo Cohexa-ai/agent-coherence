@@ -419,8 +419,14 @@ def _check_pg_hosts(
 ) -> tuple[bool, list[str]]:
     """Classify the dialed hosts; return ``(routable, checked_network_hosts)``.
 
-    ``hostaddr=`` is the authoritative dialed target when present; a leading
-    ``/`` host is a unix socket — a local target, exempt and NOT resolved.
+    Every ``host`` AND every ``hostaddr`` entry is checked — the UNION, not
+    ``hostaddr`` alone. libpq pairs ``host[i]``/``hostaddr[i]`` per position and
+    dials whichever the position resolves to, and a comma-list count mismatch (a
+    trailing/empty slot) can leave a ``host`` entry unpaired and dialed. Checking
+    the union never skips a candidate a positional ``hostaddr``-authoritative rule
+    would miss; over-checking a name used only for TLS SNI fails closed, which is
+    the safe direction. A leading ``/`` host is a unix socket — a local target,
+    exempt and NOT resolved.
 
     Rebind residual (parity with :func:`_check_s3_endpoint`): for a bare-hostname
     target (no ``hostaddr=``), libpq re-resolves the name at connect time,
@@ -430,12 +436,13 @@ def _check_pg_hosts(
     resolved IP into ``hostaddr`` (host retained for TLS SNI) would close the
     window and is the intended future hardening.
     """
-    dialed = target.hostaddrs if target.hostaddrs else target.hosts
+    seen: set[str] = set()
     routable = False
     network_hosts: list[str] = []
-    for host in dialed:
-        if host.startswith("/"):
+    for host in (*target.hostaddrs, *target.hosts):
+        if host.startswith("/") or host in seen:
             continue
+        seen.add(host)
         if not _reject_denied_target(host, resolver=resolver, env=env):
             routable = True
         network_hosts.append(host)
@@ -554,18 +561,23 @@ def _parse_pg_uri(dsn: str) -> _PgTarget:
     userinfo, _, hostpart = parts.netloc.rpartition("@")
     query = parse_qs(parts.query)
     # libpq honors host/hostaddr/password/sslmode given as URI query parameters and
-    # dials them — hostaddr in particular is the authoritative dialed IP, and host
-    # is used only for TLS SNI/cert. Parsing them here closes the URI-form
-    # equivalent of the keyword-form guards (an unchecked ``?hostaddr=`` would
-    # otherwise reach cloud metadata past a benign-looking hostname).
-    has_password = (":" in userinfo and userinfo.split(":", 1)[1] != "") or bool(
-        _query_first(query, "password")
+    # dials them. A repeated query key is merged by libpq to a SINGLE value
+    # (documented last-wins, but version-dependent), so this parser never picks one
+    # occurrence: it collects ALL host/hostaddr values (the union, checked by
+    # _check_pg_hosts) and takes the most-restrictive sslmode — immune to the merge
+    # order. This closes the URI-form guards (an unchecked ``?hostaddr=``, or a
+    # ``?host=safe&host=metadata`` duplicate, would otherwise reach a denied target
+    # past a benign-looking value).
+    has_password = (":" in userinfo and userinfo.split(":", 1)[1] != "") or any(
+        _query_all(query, "password")
     )
     hosts = [_strip_port(h) for h in _split_csv(hostpart)]
-    hosts += [_debracket(h) for h in _split_csv(_query_first(query, "host"))]
-    hostaddrs = [_debracket(h) for h in _split_csv(_query_first(query, "hostaddr"))]
-    sslmode_raw = _query_first(query, "sslmode")
-    sslmode = sslmode_raw.lower() if sslmode_raw else None
+    for value in _query_all(query, "host"):
+        hosts += [_debracket(h) for h in _split_csv(value)]
+    hostaddrs: list[str] = []
+    for value in _query_all(query, "hostaddr"):
+        hostaddrs += [_debracket(h) for h in _split_csv(value)]
+    sslmode = _least_safe_sslmode(_query_all(query, "sslmode"))
     return _PgTarget(hosts, hostaddrs=hostaddrs, sslmode=sslmode, has_inline_password=has_password)
 
 
@@ -591,14 +603,31 @@ def _strip_port(hostport: str) -> str:
     return head if sep and tail.isdigit() else text
 
 
-def _query_first(query: dict[str, list[str]], key: str) -> str | None:
-    """The first value for ``key`` in a ``parse_qs`` mapping, or None.
+def _query_all(query: dict[str, list[str]], key: str) -> list[str]:
+    """Every value for ``key`` in a ``parse_qs`` mapping (order preserved).
 
-    Case is preserved (a password is case-sensitive); the caller lowercases the
-    keys where case is irrelevant (``sslmode``).
+    All occurrences are returned, not one: a repeated security-relevant key must
+    have every candidate checked, since a parser that picked a single occurrence
+    could disagree with libpq's merge order and miss a denied target. Case is
+    preserved (a password is case-sensitive).
     """
-    values = query.get(key)
-    return values[0] if values else None
+    return list(query.get(key, ()))
+
+
+def _least_safe_sslmode(values: list[str]) -> str | None:
+    """The most-restrictive sslmode across ``values`` (duplicate-key safe).
+
+    Returns None when unset (treated as plaintext-capable downstream). If ANY
+    occurrence is not TLS-safe, that unsafe mode is returned so the TLS guard
+    fires — never trusting a safe occurrence to mask an unsafe one.
+    """
+    lowered = [v.lower() for v in values]
+    if not lowered:
+        return None
+    for mode in lowered:
+        if mode not in _TLS_SAFE_SSLMODES:
+            return mode
+    return lowered[0]
 
 
 # ---------------------------------------------------------------------------

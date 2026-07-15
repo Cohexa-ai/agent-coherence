@@ -403,6 +403,60 @@ def test_keyword_dsn_unterminated_quote_fails_closed(tmp_path):
         load(tmp_path, data)
 
 
+def test_uri_dsn_duplicate_host_metadata_denied(tmp_path):
+    # A repeated ?host= must have EVERY value checked (libpq merges duplicates to
+    # one value in a version-dependent order) — benign-first, metadata-last is
+    # still denied.
+    dsn = "postgresql:///app?host=safe.example&host=169.254.169.254&sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+    resolver = make_resolver({"safe.example": [PUBLIC_IP]})
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=resolver)
+
+
+def test_uri_dsn_duplicate_hostaddr_metadata_denied(tmp_path):
+    # The fix's own headline case, reopened by a duplicate: benign-first,
+    # metadata-last hostaddr.
+    dsn = "postgresql:///app?hostaddr=1.2.3.4&hostaddr=169.254.169.254&sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data)
+
+
+def test_uri_dsn_duplicate_sslmode_tls_downgrade_blocked(tmp_path):
+    # A safe-first, unsafe-last sslmode must not mask the plaintext mode: the
+    # most-restrictive wins, so the plaintext-credential guard still fires.
+    dsn = "postgresql:///app?hostaddr=203.0.113.9&sslmode=require&sslmode=disable"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateInsecureTransport):
+        load(tmp_path, data)
+
+
+def test_keyword_dsn_hostaddr_comma_gap_checks_unpaired_host(tmp_path):
+    # host has more entries than hostaddr (a trailing comma drops a slot); libpq
+    # dials the unpaired host, so it must be checked — never skipped by an
+    # 'hostaddr is authoritative' shortcut.
+    dsn = "host=127.0.0.1,evil.example hostaddr=127.0.0.1, sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+    resolver = make_resolver({"evil.example": ["169.254.169.254"]})
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=resolver)
+
+
+def test_uri_dsn_hostaddr_comma_gap_checks_unpaired_host(tmp_path):
+    # Same comma-gap, URI form: the unpaired ?host= entry is still checked.
+    dsn = "postgresql:///app?host=127.0.0.1,evil.example&hostaddr=127.0.0.1,"
+    data = {"artifacts": [pg_artifact(dsn)]}
+    resolver = make_resolver({"evil.example": ["169.254.169.254"]})
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=resolver)
+
+
 def test_keyword_dsn_inline_password_rejected(tmp_path):
     dsn = "host=db.example.com sslmode=require password=S3cr3tP@ss"
     data = {"artifacts": [pg_artifact(dsn)]}
