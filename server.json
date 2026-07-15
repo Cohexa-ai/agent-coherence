@@ -7,14 +7,14 @@
     "url": "https://github.com/Cohexa-ai/agent-coherence",
     "source": "github"
   },
-  "version": "0.11.0",
+  "version": "0.12.0",
   "websiteUrl": "https://agent-coherence.dev",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "agent-coherence",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
