@@ -421,6 +421,14 @@ def _check_pg_hosts(
 
     ``hostaddr=`` is the authoritative dialed target when present; a leading
     ``/`` host is a unix socket — a local target, exempt and NOT resolved.
+
+    Rebind residual (parity with :func:`_check_s3_endpoint`): for a bare-hostname
+    target (no ``hostaddr=``), libpq re-resolves the name at connect time,
+    decoupled from this load-time resolver check, so a hostname whose DNS is
+    attacker-controlled can rebind to a denied target after validation passes.
+    The load-time check still catches static misconfiguration; pinning the
+    resolved IP into ``hostaddr`` (host retained for TLS SNI) would close the
+    window and is the intended future hardening.
     """
     dialed = target.hostaddrs if target.hostaddrs else target.hosts
     routable = False
@@ -477,24 +485,88 @@ def _parse_pg_dsn(dsn: str) -> _PgTarget:
 
 
 def _parse_pg_keywords(dsn: str) -> _PgTarget:
-    params: dict[str, str] = {}
-    for token in dsn.split():
-        key, sep, value = token.partition("=")
-        if sep:
-            params[key.strip()] = value.strip()
+    params = _conninfo_params(dsn)
     hosts = [_debracket(h) for h in _split_csv(params.get("host"))]
     hostaddrs = [_debracket(h) for h in _split_csv(params.get("hostaddr"))]
     sslmode = (params.get("sslmode") or "").lower() or None
     return _PgTarget(hosts, hostaddrs, sslmode, has_inline_password=bool(params.get("password")))
 
 
+def _conninfo_params(dsn: str) -> dict[str, str]:
+    """Decompose a libpq keyword/value conninfo string the way libpq parses it.
+
+    Tolerates whitespace around ``=`` and single-quoted values with backslash
+    escapes, so a space-padded DSN (``host = h  password = p``) cannot tokenize to
+    nothing and slip a host/password/sslmode past the SSRF, inline-secret, and TLS
+    guards. Fails closed (:class:`ManifestError`) on a malformed pair or an
+    unterminated quote rather than silently dropping it. Keyword case is preserved
+    (libpq keywords are canonical lowercase; an uppercase key is an unknown libpq
+    keyword that would not dial anyway), and the security-relevant keys are looked
+    up lowercase by the caller.
+    """
+    params: dict[str, str] = {}
+    i, n = 0, len(dsn)
+    while i < n:
+        while i < n and dsn[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        while i < n and not dsn[i].isspace() and dsn[i] != "=":
+            i += 1
+        keyword = dsn[start:i]
+        while i < n and dsn[i].isspace():
+            i += 1
+        if i >= n or dsn[i] != "=":
+            raise ManifestError("malformed Postgres DSN: expected '=' after keyword")
+        i += 1
+        while i < n and dsn[i].isspace():
+            i += 1
+        value, i = _read_conninfo_value(dsn, i, n)
+        if keyword:
+            params[keyword] = value
+    return params
+
+
+def _read_conninfo_value(dsn: str, i: int, n: int) -> tuple[str, int]:
+    """Read one conninfo value (single-quoted or bare) from ``dsn[i:]``."""
+    chars: list[str] = []
+    if i < n and dsn[i] == "'":
+        i += 1
+        while i < n and dsn[i] != "'":
+            if dsn[i] == "\\" and i + 1 < n:
+                i += 1
+            chars.append(dsn[i])
+            i += 1
+        if i >= n:
+            raise ManifestError("malformed Postgres DSN: unterminated quoted value")
+        return "".join(chars), i + 1
+    while i < n and not dsn[i].isspace():
+        if dsn[i] == "\\" and i + 1 < n:
+            i += 1
+        chars.append(dsn[i])
+        i += 1
+    return "".join(chars), i
+
+
 def _parse_pg_uri(dsn: str) -> _PgTarget:
     parts = urlsplit(dsn)
     userinfo, _, hostpart = parts.netloc.rpartition("@")
-    has_password = ":" in userinfo and userinfo.split(":", 1)[1] != ""
+    query = parse_qs(parts.query)
+    # libpq honors host/hostaddr/password/sslmode given as URI query parameters and
+    # dials them — hostaddr in particular is the authoritative dialed IP, and host
+    # is used only for TLS SNI/cert. Parsing them here closes the URI-form
+    # equivalent of the keyword-form guards (an unchecked ``?hostaddr=`` would
+    # otherwise reach cloud metadata past a benign-looking hostname).
+    has_password = (":" in userinfo and userinfo.split(":", 1)[1] != "") or bool(
+        _query_first(query, "password")
+    )
     hosts = [_strip_port(h) for h in _split_csv(hostpart)]
-    sslmode = _first_query_value(parts.query, "sslmode")
-    return _PgTarget(hosts, hostaddrs=[], sslmode=sslmode, has_inline_password=has_password)
+    hosts += [_debracket(h) for h in _split_csv(_query_first(query, "host"))]
+    hostaddrs = [_debracket(h) for h in _split_csv(_query_first(query, "hostaddr"))]
+    sslmode_raw = _query_first(query, "sslmode")
+    sslmode = sslmode_raw.lower() if sslmode_raw else None
+    return _PgTarget(hosts, hostaddrs=hostaddrs, sslmode=sslmode, has_inline_password=has_password)
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -519,9 +591,14 @@ def _strip_port(hostport: str) -> str:
     return head if sep and tail.isdigit() else text
 
 
-def _first_query_value(query: str, key: str) -> str | None:
-    values = parse_qs(query).get(key)
-    return values[0].lower() if values else None
+def _query_first(query: dict[str, list[str]], key: str) -> str | None:
+    """The first value for ``key`` in a ``parse_qs`` mapping, or None.
+
+    Case is preserved (a password is case-sensitive); the caller lowercases the
+    keys where case is irrelevant (``sslmode``).
+    """
+    values = query.get(key)
+    return values[0] if values else None
 
 
 # ---------------------------------------------------------------------------

@@ -342,6 +342,67 @@ def test_uri_dsn_inline_password_rejected(tmp_path):
         load(tmp_path, data)
 
 
+def test_uri_dsn_hostaddr_query_param_denied(tmp_path):
+    # libpq honors ?hostaddr= in a URI DSN and dials it directly (host is only for
+    # TLS SNI). The URI form must apply the same hostaddr guard as the keyword
+    # form, or a metadata target slips past behind a benign hostname.
+    dsn = "postgresql://db.example.com/app?hostaddr=169.254.169.254&sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data)
+
+
+def test_uri_dsn_password_query_param_rejected(tmp_path):
+    # An inline password given as a URI query parameter is refused, same as one in
+    # the userinfo — libpq honors ?password=.
+    dsn = "postgresql://db.example.com/app?password=s3cr3t&sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateCredentialRefused):
+        load(tmp_path, data)
+
+
+def test_keyword_dsn_spaced_equals_metadata_denied(tmp_path):
+    # libpq tolerates whitespace around '='; the guard must too, or a space-padded
+    # host tokenizes to nothing and slips past the SSRF denylist.
+    dsn = "host = 169.254.169.254 sslmode = require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data)
+
+
+def test_keyword_dsn_spaced_inline_password_rejected(tmp_path):
+    # A space-padded inline password must still be refused (the same tokenization
+    # gap would otherwise drop it and skip the inline-secret guard).
+    dsn = "host = db.example.com  password = s3cr3t  sslmode = require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateCredentialRefused):
+        load(tmp_path, data)
+
+
+def test_keyword_dsn_quoted_host_metadata_denied(tmp_path):
+    # A single-quoted value is one token; the metadata host inside it is still
+    # resolved and denied.
+    dsn = "host = '169.254.169.254'  sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data)
+
+
+def test_keyword_dsn_unterminated_quote_fails_closed(tmp_path):
+    # A malformed DSN (unterminated quote) fails closed rather than silently
+    # dropping the host and skipping the guards.
+    dsn = "host = 'db.example.com sslmode=require"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(ManifestError):
+        load(tmp_path, data)
+
+
 def test_keyword_dsn_inline_password_rejected(tmp_path):
     dsn = "host=db.example.com sslmode=require password=S3cr3tP@ss"
     data = {"artifacts": [pg_artifact(dsn)]}
