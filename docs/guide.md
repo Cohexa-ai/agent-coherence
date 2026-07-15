@@ -28,21 +28,22 @@ full command-line toolset, and the API reference.
 8. [Crash recovery](#crash-recovery)
 9. [Version retention and read-at-version](#version-retention-and-read-at-version)
 10. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-11. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-12. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-13. [Inline benchmark mode](#inline-benchmark-mode)
-14. [Telemetry](#telemetry)
-15. [Graceful degradation](#graceful-degradation)
-16. [Examples](#examples)
-17. [Real-workload benchmarks](#real-workload-benchmarks)
-18. [Benchmarking your own workload](#benchmarking-your-own-workload)
-19. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-20. [Replay (v0.8.2+)](#replay-v082)
-21. [Command-line tools](#command-line-tools)
-22. [API reference](#api-reference)
-23. [Low-level adapter API](#low-level-adapter-api)
-24. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-25. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow--coherentobject)
+12. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+13. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+14. [Inline benchmark mode](#inline-benchmark-mode)
+15. [Telemetry](#telemetry)
+16. [Graceful degradation](#graceful-degradation)
+17. [Examples](#examples)
+18. [Real-workload benchmarks](#real-workload-benchmarks)
+19. [Benchmarking your own workload](#benchmarking-your-own-workload)
+20. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+21. [Replay (v0.8.2+)](#replay-v082)
+22. [Command-line tools](#command-line-tools)
+23. [API reference](#api-reference)
+24. [Low-level adapter API](#low-level-adapter-api)
+25. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+26. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -726,6 +727,71 @@ certificate requirements live in
 > An internal, experimental seam formalizes what a networked registry backend
 > would have to provide; it is not a public extension point, and there is nothing
 > for end users to configure today.
+
+## BYO substrate bindings (`CoherentRow`, `CoherentObject`)
+
+`CoherentVolume` brings coherence to files on disk. **BYO-substrate bindings** bring the same coherence to shared state that lives in a store you already run — a Postgres row, an S3 object — while the coordinator holds only coherence metadata (a monotonic version, per-agent MESI, a fixed-width `content_hash`, and optionally an opaque substrate token) and **never the bytes**. The bytes stay in your substrate; the coherence layer drops *under* it.
+
+Install the binding you need (the drivers are optional extras):
+
+```bash
+pip install "agent-coherence[coherent-row]"     # Postgres — psycopg v3
+pip install "agent-coherence[coherent-object]"  # S3 — boto3
+```
+
+### What you get over the substrate's own CAS
+
+A substrate's native conditional write (`UPDATE … WHERE version = ?`, S3 `If-Match`) already rejects a single lost update — *at write time*. The binding adds the **cross-agent** layer over it:
+
+- **Invalidation-before-act.** A peer's commit marks your cached read stale, so your next binding-mediated read/act is denied *before* you act on the moved state — the bare CAS never surfaces that.
+- **Cross-substrate uniformity.** The same typed conflict (`StaleView` / `CasVersionConflict`) and the same `deny → reacquire()` recovery over a row, an object, a file (`CoherentVolume`), or a store key (`CCSStore`) — one coherence surface, not per-substrate error handling.
+
+```python
+from ccs.adapters.coherent_row import CoherentRow
+
+row = CoherentRow(dsn="postgresql://…", table="workspaces")
+data, token = row.read("ws-42")               # (bytes, token) from ONE read
+# ... a peer commits a new version through the binding ...
+row.commit("ws-42", expected_token=token, new_bytes=revised)
+#   -> StaleView: your cached view moved. reacquire() for fresh bytes, re-decide, retry.
+```
+
+`CoherentObject` (S3) has the identical surface; its token is the object ETag, captured from the `put_object` response (never computed).
+
+### Guarantee tiers (honest by construction)
+
+Every binding declares a `CapabilityDescriptor` with a **tier**; the guarantee wording a user sees is derived from the tier, so a weaker binding can never present as enforcement:
+
+| Tier | Substrate shape | Honest guarantee |
+|---|---|---|
+| `native-CAS` | atomic conditional write (PG version column, S3 `If-Match`) | no-lost-update on the version-CAS axis, **single-host**, with the timeout asterisk below |
+| `detect-only` | no atomic conditional write | catches a *sequential* stale-read→write; cannot prevent a concurrent race |
+| `forward-only` | an action / RPC (a Slack post, a Gmail send) — no object, no token | **effect ordering only**: decision-input freshness via deny-before-act; no CAS, no rollback, no duplicate-effect prevention |
+
+### Coherence Manifest
+
+A declarative manifest binds each artifact to a substrate + connection + tier, and is a named **trust boundary**. Credentials are references, never literals (`secret-file:PATH`, `aws-default`, `secret:uri`, or a least-preferred `env:VAR`); connection targets are SSRF-constrained — the deny runs on the *resolved* address (metadata/link-local hard-denied, RFC-1918 allowed only under an explicit `CCS_SUBSTRATE_ALLOW_PRIVATE` opt-in), and a plaintext credential to a routable host is refused unless `CCS_SUBSTRATE_INSECURE` is acked. `dry_run()` prints each artifact's tier at config time. See `docs/examples/manifest.example.yaml`.
+
+### Least-privilege (provision the substrate down to what the binding needs)
+
+- **Postgres** — a dedicated, login-limited **non-owner** role granted only `SELECT, UPDATE` on the one table (no `ALTER` / `TRIGGER` / `DELETE` / re-grant, `NOSUPERUSER NOCREATEDB NOCREATEROLE`), plus an **owner-managed** `BEFORE INSERT/UPDATE` trigger that mints `version := OLD.version + 1` from the *stored* prior — so a client that supplies its own `NEW.version` cannot forge it. `CoherentRow.provisioning_sql(...)` emits (never executes) both.
+- **S3** — an IAM policy scoped to the exact key/prefix ARN with `s3:GetObject` + `s3:PutObject` only and explicit denies (no `s3:*`, no `s3:DeleteObject`), plus an **owner-managed** bucket policy that *requires* conditional writes (`Deny s3:PutObject` when `Null s3:if-match true`, with the `s3:ObjectCreationOperation` multipart exemption). `CoherentObject.conditional_write_bucket_policy(...)` / `least_privilege_iam_policy(...)` emit the verified shape.
+
+### Honest scope
+
+- **The read-generation fence over a substrate is a roadmap item, not shipped.** v1 OCC writers ride the fence's admit-on-absent path + the version-CAS. Nothing in these bindings claims the fence.
+- **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; a coordinator-timeout *after* a durable substrate write is reconverged by a token-identity re-read, and registry↔substrate agreement is a *detectable signal*, not a held guarantee.
+- **Single-host, subtractive.** When the substrate is itself distributed (S3, managed Postgres), the no-lost-update guarantee is the *substrate's* and is identical with or without this layer; the adapter's contribution (invalidation, uniformity) is single-host. Never run the S3 CAS loop through a Multi-Region Access Point / cross-Region replica, and never place agents on two hosts against one distributed substrate.
+- **Coordinator-behind-substrate is unbounded in v1.** If a writer's substrate write lands but its process dies before the coordinator bump, peers are not invalidated until the *next* binding-mediated read of that artifact — a peer acting on an already-cached read is unprotected until it re-reads. Repair-forward is a roadmap item.
+
+### Try it, then harden
+
+```bash
+python -m examples.coherent_row.main               # offline, no keys — an in-memory substrate stand-in
+python -m examples.coherent_object.main --baseline # see the silent stale act the binding catches
+```
+
+The demos run offline against a local coordinator with an in-memory substrate stand-in so the coordinator-mediated value (invalidation-before-act) is visible with zero setup. For production, point the same binding at a real Postgres / S3 and provision the least-privilege role/policy above. The tier-honesty conformance suite exercises both bindings against **real** substrates behind the `real_substrate` pytest marker (credentialed; `CCS_TEST_PG_DSN`, `CCS_REAL_S3_BUCKET`) — Moto/LocalStack are excluded because they serialize and would false-green a concurrency test.
 
 ## Multi-artifact snapshot sessions
 
