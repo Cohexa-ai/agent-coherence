@@ -13,6 +13,10 @@ the fresh version, nothing lost). In-process, deterministic, no network.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("langgraph.store.base")
+
 from examples.ccsstore_read_side.demo import (
     main,
     run_broken_writeback,
