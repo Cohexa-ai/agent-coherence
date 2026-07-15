@@ -1,0 +1,16 @@
+# Keep the Glama build context to the package + build metadata. The installed
+# distribution is src/ccs only (setuptools package-dir = src), and the build
+# reads pyproject.toml + README.md; nothing below is needed to build or run.
+.git
+.github
+tests
+benchmarks
+formal
+docs
+examples
+scripts
+*.pyc
+__pycache__
+.pytest_cache
+.ruff_cache
+uv.lock
