@@ -993,14 +993,15 @@ Use these to gate alerts or health checks without keeping a separate event list.
 
 ## Examples
 
-All examples are runnable with `python -m examples.<name>.main` from the project root.
+All examples are runnable with `python -m examples.<name>.main` (or `.demo` where noted) from the project root.
 
 Correctness demos lead; the token-savings / hit-rate demos follow.
 
 | Example | Command | What it shows |
 |---------|---------|---------------|
-| Shared knowledge base | `python -m examples.shared_knowledge_base.main` | Lost update in a shared RAG / memory corpus; `CoherentVolume` denies B's stale overwrite so both findings survive (offline, no keys) |
-| Divergent memory | `python -m examples.divergent_memory.main` | Two sessions record contradictory beliefs from a stale read; the stale write is denied fail-closed so the divergence never forms (offline, no keys) |
+| Shared knowledge base | `python -m examples.shared_knowledge_base.demo` | Lost update in a shared RAG / memory corpus; `CoherentVolume` denies B's stale overwrite so both findings survive (offline, no keys) |
+| Divergent memory | `python -m examples.divergent_memory.demo` | Two sessions record contradictory beliefs from a stale read; the stale write is denied fail-closed so the divergence never forms (offline, no keys) |
+| CCSStore read side | `python -m examples.ccsstore_read_side.demo` | Read-side invalidation on a LangGraph `BaseStore` (peer commit → next `get()` serves the new version), the `put()`-is-not-version-CAS boundary, and the `write_cas` fix (offline, no keys) |
 | Coherent volume | `python -m examples.coherent_volume.main` | Sequential stale-write deny + recovery on plain files (offline, no keys) |
 | Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |

@@ -4,6 +4,29 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Added
+
+- **CCSStore read-side demo — `examples/ccsstore_read_side/`.** A three-act,
+  offline, deterministic demo that makes the read/write split legible: Act 1
+  shows the shipped read-side guarantee (a peer's commit invalidates the
+  cached view, so the next `get()` is a fresh miss serving the new version —
+  never a stale hit); Act 2 shows the documented boundary (`put()` is not
+  version-CAS — a stale write-back lands, silently erasing the peer's update);
+  Act 3 routes the same intent through `store.core.write_cas`, re-applying it
+  against the freshly read version so nothing is lost. Runs via
+  `python -m examples.ccsstore_read_side.demo` (or `uv run demo.py`
+  standalone); exit 0 iff every invariant held, so it doubles as a CI gate.
+  Tests: `tests/test_ccsstore_read_side_demo.py`.
+
+### Fixed
+
+- **Guide examples table: two broken commands.** `examples.divergent_memory`
+  and `examples.shared_knowledge_base` ship `demo.py`, not `main.py`; the
+  documented `python -m examples.<name>.main` commands failed. Corrected to
+  `.demo`.
+
 ## [0.12.0] - 2026-07-14
 
 Atomic multi-artifact publish (commit a *set* of files all-or-nothing), the
