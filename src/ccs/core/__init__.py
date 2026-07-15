@@ -10,11 +10,17 @@ from ccs.core.granularity import (
     GranularityLevel,
     GranularitySpec,
 )
+from ccs.core.substrate import (
+    CapabilityDescriptor,
+    Tier,
+)
 
 __all__ = [
     "CANONICAL_ARTIFACT_TOKENS",
+    "CapabilityDescriptor",
     "DEFAULT_GRANULARITY",
     "GRANULARITY_SPECS",
     "GranularityLevel",
     "GranularitySpec",
+    "Tier",
 ]
