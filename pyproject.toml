@@ -98,7 +98,12 @@ mistral = ["mistralai>=2.0"]
 # The stale-write-guard-fs stdio MCP server (ccs.mcp). The official `mcp` SDK
 # is the only new runtime dep; v2-alpha renames FastMCP, so pin <2.
 mcp = ["mcp>=1.27,<2"]
-all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral,mcp]"]
+# BYO-substrate native-CAS bindings. `psycopg[binary]` (v3) is the CoherentRow
+# driver; `boto3` is the CoherentObject driver. Both are lazily imported, so the
+# adapters package stays importable without them.
+coherent-row = ["psycopg[binary]>=3.1"]
+coherent-object = ["boto3>=1.34"]
+all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral,mcp,coherent-row,coherent-object]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -115,11 +120,13 @@ markers = [
     "launch_gate_pilot_matrix: Per-PR cheap launch-gate pilot (1 scenario × {haiku, sonnet, opus}). Requires live claude CLI; ~$0.50 per run. Run via `pytest -m launch_gate_pilot_matrix`.",
     "protocol_corpus: Cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
     "live_api: OpenAI/Mistral Conversations live-API tests (stale-read probe + adapter smoke). Requires OPENAI_API_KEY and/or MISTRAL_API_KEY and the `[openai,mistral]` extras; ~$10 per full probe run. Excluded from default `pytest -q`. Run via `pytest -m live_api`.",
+    "real_substrate: BYO-substrate conformance against a REAL Postgres / S3 (no Moto/LocalStack — they serialize and false-green concurrency). Requires the `[coherent-row]`/`[coherent-object]` extras plus credentials (CCS_TEST_PG_DSN, CCS_REAL_S3_BUCKET, etc.). Excluded from default `pytest -q`. Run via `pytest -m real_substrate`.",
 ]
-# Skip launch_gate + protocol_corpus + live_api markers in default unit test
-# runs. live_api makes paid network calls and needs credentials; keep it opt-in
-# so the normal `pytest -q` loop stays fast, offline, and free.
-addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus and not live_api'"
+# Skip launch_gate + protocol_corpus + live_api + real_substrate markers in
+# default unit test runs. live_api / real_substrate need credentials and real
+# backends; keep them opt-in so the normal `pytest -q` loop stays fast, offline,
+# and free.
+addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus and not live_api and not real_substrate'"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
