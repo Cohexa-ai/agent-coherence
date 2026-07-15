@@ -648,6 +648,92 @@ class ScenarioValidationError(CoherenceError):
         self.path = path
 
 
+# ---------------------------------------------------------------------------
+# Coherence-manifest load/validation errors (BYO-substrate, Unit 2 / R8, R9)
+# ---------------------------------------------------------------------------
+#
+# The manifest is a named TRUST BOUNDARY: it wires artifact identities to
+# substrate connection targets and credential references supplied by the
+# builder. Every failure below is caught at LOAD/VALIDATE time — before any
+# substrate connection is attempted — so a bad target or an inline literal
+# secret can never reach a driver. Discipline mirrors the shipped
+# plaintext-bearer guard (``ccs.cli._coherence_client._guard_plaintext_bearer``):
+# the message names the HOST and the POSTURE only, NEVER a resolved credential
+# value or a DSN that could carry one.
+
+
+class ManifestError(CoherenceError):
+    """A coherence manifest is malformed or fails validation (Unit 2 / R8, R9).
+
+    The base for every load/validate rejection: an unknown top-level key, a
+    missing/unknown tier, a forward-only artifact declaring a version_source
+    (rejected via the descriptor's own validation), and the security subclasses
+    below. Raised at config time, never mid-run."""
+
+
+class SubstrateCredentialRefused(ManifestError):
+    """A manifest connection credential is a suspected inline literal, not a
+    reference form (Unit 2 / R8).
+
+    Credentials must be one of the allowlisted reference forms
+    (``secret-file:PATH``, ``secret:URI``, ``env:VARNAME``, ``aws-default``) so
+    the secret value never lives in the manifest. An inline DSN, a bare key, an
+    unknown prefix, or an inline password inside a DSN target is refused here.
+    The message states the CATEGORY of violation only — it NEVER echoes the
+    offending value, which may itself be the secret."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            f"refusing a suspected inline secret in the manifest connection: {detail}. "
+            "Credentials must be a reference form: secret-file:PATH (preferred), "
+            "aws-default (zero-secret), secret:URI (allowlisted providers), or "
+            "env:VARNAME (least-preferred)"
+        )
+        self.detail = detail
+
+
+class SubstrateTargetDenied(ManifestError):
+    """A manifest connection target resolves to a denied address (Unit 2 / R8, SSRF).
+
+    The deny runs on the ``getaddrinfo``-RESOLVED address(es), not the literal
+    string, so a DNS-rebind hostname and decimal/octal/hex IPv4 encodings are
+    all classified. Hard-denied: the cloud metadata / link-local class
+    (169.254.0.0/16, 100.64.0.0/10, metadata.google.internal, fd00:ec2::254,
+    fe80::/10), unwrapped through any mapped/compat IPv6 wrapper. RFC-1918/4193
+    private ranges are denied unless the per-manifest opt-in
+    (``CCS_SUBSTRATE_ALLOW_PRIVATE``) is set. Carries ``host`` and a ``posture``
+    describing the denied range — never a credential."""
+
+    def __init__(self, host: str, posture: str) -> None:
+        super().__init__(
+            f"manifest connection target {host!r} is denied: {posture}"
+        )
+        self.host = host
+        self.posture = posture
+
+
+class SubstrateInsecureTransport(ManifestError):
+    """A plaintext-credential substrate config points at a routable host without
+    an ack (Unit 2 / R8 — the substrate analog of the plaintext-bearer guard).
+
+    A Postgres DSN with ``sslmode=disable``/unset (libpq silently downgrades to
+    plaintext) or a boto3 ``endpoint_url=http://`` to a non-loopback host ships
+    the credential in cleartext. Refused unless the operator sets the DISTINCT
+    ack ``CCS_SUBSTRATE_INSECURE`` (deliberately NOT ``CCS_REMOTE_INSECURE`` /
+    ``CCS_REMOTE_COORDINATOR`` — relaxing coordinator transport must not relax
+    substrate egress). Carries ``host`` and ``posture``; never the credential."""
+
+    def __init__(self, host: str, posture: str) -> None:
+        super().__init__(
+            f"refusing a plaintext substrate credential to routable host {host!r} "
+            f"({posture}); set CCS_SUBSTRATE_INSECURE to acknowledge an "
+            "out-of-band-secured link, or use TLS (postgres sslmode=require/"
+            "verify-full, or an https S3 endpoint_url)"
+        )
+        self.host = host
+        self.posture = posture
+
+
 class WatchdogAbandoned(RuntimeError):
     """A handler's 4s watchdog fired, so its still-running work was told to abort
     before it could mutate the registry (finding A6).

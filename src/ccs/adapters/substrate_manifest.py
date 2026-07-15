@@ -1,0 +1,663 @@
+# Copyright (c) 2026 agent-coherence contributors.
+# The Coherence Protocol for AI Agents
+
+"""The Coherence Manifest: a declarative, secret-safe, SSRF-constrained wiring
+of artifact identities to substrate connections.
+
+The manifest is a named TRUST BOUNDARY. It binds an artifact id to a substrate
+type, a connection target, a credential REFERENCE (never a literal), a
+version-source, and an honest guarantee :class:`~ccs.core.substrate.Tier`. Every
+security decision is taken at LOAD/VALIDATE time — before any driver is
+constructed — so a bad target or an inline literal secret can never reach a
+substrate. The discipline mirrors the shipped plaintext-bearer guard
+(:func:`ccs.cli._coherence_client._guard_plaintext_bearer`): classify the target
+deterministically, fail closed on anything unclassifiable, and log the HOST and
+POSTURE only — never the credential.
+
+Two guards are distinct from the coordinator's own remote-mode flags on purpose
+(relaxing coordinator transport must never relax substrate egress):
+
+- ``CCS_SUBSTRATE_ALLOW_PRIVATE`` — opt in to RFC-1918/4193 private targets (a
+  customer's internal RDS/Postgres is commonly RFC-1918). NOT
+  ``CCS_REMOTE_COORDINATOR``.
+- ``CCS_SUBSTRATE_INSECURE`` — acknowledge a plaintext credential to a routable
+  host (an out-of-band-secured link). NOT ``CCS_REMOTE_INSECURE``.
+
+The DNS resolver is an INJECTABLE seam (:data:`HostResolver`): the SSRF deny
+runs on the RESOLVED address(es), and injecting the resolver keeps validation
+hermetic and lets later bindings (Postgres/S3) reuse the same
+resolve-then-check primitive.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import logging
+import os
+import re
+import socket
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import TypeAlias
+from urllib.parse import parse_qs, urlsplit
+
+import yaml
+
+from ccs.core.exceptions import (
+    ManifestError,
+    SubstrateCredentialRefused,
+    SubstrateInsecureTransport,
+    SubstrateTargetDenied,
+)
+from ccs.core.substrate import CapabilityDescriptor, Tier
+
+logger = logging.getLogger(__name__)
+
+#: Opt-in for RFC-1918/4193 private substrate targets (distinct from the
+#: coordinator's ``CCS_REMOTE_COORDINATOR`` — see the module docstring).
+ALLOW_PRIVATE_ENV = "CCS_SUBSTRATE_ALLOW_PRIVATE"
+#: Acknowledge a plaintext credential to a routable host (distinct from
+#: ``CCS_REMOTE_INSECURE``).
+INSECURE_ACK_ENV = "CCS_SUBSTRATE_INSECURE"
+
+#: Truthy env values (mirrors the shipped remote-flag parser).
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+# --- schema keys ------------------------------------------------------------
+_ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"artifacts"})
+_ALLOWED_ARTIFACT_KEYS: frozenset[str] = frozenset(
+    {"id", "substrate", "tier", "version_source", "connection"}
+)
+_ALLOWED_TARGET_KEYS: frozenset[str] = frozenset({"dsn", "endpoint_url", "region"})
+
+# --- credential reference forms (allowlist; anything else is a suspected literal)
+_ZERO_SECRET_FORMS: frozenset[str] = frozenset({"aws-default"})
+_SECRET_FILE_PREFIX = "secret-file:"
+_ENV_PREFIX = "env:"
+_SECRET_URI_PREFIX = "secret:"
+#: ``secret:`` resolvers are constrained to an allowlisted provider set.
+_ALLOWED_SECRET_PROVIDERS: frozenset[str] = frozenset(
+    {"aws-secretsmanager", "vault", "gcp-secretmanager", "azure-keyvault"}
+)
+
+# --- SSRF classification (explicit networks; NO reliance on stdlib is_private/
+#     is_link_local, which vary across CPython patch releases) -----------------
+_LINK_LOCAL_V4_NET = ipaddress.ip_network("169.254.0.0/16")  # AWS/Azure IMDS
+_CGNAT_V4_NET = ipaddress.ip_network("100.64.0.0/10")  # Alibaba metadata
+_HARD_DENY_V4_NETS = (_LINK_LOCAL_V4_NET, _CGNAT_V4_NET)
+_LINK_LOCAL_V6_NET = ipaddress.ip_network("fe80::/10")
+#: EC2 IMDS over IPv6 lives inside ``fc00::/7`` (ULA), so "private ⇒ allowed" is
+#: unsafe for egress — hard-deny the exact address.
+_HARD_DENY_V6_ADDRS: frozenset[ipaddress.IPv6Address] = frozenset(
+    {ipaddress.IPv6Address("fd00:ec2::254")}
+)
+_METADATA_HOSTNAMES: frozenset[str] = frozenset({"metadata.google.internal"})
+_PRIVATE_V4_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_ULA_V6_NET = ipaddress.ip_network("fc00::/7")
+_LOOPBACK_V4_NET = ipaddress.ip_network("127.0.0.0/8")
+_IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
+
+#: Postgres sslmodes that guarantee an encrypted link; ``disable``/``allow``/
+#: ``prefer`` (and unset → libpq ``prefer``) can silently ship the credential in
+#: cleartext.
+_TLS_SAFE_SSLMODES: frozenset[str] = frozenset({"require", "verify-ca", "verify-full"})
+
+#: A DNS resolver seam: a hostname maps to a tuple of resolved IP strings (empty
+#: ⇒ unresolvable ⇒ fail closed). Injected in tests and reused by later bindings.
+HostResolver: TypeAlias = Callable[[str], "tuple[str, ...]"]
+
+
+def resolve_host_addresses(host: str) -> tuple[str, ...]:
+    """Default resolver: the deduplicated ``getaddrinfo`` addresses for ``host``.
+
+    Returns an empty tuple on resolution failure so the caller can fail closed
+    (an unresolvable target is denied, never admitted). An IP literal is echoed
+    back with no network round-trip.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return ()
+    return tuple(dict.fromkeys(info[4][0] for info in infos))
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ManifestArtifact:
+    """One validated artifact wiring.
+
+    ``connection`` is the read-only, form-validated reference bundle (a
+    ``credential`` reference plus any target — ``dsn`` / ``endpoint_url`` /
+    ``region``) that a later binding resolves; it never carries a literal
+    secret. ``descriptor`` is the tier-derived honesty declaration.
+    """
+
+    id: str
+    substrate: str
+    tier: Tier
+    descriptor: CapabilityDescriptor
+    connection: Mapping[str, str]
+    version_source: str | None = None
+
+
+@dataclass(frozen=True)
+class SubstrateManifest:
+    """A loaded, validated set of artifact wirings."""
+
+    artifacts: tuple[ManifestArtifact, ...]
+
+    def validate(self) -> None:
+        """Re-assert per-artifact tier consistency (reusing the descriptor's own
+        validation): a ``forward-only`` artifact must declare no version_source,
+        a ``native-cas`` artifact must declare one. Raises :class:`ManifestError`."""
+        for artifact in self.artifacts:
+            _build_descriptor(artifact.tier, artifact.version_source)
+
+    def dry_run(self) -> tuple[tuple[str, str, Tier], ...]:
+        """Print and return each artifact's ``(id, substrate, tier)`` so the tier
+        is visible at config time before any substrate is touched."""
+        rows = tuple((a.id, a.substrate, a.tier) for a in self.artifacts)
+        for artifact_id, substrate, tier in rows:
+            print(f"  {artifact_id}\t{substrate}\t{tier.value}")
+        return rows
+
+
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
+
+
+def load_manifest(
+    path: str | Path,
+    *,
+    resolver: HostResolver = resolve_host_addresses,
+    env: Mapping[str, str] | None = None,
+) -> SubstrateManifest:
+    """Load, secret-form-validate, and SSRF/TLS-check a coherence manifest.
+
+    Rejects (all at load, before any driver): unknown top-level/artifact keys, a
+    missing/unknown tier, a non-reference-form credential, a target that
+    resolves into the metadata/link-local class or (without opt-in) a private
+    range, and a plaintext credential to a routable host (without the ack).
+    Warns on a world-readable manifest and on a multi-region/replica endpoint.
+    """
+    manifest_path = Path(path)
+    resolved_env = os.environ if env is None else env
+    _warn_if_world_readable(manifest_path)
+    data = _load_yaml(manifest_path)
+    _reject_unknown_keys(data, _ALLOWED_TOP_LEVEL_KEYS, "manifest top-level")
+    raw_artifacts = data.get("artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise ManifestError("manifest requires a non-empty 'artifacts' list")
+    artifacts = tuple(
+        _parse_artifact(entry, resolver=resolver, env=resolved_env)
+        for entry in raw_artifacts
+    )
+    manifest = SubstrateManifest(artifacts=artifacts)
+    manifest.validate()
+    return manifest
+
+
+def _load_yaml(path: Path) -> Mapping[str, object]:
+    """Read + ``yaml.safe_load`` the manifest; require a mapping root."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ManifestError(f"cannot read manifest {str(path)!r}: {exc}") from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ManifestError(f"manifest {str(path)!r} is not valid YAML: {exc}") from exc
+    if not isinstance(data, Mapping):
+        raise ManifestError("manifest root must be a mapping with an 'artifacts' key")
+    return data
+
+
+def _warn_if_world_readable(path: Path) -> None:
+    """Warn on a world-readable manifest (it names hosts + secret-ref paths)."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return
+    if mode & 0o004:
+        logger.warning(
+            "manifest %s is world-readable (mode %o); it names connection targets "
+            "and secret-reference paths — tighten it (e.g. 0600)",
+            str(path),
+            mode & 0o777,
+        )
+
+
+def _reject_unknown_keys(
+    mapping: Mapping[str, object], allowed: frozenset[str], label: str
+) -> None:
+    """Fail closed on any key outside ``allowed`` (strict schema discipline)."""
+    unknown = set(mapping) - allowed
+    if unknown:
+        raise ManifestError(f"unknown {label} key(s): {sorted(unknown)}")
+
+
+# ---------------------------------------------------------------------------
+# Per-artifact parse + validate
+# ---------------------------------------------------------------------------
+
+
+def _parse_artifact(
+    entry: object, *, resolver: HostResolver, env: Mapping[str, str]
+) -> ManifestArtifact:
+    """Validate one artifact entry end-to-end and build its wiring."""
+    if not isinstance(entry, Mapping):
+        raise ManifestError(f"each artifact must be a mapping (got {type(entry).__name__})")
+    _reject_unknown_keys(entry, _ALLOWED_ARTIFACT_KEYS, "artifact")
+    artifact_id = _require_str(entry, "id")
+    substrate = _require_str(entry, "substrate")
+    tier = _parse_tier(entry.get("tier"))
+    version_source = _optional_str(entry, "version_source")
+    credential_ref, target = _extract_connection(entry)
+    _validate_credential_form(credential_ref)
+    _check_target(target, resolver=resolver, env=env)
+    descriptor = _build_descriptor(tier, version_source)
+    connection = MappingProxyType({"credential": credential_ref, **target})
+    return ManifestArtifact(
+        id=artifact_id,
+        substrate=substrate,
+        tier=tier,
+        descriptor=descriptor,
+        connection=connection,
+        version_source=version_source,
+    )
+
+
+def _require_str(mapping: Mapping[str, object], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise ManifestError(f"artifact key {key!r} must be a non-empty string")
+    return value
+
+
+def _optional_str(mapping: Mapping[str, object], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ManifestError(f"artifact key {key!r} must be a string when present")
+    return value
+
+
+def _parse_tier(raw: object) -> Tier:
+    if not isinstance(raw, str) or not raw:
+        raise ManifestError(f"artifact 'tier' is required and must be a string (got {raw!r})")
+    try:
+        return Tier(raw.strip().lower().replace("-", "_"))
+    except ValueError as exc:
+        valid = ", ".join(t.value.replace("_", "-") for t in Tier)
+        raise ManifestError(f"unknown tier {raw!r}; expected one of: {valid}") from exc
+
+
+def _build_descriptor(tier: Tier, version_source: str | None) -> CapabilityDescriptor:
+    """Reuse the descriptor's own tier/version_source validation."""
+    try:
+        return CapabilityDescriptor(tier=tier, version_source=version_source)
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
+
+
+def _extract_connection(entry: Mapping[str, object]) -> tuple[str, dict[str, str]]:
+    """Split ``connection`` into ``(credential_ref, target)``.
+
+    A bare string is a credential-only reference (no network target — the
+    forward-only / ambient-credential case). A mapping carries the credential
+    plus an allowlisted target (``dsn`` / ``endpoint_url`` / ``region``).
+    """
+    conn = entry.get("connection")
+    if isinstance(conn, str):
+        return conn, {}
+    if isinstance(conn, Mapping):
+        credential = conn.get("credential")
+        if not isinstance(credential, str):
+            raise ManifestError("connection mapping requires a string 'credential'")
+        target = {key: value for key, value in conn.items() if key != "credential"}
+        _reject_unknown_keys(target, _ALLOWED_TARGET_KEYS, "connection")
+        for key, value in target.items():
+            if not isinstance(value, str):
+                raise ManifestError(f"connection {key!r} must be a string")
+        return credential, target
+    raise ManifestError("connection must be a reference string or a mapping")
+
+
+# ---------------------------------------------------------------------------
+# Credential reference forms
+# ---------------------------------------------------------------------------
+
+
+def _validate_credential_form(ref: str) -> None:
+    """Accept only an allowlisted reference form; reject a suspected literal.
+
+    NEVER echoes ``ref`` (it may be the secret) — the message names the
+    category of violation only.
+    """
+    if not ref:
+        raise SubstrateCredentialRefused("the credential is empty")
+    if ref in _ZERO_SECRET_FORMS:
+        return
+    if ref.startswith(_SECRET_FILE_PREFIX):
+        if not ref[len(_SECRET_FILE_PREFIX):]:
+            raise SubstrateCredentialRefused("a secret-file: reference has no path")
+        return
+    if ref.startswith(_ENV_PREFIX):
+        if not ref[len(_ENV_PREFIX):]:
+            raise SubstrateCredentialRefused("an env: reference has no variable name")
+        return
+    if ref.startswith(_SECRET_URI_PREFIX):
+        _validate_secret_uri(ref)
+        return
+    raise SubstrateCredentialRefused("the credential value is not a recognized reference form")
+
+
+def _validate_secret_uri(ref: str) -> None:
+    body = ref[len(_SECRET_URI_PREFIX):]
+    provider = re.split(r"[:/]", body, maxsplit=1)[0].lower() if body else ""
+    if provider not in _ALLOWED_SECRET_PROVIDERS:
+        raise SubstrateCredentialRefused("a secret: reference names a non-allowlisted provider")
+
+
+# ---------------------------------------------------------------------------
+# Connection targets (SSRF + TLS)
+# ---------------------------------------------------------------------------
+
+
+def _check_target(
+    target: Mapping[str, str], *, resolver: HostResolver, env: Mapping[str, str]
+) -> None:
+    """Run the substrate-appropriate SSRF/TLS checks for a target."""
+    if "dsn" in target:
+        _check_pg_dsn(target["dsn"], resolver=resolver, env=env)
+    if "endpoint_url" in target or "region" in target:
+        _check_s3_endpoint(
+            endpoint_url=target.get("endpoint_url"),
+            region=target.get("region"),
+            resolver=resolver,
+            env=env,
+        )
+
+
+@dataclass(frozen=True)
+class _PgTarget:
+    hosts: list[str]
+    hostaddrs: list[str]
+    sslmode: str | None
+    has_inline_password: bool
+
+
+def _check_pg_dsn(dsn: str, *, resolver: HostResolver, env: Mapping[str, str]) -> None:
+    """SSRF-check every dialed Postgres host and enforce TLS for a routable one."""
+    target = _parse_pg_dsn(dsn)
+    if target.has_inline_password:
+        raise SubstrateCredentialRefused("the connection DSN carries an inline password")
+    routable, network_hosts = _check_pg_hosts(target, resolver=resolver, env=env)
+    if routable and target.sslmode not in _TLS_SAFE_SSLMODES:
+        _require_tls_or_ack(network_hosts[0], "plaintext-capable sslmode", env=env)
+    if len(network_hosts) > 1:
+        logger.warning(
+            "manifest postgres target lists %d network hosts %r; coordinating agents "
+            "against a multi-host/replica substrate is out of scope (single-host only)",
+            len(network_hosts),
+            network_hosts,
+        )
+
+
+def _check_pg_hosts(
+    target: _PgTarget, *, resolver: HostResolver, env: Mapping[str, str]
+) -> tuple[bool, list[str]]:
+    """Classify the dialed hosts; return ``(routable, checked_network_hosts)``.
+
+    ``hostaddr=`` is the authoritative dialed target when present; a leading
+    ``/`` host is a unix socket — a local target, exempt and NOT resolved.
+    """
+    dialed = target.hostaddrs if target.hostaddrs else target.hosts
+    routable = False
+    network_hosts: list[str] = []
+    for host in dialed:
+        if host.startswith("/"):
+            continue
+        if not _reject_denied_target(host, resolver=resolver, env=env):
+            routable = True
+        network_hosts.append(host)
+    return routable, network_hosts
+
+
+def _check_s3_endpoint(
+    *,
+    endpoint_url: str | None,
+    region: str | None,
+    resolver: HostResolver,
+    env: Mapping[str, str],
+) -> None:
+    """SSRF-check an explicit S3 ``endpoint_url`` and enforce TLS for a routable one.
+
+    There is no psycopg-style resolve-then-pin for S3 (pinning the endpoint to
+    the resolved IP breaks SigV4 host signing + TLS SNI, and botocore re-resolves
+    at connect time), so this is a resolve-and-re-check with a documented narrow
+    rebind residual. A custom endpoint is a privileged opt-in, not free-form.
+    """
+    if endpoint_url:
+        parts = urlsplit(endpoint_url)
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise ManifestError(f"S3 endpoint_url scheme must be http or https (got {scheme!r})")
+        host = parts.hostname
+        if not host:
+            raise ManifestError("S3 endpoint_url is missing a host")
+        is_loopback = _reject_denied_target(host, resolver=resolver, env=env)
+        if not is_loopback and scheme == "http":
+            _require_tls_or_ack(host, "plaintext endpoint_url (http)", env=env)
+        _warn_mrap(host)
+    if region:
+        _warn_mrap(region)
+
+
+# ---------------------------------------------------------------------------
+# Postgres DSN decomposition
+# ---------------------------------------------------------------------------
+
+
+def _parse_pg_dsn(dsn: str) -> _PgTarget:
+    text = dsn.strip()
+    if text.startswith(("postgresql://", "postgres://")):
+        return _parse_pg_uri(text)
+    return _parse_pg_keywords(text)
+
+
+def _parse_pg_keywords(dsn: str) -> _PgTarget:
+    params: dict[str, str] = {}
+    for token in dsn.split():
+        key, sep, value = token.partition("=")
+        if sep:
+            params[key.strip()] = value.strip()
+    hosts = [_debracket(h) for h in _split_csv(params.get("host"))]
+    hostaddrs = [_debracket(h) for h in _split_csv(params.get("hostaddr"))]
+    sslmode = (params.get("sslmode") or "").lower() or None
+    return _PgTarget(hosts, hostaddrs, sslmode, has_inline_password=bool(params.get("password")))
+
+
+def _parse_pg_uri(dsn: str) -> _PgTarget:
+    parts = urlsplit(dsn)
+    userinfo, _, hostpart = parts.netloc.rpartition("@")
+    has_password = ":" in userinfo and userinfo.split(":", 1)[1] != ""
+    hosts = [_strip_port(h) for h in _split_csv(hostpart)]
+    sslmode = _first_query_value(parts.query, "sslmode")
+    return _PgTarget(hosts, hostaddrs=[], sslmode=sslmode, has_inline_password=has_password)
+
+
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part for part in (item.strip() for item in value.split(",")) if part]
+
+
+def _debracket(host: str) -> str:
+    stripped = host.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        return stripped[1:-1]
+    return stripped
+
+
+def _strip_port(hostport: str) -> str:
+    text = hostport.strip()
+    if text.startswith("["):
+        end = text.find("]")
+        return text[1:end] if end != -1 else text
+    head, sep, tail = text.rpartition(":")
+    return head if sep and tail.isdigit() else text
+
+
+def _first_query_value(query: str, key: str) -> str | None:
+    values = parse_qs(query).get(key)
+    return values[0].lower() if values else None
+
+
+# ---------------------------------------------------------------------------
+# Resolved-address SSRF classification
+# ---------------------------------------------------------------------------
+
+
+def _reject_denied_target(host: str, *, resolver: HostResolver, env: Mapping[str, str]) -> bool:
+    """Reject a target resolving into a denied range; return whether it is loopback.
+
+    A hostname in the metadata denylist is rejected pre-resolution; otherwise the
+    deny runs on the resolved IP(s) so a DNS-rebind and decimal/octal/hex IPv4
+    encodings are all classified. An unresolvable host fails closed (denied).
+    """
+    if host.lower() in _METADATA_HOSTNAMES:
+        raise SubstrateTargetDenied(host, "cloud metadata alias hostname")
+    is_loopback = True
+    for ip in _resolve_ips(host, resolver):
+        _reject_denied_ip(ip, host, env=env)
+        if not _is_loopback_ip(ip):
+            is_loopback = False
+    return is_loopback
+
+
+def _resolve_ips(
+    host: str, resolver: HostResolver
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    resolved = resolver(host)
+    if not resolved:
+        raise SubstrateTargetDenied(host, "unresolvable host (fail-closed)")
+    try:
+        return [ipaddress.ip_address(address) for address in resolved]
+    except ValueError as exc:
+        raise SubstrateTargetDenied(host, "resolver returned an unparseable address") from exc
+
+
+def _reject_denied_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    host: str,
+    *,
+    env: Mapping[str, str],
+) -> None:
+    """Reject a hard-denied address (metadata/link-local) or, absent the opt-in,
+    a private-range address — evaluated through any mapped/compat IPv6 wrapper."""
+    for candidate in _denylist_candidates(ip):
+        if _is_hard_denied(candidate):
+            raise SubstrateTargetDenied(host, _posture(candidate))
+        if _is_private(candidate) and not _env_truthy(env, ALLOW_PRIVATE_ENV):
+            raise SubstrateTargetDenied(
+                host, "RFC-1918/4193 private range (set CCS_SUBSTRATE_ALLOW_PRIVATE to allow)"
+            )
+
+
+def _denylist_candidates(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> Iterator[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """The address plus any IPv4 embedded in a mapped/6to4/Teredo IPv6 wrapper.
+
+    Unwrapping is the denylist INVERSION of ``verify_host``'s deliberate
+    no-unwrap allowlist rule: a mapped form (``::ffff:169.254.169.254``) must not
+    slip past the IPv4 denylist.
+    """
+    yield ip
+    if ip.version == 6:
+        for attr in ("ipv4_mapped", "sixtofour"):
+            embedded = getattr(ip, attr, None)
+            if embedded is not None:
+                yield embedded
+        teredo = getattr(ip, "teredo", None)
+        if teredo is not None:
+            yield teredo[1]
+
+
+def _is_hard_denied(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 4:
+        return any(ip in net for net in _HARD_DENY_V4_NETS)
+    return ip in _LINK_LOCAL_V6_NET or ip in _HARD_DENY_V6_ADDRS
+
+
+def _is_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 4:
+        return any(ip in net for net in _PRIVATE_V4_NETS)
+    return ip in _ULA_V6_NET
+
+
+def _is_loopback_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 4:
+        return ip in _LOOPBACK_V4_NET
+    return ip == _IPV6_LOOPBACK
+
+
+def _posture(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    if ip.version == 4:
+        if ip in _LINK_LOCAL_V4_NET:
+            return "link-local / cloud metadata range (169.254.0.0/16)"
+        return "CGNAT / cloud metadata range (100.64.0.0/10)"
+    if ip in _LINK_LOCAL_V6_NET:
+        return "IPv6 link-local range (fe80::/10)"
+    return "IPv6 cloud metadata address"
+
+
+# ---------------------------------------------------------------------------
+# TLS + locality guards
+# ---------------------------------------------------------------------------
+
+
+def _require_tls_or_ack(host: str, posture: str, *, env: Mapping[str, str]) -> None:
+    """Refuse a plaintext credential to a routable host without the distinct ack."""
+    if _env_truthy(env, INSECURE_ACK_ENV):
+        logger.warning(
+            "sending a substrate credential to routable host %r over plaintext (%s); "
+            "%s acknowledged — ensure the link is encrypted out-of-band",
+            host,
+            posture,
+            INSECURE_ACK_ENV,
+        )
+        return
+    raise SubstrateInsecureTransport(host, posture)
+
+
+def _warn_mrap(value: str) -> None:
+    """Warn on a multi-region access point / replica endpoint (out-of-scope
+    distributed-substrate locality)."""
+    lowered = value.lower()
+    if "mrap" in lowered or "s3-global" in lowered or lowered == "aws-global":
+        logger.warning(
+            "manifest S3 target %r looks like a multi-region access point / replica; "
+            "coordinating agents across hosts against one distributed substrate is out "
+            "of scope (single-host only)",
+            value,
+        )
+
+
+def _env_truthy(env: Mapping[str, str], name: str) -> bool:
+    return env.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES

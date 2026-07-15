@@ -1,0 +1,53 @@
+# Coherence Manifest — EXAMPLE.
+#
+# ==========================================================================
+# DO NOT COMMIT REAL VALUES. This file is a template.
+#   - Credentials are ALWAYS references, never literals. The loader rejects
+#     an inline DSN password, a bare key, or an unknown prefix as a suspected
+#     literal at load time.
+#   - Connection targets are SSRF-constrained: the loader denies a target that
+#     resolves into the cloud-metadata / link-local class, and (without the
+#     CCS_SUBSTRATE_ALLOW_PRIVATE opt-in) an RFC-1918/4193 private range.
+#   - A plaintext credential to a routable host is refused unless
+#     CCS_SUBSTRATE_INSECURE acknowledges an out-of-band-secured link. Prefer
+#     TLS: postgres sslmode=require/verify-full, or an https S3 endpoint.
+# ==========================================================================
+#
+# Credential reference forms (allowlist), most-preferred first:
+#   secret-file:/path        secret read from a 0600 file (never inline)
+#   aws-default              ambient IAM — zero secret in the manifest
+#   secret:<provider>:<id>   an allowlisted secret manager
+#   env:VARNAME              least-preferred (leaks in `ps` / crash dumps)
+
+artifacts:
+  # A native-CAS Postgres row. native-cas REQUIRES a version_source (the whole
+  # guarantee rides the substrate-minted token). The DSN carries the host + TLS
+  # mode ONLY — the password is a separate secret-file reference.
+  - id: agent-workspace-config
+    substrate: postgres
+    tier: native-cas
+    version_source: trigger-managed version column
+    connection:
+      dsn: "host=db.internal.example.com port=5432 dbname=app sslmode=verify-full"
+      credential: "secret-file:/run/secrets/pg_password"
+
+  # A native-CAS S3 object with ambient IAM (no secret in the manifest). The
+  # ETag is the substrate-minted version. Omitting endpoint_url uses the region's
+  # public AWS endpoint (https); set an https endpoint_url only for an
+  # S3-compatible store, never an MRAP / cross-region replica.
+  - id: agent-brief-object
+    substrate: s3
+    tier: native-cas
+    version_source: object ETag
+    connection:
+      region: "us-east-1"
+      credential: "aws-default"
+
+  # A forward-only (effectful) action backend — an RPC-style "write" (posting a
+  # message) with no token and nothing to compare. forward-only FORBIDS a
+  # version_source; the honest offer is decision-input freshness before the
+  # effect fires, never CAS/rollback/duplicate-effect prevention.
+  - id: incident-notify
+    substrate: slack
+    tier: forward-only
+    connection: "secret-file:/run/secrets/slack_token"
