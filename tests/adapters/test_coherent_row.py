@@ -374,6 +374,18 @@ def test_provisioning_sql_emits_version_guard_and_negative_grants() -> None:
     assert "WITH GRANT OPTION" not in script
 
 
+def test_provisioning_sql_trigger_names_are_single_quoted_identifiers() -> None:
+    # Regression: each trigger name must be ONE quoted identifier, never the
+    # quoted function name with a bareword suffix (`"..."_ins`), which Postgres
+    # parses as two tokens — a syntax error at "_ins" that breaks the one-time
+    # setup the whole NATIVE_CAS guarantee rides on.
+    script = provisioning_sql("workspace_rows").as_script()
+    assert '"_ins' not in script and '"_upd' not in script  # no quote-then-bareword
+    assert 'CREATE TRIGGER "workspace_rows_coherence_version_ins"' in script
+    assert 'CREATE TRIGGER "workspace_rows_coherence_version_upd"' in script
+    assert 'DROP TRIGGER IF EXISTS "workspace_rows_coherence_version_ins"' in script
+
+
 def test_provisioning_sql_rejects_unsafe_identifiers() -> None:
     with pytest.raises(ValueError):
         provisioning_sql('rows"; DROP TABLE users; --')

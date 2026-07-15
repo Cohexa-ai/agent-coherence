@@ -31,12 +31,17 @@ from ccs.adapters.substrate import (
     CasWriteResult,
     CasWritten,
     CoordinatedSubstrate,
+    CoordinatorConflict,
+    CoordinatorWin,
     ReconcileDecision,
     ReconcileVerdict,
     SubstrateCoordinatorSession,
 )
 from ccs.core.exceptions import (
+    COMMIT_UNCONFIRMED_REASON,
+    VERSION_MISMATCH_REASON,
     CasVersionConflict,
+    CoherenceError,
     CommitUnconfirmed,
     StaleView,
     ViewWedged,
@@ -89,6 +94,9 @@ class _FakeStore:
     def set(self, ref: str, data: bytes) -> str:
         return self.seed(ref, data)
 
+    def delete(self, ref: str) -> None:
+        self._data.pop(ref, None)
+
 
 def _descriptor(arm: str) -> CapabilityDescriptor:
     return CapabilityDescriptor(
@@ -108,7 +116,9 @@ class _FakeSubstrate:
         self._arm = arm
         self._descriptor = _descriptor(arm)
         self.cas_calls: list[tuple[str, str, bytes]] = []
-        self._script: tuple[str, bool] | None = None
+        # A QUEUE of scripted outcomes (not a single slot): a re-drive path issues
+        # a second cas_write, so tests must script both legs independently.
+        self._scripts: list[tuple[str, bool]] = []
         # Runs inside reconcile_after_unknown (before the verdict) — a seam to
         # inject a byte-identical peer's coordinator bump mid-commit.
         self.reconcile_hook = None
@@ -118,12 +128,20 @@ class _FakeSubstrate:
         return self._descriptor
 
     def script_unknown(self, *, landed: bool) -> None:
-        """Next ``cas_write`` returns ``CasUnknown``; ``landed`` applies the write."""
-        self._script = ("unknown", landed)
+        """Enqueue: the next scripted ``cas_write`` returns ``CasUnknown``;
+        ``landed`` applies the write to the store."""
+        self._scripts.append(("unknown", landed))
 
     def script_conflict(self) -> None:
-        """Next ``cas_write`` returns ``CasConflict`` (no write landed)."""
-        self._script = ("conflict", False)
+        """Enqueue: the next scripted ``cas_write`` returns ``CasConflict`` (no
+        write landed)."""
+        self._scripts.append(("conflict", False))
+
+    def script_ghost_conflict(self) -> None:
+        """Enqueue: the next scripted ``cas_write`` applies the write (my bytes
+        land under a fresh token — an in-flight ghost) THEN returns ``CasConflict``,
+        so the re-drive sees a moved token carrying its own intended bytes."""
+        self._scripts.append(("ghost", True))
 
     def read(self, artifact_ref: str) -> tuple[bytes, str]:
         entry = self._store.get(artifact_ref)
@@ -135,13 +153,17 @@ class _FakeSubstrate:
         self, artifact_ref: str, *, expected_token: str, new_bytes: bytes
     ) -> CasWriteResult:
         self.cas_calls.append((artifact_ref, expected_token, bytes(new_bytes)))
-        script, self._script = self._script, None
-        if script is not None:
-            kind, landed = script
+        if self._scripts:
+            kind, landed = self._scripts.pop(0)
             if kind == "unknown":
                 if landed:
                     self._store.set(artifact_ref, bytes(new_bytes))
                 return CasUnknown()
+            if kind == "ghost":
+                # The in-flight ghost landed my bytes under a fresh token, then the
+                # (late) response is a conflict — the re-drive must detect the ghost.
+                self._store.set(artifact_ref, bytes(new_bytes))
+                return CasConflict()
             return CasConflict()
         entry = self._store.get(artifact_ref)
         if entry is None or entry[1] != expected_token:
@@ -532,3 +554,264 @@ def test_admit_on_absent_occ_writer_commits(
         assert result.converged is False
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- no-op: byte-identical commit mints no phantom advance ------------------
+
+
+def test_noop_commit_touches_neither_leg(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Committing the exact bytes last observed advances NOTHING — no substrate
+    write, no coordinator bump — so a byte-identical rewrite never invalidates a
+    peer (Open Q C)."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    posts: list[str] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+        posts.append(path)
+        return real_post(endpoint, path, payload)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        result = a.commit(REF, expected_token=tok, new_bytes=b"v1")  # identical
+
+        assert result.noop is True
+        assert result.summary == "unchanged"
+        assert fake_a.cas_calls == []  # no substrate write
+        assert "/hooks/post-edit-cas" not in posts  # no coordinator bump
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- re-drive: retry outcomes (the honesty boundary) ------------------------
+
+
+def test_re_drive_retry_conflict_is_typed_conflict(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """RE_DRIVE whose retry loses to a peer (token still unmoved for me) surfaces
+    the typed conflict after EXACTLY two substrate writes — never a third, never a
+    blind win."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        _ab, a_tok = a.read(REF)
+
+        fake_a.script_unknown(landed=False)  # 1st: unknown, not landed → RE_DRIVE
+        fake_a.script_conflict()  # 2nd (the re-drive): conflict → typed conflict
+        with pytest.raises(CasVersionConflict):
+            a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+        assert len(fake_a.cas_calls) == 2
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_re_drive_retry_second_unknown_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SECOND unknown on the re-drive fails closed (CommitUnconfirmed) — it does
+    NOT loop unbounded and NEVER bumps the coordinator."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    posts: list[str] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+        posts.append(path)
+        return real_post(endpoint, path, payload)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        _ab, a_tok = a.read(REF)
+
+        fake_a.script_unknown(landed=False)  # 1st: unknown → RE_DRIVE
+        fake_a.script_unknown(landed=False)  # 2nd: unknown again → fail-closed
+        with pytest.raises(CommitUnconfirmed):
+            a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+        assert len(fake_a.cas_calls) == 2  # no third attempt
+        assert "/hooks/post-edit-cas" not in posts  # never bumped
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_re_drive_detects_own_ghost_and_converges(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """RE_DRIVE whose retry conflicts because MY OWN in-flight ghost put landed
+    converges (my bytes are present) and drives the bump — not a misleading peer
+    conflict."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        _ab, a_tok = a.read(REF)
+
+        fake_a.script_unknown(landed=False)  # 1st: unknown, not landed → RE_DRIVE
+        fake_a.script_ghost_conflict()  # 2nd: ghost lands my bytes, THEN conflicts
+        result = a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+
+        assert result.converged is True  # my ghost carried my bytes
+        assert len(fake_a.cas_calls) == 2
+        assert store.get(REF)[0] == b"v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- HOLD: absent operand wedges the view, never bumps ----------------------
+
+
+def test_hold_verdict_wedges_without_bump(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown write whose operand is ABSENT at reconcile (a raced delete)
+    HOLDs → ViewWedged, and NEVER fires the coordinator bump (no phantom advance
+    on a deleted operand)."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    posts: list[str] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+        posts.append(path)
+        return real_post(endpoint, path, payload)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        _ab, a_tok = a.read(REF)
+
+        fake_a.script_unknown(landed=False)
+        fake_a.reconcile_hook = lambda: store.delete(REF)  # operand vanishes
+        with pytest.raises(ViewWedged):
+            a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+        assert len(fake_a.cas_calls) == 1
+        assert "/hooks/post-edit-cas" not in posts  # HOLD never bumps
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- converged/clean bump losing to a peer → typed conflict -----------------
+
+
+def test_converged_bump_conflict_on_different_peer_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A converged write whose bump loses to a DIFFERENT-bytes peer is a real
+    conflict (the coordinator hash does not match my intended) — NOT a false
+    converge that would mask a lost update."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        b, _fb = _agent(store, sb, arm="object")
+        _ab, a_tok = a.read(REF)
+        _bb, _b_tok = b.read(REF)  # B is SHARED@v1 so it can bump the coordinator
+
+        def peer_bumps_different() -> None:
+            sb.commit_cas(REF, expected_version=1, content_hash=_sha256(b"peer-different"))
+
+        fake_a.script_unknown(landed=True)  # A's write landed (b"v2") → CONVERGE
+        fake_a.reconcile_hook = peer_bumps_different
+        with pytest.raises(CasVersionConflict):
+            a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+        assert len(fake_a.cas_calls) == 1  # no re-drive of a landed write
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_clean_win_bump_conflict_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean substrate win whose coordinator bump loses to a peer (a peer bumped
+    between this agent's pre-read and its bump) surfaces the typed conflict."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
+    injected = {"done": False}
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+        # Just before A's bump, let a peer bump the coordinator once (v1 → v2), so
+        # A's clean-win bump at expected_version=1 conflicts. The guard keeps the
+        # peer's own post-edit-cas from re-triggering the injection.
+        if (
+            path == "/hooks/post-edit-cas"
+            and payload.get("session_id") == sa.session_id
+            and not injected["done"]
+        ):
+            injected["done"] = True
+            sb.commit_cas(REF, expected_version=1, content_hash=_sha256(b"peer"))
+        return real_post(endpoint, path, payload)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    try:
+        a, fake_a = _agent(store, sa, arm="object")
+        b, _fb = _agent(store, sb, arm="object")
+        _ab, a_tok = a.read(REF)
+        _bb, _b_tok = b.read(REF)  # B SHARED@v1 so its injected bump lands
+
+        with pytest.raises(CasVersionConflict):
+            a.commit(REF, expected_token=a_tok, new_bytes=b"vA")
+        assert len(fake_a.cas_calls) == 1  # a clean win, no reconcile/re-drive
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- never-ship-a-store, made load-bearing at composition -------------------
+
+
+def test_binding_declaring_it_sends_content_is_refused() -> None:
+    """A binding that declares SENDS_CONTENT_TO_COORDINATOR=True is refused at
+    composition — the never-ship-a-store floor is enforced, not merely declared."""
+
+    class _ContentLeakingBinding:
+        SENDS_CONTENT_TO_COORDINATOR = True
+
+    with pytest.raises(CoherenceError):
+        CoordinatedSubstrate(_ContentLeakingBinding(), object())  # type: ignore[arg-type]
+
+
+# --- coordinator commit classification (fail-closed) ------------------------
+
+
+def test_classify_commit_ok_is_win() -> None:
+    result = substrate_module._classify_commit({"ok": True, "version": 5}, expected_version=4)
+    assert isinstance(result, CoordinatorWin) and result.version == 5
+
+
+def test_classify_commit_degraded_body_is_unconfirmed() -> None:
+    with pytest.raises(CommitUnconfirmed):
+        substrate_module._classify_commit({"ok": False, "degraded": True}, expected_version=4)
+
+
+def test_classify_commit_unconfirmed_reason_is_unconfirmed() -> None:
+    with pytest.raises(CommitUnconfirmed):
+        substrate_module._classify_commit(
+            {"ok": False, "reason": COMMIT_UNCONFIRMED_REASON}, expected_version=4
+        )
+
+
+def test_classify_commit_retryable_reason_is_conflict() -> None:
+    result = substrate_module._classify_commit(
+        {"ok": False, "reason": VERSION_MISMATCH_REASON, "current_version": 7},
+        expected_version=4,
+    )
+    assert isinstance(result, CoordinatorConflict) and result.current_version == 7
+
+
+def test_classify_commit_unknown_reason_fails_closed() -> None:
+    with pytest.raises(CoherenceError):
+        substrate_module._classify_commit({"ok": False, "reason": "mystery"}, expected_version=4)

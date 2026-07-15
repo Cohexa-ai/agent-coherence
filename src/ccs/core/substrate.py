@@ -21,11 +21,22 @@ rows — and pass it in.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Iterator, Mapping
 from uuid import UUID
+
+
+def sha256_hex(data: bytes) -> str:
+    """The one content fingerprint the coordinator may hold: a sha-256 hex digest.
+
+    Single source of truth for what ``content_hash`` means, shared by every
+    substrate binding — so a future change to the fingerprint (normalization,
+    encoding) can never silently diverge one binding from another.
+    """
+    return hashlib.sha256(data).hexdigest()
 
 
 class Tier(Enum):
@@ -127,6 +138,11 @@ _SHA256_HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 # content-proportional shadow: the floor fails closed rather than trusting a
 # field name.
 _MAX_OPAQUE_TEXT_LEN = 256
+# Coherence metadata is a handful of scalars per artifact. A large collection or
+# an arbitrary-precision integer is a body wearing another shape (bytes as a list
+# of byte-value ints, or as one big int), so both are bounded, not just strings.
+_MAX_COLLECTION_LEN = 256
+_MAX_INT_BITS = 64
 _ALLOWED_SCALARS = (bool, int, float, UUID, type(None))
 
 
@@ -166,8 +182,25 @@ def _walk_violations(value: object, path: str) -> Iterator[str]:
                 "chars is treated as content-proportional"
             )
     elif isinstance(value, (list, tuple, set, frozenset)):
+        if len(value) > _MAX_COLLECTION_LEN:
+            # A body encoded as a list of byte-value ints is content-proportional;
+            # name it and stop (walking a body-sized collection is itself a cost).
+            yield (
+                f"{path or '<root>'}: collection of {len(value)} items exceeds "
+                f"{_MAX_COLLECTION_LEN} (content-proportional)"
+            )
+            return
         for index, item in enumerate(value):
             yield from _walk_violations(item, f"{path}[{index}]")
+    elif isinstance(value, bool):
+        pass  # a flag, not a magnitude
+    elif isinstance(value, int):
+        if value.bit_length() > _MAX_INT_BITS:
+            # A body packed into one big integer (int.from_bytes) is a shadow too.
+            yield (
+                f"{path or '<root>'}: integer wider than {_MAX_INT_BITS} bits is "
+                "content-proportional"
+            )
     elif not isinstance(value, _ALLOWED_SCALARS):
         # Fail closed: a value type this floor cannot classify is rejected
         # rather than waved through.

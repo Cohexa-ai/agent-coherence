@@ -34,7 +34,7 @@ from ccs.adapters.substrate import (
     CasWritten,
     CoherenceSubstrate,
 )
-from ccs.core.exceptions import CasVersionConflict, CoherenceError
+from ccs.core.exceptions import CoherenceError
 from ccs.core.substrate import Tier
 
 
@@ -228,14 +228,13 @@ def test_cas_write_412_precondition_failed_is_conflict() -> None:
     assert isinstance(result, CasConflict)
 
 
-def test_conflict_maps_to_public_cas_version_conflict() -> None:
-    # The substrate leg returns CasConflict; Unit 5 (which holds the coordinator
-    # versions) maps it to the shipped, exact-type-mapped CasVersionConflict.
+def test_stale_token_write_returns_cas_conflict() -> None:
+    # The substrate leg returns the typed CasConflict on a stale token; the
+    # mapping to the coordinator-versioned CasVersionConflict is the cross-agent
+    # layer's job (tested in tests/adapters/test_substrate_cross_agent.py), so the
+    # binding no longer carries a private mapping seam.
     obj, _ = _make({"k": (b"v1", '"current"')})
     assert isinstance(obj.cas_write("k", expected_token='"stale"', new_bytes=b"v2"), CasConflict)
-    exc = CoherentObject.as_version_conflict("k", expected_version=3, current_version=4)
-    assert isinstance(exc, CasVersionConflict)
-    assert exc.expected_version == 3 and exc.current_version == 4
 
 
 def test_cas_write_409_classified_retryable_but_no_write_landed() -> None:

@@ -38,7 +38,6 @@ the ETag round-trip and the conditional-write semantics well-defined.
 
 from __future__ import annotations
 
-import hashlib
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Final
 
@@ -51,8 +50,9 @@ from ccs.adapters.substrate import (
     ReconcileVerdict,
     SubstrateToken,
 )
-from ccs.core.exceptions import CasVersionConflict, CoherenceError
+from ccs.core.exceptions import CoherenceError
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from ccs.core.substrate import sha256_hex as _sha256_hex
 
 if TYPE_CHECKING:
     from ccs.adapters.substrate import CoherenceSubstrate
@@ -109,10 +109,6 @@ _CODE_CONDITIONAL_CONFLICT: Final[str] = "ConditionalRequestConflict"  # 409 —
 # conflict — re-create is a CALLER decision (via CREATE_IF_ABSENT after
 # reacquire), never an automatic re-drive: a delete is itself an update.
 _NOT_FOUND_CODES: Final[frozenset[str]] = frozenset({"NoSuchKey", "NoSuchVersion", "404"})
-
-
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _s3_error_code(exc: BaseException) -> str | None:
@@ -241,8 +237,11 @@ class CoherentObject:
 
     #: Bytes threaded to the coordinator on commit: never any. The coordinator
     #: holds only a version + a fixed-width fingerprint for this binding, so the
-    #: object body is never shadowed coordinator-side (never-ship-a-store). Unit 5's
-    #: two-part-commit mixin reads this to pass ``content=None`` into the commit.
+    #: object body is never shadowed coordinator-side (never-ship-a-store). This is
+    #: the binding's self-declaration; the conformance kit asserts it, and
+    #: :class:`~ccs.adapters.substrate.CoordinatedSubstrate` refuses at composition
+    #: any binding that sets it True. The runtime enforcement lives in
+    #: ``SubstrateCoordinatorSession.commit_cas`` (a content_hash-only payload).
     SENDS_CONTENT_TO_COORDINATOR: bool = False
 
     def __init__(
@@ -269,8 +268,10 @@ class CoherentObject:
         """The content threaded to the coordinator on commit: always ``None``.
 
         The object body stays in S3; the coordinator holds only a version +
-        fingerprint. Unit 5's mixin calls this so both native-CAS bindings share
-        one content-free commit seam (no retention shadow — never-ship-a-store).
+        fingerprint (no retention shadow — never-ship-a-store). A declarative
+        companion to :attr:`SENDS_CONTENT_TO_COORDINATOR`, asserted by the
+        conformance kit; the actual content-free payload is built in
+        ``SubstrateCoordinatorSession.commit_cas``.
         """
         return None
 
@@ -387,26 +388,6 @@ class CoherentObject:
             return ReconcileDecision(ReconcileVerdict.CONVERGE, observed_bytes, observed_token)
         # (iv) token moved AND bytes differ → a real peer write → typed conflict.
         return ReconcileDecision(ReconcileVerdict.CONFLICT, observed_bytes, observed_token)
-
-    # --- public-conflict mapping seam (Unit 5 supplies the coordinator versions) --
-
-    @staticmethod
-    def as_version_conflict(
-        artifact_ref: str,
-        *,
-        expected_version: int,
-        current_version: int,
-    ) -> CasVersionConflict:
-        """Map a substrate ``CasConflict`` to the shipped public conflict.
-
-        The substrate leg speaks ETags; the shipped :class:`~ccs.core.exceptions.CasVersionConflict`
-        (exact-type mapped by ``ccs.mcp.deny``, the uniform typed conflict every
-        adapter speaks) speaks the coordinator's integer versions. Unit 5 holds
-        those versions (the pending intent's expected ``V`` and the coordinator's
-        current), so it calls this to raise the conflict a caller already knows how
-        to handle — re-read at ``current_version``, re-derive, retry.
-        """
-        return CasVersionConflict(artifact_ref, expected_version, current_version)
 
     # --- internals ------------------------------------------------------------
 

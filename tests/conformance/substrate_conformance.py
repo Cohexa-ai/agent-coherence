@@ -101,6 +101,9 @@ class InMemoryStore:
     def __init__(self) -> None:
         self._data: dict[str, tuple[bytes, str]] = {}
         self._counter = 0
+        #: Substrate-read count — a split (bytes, token) read shows up as >1 per
+        #: view.read(), which the read-pair-atomicity control asserts against.
+        self.read_count = 0
 
     def set(self, ref: str, data: bytes) -> str:
         self._counter += 1
@@ -109,6 +112,7 @@ class InMemoryStore:
         return token
 
     def get(self, ref: str) -> tuple[bytes, str] | None:
+        self.read_count += 1
         return self._data.get(ref)
 
 
@@ -288,6 +292,19 @@ class InMemoryBinding:
     def make_view(self) -> ConformanceSubstrate:
         return ConformanceSubstrate(self._store, self._arm)
 
+    def substrate_read_count(self) -> int:
+        """Total substrate reads so far — lets the read-pair-atomicity control
+        assert that one ``view.read()`` fetches ``(bytes, token)`` in ONE read."""
+        return self._store.read_count
+
+
+class _SplitReadBinding(InMemoryBinding):
+    """A ConformanceBinding whose view fetches ``(bytes, token)`` in TWO substrate
+    reads — the read-pair-atomicity control MUST reject it (teeth certification)."""
+
+    def make_view(self) -> SplitComparandSubstrate:
+        return SplitComparandSubstrate(self._store, self._arm)
+
 
 # ===========================================================================
 # Native-CAS scenarios — substrate-agnostic (fake AND real_substrate).
@@ -382,16 +399,52 @@ def assert_never_ship_a_store_wire(
         assert isinstance(payload.get("content_hash"), str)
 
 
+def assert_read_pair_is_atomic(binding: ConformanceBinding, make_session: "SessionFactory") -> None:
+    """Read-pair atomicity: one ``view.read()`` fetches ``(bytes, token)`` in a
+    SINGLE substrate read (the PR-#107 control, now certified for shipped bindings).
+
+    A split read — bytes from read A, token from a LATER read B — is the PR-#107
+    lost update: the token vouches for bytes it never described, so a CAS under it
+    passes on a stale comparand and silently loses a concurrent peer. A binding
+    that issues exactly one substrate read for the pair CANNOT split. The count is
+    read from ``substrate_read_count`` when the binding instruments it (the fake,
+    always; a real binding when its driver is wrapped); it skips otherwise rather
+    than false-green."""
+    del make_session  # a bare-substrate property; no coordinator needed
+    read_count = getattr(binding, "substrate_read_count", None)
+    if read_count is None:
+        return  # binding does not instrument substrate reads — cannot certify here
+    ref = _fresh_ref()
+    binding.seed(ref, b"base")
+    view = binding.make_view()
+    before = read_count()
+    view.read(ref)
+    delta = read_count() - before
+    assert delta == 1, (
+        f"read-pair split: view.read() issued {delta} substrate reads, not 1 — a "
+        "(bytes, token) pair read non-atomically can silently lose a peer (PR-#107)"
+    )
+
+
+def assert_read_pair_split_binding_is_rejected() -> None:
+    """Confirm the read-pair-atomicity control has TEETH: a split-read binding
+    (two substrate reads per pair) fails it (helper for the MUST-FAIL test)."""
+    with pytest.raises(AssertionError):
+        assert_read_pair_is_atomic(_SplitReadBinding("object"), None)  # type: ignore[arg-type]
+
+
 def run_native_cas_conformance(
     binding: ConformanceBinding, make_session: "SessionFactory"
 ) -> None:
     """The substrate-agnostic native-CAS arm — run against the fake AND real
     substrates. (i) proves the bare CAS; (ii) proves the coordinator's
-    invalidation-before-act; (a) pins never-ship-a-store on the wire."""
+    invalidation-before-act; (a) pins never-ship-a-store on the wire; and the
+    read-pair-atomicity control certifies the SHIPPED read is not split."""
     assert_native_cas_descriptor(binding.descriptor)
     assert_racing_writers_one_winner(binding, make_session)
     assert_invalidation_before_act(binding, make_session)
     assert_never_ship_a_store_wire(binding, make_session)
+    assert_read_pair_is_atomic(binding, make_session)
 
 
 # ===========================================================================

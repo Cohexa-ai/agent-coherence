@@ -23,7 +23,6 @@ drift apart on what a win, a conflict, or an unknown outcome means.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import urllib.error
@@ -55,6 +54,7 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor
+from ccs.core.substrate import sha256_hex as _sha256_hex
 
 logger = logging.getLogger(__name__)
 
@@ -274,64 +274,13 @@ class CoherenceSubstrate(Protocol):
         ...
 
 
-class TwoPartCommitMixin:
-    """Ordering seam for the binding commit: substrate CAS first, coordinator
-    bump second.
-
-    The order is load-bearing. Bumping the coordinator first would advance the
-    version and invalidate peers for a write that can still lose the substrate
-    compare-and-set — a phantom invalidation with the coordinator ahead of the
-    substrate, indistinguishable from a real advance and therefore
-    unrecoverable. Substrate-first is self-healing: if the coordinator leg is
-    lost, the next read reconciles because the token moved.
-
-    This mixin defines the seam only. The substrate leg is the binding's
-    :meth:`~CoherenceSubstrate.cas_write`; the coordinator leg
-    (:meth:`_bump_coordinator`) is wired by each binding.
-    """
-
-    def commit_two_part(
-        self,
-        artifact_ref: str,
-        *,
-        expected_token: SubstrateToken,
-        new_bytes: bytes,
-    ) -> CasWriteResult:
-        """Run the two-part commit and return the substrate outcome.
-
-        The coordinator leg fires ONLY on a confirmed substrate win: a conflict
-        never reaches the coordinator (no write landed), and an unknown outcome
-        never advances coordinator state (the write is unconfirmed until a
-        re-read proves otherwise).
-        """
-        outcome = self.cas_write(
-            artifact_ref, expected_token=expected_token, new_bytes=new_bytes
-        )
-        if isinstance(outcome, CasWritten):
-            self._bump_coordinator(artifact_ref, written=outcome)
-        return outcome
-
-    def cas_write(
-        self,
-        artifact_ref: str,
-        *,
-        expected_token: SubstrateToken,
-        new_bytes: bytes,
-    ) -> CasWriteResult:
-        """The substrate leg — supplied by the binding's substrate surface."""
-        raise NotImplementedError(
-            "the binding supplies the substrate leg (CoherenceSubstrate.cas_write)"
-        )
-
-    def _bump_coordinator(self, artifact_ref: str, *, written: CasWritten) -> None:
-        """The coordinator leg — version bump plus peer invalidation.
-
-        Wired by each binding; this seam only guarantees WHEN it may run
-        (after, and only after, a confirmed substrate win).
-        """
-        raise NotImplementedError(
-            "the binding wires the coordinator bump for a confirmed substrate win"
-        )
+# The two-part commit ordering (substrate CAS first, coordinator bump second) is
+# load-bearing, and it lives in ONE place: CoordinatedSubstrate below. Bumping
+# the coordinator first would advance the version and invalidate peers for a
+# write that can still lose the substrate compare-and-set — a phantom
+# invalidation, indistinguishable from a real advance and therefore
+# unrecoverable. Substrate-first is self-healing: if the coordinator leg is lost,
+# the next read reconciles because the token moved.
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +313,6 @@ class ReconcilingSubstrate(CoherenceSubstrate, Protocol):
     ) -> ReconcileDecision:
         """Re-read the substrate and return the unified reconciliation verdict."""
         ...
-
-
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _as_int(value: object, fallback: int) -> int:
@@ -639,16 +584,23 @@ class CommitResult:
     """The outcome of a landed cross-agent commit.
 
     ``converged`` is True when the write landed via reconciliation of an unknown
-    (attribution is not claimed) rather than a clean coordinator win.
+    (attribution is not claimed) rather than a clean coordinator win. ``noop`` is
+    True when the commit was byte-identical to the last-observed bytes and so
+    touched neither the substrate nor the coordinator — the version did not
+    advance and no peer was invalidated.
     """
 
     version: int
     converged: bool
+    noop: bool = False
 
     @property
     def summary(self) -> str:
-        """"converged" for a reconciled write, "committed" for a clean win —
-        never "landed", since a converged write's attribution is disclaimed."""
+        """"unchanged" for a byte-identical no-op, "converged" for a reconciled
+        write, "committed" for a clean win — never "landed", since a converged
+        write's attribution is disclaimed and a no-op landed nothing."""
+        if self.noop:
+            return "unchanged"
         return "converged" if self.converged else "committed"
 
 
@@ -689,6 +641,15 @@ class CoordinatedSubstrate:
         substrate: ReconcilingSubstrate,
         coordinator: SubstrateCoordinatorSession,
     ) -> None:
+        # never-ship-a-store, made load-bearing: a binding that declares it sends
+        # content to the coordinator is refused at composition, so the content-free
+        # commit path (commit_cas sends content_hash only) cannot be undercut by a
+        # binding that shadows the body coordinator-side.
+        if getattr(substrate, "SENDS_CONTENT_TO_COORDINATOR", False):
+            raise CoherenceError(
+                "substrate binding declares SENDS_CONTENT_TO_COORDINATOR=True; the "
+                "coordinator holds a content_hash only (never-ship-a-store) — refused"
+            )
         self._substrate = substrate
         self._coordinator = coordinator
         # Per-artifact last-observed content hash (seeded on read), so a commit's
@@ -759,6 +720,12 @@ class CoordinatedSubstrate:
         pre = self._coordinator.pre_read(artifact_ref, self._observed_hash.get(artifact_ref))
         # A write is a data-loss surface — a deny ALWAYS raises before acting.
         self._raise_on_deny(artifact_ref, pre, on_stale="raise")
+        # No-op guard: committing the exact bytes this instance last observed
+        # changes nothing. Skip BOTH legs so a byte-identical rewrite never mints a
+        # phantom version advance that would invalidate every peer (Open Q C). The
+        # deny check above still ran, so a stale no-op surfaces rather than passing.
+        if self._observed_hash.get(artifact_ref) == pending.intended_hash:
+            return CommitResult(version=pre.version, converged=False, noop=True)
         pending = _replace_expected_version(pending, pre.version)
         outcome = self._substrate.cas_write(
             artifact_ref, expected_token=expected_token, new_bytes=new_bytes
@@ -793,6 +760,8 @@ class CoordinatedSubstrate:
             return self._drive_bump(pending)
         if isinstance(outcome, CasConflict):
             # No coordinator leg — no write landed; a foreign writer moved the token.
+            # current_version is best-effort (no coordinator re-read); recover via
+            # reacquire(), not the numeric (see CasVersionConflict).
             raise CasVersionConflict(
                 pending.artifact_ref, pending.expected_version, pending.expected_version
             )
@@ -850,6 +819,8 @@ class CoordinatedSubstrate:
         if decision.re_drive_token is not None:  # RE_DRIVE — token unmoved, retry once.
             return self._re_drive(pending, decision.re_drive_token)
         # RE_DERIVE / CONFLICT — the write did not land as mine; reacquire + re-decide.
+        # current_version is best-effort (no coordinator re-read); recover via
+        # reacquire(), not the numeric (see CasVersionConflict).
         raise CasVersionConflict(
             pending.artifact_ref, pending.expected_version, pending.expected_version
         )
@@ -861,6 +832,21 @@ class CoordinatedSubstrate:
         if isinstance(retry, CasWritten):
             return self._drive_bump(pending)
         if isinstance(retry, CasConflict):
+            # The token moved between the reconcile read and this re-drive. Either
+            # MY own in-flight ghost put landed (converge — complete the bump) or a
+            # peer superseded me (a real conflict). Reconcile ONCE more to tell them
+            # apart rather than raising a misleading conflict on my own write. Only
+            # CONVERGE is acted on here; any other verdict is surfaced as a conflict,
+            # so this cannot loop back into another re-drive.
+            decision = self._substrate.reconcile_after_unknown(
+                pending.artifact_ref,
+                expected_token=pending.expected_token,
+                intended_hash=pending.intended_hash,
+            )
+            if decision.bump_fires:  # CONVERGE — my ghost carried my bytes; complete it.
+                return self._drive_bump(pending, converged=True)
+            # current_version is best-effort here — no coordinator re-read; the
+            # caller recovers via reacquire(), not the numeric (see CasVersionConflict).
             raise CasVersionConflict(
                 pending.artifact_ref, pending.expected_version, pending.expected_version
             )

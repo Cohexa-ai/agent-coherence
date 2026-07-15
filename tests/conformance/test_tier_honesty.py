@@ -27,6 +27,7 @@ from tests.conformance.substrate_conformance import (
     assert_coordinator_retention_empty,
     assert_detect_only_silent_lost_update,
     assert_forward_only_honest,
+    assert_read_pair_split_binding_is_rejected,
     assert_rejects_split_comparand,
     assert_split_view_is_rejected,
     run_native_cas_conformance,
@@ -91,6 +92,13 @@ def test_split_comparand_must_fail() -> None:
     FAILS the kit — the PR-#107 lost update a version-CAS / NoLostUpdate check
     does not catch."""
     assert_split_view_is_rejected("object")
+
+
+def test_read_pair_atomicity_control_rejects_split_binding() -> None:
+    """MANDATORY teeth: the read-pair-atomicity control (now part of every
+    native-CAS run) fails a split-read binding — a (bytes, token) pair fetched in
+    two substrate reads, not one."""
+    assert_read_pair_split_binding_is_rejected()
 
 
 def test_detect_only_forced_silent_lost_update() -> None:

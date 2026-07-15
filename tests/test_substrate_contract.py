@@ -26,11 +26,8 @@ from uuid import uuid4
 import pytest
 
 from ccs.adapters.substrate import (
-    CasConflict,
-    CasUnknown,
     CasWritten,
     CoherenceSubstrate,
-    TwoPartCommitMixin,
 )
 from ccs.core.substrate import (
     CapabilityDescriptor,
@@ -239,6 +236,36 @@ def test_unrecognized_value_type_fails_closed():
     assert never_ship_a_store(state) is False
 
 
+def test_unbounded_collection_rejected_as_content_proportional():
+    # A body encoded as a list of byte-value ints is content-proportional even
+    # though every element is an allowed scalar.
+    state = {**metadata_only_state(), "payload": list(range(256)) * 40}
+
+    assert never_ship_a_store(state) is False
+    assert any("collection" in v for v in never_ship_violations(state))
+
+
+def test_small_collection_of_scalars_allowed():
+    # A handful of tokens/ids is legitimate coherence metadata.
+    state = {**metadata_only_state(), "peers": ["agent-a", "agent-b", "agent-c"]}
+
+    assert never_ship_a_store(state) is True
+
+
+def test_arbitrary_precision_integer_rejected():
+    # A body packed into one big integer (int.from_bytes) is a content shadow.
+    state = {**metadata_only_state(), "blob": int.from_bytes(b"x" * 5000, "big")}
+
+    assert never_ship_a_store(state) is False
+    assert any("integer" in v for v in never_ship_violations(state))
+
+
+def test_ordinary_version_integer_allowed():
+    state = {**metadata_only_state(), "version": 42, "tick": 1_000_000}
+
+    assert never_ship_a_store(state) is True
+
+
 # ---------------------------------------------------------------------------
 # never_ship_a_store: retention-rows leg
 # ---------------------------------------------------------------------------
@@ -331,58 +358,11 @@ def test_read_returns_bytes_and_token_from_one_read():
 
 
 # ---------------------------------------------------------------------------
-# Two-part-commit mixin: ordering seam
+# The two-part-commit ordering (substrate CAS first, coordinator bump second) is
+# no longer a standalone mixin — it lives in CoordinatedSubstrate, and its
+# ordering guarantees (a conflict/unknown never reaches the coordinator) are
+# covered end-to-end in tests/adapters/test_substrate_cross_agent.py.
 # ---------------------------------------------------------------------------
-
-
-class RecordingBinding(TwoPartCommitMixin):
-    """Stub binding recording the order of the two commit legs."""
-
-    def __init__(self, outcome: object) -> None:
-        self.outcome = outcome
-        self.calls: list[str] = []
-
-    def cas_write(self, artifact_ref: str, *, expected_token: str, new_bytes: bytes):
-        self.calls.append("substrate_cas")
-        return self.outcome
-
-    def _bump_coordinator(self, artifact_ref: str, *, written: CasWritten) -> None:
-        self.calls.append("coordinator_bump")
-
-
-def test_win_runs_substrate_cas_before_coordinator_bump():
-    binding = RecordingBinding(CasWritten(token="token-2"))
-
-    outcome = binding.commit_two_part("ref", expected_token="token-1", new_bytes=b"new")
-
-    assert binding.calls == ["substrate_cas", "coordinator_bump"]
-    assert outcome == CasWritten(token="token-2")
-
-
-def test_conflict_never_reaches_the_coordinator():
-    binding = RecordingBinding(CasConflict())
-
-    outcome = binding.commit_two_part("ref", expected_token="token-1", new_bytes=b"new")
-
-    assert binding.calls == ["substrate_cas"]
-    assert isinstance(outcome, CasConflict)
-
-
-def test_unknown_outcome_never_bumps_the_coordinator():
-    binding = RecordingBinding(CasUnknown())
-
-    outcome = binding.commit_two_part("ref", expected_token="token-1", new_bytes=b"new")
-
-    assert binding.calls == ["substrate_cas"]
-    assert isinstance(outcome, CasUnknown)
-
-
-def test_mixin_seam_hooks_are_not_wired_by_default():
-    class BareBinding(TwoPartCommitMixin):
-        pass
-
-    with pytest.raises(NotImplementedError):
-        BareBinding().commit_two_part("ref", expected_token="t", new_bytes=b"n")
 
 
 # ---------------------------------------------------------------------------

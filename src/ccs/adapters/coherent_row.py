@@ -41,7 +41,6 @@ connection is actually needed.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from contextlib import AbstractContextManager
@@ -64,6 +63,7 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from ccs.core.substrate import sha256_hex as _sha256_hex
 
 if TYPE_CHECKING:
     from ccs.adapters.substrate import CoherenceSubstrate
@@ -224,7 +224,13 @@ def provisioning_sql(
     tbl = _quote_table(table)
     ver = _quote_identifier(version_column)
     _quote_identifier(role)  # validate the role name before interpolating it
-    fn = _quote_identifier(f"{table.split('.')[-1]}_coherence_version")
+    base = table.split(".")[-1]
+    fn = _quote_identifier(f"{base}_coherence_version")
+    # Trigger names are WHOLE quoted identifiers, not a suffix concatenated onto
+    # the already-quoted function name: `"..."_ins` is two tokens where Postgres
+    # wants one (a syntax error at "_ins"), which would break the one-time setup.
+    trig_ins = _quote_identifier(f"{base}_coherence_version_ins")
+    trig_upd = _quote_identifier(f"{base}_coherence_version_upd")
 
     trigger_function = (
         f"-- Version guard: mint {ver} from the STORED prior row. Owned by the\n"
@@ -241,11 +247,11 @@ def provisioning_sql(
         "$$ LANGUAGE plpgsql;"
     )
     trigger_bindings = (
-        f"DROP TRIGGER IF EXISTS {fn}_ins ON {tbl};\n"
-        f"CREATE TRIGGER {fn}_ins BEFORE INSERT ON {tbl}\n"
+        f"DROP TRIGGER IF EXISTS {trig_ins} ON {tbl};\n"
+        f"CREATE TRIGGER {trig_ins} BEFORE INSERT ON {tbl}\n"
         f"    FOR EACH ROW EXECUTE FUNCTION {fn}();\n"
-        f"DROP TRIGGER IF EXISTS {fn}_upd ON {tbl};\n"
-        f"CREATE TRIGGER {fn}_upd BEFORE UPDATE ON {tbl}\n"
+        f"DROP TRIGGER IF EXISTS {trig_upd} ON {tbl};\n"
+        f"CREATE TRIGGER {trig_upd} BEFORE UPDATE ON {tbl}\n"
         f"    FOR EACH ROW EXECUTE FUNCTION {fn}();"
     )
     role_grants = (
@@ -281,8 +287,11 @@ class CoherentRow:
 
     #: Bytes threaded to the coordinator on commit: never any. The coordinator
     #: holds only a version + a fixed-width fingerprint for this binding, so the
-    #: row body is never shadowed coordinator-side (never-ship-a-store). Unit 5's
-    #: two-part-commit mixin reads this to pass ``content=None`` into the commit.
+    #: row body is never shadowed coordinator-side (never-ship-a-store). This is
+    #: the binding's self-declaration; the conformance kit asserts it, and
+    #: :class:`~ccs.adapters.substrate.CoordinatedSubstrate` refuses at composition
+    #: any binding that sets it True. The runtime enforcement lives in
+    #: ``SubstrateCoordinatorSession.commit_cas`` (a content_hash-only payload).
     SENDS_CONTENT_TO_COORDINATOR: bool = False
 
     def __init__(
@@ -323,8 +332,9 @@ class CoherentRow:
         """The content threaded to the coordinator on commit: always ``None``.
 
         The row body stays in Postgres; the coordinator holds only a version +
-        fingerprint. Unit 5's mixin calls this so both native-CAS bindings share
-        one content-free commit seam.
+        fingerprint. A declarative companion to
+        :attr:`SENDS_CONTENT_TO_COORDINATOR`, asserted by the conformance kit; the
+        actual content-free payload is built in ``SubstrateCoordinatorSession.commit_cas``.
         """
         return None
 
@@ -516,10 +526,6 @@ class CoherentRow:
 def _is_usable_version(version: object) -> bool:
     """True iff ``version`` is a positive integer (not a bool, sentinel, or None)."""
     return isinstance(version, int) and not isinstance(version, bool) and version > 0
-
-
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 if TYPE_CHECKING:

@@ -626,6 +626,12 @@ class CasVersionConflict(CoherenceError):
     between, OR the caller's comparand was stale. Typed-conflict, NOT auto-merge:
     NO write landed; the agent re-reads at ``current_version``, re-merges, and
     retries. Carries both versions so the client can re-CAS without another read.
+
+    ``current_version`` is authoritative when the coordinator itself reported it
+    (a bump-conflict). On a substrate-side CAS loss — where the coordinator was
+    not re-read — it is best-effort (the version observed at pre-read time); a
+    caller keys recovery on ``reacquire()`` (which re-reads fresh), not on the
+    numeric.
     """
 
     reason = VERSION_MISMATCH_REASON
