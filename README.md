@@ -86,6 +86,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
 - 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
 - 🗂️ [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files) — `CoherentVolume`, the data-plane appliance for plain files shared across processes
+- 🧱 [BYO substrate](#byo-substrate-coherence-over-the-store-you-already-run) — `CoherentRow` / `CoherentObject`, the same coherence over a Postgres row or an S3 object you already run
 - 🛡️ [Foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) — catch out-of-band edits (a human, a formatter, a script) at the read/write boundary
 - 🔌 [MCP server](#mcp-server-stale-write-guard-fs) — `stale-write-guard-fs`, the same guarantee for any MCP client, no Python integration required
 - 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input version it decided from
@@ -253,6 +254,26 @@ versions = vol.atomic_publish([
 Either every member's version advances or none does, and a moved member holds the whole batch — a torn *commit* is never a reachable state, formally specified as the `NoPartialPublish` invariant in [`formal/tla/AtomicPublish.tla`](formal/tla/AtomicPublish.tla). A single-file publish takes the direct CAS path; a multi-file publish opens a [snapshot session](#multi-artifact-snapshot-sessions) so the versions it checks are captured at one point (no member read across a peer commit). Run it: `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add `--baseline` to see the file-by-file torn pair it prevents.
 
 **Scope, honestly.** The all-or-nothing guarantee is at the **coordinator commit** — that is what `NoPartialPublish` covers. Disk materialization happens *after* the commit and is best-effort: every file is staged to a temp then renamed into place, so a disk fault fails before any rename (disk stays uniformly old) and a rename failing partway raises a typed `PublishMaterializationError` naming exactly which files landed — never a bare error implying nothing published. This shrinks, but a crash between renames can't fully eliminate, the multi-file disk window (there is no POSIX multi-file atomic rename); on that error the coordinator is ahead of disk and you re-read + re-materialize. It is single-host and cooperative. The multi-file path also adds a small capture→commit window (the session open); a peer winning it **holds** the publish rather than tearing it. This is all-or-nothing *publish* of a file set — not rollback of effects that already escaped, and not write-skew prevention across sessions.
+
+## BYO substrate: coherence over the store you already run
+
+`CoherentVolume` puts coherence over files on disk. But shared agent state often lives in a store you already run — a Postgres row, an S3 object. **BYO-substrate bindings** bring the same coherence *over that store*, with the coordinator holding only metadata (a version, per-agent MESI, a fixed-width `content_hash`, an opaque substrate token) — **never the bytes**:
+
+```python
+from ccs.adapters.coherent_row import CoherentRow      # pip install "agent-coherence[coherent-row]"
+from ccs.adapters.coherent_object import CoherentObject  # pip install "agent-coherence[coherent-object]"
+
+# agent A reads a row it will edit over several steps
+row = CoherentRow(dsn=..., table="workspaces", artifact_id="ws-42")
+data, token = row.read("ws-42")
+# ... meanwhile agent B commits a new version through the binding ...
+# A's next binding-mediated read/act is DENIED before A writes:
+row.commit("ws-42", expected_token=token, new_bytes=revised)  # -> StaleView; reacquire() and re-decide
+```
+
+The value over the substrate's own conditional write (`UPDATE … WHERE version=?`, S3 `If-Match`): a bare CAS rejects A's write *at write time*; the binding tells A its **cached view went stale before it acts**, in the **same typed vocabulary** a file (`CoherentVolume`) or a store key (`CCSStore`) uses — one coherence surface over a row, an object, or a file. A declarative [Coherence Manifest](docs/guide.md#byo-substrate-bindings-coherentrow--coherentobject) wires each artifact to a substrate and an honest guarantee **tier**, with credentials as references (`secret-file:` / `aws-default`, never literals) and SSRF-constrained connection targets.
+
+**Scope, honestly.** v1 ships two `native-CAS` bindings (Postgres + S3) and a `forward-only` tier for action backends (a Slack post, a Gmail send — decision-input freshness only, no CAS). The value is **invalidation-before-act + cross-substrate uniformity**; the read-generation fence over a substrate is a documented roadmap item, **not claimed** — v1 OCC writers ride admit-on-absent + the version-CAS. Single-host and cooperative; when the substrate is itself distributed (S3, managed Postgres) the no-lost-update guarantee is the *substrate's* and identical with or without this layer. Run it: `python -m examples.coherent_row.main` / `examples.coherent_object.main` (offline, deterministic, no keys — an in-memory substrate stand-in; production points the same binding at real Postgres / S3). Full API, per-binding least-privilege, and the honest tier table: [BYO substrate bindings](docs/guide.md#byo-substrate-bindings-coherentrow--coherentobject).
 
 ## Status
 
