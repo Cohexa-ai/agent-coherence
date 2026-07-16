@@ -1,0 +1,44 @@
+{
+  "name": "subagent-stop-scoped-release",
+  "description": "SB-25 Unit 4: a session-stop scoped to a SUBAGENT identity (body carries agent_id) releases only that subagent's grants. Preflight: subagent A acquires EXCLUSIVE, then its scoped stop releases it. The main request — sibling B's pre-edit on the same path — must be a CLEAN acquire (bare {ok:true}, no collision warning): the grant was freed. The SubagentStop hook routes here via the hook-client's subagent-stop subcommand (agent_id mandatory there — absence must never release the parent).",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "44444444-4444-4444-8444-444444444444",
+      "agent_id": "b1937733562fd2a7e",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

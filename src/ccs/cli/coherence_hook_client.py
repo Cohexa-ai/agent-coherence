@@ -84,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pre-edit",
             "post-edit",
             "session-stop",
+            "subagent-stop",
             # v0.1.1 KTD-N — H4 mitigation: extended hook coverage.
             "pre-bash",
             "pre-grep",
@@ -185,6 +186,13 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
             response = _call(endpoint, "/hooks/post-edit", payload)
         elif args.subcommand == "session-stop":
             payload = _build_session_stop(cc_payload)
+            response = _call(endpoint, "/hooks/session-stop", payload)
+        elif args.subcommand == "subagent-stop":
+            # SB-25 Unit 4: CC's SubagentStop event → release the SUBAGENT
+            # identity's grants via the existing session-stop verb. agent_id
+            # is REQUIRED — without it the release would strip the PARENT's
+            # grants mid-session, so absence skips (fail-open {}).
+            payload = _build_subagent_stop(cc_payload)
             response = _call(endpoint, "/hooks/session-stop", payload)
         elif args.subcommand == "pre-bash":
             payload = _build_pre_bash(cc_payload)
@@ -303,6 +311,18 @@ def _build_post_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
 def _build_session_stop(cc: dict[str, Any]) -> dict[str, Any]:
     session_id = _require_session_id(cc)
     return _with_agent_id(cc, {"session_id": session_id})
+
+
+def _build_subagent_stop(cc: dict[str, Any]) -> dict[str, Any]:
+    """SB-25 Unit 4: SubagentStop → scoped grant release. The subagent
+    identity is mandatory here (contrast _with_agent_id's optional thread):
+    a SubagentStop payload without an agent id must NOT fall back to the
+    parent identity — that would release the parent's live grants."""
+    session_id = _require_session_id(cc)
+    aid = cc.get("agent_id", cc.get("agentId"))
+    if not isinstance(aid, str) or not aid:
+        raise _SkipHook("agent_id missing for subagent-stop")
+    return {"session_id": session_id, "agent_id": aid}
 
 
 def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:
