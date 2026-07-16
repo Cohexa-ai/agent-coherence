@@ -107,7 +107,7 @@ class TestSubagentStopSafety:
     """P1: a present-but-malformed agent_id must never release the parent."""
 
     def test_client_rejects_malformed_agent_id(self) -> None:
-        from ccs.cli.coherence_hook_client import _SkipHook, _build_subagent_stop
+        from ccs.cli.coherence_hook_client import _build_subagent_stop, _SkipHook
 
         # Valid → forwarded.
         assert _build_subagent_stop({"session_id": "s", "agent_id": "ok_id"}) == {

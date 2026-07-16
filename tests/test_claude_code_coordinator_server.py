@@ -398,48 +398,60 @@ def _patch_last_writer(monkeypatch, *, writer, ts) -> None:
     monkeypatch.setattr(f"{_CSRV}._last_writer_unix_ts", lambda coord, aid: ts)
 
 
+# SB-25: the predicate's 3rd arg is now the CALLER's composite agent_id
+# (compared via _agent_id_to_session to the writer's attribution), not the
+# raw session_id. Register the caller so its attribution resolves, and keep
+# monkeypatching _last_writer_for to the writer's ATTRIBUTION string.
+def _caller(coordinator, label: str):
+    """Register a session and return (session_id, composite_agent_id)."""
+    sid = _sid(label)
+    return sid, coordinator.register_session(sid)
+
+
 def test_lag_true_for_recent_self_commit(coordinator, monkeypatch) -> None:
-    sid = _sid("s1")
+    sid, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC - 0.1
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is True
 
 
 def test_lag_false_for_stale_self_commit(coordinator, monkeypatch) -> None:
     """last_writer == self but the commit is OLD => something rewrote disk
     since => correctly FOREIGN (the recency clause is load-bearing)."""
-    sid = _sid("s1")
+    sid, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is False
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is False
 
 
 def test_lag_false_for_other_writer(coordinator, monkeypatch) -> None:
+    _, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=_sid("s2"), ts=1000.0)
     assert _is_recent_self_commit_lag(
-        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+        coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
 
 
 def test_lag_false_for_no_writer(coordinator, monkeypatch) -> None:
+    _, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=None, ts=None)
     assert _is_recent_self_commit_lag(
-        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+        coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
 
 
 def test_lag_false_for_missing_updated_at(coordinator, monkeypatch) -> None:
-    sid = _sid("s1")
+    sid, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=sid, ts=None)
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=1000.1) is False
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
 
 
 def test_lag_true_at_exact_window_boundary(coordinator, monkeypatch) -> None:
     """`<=` boundary: a self-commit EXACTLY at the window edge is still treated as
     lag (the fail-safe direction). Pins the operator choice against a silent flip
     to `<`."""
-    sid = _sid("s1")
+    sid, agent_id = _caller(coordinator, "s1")
     _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is True
 
 
 def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
