@@ -483,6 +483,11 @@ def _check_s3_endpoint(
         scheme = (parts.scheme or "").lower()
         if scheme not in ("http", "https"):
             raise ManifestError(f"S3 endpoint_url scheme must be http or https (got {scheme!r})")
+        if parts.username or parts.password:
+            raise SubstrateCredentialRefused(
+                "the S3 endpoint_url carries inline userinfo; supply a credential "
+                "reference, never a literal in the URL"
+            )
         host = parts.hostname
         if not host:
             raise ManifestError("S3 endpoint_url is missing a host")

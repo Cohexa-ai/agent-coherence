@@ -8,21 +8,45 @@ published wheel.
 
 ## Outbound network destinations
 
-`agent-coherence` and its `[diagnose]` extra make **zero outbound network
-requests** in v0. No submission code ships in v0.
+The core `agent-coherence` package and its `[diagnose]` extra make **zero
+outbound network requests** in v0 — no telemetry, no submission code, no phoning
+home. Exactly two capabilities make deliberate, opt-in, **user-configured**
+outbound connections, and nothing else does: cross-host coordinator mode and the
+bring-your-own-substrate bindings (both below). Each connects only to an endpoint
+you configure — never the internet at large, never an agent-coherence-controlled
+host.
 
-If you find any outbound traffic from this package in v0, please [open a
-security advisory](https://github.com/Cohexa-ai/agent-coherence/security/advisories)
+If you find outbound traffic from this package that is neither of those two
+opt-in paths, please [open a security advisory](https://github.com/Cohexa-ai/agent-coherence/security/advisories)
 — it would be a bug.
 
 **Cross-host mode (default OFF).** Setting `CCS_REMOTE_COORDINATOR=1` and pointing
 a `CoherentVolume` at a remote coordinator (`CCS_REMOTE_HOST` / `CCS_REMOTE_PORT` /
 `CCS_REMOTE_SECRET_FILE`) makes the client open connections to that
 **user-configured, private-range coordinator endpoint** — never the internet, and
-no telemetry. This is the only host-leaving traffic the library generates, it is opt-in,
-and the coordinator only binds beyond loopback to an RFC-1918/4193 address (see the
-cross-host demo, `examples/cross_host/`). With the flag unset the zero-outbound
-posture above is unchanged.
+no telemetry. This host-leaving traffic is opt-in, and the coordinator only binds
+beyond loopback to an RFC-1918/4193 address (see the cross-host demo,
+`examples/cross_host/`). With the flag unset the zero-outbound posture above is
+unchanged.
+
+**BYO substrate bindings (default OFF).** The optional `[coherent-row]` (Postgres)
+and `[coherent-object]` (S3) extras connect to the substrate you declare in a
+Coherence Manifest — your own database or object store, never the internet at
+large and never an agent-coherence-controlled host. Every connection target is
+egress-controlled at manifest-load time, before any driver is built: the SSRF deny
+runs on the **resolved** address (cloud-metadata, link-local, and CGNAT ranges are
+hard-denied; RFC-1918/4193 private ranges require `CCS_SUBSTRATE_ALLOW_PRIVATE=1`),
+TLS is required unless you acknowledge a plaintext link with
+`CCS_SUBSTRATE_INSECURE=1`, an inline secret in a DSN or endpoint URL is refused
+(supply a credential *reference*, never a literal), and a target this loader
+cannot classify — a Postgres `service=` entry whose host lives in an unreadable
+`pg_service.conf` — is refused outright. Two residuals to know: libpq and botocore
+re-resolve DNS at connect time, so a bare hostname carries a narrow connect-time
+rebind window; and the `PGHOST` / `PGHOSTADDR` / `PGSERVICE` environment variables
+are invisible to a DSN-text parser — pin `host`/`hostaddr` in the manifest if you
+rely on egress control. The coordinator itself still receives metadata only (a
+content hash, never your bytes); the bytes live in your substrate, which is the
+whole point.
 
 **Client TLS (verified https).** The client can speak `https://` to a
 TLS-terminating front with **enforced certificate verification**. Set

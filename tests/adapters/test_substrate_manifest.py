@@ -528,6 +528,17 @@ def test_s3_http_endpoint_loads_with_distinct_ack(tmp_path):
     assert len(manifest.artifacts) == 1
 
 
+def test_s3_endpoint_inline_userinfo_refused(tmp_path):
+    # Parity with the PG inline-password refusal: a literal secret in the endpoint
+    # URL is refused, so "credential reference, never a literal" holds for S3 too.
+    resolver = make_resolver({"minio.example.com": [PUBLIC_IP]})
+    conn = {"endpoint_url": "https://key:s3cr3t@minio.example.com", "credential": "aws-default"}
+    data = {"artifacts": [s3_artifact(conn)]}
+
+    with pytest.raises(SubstrateCredentialRefused):
+        load(tmp_path, data, resolver=resolver)
+
+
 # ---------------------------------------------------------------------------
 # MRAP / replica endpoint -> warning (forbidden distributed-substrate locality)
 # ---------------------------------------------------------------------------
