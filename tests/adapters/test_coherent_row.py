@@ -30,7 +30,7 @@ from ccs.adapters.coherent_row import (
     provisioning_sql,
 )
 from ccs.adapters.substrate import CasConflict, CasUnknown, CasWritten
-from ccs.core.exceptions import CasVersionConflict, CoherenceError, CommitUnconfirmed
+from ccs.core.exceptions import CasVersionConflict, CoherenceError, CommitUnconfirmed, ViewWedged
 from ccs.core.substrate import Tier
 
 
@@ -240,6 +240,61 @@ def test_write_maps_unknown_to_commit_unconfirmed(fake_psycopg: types.ModuleType
         _row(conn).write("k", expected_token="5", new_bytes=b"new")
 
 
+def test_write_view_wedged_when_row_absent_on_conflict_refetch() -> None:
+    # A CAS conflict whose post-conflict re-fetch finds the row gone → ViewWedged
+    # (a delete is itself an update). Exercises _current_version_or_wedged's
+    # absent branch, which the row-present conflict path never reaches.
+    conn = _FakeConnection({})  # absent: UPDATE finds nothing → conflict; refetch → absent
+    with pytest.raises(ViewWedged):
+        _row(conn).write("k", expected_token="5", new_bytes=b"new")
+
+
+def test_dsn_owned_connection_reconnects_after_operational_error(
+    fake_psycopg: types.ModuleType,
+) -> None:
+    # A DB blip must not permanently poison a self-owned connection: after an
+    # operational error the dead connection is discarded, so the next call
+    # reconnects instead of replaying the same failure forever.
+    conns: list[_FakeConnection] = []
+
+    def fake_connect(dsn, **kwargs):
+        conn = _FakeConnection({"k": (b"v", 3)})
+        if not conns:  # the first connection is born broken (server closed)
+            conn.raise_on_execute = fake_psycopg.OperationalError("server closed")  # type: ignore[attr-defined]
+        conns.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect  # type: ignore[attr-defined]
+    row = CoherentRow(table="workspace_rows", dsn="postgresql://u:sec@db/app")
+
+    assert isinstance(row.cas_write("k", expected_token="3", new_bytes=b"n"), CasUnknown)
+    assert row.read("k") == (b"v", "3")  # reconnected to a fresh, healthy socket
+    assert len(conns) == 2  # discarded the poisoned one and dialed again
+
+
+def test_dsn_connection_applies_connect_and_statement_timeouts(
+    fake_psycopg: types.ModuleType,
+) -> None:
+    # A hung DB must raise (→ reconcilable CasUnknown), not block forever: the
+    # self-owned connection carries a connect_timeout and a statement_timeout.
+    captured: dict[str, object] = {}
+
+    def fake_connect(dsn, **kwargs):
+        captured.update(kwargs)
+        return _FakeConnection({"k": (b"v", 1)})
+
+    fake_psycopg.connect = fake_connect  # type: ignore[attr-defined]
+    row = CoherentRow(
+        table="workspace_rows",
+        dsn="postgresql://u@db/app",
+        connect_timeout=7.5,
+        statement_timeout_ms=12345,
+    )
+    row.read("k")
+    assert captured["connect_timeout"] == 7.5
+    assert "statement_timeout=12345" in str(captured["options"])
+
+
 # --- credential scrubbing ---------------------------------------------------
 
 
@@ -355,9 +410,12 @@ def test_module_imports_without_psycopg_and_defers_error() -> None:
 
 def test_provisioning_sql_emits_version_guard_and_negative_grants() -> None:
     script = provisioning_sql("workspace_rows", role="coherence_writer").as_script()
-    # The version is minted from the STORED prior row, never a client value.
-    assert 'OLD."version" + 1' in script
+    # The version is minted from the STORED prior row, never a client value; the
+    # COALESCE lets a pre-existing NULL/0 row advance to a usable version.
+    assert 'COALESCE(OLD."version", 0) + 1' in script
     assert "never trust a client-supplied NEW.version" in script
+    # A one-time backfill seeds pre-existing NULL/0 rows so they can be onboarded.
+    assert 'UPDATE "workspace_rows" SET "version" = 1 WHERE "version" IS NULL OR "version" <= 0' in script
     # Least privilege: SELECT, UPDATE only; no escalation.
     assert "GRANT SELECT, UPDATE" in script
     assert "NOSUPERUSER" in script

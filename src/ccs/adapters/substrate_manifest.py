@@ -159,8 +159,17 @@ class SubstrateManifest:
     def validate(self) -> None:
         """Re-assert per-artifact tier consistency (reusing the descriptor's own
         validation): a ``forward-only`` artifact must declare no version_source,
-        a ``native-cas`` artifact must declare one. Raises :class:`ManifestError`."""
+        a ``native-cas`` artifact must declare one. Also reject a duplicate
+        artifact ``id`` — a second entry would silently shadow the first's wiring.
+        Raises :class:`ManifestError`."""
+        seen: set[str] = set()
         for artifact in self.artifacts:
+            if artifact.id in seen:
+                raise ManifestError(
+                    f"duplicate artifact id {artifact.id!r}: each id must be unique — "
+                    "a second entry would silently shadow the first's wiring"
+                )
+            seen.add(artifact.id)
             _build_descriptor(artifact.tier, artifact.version_source)
 
     def dry_run(self) -> tuple[tuple[str, str, Tier], ...]:
@@ -417,9 +426,9 @@ def _check_pg_dsn(dsn: str, *, resolver: HostResolver, env: Mapping[str, str]) -
         )
     if target.has_inline_password:
         raise SubstrateCredentialRefused("the connection DSN carries an inline password")
-    routable, network_hosts = _check_pg_hosts(target, resolver=resolver, env=env)
-    if routable and target.sslmode not in _TLS_SAFE_SSLMODES:
-        _require_tls_or_ack(network_hosts[0], "plaintext-capable sslmode", env=env)
+    routable_host, network_hosts = _check_pg_hosts(target, resolver=resolver, env=env)
+    if routable_host is not None and target.sslmode not in _TLS_SAFE_SSLMODES:
+        _require_tls_or_ack(routable_host, "plaintext-capable sslmode", env=env)
     if len(network_hosts) > 1:
         logger.warning(
             "manifest postgres target lists %d network hosts %r; coordinating agents "
@@ -431,8 +440,8 @@ def _check_pg_dsn(dsn: str, *, resolver: HostResolver, env: Mapping[str, str]) -
 
 def _check_pg_hosts(
     target: _PgTarget, *, resolver: HostResolver, env: Mapping[str, str]
-) -> tuple[bool, list[str]]:
-    """Classify the dialed hosts; return ``(routable, checked_network_hosts)``.
+) -> tuple[str | None, list[str]]:
+    """Classify the dialed hosts; return ``(first_routable_host, checked_hosts)``.
 
     Every ``host`` AND every ``hostaddr`` entry is checked — the UNION, not
     ``hostaddr`` alone. libpq pairs ``host[i]``/``hostaddr[i]`` per position and
@@ -452,16 +461,16 @@ def _check_pg_hosts(
     window and is the intended future hardening.
     """
     seen: set[str] = set()
-    routable = False
+    routable_host: str | None = None
     network_hosts: list[str] = []
     for host in (*target.hostaddrs, *target.hosts):
         if host.startswith("/") or host in seen:
             continue
         seen.add(host)
-        if not _reject_denied_target(host, resolver=resolver, env=env):
-            routable = True
+        if not _reject_denied_target(host, resolver=resolver, env=env) and routable_host is None:
+            routable_host = host
         network_hosts.append(host)
-    return routable, network_hosts
+    return routable_host, network_hosts
 
 
 def _check_s3_endpoint(

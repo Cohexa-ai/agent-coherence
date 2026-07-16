@@ -528,6 +528,56 @@ def test_s3_http_endpoint_loads_with_distinct_ack(tmp_path):
     assert len(manifest.artifacts) == 1
 
 
+def test_duplicate_artifact_id_refused(tmp_path):
+    # Two entries sharing an id would silently shadow each other's wiring.
+    art = pg_artifact("postgresql://u@db.example.com/app?sslmode=require")
+    data = {"artifacts": [art, dict(art)]}
+    resolver = make_resolver({"db.example.com": [PUBLIC_IP]})
+
+    with pytest.raises(ManifestError):
+        load(tmp_path, data, resolver=resolver)
+
+
+def test_multihost_tls_error_names_routable_host_not_first(tmp_path):
+    # First host is loopback (exempt); a later host is the routable one. The
+    # TLS-ack error must name the host that actually made the target routable.
+    resolver = make_resolver({"db.example.com": [PUBLIC_IP]})
+    dsn = "host=127.0.0.1,db.example.com dbname=app sslmode=disable"
+    data = {"artifacts": [pg_artifact(dsn)]}
+
+    with pytest.raises(SubstrateInsecureTransport) as exc:
+        load(tmp_path, data, resolver=resolver)
+    assert "db.example.com" in str(exc.value)
+    assert "127.0.0.1" not in str(exc.value)
+
+
+def test_unresolvable_host_fails_closed(tmp_path):
+    # A host that resolves to nothing is denied (fail-closed), not admitted.
+    resolver = make_resolver({})  # every host resolves to ()
+    data = {"artifacts": [pg_artifact("host=nowhere.invalid dbname=app sslmode=require")]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=resolver)
+
+
+def test_unparseable_resolved_address_fails_closed(tmp_path):
+    # A resolver returning a non-address string is denied, never dialed.
+    data = {"artifacts": [pg_artifact("host=db.example.com dbname=app sslmode=require")]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=lambda host: ("not-an-ip-address",))
+
+
+def test_sixtofour_ipv6_unwraps_to_denied_v4(tmp_path):
+    # 2002:a9fe:a9fe:: embeds 169.254.169.254 (0xA9FEA9FE) as its 6to4 payload —
+    # the unwrap must classify it into the metadata denylist, not wave it past.
+    resolver = make_resolver({"db.example.com": ["2002:a9fe:a9fe::"]})
+    data = {"artifacts": [pg_artifact("host=db.example.com dbname=app sslmode=require")]}
+
+    with pytest.raises(SubstrateTargetDenied):
+        load(tmp_path, data, resolver=resolver)
+
+
 def test_s3_endpoint_inline_userinfo_refused(tmp_path):
     # Parity with the PG inline-password refusal: a literal secret in the endpoint
     # URL is refused, so "credential reference, never a literal" holds for S3 too.

@@ -225,6 +225,23 @@ def test_peer_commit_denies_next_act_before_write(
         stop_coordinator(tmp_path)
 
 
+def test_read_rejects_unknown_on_stale_value(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    # A typo'd on_stale must fail closed (ValueError) rather than silently falling
+    # through to the permissive 'allow' path — validated before the substrate is
+    # even touched.
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fake_a = _agent(store, sa)
+        with pytest.raises(ValueError):
+            a.read(REF, on_stale="raize")
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_read_time_deny_surfaces_stale_view(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

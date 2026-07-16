@@ -201,10 +201,14 @@ class ProvisioningSql:
     trigger_function: str
     trigger_bindings: str
     role_grants: str
+    version_backfill: str = ""
 
     def as_script(self) -> str:
         """The full provisioning script, in apply order."""
-        return "\n\n".join((self.trigger_function, self.trigger_bindings, self.role_grants))
+        parts = [self.trigger_function, self.trigger_bindings, self.role_grants]
+        if self.version_backfill:
+            parts.append(self.version_backfill)
+        return "\n\n".join(parts)
 
 
 def provisioning_sql(
@@ -212,15 +216,26 @@ def provisioning_sql(
     *,
     role: str = "coherence_writer",
     version_column: str = "version",
+    connection_limit: int = 16,
 ) -> ProvisioningSql:
     """Emit the version-guard trigger + least-privilege grants for one row table.
 
     The trigger derives the new version from the STORED prior row
-    (``NEW.version := OLD.version + 1``) so a client that supplies its own
-    ``NEW.version`` cannot forge one. The role is a dedicated non-owner login
-    with only ``SELECT, UPDATE`` on the one table — it holds no ``ALTER`` or
-    ``TRIGGER`` privilege, so it cannot drop or disable the guard.
+    (``NEW.version := COALESCE(OLD.version, 0) + 1``) so a client that supplies
+    its own ``NEW.version`` cannot forge one, and a pre-existing row with a
+    ``NULL``/``0`` version still advances to a usable value. The role is a
+    dedicated non-owner login with only ``SELECT, UPDATE`` on the one table — it
+    holds no ``ALTER`` or ``TRIGGER`` privilege, so it cannot drop or disable the
+    guard. ``connection_limit`` caps concurrent logins for the shared coherence
+    role (raise it for a larger agent fleet).
+
+    The emitted ``version_backfill`` seeds any pre-existing row sitting at
+    ``NULL``/``0`` to version ``1`` so it can be onboarded — the binding refuses a
+    version ``<= 0`` as a CAS comparand, so without this a legacy row would be
+    unreadable and therefore un-writable through this binding.
     """
+    if not isinstance(connection_limit, int) or isinstance(connection_limit, bool) or connection_limit < 1:
+        raise ValueError(f"connection_limit must be a positive int, got {connection_limit!r}")
     tbl = _quote_table(table)
     ver = _quote_identifier(version_column)
     _quote_identifier(role)  # validate the role name before interpolating it
@@ -238,7 +253,7 @@ def provisioning_sql(
         f"CREATE OR REPLACE FUNCTION {fn}() RETURNS trigger AS $$\n"
         "BEGIN\n"
         "    IF TG_OP = 'UPDATE' THEN\n"
-        f"        NEW.{ver} := OLD.{ver} + 1;\n"
+        f"        NEW.{ver} := COALESCE(OLD.{ver}, 0) + 1;\n"
         "    ELSE  -- INSERT: no stored prior, so the version starts at 1\n"
         f"        NEW.{ver} := 1;\n"
         "    END IF;\n"
@@ -258,14 +273,21 @@ def provisioning_sql(
         f'-- Dedicated, login-limited, NON-owner coherence role. It can read and\n'
         f'-- update the row, and nothing else — it cannot ALTER the table, drop or\n'
         f'-- disable the version trigger, or create databases/roles.\n'
-        f'CREATE ROLE "{role}" LOGIN CONNECTION LIMIT 4\n'
+        f'CREATE ROLE "{role}" LOGIN CONNECTION LIMIT {connection_limit}\n'
         f"    NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;\n"
         f'REVOKE ALL ON {tbl} FROM "{role}";\n'
         f'GRANT SELECT, UPDATE ON {tbl} TO "{role}";\n'
         f"-- Deliberately withheld: table ALTER, the TRIGGER privilege, row DELETE,\n"
         f"-- and any re-grant right."
     )
-    return ProvisioningSql(trigger_function, trigger_bindings, role_grants)
+    version_backfill = (
+        f"-- One-time backfill: a row that predates the version column sits at\n"
+        f"-- NULL/0, which the binding refuses as a CAS comparand (must be > 0).\n"
+        f"-- Seed such rows to 1 so they can be onboarded. Idempotent, and the\n"
+        f"-- trigger's COALESCE keeps it safe whether the trigger is installed yet.\n"
+        f"UPDATE {tbl} SET {ver} = 1 WHERE {ver} IS NULL OR {ver} <= 0;"
+    )
+    return ProvisioningSql(trigger_function, trigger_bindings, role_grants, version_backfill)
 
 
 # --- the binding ------------------------------------------------------------
@@ -303,12 +325,19 @@ class CoherentRow:
         version_column: str = "version",
         connection: PgConnection | None = None,
         dsn: str | None = None,
+        connect_timeout: float | None = 10.0,
+        statement_timeout_ms: int | None = 30_000,
     ) -> None:
         if connection is None and dsn is None:
             raise ValueError("CoherentRow needs a connection or a dsn (fail-closed)")
         self._table = table
         self._connection = connection
         self._dsn = dsn
+        # Bounded waits for a self-owned (dsn) connection: a hung DB then raises
+        # (→ CasUnknown, which is reconcilable) instead of blocking the CAS loop
+        # forever. A caller-injected connection keeps its own settings.
+        self._connect_timeout = connect_timeout
+        self._statement_timeout_ms = statement_timeout_ms
         tbl = _quote_table(table)
         idc = _quote_identifier(id_column)
         val = _quote_identifier(value_column)
@@ -383,6 +412,7 @@ class CoherentRow:
         except Exception as exc:  # noqa: BLE001 - re-raised typed/scrubbed below
             self._rollback_quietly(conn)
             if _is_unconfirmed_error(exc):
+                self._discard_owned_connection()
                 return CasUnknown()
             raise self._scrubbed(exc, "cas_write") from None
         if rowcount == 0 or row is None:
@@ -452,9 +482,11 @@ class CoherentRow:
 
     # --- provisioning (convenience) -------------------------------------------
 
-    def provisioning_sql(self, *, role: str = "coherence_writer") -> ProvisioningSql:
+    def provisioning_sql(
+        self, *, role: str = "coherence_writer", connection_limit: int = 16
+    ) -> ProvisioningSql:
         """The version-guard DDL + least-privilege grants for this row's table."""
-        return provisioning_sql(self._table, role=role)
+        return provisioning_sql(self._table, role=role, connection_limit=connection_limit)
 
     # --- internals ------------------------------------------------------------
 
@@ -462,10 +494,29 @@ class CoherentRow:
         if self._connection is None:
             psycopg = _require_psycopg()
             try:
-                self._connection = psycopg.connect(self._dsn)
+                self._connection = psycopg.connect(self._dsn, **self._connect_kwargs())
             except Exception as exc:  # noqa: BLE001 - a DSN error carries the password
                 raise self._scrubbed(exc, "connect") from None
         return self._connection
+
+    def _connect_kwargs(self) -> dict[str, object]:
+        """Bounded-wait connect args (connect + per-statement timeout). Passed as
+        libpq conninfo kwargs, so they take precedence over the DSN string."""
+        kwargs: dict[str, object] = {}
+        if self._connect_timeout is not None:
+            kwargs["connect_timeout"] = self._connect_timeout
+        if self._statement_timeout_ms is not None:
+            kwargs["options"] = f"-c statement_timeout={self._statement_timeout_ms}"
+        return kwargs
+
+    def _discard_owned_connection(self) -> None:
+        """Drop a self-owned connection poisoned by an operational error so the
+        next :meth:`_conn` reconnects. Without this, one DB blip (restart, network
+        drop) leaves every later read/write hitting the same dead socket — the
+        documented 're-read then retry' recovery could never succeed. A
+        caller-injected connection (no dsn) is caller-owned and never dropped."""
+        if self._dsn is not None:
+            self._connection = None
 
     def _fetch_row(self, artifact_ref: str) -> tuple | None:
         conn = self._conn()
@@ -476,6 +527,8 @@ class CoherentRow:
             conn.rollback()  # end the read-only snapshot; nothing to commit
         except Exception as exc:  # noqa: BLE001 - re-raised scrubbed
             self._rollback_quietly(conn)
+            if _is_unconfirmed_error(exc):
+                self._discard_owned_connection()
             raise self._scrubbed(exc, "read") from None
         return row
 

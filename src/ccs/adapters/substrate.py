@@ -23,14 +23,13 @@ drift apart on what a win, a conflict, or an unknown outcome means.
 
 from __future__ import annotations
 
-import logging
 import os
 import urllib.error
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
 
 import yaml
 
@@ -56,7 +55,8 @@ from ccs.core.exceptions import (
 from ccs.core.substrate import CapabilityDescriptor
 from ccs.core.substrate import sha256_hex as _sha256_hex
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 
 # The substrate-minted version token: an object ETag, a row-version rendered
 # opaque, etc. Two properties are contractual: it comes from the SAME read (or
@@ -471,7 +471,7 @@ class SubstrateCoordinatorSession:
         root: "str | os.PathLike[str]",
         *,
         managed: tuple[str, ...],
-        config: object | None = None,
+        config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
         # Deferred so importing a binding never pulls in the coordinator server.
@@ -679,6 +679,8 @@ class CoordinatedSubstrate:
         :class:`~ccs.core.exceptions.ViewWedged` — the view is wedged, not merely
         stale.
         """
+        if on_stale not in ("allow", "raise"):
+            raise ValueError(f"on_stale must be 'allow' or 'raise', got {on_stale!r}")
         observed_bytes, token = self._substrate.read(artifact_ref)
         content_hash = _sha256_hex(observed_bytes)
         pre = self._coordinator.pre_read(artifact_ref, content_hash)

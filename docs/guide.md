@@ -783,6 +783,7 @@ A declarative manifest binds each artifact to a substrate + connection + tier, a
 - **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; a coordinator-timeout *after* a durable substrate write is reconverged by a token-identity re-read, and registry↔substrate agreement is a *detectable signal*, not a held guarantee.
 - **Single-host, subtractive.** When the substrate is itself distributed (S3, managed Postgres), the no-lost-update guarantee is the *substrate's* and is identical with or without this layer; the adapter's contribution (invalidation, uniformity) is single-host. Never run the S3 CAS loop through a Multi-Region Access Point / cross-Region replica, and never place agents on two hosts against one distributed substrate.
 - **Coordinator-behind-substrate is unbounded in v1.** If a writer's substrate write lands but its process dies before the coordinator bump, peers are not invalidated until the *next* binding-mediated read of that artifact — a peer acting on an already-cached read is unprotected until it re-reads. Repair-forward is a roadmap item.
+- **More backends are demand-gated, not shipped.** A Letta vendor-memory sidecar is a post-v1 candidate: Letta exposes no atomic conditional-write token, so a binding could only *detect* a sequential stale write via a client-held content shadow, not prevent a concurrent one — it would be a `detect-only` tier and lands only when a concrete need pulls it in.
 
 ### Try it, then harden
 
