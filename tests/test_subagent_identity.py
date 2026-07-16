@@ -101,3 +101,47 @@ class TestClientThreading:
         cc_camel = {"session_id": SID, "agentId": SUB_B}
         assert _build_session_stop(cc_camel)["agent_id"] == SUB_B
         assert "agent_id" not in _build_session_stop({"session_id": SID})
+
+
+class TestSubagentStopSafety:
+    """P1: a present-but-malformed agent_id must never release the parent."""
+
+    def test_client_rejects_malformed_agent_id(self) -> None:
+        from ccs.cli.coherence_hook_client import _SkipHook, _build_subagent_stop
+
+        # Valid → forwarded.
+        assert _build_subagent_stop({"session_id": "s", "agent_id": "ok_id"}) == {
+            "session_id": "s",
+            "agent_id": "ok_id",
+        }
+        assert _build_subagent_stop({"session_id": "s", "agentId": "ok2"}) == {
+            "session_id": "s",
+            "agent_id": "ok2",
+        }
+        # Absent AND present-but-malformed both raise _SkipHook (fail-open {}).
+        import pytest
+
+        for bad in (None, "", "bad.id", "has space", "x" * 65, "trailing\n", "a/b"):
+            payload = {"session_id": "s"} if bad is None else {"session_id": "s", "agent_id": bad}
+            with pytest.raises(_SkipHook):
+                _build_subagent_stop(payload)
+
+    def test_has_subagent_id_field(self) -> None:
+        from ccs.adapters.claude_code.coordinator_server import has_subagent_id_field
+
+        assert has_subagent_id_field({"agent_id": "bad.id"}) is True
+        assert has_subagent_id_field({"agentId": "x"}) is True
+        assert has_subagent_id_field({}) is False
+        assert has_subagent_id_field({"agent_id": ""}) is False
+        assert has_subagent_id_field({"agent_id": None}) is False
+
+
+class TestSubagentIdTrailingNewline:
+    """P2 parity: fullmatch rejects a trailing newline (Node `$` already does)."""
+
+    def test_trailing_newline_rejected(self) -> None:
+        from ccs.adapters.claude_code.coordinator_server import read_subagent_id
+
+        assert read_subagent_id({"agent_id": "abc"}) == "abc"
+        assert read_subagent_id({"agent_id": "abc\n"}) is None
+        assert read_subagent_id({"agent_id": "a\nb"}) is None

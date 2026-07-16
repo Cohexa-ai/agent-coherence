@@ -285,6 +285,36 @@ def test_pre_read_strict_shared_recent_self_commit_lag_allows(
     assert body == {"status": "fresh", "version": 1, "hash_differs": True}
 
 
+def test_pre_read_strict_shared_self_commit_lag_subagent_allows(
+    strict_client: _Client, monkeypatch,
+) -> None:
+    """SB-25 P1: the self-commit-lag suppression must recognize a SUBAGENT's
+    OWN recent commit. `_last_writer_for` returns the writer's ATTRIBUTION
+    (a subagent's bare id for a composite identity), so comparing it to the
+    parent session_id could never match — the subagent's immediate self-
+    re-read was wrongly denied as a foreign edit. The fix compares writer
+    attribution against the CALLER's attribution. Here the caller is a
+    subagent (agent_id='suba') and the (monkeypatched) last writer is that
+    same subagent → lag suppressed → warn-mode allow, not deny."""
+    import ccs.adapters.claude_code.coordinator_server as _csrv
+
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "agent_id": "suba", "path": "CLAUDE.md",
+         "content_hash": _hash("v1")},
+    )
+    # The last writer is the SUBAGENT's attribution id (not the parent session).
+    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: "suba")
+    monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "agent_id": "suba", "path": "CLAUDE.md",
+         "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
 def test_pre_read_strict_shared_foreign_edit_records_telemetry(
     strict_coordinator, strict_client: _Client,
 ) -> None:

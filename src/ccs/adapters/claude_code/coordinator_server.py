@@ -264,10 +264,32 @@ def read_subagent_id(body: dict) -> str | None:
     backward-compatible: absent, non-string, or out-of-shape values resolve
     to ``None`` — the parent identity — never a 400.
     """
-    raw = body.get("agent_id", body.get("agentId"))
-    if isinstance(raw, str) and _SUBAGENT_ID_RE.match(raw):
+    raw = _raw_subagent_id_value(body)
+    # fullmatch (not match): Python's `$` also matches just before a trailing
+    # newline, so `.match("abc\n")` would ACCEPT it — but JS's `$` does not,
+    # so a trailing-newline id would fork the composite agent_id across
+    # backends. fullmatch closes that byte-parity gap.
+    if isinstance(raw, str) and _SUBAGENT_ID_RE.fullmatch(raw):
         return raw
     return None
+
+
+def _raw_subagent_id_value(body: dict) -> object:
+    """Raw subagent-id value, snake_case preferred (SB-25). Byte-parity with
+    the Node reader: an explicitly-present ``agent_id`` (even null) is NOT
+    overridden by ``agentId`` — only an ABSENT ``agent_id`` key falls back."""
+    return body.get("agent_id", body.get("agentId"))
+
+
+def has_subagent_id_field(body: dict) -> bool:
+    """True iff the body carries a NON-EMPTY subagent-id value, regardless of
+    whether it passes :data:`_SUBAGENT_ID_RE`. Lets the destructive
+    session-stop path distinguish "absent → legitimate parent stop" from
+    "present-but-malformed → refuse, never degrade to releasing the parent's
+    grants" (the P1 subagent-stop safety fix). Read paths don't need this — a
+    malformed id degrading to parent attribution there is benign."""
+    raw = _raw_subagent_id_value(body)
+    return isinstance(raw, str) and raw != ""
 
 
 def validate_session_id(
@@ -1411,7 +1433,16 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    subagent_id = read_subagent_id(body)
+    # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
+    # agent_id must NOT silently degrade to the parent identity — that would
+    # release the parent's live grants. Absent = legitimate parent Stop.
+    # Present-but-invalid = refuse (no-op), since the caller intended a scoped
+    # subagent release the server can't resolve. Read paths stay lax (benign).
+    if subagent_id is None and has_subagent_id_field(body):
+        req._json(200, {"ok": True, "released_artifacts": []})
+        return
+    agent_id = coordinator.register_session(session_id, subagent_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1486,7 +1517,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     # within the call (KTD-P).
                     _now = _payloads.now_unix()
                     if _is_recent_self_commit_lag(
-                        coordinator, artifact_id, session_id, now_unix=_now,
+                        coordinator, artifact_id, agent_id, now_unix=_now,
                     ):
                         # Benign commit→disk-write lag (R2): count the
                         # suppression so operators can size the lag-window
@@ -3836,7 +3867,7 @@ def _emit_pre_read_strict_deny(
 def _is_recent_self_commit_lag(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
-    session_id: str,
+    caller_agent_id: UUID,
     *,
     now_unix: float,
 ) -> bool:
@@ -3853,7 +3884,17 @@ def _is_recent_self_commit_lag(
     last_writer, no last_writer, or a stale self-commit (something rewrote disk
     since) is a genuine out-of-band edit and must be denied.
     """
-    if _last_writer_for(coordinator, artifact_id) != session_id:
+    # P1: compare the writer's attribution against THIS CALLER's attribution —
+    # NOT against the parent session_id. SB-25 made the reverse lookup return a
+    # subagent's bare attribution id, so `_last_writer_for(...) != session_id`
+    # could never match for a subagent's own commit, wrongly denying its
+    # immediate self-re-read as a "foreign edit." Comparing attribution-to-
+    # attribution is correct for both parent (session_id) and subagent
+    # (subagent id) callers, and keeps the `_last_writer_for` indirection (its
+    # MODIFIED-holder fallback + test monkeypatch point) intact.
+    if _last_writer_for(coordinator, artifact_id) != _agent_id_to_session(
+        coordinator, caller_agent_id
+    ):
         return False
     updated_at = _last_writer_unix_ts(coordinator, artifact_id)
     if updated_at is None:

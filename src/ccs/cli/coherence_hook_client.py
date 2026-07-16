@@ -55,6 +55,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 from pathlib import Path
@@ -313,15 +314,23 @@ def _build_session_stop(cc: dict[str, Any]) -> dict[str, Any]:
     return _with_agent_id(cc, {"session_id": session_id})
 
 
+# Mirrors the coordinator's _SUBAGENT_ID_RE (charset + length). Kept in sync
+# by hand across the client/server modules; a divergence is caught by the
+# subagent-stop safety test. fullmatch semantics (see below) match the server.
+_SUBAGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def _build_subagent_stop(cc: dict[str, Any]) -> dict[str, Any]:
     """SB-25 Unit 4: SubagentStop → scoped grant release. The subagent
-    identity is mandatory here (contrast _with_agent_id's optional thread):
-    a SubagentStop payload without an agent id must NOT fall back to the
-    parent identity — that would release the parent's live grants."""
+    identity is mandatory AND shape-validated here (contrast _with_agent_id's
+    optional thread): a SubagentStop payload with a missing OR malformed agent
+    id must NOT fall back to the parent identity — the server would null a
+    malformed id and degrade to releasing the PARENT's live grants (P1). Fail
+    open (skip) on a doomed release rather than performing the wrong one."""
     session_id = _require_session_id(cc)
     aid = cc.get("agent_id", cc.get("agentId"))
-    if not isinstance(aid, str) or not aid:
-        raise _SkipHook("agent_id missing for subagent-stop")
+    if not isinstance(aid, str) or not _SUBAGENT_ID_RE.fullmatch(aid):
+        raise _SkipHook("agent_id missing or malformed for subagent-stop")
     return {"session_id": session_id, "agent_id": aid}
 
 
