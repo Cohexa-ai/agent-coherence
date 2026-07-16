@@ -211,10 +211,25 @@ could mint v1 with attacker-chosen hash strings."""
 # ----------------------------------------------------------------------
 
 
-def session_to_agent_id(session_id: str) -> UUID:
+def session_to_agent_id(session_id: str, subagent_id: str | None = None) -> UUID:
     """Deterministic UUID for a Claude Code session, matching the convention
     in :class:`CoherenceAdapterCore` so other adapters and the in-process
-    library see the same agent identity."""
+    library see the same agent identity.
+
+    SB-25 composite identity: a subagent's hook payload carries the PARENT
+    session_id plus a distinct ``agent_id`` — folding it into the uuid5 name
+    makes each subagent a first-class coherence peer (correct ``last_writer``
+    attribution + sibling-collision detection). ``subagent_id`` absent/empty
+    ⇒ the original derivation, byte-identical (main-thread behavior
+    unchanged). The fold string is mirrored byte-for-byte by the Node
+    backend (``agent_id.ts``) — a one-char divergence would silently fork
+    the shared ``agent_states`` rows.
+    """
+    if subagent_id:
+        return uuid5(
+            NAMESPACE_URL,
+            f"ccs-agent:claude-session-{session_id}:subagent-{subagent_id}",
+        )
     return uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}")
 
 
