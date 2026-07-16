@@ -233,8 +233,12 @@ def session_to_agent_id(session_id: str, subagent_id: str | None = None) -> UUID
     return uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}")
 
 
-def session_to_agent_name(session_id: str) -> str:
-    """Human-readable agent name for state_log and status display."""
+def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> str:
+    """Human-readable agent name for state_log and status display. SB-25:
+    a subagent identity renders as ``claude-session-<sid>:subagent-<aid>``
+    so /status keeps the parent linkage visible."""
+    if subagent_id:
+        return f"claude-session-{session_id}:subagent-{subagent_id}"
     return f"claude-session-{session_id}"
 
 
@@ -246,6 +250,24 @@ def monotonic_seconds() -> int:
 # ----------------------------------------------------------------------
 # Boundary validators (Adv-review hardening A2 + A3 + A8)
 # ----------------------------------------------------------------------
+
+
+_SUBAGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def read_subagent_id(body: dict) -> str | None:
+    """SB-25: optional subagent identity from the hook request body.
+
+    Accepts the documented snake_case ``agent_id`` with a defensive fallback
+    to the transcript-observed camelCase ``agentId`` (exact wire casing is
+    pinned by the R6 live capture; until then both are honored). Additive +
+    backward-compatible: absent, non-string, or out-of-shape values resolve
+    to ``None`` — the parent identity — never a 400.
+    """
+    raw = body.get("agent_id", body.get("agentId"))
+    if isinstance(raw, str) and _SUBAGENT_ID_RE.match(raw):
+        return raw
+    return None
 
 
 def validate_session_id(
@@ -763,17 +785,21 @@ class CoordinatorHTTPServer:
     def shutting_down(self) -> bool:
         return self._shutting_down
 
-    def register_session(self, session_id: str) -> UUID:
+    def register_session(
+        self, session_id: str, subagent_id: str | None = None
+    ) -> UUID:
         """Idempotent session registration. Returns the deterministic agent UUID.
 
         R10 (Unit 6): mutation is wrapped in ``_agent_names_lock`` so the
         check-then-set is atomic w.r.t. concurrent registrations AND so
         :meth:`agent_name_for` snapshots see a consistent dict — relying
         on the GIL is forbidden by the project standard."""
-        agent_id = session_to_agent_id(session_id)
+        agent_id = session_to_agent_id(session_id, subagent_id)
         with self._agent_names_lock:
             if agent_id not in self._agent_names:
-                self._agent_names[agent_id] = session_to_agent_name(session_id)
+                self._agent_names[agent_id] = session_to_agent_name(
+                    session_id, subagent_id
+                )
         return agent_id
 
     def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
@@ -1385,7 +1411,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1665,7 +1691,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1831,7 +1857,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2003,7 +2029,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2091,7 +2117,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": sid_err[1]})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2306,7 +2332,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2474,7 +2500,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3841,7 +3867,14 @@ def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> 
     the private dict directly."""
     name = coordinator.agent_name_for(agent_id)
     if name and name.startswith("claude-session-"):
-        return name[len("claude-session-"):]
+        rest = name[len("claude-session-"):]
+        # SB-25 (R2 attribution): a subagent identity attributes to the
+        # SUBAGENT id, not the parent session — the [:8] short form in
+        # deny/warn prose must name the actual writer. The parent linkage
+        # stays visible via the full agent_name on /status.
+        if ":subagent-" in rest:
+            return rest.split(":subagent-", 1)[1]
+        return rest
     return None
 
 
