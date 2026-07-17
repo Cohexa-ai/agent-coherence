@@ -282,14 +282,18 @@ def _raw_subagent_id_value(body: dict) -> object:
 
 
 def has_subagent_id_field(body: dict) -> bool:
-    """True iff the body carries a NON-EMPTY subagent-id value, regardless of
-    whether it passes :data:`_SUBAGENT_ID_RE`. Lets the destructive
-    session-stop path distinguish "absent → legitimate parent stop" from
-    "present-but-malformed → refuse, never degrade to releasing the parent's
-    grants" (the P1 subagent-stop safety fix). Read paths don't need this — a
-    malformed id degrading to parent attribution there is benign."""
+    """True iff the body carries a present, non-null, non-empty subagent-id
+    value of ANY type — regardless of whether it passes :data:`_SUBAGENT_ID_RE`.
+    Lets the destructive session-stop path distinguish "absent → legitimate
+    parent stop" from "present-but-malformed → refuse, never degrade to
+    releasing the parent's grants" (the P1 subagent-stop safety fix).
+
+    Covering non-string types (int/list/dict/bool) matters: a present
+    ``agent_id: 42`` must be REFUSED, not treated as absent and degraded to the
+    parent identity. Read paths don't carry this guard — a malformed id
+    degrading to parent attribution there is benign."""
     raw = _raw_subagent_id_value(body)
-    return isinstance(raw, str) and raw != ""
+    return raw is not None and raw != ""
 
 
 def validate_session_id(
@@ -1433,16 +1437,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    subagent_id = read_subagent_id(body)
-    # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
-    # agent_id must NOT silently degrade to the parent identity — that would
-    # release the parent's live grants. Absent = legitimate parent Stop.
-    # Present-but-invalid = refuse (no-op), since the caller intended a scoped
-    # subagent release the server can't resolve. Read paths stay lax (benign).
-    if subagent_id is None and has_subagent_id_field(body):
-        req._json(200, {"ok": True, "released_artifacts": []})
-        return
-    agent_id = coordinator.register_session(session_id, subagent_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2148,7 +2143,19 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": sid_err[1]})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    subagent_id = read_subagent_id(body)
+    # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
+    # agent_id must NOT silently degrade to the parent identity — that would
+    # release the PARENT's live grants. Absent agent_id = a legitimate parent
+    # Stop (release the parent's own grants, unchanged). Present-but-invalid =
+    # refuse (no-op), since the caller intended a scoped subagent release the
+    # server can't resolve. The read paths (where degrading to parent
+    # attribution is benign) deliberately do NOT carry this guard.
+    if subagent_id is None and has_subagent_id_field(body):
+        req._json(200, {"ok": True, "released_artifacts": []})
+        return
+
+    agent_id = coordinator.register_session(session_id, subagent_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3876,25 +3883,24 @@ def _is_recent_self_commit_lag(
 
     A still-SHARED reader proves no peer commit landed since its grant (a peer
     commit invalidates every non-INVALID peer), so the canonical hash is the
-    reader's own granted-version hash and a disk-hash mismatch is this
-    session's own disk diverging. That is the legitimate lag iff THIS session
-    is the artifact's last committer AND that commit is recent — the registry
-    advanced the canonical hash (e.g. a commit_cas WIN that leaves the writer
-    SHARED) but the agent has not yet flushed the new bytes to disk. Any other
-    last_writer, no last_writer, or a stale self-commit (something rewrote disk
-    since) is a genuine out-of-band edit and must be denied.
+    reader's own granted-version hash and a disk-hash mismatch is the CALLER's
+    own disk diverging. That is the legitimate lag iff the CALLER is the
+    artifact's last committer AND that commit is recent — the registry advanced
+    the canonical hash (e.g. a commit_cas WIN that leaves the writer SHARED) but
+    the agent has not yet flushed the new bytes to disk. Any other last_writer,
+    no last_writer, or a stale self-commit (something rewrote disk since) is a
+    genuine out-of-band edit and must be denied.
     """
-    # P1: compare the writer's attribution against THIS CALLER's attribution —
-    # NOT against the parent session_id. SB-25 made the reverse lookup return a
-    # subagent's bare attribution id, so `_last_writer_for(...) != session_id`
-    # could never match for a subagent's own commit, wrongly denying its
-    # immediate self-re-read as a "foreign edit." Comparing attribution-to-
-    # attribution is correct for both parent (session_id) and subagent
-    # (subagent id) callers, and keeps the `_last_writer_for` indirection (its
-    # MODIFIED-holder fallback + test monkeypatch point) intact.
-    if _last_writer_for(coordinator, artifact_id) != _agent_id_to_session(
-        coordinator, caller_agent_id
-    ):
+    # Compare the RAW committed-writer agent id against the CALLER's composite
+    # agent id — matching the Node backend (`last_writer_id === agentId`). An
+    # earlier version compared ATTRIBUTION strings via `_agent_id_to_session`,
+    # but a subagent's attribution is its BARE agent_id, which COLLIDES across
+    # two different parent sessions that present the same agent_id string — that
+    # would suppress a genuine foreign-edit deny (adversarial review 2026-07-17)
+    # and diverge from Node. The raw composite id is unique per (session,
+    # subagent) and cannot collide. `_last_writer_for` is still used for the
+    # DISPLAY attribution (the [:8] prose naming the writer), not this gate.
+    if coordinator.registry.last_writer_for(artifact_id) != caller_agent_id:
         return False
     updated_at = _last_writer_unix_ts(coordinator, artifact_id)
     if updated_at is None:

@@ -134,6 +134,12 @@ class TestSubagentStopSafety:
         assert has_subagent_id_field({}) is False
         assert has_subagent_id_field({"agent_id": ""}) is False
         assert has_subagent_id_field({"agent_id": None}) is False
+        # P2: present NON-STRING values are "present" (must be refused on the
+        # session-stop path, not degraded to the parent identity).
+        assert has_subagent_id_field({"agent_id": 42}) is True
+        assert has_subagent_id_field({"agent_id": [1]}) is True
+        assert has_subagent_id_field({"agent_id": {"k": 1}}) is True
+        assert has_subagent_id_field({"agent_id": True}) is True
 
 
 class TestSubagentIdTrailingNewline:
