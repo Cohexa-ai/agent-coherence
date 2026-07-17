@@ -55,6 +55,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 from pathlib import Path
@@ -84,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pre-edit",
             "post-edit",
             "session-stop",
+            "subagent-stop",
             # v0.1.1 KTD-N — H4 mitigation: extended hook coverage.
             "pre-bash",
             "pre-grep",
@@ -186,6 +188,13 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
         elif args.subcommand == "session-stop":
             payload = _build_session_stop(cc_payload)
             response = _call(endpoint, "/hooks/session-stop", payload)
+        elif args.subcommand == "subagent-stop":
+            # SB-25 Unit 4: CC's SubagentStop event → release the SUBAGENT
+            # identity's grants via the existing session-stop verb. agent_id
+            # is REQUIRED — without it the release would strip the PARENT's
+            # grants mid-session, so absence skips (fail-open {}).
+            payload = _build_subagent_stop(cc_payload)
+            response = _call(endpoint, "/hooks/session-stop", payload)
         elif args.subcommand == "pre-bash":
             payload = _build_pre_bash(cc_payload)
             response = _call(endpoint, "/hooks/pre-bash", payload)
@@ -267,14 +276,14 @@ def _build_pre_read(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     content_hash = _hash_file(Path(file_path))
     if content_hash is not None:
         body["content_hash"] = content_hash
-    return body
+    return _with_agent_id(cc, body)
 
 
 def _build_pre_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     session_id = _require_session_id(cc)
     file_path = _require_file_path(cc)
     rel = _to_workspace_relative(file_path, root)
-    return {"session_id": session_id, "path": rel}
+    return _with_agent_id(cc, {"session_id": session_id, "path": rel})
 
 
 def _build_post_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -297,12 +306,32 @@ def _build_post_edit(cc: dict[str, Any], root: Path) -> dict[str, Any]:
     }
     if content_hash is not None:
         body["content_hash"] = content_hash
-    return body
+    return _with_agent_id(cc, body)
 
 
 def _build_session_stop(cc: dict[str, Any]) -> dict[str, Any]:
     session_id = _require_session_id(cc)
-    return {"session_id": session_id}
+    return _with_agent_id(cc, {"session_id": session_id})
+
+
+# Mirrors the coordinator's _SUBAGENT_ID_RE (charset + length). Kept in sync
+# by hand across the client/server modules; a divergence is caught by the
+# subagent-stop safety test. fullmatch semantics (see below) match the server.
+_SUBAGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _build_subagent_stop(cc: dict[str, Any]) -> dict[str, Any]:
+    """SB-25 Unit 4: SubagentStop → scoped grant release. The subagent
+    identity is mandatory AND shape-validated here (contrast _with_agent_id's
+    optional thread): a SubagentStop payload with a missing OR malformed agent
+    id must NOT fall back to the parent identity — the server would null a
+    malformed id and degrade to releasing the PARENT's live grants (P1). Fail
+    open (skip) on a doomed release rather than performing the wrong one."""
+    session_id = _require_session_id(cc)
+    aid = cc.get("agent_id", cc.get("agentId"))
+    if not isinstance(aid, str) or not _SUBAGENT_ID_RE.fullmatch(aid):
+        raise _SkipHook("agent_id missing or malformed for subagent-stop")
+    return {"session_id": session_id, "agent_id": aid}
 
 
 def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:
@@ -319,7 +348,7 @@ def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:
     command = tool_input.get("command")
     if not isinstance(command, str) or not command.strip():
         raise _SkipHook("tool_input.command missing or empty")
-    return {"session_id": session_id, "command": command}
+    return _with_agent_id(cc, {"session_id": session_id, "command": command})
 
 
 def _build_pre_grep(cc: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -352,7 +381,7 @@ def _build_pre_grep(cc: dict[str, Any], root: Path) -> dict[str, Any]:
         search_root = _to_workspace_relative(raw_path, root)
     else:
         search_root = raw_path[2:] if raw_path.startswith("./") else raw_path
-    return {"session_id": session_id, "search_root": search_root}
+    return _with_agent_id(cc, {"session_id": session_id, "search_root": search_root})
 
 
 # ----------------------------------------------------------------------
@@ -373,6 +402,17 @@ def _require_file_path(cc: dict[str, Any]) -> str:
     if not isinstance(fp, str) or not fp:
         raise _SkipHook("tool_input.file_path missing")
     return fp
+
+
+def _with_agent_id(cc: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """SB-25: thread the optional subagent identity through to the
+    coordinator. Accepts snake_case ``agent_id`` with a defensive camelCase
+    ``agentId`` fallback (wire casing pinned by the R6 live capture).
+    Absent/invalid → body unchanged (parent identity)."""
+    aid = cc.get("agent_id", cc.get("agentId"))
+    if isinstance(aid, str) and aid:
+        body["agent_id"] = aid
+    return body
 
 
 def _to_workspace_relative(file_path: str, root: Path) -> str:

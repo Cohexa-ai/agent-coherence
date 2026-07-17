@@ -259,7 +259,7 @@ def test_pre_read_strict_shared_sentinel_never_denies(
 
 
 def test_pre_read_strict_shared_recent_self_commit_lag_allows(
-    strict_client: _Client, monkeypatch,
+    strict_coordinator, strict_client: _Client, monkeypatch,
 ) -> None:
     """FP-lag negative control (MANDATORY): a SHARED holder whose mismatch is
     its OWN recent commit (registry canonical advanced via a commit_cas WIN,
@@ -273,8 +273,9 @@ def test_pre_read_strict_shared_recent_self_commit_lag_allows(
         "/hooks/pre-read",
         {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
     )
-    # Make CLAUDE.md appear as this session's just-now commit (the lag shape).
-    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: _sid("s1"))
+    # Make CLAUDE.md's committed writer THIS caller (session s1) — the lag shape.
+    caller_agent_id = strict_coordinator.register_session(_sid("s1"))
+    monkeypatch.setattr(strict_coordinator.registry, "last_writer_for", lambda aid: caller_agent_id)
     monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
     status, body = strict_client.post(
         "/hooks/pre-read",
@@ -282,6 +283,36 @@ def test_pre_read_strict_shared_recent_self_commit_lag_allows(
     )
     assert status == 200
     # Lag-excluded: no deny, falls through to the warn-mode allow + hash_differs.
+    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+
+
+def test_pre_read_strict_shared_self_commit_lag_subagent_allows(
+    strict_coordinator, strict_client: _Client, monkeypatch,
+) -> None:
+    """SB-25: the self-commit-lag suppression must recognize a SUBAGENT's OWN
+    recent commit. The gate compares the raw committed-writer agent id against
+    the CALLER's composite agent id; here the caller is a subagent
+    (agent_id='suba') and the (monkeypatched) last writer is that same
+    subagent's composite id → lag suppressed → warn-mode allow, not deny.
+    Before SB-25 the comparison used the parent session_id and could never
+    match for a subagent, wrongly denying its own re-read as a foreign edit."""
+    import ccs.adapters.claude_code.coordinator_server as _csrv
+
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "agent_id": "suba", "path": "CLAUDE.md",
+         "content_hash": _hash("v1")},
+    )
+    # The committed writer is THIS subagent caller's composite agent id.
+    caller_agent_id = strict_coordinator.register_session(_sid("s1"), "suba")
+    monkeypatch.setattr(strict_coordinator.registry, "last_writer_for", lambda aid: caller_agent_id)
+    monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("s1"), "agent_id": "suba", "path": "CLAUDE.md",
+         "content_hash": _hash("foreign-v2")},
+    )
+    assert status == 200
     assert body == {"status": "fresh", "version": 1, "hash_differs": True}
 
 
@@ -320,7 +351,8 @@ def test_pre_read_strict_shared_lag_suppression_increments_counter(
         "/hooks/pre-read",
         {"session_id": _sid("s1"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
     )
-    monkeypatch.setattr(_csrv, "_last_writer_for", lambda coord, aid: _sid("s1"))
+    caller_agent_id = strict_coordinator.register_session(_sid("s1"))
+    monkeypatch.setattr(strict_coordinator.registry, "last_writer_for", lambda aid: caller_agent_id)
     monkeypatch.setattr(_csrv, "_last_writer_unix_ts", lambda coord, aid: time.time())
     status, body = strict_client.post(
         "/hooks/pre-read",

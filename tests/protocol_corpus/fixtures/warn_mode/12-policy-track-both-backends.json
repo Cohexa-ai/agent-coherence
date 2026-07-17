@@ -1,0 +1,21 @@
+{
+  "name": "policy-track-both-backends",
+  "description": "POST /policy/track wire-parity across BOTH backends. As of the zero-Python Node self-sufficiency work the Node coordinator implements the policy-management surface (bin CLIs + /policy routes), so a track of a valid relative path returns the same {ok, added, rejected} body on Python and Node. (Renamed from the v0.1.1 'python-only' fixture, whose premise no longer holds.)",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/policy/track",
+    "body": {
+      "paths": ["docs/plans/feature-y.md"]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "added": ["docs/plans/feature-y.md"],
+      "rejected": []
+    }
+  },
+  "backends": ["python", "node"]
+}

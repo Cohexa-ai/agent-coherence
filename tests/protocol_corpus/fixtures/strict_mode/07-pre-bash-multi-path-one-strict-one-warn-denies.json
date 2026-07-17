@@ -2,32 +2,90 @@
   "name": "pre-bash-multi-path-one-strict-one-warn-denies",
   "description": "Bash command `cat plan.md docs/plans/x.md` where plan.md is strict + preempted and docs/plans/x.md is tracked-but-warn-only + preempted. ANY strict-stale match triggers deny for the WHOLE command per the plan's KTD-Q edge case. The stale_paths array still reflects all preempted paths in the command (both plan.md and docs/plans/x.md surface as stale).",
   "setup": {
-    "tracked": ["plan.md", "docs/plans/x.md"],
-    "strict_mode": ["plan.md"],
-    "files": {"plan.md": "# Plan\nv1\n", "docs/plans/x.md": "# X\nv1\n"},
+    "tracked": [
+      "plan.md",
+      "docs/plans/x.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n",
+      "docs/plans/x.md": "# X\nv1\n"
+    },
     "preflight_requests": [
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "aaaaaaaa-0000-4000-8000-000000000001",
-                "path": "plan.md", "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "aaaaaaaa-0000-4000-8000-000000000001",
-                "path": "docs/plans/x.md", "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
-                "path": "plan.md", "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
-                "path": "docs/plans/x.md", "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002", "path": "plan.md"}},
-      {"method": "POST", "path": "/hooks/post-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002", "path": "plan.md",
-                "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f", "success": true}},
-      {"method": "POST", "path": "/hooks/pre-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002", "path": "docs/plans/x.md"}},
-      {"method": "POST", "path": "/hooks/post-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002", "path": "docs/plans/x.md",
-                "content_hash": "be1f3a2c2e9e9d6b9d3e7f5c1e4b8c6f0d9e3f4a5b6c7d8e9f0a1b2c3d4e5f6a", "success": true}}
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/plans/x.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md",
+          "content_hash": "be1f3a2c2e9e9d6b9d3e7f5c1e4b8c6f0d9e3f4a5b6c7d8e9f0a1b2c3d4e5f6a",
+          "success": true
+        }
+      }
     ]
   },
   "request": {
@@ -38,19 +96,24 @@
       "command": "cat plan.md docs/plans/x.md"
     }
   },
-  "ignore_keys": ["permissionDecisionReason", "stale_paths"],
+  "ignore_keys": [
+    "stale_paths"
+  ],
   "expected": {
     "status": 200,
     "body": {
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "<IGNORED>"
+        "permissionDecisionReason": "Stale read denied: plan.md was updated by session bbbbbbbb at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
       },
       "status": "stale",
       "stale_paths": "<IGNORED>"
     }
   },
   "_comment": "stale_paths ordering is non-deterministic (depends on bash_path_detector iteration order); ignored at corpus level. Existence and shape ('stale') are asserted.",
-  "backends": ["python"]
+  "backends": [
+    "python",
+    "node"
+  ]
 }

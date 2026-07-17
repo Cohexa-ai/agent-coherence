@@ -211,15 +211,34 @@ could mint v1 with attacker-chosen hash strings."""
 # ----------------------------------------------------------------------
 
 
-def session_to_agent_id(session_id: str) -> UUID:
+def session_to_agent_id(session_id: str, subagent_id: str | None = None) -> UUID:
     """Deterministic UUID for a Claude Code session, matching the convention
     in :class:`CoherenceAdapterCore` so other adapters and the in-process
-    library see the same agent identity."""
+    library see the same agent identity.
+
+    SB-25 composite identity: a subagent's hook payload carries the PARENT
+    session_id plus a distinct ``agent_id`` — folding it into the uuid5 name
+    makes each subagent a first-class coherence peer (correct ``last_writer``
+    attribution + sibling-collision detection). ``subagent_id`` absent/empty
+    ⇒ the original derivation, byte-identical (main-thread behavior
+    unchanged). The fold string is mirrored byte-for-byte by the Node
+    backend (``agent_id.ts``) — a one-char divergence would silently fork
+    the shared ``agent_states`` rows.
+    """
+    if subagent_id:
+        return uuid5(
+            NAMESPACE_URL,
+            f"ccs-agent:claude-session-{session_id}:subagent-{subagent_id}",
+        )
     return uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}")
 
 
-def session_to_agent_name(session_id: str) -> str:
-    """Human-readable agent name for state_log and status display."""
+def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> str:
+    """Human-readable agent name for state_log and status display. SB-25:
+    a subagent identity renders as ``claude-session-<sid>:subagent-<aid>``
+    so /status keeps the parent linkage visible."""
+    if subagent_id:
+        return f"claude-session-{session_id}:subagent-{subagent_id}"
     return f"claude-session-{session_id}"
 
 
@@ -231,6 +250,50 @@ def monotonic_seconds() -> int:
 # ----------------------------------------------------------------------
 # Boundary validators (Adv-review hardening A2 + A3 + A8)
 # ----------------------------------------------------------------------
+
+
+_SUBAGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def read_subagent_id(body: dict) -> str | None:
+    """SB-25: optional subagent identity from the hook request body.
+
+    Accepts the documented snake_case ``agent_id`` with a defensive fallback
+    to the transcript-observed camelCase ``agentId`` (exact wire casing is
+    pinned by the R6 live capture; until then both are honored). Additive +
+    backward-compatible: absent, non-string, or out-of-shape values resolve
+    to ``None`` — the parent identity — never a 400.
+    """
+    raw = _raw_subagent_id_value(body)
+    # fullmatch (not match): Python's `$` also matches just before a trailing
+    # newline, so `.match("abc\n")` would ACCEPT it — but JS's `$` does not,
+    # so a trailing-newline id would fork the composite agent_id across
+    # backends. fullmatch closes that byte-parity gap.
+    if isinstance(raw, str) and _SUBAGENT_ID_RE.fullmatch(raw):
+        return raw
+    return None
+
+
+def _raw_subagent_id_value(body: dict) -> object:
+    """Raw subagent-id value, snake_case preferred (SB-25). Byte-parity with
+    the Node reader: an explicitly-present ``agent_id`` (even null) is NOT
+    overridden by ``agentId`` — only an ABSENT ``agent_id`` key falls back."""
+    return body.get("agent_id", body.get("agentId"))
+
+
+def has_subagent_id_field(body: dict) -> bool:
+    """True iff the body carries a present, non-null, non-empty subagent-id
+    value of ANY type — regardless of whether it passes :data:`_SUBAGENT_ID_RE`.
+    Lets the destructive session-stop path distinguish "absent → legitimate
+    parent stop" from "present-but-malformed → refuse, never degrade to
+    releasing the parent's grants" (the P1 subagent-stop safety fix).
+
+    Covering non-string types (int/list/dict/bool) matters: a present
+    ``agent_id: 42`` must be REFUSED, not treated as absent and degraded to the
+    parent identity. Read paths don't carry this guard — a malformed id
+    degrading to parent attribution there is benign."""
+    raw = _raw_subagent_id_value(body)
+    return raw is not None and raw != ""
 
 
 def validate_session_id(
@@ -748,17 +811,21 @@ class CoordinatorHTTPServer:
     def shutting_down(self) -> bool:
         return self._shutting_down
 
-    def register_session(self, session_id: str) -> UUID:
+    def register_session(
+        self, session_id: str, subagent_id: str | None = None
+    ) -> UUID:
         """Idempotent session registration. Returns the deterministic agent UUID.
 
         R10 (Unit 6): mutation is wrapped in ``_agent_names_lock`` so the
         check-then-set is atomic w.r.t. concurrent registrations AND so
         :meth:`agent_name_for` snapshots see a consistent dict — relying
         on the GIL is forbidden by the project standard."""
-        agent_id = session_to_agent_id(session_id)
+        agent_id = session_to_agent_id(session_id, subagent_id)
         with self._agent_names_lock:
             if agent_id not in self._agent_names:
-                self._agent_names[agent_id] = session_to_agent_name(session_id)
+                self._agent_names[agent_id] = session_to_agent_name(
+                    session_id, subagent_id
+                )
         return agent_id
 
     def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
@@ -1370,7 +1437,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1445,7 +1512,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     # within the call (KTD-P).
                     _now = _payloads.now_unix()
                     if _is_recent_self_commit_lag(
-                        coordinator, artifact_id, session_id, now_unix=_now,
+                        coordinator, artifact_id, agent_id, now_unix=_now,
                     ):
                         # Benign commit→disk-write lag (R2): count the
                         # suppression so operators can size the lag-window
@@ -1650,7 +1717,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1816,7 +1883,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1988,7 +2055,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2076,7 +2143,19 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": sid_err[1]})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    subagent_id = read_subagent_id(body)
+    # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
+    # agent_id must NOT silently degrade to the parent identity — that would
+    # release the PARENT's live grants. Absent agent_id = a legitimate parent
+    # Stop (release the parent's own grants, unchanged). Present-but-invalid =
+    # refuse (no-op), since the caller intended a scoped subagent release the
+    # server can't resolve. The read paths (where degrading to parent
+    # attribution is benign) deliberately do NOT carry this guard.
+    if subagent_id is None and has_subagent_id_field(body):
+        req._json(200, {"ok": True, "released_artifacts": []})
+        return
+
+    agent_id = coordinator.register_session(session_id, subagent_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2291,7 +2370,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2459,7 +2538,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(200, {"status": "fresh"})
         return
 
-    agent_id = coordinator.register_session(session_id)
+    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3795,7 +3874,7 @@ def _emit_pre_read_strict_deny(
 def _is_recent_self_commit_lag(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
-    session_id: str,
+    caller_agent_id: UUID,
     *,
     now_unix: float,
 ) -> bool:
@@ -3804,15 +3883,24 @@ def _is_recent_self_commit_lag(
 
     A still-SHARED reader proves no peer commit landed since its grant (a peer
     commit invalidates every non-INVALID peer), so the canonical hash is the
-    reader's own granted-version hash and a disk-hash mismatch is this
-    session's own disk diverging. That is the legitimate lag iff THIS session
-    is the artifact's last committer AND that commit is recent — the registry
-    advanced the canonical hash (e.g. a commit_cas WIN that leaves the writer
-    SHARED) but the agent has not yet flushed the new bytes to disk. Any other
-    last_writer, no last_writer, or a stale self-commit (something rewrote disk
-    since) is a genuine out-of-band edit and must be denied.
+    reader's own granted-version hash and a disk-hash mismatch is the CALLER's
+    own disk diverging. That is the legitimate lag iff the CALLER is the
+    artifact's last committer AND that commit is recent — the registry advanced
+    the canonical hash (e.g. a commit_cas WIN that leaves the writer SHARED) but
+    the agent has not yet flushed the new bytes to disk. Any other last_writer,
+    no last_writer, or a stale self-commit (something rewrote disk since) is a
+    genuine out-of-band edit and must be denied.
     """
-    if _last_writer_for(coordinator, artifact_id) != session_id:
+    # Compare the RAW committed-writer agent id against the CALLER's composite
+    # agent id — matching the Node backend (`last_writer_id === agentId`). An
+    # earlier version compared ATTRIBUTION strings via `_agent_id_to_session`,
+    # but a subagent's attribution is its BARE agent_id, which COLLIDES across
+    # two different parent sessions that present the same agent_id string — that
+    # would suppress a genuine foreign-edit deny (adversarial review 2026-07-17)
+    # and diverge from Node. The raw composite id is unique per (session,
+    # subagent) and cannot collide. `_last_writer_for` is still used for the
+    # DISPLAY attribution (the [:8] prose naming the writer), not this gate.
+    if coordinator.registry.last_writer_for(artifact_id) != caller_agent_id:
         return False
     updated_at = _last_writer_unix_ts(coordinator, artifact_id)
     if updated_at is None:
@@ -3826,7 +3914,14 @@ def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> 
     the private dict directly."""
     name = coordinator.agent_name_for(agent_id)
     if name and name.startswith("claude-session-"):
-        return name[len("claude-session-"):]
+        rest = name[len("claude-session-"):]
+        # SB-25 (R2 attribution): a subagent identity attributes to the
+        # SUBAGENT id, not the parent session — the [:8] short form in
+        # deny/warn prose must name the actual writer. The parent linkage
+        # stays visible via the full agent_name on /status.
+        if ":subagent-" in rest:
+            return rest.split(":subagent-", 1)[1]
+        return rest
     return None
 
 

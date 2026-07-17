@@ -1,0 +1,26 @@
+{
+  "name": "policy-track-rejection-parity",
+  "description": "POST /policy/track rejection-reason byte-parity across BOTH backends. The path validator (Python validate_path / Node validatePolicyPath) rejects absolute, traversal, control-char (the YAML newline-injection vector), and leading-backslash paths with identical reason strings and preserves partial-accept (the one valid path is added). Distinct paths → no dedup rejections → rejected[] is validation failures in input order on both backends.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/policy/track",
+    "body": {
+      "paths": ["ok.md", "/abs.md", "../up.md", "a\n- /etc/passwd", "\\win.md"]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "added": ["ok.md"],
+      "rejected": [
+        {"path": "/abs.md", "reason": "path must be relative (no leading /)"},
+        {"path": "../up.md", "reason": "path contains '..' traversal"},
+        {"path": "a\n- /etc/passwd", "reason": "path contains control characters"},
+        {"path": "\\win.md", "reason": "path must be relative (no leading \\)"}
+      ]
+    }
+  },
+  "backends": ["python", "node"]
+}

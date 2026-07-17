@@ -2,26 +2,52 @@
   "name": "pre-edit-strict-tracked-stale-denies",
   "description": "Pre-edit on a strict + tracked + preempted artifact denies before acquiring EXCLUSIVE. The editor must re-read first per KTD-Q's Edit/Write surface (hooks.json matcher Edit|Write routes both to /hooks/pre-edit). Wire shape: {ok: false, hookSpecificOutput: deny, status: stale, summary}.",
   "setup": {
-    "tracked": ["plan.md"],
-    "strict_mode": ["plan.md"],
-    "files": {"plan.md": "# Plan\nv1\n"},
+    "tracked": [
+      "plan.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n"
+    },
     "preflight_requests": [
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "aaaaaaaa-0000-4000-8000-000000000001",
-                "path": "plan.md",
-                "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-read",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
-                "path": "plan.md",
-                "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
-      {"method": "POST", "path": "/hooks/pre-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
-                "path": "plan.md"}},
-      {"method": "POST", "path": "/hooks/post-edit",
-       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
-                "path": "plan.md",
-                "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
-                "success": true}}
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      }
     ]
   },
   "request": {
@@ -32,7 +58,9 @@
       "path": "plan.md"
     }
   },
-  "ignore_keys": ["permissionDecisionReason", "summary"],
+  "ignore_keys": [
+    "summary"
+  ],
   "expected": {
     "status": 200,
     "body": {
@@ -40,11 +68,14 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "<IGNORED>"
+        "permissionDecisionReason": "Stale read denied: plan.md was updated by session bbbbbbbb at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
       },
       "status": "stale",
       "summary": "<IGNORED>"
     }
   },
-  "backends": ["python"]
+  "backends": [
+    "python",
+    "node"
+  ]
 }

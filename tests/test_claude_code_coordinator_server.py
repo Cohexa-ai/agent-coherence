@@ -393,53 +393,85 @@ def test_pre_read_fresh_shared_hash_mismatch_increments_counter(
 _CSRV = "ccs.adapters.claude_code.coordinator_server"
 
 
-def _patch_last_writer(monkeypatch, *, writer, ts) -> None:
-    monkeypatch.setattr(f"{_CSRV}._last_writer_for", lambda coord, aid: writer)
+def _patch_last_writer(monkeypatch, coordinator, *, writer, ts) -> None:
+    # The lag gate now reads the RAW committed-writer agent id straight from the
+    # registry (matching Node), so patch that method — NOT the module-level
+    # `_last_writer_for` (which resolves to a display attribution string and is
+    # only used for the deny prose). `writer` is the writer's composite agent_id
+    # (a UUID) or None.
+    monkeypatch.setattr(coordinator.registry, "last_writer_for", lambda aid: writer)
     monkeypatch.setattr(f"{_CSRV}._last_writer_unix_ts", lambda coord, aid: ts)
 
 
+# SB-25: the predicate's 3rd arg is the CALLER's composite agent_id, compared
+# to the raw committed-writer agent_id from the registry. Register the caller
+# to get its agent_id; the "self commit" cases set the registry writer to that
+# same agent_id.
+def _caller(coordinator, label: str):
+    """Register a session and return (session_id, composite_agent_id)."""
+    sid = _sid(label)
+    return sid, coordinator.register_session(sid)
+
+
 def test_lag_true_for_recent_self_commit(coordinator, monkeypatch) -> None:
-    sid = _sid("s1")
-    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    _, agent_id = _caller(coordinator, "s1")
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC - 0.1
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is True
 
 
 def test_lag_false_for_stale_self_commit(coordinator, monkeypatch) -> None:
     """last_writer == self but the commit is OLD => something rewrote disk
     since => correctly FOREIGN (the recency clause is load-bearing)."""
-    sid = _sid("s1")
-    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    _, agent_id = _caller(coordinator, "s1")
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is False
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is False
 
 
 def test_lag_false_for_other_writer(coordinator, monkeypatch) -> None:
-    _patch_last_writer(monkeypatch, writer=_sid("s2"), ts=1000.0)
+    _, agent_id = _caller(coordinator, "s1")
+    _, other_agent_id = _caller(coordinator, "s2")
+    _patch_last_writer(monkeypatch, coordinator, writer=other_agent_id, ts=1000.0)
     assert _is_recent_self_commit_lag(
-        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+        coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
 
 
 def test_lag_false_for_no_writer(coordinator, monkeypatch) -> None:
-    _patch_last_writer(monkeypatch, writer=None, ts=None)
+    _, agent_id = _caller(coordinator, "s1")
+    _patch_last_writer(monkeypatch, coordinator, writer=None, ts=None)
     assert _is_recent_self_commit_lag(
-        coordinator, uuid.uuid4(), _sid("s1"), now_unix=1000.1) is False
+        coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
 
 
 def test_lag_false_for_missing_updated_at(coordinator, monkeypatch) -> None:
-    sid = _sid("s1")
-    _patch_last_writer(monkeypatch, writer=sid, ts=None)
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=1000.1) is False
+    _, agent_id = _caller(coordinator, "s1")
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=None)
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=1000.1) is False
+
+
+def test_lag_false_for_cross_session_same_subagent_id(coordinator, monkeypatch) -> None:
+    """Regression: two DIFFERENT sessions presenting the SAME agent_id string
+    have DIFFERENT composite agent_ids, so a foreign edit by one is NOT
+    suppressed for the other. (The prior attribution comparison collided on the
+    bare subagent id and wrongly suppressed — adversarial review 2026-07-17.)"""
+    _, a1 = _caller(coordinator, "s1")
+    a2 = coordinator.register_session(_sid("s2"), "shared-agent")
+    b2 = coordinator.register_session(_sid("s1"), "shared-agent")
+    assert a2 != b2  # same agent_id string, different sessions → distinct ids
+    _patch_last_writer(monkeypatch, coordinator, writer=a2, ts=1000.0)  # session-2's subagent wrote
+    # caller is session-1 (parent) — must NOT be treated as the writer.
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), a1, now_unix=1000.1) is False
 
 
 def test_lag_true_at_exact_window_boundary(coordinator, monkeypatch) -> None:
     """`<=` boundary: a self-commit EXACTLY at the window edge is still treated as
     lag (the fail-safe direction). Pins the operator choice against a silent flip
     to `<`."""
-    sid = _sid("s1")
-    _patch_last_writer(monkeypatch, writer=sid, ts=1000.0)
+    _, agent_id = _caller(coordinator, "s1")
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=1000.0)
     now = 1000.0 + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
-    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), sid, now_unix=now) is True
+    assert _is_recent_self_commit_lag(coordinator, uuid.uuid4(), agent_id, now_unix=now) is True
 
 
 def test_status_metrics_exposes_fresh_shared_hash_mismatch_counter(client: _Client) -> None:
@@ -503,6 +535,36 @@ def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -
     # Another session can now acquire immediately
     s2, b2 = client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
     assert s2 == 200 and b2.get("ok") is True
+
+
+def test_session_stop_malformed_agent_id_does_not_release_parent(client: _Client) -> None:
+    """P0 regression: a present-but-malformed agent_id on /hooks/session-stop
+    must fail closed (no-op), NOT degrade to the parent identity and release
+    the parent's live grants. The guard was briefly mis-wired into
+    _handle_pre_read instead of _handle_session_stop; no end-to-end test drove
+    the handler, so it shipped clean."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})  # parent holds E
+    # Every present-but-malformed JSON type → no-op; the parent's grant survives.
+    for bad in (42, [1], {"k": 1}, True, "bad id!", "x" * 65):
+        s, b = client.post("/hooks/session-stop", {"session_id": _sid("A"), "agent_id": bad})
+        assert s == 200
+        assert b == {"ok": True, "released_artifacts": []}, f"malformed {bad!r} must be a no-op"
+    # An ABSENT agent_id is a legitimate parent stop → the grant IS released.
+    s, b = client.post("/hooks/session-stop", {"session_id": _sid("A")})
+    assert s == 200
+    assert b["released_artifacts"] == ["plan.md"]
+
+
+def test_pre_read_malformed_agent_id_keeps_fresh_stale_contract(client: _Client) -> None:
+    """P0 regression: a malformed agent_id on /hooks/pre-read must NOT short-
+    circuit to a session-stop-shaped body — it degrades to parent attribution
+    and returns pre-read's normal fresh/stale contract."""
+    s, b = client.post(
+        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "agent_id": 42}
+    )
+    assert s == 200
+    assert "released_artifacts" not in b
+    assert b.get("status") in ("fresh", "stale")
 
 
 def test_collision_surfaces_via_additional_context(coordinator, client: _Client) -> None:

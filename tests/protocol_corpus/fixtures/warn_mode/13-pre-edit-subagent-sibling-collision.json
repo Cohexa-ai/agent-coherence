@@ -1,0 +1,43 @@
+{
+  "name": "pre-edit-subagent-sibling-collision",
+  "description": "SB-25 composite identity: two subagents of ONE parent session are distinct coherence peers. Subagent A acquires EXCLUSIVE on a tracked path (preflight); sibling subagent B's pre-edit on the same path then surfaces a collision warning (ok+collision+allow envelope). Pre-SB-25 both subagents collapsed into the parent identity and this conflict was structurally invisible (the acquireExclusive self-skip saw one agent). additionalContext is ignored (holder short-id + timestamps vary per run); the collision KEYS are the parity contract.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "44444444-4444-4444-8444-444444444444",
+      "agent_id": "b1937733562fd2a7e",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      }
+    }
+  },
+  "ignore_keys": ["additionalContext"]
+}
