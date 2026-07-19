@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.cohexa-ai/stale-write-guard-fs",
+  "name": "io.github.Cohexa-ai/stale-write-guard-fs",
   "title": "Agent Coherence — Stale Write Guard (FS)",
   "description": "Coherence guard for shared files: denies stale writes so agents don't silently overwrite each other.",
   "repository": {
