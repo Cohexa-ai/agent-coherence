@@ -9,13 +9,22 @@
 name: publish-mcp-registry
 
 on:
-  # release.yml runs preflight -> build -> publish-to-PyPI -> github-release, so
-  # a published release means the version is already on PyPI. The registry
-  # validates the package (and its `mcp-name` marker) before accepting, so
-  # triggering any earlier — e.g. on the tag push — would race that publish.
+  # The primary trigger. `release: published` cannot be relied on here: the
+  # Release is created by release.yml with the default GITHUB_TOKEN, and GitHub
+  # suppresses events from token-created objects to prevent workflow recursion
+  # — the event simply never fires (observed on v0.13.0). workflow_run fires on
+  # the workflow's completion regardless of what token it used. release.yml
+  # orders preflight -> build -> publish-to-PyPI -> github-release, so its
+  # success means the version is already live on PyPI — which matters because
+  # the registry validates the package (and its `mcp-name` marker) at publish.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  # Kept for releases published by a human from the GitHub UI, where the event
+  # does fire.
   release:
     types: [published]
-  # Publish the currently committed server.json without cutting a release.
+  # Manual fallback; publishes the latest GitHub release's version.
   workflow_dispatch:
 
 permissions:
@@ -24,6 +33,9 @@ permissions:
 jobs:
   publish:
     name: Publish server.json to the MCP Registry
+    # For workflow_run, only publish after a *successful* release run — a failed
+    # or cancelled release must not push metadata for a version PyPI never got.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       id-token: write # mints the OIDC token the registry authenticates with
@@ -32,14 +44,22 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # The registry refuses a version it already holds, so the manifest has to
-      # track the release being published rather than whatever was last
-      # committed. Both fields matter: the server version and the pypi one.
-      - name: Sync server.json version to the release tag
-        if: github.event_name == 'release'
+      # track the released version rather than whatever was last committed.
+      # Both fields matter: the server version and the pypi package version.
+      # On a release event the tag rides in on the event payload; on
+      # workflow_run and workflow_dispatch it is resolved from the latest
+      # GitHub release (which a just-completed release.yml run has published).
+      - name: Sync server.json version to the released tag
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          version="${RELEASE_TAG#v}"
+          tag="$EVENT_RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+          version="${tag#v}"
+          echo "Publishing version: $version (from tag $tag)"
           jq --arg v "$version" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
           mv server.json.tmp server.json
 
