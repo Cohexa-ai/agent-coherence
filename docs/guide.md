@@ -907,6 +907,22 @@ writes have to go through `swg_write` / `swg_write_cas` and inherit the stale-vi
 deny. The Claude Code adapter that wires this seam ships in
 `ccs.adapters.claude_code`.
 
+**Subagent identity (v0.13.0).** When a Claude Code hook payload carries an
+`agent_id` alongside the parent `session_id`, the adapter folds both into the
+identity derivation, so each subagent becomes its own coherence peer rather
+than blending into the parent session. That buys two things: `last_writer`
+attribution names the subagent that actually wrote (visible in `/status` as
+`claude-session-<sid>:subagent-<aid>`), and two sibling subagents racing the
+same artifact are detected as a collision instead of passing as one writer.
+With no `agent_id` in the payload the derivation is unchanged, byte-for-byte —
+main-thread sessions behave exactly as before. On Claude Code's
+`SubagentStop` event, the hook client's `subagent-stop` subcommand releases
+just that subagent's grants; the `agent_id` is required there, so a payload
+without one skips the release rather than stripping the parent's grants
+mid-session. The Python and Node coordinator backends derive the identity
+byte-identically; the protocol corpus pins the parity (sibling collision,
+attribution, scoped release fixtures).
+
 Run the red→green demo: `python -m examples.mcp_stale_write_guard.main`
 (offline, deterministic, no keys).
 

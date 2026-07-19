@@ -6,7 +6,64 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-19
+
 ### Added
+
+- **BYO-substrate bindings — `CoherenceSubstrate` contract, `CoherentRow`
+  (Postgres), `CoherentObject` (S3).** Coherence over shared state that lives in
+  a store *you already run* — a Postgres row, an S3 object — instead of a store
+  this library ships. The coordinator holds only coherence metadata (a monotonic
+  version, per-agent MESI state, a fixed-width `content_hash`, an opaque
+  substrate token); it never holds your bytes. A native conditional write
+  (`UPDATE … WHERE version = ?`, S3 `If-Match`) already rejects a single lost
+  update *at the moment you write* — the bindings add the cross-agent layer on
+  top: a peer's commit marks your cached read **stale**, so your next
+  binding-mediated read or write is denied *before* you act on state that
+  already moved, and every substrate speaks the same typed conflict and the same
+  `reacquire()` recovery. Ships with: the **Coherence Manifest**
+  (allowlist-of-forms secret handling, resolved-address SSRF deny, tier
+  visibility), **capability tiers** with a never-ship-a-store floor,
+  coordinator-mediated cross-agent wiring (pull invalidation, two-part commit,
+  divergence detection), offline demos (`examples/coherent_row`,
+  `examples/coherent_object` — run `--baseline` first to watch the unguarded
+  clobber), and a tier-honesty conformance kit. Install via the new extras:
+  `pip install "agent-coherence[coherent-row]"` / `"agent-coherence[coherent-object]"`.
+  Docs: [`docs/usage/byo-substrate.md`](docs/usage/byo-substrate.md), README
+  § BYO substrate, guide API reference. Single-host scope unchanged.
+
+- **Subagent identity (Claude Code adapter) — subagents as first-class
+  coherence peers.** A Claude Code subagent's hook payload carries the parent
+  `session_id` plus a distinct `agent_id`; folding both into the identity
+  derivation gives each subagent its own coherence identity — correct
+  `last_writer` attribution and sibling-collision detection, instead of every
+  subagent blending into the parent session. With no `agent_id` the derivation
+  is byte-identical to before, so main-thread behavior is unchanged. A new
+  `subagent-stop` hook-client subcommand maps Claude Code's `SubagentStop`
+  event to a scoped release of just that subagent's grants (`agent_id`
+  required — absent it skips rather than stripping the parent's grants
+  mid-session). The identity fold is mirrored byte-for-byte by the Node
+  backend; parity is pinned by new protocol-corpus fixtures
+  (sibling collision, attribution, scoped release).
+
+- **Three lead-use-case demos** — runnable, offline, exit-0-gated:
+  `examples/rag_stale_memory` (an agent caches a memory record, a peer appends
+  a fact, the agent's stale write-back erases it — `broken.py` loses the
+  update; `fixed.py` denies the stale write, reacquires, re-applies, and both
+  facts survive), `examples/ci_merge_gate` (three clean PRs, three green CI
+  runs, one broken product: a merge validated against a base SHA a peer
+  already moved; `gate()` holds the merge and re-fires on the fresh base), and
+  `examples/gate_effect_ordering` (a deploy planned from a base that moved
+  before it fired; `gate()` holds and re-plans).
+
+- **MCP Registry publish workflow (`.github/workflows/publish-mcp.yml`).**
+  Publishes `server.json` to the Official MCP Registry via GitHub OIDC —
+  repository identity, which is what grants the org namespace; the interactive
+  `mcp-publisher login github` device flow cannot see org membership and only
+  grants a personal namespace. Runs on `release: published` (after the PyPI
+  job, so the package is live before the registry validates it) with a
+  `workflow_dispatch` manual path, and syncs the manifest version from the
+  release tag.
 
 - **CCSStore read-side demo — `examples/ccsstore_read_side/`.** A three-act,
   offline, deterministic demo that makes the read/write split legible: Act 1
