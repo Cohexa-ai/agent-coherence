@@ -22,6 +22,14 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **MCP Registry namespace casing — `server.json` and the PyPI ownership tag.**
+  Both used `io.github.cohexa-ai/…`, but the registry derives the namespace from
+  GitHub's canonical organization name and grants `io.github.Cohexa-ai/*`, so
+  publishing was rejected with a 403. Both now read
+  `io.github.Cohexa-ai/stale-write-guard-fs`. The `mcp-name:` tag is matched
+  case-sensitively against the README of the *published* PyPI package, so the
+  corrected tag only takes effect for releases from this one onward.
+
 - **Guide examples table: two broken commands.** `examples.divergent_memory`
   and `examples.shared_knowledge_base` ship `demo.py`, not `main.py`; the
   documented `python -m examples.<name>.main` commands failed. Corrected to
