@@ -1,0 +1,54 @@
+# Publishes server.json to the Official MCP Registry (registry.modelcontextprotocol.io).
+#
+# Auth is GitHub OIDC rather than `mcp-publisher login github`. OIDC proves THIS
+# repository's identity, which is what grants the `io.github.cohexa-ai/*`
+# namespace. The device flow cannot: it authenticates a user through the
+# registry's GitHub App, which has no visibility into org membership, so it only
+# ever grants the personal namespace — regardless of org role or membership
+# visibility. See https://github.com/modelcontextprotocol/registry/issues/398
+name: publish-mcp-registry
+
+on:
+  # release.yml runs preflight -> build -> publish-to-PyPI -> github-release, so
+  # a published release means the version is already on PyPI. The registry
+  # validates the package (and its `mcp-name` marker) before accepting, so
+  # triggering any earlier — e.g. on the tag push — would race that publish.
+  release:
+    types: [published]
+  # Publish the currently committed server.json without cutting a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish server.json to the MCP Registry
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mints the OIDC token the registry authenticates with
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # The registry refuses a version it already holds, so the manifest has to
+      # track the release being published rather than whatever was last
+      # committed. Both fields matter: the server version and the pypi one.
+      - name: Sync server.json version to the release tag
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          jq --arg v "$version" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the registry via OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
