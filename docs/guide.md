@@ -632,6 +632,18 @@ re-materialize (don't retry the publish — it would version-mismatch). Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 
+**Volume-mediated writers only.** The staleness `atomic_publish` detects is
+*version* drift, and only writes routed through a volume advance versions. An edit
+that bypasses the volume — a human in an editor, a formatter, a script writing a
+member directly — advances nothing, so a multi-file publish cannot see it: the
+batch still commits and the out-of-band edit is silently overwritten. (A
+single-file publish takes the direct CAS path, whose content-checked comparand
+read fails closed on such an edit, as does plain `write()` — see
+[Foreign-edit guards](#foreign-edit-guards).) Use `atomic_publish` only for file
+sets whose every contending writer goes through a volume; for files that humans
+or out-of-band tools also edit, use `write()` — its foreign-edit guard covers
+exactly that case.
+
 ### Foreign-edit guards
 
 Files also change *outside* the fleet — a human edit, a formatter, a regenerating
@@ -653,6 +665,12 @@ These guards are **content-hash checks at the volume boundary** — best-effort
 point-in-time detection, not filesystem interception. An edit that bypasses the
 volume is caught at the *next* volume read or write of that file, not blocked as
 it happens.
+
+They cover `read()` and `write()`. The CAS paths check *versions* instead:
+`write_cas` / `write_cas_at` still fail closed on a foreign edit (their
+content-checked comparand read wedges rather than clobbering), but a multi-file
+`atomic_publish` **does not check disk content at all** — see the scope note in
+[Atomic multi-file publish](#atomic-multi-file-publish-atomic_publish-v0120).
 
 ### The `open()` shim (demo-grade)
 
