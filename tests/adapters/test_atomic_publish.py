@@ -22,6 +22,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     PublishMaterializationError,
     StaleView,
+    ViewWedged,
 )
 
 
@@ -365,5 +366,76 @@ def test_corruption_reason_is_non_retryable_not_staleview(
         # Nothing written on disk.
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# Foreign-edit boundary (SB-18 × SB-23) — pinned, deliberately asymmetric
+# ----------------------------------------------------------------------
+#
+# atomic_publish is VERSION-OCC against the coordinator, and only volume-mediated
+# writes advance versions. The multi-member session path never re-reads disk
+# between the caller's read and materialization, so an out-of-band edit in that
+# window cannot version-mismatch and is NOT content-checked — the SB-23 predicate
+# (_check_foreign_edit) does not run there, even though _read_with_version seeds
+# its baseline. This is the DOCUMENTED boundary (the API is for volume-mediated
+# writer sets only — see the docstring's foreign-edit paragraph and the guide's
+# scope note), not an accident. These tests pin both publish surfaces so any
+# change to the boundary is a deliberate, test-flipping decision; write()'s and
+# write_cas's fail-closed contrast is pinned in test_coherent_volume.py
+# (test_write_denies_foreign_edit_by_default,
+# test_write_cas_on_foreign_edit_wedges_not_stale_view).
+
+
+def test_multi_publish_overwrites_foreign_edit_documented_boundary(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """An out-of-band disk edit between read_with_version and a MULTI-member
+    publish advances no version, so the batch commits and overwrites it — the
+    seeded SB-23 baseline is not consulted on this path. Flipping this behavior
+    means flipping this test WITH the docstring/guide/README scope notes."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _, version_a = vol.read_with_version("data/a.txt")
+        _, version_b = vol.read_with_version("data/b.txt")  # seeds the baseline
+        # Straight to disk: no volume, no version advance — a hand edit.
+        (tmp_path / "data/b.txt").write_bytes(b"b-FOREIGN")
+
+        versions = vol.atomic_publish(
+            [("data/a.txt", version_a, b"a-v2"), ("data/b.txt", version_b, b"b-v2")]
+        )
+
+        assert versions == {
+            "data/a.txt": version_a + 1,
+            "data/b.txt": version_b + 1,
+        }
+        # The foreign bytes are gone — the documented cost of the version-OCC
+        # boundary on the session path.
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_single_publish_fails_closed_on_foreign_edit(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The SAME edit against a SINGLE-member publish fails closed: the standalone
+    CAS path's comparand read is hash-checked under a re-minted identity, so the
+    foreign bytes deny the read and the publish wedges instead of clobbering.
+    Pins the intra-API asymmetry the boundary comment above documents."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _, version_a = vol.read_with_version("data/a.txt")
+        (tmp_path / "data/a.txt").write_bytes(b"a-FOREIGN")
+
+        with pytest.raises(ViewWedged):
+            vol.atomic_publish([("data/a.txt", version_a, b"a-v2")])
+
+        # Fail-closed: the foreign edit survives, nothing was published.
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-FOREIGN"
     finally:
         stop_coordinator(tmp_path)
