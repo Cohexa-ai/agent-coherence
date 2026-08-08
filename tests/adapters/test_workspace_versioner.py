@@ -38,13 +38,29 @@ from ccs.adapters.coherent_object import CoherentObject
 from ccs.adapters.workspace import (
     BINARY_FILE_MEMBER_REASON,
     CHECKPOINT_NOT_PERSISTED_REASON,
+    MAX_RESTORE_LEG_REDRIVES,
     BinaryFileMemberRefused,
     CheckpointPersistFailed,
     WorkspaceVersioner,
 )
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
-from ccs.core.exceptions import WatchdogAbandoned
+from ccs.core.exceptions import (
+    CHECKPOINT_UNKNOWN_REASON,
+    RESTORE_OUTCOME_CONFLICT,
+    RESTORE_OUTCOME_CONVERGED,
+    RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
+    RESTORE_OUTCOME_HELD_UNCONFIRMED,
+    RESTORE_OUTCOME_RESTORED,
+    RESTORE_OUTCOME_TARGET_LOST,
+    RESTORE_STATUS_CONCLUDED,
+    RESTORE_STATUS_IN_PROGRESS,
+    RESTORE_STATUS_NONE,
+    CasVersionConflict,
+    CheckpointUnknown,
+    CommitUnconfirmed,
+    WatchdogAbandoned,
+)
 from ccs.core.substrate import sha256_hex
 from ccs.testing.s3_local import LocalS3Client
 
@@ -141,9 +157,14 @@ def service(registry: ArtifactRegistry) -> CoordinatorService:
     return CoordinatorService(registry)
 
 
-def _versioner(service: Any, clock: Any | None = None) -> WorkspaceVersioner:
+def _versioner(
+    service: Any, clock: Any | None = None, resolver: Any | None = None
+) -> WorkspaceVersioner:
     return WorkspaceVersioner(
-        service=service, owner=OWNER, clock=clock if clock is not None else _TickClock()
+        service=service,
+        owner=OWNER,
+        clock=clock if clock is not None else _TickClock(),
+        file_resolver=resolver,
     )
 
 
@@ -652,3 +673,679 @@ def test_route_checkpoint_boundary_validation(client) -> None:
     # Nothing persisted by any of the rejects.
     status, listing = client("GET", "/workspace/checkpoints")
     assert status == 200 and listing["checkpoints"] == []
+
+
+# ===========================================================================
+# Restore — WV plan Unit 4 (R3): per-member conditional legs under the
+# TERMINATION CONTRACT (bounded re-drive, absorbing outcomes, complete
+# per-member terminal report, crash-resume from durable state).
+# ===========================================================================
+
+
+class _FakeFileStore:
+    """State-based file member store speaking the full FileRestoreTarget
+    surface (``read_with_version`` + ``write_cas_at``), with schedulable
+    foreign-edit interleaves.
+
+    ``write_cas_at`` mirrors ``CoherentVolume``'s contract: commit iff the
+    current version equals ``expected_version`` (else the typed
+    ``CasVersionConflict``), new version = expected + 1 — DETECTION-guarded,
+    no arbiter. A scheduled foreign edit lands immediately AFTER a read
+    returns, so the returned (bytes, version) pair is already stale by CAS
+    time — the file half of the delay-injection harness.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict[str, tuple[bytes, int]] = {}
+        self._foreign_after_read: dict[str, list[bytes]] = {}
+        self.cas_calls: dict[str, int] = {}
+
+    def put(self, path: str, data: bytes, version: int) -> None:
+        self._state[path] = (bytes(data), version)
+
+    def remove(self, path: str) -> None:
+        self._state.pop(path, None)
+
+    def state(self, path: str) -> tuple[bytes, int]:
+        return self._state[path]
+
+    def schedule_foreign_edit_after_read(self, path: str, *bodies: bytes) -> None:
+        self._foreign_after_read.setdefault(path, []).extend(bodies)
+
+    def read_with_version(self, path: str) -> tuple[bytes, int]:
+        if path not in self._state:
+            raise FileNotFoundError(f"no such file in workspace: {path}")
+        data, version = self._state[path]
+        queue = self._foreign_after_read.get(path)
+        if queue:
+            foreign = queue.pop(0)
+            self._state[path] = (bytes(foreign), version + 1)
+        return data, version
+
+    def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+        self.cas_calls[path] = self.cas_calls.get(path, 0) + 1
+        if path not in self._state:
+            raise CasVersionConflict(path, expected_version, 0)
+        _data, version = self._state[path]
+        if version != expected_version:
+            raise CasVersionConflict(path, expected_version, version)
+        self._state[path] = (bytes(new_content), version + 1)
+
+
+class _FakeResolver:
+    """FileContentResolver fake: an explicit (path, version) -> bytes history."""
+
+    def __init__(self) -> None:
+        self._history: dict[tuple[str, int], bytes] = {}
+
+    def keep(self, path: str, version: int, data: bytes) -> None:
+        self._history[(path, int(version))] = bytes(data)
+
+    def content_at(self, member_path: str, version: int) -> bytes:
+        try:
+            return self._history[(member_path, int(version))]
+        except KeyError:
+            raise KeyError(f"no retained version {version} for {member_path}") from None
+
+
+class _ForeignWriterOnLiveReads:
+    """The S3 half of the delay-injection harness (Unit-4 execution note).
+
+    Interleaves a foreign put between the engine's live comparand read and its
+    CAS put: the (bytes, ETag) the engine holds is already stale by CAS time.
+    Pinned (VersionId) reads are exempt — the pinned target is immutable
+    history. ``times=None`` = every live read (sustained contention);
+    an integer bounds the interleaves (a single race → one retry).
+    """
+
+    def __init__(
+        self, inner: LocalS3Client, bucket: str, key: str, *, times: int | None = None
+    ) -> None:
+        self._inner = inner
+        self._bucket = bucket
+        self._key = key
+        self._times = times
+        self.landed = 0
+
+    def get_object(self, **kwargs: Any) -> Any:
+        resp = self._inner.get_object(**kwargs)
+        if kwargs.get("Key") == self._key and kwargs.get("VersionId") is None:
+            if self._times is None or self.landed < self._times:
+                self.landed += 1
+                self._inner.put_object(
+                    Bucket=self._bucket,
+                    Key=self._key,
+                    Body=f"foreign-{self.landed}".encode(),
+                )
+        return resp
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _VanishOnCasPut:
+    """UNKNOWN-outcome harness: an If-Match put of ``key`` deletes the object
+    underneath, then dies transport-shaped (no S3 error code) — the put's
+    outcome is UNKNOWN and the reconciliation read finds the object gone
+    (HOLD), driving the ``held_unconfirmed`` terminal."""
+
+    def __init__(self, inner: LocalS3Client, bucket: str, key: str) -> None:
+        self._inner = inner
+        self._bucket = bucket
+        self._key = key
+
+    def put_object(self, **kwargs: Any) -> Any:
+        if kwargs.get("Key") == self._key and kwargs.get("IfMatch") is not None:
+            self._inner.delete_object(Bucket=self._bucket, Key=self._key)
+            raise ConnectionError("socket dropped mid-put")
+        return self._inner.put_object(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _CrashOnNthMemberRecord:
+    """Kill-after-N-members crash: forwards to the real service but raises on
+    the Nth durable member-progress write — a crash AFTER that member's leg
+    landed on the substrate and BEFORE its outcome record.
+
+    The CheckpointRestoreStore members are delegated EXPLICITLY (not via
+    ``__getattr__``): runtime-checkable Protocol isinstance uses static
+    attribute lookup on 3.12+, which a ``__getattr__`` fallthrough never
+    satisfies.
+    """
+
+    def __init__(self, inner: Any, fail_on_call: int) -> None:
+        self._inner = inner
+        self._fail_on = fail_on_call
+        self._calls = 0
+
+    def get_workspace_checkpoint(self, checkpoint_id: str) -> Any:
+        return self._inner.get_workspace_checkpoint(checkpoint_id)
+
+    def get_workspace_checkpoint_members(self, checkpoint_id: str) -> Any:
+        return self._inner.get_workspace_checkpoint_members(checkpoint_id)
+
+    def set_workspace_checkpoint_restore_status(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.set_workspace_checkpoint_restore_status(*args, **kwargs)
+
+    def set_workspace_checkpoint_member_restore(self, *args: Any, **kwargs: Any) -> Any:
+        self._calls += 1
+        if self._calls == self._fail_on:
+            raise RuntimeError("simulated crash (kill -9)")
+        return self._inner.set_workspace_checkpoint_member_restore(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+# ---------------------------------------------------------------------------
+# Happy full restore — create + modify + delete legs, all terminal outcomes
+# ---------------------------------------------------------------------------
+
+
+def test_happy_full_restore_all_terminal_outcomes(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"cfg-v1")
+    client.put_object(Bucket="demo", Key="gone.json", Body=b"keep-me")
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    files.put("notes/calm.md", b"calm", 5)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    versioner.add_file_member(files, "notes/calm.md")
+    versioner.add_object_member(obj, "cfg.json")
+    versioner.add_object_member(obj, "gone.json")
+    versioner.add_object_member(obj, "ghost.json")  # ABSENT at capture
+    versioner.add_forward_only_member("effects/notify")
+    cp = versioner.checkpoint("full")
+
+    # Post-capture divergence: a modify, a delete, a foreign create, a file edit.
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"cfg-v2")  # modify leg
+    client.delete_object(Bucket="demo", Key="gone.json")  # create leg (marker)
+    client.put_object(Bucket="demo", Key="ghost.json", Body=b"intruder")  # delete leg
+    files.put("notes/plan.md", b"edited", 9)  # file modify leg
+
+    report = versioner.restore(cp.record.checkpoint_id)
+
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    by_path = report.members_by_path
+    assert by_path["s3://cfg.json"].outcome == RESTORE_OUTCOME_RESTORED
+    assert by_path["s3://cfg.json"].new_native_token is not None
+    assert by_path["s3://gone.json"].outcome == RESTORE_OUTCOME_RESTORED
+    assert by_path["s3://ghost.json"].outcome == RESTORE_OUTCOME_RESTORED
+    assert by_path["s3://ghost.json"].deleted_at_restore is not None
+    assert by_path["notes/plan.md"].outcome == RESTORE_OUTCOME_RESTORED
+    assert by_path["notes/plan.md"].new_native_token == "10"  # 9 (live) + 1
+    assert by_path["notes/calm.md"].outcome == RESTORE_OUTCOME_CONVERGED
+    assert by_path["effects/notify"].outcome == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+
+    # The substrates hold the manifest state again.
+    data, _etag = obj.read("cfg.json")
+    assert data == b"cfg-v1"
+    data, _etag = obj.read("gone.json")
+    assert data == b"keep-me"
+    with pytest.raises(KeyError):
+        obj.read("ghost.json")  # deleted (marker-current)
+    assert files.state("notes/plan.md")[0] == b"plan text"
+
+    # Durably mirrored: outcomes on the member rows, concluded on the header.
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+    stored = {m.member_path: m for m in registry.get_checkpoint_members(cp.record.checkpoint_id)}
+    for path, outcome in by_path.items():
+        assert stored[path].restore_outcome == outcome.outcome
+
+
+# ---------------------------------------------------------------------------
+# Foreign-writer races (the delay-injection harness)
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_one_s3_member(
+    service: CoordinatorService, client: LocalS3Client, key: str, body: bytes
+) -> str:
+    obj = CoherentObject("demo", client=client)
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, key)
+    return versioner.checkpoint(f"cp-{key}").record.checkpoint_id
+
+
+def test_single_interleaved_foreign_write_retries_once_and_lands(
+    service: CoordinatorService,
+) -> None:
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    client.put_object(Bucket="demo", Key="raced.json", Body=b"original")
+    checkpoint_id = _checkpoint_one_s3_member(service, client, "raced.json", b"original")
+    # Diverge live so the leg must write, then interleave EXACTLY one foreign
+    # put between the engine's live read and its CAS.
+    client.put_object(Bucket="demo", Key="raced.json", Body=b"diverged")
+    racing = _ForeignWriterOnLiveReads(client, "demo", "raced.json", times=1)
+
+    restorer = _versioner(service)
+    restorer.add_object_member(CoherentObject("demo", client=racing), "raced.json")
+    report = restorer.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.attempts == 2  # attempt 1 lost the If-Match race; attempt 2 landed
+    data, _etag = CoherentObject("demo", client=client).read("raced.json")
+    assert data == b"original"
+
+
+def test_sustained_contention_exhausts_budget_into_conflict_no_livelock(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    client.put_object(Bucket="demo", Key="hot.json", Body=b"original")
+    client.put_object(Bucket="demo", Key="calm.json", Body=b"steady")
+
+    obj = CoherentObject("demo", client=client)
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "hot.json")
+    versioner.add_object_member(obj, "calm.json")
+    checkpoint_id = versioner.checkpoint("contended").record.checkpoint_id
+
+    client.put_object(Bucket="demo", Key="hot.json", Body=b"diverged")
+    racing = _ForeignWriterOnLiveReads(client, "demo", "hot.json", times=None)
+    put_count_before = len(client.put_calls)
+
+    restorer = _versioner(service)
+    restorer.add_object_member(CoherentObject("demo", client=racing), "hot.json")
+    restorer.add_object_member(CoherentObject("demo", client=racing), "calm.json")
+    report = restorer.restore(checkpoint_id)
+
+    by_path = report.members_by_path
+    hot = by_path["s3://hot.json"]
+    # Budget exhausted, absorbed as conflict — the restore still CONCLUDED and
+    # the report names the losing member; the healthy peer converged untouched.
+    assert hot.outcome == RESTORE_OUTCOME_CONFLICT
+    assert hot.attempts == MAX_RESTORE_LEG_REDRIVES + 1
+    assert by_path["s3://calm.json"].outcome == RESTORE_OUTCOME_CONVERGED
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+    # NO livelock: the engine issued exactly budget-many If-Match puts (the
+    # foreign writer's own unconditional puts ride the same log).
+    engine_cas_puts = [
+        c
+        for c in client.put_calls[put_count_before:]
+        if c["Key"] == "hot.json" and c["IfMatch"] is not None
+    ]
+    assert len(engine_cas_puts) == MAX_RESTORE_LEG_REDRIVES + 1
+
+
+def test_file_member_foreign_edit_detection_labeled_no_arbiter(
+    service: CoordinatorService,
+) -> None:
+    files = _FakeFileStore()
+    files.put("doc.md", b"captured", 3)
+    resolver = _FakeResolver()
+    resolver.keep("doc.md", 3, b"captured")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "doc.md")
+    checkpoint_id = versioner.checkpoint("file-race").record.checkpoint_id
+
+    files.put("doc.md", b"edited", 5)
+    # One foreign edit between the engine's read and its CAS: detection fires
+    # (typed CasVersionConflict), ONE retry lands.
+    files.schedule_foreign_edit_after_read("doc.md", b"foreign-edit")
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    report = restorer.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.attempts == 2
+    # The no-arbiter honesty label: a file outcome is DETECTION, never
+    # presented as substrate arbitration.
+    assert "no-arbiter" in member.detail
+    assert "detection" in member.detail.lower()
+    assert "never substrate arbitration" in member.detail
+    assert files.state("doc.md")[0] == b"captured"
+
+
+def test_file_member_sustained_foreign_edits_conflict_no_arbiter(
+    service: CoordinatorService,
+) -> None:
+    files = _FakeFileStore()
+    files.put("doc.md", b"captured", 3)
+    resolver = _FakeResolver()
+    resolver.keep("doc.md", 3, b"captured")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "doc.md")
+    checkpoint_id = versioner.checkpoint("file-storm").record.checkpoint_id
+
+    files.put("doc.md", b"edited", 5)
+    # More foreign edits than the budget: every CAS detects a moved version.
+    files.schedule_foreign_edit_after_read(
+        "doc.md", *[f"foreign-{i}".encode() for i in range(2 * MAX_RESTORE_LEG_REDRIVES)]
+    )
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    report = restorer.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_CONFLICT
+    assert member.attempts == MAX_RESTORE_LEG_REDRIVES + 1
+    assert "no-arbiter" in member.detail
+    assert files.cas_calls["doc.md"] == MAX_RESTORE_LEG_REDRIVES + 1  # bounded, no livelock
+
+
+# ---------------------------------------------------------------------------
+# Crash-resume (durable progress; no double-apply)
+# ---------------------------------------------------------------------------
+
+
+def test_crash_mid_restore_fresh_engine_resumes_without_double_apply(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    for key in ("a.json", "b.json", "c.json"):
+        client.put_object(Bucket="demo", Key=key, Body=f"{key}-v1".encode())
+
+    obj = CoherentObject("demo", client=client)
+    versioner = _versioner(service)
+    for key in ("a.json", "b.json", "c.json"):
+        versioner.add_object_member(obj, key)
+    checkpoint_id = versioner.checkpoint("crashy").record.checkpoint_id
+
+    for key in ("a.json", "b.json", "c.json"):
+        client.put_object(Bucket="demo", Key=key, Body=f"{key}-diverged".encode())
+
+    # Crash on the SECOND member's durable outcome write: member a concluded
+    # durably; member b's substrate write LANDED but its record did not.
+    crashing = _CrashOnNthMemberRecord(service, fail_on_call=2)
+    crashed = _versioner(crashing)
+    for key in ("a.json", "b.json", "c.json"):
+        crashed.add_object_member(obj, key)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        crashed.restore(checkpoint_id)
+
+    # Mid-crash durable state: in_progress, member a terminal, b/c pending.
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_IN_PROGRESS
+    stored = {m.member_path: m for m in registry.get_checkpoint_members(checkpoint_id)}
+    assert stored["s3://a.json"].restore_outcome == RESTORE_OUTCOME_RESTORED
+    assert stored["s3://b.json"].restore_outcome is None
+    assert stored["s3://c.json"].restore_outcome is None
+
+    puts_before_resume = [c["Key"] for c in client.put_calls]
+
+    # A FRESH engine resumes from durable state alone.
+    resumed = _versioner(service)
+    for key in ("a.json", "b.json", "c.json"):
+        resumed.add_object_member(obj, key)
+    report = resumed.restore(checkpoint_id)
+
+    by_path = report.members_by_path
+    assert by_path["s3://a.json"].resumed_from_prior_run is True
+    assert by_path["s3://a.json"].outcome == RESTORE_OUTCOME_RESTORED
+    # Member b's pre-crash write already landed: token identity concludes it
+    # CONVERGED with NO second write (no double-apply).
+    assert by_path["s3://b.json"].outcome == RESTORE_OUTCOME_CONVERGED
+    assert by_path["s3://c.json"].outcome == RESTORE_OUTCOME_RESTORED
+    puts_after_resume = [c["Key"] for c in client.put_calls[len(puts_before_resume):]]
+    assert "a.json" not in puts_after_resume  # skipped, not re-driven
+    assert "b.json" not in puts_after_resume  # converged, not re-applied
+    assert puts_after_resume.count("c.json") == 1
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+    # Every substrate holds the manifest bytes exactly once.
+    for key in ("a.json", "b.json", "c.json"):
+        data, _etag = obj.read(key)
+        assert data == f"{key}-v1".encode()
+
+
+def test_concluded_checkpoint_restore_is_idempotent_report_only(
+    service: CoordinatorService,
+) -> None:
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    checkpoint_id = versioner.checkpoint("twice").record.checkpoint_id
+
+    first = versioner.restore(checkpoint_id)
+    puts_after_first = len(client.put_calls)
+    second = versioner.restore(checkpoint_id)
+
+    assert first.status == second.status == RESTORE_STATUS_CONCLUDED
+    assert [m.outcome for m in second.members] == [m.outcome for m in first.members]
+    assert all(m.resumed_from_prior_run for m in second.members)
+    assert len(client.put_calls) == puts_after_first  # nothing re-driven
+
+
+# ---------------------------------------------------------------------------
+# Absorbing outcomes: expired pin, forward-only, degenerate shapes
+# ---------------------------------------------------------------------------
+
+
+def test_expired_pin_yields_target_lost_and_restore_concludes(
+    service: CoordinatorService,
+) -> None:
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    checkpoint_id = versioner.checkpoint("pinned").record.checkpoint_id
+
+    # A live writer makes the captured version noncurrent; a lifecycle rule
+    # then expires it (no legal hold established — Unit 6): the pin is gone.
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired and not held
+
+    report = versioner.restore(checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_TARGET_LOST
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    data, _etag = obj.read("cfg.json")
+    assert data == b"v2"  # the live state was never touched
+
+
+def test_forward_only_and_unversioned_members_skipped_and_enumerated(
+    service: CoordinatorService,
+) -> None:
+    client, obj = _s3(versioned=False)
+    client.put_object(Bucket="demo", Key="plain.txt", Body=b"unversioned")
+    files = _FakeFileStore()
+    files.put("a.txt", b"a", 1)
+    resolver = _FakeResolver()
+    resolver.keep("a.txt", 1, b"a")
+
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "a.txt")
+    versioner.add_object_member(obj, "plain.txt")  # tiered forward_only (no pointer)
+    versioner.add_forward_only_member("effects/send-email")
+    checkpoint_id = versioner.checkpoint("skips").record.checkpoint_id
+
+    report = versioner.restore(checkpoint_id)
+    by_path = report.members_by_path
+    # BOTH forward-only shapes are enumerated in the report, never silent:
+    # the declared action surface AND the unversioned-S3 capture refusal.
+    assert by_path["effects/send-email"].outcome == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+    assert by_path["s3://plain.txt"].outcome == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+    assert by_path["a.txt"].outcome == RESTORE_OUTCOME_CONVERGED
+    assert report.status == RESTORE_STATUS_CONCLUDED
+
+
+def test_all_absent_degenerate_shape_concludes_cleanly(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """Every member ABSENT at capture and still absent live: nothing to write,
+    nothing to delete — all converged, the restore concludes (no registration
+    exists in this unit, so conclusion == status update + report)."""
+    _client, obj = _s3()
+    files = _FakeFileStore()  # nothing stored -> FileNotFoundError
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "gone.md")
+    versioner.add_object_member(obj, "gone.json")
+    checkpoint_id = versioner.checkpoint("all-absent").record.checkpoint_id
+
+    report = versioner.restore(checkpoint_id)
+    assert {m.outcome for m in report.members} == {RESTORE_OUTCOME_CONVERGED}
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+
+
+def test_absent_manifest_file_present_live_is_labeled_conflict(
+    service: CoordinatorService,
+) -> None:
+    """The v1 residual: a live file the manifest records ABSENT cannot be
+    deleted through the file seam — absorbed as conflict, labeled no-arbiter,
+    and the restore still concludes."""
+    files = _FakeFileStore()  # absent at capture
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "late.md")
+    checkpoint_id = versioner.checkpoint("late-file").record.checkpoint_id
+
+    files.put("late.md", b"appeared later", 2)
+    report = versioner.restore(checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_CONFLICT
+    assert "no-arbiter" in member.detail
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert files.state("late.md")[0] == b"appeared later"  # never touched
+
+
+# ---------------------------------------------------------------------------
+# HOLD terminals (UNCONFIRMED — never best-effort)
+# ---------------------------------------------------------------------------
+
+
+def test_s3_unknown_write_outcome_reconciles_to_held_unconfirmed(
+    service: CoordinatorService,
+) -> None:
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    client.put_object(Bucket="demo", Key="flaky.json", Body=b"original")
+    checkpoint_id = _checkpoint_one_s3_member(service, client, "flaky.json", b"original")
+
+    client.put_object(Bucket="demo", Key="flaky.json", Body=b"diverged")
+    vanishing = _VanishOnCasPut(client, "demo", "flaky.json")
+    restorer = _versioner(service)
+    restorer.add_object_member(CoherentObject("demo", client=vanishing), "flaky.json")
+    report = restorer.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_HELD_UNCONFIRMED
+    assert "HELD" in member.detail and "best-effort" in member.detail
+    assert report.status == RESTORE_STATUS_CONCLUDED
+
+
+def test_file_commit_unconfirmed_is_held(service: CoordinatorService) -> None:
+    class _UnconfirmedStore(_FakeFileStore):
+        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+            raise CommitUnconfirmed("transport failed mid-commit")
+
+    files = _UnconfirmedStore()
+    files.put("doc.md", b"captured", 3)
+    resolver = _FakeResolver()
+    resolver.keep("doc.md", 3, b"captured")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "doc.md")
+    checkpoint_id = versioner.checkpoint("unconfirmed").record.checkpoint_id
+
+    files.put("doc.md", b"edited", 5)
+    report = versioner.restore(checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_HELD_UNCONFIRMED
+    assert report.status == RESTORE_STATUS_CONCLUDED
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight refusals (typed; nothing started)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_checkpoint_typed_preflight_refusal(service: CoordinatorService) -> None:
+    versioner = _versioner(service)
+    with pytest.raises(CheckpointUnknown) as excinfo:
+        versioner.restore("no-such-checkpoint")
+    assert excinfo.value.reason is CHECKPOINT_UNKNOWN_REASON
+    assert excinfo.value.checkpoint_id == "no-such-checkpoint"
+
+
+def test_capture_only_service_refused_before_any_state(
+    service: CoordinatorService,
+) -> None:
+    files = _FakeFileStore()
+    files.put("a.txt", b"a", 1)
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "a.txt")
+    checkpoint_id = versioner.checkpoint("cap-only").record.checkpoint_id
+
+    # A capture-only seam (create_workspace_checkpoint only) cannot record a
+    # crash-resumable restore: refused with TypeError, before any progress.
+    crippled = WorkspaceVersioner(service=_DownService(), owner=OWNER)
+    crippled.add_file_member(files, "a.txt")
+    with pytest.raises(TypeError, match="CheckpointRestoreStore"):
+        crippled.restore(checkpoint_id)
+
+
+def test_preflight_missing_binding_and_resolver_fail_before_status(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    files = _FakeFileStore()
+    files.put("doc.md", b"body", 2)
+    resolver = _FakeResolver()
+    resolver.keep("doc.md", 2, b"body")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "doc.md")
+    checkpoint_id = versioner.checkpoint("preflight").record.checkpoint_id
+
+    # Fresh engine with NO member bindings declared.
+    bare = _versioner(service, resolver=resolver)
+    with pytest.raises(ValueError, match="no declared file/object member binding"):
+        bare.restore(checkpoint_id)
+
+    # Bindings declared but no resolver for an actionable file member.
+    no_resolver = _versioner(service)
+    no_resolver.add_file_member(files, "doc.md")
+    with pytest.raises(ValueError, match="FileContentResolver"):
+        no_resolver.restore(checkpoint_id)
+
+    # Nothing was started: the checkpoint never left status "none".
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_NONE
+
+
+# ---------------------------------------------------------------------------
+# Service-level restore vocabulary (closed sets, fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def test_service_restore_vocabulary_fails_closed(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    files = _FakeFileStore()
+    files.put("a.txt", b"a", 1)
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "a.txt")
+    checkpoint_id = versioner.checkpoint("vocab").record.checkpoint_id
+
+    with pytest.raises(ValueError, match="unknown restore status"):
+        service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "magic", updated_at=1.0
+        )
+    with pytest.raises(ValueError, match="unknown restore outcome"):
+        service.set_workspace_checkpoint_member_restore(
+            checkpoint_id, "a.txt", restore_outcome="magic"
+        )
+    # Nothing landed from either reject.
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_NONE
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None

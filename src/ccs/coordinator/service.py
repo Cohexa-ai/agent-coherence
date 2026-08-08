@@ -24,6 +24,8 @@ from ccs.core.exceptions import (
     FUTURE_VERSION_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_STATUSES,
     RETENTION_OFF_REASON,
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
     SESSION_CAP_EXCEEDED_REASON,
@@ -2360,6 +2362,91 @@ class CoordinatorService:
         with self.registry.abort_guard(abort):
             self.registry.create_checkpoint(record, member_rows)
         return record
+
+    def get_workspace_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """The checkpoint header (durable), or ``None`` when unknown.
+
+        The restore engine's pre-flight read (WV plan Unit 4 / R3): ``None``
+        maps to its typed ``CheckpointUnknown`` refusal — the service never
+        raises for an unknown id on the read side (the header getter tells
+        known from unknown; the member getter below returns ``[]`` either way).
+        """
+        return self.registry.get_checkpoint(checkpoint_id)
+
+    def get_workspace_checkpoint_members(
+        self, checkpoint_id: str
+    ) -> "list[CheckpointMember]":
+        """The manifest's member rows (durable), ordered by ``member_path``.
+
+        THE restore engine's member source (WV plan Unit 4 / R3): legs are
+        driven from these durable rows — never from an in-memory capture
+        return — so a fresh engine can resume a crashed restore from exactly
+        the state the registry holds. Empty list for an unknown checkpoint.
+        """
+        return self.registry.get_checkpoint_members(checkpoint_id)
+
+    def set_workspace_checkpoint_restore_status(
+        self,
+        checkpoint_id: str,
+        status: str,
+        *,
+        updated_at: float,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Update the checkpoint-level restore status (durable, crash-visible).
+
+        The vocabulary is the SERVICE layer's (the registry stores the string):
+        only :data:`~ccs.core.exceptions.RESTORE_STATUSES` pass — an unknown
+        status is a caller bug and fails closed BEFORE any write (a misspelled
+        status would silently orphan a crash-resume that matches by identity).
+        ``abort`` threads into :meth:`registry.abort_guard` (the A6 lesson:
+        every mutating path threads it). Raises ``KeyError`` for an unknown
+        checkpoint.
+        """
+        if status not in RESTORE_STATUSES:
+            raise ValueError(
+                f"unknown restore status {status!r}: the closed vocabulary is "
+                f"{sorted(RESTORE_STATUSES)} (fail-closed — an unknown status "
+                "would orphan crash-resume, which matches by identity)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_restore_status(
+                checkpoint_id, status, updated_at=updated_at
+            )
+
+    def set_workspace_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Record one member's durable restore progress (both columns written).
+
+        ``restore_outcome`` must be one of the closed
+        :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (or ``None`` — the
+        explicit reset a new run may write); anything else fails closed BEFORE
+        the write, because crash-resume decides skip-vs-redrive by matching
+        this value against the closed set — an unvetted string would make a
+        non-terminal member look terminal. ``abort`` threads into
+        :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
+        (checkpoint, member) pair.
+        """
+        if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
+            raise ValueError(
+                f"unknown restore outcome {restore_outcome!r}: the closed "
+                f"vocabulary is {sorted(RESTORE_MEMBER_OUTCOMES)} (fail-closed "
+                "— crash-resume classifies terminality by identity against it)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_member_restore(
+                checkpoint_id,
+                member_path,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=deleted_at_restore,
+            )
 
     def invalidate(
         self,

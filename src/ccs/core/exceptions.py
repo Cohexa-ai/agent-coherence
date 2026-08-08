@@ -740,6 +740,95 @@ class SubstrateInsecureTransport(ManifestError):
         self.posture = posture
 
 
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore vocabulary (WV plan Unit 4 / R3)
+# ---------------------------------------------------------------------------
+#
+# The restore engine (``ccs.adapters.workspace.WorkspaceVersioner.restore``)
+# concludes with a per-member TERMINAL outcome for EVERY manifest member — the
+# termination contract: bounded re-drive, absorbing outcomes, a complete typed
+# report. Each outcome below is a wire-stable constant matched by IDENTITY
+# (add, never rename); modality is part of the contract:
+#
+# - success  — ``restored`` (the leg landed the pinned state) /
+#   ``converged`` (the live state already matched the manifest, so NO write was
+#   issued — authorship is never claimed, mirroring ReconcileVerdict.CONVERGE);
+# - absorbing — ``conflict`` (live-writer contention absorbed the bounded
+#   re-drive budget, or a divergence the leg cannot converge), ``target_lost``
+#   (the manifested restore pointer no longer resolves — expired/raced pin),
+#   ``forward_only_skipped`` (nothing to restore; enumerated, never silent);
+# - hold — ``held_unconfirmed`` (a write's outcome stayed UNKNOWN after the
+#   binding's reconciliation read: HOLD, never best-effort — coordinator state
+#   must never advance on it).
+#
+# Every outcome is terminal: a restore never leaves a member outcome-less once
+# it concludes, and a crash-resumed run skips members already terminal.
+RESTORE_OUTCOME_RESTORED = "restored"
+RESTORE_OUTCOME_CONVERGED = "converged"
+RESTORE_OUTCOME_CONFLICT = "conflict"
+RESTORE_OUTCOME_HELD_UNCONFIRMED = "held_unconfirmed"
+RESTORE_OUTCOME_TARGET_LOST = "target_lost"
+RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED = "forward_only_skipped"
+
+# The modality split, machine-usable (the report and Unit-5 registration branch
+# on these): success outcomes may carry a freshly minted pointer; absorbing and
+# hold outcomes never do.
+RESTORE_SUCCESS_OUTCOMES: frozenset[str] = frozenset(
+    {RESTORE_OUTCOME_RESTORED, RESTORE_OUTCOME_CONVERGED}
+)
+RESTORE_ABSORBING_OUTCOMES: frozenset[str] = frozenset(
+    {
+        RESTORE_OUTCOME_CONFLICT,
+        RESTORE_OUTCOME_TARGET_LOST,
+        RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
+    }
+)
+RESTORE_HOLD_OUTCOMES: frozenset[str] = frozenset({RESTORE_OUTCOME_HELD_UNCONFIRMED})
+
+# The closed set of member terminal outcomes. Consumers match membership /
+# ``outcome == CONSTANT`` — never a substring of any human detail line.
+RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
+    RESTORE_SUCCESS_OUTCOMES | RESTORE_ABSORBING_OUTCOMES | RESTORE_HOLD_OUTCOMES
+)
+
+# Checkpoint-level restore status (the ``CheckpointRecord.restore_status``
+# vocabulary — the registry stores the string, THIS is its meaning). Kept
+# deliberately small: ``none`` (never restored) → ``in_progress`` (a restore
+# run is driving legs; a checkpoint FOUND in this state by a fresh engine is a
+# crashed run and is RESUMED, never refused) → ``concluded`` (every member
+# holds a terminal outcome; the report is reconstructible from durable rows).
+RESTORE_STATUS_NONE = "none"
+RESTORE_STATUS_IN_PROGRESS = "in_progress"
+RESTORE_STATUS_CONCLUDED = "concluded"
+RESTORE_STATUSES: frozenset[str] = frozenset(
+    {RESTORE_STATUS_NONE, RESTORE_STATUS_IN_PROGRESS, RESTORE_STATUS_CONCLUDED}
+)
+
+# Pre-flight restore refusal: the checkpoint id names no persisted manifest.
+# The ONLY typed restore exception — a restore that starts always CONCLUDES
+# with a report (failures are per-member absorbing outcomes, never raises).
+CHECKPOINT_UNKNOWN_REASON = "checkpoint_unknown"
+
+
+class CheckpointUnknown(CoherenceError):
+    """``restore(checkpoint_id)`` pre-flight refusal: no such checkpoint.
+
+    Raised BEFORE any status/progress write — an unknown id must never mint an
+    ``in_progress`` record. Carries :data:`CHECKPOINT_UNKNOWN_REASON`, matched
+    by identity (the typed-signal-not-substring house rule), plus the offending
+    ``checkpoint_id``.
+    """
+
+    reason = CHECKPOINT_UNKNOWN_REASON
+
+    def __init__(self, checkpoint_id: str) -> None:
+        super().__init__(
+            f"checkpoint {checkpoint_id!r} is unknown: no persisted manifest — "
+            "nothing was restored (list checkpoints and retry with a known id)"
+        )
+        self.checkpoint_id = checkpoint_id
+
+
 class WatchdogAbandoned(RuntimeError):
     """A handler's 4s watchdog fired, so its still-running work was told to abort
     before it could mutate the registry (finding A6).
