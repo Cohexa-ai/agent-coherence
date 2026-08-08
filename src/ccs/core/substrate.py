@@ -59,6 +59,60 @@ class Tier(Enum):
     FORWARD_ONLY = "forward_only"
 
 
+class RestoreTier(Enum):
+    """Honest per-member RESTORE capability a Workspace-Versioning member declares.
+
+    A second, ADDITIVE axis on the :class:`CapabilityDescriptor` — it extends the
+    shipped :class:`Tier` vocabulary, it never replaces it (Tier speaks to write
+    arbitration; RestoreTier speaks to whether a captured state can be brought
+    back). Values are wire-stable constants matched by identity; add, never
+    rename.
+
+    - ``RESTORABLE`` — the substrate retains the captured version under a pin
+      (e.g. an S3 versioned bucket with a legal hold on the pinned version), so
+      a later restore read is guaranteed servable.
+    - ``RESTORABLE_UNPINNED`` — the substrate retains history (versioning is
+      on) but the captured version could NOT be pinned, so a lifecycle rule or
+      an operator delete may silently expire it before restore. Honest
+      downgrade, never silently presented as ``RESTORABLE``.
+    - ``FORWARD_ONLY`` — the substrate keeps no history for this member (an
+      unversioned bucket, an action/effect): the checkpoint can only describe
+      it, a restore must skip it and say so.
+    """
+
+    RESTORABLE = "restorable"
+    RESTORABLE_UNPINNED = "restorable-unpinned"
+    FORWARD_ONLY = "forward_only"
+
+
+class ArbitrationTier(Enum):
+    """Who arbitrates a FOREIGN writer racing a restore leg on this member.
+
+    - ``NATIVE_CAS`` — the substrate itself arbitrates: the restore leg is a
+      conditional write keyed on a substrate-minted token, so a foreign writer
+      that moved the token wins and the leg surfaces a typed conflict.
+    - ``NO_ARBITER`` — no substrate arbitration exists (a plain file member):
+      the binding can only DETECT a foreign edit adapter-locally; the outcome
+      must be labeled detection, never presented as substrate arbitration.
+    """
+
+    NATIVE_CAS = "native-cas"
+    NO_ARBITER = "no-arbiter"
+
+
+def derive_restore_tier(*, versioned: bool, pinnable: bool) -> RestoreTier:
+    """The honest :class:`RestoreTier` for one member, from what capture observed.
+
+    ONE derivation rule shared by every binding so capture-time tiering cannot
+    drift: no versioning → ``FORWARD_ONLY`` (never ``restorable``, the
+    fail-closed floor); versioning without a pin → ``RESTORABLE_UNPINNED``;
+    versioning with an established pin → ``RESTORABLE``.
+    """
+    if not versioned:
+        return RestoreTier.FORWARD_ONLY
+    return RestoreTier.RESTORABLE if pinnable else RestoreTier.RESTORABLE_UNPINNED
+
+
 # Guarantee wording is a closed, tier-keyed table rather than free text so the
 # honesty floor is enforceable: the non-native tiers must never carry
 # enforcement or compare-and-set claims, and a per-binding rewording cannot
@@ -98,12 +152,29 @@ class CapabilityDescriptor:
       stated so an operator can scope access down to it.
     - ``consistency_note`` — the substrate's own consistency caveat, surfaced
       verbatim so the builder sees the substrate's limits, not just ours.
+
+    Workspace-Versioning axes (ADDITIVE — every pre-WV construction is
+    unchanged; the defaults claim nothing):
+
+    - ``versioned_pinnable`` — True iff the substrate offers BOTH version
+      history and a per-version pin (e.g. an S3 versioned bucket with Object
+      Lock legal hold). The capability flag :data:`RestoreTier.RESTORABLE`
+      rides on; False claims nothing.
+    - ``restore_tier`` — the member's honest restore capability, or ``None``
+      when the binding is not (yet) speaking the restore axis. ``RESTORABLE``
+      without ``versioned_pinnable`` is refused fail-closed — a descriptor may
+      under-claim (a loud downgrade) but never over-claim.
+    - ``arbitration_tier`` — who arbitrates a foreign writer racing a restore
+      leg, or ``None`` when the binding is not speaking the restore axis.
     """
 
     tier: Tier
     version_source: str | None = None
     least_privilege: str = ""
     consistency_note: str = ""
+    versioned_pinnable: bool = False
+    restore_tier: RestoreTier | None = None
+    arbitration_tier: ArbitrationTier | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, Tier):
@@ -118,6 +189,25 @@ class CapabilityDescriptor:
             raise ValueError(
                 "native_cas requires a version_source: the tier's guarantee is "
                 "keyed on the substrate-minted token"
+            )
+        if self.restore_tier is not None and not isinstance(self.restore_tier, RestoreTier):
+            valid = ", ".join(t.value for t in RestoreTier)
+            raise ValueError(
+                f"unknown restore_tier: {self.restore_tier!r} (expected one of: {valid})"
+            )
+        if self.arbitration_tier is not None and not isinstance(
+            self.arbitration_tier, ArbitrationTier
+        ):
+            valid = ", ".join(t.value for t in ArbitrationTier)
+            raise ValueError(
+                f"unknown arbitration_tier: {self.arbitration_tier!r} "
+                f"(expected one of: {valid})"
+            )
+        if self.restore_tier is RestoreTier.RESTORABLE and not self.versioned_pinnable:
+            raise ValueError(
+                "restore_tier 'restorable' requires versioned_pinnable=True: a "
+                "descriptor may under-claim but never over-claim (fail-closed) — "
+                "an unpinned member is 'restorable-unpinned' at best"
             )
 
     @property
