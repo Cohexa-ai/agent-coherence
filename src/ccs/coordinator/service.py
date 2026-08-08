@@ -14,8 +14,8 @@ import time
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional
-from uuid import NAMESPACE_URL, UUID, uuid5
+from typing import Callable, Iterable, Mapping, Optional, Sequence
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ccs.coordinator.retention import collectible_versions
 from ccs.core.exceptions import (
@@ -59,7 +59,7 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
-from .registry_protocol import RegistryBase
+from .registry_protocol import CheckpointMember, CheckpointRecord, RegistryBase
 
 logger = logging.getLogger(__name__)
 
@@ -2294,6 +2294,72 @@ class CoordinatorService:
         return self.commit_all(
             agent_id=committer_id, writes=batch, issued_at_tick=issued_at_tick, abort=abort
         )
+
+    def create_workspace_checkpoint(
+        self,
+        *,
+        name: str,
+        owner: UUID,
+        members: "Sequence[CheckpointMember]",
+        window_min: float,
+        window_max: float,
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> CheckpointRecord:
+        """Persist ONE workspace-checkpoint manifest (WV plan Unit 3 / R1–R2).
+
+        The single registration point for the capture engine
+        (``ccs.adapters.workspace.WorkspaceVersioner``): mints the
+        ``checkpoint_id`` SERVER-SIDE (a caller never names its own id) and
+        hands the header + every member row to the Unit-2 registry API
+        (:meth:`~ccs.coordinator.registry_protocol.RegistryBase.create_checkpoint`),
+        which lands them in ONE transaction — owner metadata included, all rows
+        or none. A raise from the registry therefore leaves NO partial
+        manifest; the adapter maps it to its typed
+        ``CheckpointPersistFailed``.
+
+        Validation fails closed BEFORE minting anything: a blank name, an
+        absent owner, an empty member set, or an inverted window raise
+        ``ValueError`` (an empty manifest describes nothing; the window
+        endpoints come from the capture pass and can never invert unless the
+        caller is buggy).
+
+        ``abort`` threads into :meth:`registry.abort_guard` (the A6
+        session-commit lesson — every mutating path threads it): a
+        watchdog-timed-out ``/workspace/checkpoint`` request fails closed at
+        the registry write lock instead of landing a manifest AFTER the client
+        already received the degraded ``checkpoint_unconfirmed`` response.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("create_workspace_checkpoint requires a non-empty name")
+        if owner is None:
+            raise ValueError(
+                "create_workspace_checkpoint requires an owner: an ownerless "
+                "manifest is unrepresentable (fail-closed)"
+            )
+        member_rows = list(members)
+        if not member_rows:
+            raise ValueError(
+                "create_workspace_checkpoint requires at least one member row "
+                "(an empty manifest describes nothing)"
+            )
+        if window_max < window_min:
+            raise ValueError(
+                f"inverted capture window: window_max={window_max!r} < "
+                f"window_min={window_min!r}"
+            )
+        record = CheckpointRecord(
+            checkpoint_id=str(uuid4()),
+            name=name,
+            owner=owner,
+            created_at=float(issued_at_tick),
+            created_at_tick=issued_at_tick,
+            window_min=float(window_min),
+            window_max=float(window_max),
+        )
+        with self.registry.abort_guard(abort):
+            self.registry.create_checkpoint(record, member_rows)
+        return record
 
     def invalidate(
         self,
