@@ -822,9 +822,13 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         }
         # The v3 session-pin table (SB-17 Unit 2) is present on a fresh db.
         assert "session_pins" in tables
-        # SB-17 Unit 2 bumped the schema to v3; a fresh db is created at v3.
+        # The v5 workspace-checkpoint tables (WV Unit 2) are present on a fresh
+        # db too — the fresh apply always lands the COMPLETE current schema.
+        assert "workspace_checkpoints" in tables
+        assert "workspace_checkpoint_members" in tables
+        # WV Unit 2 bumped the schema to v5; a fresh db is created at v5.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 4
+        assert SCHEMA_USER_VERSION == 5
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:

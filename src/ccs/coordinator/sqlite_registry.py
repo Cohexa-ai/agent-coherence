@@ -84,7 +84,17 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, NoReturn, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+)
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -116,6 +126,8 @@ from .registry_protocol import (
     RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
+    CheckpointMember,
+    CheckpointRecord,
     ReclamationSlot,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -126,7 +138,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 4
+SCHEMA_USER_VERSION = 5
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -152,6 +164,18 @@ already stamped ``user_version=3`` with ``session_pins`` but WITHOUT
 ``session_meta`` (it opens via the write-free rehydrate path). The dedicated
 ``_migrate_v3_to_v4`` creates both for any v3 db; a Node-v3 db is rejected by
 ``_reject_foreign_ledger_db`` before reaching it.
+
+**v4 -> v5** (Workspace Versioning, WV plan Unit 2 / R1, R9) adds the
+``workspace_checkpoints`` + ``workspace_checkpoint_members`` tables (the durable
+checkpoint MANIFEST: per-member tokens/fingerprints/tiers/flags + owner metadata
++ pin refcounts + restore-progress state — FIXED-WIDTH data only, never content
+bytes) and the ``idx_workspace_checkpoints_name`` index. Additive-only (no
+existing table touched). The step also carries the ``_V4_USER_VERSION`` literal
+conversion: ``_migrate_v3_to_v4`` previously guarded AND stamped with the
+``SCHEMA_USER_VERSION`` constant, so bumping the constant to 5 would have made a
+v3-origin db stamp user_version=5 WITHOUT the v5 DDL — exactly the state the
+structural probes refuse. It now stamps the intermediate literal 4 and the
+chained ``_migrate_v4_to_v5`` lands the v5 DDL + the v5 stamp.
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -179,6 +203,18 @@ before the chained ``_migrate_v3_to_v4`` step adds ``session_meta`` + the
 ``session_pins`` artifact index and advances to ``SCHEMA_USER_VERSION``. A
 literal because session_pins-at-v3 is a distinct on-disk state earlier commits
 of this branch already produced."""
+
+_V4_USER_VERSION = 4
+"""The intermediate v4 stamp ``_migrate_v3_to_v4`` writes (session_meta + the
+session_pins artifact index), before the chained ``_migrate_v4_to_v5`` step adds
+the workspace-checkpoint tables and advances to ``SCHEMA_USER_VERSION``. A
+literal for the same reason as ``_V2_USER_VERSION``/``_V3_USER_VERSION`` — and
+the fix for the v5 migration trap: ``_migrate_v3_to_v4`` originally guarded AND
+stamped with the ``SCHEMA_USER_VERSION`` constant (correct while the constant
+was 4), so the v5 bump alone would have made a v3-origin db skip the v4->v5
+step's loser-guard and get stamped 5 without the v5 DDL. Every intermediate
+migration must pin its own stamp as a literal; only the FINAL step in the chain
+may stamp the constant."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -261,6 +297,74 @@ CREATE TABLE session_meta (
     created_at_tick INTEGER NOT NULL
 )
 """
+
+# Workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9; schema v5).
+# One row per named checkpoint: identity + owner metadata (owner is NOT NULL —
+# an ownerless manifest is unrepresentable on disk, the fail-closed half of the
+# owner-absent contract enforced in create_checkpoint), the skew-declared cut
+# window [window_min, window_max] (monotonic-seconds endpoints; the clock caveat
+# is a manifest-surface concern, not a storage one), the checkpoint-level
+# restore-progress fields (restore_status + restore_updated_at — restore is
+# crash-resumable, so its status must be durable), and the GC pin refcount
+# (Unit 6's minimal pin legs: one refcount per checkpoint, adjusted through
+# adjust_checkpoint_pin_refcount, never below zero). FIXED-WIDTH data only —
+# ids/paths/tokens/flags/timestamps; NEVER content bytes (KTD-13 posture: the
+# manifest points at member versions, it does not store them).
+_WORKSPACE_CHECKPOINTS_DDL = """
+CREATE TABLE workspace_checkpoints (
+    checkpoint_id      TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    owner              TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    created_at_tick    INTEGER NOT NULL,
+    window_min         REAL NOT NULL,
+    window_max         REAL NOT NULL,
+    restore_status     TEXT NOT NULL DEFAULT 'none',
+    restore_updated_at REAL,
+    pin_refcount       INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# Per-member manifest rows (WV plan Unit 2 / R1). One row per (checkpoint,
+# member path): the member's native CAS token + fingerprint + capture timestamp,
+# the ABSENT marker (absent-at-capture is a recorded fact, distinct from empty),
+# the torn-cut flag (dirty_during_window), the two tier axes (arbitration_tier:
+# native-cas / no-arbiter; restore_tier: restorable / restorable-unpinned /
+# forward_only), per-member pin state, and the restore-progress columns
+# (restore_outcome: the per-member typed terminal outcome a crash-resumable
+# restore records durably; deleted_at_restore: the manifest-side delete record —
+# ``commit_all`` has no delete semantics, so delete legs are recorded HERE, per
+# the plan's restore-registration design). ``artifact_id`` is nullable and has
+# NO foreign key to ``artifacts`` on PURPOSE (the session_pins rationale): an S3
+# member has no coordinator artifact at all, and a file member's artifact being
+# removed later must surface as a typed restore outcome (target-lost), never as
+# a silent cascade-delete of manifest history. The parent-checkpoint FK DOES
+# cascade: members belong to their manifest. Fixed-width data only.
+_WORKSPACE_CHECKPOINT_MEMBERS_DDL = """
+CREATE TABLE workspace_checkpoint_members (
+    checkpoint_id       TEXT NOT NULL,
+    member_path         TEXT NOT NULL,
+    artifact_id         TEXT,
+    native_token        TEXT,
+    fingerprint         TEXT,
+    captured_at         REAL NOT NULL,
+    absent              INTEGER NOT NULL DEFAULT 0,
+    dirty_during_window INTEGER NOT NULL DEFAULT 0,
+    arbitration_tier    TEXT NOT NULL,
+    restore_tier        TEXT NOT NULL,
+    pin_state           TEXT NOT NULL DEFAULT 'unpinned',
+    restore_outcome     TEXT,
+    deleted_at_restore  REAL,
+    PRIMARY KEY (checkpoint_id, member_path),
+    FOREIGN KEY (checkpoint_id) REFERENCES workspace_checkpoints(checkpoint_id) ON DELETE CASCADE
+)
+"""
+
+# The CLI's ``list``/``restore <name>`` verbs resolve checkpoints by NAME, which
+# is not the PK — without this index every name lookup is a full scan.
+_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL = (
+    "CREATE INDEX idx_workspace_checkpoints_name ON workspace_checkpoints(name)"
+)
 
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
@@ -563,23 +667,26 @@ class SqliteArtifactRegistry:
 
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
-          + the artifact index) in one atomic transaction (no shim ever runs on a
-          fresh db).
+          + the workspace-checkpoint tables + the indexes) in one atomic
+          transaction (no shim ever runs on a fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
-          ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4``: idempotently subsumes
-          BOTH additive shims (fence columns + epoch seed, and ``pending_notices``),
-          adds ``artifact_versions`` (v2), ``session_pins`` (v3), then
-          ``session_meta`` + the artifact index (v4). The wild v1 population is a
-          2x2 matrix ({±fence columns} x {±pending_notices}) because both shims
-          shipped with no version bump; ``IF NOT EXISTS`` guards make each piece
-          apply only when missing.
-        - ``user_version == 2`` → ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4``:
-          adds ``session_pins`` (v3), then ``session_meta`` + the index (v4).
-        - ``user_version == 3`` → ``_migrate_v3_to_v4``: an existing v3 db
-          (``session_pins`` present, ``session_meta`` ABSENT — earlier commits of
-          this branch stamped it) gains ``session_meta`` + the index. Without this
-          branch such a db would open write-free and crash on the first session op.
-        - ``user_version == 4`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+          ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
+          ``_migrate_v4_to_v5``: idempotently subsumes BOTH additive shims (fence
+          columns + epoch seed, and ``pending_notices``), adds
+          ``artifact_versions`` (v2), ``session_pins`` (v3), ``session_meta`` +
+          the artifact index (v4), then the workspace-checkpoint tables (v5). The
+          wild v1 population is a 2x2 matrix ({±fence columns} x
+          {±pending_notices}) because both shims shipped with no version bump;
+          ``IF NOT EXISTS`` guards make each piece apply only when missing.
+        - ``user_version == 2`` → the chained ``2 -> 3 -> 4 -> 5`` steps.
+        - ``user_version == 3`` → ``_migrate_v3_to_v4`` then ``_migrate_v4_to_v5``:
+          an existing v3 db (``session_pins`` present, ``session_meta`` ABSENT —
+          earlier commits of that branch stamped it) gains ``session_meta`` + the
+          index, then the workspace-checkpoint tables. Without the v3 branch such
+          a db would open write-free and crash on the first session op.
+        - ``user_version == 4`` → ``_migrate_v4_to_v5``: an existing v4 db gains
+          the workspace-checkpoint tables.
+        - ``user_version == 5`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -597,23 +704,30 @@ class SqliteArtifactRegistry:
             if current == 0:
                 self._apply_v2_schema(instance_id)
             elif current == 1:
-                # v1 → v2 → v3 → v4: each step is its own atomic BEGIN IMMEDIATE
-                # and rehydrates meta; the chain lands the full current schema.
+                # v1 → v2 → v3 → v4 → v5: each step is its own atomic BEGIN
+                # IMMEDIATE and rehydrates meta; the chain lands the full schema.
                 self._migrate_v1_to_v2(instance_id)
                 self._migrate_v2_to_v3(instance_id)
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
             elif current == 2:
-                # 2 → 3 → 4: add session_pins, then session_meta + the index.
+                # 2 → 3 → 4 → 5: session_pins, session_meta + index, checkpoints.
                 self._migrate_v2_to_v3(instance_id)
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
-                # commits of this branch stamped it) → add session_meta + index.
-                # WITHOUT this branch such a db would open write-free and crash on
-                # the first session op with 'no such table: session_meta'.
+                # commits of that branch stamped it) → add session_meta + index,
+                # then chain to v5. WITHOUT the v3 branch such a db would open
+                # write-free and crash on the first session op with 'no such
+                # table: session_meta'.
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
+            elif current == _V4_USER_VERSION:
+                # An existing v4 db → add the workspace-checkpoint tables (v5).
+                self._migrate_v4_to_v5(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v4 database — rehydrate; NO writes on this path (the
+                # Existing v5 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -736,6 +850,14 @@ class SqliteArtifactRegistry:
            for a Node-v3 db whose ``deadline_tick`` probe somehow missed (and
            defense-in-depth alongside the ``schema_runtime`` stamp). Literal
            ``3`` — pins Python-v3 semantics.
+        5. ``user_version == 5`` WITHOUT ``workspace_checkpoints`` — a Python-v5
+           db ALWAYS has the table (``_migrate_v4_to_v5`` / the fresh apply
+           creates it atomically with the v5 stamp; the ``_V4_USER_VERSION``
+           literal conversion is what makes that guarantee hold for every
+           migration origin). NO ledger this build recognizes stamps 5 without
+           it, so the state is foreign-or-corrupt either way and the fail-closed
+           refusal is the honest response. Literal ``5`` — pins Python-v5
+           semantics.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -766,6 +888,13 @@ class SqliteArtifactRegistry:
                 "Python-v3 store always has it; the Node ledger's v3 is the "
                 "agent_states.deadline_tick ALTER, not session_pins)"
             )
+        if current == 5 and not self._has_table("workspace_checkpoints"):
+            self._raise_cross_runtime(
+                "is user_version=5 without the workspace_checkpoints table (a "
+                "Python-v5 store always has it — the v4->v5 migration creates "
+                "it atomically with the v5 stamp; no ledger this build "
+                "recognizes stamps 5 without it)"
+            )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
         """Compose the single :class:`CrossRuntimeSchemaError` message shape.
@@ -791,7 +920,8 @@ class SqliteArtifactRegistry:
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:
         """Create the COMPLETE current schema (v2 tables + the v3 ``session_pins``
-        table) + seed registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
+        table + the v4 ``session_meta`` table/index + the v5 workspace-checkpoint
+        tables) + seed registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
         Caller holds lock. (The method keeps its historical ``_apply_v2_schema``
         name; a fresh db is always built at the latest schema directly so no
         migration shim ever runs against it.)
@@ -894,6 +1024,13 @@ class SqliteArtifactRegistry:
             c.execute(_SESSION_PINS_DDL)
             c.execute(_SESSION_PINS_ARTIFACT_INDEX_DDL)
             c.execute(_SESSION_META_DDL)
+            # Workspace-checkpoint manifest tables (v5, WV Unit 2): same rule —
+            # the fresh apply lands the COMPLETE current schema so the v4->v5
+            # migration never runs against a fresh db and the steady-state open
+            # stays write-free.
+            c.execute(_WORKSPACE_CHECKPOINTS_DDL)
+            c.execute(_WORKSPACE_CHECKPOINT_MEMBERS_DDL)
+            c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -1122,11 +1259,12 @@ class SqliteArtifactRegistry:
 
     def _migrate_v3_to_v4(self, instance_id: str | None) -> None:
         """Migrate a v3 db (``session_pins`` present, ``session_meta`` absent) to
-        v4 in ONE atomic transaction (SB-17 / TX-1, durable owner-binding). Caller
-        holds lock.
+        the INTERMEDIATE v4 in ONE atomic transaction (SB-17 / TX-1, durable
+        owner-binding). Caller holds lock. Chained to ``_migrate_v4_to_v5`` by
+        the open dispatcher (a v3 db steps 3 -> 4 -> 5).
 
         Why a dedicated step rather than folding it into the v2->v3 add: earlier
-        commits of THIS branch already shipped ``user_version=3`` with
+        commits of the SB-17 branch already shipped ``user_version=3`` with
         ``session_pins`` but no ``session_meta``. Such a db opens via the
         write-free rehydrate path (``current == SCHEMA_USER_VERSION`` once that was
         4) and would NEVER gain ``session_meta`` — so every ``begin_session`` /
@@ -1134,6 +1272,15 @@ class SqliteArtifactRegistry:
         ``current == 3`` through this step creates the table (and the
         ``session_pins`` artifact index) for any v3 db, fresh-this-build or
         earlier-branch.
+
+        Guard + stamp use the ``_V4_USER_VERSION`` LITERAL, not the constant (the
+        v5 migration trap, WV plan Unit 2 / review P1): while this was the final
+        step it guarded and stamped ``SCHEMA_USER_VERSION``, which was correct at
+        4 — but once the constant moved to 5, a v3-origin db running this step
+        would have been stamped 5 WITHOUT the v5 DDL (and the chained v4->v5
+        step's loser-guard would then see >= 5 and no-op), exactly the state the
+        structural foreign-ledger probe refuses. Intermediate migrations pin
+        their own stamp; only the final chain step stamps the constant.
 
         Additive-only (``session_meta`` + ``idx_session_pins_artifact``), same
         atomicity discipline as the other migrations. Idempotent via ``IF NOT
@@ -1143,8 +1290,9 @@ class SqliteArtifactRegistry:
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
-            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
-                # A racing winner already advanced to v4 — nothing to do.
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V4_USER_VERSION:
+                # A racing winner already advanced to >= v4 — nothing to do here
+                # (the chained v4->v5 step runs next regardless).
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
@@ -1153,6 +1301,79 @@ class SqliteArtifactRegistry:
             )
             c.execute(
                 _SESSION_PINS_ARTIFACT_INDEX_DDL.replace(
+                    "CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1
+                )
+            )
+            c.execute(f"PRAGMA user_version = {_V4_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v4_to_v5(self, instance_id: str | None) -> None:
+        """Migrate a v4 db to v5 in ONE atomic transaction (WV plan Unit 2 / R1,
+        R9): add the ``workspace_checkpoints`` + ``workspace_checkpoint_members``
+        tables and the name index, then stamp ``user_version=5``. Caller holds
+        lock. The FINAL step of the chain, so it stamps ``SCHEMA_USER_VERSION``.
+
+        Additive-only — it touches NO existing table, so there is no shim to
+        subsume and no content/mode posture change (the new tables hold
+        fixed-width manifest data only, never content bytes). Same atomicity
+        discipline as every other migration (the
+        sqlite-schema-init-non-atomic-leaves-unbootable-db learning): ONE
+        explicit ``BEGIN IMMEDIATE`` wrapping all DDL + the ``PRAGMA
+        user_version`` stamp, individual ``execute()`` calls (never
+        ``executescript``), ``except BaseException`` ROLLBACK so a SIGKILL
+        mid-migration leaves the v4 db intact for a clean re-migrate, and ``IF
+        NOT EXISTS`` guards for the half-migrated-db case (tables created by a
+        prior crashed migration whose stamp never committed).
+
+        Concurrent-loser path: two processes can both read ``user_version == 4``
+        (a bare pre-lock read) and both land here; they serialize on the ``BEGIN
+        IMMEDIATE`` write lock. The loser re-reads ``user_version`` INSIDE its
+        txn, sees the winner already at >= v5, and no-ops.
+
+        NODE-LEDGER COORDINATION (checked at authoring, 2026-08-08, against the
+        local agent-coherence-plugin checkout): the sibling Node coordinator's
+        ledger tops out at ``user_version=3`` (``src/migrations/`` has exactly
+        v1_initial / v2_validate_pending_notices / v3_watchdog_deadline; no
+        migration consumes 4 or 5). Its ``rejectForeignLedgerDb`` runs BEFORE its
+        version dispatch and refuses any Python-lineage db on three markers that
+        every Python v2+ db carries — the ``schema_runtime='python'`` stamp, the
+        ``artifact_versions`` table, and the ``artifacts.owner_generation``
+        column — so a Python-v5 db is rejected by lineage before the integer 5 is
+        ever interpreted against the Node ledger, and its ``startVersion >
+        SCHEMA_USER_VERSION`` guard would refuse it even if the probes were
+        bypassed. No Node-side change is required by this bump; the reverse
+        direction (a future Node v4+/v5 db opened here) stays covered by the
+        ``deadline_tick`` structural probe (``>= 3``, columns are never dropped)
+        plus the ``schema_runtime='node'`` stamp.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v5 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _WORKSPACE_CHECKPOINTS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(
+                _WORKSPACE_CHECKPOINT_MEMBERS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(
+                _WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL.replace(
                     "CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1
                 )
             )
@@ -2031,6 +2252,293 @@ class SqliteArtifactRegistry:
         if not rows:
             return None
         return {UUID(hex=r[0]): int(r[1]) for r in rows}
+
+    # ------------------------------------------------------------------
+    # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        checkpoint: CheckpointRecord,
+        members: Sequence[CheckpointMember],
+    ) -> None:
+        """Persist a checkpoint manifest atomically: the header row (owner
+        metadata INCLUDED — written in the SAME transaction, per the plan's
+        owner-metadata-same-txn rule) plus every member row land in ONE ``BEGIN
+        IMMEDIATE``, or none do. Parity with
+        :meth:`ArtifactRegistry.create_checkpoint`; divergent only on
+        restart-survival (sqlite manifests are durable).
+
+        Fail-closed owner contract: an absent owner raises ``ValueError`` BEFORE
+        the transaction opens — an ownerless manifest is never persisted (the
+        ``owner TEXT NOT NULL`` column is the schema-level backstop). A
+        duplicate ``checkpoint_id`` or duplicate member path raises
+        ``ValueError`` (mapped from the PK ``IntegrityError``) with the whole
+        insert rolled back.
+        """
+        self._guard_writable()
+        if checkpoint.owner is None:
+            raise ValueError(
+                "create_checkpoint requires an owner: a checkpoint manifest "
+                "without owner metadata is unrepresentable (fail-closed; the "
+                "restore path owner-validates against it)"
+            )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO workspace_checkpoints
+                        (checkpoint_id, name, owner, created_at, created_at_tick,
+                         window_min, window_max, restore_status,
+                         restore_updated_at, pin_refcount)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint.checkpoint_id,
+                        checkpoint.name,
+                        checkpoint.owner.hex,
+                        checkpoint.created_at,
+                        checkpoint.created_at_tick,
+                        checkpoint.window_min,
+                        checkpoint.window_max,
+                        checkpoint.restore_status,
+                        checkpoint.restore_updated_at,
+                        checkpoint.pin_refcount,
+                    ),
+                )
+                for member in members:
+                    self._conn.execute(
+                        """
+                        INSERT INTO workspace_checkpoint_members
+                            (checkpoint_id, member_path, artifact_id, native_token,
+                             fingerprint, captured_at, absent, dirty_during_window,
+                             arbitration_tier, restore_tier, pin_state,
+                             restore_outcome, deleted_at_restore)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            checkpoint.checkpoint_id,
+                            member.member_path,
+                            member.artifact_id.hex if member.artifact_id else None,
+                            member.native_token,
+                            member.fingerprint,
+                            member.captured_at,
+                            1 if member.absent else 0,
+                            1 if member.dirty_during_window else 0,
+                            member.arbitration_tier,
+                            member.restore_tier,
+                            member.pin_state,
+                            member.restore_outcome,
+                            member.deleted_at_restore,
+                        ),
+                    )
+                self._conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValueError(
+                    f"create_checkpoint: duplicate checkpoint_id "
+                    f"{checkpoint.checkpoint_id!r} or duplicate member path in "
+                    f"the manifest ({exc})"
+                ) from exc
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """Return the checkpoint header, or ``None`` when unknown."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
+                "window_min, window_max, restore_status, restore_updated_at, "
+                "pin_refcount FROM workspace_checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+        return self._checkpoint_record_from_row(row) if row is not None else None
+
+    def list_checkpoints(self) -> list[CheckpointRecord]:
+        """Return every checkpoint header, ordered by ``(created_at,
+        checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
+                "window_min, window_max, restore_status, restore_updated_at, "
+                "pin_refcount FROM workspace_checkpoints "
+                "ORDER BY created_at, checkpoint_id"
+            ).fetchall()
+        return [self._checkpoint_record_from_row(r) for r in rows]
+
+    def get_checkpoint_members(self, checkpoint_id: str) -> list[CheckpointMember]:
+        """Return the manifest's member rows ordered by ``member_path`` (empty
+        list for an unknown checkpoint — :meth:`get_checkpoint` tells known from
+        unknown)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT member_path, artifact_id, native_token, fingerprint, "
+                "captured_at, absent, dirty_during_window, arbitration_tier, "
+                "restore_tier, pin_state, restore_outcome, deleted_at_restore "
+                "FROM workspace_checkpoint_members WHERE checkpoint_id = ? "
+                "ORDER BY member_path",
+                (checkpoint_id,),
+            ).fetchall()
+        return [
+            CheckpointMember(
+                member_path=r[0],
+                artifact_id=UUID(hex=r[1]) if r[1] else None,
+                native_token=r[2],
+                fingerprint=r[3],
+                captured_at=float(r[4]),
+                absent=bool(r[5]),
+                dirty_during_window=bool(r[6]),
+                arbitration_tier=r[7],
+                restore_tier=r[8],
+                pin_state=r[9],
+                restore_outcome=r[10],
+                deleted_at_restore=float(r[11]) if r[11] is not None else None,
+            )
+            for r in rows
+        ]
+
+    def set_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, *, updated_at: float
+    ) -> None:
+        """Update the checkpoint-level restore status + its ``updated_at`` stamp
+        (the crash-resumable restore's durable progress marker). Raises
+        ``KeyError`` for an unknown checkpoint (fail fast, no silent no-op)."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoints "
+                    "SET restore_status = ?, restore_updated_at = ? "
+                    "WHERE checkpoint_id = ?",
+                    (status, updated_at, checkpoint_id),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def set_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+    ) -> None:
+        """Record a member's restore progress: BOTH columns are written to the
+        given values (a full member-restore-state write — a new restore run's
+        first write for a member resets any prior run's delete record). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoint_members "
+                    "SET restore_outcome = ?, deleted_at_restore = ? "
+                    "WHERE checkpoint_id = ? AND member_path = ?",
+                    (restore_outcome, deleted_at_restore, checkpoint_id, member_path),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(
+                        f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                        f"not in registry"
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def set_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        """Update a member's pin state; ``restore_tier`` (when given) rewrites
+        the member's restore tier in the same step — the Unit-6 loud tier
+        downgrade (``restorable`` -> ``restorable-unpinned`` on a failed pin
+        leg). ``restore_tier=None`` leaves the tier untouched (COALESCE). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoint_members "
+                    "SET pin_state = ?, restore_tier = COALESCE(?, restore_tier) "
+                    "WHERE checkpoint_id = ? AND member_path = ?",
+                    (pin_state, restore_tier, checkpoint_id, member_path),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(
+                        f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                        f"not in registry"
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
+        """Atomically add ``delta`` to a checkpoint's pin refcount and return the
+        new value — read + validate + write in ONE ``BEGIN IMMEDIATE`` so two
+        concurrent adjustments cannot lose an update. Raises ``KeyError`` for an
+        unknown checkpoint and ``ValueError`` if the result would go negative (a
+        release without a matching pin is a bookkeeping bug, fail-closed — the
+        refcount never wraps below zero)."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT pin_refcount FROM workspace_checkpoints "
+                    "WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                new_count = int(row[0]) + delta
+                if new_count < 0:
+                    raise ValueError(
+                        f"pin refcount for checkpoint {checkpoint_id!r} would go "
+                        f"negative ({row[0]} + {delta}); a release without a "
+                        f"matching pin is a bookkeeping bug (fail-closed)"
+                    )
+                self._conn.execute(
+                    "UPDATE workspace_checkpoints SET pin_refcount = ? "
+                    "WHERE checkpoint_id = ?",
+                    (new_count, checkpoint_id),
+                )
+                self._conn.execute("COMMIT")
+                return new_count
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _checkpoint_record_from_row(row: "tuple[Any, ...]") -> CheckpointRecord:
+        """Decode one ``workspace_checkpoints`` row (column order matches the
+        SELECTs above) into the contract dataclass."""
+        return CheckpointRecord(
+            checkpoint_id=row[0],
+            name=row[1],
+            owner=UUID(hex=row[2]),
+            created_at=float(row[3]),
+            created_at_tick=int(row[4]),
+            window_min=float(row[5]),
+            window_max=float(row[6]),
+            restore_status=row[7],
+            restore_updated_at=float(row[8]) if row[8] is not None else None,
+            pin_refcount=int(row[9]),
+        )
 
     # ------------------------------------------------------------------
     # ArtifactRegistry surface — agent state map
