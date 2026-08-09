@@ -35,7 +35,13 @@ forward-only members (actions/effects with no state to capture).
   presence) marks that member ``dirty_during_window=True``. Conservative by
   design: the verification read runs after ``window_max``, so a write landing
   between the window close and the verify read still flags — dirty means "not
-  verified quiescent across the window", never "verified torn".
+  verified quiescent across the window", never "verified torn". Disclosed
+  residual (the tail window): a foreign write landing AFTER the verification
+  read but BEFORE the manifest persists is NOT flagged — the cut itself stays
+  internally consistent (every token and fingerprint comes from the capture
+  reads) and restore never trusts the flag (every leg re-reads its live
+  comparand), so the residual under-flags the window; it never corrupts the
+  manifest (the safe direction).
 - **The window** — ``[window_min, window_max]`` is the min/max of the members'
   capture timestamps (whole-second wall-clock ticks; the skew is DECLARED, not
   hidden).
@@ -340,6 +346,11 @@ class CheckpointRestoreStore(Protocol):
     engine (post-crash) resumes from exactly the state the registry holds.
     :meth:`register_workspace_restore` is the Unit-5 coordinator-registration
     half (written file members → one all-or-nothing hash-only ``commit_all``).
+    :meth:`workspace_member_registered` is its READ-ONLY rebuild seam: a
+    re-restore of an already-``concluded`` checkpoint re-derives the
+    registration answer from the coordinator's registered state (a
+    refused-terminal registration must never re-read as ``None``-means-fine)
+    — it never resolves, mints, or mutates anything.
     :meth:`WorkspaceVersioner.restore` verifies its service speaks this surface
     BEFORE touching any state (fail-fast on a capture-only service).
     """
@@ -375,6 +386,9 @@ class CheckpointRestoreStore(Protocol):
         writes: Sequence[WorkspaceRestoreWrite],
         issued_at_tick: int = 0,
     ) -> WorkspaceRegistrationResult:
+        ...
+
+    def workspace_member_registered(self, member_path: str, fingerprint: str) -> bool:
         ...
 
 
@@ -565,9 +579,16 @@ class RestoreRegistration:
     signals the commit returned (broadcast-after-commit: registered peers
     holding a member were atomically invalidated by the registry).
 
-    Run-local: durable rows retain outcomes and the ``registered`` status
-    marker, not this detail — a report rebuilt from durable rows of an
-    already-``concluded`` checkpoint carries ``registration=None``.
+    Run-local detail, durable REBUILD: durable rows retain outcomes and the
+    ``registered`` status marker, not this detail — a report rebuilt from
+    durable rows of an already-``concluded`` checkpoint carries a REBUILT
+    answer instead (:meth:`WorkspaceVersioner._registration_from_durable_state`
+    re-reads the coordinator's registered state): ``empty_write_set`` /
+    ``registered_by_prior_run`` where the durable truth backs them, or
+    ``refused`` (with an empty per-member reason map — reasons are not durably
+    retained; the identity-matched ``status`` is the signal) where written
+    members are not at their manifest fingerprints. A refused-terminal
+    registration must never re-read as ``None``-means-fine.
     """
 
     status: str
@@ -588,8 +609,11 @@ class WorkspaceRestoreReport:
     Returned to the caller AND durably mirrored (each member's ``outcome`` in
     its registry row; ``status`` — always ``concluded`` — on the checkpoint
     header), so the same report is reconstructible from durable state alone.
-    ``registration`` is the Unit-5 registration answer for THIS run (run-local
-    detail; ``None`` on a report rebuilt from durable rows).
+    ``registration`` is the Unit-5 registration answer for THIS run, or —
+    on a report rebuilt from durable rows (a re-restore of a ``concluded``
+    checkpoint) — the answer REBUILT from the coordinator's registered state
+    (never ``None`` on that path: a refused-terminal registration stays
+    visible so downstream surfaces can exit non-zero).
     """
 
     checkpoint_id: str
@@ -842,6 +866,15 @@ class WorkspaceVersioner:
         ``dirty_during_window=True``. Forward-only members carry no state and
         are never verified. Conservative: a write landing after ``window_max``
         but before this re-read still flags (dirty = "not verified quiescent").
+
+        Disclosed residual (the tail window): the flag covers movement
+        observed between the capture read and THIS verification read — a
+        foreign write landing AFTER the verify read but BEFORE the manifest
+        persists is NOT flagged. Safe direction: the cut stays internally
+        consistent (every manifested token/fingerprint comes from the capture
+        reads, never from the tail), and restore never trusts the flag —
+        every leg re-reads its live comparand — so the residual under-flags
+        the window; it cannot corrupt the manifest or a restore.
         """
         verified: list[CheckpointMember] = []
         member_by_path = {m.member_path: m for m in self._members}
@@ -1129,18 +1162,30 @@ class WorkspaceVersioner:
         checkpoint still holds a ``held`` pin on the same ``(member_path,
         native_token)`` — the cross-checkpoint scan: a shared hold survives
         until the LAST holder releases (S3's hold is a flag, not a counter;
-        the scan is the counter). A crash between (1) and (3) leaves an
-        over-retained hold — the safe direction — which the sharing peer's own
-        release still drops (its scan sees this row as ``released``).
+        the scan is the counter). The scan runs TWICE, fresh both times: once
+        as the drop's admission check and once as the LAST-INSTANT re-check
+        immediately before the substrate ``release_legal_hold`` call — a
+        concurrent ``pin_checkpoint`` (another versioner/process; this lock
+        does not serialize it) that recorded ``held`` on the same identity
+        since the first scan is seen there and the drop is SKIPPED, failing
+        toward over-retention (safe: the new holder's own release drops the
+        hold last-out). A crash between (1) and (3) leaves an over-retained
+        hold — the safe direction — which the sharing peer's own release
+        still drops (its scan sees this row as ``released``).
 
         Documented residuals: two checkpoints releasing CONCURRENTLY from
         different processes can each see the other still ``held`` and both
-        skip the drop (over-retention, never data loss); the refcount write is
-        a separate registry write from the pin record, so a crash between them
-        leaves a benign bookkeeping drift. Cross-checkpoint identity is
-        ``(member_path, native_token)`` — the bucket lives binding-side (real
-        S3 version ids are unique; a cross-bucket collision is a documented
-        residual of the fake's shape, not the engine's).
+        skip the drop (over-retention, never data loss); a concurrent pin
+        whose ``held`` row lands AFTER the last-instant re-check but BEFORE
+        the drop can still lose its hold (under-retention — the narrow
+        remaining window; closing it needs a registry-side transactional
+        claim spanning check-and-drop, outside v1's registry surface); the
+        refcount write is a separate registry write from the pin record, so a
+        crash between them leaves a benign bookkeeping drift.
+        Cross-checkpoint identity is ``(member_path, native_token)`` — the
+        bucket lives binding-side (real S3 version ids are unique; a
+        cross-bucket collision is a documented residual of the fake's shape,
+        not the engine's).
 
         Returns the refreshed durable rows. Raises
         :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id,
@@ -1189,6 +1234,16 @@ class WorkspaceVersioner:
                     continue  # another checkpoint's hold: survives (last-out drops)
                 member = declared[row.member_path]
                 assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
+                if self._pin_shared_elsewhere(store, checkpoint_id, row):
+                    # LAST-INSTANT re-check (fresh registry read): a concurrent
+                    # pin_checkpoint recorded ``held`` on this (member_path,
+                    # native_token) since the scan above — dropping now would
+                    # strip the hold the sibling just claimed (under-retention,
+                    # the UNSAFE direction). Skip instead: over-retention, safe
+                    # (the new holder's own release drops it last-out). The
+                    # window between THIS read and the drop remains — see the
+                    # docstring's disclosed residual.
+                    continue
                 try:
                     member.binding.release_legal_hold(
                         member.key, version_id=row.native_token
@@ -1240,12 +1295,37 @@ class WorkspaceVersioner:
         (caller misconfiguration must never mint an ``in_progress`` record it
         cannot drive).
 
+        Termination-contract boundary (the two unanticipated-exception
+        classes): a DETERMINISTIC member/environment pathology escaping a leg
+        — the OSError family (the member path replaced by a directory,
+        permission denied) minus the transient transport shapes, plus
+        ``UnicodeDecodeError`` — is ABSORBED into the member's terminal
+        ``target_lost`` (re-driving can never succeed; see
+        :meth:`_drive_member_absorbing`), so the restore still concludes.
+        Everything else (``ConnectionError`` / ``TimeoutError`` transport
+        blips, registry raises, genuine bugs) PROPAGATES by design — the
+        crash-resume path: ``restore_status`` stays ``in_progress`` durably
+        and a later ``restore()`` resumes it idempotently.
+
         Crash-resume: a checkpoint found ``in_progress`` is RESUMED — members
         whose durable ``restore_outcome`` is already terminal are skipped
         (reported ``resumed_from_prior_run``), the rest re-driven idempotently
         (a live state already matching the manifest concludes ``converged``
         with NO write — no double-apply). A ``concluded`` checkpoint returns
-        its report rebuilt from durable rows, driving nothing.
+        its report rebuilt from durable rows, driving nothing — including a
+        REBUILT registration answer (re-read from the coordinator's registered
+        state, never ``None``): a registration that concluded ``refused`` (the
+        fence rejecting a superseded controller, or budget exhaustion) is
+        TERMINAL — the re-restore REPORTS the refusal; it never re-attempts
+        the registration and never calls ``commit_all`` on this path.
+
+        Disclosed single-controller assumption: two CONCURRENT restores of
+        DIFFERENT checkpoints over an overlapping member are not
+        cross-serialized — each leg CASes only against the live state it
+        read, so both runs can honestly report ``restored`` for the member
+        while only the LAST write survives live. The engine serializes its
+        OWN runs (one lock per versioner); cross-controller ordering is the
+        operator's contract in v1.
         """
         if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
             raise ValueError("restore needs a non-empty checkpoint id")
@@ -1262,9 +1342,12 @@ class WorkspaceVersioner:
         rows = store.get_workspace_checkpoint_members(checkpoint_id)
         self._require_known_restore_state(record, rows)
         if record.restore_status == RESTORE_STATUS_CONCLUDED:
-            # Idempotent re-conclude: the durable rows ARE the report (the
-            # run-local registration detail is not durably retained).
-            return self._report_from_durable_rows(checkpoint_id, rows)
+            # Idempotent re-conclude: the durable rows ARE the report. The
+            # run-local registration detail is not durably retained, so the
+            # registration answer is REBUILT from the coordinator's registered
+            # state — a refused-terminal registration must surface here, never
+            # a silent registration=None the caller reads as fine.
+            return self._report_from_durable_rows(store, checkpoint_id, rows)
         # The durable idempotency marker (Unit 5): a crashed run that already
         # completed its registration step must never re-register on resume.
         prior_registration = record.restore_status == RESTORE_STATUS_REGISTERED
@@ -1279,7 +1362,7 @@ class WorkspaceVersioner:
                 # Terminal from a prior (crashed) run: skip, never re-drive.
                 outcomes.append(self._outcome_from_durable_row(row))
                 continue
-            outcome = self._drive_member(row)
+            outcome = self._drive_member_absorbing(row)
             # Durable BEFORE the next member: a crash after this write leaves a
             # terminal row the resuming run skips; a crash before it leaves a
             # pending row the resuming run re-drives idempotently.
@@ -1299,10 +1382,15 @@ class WorkspaceVersioner:
         ):
             # The durable marker: a crash between here and ``concluded`` makes
             # the resuming run skip the (already answered) registration step.
-            # A REFUSED registration deliberately skips the marker so a later
-            # resume MAY re-attempt (transient contention clears; the fence
-            # rejects a superseded controller again). PRIOR_RUN already holds
-            # the marker.
+            # A REFUSED registration skips the marker — NOT as an invitation to
+            # retry: REFUSED is TERMINAL (the very next write stamps
+            # ``concluded``, which is absorbing — a re-restore REBUILDS and
+            # REPORTS the refusal from durable state, never re-attempts it).
+            # The skipped marker matters only in the narrow crash window
+            # BEFORE the ``concluded`` write lands: that resume re-runs the
+            # seam once more, where the fence rejects a superseded controller
+            # again (never retried past it). PRIOR_RUN already holds the
+            # marker.
             store.set_workspace_checkpoint_restore_status(
                 checkpoint_id,
                 RESTORE_STATUS_REGISTERED,
@@ -1568,6 +1656,52 @@ class WorkspaceVersioner:
             )
 
     # --- one member's leg (terminal outcome, always) --------------------------
+
+    def _drive_member_absorbing(self, row: CheckpointMember) -> MemberRestoreOutcome:
+        """Drive one member's leg, absorbing DETERMINISTIC environment failures.
+
+        The termination-contract boundary for exceptions the legs did not
+        anticipate. Two classes:
+
+        - **Deterministic member/environment pathology** — the ``OSError``
+          family (the member path replaced by a directory → ``IsADirectoryError``,
+          permission denial → ``PermissionError``, …) and ``UnicodeDecodeError``
+          (the text wire meeting bytes it cannot carry). Re-driving can NEVER
+          succeed, so letting it raise would leave ``restore_status=in_progress``
+          durably with no report and every resume re-raising forever — the
+          termination contract would hold only for anticipated failures.
+          Absorbed HERE into the absorbing ``target_lost``: the member's state
+          is unreachable THROUGH ITS DECLARED SURFACE — the same "the restore
+          target cannot be reached" meaning ``target_lost`` already carries for
+          an expired pin or unretained version. ``conflict`` is deliberately
+          NOT used: it is arbitration/divergence-shaped (a foreign writer
+          losing a CAS, a detected live divergence) and an EISDIR/EACCES has
+          neither an arbiter nor a diverging writer.
+        - **Everything else** — ``ConnectionError`` / ``TimeoutError`` (OSError
+          subclasses, but TRANSIENT transport shapes: a redrive can succeed
+          once the transport heals), registry raises, genuine bugs — PROPAGATES
+          by design: the crash-resume path. ``restore_status`` stays
+          ``in_progress`` durably and a later :meth:`restore` resumes
+          idempotently.
+        """
+        try:
+            return self._drive_member(row)
+        except (ConnectionError, TimeoutError):
+            # Transient transport shapes: crash-resume, never terminalized.
+            raise
+        except (OSError, UnicodeDecodeError) as exc:
+            return MemberRestoreOutcome(
+                member_path=row.member_path,
+                outcome=RESTORE_OUTCOME_TARGET_LOST,
+                attempts=0,
+                detail=(
+                    "deterministic member-environment failure absorbed "
+                    f"({type(exc).__name__}: {exc}) — the member is unreachable "
+                    "through its declared surface and a re-drive cannot "
+                    "succeed; the restore still concludes (termination "
+                    "contract)"
+                ),
+            )
 
     def _drive_member(self, row: CheckpointMember) -> MemberRestoreOutcome:
         # ABSENT-fact FIRST: an absent-at-capture member restores to ABSENCE
@@ -2055,12 +2189,113 @@ class WorkspaceVersioner:
         )
 
     def _report_from_durable_rows(
-        self, checkpoint_id: str, rows: Sequence[CheckpointMember]
+        self,
+        store: CheckpointRestoreStore,
+        checkpoint_id: str,
+        rows: Sequence[CheckpointMember],
     ) -> WorkspaceRestoreReport:
         return WorkspaceRestoreReport(
             checkpoint_id=checkpoint_id,
             status=RESTORE_STATUS_CONCLUDED,
             members=tuple(self._outcome_from_durable_row(row) for row in rows),
+            registration=self._registration_from_durable_state(store, rows),
+        )
+
+    def _registration_from_durable_state(
+        self, store: CheckpointRestoreStore, rows: Sequence[CheckpointMember]
+    ) -> RestoreRegistration:
+        """Rebuild the registration ANSWER for an already-concluded checkpoint.
+
+        The run-local :class:`RestoreRegistration` detail (per-member refusal
+        reasons, invalidation counts, attempts) is not durably retained — but
+        the registration's EFFECT is: a landed registration leaves every
+        written file member's coordinator artifact at the manifest fingerprint
+        (the exact predicate the service-side idempotency filter matches).
+        This rebuild re-classifies the durable member rows the way
+        :meth:`_registration_seam` classifies run-local outcomes, then
+        re-READS that effect through the store's
+        ``workspace_member_registered`` seam — pure reads; nothing resolves,
+        mints, commits, or re-attempts (REFUSED is terminal; ``concluded`` is
+        absorbing):
+
+        - no written file members → ``empty_write_set`` (nothing ever needed
+          a commit — the delete-only / all-converged / S3-only shapes);
+        - every written file member registered at its manifest fingerprint →
+          ``registered_by_prior_run`` (the registration landed before this
+          checkpoint concluded; nothing re-registered);
+        - anything else → ``refused``: the registration concluded REFUSED
+          (fence or exhaustion — terminal either way). The un-registered
+          members are named in the detail; durable rows retain no per-member
+          conflict reason, so the ``refused`` map stays empty and the
+          identity-matched ``status`` is the signal downstream surfaces exit
+          non-zero on.
+
+        Disclosed residual: a foreign commit landing AFTER a committed
+        registration moves the artifact off the manifest fingerprint, so a
+        much-later rebuild can read a landed registration as ``refused`` —
+        the fail-closed direction (a loud false alarm an operator can
+        inspect), never the silent ``None``-means-fine this rebuild replaces.
+        """
+        substrate_registered: list[str] = []
+        deleted_recorded: list[str] = []
+        writes: list[WorkspaceRestoreWrite] = []
+        for row in rows:
+            if row.deleted_at_restore is not None:
+                deleted_recorded.append(row.member_path)
+                continue
+            if row.restore_outcome != RESTORE_OUTCOME_RESTORED:
+                continue
+            if row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value:
+                substrate_registered.append(row.member_path)
+                continue
+            if row.fingerprint is None:  # defensive: a written member has one
+                continue
+            writes.append(
+                WorkspaceRestoreWrite(
+                    member_path=row.member_path, fingerprint=row.fingerprint
+                )
+            )
+        if not writes:
+            return RestoreRegistration(
+                status=WORKSPACE_REGISTRATION_EMPTY,
+                detail=(
+                    "rebuilt from durable rows: no written file members — the "
+                    "commit write-set was empty and commit_all was never called"
+                ),
+                substrate_registered=tuple(substrate_registered),
+                deleted_recorded=tuple(deleted_recorded),
+            )
+        unregistered = [
+            write.member_path
+            for write in writes
+            if not store.workspace_member_registered(
+                write.member_path, write.fingerprint
+            )
+        ]
+        if not unregistered:
+            return RestoreRegistration(
+                status=WORKSPACE_REGISTRATION_PRIOR_RUN,
+                detail=(
+                    "rebuilt from durable state: every written file member is "
+                    "registered at its manifest fingerprint — the registration "
+                    "landed before this checkpoint concluded (nothing "
+                    "re-registered)"
+                ),
+                substrate_registered=tuple(substrate_registered),
+                deleted_recorded=tuple(deleted_recorded),
+            )
+        return RestoreRegistration(
+            status=WORKSPACE_REGISTRATION_REFUSED,
+            detail=(
+                "rebuilt from durable state: written file member(s) "
+                f"{sorted(unregistered)} are NOT registered at their manifest "
+                "fingerprints — the registration concluded REFUSED (fence or "
+                "exhaustion; TERMINAL — concluded is absorbing, nothing is "
+                "re-attempted). Per-member conflict reasons are not durably "
+                "retained; the status is the signal."
+            ),
+            substrate_registered=tuple(substrate_registered),
+            deleted_recorded=tuple(deleted_recorded),
         )
 
     # --- internals ------------------------------------------------------------

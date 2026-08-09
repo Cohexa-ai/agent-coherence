@@ -69,6 +69,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CheckpointUnknown,
     CommitUnconfirmed,
+    OccCallerTransientError,
     WatchdogAbandoned,
 )
 from ccs.core.invariants import check_monotonic_version
@@ -851,6 +852,9 @@ class _CrashOnNthMemberRecord:
     def register_workspace_restore(self, *args: Any, **kwargs: Any) -> Any:
         return self._inner.register_workspace_restore(*args, **kwargs)
 
+    def workspace_member_registered(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.workspace_member_registered(*args, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
@@ -1289,6 +1293,80 @@ def test_file_commit_unconfirmed_is_held(service: CoordinatorService) -> None:
     assert report.status == RESTORE_STATUS_CONCLUDED
 
 
+class _EnvFailureFileStore(_FakeFileStore):
+    """``read_with_version`` raises the armed exception — the member path
+    replaced by a directory (deterministic pathology) or a transport blip
+    (transient), armed AFTER capture so only the restore leg sees it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reads_with: BaseException | None = None
+
+    def read_with_version(self, path: str) -> tuple[bytes, int]:
+        if self.fail_reads_with is not None:
+            raise self.fail_reads_with
+        return super().read_with_version(path)
+
+
+def test_member_path_replaced_by_directory_absorbs_and_restore_concludes(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """FIX-2 regression (termination-contract hole): a deterministic
+    member-environment pathology (the member path now a directory —
+    IsADirectoryError, OSError family) escaping a restore leg is ABSORBED
+    into the absorbing target_lost with the member recorded durably; the
+    restore CONCLUDES instead of wedging in_progress with no report."""
+    files = _EnvFailureFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    checkpoint_id = versioner.checkpoint("dirified").record.checkpoint_id
+    files.fail_reads_with = IsADirectoryError(21, "Is a directory", "notes/plan.md")
+
+    report = versioner.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_TARGET_LOST
+    assert "IsADirectoryError" in member.detail
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+    (stored,) = registry.get_checkpoint_members(checkpoint_id)
+    assert stored.restore_outcome == RESTORE_OUTCOME_TARGET_LOST  # durably terminal
+
+
+def test_transient_transport_failure_still_raises_then_resumes(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """FIX-2 boundary: transient transport shapes (ConnectionError — an
+    OSError subclass) are NOT absorbed — they propagate (the crash-resume
+    path, BY DESIGN), leave restore_status=in_progress durably, and a later
+    restore() resumes and concludes once the transient clears."""
+    files = _EnvFailureFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    checkpoint_id = versioner.checkpoint("transient").record.checkpoint_id
+    files.fail_reads_with = ConnectionError("volume transport down")
+
+    with pytest.raises(ConnectionError):
+        versioner.restore(checkpoint_id)
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_IN_PROGRESS
+    (stored,) = registry.get_checkpoint_members(checkpoint_id)
+    assert stored.restore_outcome is None  # still pending: nothing terminalized
+
+    files.fail_reads_with = None  # the transient clears
+    report = versioner.restore(checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED  # live still matches
+    assert report.status == RESTORE_STATUS_CONCLUDED
+
+
 # ---------------------------------------------------------------------------
 # Pre-flight refusals (typed; nothing started)
 # ---------------------------------------------------------------------------
@@ -1396,6 +1474,14 @@ class _RegistrationProbeService(CoordinatorService):
         #: Callable fired INSIDE the first commit_all, before it runs — lands
         #: a peer commit between the registration's comparand read and its CAS.
         self.before_first_commit_all: Any | None = None
+        #: Callable fired INSIDE EVERY commit_all, before it runs — sustains
+        #: registered-writer contention across the whole re-drive budget (the
+        #: FIX-5 exhaustion driver).
+        self.before_every_commit_all: Any | None = None
+        #: 1-based register calls that raise OccCallerTransientError BEFORE
+        #: delegating (a peer's commit left the controller mid-transient:
+        #: retry-eligible, budget-bounded — the FIX-5 continue branch).
+        self.transient_on_register_calls: set[int] = set()
         #: 1-based register call to crash BEFORE delegating (kill between the
         #: legs and the registration).
         self.crash_on_register_call: int | None = None
@@ -1408,10 +1494,16 @@ class _RegistrationProbeService(CoordinatorService):
         self.commit_all_calls += 1
         if self.commit_all_calls == 1 and self.before_first_commit_all is not None:
             self.before_first_commit_all()
+        if self.before_every_commit_all is not None:
+            self.before_every_commit_all()
         return super().commit_all(**kwargs)
 
     def register_workspace_restore(self, **kwargs: Any) -> Any:
         self.register_calls += 1
+        if self.register_calls in self.transient_on_register_calls:
+            raise OccCallerTransientError(
+                "controller invalidated mid-flight (scripted transient)"
+            )
         if self.crash_on_register_call == self.register_calls:
             raise RuntimeError("simulated crash before registration")
         result = super().register_workspace_restore(**kwargs)
@@ -1779,8 +1871,11 @@ def test_superseded_controller_late_apply_rejected_by_fence() -> None:
     updated = registry.get_artifact(art.id)
     assert updated.version == 1
     assert updated.content_hash == sha256_hex(b"old-body")
-    # The restore still CONCLUDES; the refusal skipped the 'registered' marker
-    # (a later resume may re-attempt; the fence rejects it again).
+    # The restore still CONCLUDES; the refusal skipped the 'registered' marker.
+    # REFUSED is TERMINAL: 'concluded' is absorbing, so a later restore()
+    # REPORTS the refusal rebuilt from durable state and never re-attempts it
+    # (only a crash BEFORE the concluded write resumes into the seam once
+    # more — where the fence rejects a superseded controller again).
     assert report.status == RESTORE_STATUS_CONCLUDED
     assert service.status_writes == [
         RESTORE_STATUS_IN_PROGRESS,
@@ -1830,10 +1925,11 @@ def test_restore_monotonicity_forward_commit_carrying_old_bytes() -> None:
     assert updated.content_hash == _FP_PLAN  # the captured state, re-imposed
 
 
-def test_concluded_report_from_durable_rows_carries_no_registration() -> None:
+def test_concluded_report_rebuilds_registration_from_durable_state() -> None:
     """A report rebuilt from durable rows (idempotent re-restore of a
-    concluded checkpoint) carries registration=None — the detail is run-local
-    by design; the durable truths are the marker and the artifact versions."""
+    concluded checkpoint) REBUILDS its registration answer — the run-local
+    detail is gone, but the durable truths (member rows + the coordinator's
+    registered state) re-derive it: never a silent registration=None."""
     _registry, service = _probe_service()
     files = _FakeFileStore()
     files.put("calm.md", b"calm", 5)
@@ -1844,9 +1940,156 @@ def test_concluded_report_from_durable_rows_carries_no_registration() -> None:
     checkpoint_id = versioner.checkpoint("re").record.checkpoint_id
     first = versioner.restore(checkpoint_id)
     assert first.registration is not None
+    assert first.registration.status is WORKSPACE_REGISTRATION_EMPTY  # converged: no writes
     second = versioner.restore(checkpoint_id)
-    assert second.registration is None
     assert second.status == RESTORE_STATUS_CONCLUDED
+    assert second.registration is not None  # rebuilt, never None-means-fine
+    assert second.registration.status is WORKSPACE_REGISTRATION_EMPTY
+
+
+def test_concluded_report_rebuilds_committed_registration_as_prior_run() -> None:
+    """The committed half of the rebuild: after a COMMITTED registration
+    concludes, a re-restore re-reads every written member at its manifest
+    fingerprint and answers registered_by_prior_run — commit_all and the
+    registration seam are NOT re-driven (exactly-once across re-restores)."""
+    _registry, service = _probe_service()
+    service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+    first = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert first.registration is not None
+    assert first.registration.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert service.commit_all_calls == 1
+
+    second = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = second.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_PRIOR_RUN
+    assert service.commit_all_calls == 1  # nothing re-committed
+    assert service.register_calls == 1  # the seam itself was not re-driven
+
+
+def test_fence_refused_re_restore_reports_refusal_not_success() -> None:
+    """FIX-1 regression (REFUSED masked as success): after a fence-REFUSED
+    registration concludes, a SECOND restore() must surface the refusal —
+    registration.status REFUSED rebuilt from durable state, never None — and
+    must not call commit_all again (REFUSED is terminal; concluded is
+    absorbing)."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    registry.set_agent_state(art.id, OWNER, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    registry.set_agent_state(
+        art.id, OWNER, MESIState.INVALID, trigger="reclaim_heartbeat", tick=2
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    first = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert first.registration is not None
+    assert first.registration.status is WORKSPACE_REGISTRATION_REFUSED
+    assert service.commit_all_calls == 1
+
+    second = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    assert second.status == RESTORE_STATUS_CONCLUDED
+    reg = second.registration
+    assert reg is not None  # never silent None-means-fine
+    assert reg.status is WORKSPACE_REGISTRATION_REFUSED
+    assert "notes/plan.md" in reg.detail  # the un-registered member is named
+    assert service.commit_all_calls == 1  # nothing re-attempted (terminal)
+    assert service.register_calls == 1  # the seam itself was not re-driven
+    # The fenced-out apply stayed out across BOTH runs: no phantom bump.
+    updated = registry.get_artifact(art.id)
+    assert updated.version == 1
+    assert updated.content_hash == sha256_hex(b"old-body")
+
+
+def test_registration_budget_exhaustion_under_sustained_contention() -> None:
+    """FIX-5a: sustained version_mismatch contention (a registered peer lands
+    a commit inside EVERY comparand gap) drives the registration re-drive
+    loop to budget exhaustion — REFUSED (nothing registered, all-or-nothing),
+    the restore still concludes WITHOUT the 'registered' marker, and a
+    re-restore REPORTS the refusal rebuilt from durable state (post-FIX-1
+    semantics), never re-attempting."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+    writer = uuid.uuid4()
+
+    def _peer_commit_every_gap() -> None:
+        current = registry.get_artifact(art.id).version
+        result = registry.commit_cas(
+            art.id,
+            writer,
+            expected_version=current,
+            content_hash=sha256_hex(f"peer-{current}".encode()),
+            content=f"peer-{current}",
+            tick=50 + current,
+        )
+        assert not isinstance(result, ConflictDetail)  # the peer always WINS
+
+    service.before_every_commit_all = _peer_commit_every_gap
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = report.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_REFUSED
+    assert reg.attempts == MAX_RESTORE_LEG_REDRIVES + 1  # budget fully consumed
+    assert service.commit_all_calls == MAX_RESTORE_LEG_REDRIVES + 1
+    assert reg.refused == {"notes/plan.md": "version_mismatch"}
+    assert "budget exhausted" in reg.detail
+    # Status honesty: concluded WITHOUT the 'registered' marker (refused path).
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_CONCLUDED,
+    ]
+    # Nothing registered: the artifact carries the last PEER hash, not the
+    # manifest fingerprint (all-or-nothing held every attempt).
+    assert registry.get_artifact(art.id).content_hash != _FP_PLAN
+
+    # Post-FIX-1: the re-restore rebuilds REFUSED (never None) and does not
+    # re-attempt — commit_all and the seam are untouched by the second run.
+    calls_before = (service.commit_all_calls, service.register_calls)
+    second = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert second.registration is not None
+    assert second.registration.status is WORKSPACE_REGISTRATION_REFUSED
+    assert (service.commit_all_calls, service.register_calls) == calls_before
+
+
+def test_registration_transient_invalidation_retries_and_lands() -> None:
+    """FIX-5b: OccCallerTransientError raised by the registration call (a
+    peer's commit left the controller mid-transient) is retry-eligible — the
+    loop consumes one budget slot, continues, and the next attempt lands
+    COMMITTED; the transient never escapes the restore."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+    service.transient_on_register_calls = {1}
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = report.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert reg.attempts == 2  # attempt 1 raised the transient; attempt 2 landed
+    assert service.register_calls == 2
+    assert service.commit_all_calls == 1  # the transient attempt never committed
+    updated = registry.get_artifact(art.id)
+    assert updated.version == 2
+    assert updated.content_hash == _FP_PLAN
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_REGISTERED,
+        RESTORE_STATUS_CONCLUDED,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2231,6 +2474,69 @@ def test_shared_version_cross_checkpoint_release_keeps_hold(
     assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
     expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
     assert expired == [put["VersionId"]] and held == []
+
+
+class _PinBetweenScanAndDrop(WorkspaceVersioner):
+    """Deterministic FIX-3 interleave: right AFTER the release's first
+    shared-elsewhere scan answers, the injected callable lands a sibling
+    checkpoint's pin on the same (member_path, native_token) — the
+    'concurrent pin_checkpoint between the scan and the substrate drop'
+    race, reproduced without threads."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.inject_after_first_scan: Any | None = None
+
+    def _pin_shared_elsewhere(self, store: Any, checkpoint_id: str, row: Any) -> bool:
+        result = WorkspaceVersioner._pin_shared_elsewhere(store, checkpoint_id, row)
+        if self.inject_after_first_scan is not None:
+            inject, self.inject_after_first_scan = self.inject_after_first_scan, None
+            inject()
+        return result
+
+
+def test_concurrent_pin_between_release_scan_and_drop_keeps_hold(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """FIX-3 regression (under-retention race): a concurrent pin_checkpoint
+    recording `held` on the same (member_path, native_token) BETWEEN the
+    release's shared-elsewhere scan and its substrate drop must not lose the
+    hold it just claimed — the last-instant re-check sees the new holder and
+    SKIPS the drop (over-retention direction, safe)."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    releasing = _PinBetweenScanAndDrop(service=service, owner=OWNER, clock=_TickClock())
+    releasing.add_object_member(obj, "cfg.json")
+    cp_a = releasing.checkpoint("holder-a")
+    assert cp_a.members[0].pin_state == PIN_STATE_HELD
+
+    sibling = _versioner(service)
+    sibling.add_object_member(obj, "cfg.json")
+    # Same version (no intervening write), deliberately unpinned so the
+    # release's FIRST scan sees no other holder.
+    cp_b = sibling.checkpoint("holder-b", pin=False)
+    assert cp_b.members[0].native_token == cp_a.members[0].native_token
+    assert cp_b.members[0].pin_state == PIN_STATE_UNPINNED
+
+    releasing.inject_after_first_scan = lambda: sibling.pin_checkpoint(
+        cp_b.record.checkpoint_id
+    )
+
+    releasing._release_checkpoint_pins(cp_a.record.checkpoint_id)
+
+    # A's record is released; B's freshly-landed hold SURVIVES the release.
+    (row_a,) = registry.get_checkpoint_members(cp_a.record.checkpoint_id)
+    (row_b,) = registry.get_checkpoint_members(cp_b.record.checkpoint_id)
+    assert row_a.pin_state == PIN_STATE_RELEASED
+    assert row_b.pin_state == PIN_STATE_HELD
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    # The version is genuinely protected: lifecycle expiry cannot take it.
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert held == [put["VersionId"]] and expired == []
+    # Last-out still drops: B's own release finds no other holder.
+    sibling._release_checkpoint_pins(cp_b.record.checkpoint_id)
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
 
 
 def test_pin_checkpoint_redrive_is_idempotent(

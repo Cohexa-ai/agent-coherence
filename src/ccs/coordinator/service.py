@@ -448,6 +448,18 @@ class CoordinatorService:
         # ``looks_like_session_token`` (the shape predicate), so the fail-closed
         # guarantee never depends on the tombstone, only the precise attribution.
         self._reaped_tombstone: "OrderedDict[str, None]" = OrderedDict()
+        # Workspace-registration first-observation mint (WV Unit 5): the
+        # IN-MEMORY registry has no ``resolve_or_register``, so the fallback in
+        # :meth:`_resolve_workspace_member_artifact` is a name scan followed by
+        # a mint — a compound check-then-act with no UNIQUE constraint behind
+        # it. This lock serializes that scan+mint so two concurrent first
+        # observations of one member_path mint ONE artifact (parity with the
+        # sqlite path's atomic ``resolve_or_register``; free-threading
+        # discipline F4 — correctness never rides the GIL). Lock order stays
+        # service-lock → registry-lock (the registry never calls back into the
+        # service), and this lock is never held together with
+        # ``_session_lock``.
+        self._workspace_mint_lock = threading.Lock()
 
     def register_artifact(
         self,
@@ -2726,16 +2738,45 @@ class CoordinatorService:
         a miss — an ``Artifact(name, version=1, content_hash=fingerprint)``
         seeded with EMPTY content (hash-only: member bytes never enter the
         coordinator; parity with the sqlite mint, which stores no body either).
+
+        The in-memory scan+mint is a compound check-then-act, so it runs under
+        ``_workspace_mint_lock`` — two concurrent first observations of one
+        ``member_path`` serialize and mint ONE artifact, keeping the parity
+        claim with sqlite's UNIQUE-backed ``resolve_or_register`` honest
+        instead of GIL-dependent.
         """
         if isinstance(self.registry, SqliteExtended):
             return self.registry.resolve_or_register(member_path, fingerprint)
+        with self._workspace_mint_lock:
+            for artifact_id in self.registry.artifact_ids():
+                artifact = self.registry.get_artifact(artifact_id)
+                if artifact is not None and artifact.name == member_path:
+                    return artifact_id
+            minted = Artifact(name=member_path, version=1, content_hash=fingerprint)
+            self.registry.register_artifact(minted, "")
+            return minted.id
+
+    def workspace_member_registered(self, member_path: str, fingerprint: str) -> bool:
+        """READ-ONLY: is ``member_path`` currently registered at ``fingerprint``?
+
+        True iff a coordinator artifact named ``member_path`` exists AND its
+        current ``content_hash`` equals ``fingerprint`` — the same predicate
+        :meth:`register_workspace_restore`'s idempotency filter applies,
+        exposed as a pure read so the restore engine can REBUILD the
+        registration answer for an already-``concluded`` checkpoint (WV Unit
+        5: a refused-terminal registration must never re-read as
+        ``None``-means-fine on a re-restore). Never resolves, never mints,
+        never mutates: an unknown path answers ``False`` (nothing registered).
+        A plain name scan on BOTH registry backends — sqlite's
+        ``resolve_or_register`` is mint-on-miss and therefore unusable for a
+        read — matching the first-match semantics of
+        :meth:`_resolve_workspace_member_artifact`'s in-memory scan.
+        """
         for artifact_id in self.registry.artifact_ids():
             artifact = self.registry.get_artifact(artifact_id)
             if artifact is not None and artifact.name == member_path:
-                return artifact_id
-        minted = Artifact(name=member_path, version=1, content_hash=fingerprint)
-        self.registry.register_artifact(minted, "")
-        return minted.id
+                return artifact.content_hash == fingerprint
+        return False
 
     def invalidate(
         self,

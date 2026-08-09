@@ -339,3 +339,89 @@ def test_registered_status_accepted_and_round_trips(service, registry) -> None:
     assert record is not None
     assert record.restore_status == RESTORE_STATUS_REGISTERED
     assert record.restore_updated_at == 123.0
+
+
+# ---------------------------------------------------------------------------
+# The read-only registration query (the FIX-1 rebuild seam)
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_member_registered_pure_read_never_mints(service, registry) -> None:
+    """workspace_member_registered answers the idempotency-filter predicate as
+    a PURE read: unknown path → False with nothing minted; known path → the
+    content-hash comparison; never a resolve, never a mutation."""
+    ids_before = set(registry.artifact_ids())
+    assert service.workspace_member_registered("notes/plan.md", FP_NEW) is False
+    assert set(registry.artifact_ids()) == ids_before  # no first-observation mint
+
+    artifact = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=FP_OLD
+    )
+    assert service.workspace_member_registered("notes/plan.md", FP_NEW) is False
+    assert service.workspace_member_registered("notes/plan.md", FP_OLD) is True
+    assert registry.get_artifact(artifact.id).version == 1  # untouched either way
+
+
+# ---------------------------------------------------------------------------
+# The in-memory first-observation mint race (the FIX-4 serialization)
+# ---------------------------------------------------------------------------
+
+
+class _ScanGateRegistry(ArtifactRegistry):
+    """``artifact_ids()`` blocks ONCE mid-scan — widens the scan→mint window
+    so the two-thread first-observation race is deterministic, not timing-
+    dependent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scan_entered = threading.Event()
+        self.release_scan = threading.Event()
+        self._armed = True
+
+    def artifact_ids(self):
+        ids = super().artifact_ids()
+        if self._armed:
+            self._armed = False
+            self.scan_entered.set()
+            assert self.release_scan.wait(timeout=5.0)
+        return ids
+
+
+def test_in_memory_first_observation_race_mints_one_artifact() -> None:
+    """FIX-4 regression (in-memory mint race): two concurrent first
+    observations of one never-seen member_path on the IN-MEMORY registry must
+    resolve to ONE artifact — the scan-then-mint is serialized service-side,
+    honoring the parity claim with sqlite's atomic resolve_or_register."""
+    registry = _ScanGateRegistry()
+    service = CoordinatorService(registry)
+    results: list = []
+
+    def resolve() -> None:
+        results.append(
+            service._resolve_workspace_member_artifact("notes/plan.md", FP_NEW)
+        )
+
+    first = threading.Thread(target=resolve)
+    first.start()
+    assert registry.scan_entered.wait(timeout=5.0)  # first observer is mid-scan
+    second = threading.Thread(target=resolve)
+    second.start()
+    # Serialized: the second observer must NOT complete while the first still
+    # holds the mint lock mid-scan (pre-fix it minted a duplicate right here).
+    second.join(timeout=0.5)
+    assert second.is_alive()
+    registry.release_scan.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+    assert not first.is_alive() and not second.is_alive()
+
+    assert len(results) == 2
+    assert len(set(results)) == 1  # ONE artifact id, both observers agree
+    named = [
+        artifact
+        for artifact in (registry.get_artifact(a) for a in registry.artifact_ids())
+        if artifact is not None and artifact.name == "notes/plan.md"
+    ]
+    assert len(named) == 1  # exactly one mint
+    assert named[0].version == 1
+    assert named[0].content_hash == FP_NEW
