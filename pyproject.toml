@@ -66,6 +66,10 @@ agent-coherence-hook-client = "ccs.cli.coherence_hook_client:main"
 # predicate engine (single-writer / monotonic-version / stale-read /
 # lost-write) and emits human or JSON findings with per-reason exit codes.
 agent-coherence-replay = "ccs.cli.coherence_replay:main"
+# Workspace-Versioning operator CLI (WV R6): checkpoint / list / restore /
+# status over heterogeneous workspace members, driving an in-process
+# coordinator service (pin legs have no HTTP surface by design).
+agent-coherence-workspace = "ccs.cli.workspace:main"
 # The stale-write-guard-fs stdio MCP server (requires the `mcp` extra).
 # Single-host coherence guard over CoherentVolume; configured via SWG_ROOT /
 # SWG_MANAGED. See src/ccs/mcp/.
