@@ -68,8 +68,11 @@ from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
     OCC_CALLER_TRANSIENT_REASON,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
     SessionInvalidated,
@@ -87,6 +90,7 @@ from ccs.core.types import (
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
+    WorkspaceRestoreWrite,
 )
 
 logger = logging.getLogger(__name__)
@@ -3458,6 +3462,301 @@ def _handle_workspace_checkpoints(
     )
 
 
+MAX_CHECKPOINT_ID_LEN = 128
+"""Cap on a wire ``checkpoint_id`` (server-minted uuid4 strings are 36 chars;
+the headroom absorbs future id shapes without admitting content-sized text)."""
+
+_RESTORE_PROGRESS_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_progress_unconfirmed",
+}
+"""Fail-closed degrade envelope for the restore progress routes (WV Unit 5):
+a watchdog-timed-out status/outcome write must NOT read as recorded — the
+abort Event threaded into the service's ``abort_guard`` fails the late write
+closed at the registry lock (the A6 lesson)."""
+
+_RESTORE_REGISTER_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_registration_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /workspace/restore/register``: a
+timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
+posture — it is a version-bumping commit path), never as success."""
+
+
+def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
+    """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
+    if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+        return "checkpoint_id must be a non-empty string"
+    if len(checkpoint_id) > MAX_CHECKPOINT_ID_LEN:
+        return f"checkpoint_id exceeds {MAX_CHECKPOINT_ID_LEN} chars"
+    return None
+
+
+def _handle_workspace_restore_status(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/status — record checkpoint-level restore status.
+
+    Request: ``{session_id, checkpoint_id, status}`` where ``status`` is one of
+    the closed :data:`~ccs.core.exceptions.RESTORE_STATUSES` (boundary-gated
+    here AND service-validated — fail-closed twice; crash-resume classifies by
+    identity, so an unvetted string must never land). The remote half of the
+    restore engine's ``CheckpointRestoreStore`` seam (the capture path's
+    mirror: durable metadata write, abort-threaded, degrade fail-closed).
+
+    NOT in ``_MIGRATION_REJECTED_ROUTES``: like the checkpoint create, this is
+    durable metadata with no version bump — it lands durably or fails typed.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    status = body.get("status")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if status not in RESTORE_STATUSES:
+        req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
+        return
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_restore_status(
+                checkpoint_id, status, updated_at=float(now), abort=abort
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "restore_status": status,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_member(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/member — record one member's terminal outcome.
+
+    Request: ``{session_id, checkpoint_id, member_path, restore_outcome,
+    deleted_at_restore?}``. ``restore_outcome`` is ``null`` (the explicit
+    reset) or one of the closed
+    :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (boundary-gated AND
+    service-validated); ``deleted_at_restore`` is the manifest-side delete
+    record — per the plan's registration split, delete legs register HERE,
+    never through ``commit_all`` (which has no delete semantics).
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    member_path = body.get("member_path")
+    restore_outcome = body.get("restore_outcome")
+    deleted_at_restore = body.get("deleted_at_restore")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    path_err = validate_path(member_path)
+    if path_err:
+        req._json(400, {"error": f"member_path: {path_err}"})
+        return
+    if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
+        req._json(
+            400,
+            {
+                "error": (
+                    f"restore_outcome must be null or one of "
+                    f"{sorted(RESTORE_MEMBER_OUTCOMES)}"
+                )
+            },
+        )
+        return
+    if deleted_at_restore is not None and (
+        isinstance(deleted_at_restore, bool)
+        or not isinstance(deleted_at_restore, (int, float))
+    ):
+        req._json(400, {"error": "deleted_at_restore must be null or a number"})
+        return
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_member_restore(
+                checkpoint_id,
+                member_path,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=(
+                    float(deleted_at_restore) if deleted_at_restore is not None else None
+                ),
+                abort=abort,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "member_path": member_path,
+            "restore_outcome": restore_outcome,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_register(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/register — the Unit-5 coordinator registration.
+
+    Request: ``{session_id, checkpoint_id, writes: [{member_path,
+    fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
+    (fingerprints, never content bytes; the boundary enforces 64-hex). The
+    CONTROLLER identity derives from the authenticated ``session_id``
+    server-side (R9/R13), never a client field. One
+    ``register_workspace_restore`` call → at most one all-or-nothing
+    ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
+    (``commit_all`` never called, by contract).
+
+    Registered peers holding a member are invalidated ATOMICALLY by the
+    registry commit; peers learn through the protocol (their next read is
+    strict-denied), so — matching the post-edit-cas house pattern — the
+    response surfaces the invalidation COUNT rather than re-broadcasting
+    signals.
+
+    In ``_MIGRATION_REJECTED_ROUTES``: this is a version-bumping write
+    initiation (the post-edit-cas strand hazard applies mid-drain).
+
+    Responses:
+      - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
+        refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
+        from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
+        on ``status == "refused"`` — nothing mutated then, all-or-nothing)
+      - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
+      - watchdog degrade → fail-closed
+        :data:`_RESTORE_REGISTER_DEGRADED_RESPONSE`
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    writes = body.get("writes")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if not isinstance(writes, list):
+        req._json(400, {"error": "writes must be a list of {member_path, fingerprint}"})
+        return
+    if len(writes) > MAX_CHECKPOINT_MEMBERS:
+        req._json(400, {"error": f"writes exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
+        return
+    entries: list[WorkspaceRestoreWrite] = []
+    seen_paths: set[str] = set()
+    for item in writes:
+        if not isinstance(item, dict):
+            req._json(400, {"error": "each write must be a JSON object"})
+            return
+        member_path = item.get("member_path", "")
+        path_err = validate_path(member_path)
+        if path_err:
+            req._json(400, {"error": f"member_path: {path_err}"})
+            return
+        fingerprint = item.get("fingerprint")
+        if not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint):
+            req._json(400, {"error": "fingerprint must be a 64-hex sha-256 digest"})
+            return
+        if member_path in seen_paths:
+            req._json(400, {"error": "writes contains duplicate member_path values"})
+            return
+        seen_paths.add(member_path)
+        entries.append(
+            WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
+        )
+
+    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    controller = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            result = coordinator.service.register_workspace_restore(
+                checkpoint_id=checkpoint_id,
+                controller=controller,
+                writes=entries,
+                issued_at_tick=now,
+                abort=abort,
+            )
+        except CheckpointUnknown as exc:
+            return {"ok": False, "reason": exc.reason}
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        except OccCallerTransientError:
+            # Retry-eligible: the controller is mid-transient (a peer's commit
+            # invalidated it between read and CAS). Byte-stable reason.
+            return {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+        except CoherenceError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "status": result.status,
+            "detail": result.detail,
+            "versions": dict(result.versions),
+            "skipped": list(result.skipped),
+            "refused": {
+                path: conflict.reason for path, conflict in result.refused.items()
+            },
+            "invalidated": len(result.signals),
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_REGISTER_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
 def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
@@ -3805,6 +4104,12 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     # A6 session-commit lesson: every new mutating route threads abort).
     ("POST", "/workspace/checkpoint"): _handle_workspace_checkpoint,
     ("GET", "/workspace/checkpoints"): _handle_workspace_checkpoints,
+    # WV plan Unit 5 — restore progress + registration endpoints (the remote
+    # half of the restore engine's CheckpointRestoreStore seam). Every
+    # mutating handler threads a watchdog abort Event (the A6 lesson).
+    ("POST", "/workspace/restore/status"): _handle_workspace_restore_status,
+    ("POST", "/workspace/restore/member"): _handle_workspace_restore_member,
+    ("POST", "/workspace/restore/register"): _handle_workspace_restore_register,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
 }
@@ -3834,6 +4139,12 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # session.commit_all is the batch OCC write — same strand hazard as
     # /session/commit, multiplied across the write-set. Reject it draining.
     ("POST", "/session/commit_all"),
+    # WV Unit 5: the restore registration is a version-bumping write
+    # initiation (its commit_all rides the same strand hazard). The restore
+    # PROGRESS routes (/workspace/restore/status, /workspace/restore/member)
+    # stay out: durable metadata with no version bump — the checkpoint-create
+    # rationale.
+    ("POST", "/workspace/restore/register"),
 }
 
 

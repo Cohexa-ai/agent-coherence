@@ -56,12 +56,21 @@ from ccs.core.exceptions import (
     RESTORE_STATUS_CONCLUDED,
     RESTORE_STATUS_IN_PROGRESS,
     RESTORE_STATUS_NONE,
+    RESTORE_STATUS_REGISTERED,
+    STALE_READ_GENERATION_REASON,
+    WORKSPACE_REGISTRATION_COMMITTED,
+    WORKSPACE_REGISTRATION_EMPTY,
+    WORKSPACE_REGISTRATION_PRIOR_RUN,
+    WORKSPACE_REGISTRATION_REFUSED,
     CasVersionConflict,
     CheckpointUnknown,
     CommitUnconfirmed,
     WatchdogAbandoned,
 )
+from ccs.core.invariants import check_monotonic_version
+from ccs.core.states import MESIState
 from ccs.core.substrate import sha256_hex
+from ccs.core.types import ConflictDetail
 from ccs.testing.s3_local import LocalS3Client
 
 OWNER = uuid.uuid4()
@@ -835,6 +844,9 @@ class _CrashOnNthMemberRecord:
             raise RuntimeError("simulated crash (kill -9)")
         return self._inner.set_workspace_checkpoint_member_restore(*args, **kwargs)
 
+    def register_workspace_restore(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.register_workspace_restore(*args, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
@@ -1349,3 +1361,684 @@ def test_service_restore_vocabulary_fails_closed(
     assert record is not None and record.restore_status == RESTORE_STATUS_NONE
     (member,) = registry.get_checkpoint_members(checkpoint_id)
     assert member.restore_outcome is None
+
+
+# ===========================================================================
+# Registration — WV plan Unit 5 (R4/R5): coordinator registration of restore
+# results (all-or-nothing for writes), registered-writer concurrency semantics
+# (invalidation + fence), and restore monotonicity (forward commit carrying
+# old bytes).
+# ===========================================================================
+
+
+class _RegistrationProbeService(CoordinatorService):
+    """CoordinatorService instrumented for the Unit-5 tests: call counters,
+    the durable status-write trace, and deterministic crash / race injection
+    hooks (the delay-injection harness's registration half)."""
+
+    def __init__(self, registry: ArtifactRegistry) -> None:
+        super().__init__(registry)
+        self.commit_all_calls = 0
+        self.register_calls = 0
+        self.status_writes: list[str] = []
+        #: Callable fired INSIDE the first commit_all, before it runs — lands
+        #: a peer commit between the registration's comparand read and its CAS.
+        self.before_first_commit_all: Any | None = None
+        #: 1-based register call to crash BEFORE delegating (kill between the
+        #: legs and the registration).
+        self.crash_on_register_call: int | None = None
+        #: Crash AFTER the registration landed (the marker-write window).
+        self.crash_after_register_once: bool = False
+        #: Status value whose FIRST durable write crashes (e.g. "concluded").
+        self.crash_on_status_once: str | None = None
+
+    def commit_all(self, **kwargs: Any) -> Any:
+        self.commit_all_calls += 1
+        if self.commit_all_calls == 1 and self.before_first_commit_all is not None:
+            self.before_first_commit_all()
+        return super().commit_all(**kwargs)
+
+    def register_workspace_restore(self, **kwargs: Any) -> Any:
+        self.register_calls += 1
+        if self.crash_on_register_call == self.register_calls:
+            raise RuntimeError("simulated crash before registration")
+        result = super().register_workspace_restore(**kwargs)
+        if self.crash_after_register_once:
+            self.crash_after_register_once = False
+            raise RuntimeError("simulated crash after registration landed")
+        return result
+
+    def set_workspace_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, **kwargs: Any
+    ) -> None:
+        if self.crash_on_status_once == status:
+            self.crash_on_status_once = None
+            raise RuntimeError(f"simulated crash on status write {status!r}")
+        self.status_writes.append(status)
+        super().set_workspace_checkpoint_restore_status(checkpoint_id, status, **kwargs)
+
+
+def _probe_service() -> tuple[ArtifactRegistry, _RegistrationProbeService]:
+    registry = ArtifactRegistry()
+    return registry, _RegistrationProbeService(registry)
+
+
+_FP_PLAN = sha256_hex(b"plan text")
+
+
+def _checkpoint_diverged_file(
+    service: Any,
+) -> tuple[str, _FakeFileStore, _FakeResolver]:
+    """One file member captured at (b'plan text', v7) then diverged live, so
+    the restore leg must WRITE — the written-member registration shape."""
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    checkpoint_id = versioner.checkpoint("reg").record.checkpoint_id
+    files.put("notes/plan.md", b"edited", 9)
+    return checkpoint_id, files, resolver
+
+
+def _restorer_for(service: Any, files: _FakeFileStore, resolver: _FakeResolver) -> Any:
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "notes/plan.md")
+    return restorer
+
+
+def test_restored_file_member_registers_via_commit_all_and_invalidates_peer() -> None:
+    """The written-file leg of the registration split: ONE all-or-nothing
+    commit_all, hash-only, forward version bump, registered peer invalidated."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    peer = uuid.uuid4()
+    registry.set_agent_state(art.id, peer, MESIState.SHARED, trigger="fetch", tick=1)
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    reg = report.registration
+    assert reg is not None
+    # Typed status matched by IDENTITY (the constant object flows through).
+    assert reg.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert reg.registered == {"notes/plan.md": 2}
+    assert reg.attempts == 1
+    assert service.commit_all_calls == 1
+
+    # The coordinator side: forward commit carrying OLD bytes' hash — version
+    # strictly increases, content hash is the manifest fingerprint, and the
+    # body NEVER entered the coordinator (hash-only registration).
+    updated = registry.get_artifact(art.id)
+    assert updated is not None
+    assert updated.version == 2
+    check_monotonic_version(1, updated.version)  # never a decrement
+    assert updated.content_hash == _FP_PLAN
+    assert registry.get_content(art.id) == "old-body"  # unchanged: no bytes in
+
+    # Registered-writer concurrency: the peer holding SHARED was invalidated
+    # atomically by the commit and the signal count surfaces on the report.
+    assert registry.get_agent_state(art.id, peer) == MESIState.INVALID
+    assert reg.invalidated_peers == 1
+
+    # The durable idempotency marker walked in_progress -> registered -> concluded.
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_REGISTERED,
+        RESTORE_STATUS_CONCLUDED,
+    ]
+
+
+def test_s3_written_member_registration_is_manifest_side_only() -> None:
+    """The S3 leg of the split: a written BYO-substrate member registers
+    MANIFEST-SIDE (its durable outcome row) — no coordinator artifact row is
+    ever forced (the substrate owns identity), and the commit_all write-set
+    holds ONLY the file member."""
+    registry, service = _probe_service()
+    service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"cfg-v1")
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    versioner.add_object_member(obj, "cfg.json")
+    checkpoint_id = versioner.checkpoint("split").record.checkpoint_id
+    files.put("notes/plan.md", b"edited", 9)
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"cfg-v2")
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "notes/plan.md")
+    restorer.add_object_member(obj, "cfg.json")
+    report = restorer.restore(checkpoint_id)
+
+    by_path = report.members_by_path
+    assert by_path["notes/plan.md"].outcome == RESTORE_OUTCOME_RESTORED
+    assert by_path["s3://cfg.json"].outcome == RESTORE_OUTCOME_RESTORED
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_COMMITTED
+    assert reg.registered == {"notes/plan.md": 2}
+    assert reg.substrate_registered == ("s3://cfg.json",)
+    assert service.commit_all_calls == 1
+    # No coordinator artifact identity was minted for the S3 member.
+    names = {registry.get_artifact(aid).name for aid in registry.artifact_ids()}
+    assert "s3://cfg.json" not in names
+    # Its manifest-side registration IS the durable outcome row.
+    stored = {m.member_path: m for m in registry.get_checkpoint_members(checkpoint_id)}
+    assert stored["s3://cfg.json"].restore_outcome == RESTORE_OUTCOME_RESTORED
+
+
+def test_delete_only_restore_records_only_never_calls_commit_all() -> None:
+    """The delete leg of the split: manifest-side deleted_at_restore records
+    ONLY — commit_all is NEVER called (asserted via the counting service), and
+    the registration concludes typed-EMPTY."""
+    registry, service = _probe_service()
+    client, obj = _s3()
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "ghost.json")  # ABSENT at capture
+    checkpoint_id = versioner.checkpoint("del-only").record.checkpoint_id
+    client.put_object(Bucket="demo", Key="ghost.json", Body=b"intruder")
+
+    restorer = _versioner(service)
+    restorer.add_object_member(obj, "ghost.json")
+    report = restorer.restore(checkpoint_id)
+
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.deleted_at_restore is not None
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_EMPTY
+    assert reg.deleted_recorded == ("s3://ghost.json",)
+    assert service.commit_all_calls == 0
+    assert service.register_calls == 0  # the empty write-set never leaves the seam
+    (stored,) = registry.get_checkpoint_members(checkpoint_id)
+    assert stored.deleted_at_restore is not None
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+
+
+def test_all_converged_empty_restore_concludes_with_empty_registration() -> None:
+    """Every member converged/skipped: the commit write-set is empty — the
+    status-update conclusion alone, commit_all never called."""
+    registry, service = _probe_service()
+    files = _FakeFileStore()
+    files.put("calm.md", b"calm", 5)
+    resolver = _FakeResolver()
+    resolver.keep("calm.md", 5, b"calm")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "calm.md")
+    versioner.add_forward_only_member("effects/notify")
+    checkpoint_id = versioner.checkpoint("noop").record.checkpoint_id
+
+    report = versioner.restore(checkpoint_id)
+
+    by_path = report.members_by_path
+    assert by_path["calm.md"].outcome == RESTORE_OUTCOME_CONVERGED
+    assert by_path["effects/notify"].outcome == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_EMPTY
+    assert reg.registered == {} and reg.deleted_recorded == ()
+    assert service.commit_all_calls == 0
+    assert service.register_calls == 0
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+
+
+def test_crash_between_legs_and_registration_resume_registers_exactly_once() -> None:
+    """Registration all-or-nothing under crash injection: a kill between the
+    legs and the registration leaves NO partial coordinator state; the resumed
+    run registers exactly once."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    service.crash_on_register_call = 1
+    with pytest.raises(RuntimeError, match="before registration"):
+        _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    # No partial coordinator state: the artifact never moved, the marker never
+    # landed, the member outcome is durable (the legs concluded).
+    assert registry.get_artifact(art.id).version == 1
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_IN_PROGRESS
+    (stored,) = registry.get_checkpoint_members(checkpoint_id)
+    assert stored.restore_outcome == RESTORE_OUTCOME_RESTORED
+
+    # Resume: the registration runs EXACTLY once (one commit_all, one bump).
+    service.crash_on_register_call = None
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    (member,) = report.members
+    assert member.resumed_from_prior_run is True
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_COMMITTED
+    assert reg.registered == {"notes/plan.md": 2}
+    assert service.commit_all_calls == 1
+    assert registry.get_artifact(art.id).version == 2
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,  # crashed run
+        RESTORE_STATUS_IN_PROGRESS,  # resume
+        RESTORE_STATUS_REGISTERED,
+        RESTORE_STATUS_CONCLUDED,
+    ]
+
+
+def test_crash_after_registration_landed_before_marker_no_double_commit() -> None:
+    """The marker-write crash window: the commit landed but 'registered' never
+    did. The resumed registration re-runs and the hash filter answers it
+    EMPTY — exactly-once, no second version bump."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    service.crash_after_register_once = True
+    with pytest.raises(RuntimeError, match="after registration landed"):
+        _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    # The commit landed; the marker did not.
+    assert registry.get_artifact(art.id).version == 2
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_IN_PROGRESS
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_EMPTY  # already at the fingerprint
+    assert reg.skipped == ("notes/plan.md",)
+    assert service.commit_all_calls == 1  # never a second commit
+    assert registry.get_artifact(art.id).version == 2  # exactly one bump
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+
+
+def test_crash_after_registered_marker_resume_skips_registration() -> None:
+    """The durable marker honored: a crash AFTER 'registered' but before
+    'concluded' resumes WITHOUT re-entering the registration step at all."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    service.crash_on_status_once = RESTORE_STATUS_CONCLUDED
+    with pytest.raises(RuntimeError, match="concluded"):
+        _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_REGISTERED
+    assert registry.get_artifact(art.id).version == 2
+    register_calls_before = service.register_calls
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    reg = report.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_PRIOR_RUN
+    assert service.register_calls == register_calls_before  # step never re-entered
+    assert service.commit_all_calls == 1
+    assert registry.get_artifact(art.id).version == 2  # exactly once
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+
+
+def test_registered_live_writer_racing_registration_retries_bounded_and_wins() -> None:
+    """A registered live writer's commit lands between the registration's
+    comparand read and its commit_all: the batch is HELD version_mismatch
+    (all-or-nothing, nothing mutated), the seam re-drives from fresh
+    comparands (bounded), and the landed registration invalidates the peer."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    peer = uuid.uuid4()
+    registry.set_agent_state(art.id, peer, MESIState.SHARED, trigger="fetch", tick=1)
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    def _peer_commit_lands_first() -> None:
+        result = registry.commit_cas(
+            art.id,
+            peer,
+            expected_version=1,
+            content_hash=sha256_hex(b"peer-body"),
+            content="peer-body",
+            tick=5,
+        )
+        assert not isinstance(result, ConflictDetail)  # the peer WON (v1 -> v2)
+
+    service.before_first_commit_all = _peer_commit_lands_first
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_COMMITTED
+    assert reg.attempts == 2  # attempt 1 HELD version_mismatch; attempt 2 landed
+    assert service.commit_all_calls == 2
+    # Forward past the peer's commit: v1 -> (peer) v2 -> (registration) v3.
+    updated = registry.get_artifact(art.id)
+    assert updated.version == 3
+    check_monotonic_version(2, updated.version)
+    assert updated.content_hash == _FP_PLAN
+    assert reg.registered == {"notes/plan.md": 3}
+    # The peer (SHARED after its own OCC win) was invalidated by the landing.
+    assert registry.get_agent_state(art.id, peer) == MESIState.INVALID
+    assert reg.invalidated_peers == 1
+
+
+def test_superseded_controller_late_apply_rejected_by_fence() -> None:
+    """The read-generation fence: a controller whose grant a sweep reclaimed
+    is SUPERSEDED — its late registration apply is rejected
+    (stale_read_generation), NEVER retried, and nothing registers
+    (all-or-nothing). The restore still concludes, refusal reported."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    # The controller (the versioner's owner) held EXCLUSIVE (read_gen 0), then
+    # the sweep reclaimed it (owner_gen 1): superseded.
+    registry.set_agent_state(art.id, OWNER, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    registry.set_agent_state(
+        art.id, OWNER, MESIState.INVALID, trigger="reclaim_heartbeat", tick=2
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = report.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_REFUSED
+    assert reg.refused == {"notes/plan.md": STALE_READ_GENERATION_REASON}
+    assert service.commit_all_calls == 1  # the fence is terminal on sight
+    # The late apply was fenced out: no phantom bump, hash untouched.
+    updated = registry.get_artifact(art.id)
+    assert updated.version == 1
+    assert updated.content_hash == sha256_hex(b"old-body")
+    # The restore still CONCLUDES; the refusal skipped the 'registered' marker
+    # (a later resume may re-attempt; the fence rejects it again).
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_CONCLUDED,
+    ]
+
+
+def test_restore_monotonicity_forward_commit_carrying_old_bytes() -> None:
+    """R5: restore registers as a FORWARD commit — the coordinator version
+    strictly increases past every live-writer commit while the content hash
+    returns to the captured (old) fingerprint; never a decrement anywhere."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="v1-body", content_hash=sha256_hex(b"v1-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+
+    # Live writers advance the coordinator past the capture: v1 -> v4.
+    observed_versions = [registry.get_artifact(art.id).version]
+    writer = uuid.uuid4()
+    for i in range(3):
+        current = registry.get_artifact(art.id).version
+        result = registry.commit_cas(
+            art.id,
+            writer,
+            expected_version=current,
+            content_hash=sha256_hex(f"writer-{i}".encode()),
+            content=f"writer-{i}",
+            tick=10 + i,
+        )
+        assert not isinstance(result, ConflictDetail)
+        observed_versions.append(registry.get_artifact(art.id).version)
+    assert observed_versions == [1, 2, 3, 4]
+
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    reg = report.registration
+    assert reg is not None
+    assert reg.status == WORKSPACE_REGISTRATION_COMMITTED
+    updated = registry.get_artifact(art.id)
+    # Strictly increasing across the whole history — old bytes, NEW version.
+    observed_versions.append(updated.version)
+    assert observed_versions == [1, 2, 3, 4, 5]
+    for previous, current in zip(observed_versions, observed_versions[1:]):
+        check_monotonic_version(previous, current)
+        assert current > previous  # strict: a restore is never a re-stamp
+    assert updated.content_hash == _FP_PLAN  # the captured state, re-imposed
+
+
+def test_concluded_report_from_durable_rows_carries_no_registration() -> None:
+    """A report rebuilt from durable rows (idempotent re-restore of a
+    concluded checkpoint) carries registration=None — the detail is run-local
+    by design; the durable truths are the marker and the artifact versions."""
+    _registry, service = _probe_service()
+    files = _FakeFileStore()
+    files.put("calm.md", b"calm", 5)
+    resolver = _FakeResolver()
+    resolver.keep("calm.md", 5, b"calm")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "calm.md")
+    checkpoint_id = versioner.checkpoint("re").record.checkpoint_id
+    first = versioner.restore(checkpoint_id)
+    assert first.registration is not None
+    second = versioner.restore(checkpoint_id)
+    assert second.registration is None
+    assert second.status == RESTORE_STATUS_CONCLUDED
+
+
+# ---------------------------------------------------------------------------
+# Route level — Unit-5 restore progress + registration endpoints (the remote
+# half of the CheckpointRestoreStore seam; mirrors the checkpoint routes)
+# ---------------------------------------------------------------------------
+
+
+def _route_checkpoint(client, *, member_path: str = "notes/plan.md") -> str:
+    sid = str(uuid.uuid4())
+    status, body = client(
+        "POST",
+        "/workspace/checkpoint",
+        {
+            "session_id": sid,
+            "name": "route-restore-cp",
+            "window_min": 100.0,
+            "window_max": 100.0,
+            "members": [
+                _member_wire(
+                    member_path,
+                    native_token="7",
+                    fingerprint=sha256_hex(b"plan text"),
+                    arbitration_tier="no-arbiter",
+                    restore_tier="restorable-unpinned",
+                )
+            ],
+        },
+    )
+    assert status == 200 and body["ok"] is True
+    return body["checkpoint_id"]
+
+
+def test_route_restore_progress_roundtrip(client) -> None:
+    sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+
+    status, body = client(
+        "POST",
+        "/workspace/restore/status",
+        {"session_id": sid, "checkpoint_id": checkpoint_id, "status": "in_progress"},
+    )
+    assert status == 200 and body["ok"] is True
+
+    status, body = client(
+        "POST",
+        "/workspace/restore/member",
+        {
+            "session_id": sid,
+            "checkpoint_id": checkpoint_id,
+            "member_path": "notes/plan.md",
+            "restore_outcome": "restored",
+        },
+    )
+    assert status == 200 and body["ok"] is True
+
+    # The full status walk lands durably, including the Unit-5 marker.
+    for next_status in ("registered", "concluded"):
+        status, body = client(
+            "POST",
+            "/workspace/restore/status",
+            {"session_id": sid, "checkpoint_id": checkpoint_id, "status": next_status},
+        )
+        assert status == 200 and body["ok"] is True
+
+    status, listing = client("GET", "/workspace/checkpoints")
+    assert status == 200
+    (cp,) = listing["checkpoints"]
+    assert cp["restore_status"] == "concluded"
+    (member,) = cp["members"]
+    assert member["restore_outcome"] == "restored"
+
+
+def test_route_restore_progress_validation_fails_closed(client) -> None:
+    sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+
+    # Unknown status — closed vocabulary, boundary-gated.
+    status, _ = client(
+        "POST",
+        "/workspace/restore/status",
+        {"session_id": sid, "checkpoint_id": checkpoint_id, "status": "magic"},
+    )
+    assert status == 400
+    # Unknown outcome — closed vocabulary.
+    status, _ = client(
+        "POST",
+        "/workspace/restore/member",
+        {
+            "session_id": sid,
+            "checkpoint_id": checkpoint_id,
+            "member_path": "notes/plan.md",
+            "restore_outcome": "magic",
+        },
+    )
+    assert status == 400
+    # Unknown checkpoint — typed reject body, nothing recorded.
+    status, body = client(
+        "POST",
+        "/workspace/restore/status",
+        {"session_id": sid, "checkpoint_id": "nope", "status": "in_progress"},
+    )
+    assert status == 200 and body["ok"] is False
+    status, listing = client("GET", "/workspace/checkpoints")
+    (cp,) = listing["checkpoints"]
+    assert cp["restore_status"] == "none"
+
+
+def test_route_restore_register_first_observation_then_commit(client) -> None:
+    """Over HTTP against the sqlite-backed coordinator: the first registration
+    of an unknown path mints hash-only via resolve_or_register (skipped —
+    empty_write_set), and a later differing fingerprint COMMITS forward."""
+    sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+    fp_one = sha256_hex(b"plan text")
+    fp_two = sha256_hex(b"restored text")
+
+    # Empty writes: typed empty, never a commit.
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {"session_id": sid, "checkpoint_id": checkpoint_id, "writes": []},
+    )
+    assert status == 200 and body["ok"] is True
+    assert body["status"] == "empty_write_set"
+
+    # First observation: the mint IS the registration (skipped, no commit).
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            "session_id": sid,
+            "checkpoint_id": checkpoint_id,
+            "writes": [{"member_path": "notes/plan.md", "fingerprint": fp_one}],
+        },
+    )
+    assert status == 200 and body["ok"] is True
+    assert body["status"] == "empty_write_set"
+    assert body["skipped"] == ["notes/plan.md"]
+
+    # A differing fingerprint commits FORWARD (v1 -> v2), all-or-nothing.
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            "session_id": sid,
+            "checkpoint_id": checkpoint_id,
+            "writes": [{"member_path": "notes/plan.md", "fingerprint": fp_two}],
+        },
+    )
+    assert status == 200 and body["ok"] is True
+    assert body["status"] == "committed"
+    assert body["versions"] == {"notes/plan.md": 2}
+    assert body["refused"] == {}
+
+
+def test_route_restore_register_boundary_validation(client) -> None:
+    sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+    fp = sha256_hex(b"plan text")
+
+    # Unknown checkpoint — the typed identity-stable reason.
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            "session_id": sid,
+            "checkpoint_id": "nope",
+            "writes": [{"member_path": "notes/plan.md", "fingerprint": fp}],
+        },
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == CHECKPOINT_UNKNOWN_REASON
+
+    base = {"session_id": sid, "checkpoint_id": checkpoint_id}
+    # Malformed fingerprint.
+    status, _ = client(
+        "POST",
+        "/workspace/restore/register",
+        {**base, "writes": [{"member_path": "a.md", "fingerprint": "beef"}]},
+    )
+    assert status == 400
+    # Duplicate member paths.
+    status, _ = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            **base,
+            "writes": [
+                {"member_path": "a.md", "fingerprint": fp},
+                {"member_path": "a.md", "fingerprint": fp},
+            ],
+        },
+    )
+    assert status == 400
+    # Non-list writes.
+    status, _ = client(
+        "POST", "/workspace/restore/register", {**base, "writes": "nope"}
+    )
+    assert status == 400
+    # Absolute member path (the authoritative server-side path gate).
+    status, _ = client(
+        "POST",
+        "/workspace/restore/register",
+        {**base, "writes": [{"member_path": "/etc/passwd", "fingerprint": fp}]},
+    )
+    assert status == 400

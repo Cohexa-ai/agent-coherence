@@ -80,15 +80,46 @@ conditional leg per DURABLE member row under a TERMINATION CONTRACT:
 - **Delete legs restore the ABSENT fact** — a member captured ABSENT that
   exists live is deleted (S3: an unconditional-latest ``delete``, minting a
   marker on a versioned bucket; the pre-delete race window is a documented
-  residual). Coordinator registration of restored/deleted members is Unit 5 —
-  see :meth:`WorkspaceVersioner._registration_seam`.
+  residual).
+
+**Registration (WV Unit 5 / R4–R5)** — after every member is terminal and
+before ``concluded``, :meth:`WorkspaceVersioner._registration_seam` registers
+the restore with the coordinator, split per member class (the plan's
+restore-registration design, grounded in what the coordinator stores):
+
+- **written FILE members** (``restored``, no delete record, ``no-arbiter``
+  tier) register through ``CoordinatorService.register_workspace_restore`` →
+  ONE all-or-nothing ``commit_all`` batch (hash-only — fingerprints, never
+  bytes; the controller is the versioner's owner, an S/I caller per D4).
+  Registered peers holding the artifact are invalidated atomically and the
+  invalidation signals surface on the report; a superseded controller's late
+  apply is rejected by the read-generation fence (``stale_read_generation``,
+  never retried). The registration is a FORWARD commit carrying old bytes:
+  versions strictly increase, never decrement.
+- **written S3 members** are registered MANIFEST-SIDE ONLY: the coordinator
+  holds no artifact identity for a BYO-substrate member (the substrate owns
+  identity; their manifest ``artifact_id`` is NULL by design) — their durable
+  ``restore_outcome`` row IS the registration.
+- **deleted members** are recorded manifest-side (``deleted_at_restore``,
+  written by the delete leg) — ``commit_all`` has no delete semantics and the
+  registration adds NO commit interaction for them.
+- **an empty commit write-set** (every member skipped/absorbed/converged/
+  deleted/S3) concludes via the status update alone — ``commit_all`` is NEVER
+  called (it raises on an empty set).
+
+Idempotent under crash-resume by TWO durable mechanisms: the checkpoint-level
+``registered`` status (written between a committed/empty registration and
+``concluded`` — a resume finding it skips the step), and the service-side
+hash filter (an artifact already carrying the manifest fingerprint is skipped,
+so a crash between the ``commit_all`` landing and the marker write still
+re-answers without a second version bump).
 """
 
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Final, Protocol, Sequence, runtime_checkable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Final, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import UUID
 
 from ccs.adapters.coherent_object import (
@@ -110,16 +141,24 @@ from ccs.core.exceptions import (
     RESTORE_OUTCOME_TARGET_LOST,
     RESTORE_STATUS_CONCLUDED,
     RESTORE_STATUS_IN_PROGRESS,
+    RESTORE_STATUS_REGISTERED,
     RESTORE_STATUSES,
+    STALE_READ_GENERATION_REASON,
+    WORKSPACE_REGISTRATION_COMMITTED,
+    WORKSPACE_REGISTRATION_EMPTY,
+    WORKSPACE_REGISTRATION_PRIOR_RUN,
+    WORKSPACE_REGISTRATION_REFUSED,
     CasRetriesExhausted,
     CasVersionConflict,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
+    OccCallerTransientError,
     ViewWedged,
 )
 from ccs.core.substrate import ArbitrationTier, RestoreTier, derive_restore_tier
 from ccs.core.substrate import sha256_hex as _sha256_hex
+from ccs.core.types import WorkspaceRegistrationResult, WorkspaceRestoreWrite
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -136,6 +175,7 @@ __all__ = [
     "FileRestoreTarget",
     "MAX_RESTORE_LEG_REDRIVES",
     "MemberRestoreOutcome",
+    "RestoreRegistration",
     "WorkspaceCheckpoint",
     "WorkspaceRestoreReport",
     "WorkspaceVersioner",
@@ -239,12 +279,15 @@ class CheckpointPersistence(Protocol):
 
 @runtime_checkable
 class CheckpointRestoreStore(Protocol):
-    """The restore engine's durable-store seam (WV Unit 4 / R3):
-    ``CoordinatorService``'s workspace-checkpoint read + progress surface.
+    """The restore engine's durable-store seam (WV Units 4–5 / R3–R5):
+    ``CoordinatorService``'s workspace-checkpoint read + progress +
+    registration surface.
 
     Restore is driven FROM these durable reads and records progress THROUGH
     these durable writes — never from an in-memory capture return — so a fresh
     engine (post-crash) resumes from exactly the state the registry holds.
+    :meth:`register_workspace_restore` is the Unit-5 coordinator-registration
+    half (written file members → one all-or-nothing hash-only ``commit_all``).
     :meth:`WorkspaceVersioner.restore` verifies its service speaks this surface
     BEFORE touching any state (fail-fast on a capture-only service).
     """
@@ -270,6 +313,16 @@ class CheckpointRestoreStore(Protocol):
         restore_outcome: str | None,
         deleted_at_restore: float | None = None,
     ) -> None:
+        ...
+
+    def register_workspace_restore(
+        self,
+        *,
+        checkpoint_id: str,
+        controller: UUID,
+        writes: Sequence[WorkspaceRestoreWrite],
+        issued_at_tick: int = 0,
+    ) -> WorkspaceRegistrationResult:
         ...
 
 
@@ -392,17 +445,62 @@ class MemberRestoreOutcome:
 
 
 @dataclass(frozen=True)
+class RestoreRegistration:
+    """The registration step's terminal answer, per member class (WV Unit 5).
+
+    ``status`` is one of the closed
+    :data:`~ccs.core.exceptions.WORKSPACE_REGISTRATION_STATUSES` (identity-
+    matched): ``committed`` (the all-or-nothing ``commit_all`` landed —
+    ``registered`` maps each file member path to its NEW coordinator version),
+    ``empty_write_set`` (nothing needed a commit; ``commit_all`` was never
+    called), ``registered_by_prior_run`` (the durable ``registered`` marker —
+    a crashed run already completed the step; nothing re-registered), or
+    ``refused`` (the batch was HELD: NOTHING registered, ``refused`` maps each
+    failing member path to its typed conflict reason — identity-matched wire
+    constants; ``stale_read_generation`` is the fence rejecting a superseded
+    controller's late apply, never retried).
+
+    The per-member-class honesty surfaces: ``substrate_registered`` names the
+    written S3 members whose registration is MANIFEST-SIDE by design (the
+    substrate owns their identity — no coordinator artifact row is ever
+    forced); ``deleted_recorded`` names the delete-leg members whose
+    registration is their durable ``deleted_at_restore`` record; ``skipped``
+    names file members already registered at the manifest fingerprint (the
+    exactly-once filter). ``invalidated_peers`` counts the invalidation
+    signals the commit returned (broadcast-after-commit: registered peers
+    holding a member were atomically invalidated by the registry).
+
+    Run-local: durable rows retain outcomes and the ``registered`` status
+    marker, not this detail — a report rebuilt from durable rows of an
+    already-``concluded`` checkpoint carries ``registration=None``.
+    """
+
+    status: str
+    detail: str
+    registered: Mapping[str, int] = field(default_factory=dict)
+    skipped: tuple[str, ...] = ()
+    substrate_registered: tuple[str, ...] = ()
+    deleted_recorded: tuple[str, ...] = ()
+    refused: Mapping[str, str] = field(default_factory=dict)
+    invalidated_peers: int = 0
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
 class WorkspaceRestoreReport:
     """The complete per-member terminal report one restore run concludes with.
 
     Returned to the caller AND durably mirrored (each member's ``outcome`` in
     its registry row; ``status`` — always ``concluded`` — on the checkpoint
     header), so the same report is reconstructible from durable state alone.
+    ``registration`` is the Unit-5 registration answer for THIS run (run-local
+    detail; ``None`` on a report rebuilt from durable rows).
     """
 
     checkpoint_id: str
     status: str
     members: tuple[MemberRestoreOutcome, ...]
+    registration: RestoreRegistration | None = None
 
     @property
     def members_by_path(self) -> "dict[str, MemberRestoreOutcome]":
@@ -714,8 +812,10 @@ class WorkspaceVersioner:
         A restore that starts always CONCLUDES: every member reaches exactly
         one terminal outcome from the closed
         :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` vocabulary, the
-        checkpoint's ``restore_status`` moves ``in_progress`` → ``concluded``,
-        and the frozen :class:`WorkspaceRestoreReport` is returned AND durably
+        checkpoint's ``restore_status`` moves ``in_progress`` →
+        (``registered`` on a committed/empty registration step) →
+        ``concluded``, and the frozen :class:`WorkspaceRestoreReport` —
+        including the Unit-5 ``registration`` answer — is returned AND durably
         mirrored. Per-member failures are ABSORBED into the report — the only
         raises are pre-flight, before any status write: the typed
         :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id,
@@ -746,8 +846,12 @@ class WorkspaceVersioner:
         rows = store.get_workspace_checkpoint_members(checkpoint_id)
         self._require_known_restore_state(record, rows)
         if record.restore_status == RESTORE_STATUS_CONCLUDED:
-            # Idempotent re-conclude: the durable rows ARE the report.
+            # Idempotent re-conclude: the durable rows ARE the report (the
+            # run-local registration detail is not durably retained).
             return self._report_from_durable_rows(checkpoint_id, rows)
+        # The durable idempotency marker (Unit 5): a crashed run that already
+        # completed its registration step must never re-register on resume.
+        prior_registration = record.restore_status == RESTORE_STATUS_REGISTERED
         pending = [row for row in rows if row.restore_outcome is None]
         self._require_drivable(pending)
         store.set_workspace_checkpoint_restore_status(
@@ -770,7 +874,24 @@ class WorkspaceVersioner:
                 deleted_at_restore=outcome.deleted_at_restore,
             )
             outcomes.append(outcome)
-        self._registration_seam(checkpoint_id, outcomes)
+        registration = self._registration_seam(
+            store, checkpoint_id, rows, outcomes, prior_run=prior_registration
+        )
+        if registration.status in (
+            WORKSPACE_REGISTRATION_COMMITTED,
+            WORKSPACE_REGISTRATION_EMPTY,
+        ):
+            # The durable marker: a crash between here and ``concluded`` makes
+            # the resuming run skip the (already answered) registration step.
+            # A REFUSED registration deliberately skips the marker so a later
+            # resume MAY re-attempt (transient contention clears; the fence
+            # rejects a superseded controller again). PRIOR_RUN already holds
+            # the marker.
+            store.set_workspace_checkpoint_restore_status(
+                checkpoint_id,
+                RESTORE_STATUS_REGISTERED,
+                updated_at=float(self._clock()),
+            )
         store.set_workspace_checkpoint_restore_status(
             checkpoint_id, RESTORE_STATUS_CONCLUDED, updated_at=float(self._clock())
         )
@@ -778,30 +899,169 @@ class WorkspaceVersioner:
             checkpoint_id=checkpoint_id,
             status=RESTORE_STATUS_CONCLUDED,
             members=tuple(outcomes),
+            registration=registration,
         )
 
     def _registration_seam(
-        self, checkpoint_id: str, outcomes: Sequence[MemberRestoreOutcome]
-    ) -> None:
-        """THE UNIT-5 REGISTRATION HOOK POINT — deliberately inert in Unit 4.
+        self,
+        store: CheckpointRestoreStore,
+        checkpoint_id: str,
+        rows: Sequence[CheckpointMember],
+        outcomes: Sequence[MemberRestoreOutcome],
+        *,
+        prior_run: bool,
+    ) -> RestoreRegistration:
+        """THE UNIT-5 REGISTRATION STEP — after all-terminal, before ``concluded``.
 
-        Runs after every member holds a terminal outcome and BEFORE the
-        ``concluded`` status lands. Unit 5 replaces this no-op with the
-        coordinator registration split (the plan's restore-registration
-        design), consuming exactly what it receives here — the checkpoint id
-        plus the full per-member outcome sequence:
+        Classifies every terminal outcome into the plan's registration split
+        (module docstring, "Registration") and drives the coordinator half:
 
-        - WRITTEN members (``outcome == restored`` with ``new_native_token``
-          set) register via ``commit_all`` — all-or-nothing, an S/I caller;
-        - DELETED members (``deleted_at_restore`` set) are recorded
-          manifest-side in the same service transaction (``commit_all`` has no
-          delete semantics);
-        - an EMPTY write-set (every member skipped/absorbed/converged/deleted)
-          concludes via the status update alone — ``commit_all`` is never
-          called (it raises on an empty set).
+        - written FILE members (``restored``, no delete record, ``no-arbiter``
+          tier) → ONE ``register_workspace_restore`` call → one all-or-nothing
+          hash-only ``commit_all``;
+        - written S3 members → ``substrate_registered`` (manifest-side by
+          design — no coordinator artifact identity is ever forced);
+        - delete legs → ``deleted_recorded`` (their durable
+          ``deleted_at_restore`` record IS the registration);
+        - empty commit write-set → typed EMPTY, the service is never called
+          and ``commit_all`` therefore never runs.
 
-        Must stay side-effect-free until Unit 5 lands.
+        Bounded re-drive (the leg-budget twin): a HELD batch whose reasons are
+        all retry-eligible (``version_mismatch`` — a live registered writer
+        moved a member between the comparand read and the batch —
+        or ``other_holder``) re-drives from fresh comparands at most
+        :data:`MAX_RESTORE_LEG_REDRIVES` times; ``stale_read_generation``
+        (the fence: this controller was superseded by a sweep reclamation) is
+        TERMINAL on sight — a superseded controller's late apply must never
+        retry its way past the fence. Exhaustion and fence rejections conclude
+        as ``refused`` (nothing registered, all-or-nothing); the restore still
+        CONCLUDES — the refusal is reported, never raised.
         """
+        writes: list[WorkspaceRestoreWrite] = []
+        substrate_registered: list[str] = []
+        deleted_recorded: list[str] = []
+        row_by_path = {row.member_path: row for row in rows}
+        for outcome in outcomes:
+            if outcome.deleted_at_restore is not None:
+                deleted_recorded.append(outcome.member_path)
+                continue
+            if outcome.outcome != RESTORE_OUTCOME_RESTORED:
+                continue
+            row = row_by_path[outcome.member_path]
+            if row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value:
+                substrate_registered.append(outcome.member_path)
+                continue
+            if row.fingerprint is None:  # defensive: a written member has one
+                continue
+            writes.append(
+                WorkspaceRestoreWrite(
+                    member_path=outcome.member_path, fingerprint=row.fingerprint
+                )
+            )
+        if prior_run:
+            return RestoreRegistration(
+                status=WORKSPACE_REGISTRATION_PRIOR_RUN,
+                detail=(
+                    "the durable 'registered' marker is set: a prior (crashed) "
+                    "run already completed the registration step — nothing "
+                    "re-registered (exactly-once)"
+                ),
+                substrate_registered=tuple(substrate_registered),
+                deleted_recorded=tuple(deleted_recorded),
+            )
+        if not writes:
+            return RestoreRegistration(
+                status=WORKSPACE_REGISTRATION_EMPTY,
+                detail=(
+                    "no written file members: the commit write-set is empty — "
+                    "commit_all was never called (deletes are manifest-side "
+                    "records; S3 members are substrate-registered by design)"
+                ),
+                substrate_registered=tuple(substrate_registered),
+                deleted_recorded=tuple(deleted_recorded),
+            )
+        return self._drive_registration(
+            store,
+            checkpoint_id,
+            writes,
+            substrate_registered=tuple(substrate_registered),
+            deleted_recorded=tuple(deleted_recorded),
+        )
+
+    def _drive_registration(
+        self,
+        store: CheckpointRestoreStore,
+        checkpoint_id: str,
+        writes: "list[WorkspaceRestoreWrite]",
+        *,
+        substrate_registered: tuple[str, ...],
+        deleted_recorded: tuple[str, ...],
+    ) -> RestoreRegistration:
+        """The bounded registration re-drive loop (see ``_registration_seam``)."""
+        budget = _LegBudget(MAX_RESTORE_LEG_REDRIVES)
+        last_refused: "dict[str, str]" = {}
+        while True:
+            if budget.try_consume() is None:
+                return RestoreRegistration(
+                    status=WORKSPACE_REGISTRATION_REFUSED,
+                    detail=(
+                        f"registration re-drive budget exhausted "
+                        f"({budget.attempts} attempts) under sustained "
+                        "registered-writer contention — NOTHING registered "
+                        "(all-or-nothing)"
+                    ),
+                    substrate_registered=substrate_registered,
+                    deleted_recorded=deleted_recorded,
+                    refused=dict(last_refused),
+                    attempts=budget.attempts,
+                )
+            try:
+                result = store.register_workspace_restore(
+                    checkpoint_id=checkpoint_id,
+                    controller=self._owner,
+                    writes=tuple(writes),
+                    issued_at_tick=int(self._clock()),
+                )
+            except OccCallerTransientError:
+                # The controller was invalidated mid-flight (a peer's commit
+                # left it mid-transient): retry-eligible, budget-bounded.
+                continue
+            if result.status in (
+                WORKSPACE_REGISTRATION_COMMITTED,
+                WORKSPACE_REGISTRATION_EMPTY,
+            ):
+                return RestoreRegistration(
+                    status=result.status,
+                    detail=result.detail,
+                    registered=dict(result.versions),
+                    skipped=result.skipped,
+                    substrate_registered=substrate_registered,
+                    deleted_recorded=deleted_recorded,
+                    invalidated_peers=len(result.signals),
+                    attempts=budget.attempts,
+                )
+            # REFUSED (all-or-nothing HELD; nothing mutated). Reasons are
+            # identity-matched wire constants from ConflictDetail.
+            last_refused = {
+                path: conflict.reason for path, conflict in result.refused.items()
+            }
+            if STALE_READ_GENERATION_REASON in last_refused.values():
+                # The read-generation fence: THIS controller was superseded by
+                # a sweep reclamation — its late apply is rejected and must
+                # never be retried into landing (the fence's whole point).
+                return RestoreRegistration(
+                    status=WORKSPACE_REGISTRATION_REFUSED,
+                    detail=(
+                        "the read-generation fence rejected this superseded "
+                        "controller's late apply — NOTHING registered "
+                        "(all-or-nothing); not retried"
+                    ),
+                    substrate_registered=substrate_registered,
+                    deleted_recorded=deleted_recorded,
+                    refused=dict(last_refused),
+                    attempts=budget.attempts,
+                )
+            # version_mismatch / other_holder: re-drive from fresh comparands.
 
     # --- restore pre-flight (fail-fast, before any status write) --------------
 
@@ -809,9 +1069,10 @@ class WorkspaceVersioner:
         if not isinstance(self._service, CheckpointRestoreStore):
             raise TypeError(
                 "restore needs a service speaking the CheckpointRestoreStore "
-                "surface (checkpoint read + durable restore progress); this "
-                f"service ({type(self._service).__name__}) does not — a "
-                "capture-only seam cannot record a crash-resumable restore"
+                "surface (checkpoint read + durable restore progress + the "
+                "Unit-5 registration); this service "
+                f"({type(self._service).__name__}) does not — a capture-only "
+                "seam cannot record a crash-resumable, registrable restore"
             )
         return self._service
 
@@ -842,13 +1103,16 @@ class WorkspaceVersioner:
                     f"{row.restore_outcome!r} — refusing to classify it as "
                     "terminal or pending (fail-closed)"
                 )
-        if record.restore_status == RESTORE_STATUS_CONCLUDED and any(
-            row.restore_outcome is None for row in rows
-        ):
+        if record.restore_status in (
+            RESTORE_STATUS_CONCLUDED,
+            RESTORE_STATUS_REGISTERED,
+        ) and any(row.restore_outcome is None for row in rows):
             raise CoherenceError(
-                f"checkpoint {record.checkpoint_id!r} is 'concluded' but holds "
-                "outcome-less members — inconsistent durable state (a concluded "
-                "restore records a terminal outcome for EVERY member)"
+                f"checkpoint {record.checkpoint_id!r} is "
+                f"{record.restore_status!r} but holds outcome-less members — "
+                "inconsistent durable state (both statuses require a terminal "
+                "outcome for EVERY member: registration runs only after "
+                "all-terminal, and a concluded restore records every outcome)"
             )
 
     def _require_drivable(self, pending: Sequence[CheckpointMember]) -> None:

@@ -795,13 +795,58 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
 # vocabulary — the registry stores the string, THIS is its meaning). Kept
 # deliberately small: ``none`` (never restored) → ``in_progress`` (a restore
 # run is driving legs; a checkpoint FOUND in this state by a fresh engine is a
-# crashed run and is RESUMED, never refused) → ``concluded`` (every member
-# holds a terminal outcome; the report is reconstructible from durable rows).
+# crashed run and is RESUMED, never refused) → ``registered`` (WV Unit 5: every
+# member is terminal AND the coordinator-registration step ran to its answer —
+# the durable idempotency marker; a resumed run finding this status skips
+# registration, so a crash between the registration commit and ``concluded``
+# can never double-register) → ``concluded`` (every member holds a terminal
+# outcome; the report is reconstructible from durable rows). ``registered`` is
+# written ONLY on a committed/empty registration — a REFUSED registration
+# concludes without it so a later resume may re-attempt (the refusal may have
+# been transient contention; the fence rejects a superseded controller again).
 RESTORE_STATUS_NONE = "none"
 RESTORE_STATUS_IN_PROGRESS = "in_progress"
+RESTORE_STATUS_REGISTERED = "registered"
 RESTORE_STATUS_CONCLUDED = "concluded"
 RESTORE_STATUSES: frozenset[str] = frozenset(
-    {RESTORE_STATUS_NONE, RESTORE_STATUS_IN_PROGRESS, RESTORE_STATUS_CONCLUDED}
+    {
+        RESTORE_STATUS_NONE,
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_REGISTERED,
+        RESTORE_STATUS_CONCLUDED,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore REGISTRATION vocabulary (WV plan Unit 5 / R4-R5)
+# ---------------------------------------------------------------------------
+#
+# The terminal answer of the coordinator-registration step that runs after
+# every member holds a terminal outcome and before the restore concludes.
+# Wire-stable constants matched by IDENTITY (add, never rename). The per-
+# member-class registration split (the plan's restore-registration design):
+#
+# - WRITTEN file members (``restored``, no delete record, ``no-arbiter``
+#   tier) register through ``commit_all`` — all-or-nothing, hash-only
+#   (fingerprints, never content bytes), an S/I controller per D4;
+# - WRITTEN S3 members are registered MANIFEST-SIDE ONLY: the coordinator
+#   holds no artifact identity for a BYO substrate member (the substrate owns
+#   identity — ``workspace_checkpoint_members.artifact_id`` is NULL for them
+#   by design), so their registration IS the durable outcome row;
+# - DELETED members are recorded manifest-side (``deleted_at_restore`` —
+#   ``commit_all`` has no delete semantics);
+# - an EMPTY commit write-set NEVER calls ``commit_all`` (it raises on empty).
+WORKSPACE_REGISTRATION_COMMITTED = "committed"
+WORKSPACE_REGISTRATION_EMPTY = "empty_write_set"
+WORKSPACE_REGISTRATION_PRIOR_RUN = "registered_by_prior_run"
+WORKSPACE_REGISTRATION_REFUSED = "refused"
+WORKSPACE_REGISTRATION_STATUSES: frozenset[str] = frozenset(
+    {
+        WORKSPACE_REGISTRATION_COMMITTED,
+        WORKSPACE_REGISTRATION_EMPTY,
+        WORKSPACE_REGISTRATION_PRIOR_RUN,
+        WORKSPACE_REGISTRATION_REFUSED,
+    }
 )
 
 # Pre-flight restore refusal: the checkpoint id names no persisted manifest.
