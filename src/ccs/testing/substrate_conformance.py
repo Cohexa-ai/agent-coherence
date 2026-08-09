@@ -8,7 +8,9 @@ PACKAGED (WV plan Unit 9 / R11): this corpus ships inside the package
 (``ccs.testing`` — ``where = ["src"]``) so a foreign implementation can import
 and run it without vendoring this repository's test tree. The in-repo runner
 (``tests/conformance/``) imports FROM here through a thin shim; this module
-never imports from the test tree.
+never imports from the test tree. pytest is OPTIONAL: the corpus imports and
+runs without it (raise-expectations use an internal shim); only scenario SKIP
+reporting needs it — ``pip install 'agent-coherence[conformance]'``.
 
 A descriptor-parametrized kit that certifies a substrate binding's declared tier
 is HONEST and, crucially, that the **adapter's** invalidation value — not the
@@ -56,13 +58,22 @@ mimicking any particular internal mechanism.
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Iterator, NoReturn, Protocol, Sequence, runtime_checkable
 from uuid import UUID, uuid4
 
-import pytest
+# pytest backs SKIP reporting ONLY — the corpus itself must import and run
+# without the test framework installed (the packaged-importable claim above).
+# Guarded like the optional substrate drivers (see coherent_object's boto3
+# deferral): absence degrades to None here and fails actionably at USE time.
+try:
+    import pytest
+except ImportError:  # pragma: no cover — exercised by the clean-import test
+    pytest = None  # type: ignore[assignment]
 
 import ccs.adapters.substrate as substrate_module
 from ccs.adapters.coherent_object import CoherentObject
@@ -97,10 +108,92 @@ from ccs.core.substrate import (
 )
 from ccs.testing.s3_local import LocalS3Client
 
+if TYPE_CHECKING:
+    # Annotation-only: importing the corpus must never pull the server stack
+    # (SubstrateCoordinatorSession defers the same import for the same reason).
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig
+
+__all__ = [
+    "WORKSPACE_BINDING_MEMBERS",
+    "ConformanceBinding",
+    "ConformanceSubstrate",
+    "CoordinatorHarness",
+    "InMemoryBinding",
+    "InMemoryStore",
+    "LocalWorkspaceBinding",
+    "LwwSubstrate",
+    "RestoredMemberFacts",
+    "SessionFactory",
+    "SplitComparandSubstrate",
+    "TornCutBlindWorkspaceBinding",
+    "WorkspaceCheckpointFacts",
+    "WorkspaceConformanceBinding",
+    "WorkspaceMemberFacts",
+    "WorkspaceRestoreFacts",
+    "assert_abort_after_partial_visibility",
+    "assert_coordinator_retention_empty",
+    "assert_detect_only_silent_lost_update",
+    "assert_forward_only_honest",
+    "assert_invalidation_before_act",
+    "assert_native_cas_descriptor",
+    "assert_never_ship_a_store_wire",
+    "assert_racing_writers_one_winner",
+    "assert_read_pair_is_atomic",
+    "assert_read_pair_split_binding_is_rejected",
+    "assert_rejects_split_comparand",
+    "assert_split_view_is_rejected",
+    "assert_torn_cut_blind_binding_is_rejected",
+    "assert_workspace_binding_declares_all",
+    "assert_wv_absent_is_a_fact",
+    "assert_wv_declared_pin_honest",
+    "assert_wv_declared_versioning_honest",
+    "assert_wv_monotonic_restore",
+    "assert_wv_restart_survival_per_declaration",
+    "assert_wv_restore_one_winner",
+    "assert_wv_restore_terminates_under_contention",
+    "assert_wv_torn_cut_detection",
+    "run_native_cas_conformance",
+    "run_workspace_conformance",
+    "workspace_protocol_members",
+]
+
 # The wording a non-native tier must never carry: enforcement / CAS / rollback /
 # duplicate-effect claims. Matched case-insensitively, so the guarantee text must
 # express its disclaimers without these trigger words.
 _FORBIDDEN_ENFORCEMENT_WORDS = ("enforce", "cas", "rollback", "dedup")
+
+_PYTEST_INSTALL_HINT = (
+    "reporting a conformance-scenario SKIP requires pytest — install it with: "
+    "pip install 'agent-coherence[conformance]'"
+)
+
+
+@contextmanager
+def _expect_raises(exc_type: type[BaseException], match: str | None = None) -> Iterator[None]:
+    """A dependency-free ``pytest.raises``: the packaged corpus must RUN, not
+    just import, without the test framework. Mirrors pytest's semantics — the
+    block must raise ``exc_type``, and ``match`` (when given) is
+    ``re.search``-ed against the exception text."""
+    try:
+        yield
+    except exc_type as caught:
+        if match is not None and re.search(match, str(caught)) is None:
+            raise AssertionError(
+                f"{type(caught).__name__} was raised but its message did not "
+                f"match {match!r}: {caught}"
+            ) from caught
+    else:
+        raise AssertionError(f"expected {exc_type.__name__} to be raised; nothing was")
+
+
+def _skip_scenario(reason: str) -> NoReturn:
+    """Report a scenario skip through pytest when it is installed. Without
+    pytest there is no channel that distinguishes 'skipped' from 'passed', so
+    fail closed AT USE with the install hint (never a silent green)."""
+    if pytest is None:
+        raise ModuleNotFoundError(f"{_PYTEST_INSTALL_HINT} (skip reason: {reason})")
+    pytest.skip(reason)
+    raise AssertionError("unreachable: pytest.skip always raises")  # pragma: no cover
 
 
 def _sha256(data: bytes) -> str:
@@ -370,7 +463,7 @@ def assert_racing_writers_one_winner(
     # is NOT told, so the pre-read stays clean and the substrate CAS is the arbiter.
     binding.foreign_write(ref, b"v2-foreign")
 
-    with pytest.raises(CasVersionConflict):
+    with _expect_raises(CasVersionConflict):
         agent.commit(ref, expected_token=tok, new_bytes=b"vA")
     # The foreign write is the one winner; the loser's bytes never landed.
     assert binding.make_view().read(ref)[0] == b"v2-foreign"
@@ -393,7 +486,7 @@ def assert_invalidation_before_act(
     _bb, b_tok = agent_b.read(ref)
     agent_b.commit(ref, expected_token=b_tok, new_bytes=b"v2")  # B wins; A invalidated
 
-    with pytest.raises(StaleView):
+    with _expect_raises(StaleView):
         agent_a.commit(ref, expected_token=a_tok, new_bytes=b"vA")
     # Deny-before-act: the substrate write was never attempted (fake-observable).
     if hasattr(view_a, "cas_calls"):
@@ -463,7 +556,7 @@ def assert_read_pair_is_atomic(binding: ConformanceBinding, make_session: "Sessi
 def assert_read_pair_split_binding_is_rejected() -> None:
     """Confirm the read-pair-atomicity control has TEETH: a split-read binding
     (two substrate reads per pair) fails it (helper for the MUST-FAIL test)."""
-    with pytest.raises(AssertionError):
+    with _expect_raises(AssertionError):
         assert_read_pair_is_atomic(_SplitReadBinding("object"), None)  # type: ignore[arg-type]
 
 
@@ -495,7 +588,7 @@ def assert_abort_after_partial_visibility(
     binding.seed(ref, b"v1")
     view = binding.make_view()
     if not hasattr(view, "script_unknown"):
-        pytest.skip("abort-after-partial-visibility needs a scriptable substrate")
+        _skip_scenario("abort-after-partial-visibility needs a scriptable substrate")
 
     agent = CoordinatedSubstrate(view, make_session())
     _bytes, tok = agent.read(ref)
@@ -517,14 +610,15 @@ def assert_rejects_split_comparand(store_arm: str = "object") -> None:
     so its CAS PASSES on a token that never described its bytes → the peer's write
     is silently lost. This function ASSERTS "the peer's write survives"; it PASSES
     for the conforming view and RAISES ``AssertionError`` for the split view (the
-    test wraps the split call in ``pytest.raises(AssertionError)``).
+    MUST-FAIL helper :func:`assert_split_view_is_rejected` wraps the split call
+    and asserts the raise).
     """
     _run_split_control(ConformanceSubstrate, store_arm)
 
 
 def assert_split_view_is_rejected(store_arm: str = "object") -> None:
     """Confirm the split view fails the control (helper for the MUST-FAIL test)."""
-    with pytest.raises(AssertionError):
+    with _expect_raises(AssertionError):
         _run_split_control(SplitComparandSubstrate, store_arm)
 
 
@@ -590,7 +684,7 @@ def assert_forward_only_honest() -> None:
         assert word not in text, f"forward-only text must not contain {word!r}"
     # A forward-only descriptor declaring a version_source is rejected: an action
     # mints no token to compare.
-    with pytest.raises(ValueError, match="version_source"):
+    with _expect_raises(ValueError, match="version_source"):
         CapabilityDescriptor(tier=Tier.FORWARD_ONLY, version_source="etag")
 
 
@@ -611,7 +705,7 @@ def _dump_retention_rows(db_path) -> list[dict]:
     return [{"artifact_id": UUID(hex=aid), "version": version} for aid, version in rows]
 
 
-def assert_coordinator_retention_empty(tmp_path) -> None:
+def assert_coordinator_retention_empty(tmp_path: Path) -> None:
     """(b) Coordinator backstop, WITH ``retain_versions=True`` (else it false-greens
     exactly when it matters): the binding's hash-only registration leg leaves the
     ``artifact_versions`` table EMPTY, while a content-bearing register does NOT —
@@ -661,9 +755,7 @@ class CoordinatorHarness:
     """Owns the coordinator lifecycle for a conformance run: each call mints a new
     agent identity on ONE root; :meth:`close` tears the coordinator down."""
 
-    def __init__(self, root, config) -> None:
-        from pathlib import Path
-
+    def __init__(self, root: Path | str, config: LifecycleConfig | None) -> None:
         self._root = Path(root)
         self._config = config
 
@@ -1553,7 +1645,7 @@ def assert_torn_cut_blind_binding_is_rejected(state_dir: "Path | str") -> None:
     the torn-cut scenario, and the failure message NAMES the dropped leg."""
     stub = TornCutBlindWorkspaceBinding(state_dir)
     try:
-        with pytest.raises(AssertionError, match="torn-cut detection leg"):
+        with _expect_raises(AssertionError, match="torn-cut detection leg"):
             assert_wv_torn_cut_detection(stub)
     finally:
         stub.close()

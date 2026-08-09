@@ -67,6 +67,7 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CHECKPOINT_UNKNOWN_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
@@ -3229,6 +3230,30 @@ Event threaded into the service's ``abort_guard`` fails the late write closed
 at the registry lock (the A6 session-commit lesson)."""
 
 
+def _typed_reason_response(exc: BaseException) -> dict:
+    """The stable-reason reject envelope for the workspace routes.
+
+    A typed exception's identity-stable ``reason`` token goes on the wire (the
+    ``/workspace/restore/register`` house pattern — clients classify by token
+    identity, never by substring-matching prose), and the human prose rides in
+    a separate ``detail`` field so nothing is lost. An exception carrying no
+    ``reason`` falls back to its prose as before.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        return {"ok": False, "reason": reason, "detail": str(exc)}
+    return {"ok": False, "reason": str(exc)}
+
+
+def _unknown_checkpoint_response(exc: KeyError) -> dict:
+    """The registry's unknown-checkpoint/member ``KeyError`` mapped to the SAME
+    stable token ``/workspace/restore/register`` emits for that failure class
+    (:data:`~ccs.core.exceptions.CHECKPOINT_UNKNOWN_REASON`), prose preserved
+    in ``detail`` (``KeyError`` str() wraps its arg in quotes, so unwrap)."""
+    detail = str(exc.args[0]) if exc.args else str(exc)
+    return {"ok": False, "reason": CHECKPOINT_UNKNOWN_REASON, "detail": detail}
+
+
 def _parse_checkpoint_member(item: object) -> "CheckpointMember | str":
     """Validate ONE wire member object into a :class:`CheckpointMember`, or
     return the boundary-rejection reason string (fail-closed shape gate)."""
@@ -3304,7 +3329,9 @@ def _handle_workspace_checkpoint(
     Responses:
       - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
         coordinator_epoch}``
-      - validation / registry rejection → ``{ok: false, reason}``
+      - validation / registry rejection → ``{ok: false, reason}``; a typed
+        ``CoherenceError`` carries its identity-stable ``reason`` token with
+        the prose in ``detail``
       - watchdog degrade → ``{ok: false, degraded: true, reason:
         "checkpoint_unconfirmed"}`` (fail-closed; see
         :data:`_CHECKPOINT_DEGRADED_RESPONSE`)
@@ -3373,7 +3400,9 @@ def _handle_workspace_checkpoint(
             # boundary checks above) — typed reject, nothing persisted.
             return {"ok": False, "reason": str(exc)}
         except CoherenceError as exc:
-            return {"ok": False, "reason": str(exc)}
+            # Typed domain failure: identity-stable reason token on the wire
+            # (the restore/register posture), prose preserved in "detail".
+            return _typed_reason_response(exc)
         return {
             "ok": True,
             "checkpoint_id": record.checkpoint_id,
@@ -3509,6 +3538,8 @@ def _handle_workspace_restore_status(
 
     NOT in ``_MIGRATION_REJECTED_ROUTES``: like the checkpoint create, this is
     durable metadata with no version bump — it lands durably or fails typed.
+    An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
+    detail}`` — the register route's stable token, matched by identity.
     """
     body = req._read_json()
     if body is None:
@@ -3534,7 +3565,10 @@ def _handle_workspace_restore_status(
             coordinator.service.set_workspace_checkpoint_restore_status(
                 checkpoint_id, status, updated_at=float(now), abort=abort
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            # Unknown checkpoint — the register route's stable token, not prose.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
             "ok": True,
@@ -3564,7 +3598,9 @@ def _handle_workspace_restore_member(
     :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (boundary-gated AND
     service-validated); ``deleted_at_restore`` is the manifest-side delete
     record — per the plan's registration split, delete legs register HERE,
-    never through ``commit_all`` (which has no delete semantics).
+    never through ``commit_all`` (which has no delete semantics). An unknown
+    (checkpoint, member) pair answers ``{ok: false, reason:
+    "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
     """
     body = req._read_json()
     if body is None:
@@ -3615,7 +3651,11 @@ def _handle_workspace_restore_member(
                 ),
                 abort=abort,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            # Unknown (checkpoint, member) pair — same stable token as the
+            # register route's unknown-checkpoint class; "detail" says which.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
             "ok": True,

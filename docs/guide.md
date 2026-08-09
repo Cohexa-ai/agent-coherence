@@ -872,6 +872,8 @@ Exit codes:
 
 **S3 members and the CLI.** S3 object members are captured and restored via the Python API shown above — their bindings carry credentials the CLI cannot (and should not) reconstruct. `restore` on a checkpoint with pending S3 members refuses cleanly and points you at the Python API; `status` and `list` still render those members honestly.
 
+**The HTTP surface.** The coordinator serves the workspace verbs over local HTTP — `POST /workspace/checkpoint`, `GET /workspace/checkpoints`, `POST /workspace/restore/status`, `POST /workspace/restore/member`, and `POST /workspace/restore/register` — the same routes the Python API and the CLI ride. Pin orchestration has no HTTP route by design: pins are placed and released through the Python API only, because the substrate bindings that hold them carry your credentials, and credentials never belong on the coordinator's wire.
+
 ### Try it
 
 ```bash
@@ -883,9 +885,15 @@ Offline, deterministic, no API keys. `--baseline` first demonstrates the loss (n
 
 ### For implementers: the conformance corpus
 
-The workspace family ships in the packaged conformance corpus (`ccs.testing.substrate_conformance`), so a foreign implementation of workspace checkpoint/restore can be tested against the same scenarios ours is. Implement the `WorkspaceConformanceBinding` protocol and **declare your capabilities honestly** (`declares_versioned` / `declares_pinnable` / `declares_restart_survival`); the suite splits into **MUST-MATCH** scenarios every implementation must reproduce (one-winner restore arbitration, torn-cut detection, bounded termination under contention, restore-as-forward-commit, ABSENT-is-a-fact) and **DECLARED** scenarios pinned to your own declarations (versioned vs unversioned history, pinnable vs `restorable-unpinned`, restart survival) — a binding passes by satisfying observable outcomes, never by mimicking our internals. The restore-registration design is model-checked (`formal/tla/WorkspaceVersion.tla`, run in CI).
+The workspace family ships in the packaged conformance corpus (`ccs.testing.substrate_conformance`), so a foreign implementation of workspace checkpoint/restore can be tested against the same scenarios ours is. Implement the `WorkspaceConformanceBinding` protocol and **declare your capabilities honestly** (`declares_versioned` / `declares_pinnable` / `declares_restart_survival`); the suite splits into **MUST-MATCH** scenarios every implementation must reproduce (one-winner restore arbitration, torn-cut detection, bounded termination under contention, restore-as-forward-commit, ABSENT-is-a-fact) and **DECLARED** scenarios pinned to your own declarations (versioned vs unversioned history, pinnable vs `restorable-unpinned`, restart survival) — a binding passes by satisfying observable outcomes, never by mimicking our internals. The corpus imports and runs without pytest; `pip install 'agent-coherence[conformance]'` adds it so skipped scenarios report as skips under your test runner. The restore-registration design is model-checked (`formal/tla/WorkspaceVersion.tla`, run in CI).
 
-**Scope, honestly.** Single-host coordinator: checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims. Restore is over **artifacts, never effects** — files and objects come back; a sent message does not. File members are detection-only (`no-arbiter`); only backends with a native conditional write arbitrate. And restore is a **forward** commit carrying old bytes — versions strictly increase, history is never rewritten.
+**Scope, honestly.**
+
+- Single-host coordinator: checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims.
+- Restore is over **artifacts, never effects** — files and objects come back; a sent message does not.
+- File members are detection-only (`no-arbiter`); only backends with a native conditional write arbitrate. And restore is a **forward** commit carrying old bytes — versions strictly increase, history is never rewritten.
+- Restoring file members while a live coordinator session is running bypasses that session's grants — the session learns of the change on its next read, not before. The CLI warns when it detects a live coordinator; it does not refuse.
+- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores of the same checkpoint assume a single controller — run one restore at a time.
 
 ## Multi-artifact snapshot sessions
 

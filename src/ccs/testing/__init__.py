@@ -20,4 +20,8 @@ Current members:
   ``LocalWorkspaceBinding`` reference arm, the torn-cut-blind teeth stub).
   The in-repo runner under ``tests/conformance/`` imports FROM here through a
   thin shim; the corpus never imports from the test tree.
+
+The corpus imports and runs WITHOUT pytest (its raise-expectations ride an
+internal shim); only scenario SKIP reporting requires it — install via the
+``conformance`` extra: ``pip install 'agent-coherence[conformance]'``.
 """

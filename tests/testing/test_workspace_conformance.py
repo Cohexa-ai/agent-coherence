@@ -22,6 +22,8 @@ re-export the packaged corpus by IDENTITY (one conformance home, no fork).
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +208,78 @@ def test_runner_shim_reexports_the_packaged_corpus_by_identity() -> None:
             f"shim name {name!r} is not the packaged object — the corpus must "
             "have exactly ONE home"
         )
+
+
+# ---------------------------------------------------------------------------
+# Packaged-importable teeth (R11) — the corpus without pytest installed.
+# ---------------------------------------------------------------------------
+
+
+def test_corpus_all_names_resolve() -> None:
+    """Every name the corpus exports via ``__all__`` resolves — the public
+    surface a foreign implementation imports is real, not aspirational."""
+    for name in corpus.__all__:
+        assert hasattr(corpus, name), f"__all__ exports missing name {name!r}"
+
+
+_PYTEST_FREE_IMPORT_SCRIPT = """\
+import sys
+
+
+class _BlockPytest:
+    # Raise on ANY pytest import attempt — a clean venv, deterministically.
+    def find_spec(self, name, path=None, target=None):
+        if name == "pytest" or name.startswith("pytest."):
+            raise ModuleNotFoundError("pytest is blocked for the clean-import test")
+        return None
+
+
+sys.meta_path.insert(0, _BlockPytest())
+sys.modules.pop("pytest", None)
+
+import ccs.testing.substrate_conformance as corpus
+
+# Import SUCCEEDED without pytest; the guarded import degraded to the sentinel.
+assert corpus.pytest is None
+
+# Raise-expectation scenarios RUN without pytest (the internal shim).
+corpus.assert_forward_only_honest()
+corpus.assert_split_view_is_rejected()
+
+# The one pytest-only surface (skip reporting) fails AT USE, actionably.
+try:
+    corpus._skip_scenario("needs a scriptable substrate")
+except ModuleNotFoundError as err:
+    assert "agent-coherence[conformance]" in str(err), str(err)
+    assert "needs a scriptable substrate" in str(err), str(err)
+else:
+    raise AssertionError("_skip_scenario without pytest must raise the install hint")
+
+assert "pytest" not in sys.modules
+print("PYTEST-FREE-OK")
+"""
+
+
+def test_corpus_imports_and_runs_with_pytest_blocked() -> None:
+    """R11 packaged-importable teeth: a clean venv (``pip install
+    agent-coherence`` — no pytest) must import the corpus and run its
+    scenarios; only skip REPORTING needs the ``conformance`` extra, and its
+    absence fails at use time naming that extra. A subprocess with a
+    meta-path blocker plays the clean venv."""
+    src_dir = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(src_dir)
+    proc = subprocess.run(
+        [sys.executable, "-c", _PYTEST_FREE_IMPORT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"pytest-free corpus run failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    assert "PYTEST-FREE-OK" in proc.stdout
 
 
 # ---------------------------------------------------------------------------

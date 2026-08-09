@@ -82,6 +82,10 @@ stale-write-guard-fs = "ccs.mcp.server:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4"]
+# The packaged conformance corpus (ccs.testing.substrate_conformance) imports
+# and runs WITHOUT pytest; this extra adds it so scenario skips report as
+# skips when a foreign implementation runs the corpus under its test suite.
+conformance = ["pytest>=7.0"]
 langgraph = ["langgraph>=0.2"]
 crewai = ["crewai>=0.80"]
 # `opentelemetry-api` is the runtime dep (the OtelExporter no-ops without an
