@@ -1,6 +1,6 @@
 # TLA+ Formal Verification
 
-TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, consistent multi-artifact snapshot sessions, and atomic multi-artifact publish.
+TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, consistent multi-artifact snapshot sessions, atomic multi-artifact publish, and workspace-restore registration.
 
 ## What is modeled
 
@@ -16,6 +16,7 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 - **Bounded version retention + read-at-version (Retention)** — a per-artifact K-bounded history of committed versions (`history`, content abstracted as the version number), extended and garbage-collected atomically inside the fence-guarded commit (`RetentionCommitAction` — commit + retain + K-GC are one action, mirroring the same-transaction capture discipline), plus an off-protocol read-at-version request (`VersionedReadAction`) proven to be a protocol no-op. Every inherited invariant is re-checked with retention composed in — safety **preservation**, not behavioral equivalence (no refinement mapping). Corresponds to the retention capture points and `CoordinatorService.read_at_version` (plan: `docs/plans/2026-06-10-001-feat-version-retention-read-at-version-plan.md`).
 - **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — atomic multi-artifact *publish* is modeled separately in `AtomicPublish.tla` (below). The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer (plan: `docs/plans/2026-06-26-002-feat-read-side-transaction-snapshot-plan.md`).
 - **Atomic multi-artifact publish (AtomicPublish)** — a write-set-quantified commit action (no other spec in the chain has one; all inherited commits are single-`(agent, artifact)`): a batch of members either all advance to their next version atomically or none do (`NoPartialPublish`), and no peer observes an INVALID for a member of a batch that did not commit (broadcast-after-commit). `EXTENDS OCC` — the write race lives in the version-CAS, which keeps the state space lighter than extending Snapshot. Corresponds to `commit_all` in `src/ccs/coordinator/`. **Held out of the `make tla-check` CI sweep:** the write-set state space (≈ 2^|Artifacts| × MaxVersion^|Artifacts|) exceeds the 5-minute CI budget on the reference machine; the spec parses and the invariant is checkable on a smaller/longer local run, with CI-budget convergence tuning tracked as a follow-up (plan: `docs/plans/2026-07-07-001-feat-sb18-multi-artifact-atomic-transactions-plan.md`).
+- **Workspace-restore registration (WorkspaceVersion)** — the coordinator-registration layer of the Workspace-Versioning restore engine (WV plan Unit 7 / R10), modeled as the Unit-5 code implements it: the checkpoint status marker machine (`none → in_progress → registered → concluded`, `registered` one-shot and reachable only via a committed/empty registration), the member-class partition (written file members → one `commit_all` batch; S3 members manifest-side; deletes as records; the empty write-set as a no-commit transition), the hash-equality already-registered filter, the comparand-gap HELD → bounded re-drive, the fence-terminal refusal, crash/resume at every step, and a concurrent registered-writer bump. Proves `NoPartialRestoreRegistered` (all-or-nothing registration), `NoVersionRegression` (restore-as-forward-commit — old bytes at a strictly increasing version, never a rollback), and `ExactlyOnceRegistration` (the `registered` marker ∨ the hash filter across every crash window). **STANDALONE** — deliberately not `EXTENDS AtomicPublish`: `commit_all`'s internal all-or-nothing is AtomicPublish's proven theorem (`NoPartialPublish`) and the per-leg CAS arbitration is OCC's `NoLostUpdate`, so `commit_all` enters this model as ONE atomic action, keeping the state space CI-convergent (extending AtomicPublish would inherit exactly the state space that holds it out of the sweep). Corresponds to `WorkspaceVersioner._restore_locked` / `_registration_seam` / `_drive_registration` in `src/ccs/adapters/workspace.py` and `CoordinatorService.register_workspace_restore` in `src/ccs/coordinator/service.py` (plan: `docs/plans/2026-08-08-001-feat-workspace-versioning-e2e-plan.md`).
 
 ## What is deliberately out of scope
 
@@ -60,6 +61,9 @@ formal/tla/
 ├── AtomicPublish.tla       # amendment: EXTENDS OCC, adds the write-set-quantified atomic commit (NoPartialPublish)
 ├── AtomicPublish.cfg       # TLC config: 2 agents, 2 artifacts (local deep runs)
 ├── AtomicPublish_CI.cfg    # TLC config: 2 agents, 2 artifacts (held out of make tla-check pending convergence tuning)
+├── WorkspaceVersion.tla    # STANDALONE: workspace-restore registration (WV Unit 7 — marker machine, hash filter, fence, crash/resume)
+├── WorkspaceVersion.cfg    # TLC config: 2 members, MaxVersion=4, MaxAttempts=2 (local deep runs)
+├── WorkspaceVersion_CI.cfg # TLC config: 2 members, MaxVersion=3, MaxAttempts=1 (CI, ~5s)
 ├── lib/
 │   └── tla2tools.jar       # committed TLC binary (see version below)
 └── README.md               # this file
@@ -68,7 +72,7 @@ formal/tla/
 ## Running TLC
 
 ```bash
-# All six specs (recommended)
+# All CI-swept specs (recommended)
 make tla-check
 
 # Individual models
@@ -89,6 +93,9 @@ java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
 
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/Snapshot_CI.cfg formal/tla/Snapshot.tla -workers auto
+
+java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
+  -config formal/tla/WorkspaceVersion_CI.cfg formal/tla/WorkspaceVersion.tla -workers auto
 ```
 
 Requires Java 17+. CI uses Temurin via `actions/setup-java`.
@@ -112,6 +119,12 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `NoReadSkewWithinCut` | Snapshot | No commit ever interleaved a partially-captured session — every session reads a coherent multi-artifact cut. Atomic capture makes a partial cut unreachable (vacuous-TRUE in the correct spec); the split mutant (recipe 9) gives it teeth — the `staleApply`/`collectedRead` sticky-flag idiom |
 | — | `PinAlwaysRetained` | Snapshot | Every version a live session pinned is still in the artifact's retained history — the K-bounded GC never collects a pin out from under its session (the exemptions seam: `SnapRetainAndCollect` keeps window ∪ live-session pins; recipe 10 gives it teeth) |
 | — | `NoPartialPublish` | AtomicPublish (not in the CI sweep — see CI time budget) | No reachable state where a strict, non-empty subset of a batch's members advanced, and no peer observes an INVALID for a member of a batch that did not commit — a torn multi-artifact publish is unreachable. The split mutant (recipe 11) gives it teeth |
+| — | `WVTypeOK` / `RegisteredImpliesTerminal` | WorkspaceVersion | State types + registration well-formedness: an armed batch is non-empty/unanswered/in a live run, and the `registered`/`concluded` statuses are reachable only after every member holds a terminal outcome |
+| — | `NoPartialRestoreRegistered` | WorkspaceVersion | No restore registration ever landed a strict, non-empty subset of its commit batch — the WV-layer analog of `NoPartialPublish`, one level up (recipe 12 gives it teeth) |
+| — | `NoVersionRegression` | WorkspaceVersion | A restored member's coordinator version strictly increases while carrying OLD bytes (restore-as-forward-commit) — never a decrement; mirrors `check_monotonic_version` defense-in-depth (recipe 14 gives it teeth) |
+| — | `ExactlyOnceRegistration` | WorkspaceVersion | No registration commit ever re-bumped a member already at its manifest fingerprint — the `registered` marker ∨ the hash filter covers every crash window, incl. crash-after-commit-before-marker and crash-after-marker-before-conclude (recipe 13 gives it teeth) |
+
+"All six" above = the MESI-chain specs (`MESI_Standalone` … `Snapshot`); `WorkspaceVersion` is a **standalone** module (see its base-choice header) with its own type/monotonicity analogs, listed separately.
 
 I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 
@@ -144,6 +157,10 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `SnapRetainAndCollect` | `collectible_versions(exemptions=…)` — the K-GC keeping the window ∪ live-session pins (the exemptions seam, plan Unit 2) |
 | `NoReadSkewWithinCut` | the consistent-cut regression suite — atomic capture across peer commits (plan Units 2–3) |
 | `PinAlwaysRetained` | the exemptions-seam + session-liveness sweep tests (plan Units 2/5) |
+| `StartRestore/Crash/Resume` (WorkspaceVersion) | `WorkspaceVersioner._restore_locked` — the status writes, durable member rows, and the run-local `prior_run` flag read from a `registered` status at resume (`src/ccs/adapters/workspace.py`) |
+| `SeamPriorRun/SeamEmpty/ReadComparands/BudgetExhausted` | `WorkspaceVersioner._registration_seam` / `_drive_registration` — the member-class partition, the seam-level EMPTY, the bounded re-drive (`MAX_RESTORE_LEG_REDRIVES`) |
+| `RegisterCommitAction` | `CoordinatorService.register_workspace_restore` — the hash filter, the service-level EMPTY, ONE `commit_all` batch (WIN/HELD/fence), `check_monotonic_version` defense-in-depth |
+| `NoPartialRestoreRegistered` / `ExactlyOnceRegistration` / `NoVersionRegression` | the Unit-5 registration suites — `tests/coordinator/test_workspace_registration.py` (both registries) + the crash/race scenarios in `tests/adapters/test_workspace_versioner.py` |
 
 The model abstracts away transient states — the implementation's
 `enforce_transient_timeouts` and transient-skip rule in the sweep are not modeled.
@@ -160,7 +177,7 @@ non-decreasing) holds regardless of the bound.
 
 ## CI time budget
 
-Target: **5 minutes** total across the six specs run in CI (the original five measured 4min 32s sequential on the reference machine; Snapshot adds ~18s reference-equivalent on a tight 1-agent × 2-artifact config — see the Snapshot note below). The budget stays snug; treat further spec additions as needing their own budget review. `AtomicPublish.tla` is a seventh spec deliberately **held out of this budget** — its write-set state space does not converge inside the 5-minute target on the reference machine, so `make tla-check` does not run it (convergence tuning is a tracked follow-up).
+Target: **5 minutes** total across the specs run in CI (the original five measured 4min 32s sequential on the reference machine; Snapshot adds ~18s reference-equivalent on a tight 1-agent × 2-artifact config — see the Snapshot note below; WorkspaceVersion adds ~5s — its standalone base keeps the whole model two orders of magnitude below the chain specs, which is the point of the base choice). The budget stays snug; treat further spec additions as needing their own budget review. `AtomicPublish.tla` is deliberately **held out of this budget** — its write-set state space does not converge inside the 5-minute target on the reference machine, so `make tla-check` does not run it (convergence tuning is a tracked follow-up).
 
 | Model | Config | Agents | Artifacts | MaxTicks | Distinct States | Wall Time |
 |-------|--------|--------|-----------|----------|----------------|-----------|
@@ -175,6 +192,8 @@ Target: **5 minutes** total across the six specs run in CI (the original five me
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
 | Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 375,180 | ~18s |
 | Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
+| WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~5s |
+| WorkspaceVersion (local) | `WorkspaceVersion.cfg` | — | 2 members | MaxVersion=4 | 204,216 | ~6s |
 
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)
@@ -299,8 +318,44 @@ and confirm TLC finds a counterexample:
    CI budget (see CI time budget), run these locally rather than via
    `make tla-check`; they are not yet part of the CI-verified recipe set.
 
+12. **WorkspaceVersion torn-registration mutation (WV-1: apply the passing
+   subset)**: In `WorkspaceVersion.tla`, in `RegisterCommitAction`'s WIN
+   branch, relax the guard `winners = batch` to `winners /= {}` and change
+   `LET applied == batch` to `LET applied == winners` (both lines carry the
+   `MUTANT WV-1` marker) — a batch where only a strict subset of members
+   passes the version-CAS now commits that subset. Run TLC on
+   `WorkspaceVersion_CI.cfg`. TLC should fail with a
+   `NoPartialRestoreRegistered` violation: one member of the registration
+   batch advanced while a peer-bumped member was held — the torn
+   registration the whole-batch atomic apply excludes. (Verified
+   2026-08-09: violation found in ~1s, 88,660 states generated.)
+
+13. **WorkspaceVersion double-registration mutation (WV-2: drop the hash
+   filter)**: In `WorkspaceVersion.tla`, in `ReadComparandsAction`, change
+   `LET batch == { m \in FileWrites : hash[m] /= "fp" }` to
+   `LET batch == FileWrites` (the `MUTANT WV-2` marker) — the
+   already-at-fingerprint skip is gone, so a member whose commit already
+   landed (a coordinator-connected leg, or a crash-resumed run whose prior
+   `commit_all` landed before the `registered` marker) is re-committed. Run
+   TLC on `WorkspaceVersion_CI.cfg`. TLC should fail with an
+   `ExactlyOnceRegistration` violation — the phantom second bump the
+   marker + filter pair exists to exclude. (Verified 2026-08-09: violation
+   found in ~1s, 36,649 states generated.)
+
+14. **WorkspaceVersion rollback mutation (WV-3: restore-as-rollback)**: In
+   `WorkspaceVersion.tla`, in `RegisterCommitAction`'s WIN branch, change
+   `ApplyV(m) == version[m] + 1` to `ApplyV(m) == 1` (the `MUTANT WV-3`
+   marker) — the registration now "restores" by rolling the coordinator
+   version back to the checkpoint's instead of forward-committing old bytes
+   at a new version. Run TLC on `WorkspaceVersion_CI.cfg`. TLC should fail
+   with a `NoVersionRegression` violation once a peer commit has moved a
+   member past version 1 — the silent un-publish the forward-commit
+   discipline (`check_monotonic_version`) excludes. (Verified 2026-08-09:
+   violation found in ~1s, 74,767 states generated.)
+
 These mutations are run manually during development to validate TLC's
 bug-detection capability. The mutated files are not committed. Recipes 5–10
 run TLC directly on their amendment's CI config (`Retention_CI.cfg` /
-`Snapshot_CI.cfg`); recipe 11 runs on `AtomicPublish.cfg`. Mutating one amendment
-cannot affect the other specs, so the full `make tla-check` adds nothing.
+`Snapshot_CI.cfg`); recipe 11 runs on `AtomicPublish.cfg`; recipes 12–14 run
+on `WorkspaceVersion_CI.cfg`. Mutating one amendment cannot affect the other
+specs, so the full `make tla-check` adds nothing.
