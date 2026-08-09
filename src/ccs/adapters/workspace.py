@@ -113,6 +113,52 @@ Idempotent under crash-resume by TWO durable mechanisms: the checkpoint-level
 hash filter (an artifact already carrying the manifest fingerprint is skipped,
 so a crash between the ``commit_all`` landing and the marker write still
 re-answers without a second version bump).
+
+**Pins (WV Unit 6 / R9)** — "``restorable`` means restorable, or says
+``restorable-unpinned`` loudly". :meth:`WorkspaceVersioner.checkpoint` runs
+the pin legs by default (``pin=True``) right after the manifest persists —
+folding the pin into the capture verb is the ergonomic fail-closed default: a
+checkpoint whose S3 members claim ``restorable`` must not depend on a second
+call the operator can forget. The honesty contract is the durable PAIR
+``(restore_tier, pin_state)``: ``restorable`` is BACKED only by
+``pin_state="held"`` (:data:`~ccs.core.exceptions.PIN_STATES`); every
+consumer must render (``restorable``, ``unpinned``) — the ``pin=False``
+capture-only shape, or a run that died before a member's pin leg — as
+claimed-but-not-yet-backed. :meth:`WorkspaceVersioner.pin_checkpoint`
+re-drives pins idempotently (only ``unpinned`` members are attempted).
+
+- **S3 member (tier ``restorable``)** — the pin is the substrate's own:
+  ``set_legal_hold`` on the manifested versionId. Established → ``held`` (+1
+  on the checkpoint's pin refcount); the typed
+  :class:`~ccs.adapters.coherent_object.LegalHoldUnavailable` (no Object Lock
+  configuration) → the LOUD durable downgrade to ``restorable-unpinned`` with
+  ``pin_state="pin_unavailable"`` — the tier and the pin state land in ONE
+  registry write, never silently; a version already gone at pin time
+  (``KeyError``) downgrades the same way (restore will say ``target_lost``).
+- **File member (tier ``restorable-unpinned``)** — v1's VERIFICATION pin over
+  the coordinator's declared retention: the captured version's retained bytes
+  are read through the :class:`FileContentResolver` seam and checked against
+  the captured fingerprint. Verified → ``held`` (+1) with the tier kept at
+  ``restorable-unpinned`` (coordinator retention offers no per-version hold
+  in v1 — a bounded K/T policy may still evict, which restore reports
+  ``target_lost``; the R13 declared-retention disclosure documents this).
+  Retention off / the version not retained / a fingerprint mismatch → the
+  LOUD downgrade to ``forward_only`` with ``pin_state="pin_unavailable"``
+  (the captured state is ALREADY unreachable — describing it as any flavor of
+  restorable would be the silent-decay lie). A versioner with no resolver
+  skips file pin legs entirely (nothing above ``restorable-unpinned`` was
+  ever claimed, so nothing needs backing).
+- **Forward-only / absent / unconfirmed members** — never pinned, untouched.
+- **Release is INTERNAL-ONLY** (``_release_checkpoint_pins``): there is no
+  public checkpoint-delete/release verb in v1. Refcount-aware across
+  checkpoints: before dropping an S3 legal hold the release scans every OTHER
+  checkpoint's members for another ``held`` pin of the same ``(member_path,
+  native_token)`` — a shared hold survives until the LAST holder releases.
+  Each released member is recorded ``pin_state="released"`` (tier downgraded
+  to ``restorable-unpinned`` where it was ``restorable``) BEFORE the substrate
+  hold is dropped — a crash between the record and the drop leaves an
+  over-retained version (safe direction) whose next release attempt (any
+  checkpoint) still drops it, never an unbacked ``restorable`` claim.
 """
 
 from __future__ import annotations
@@ -125,6 +171,7 @@ from uuid import UUID
 from ccs.adapters.coherent_object import (
     CREATE_IF_ABSENT,
     CoherentObject,
+    LegalHoldUnavailable,
     VersionedCasWritten,
     VersionPointerUnconfirmed,
 )
@@ -132,6 +179,10 @@ from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    PIN_STATE_HELD,
+    PIN_STATE_RELEASED,
+    PIN_STATE_UNAVAILABLE,
+    PIN_STATE_UNPINNED,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_CONVERGED,
@@ -169,6 +220,7 @@ __all__ = [
     "CHECKPOINT_NOT_PERSISTED_REASON",
     "CheckpointPersistFailed",
     "CheckpointPersistence",
+    "CheckpointPinStore",
     "CheckpointRestoreStore",
     "FileContentResolver",
     "FileMemberSource",
@@ -323,6 +375,49 @@ class CheckpointRestoreStore(Protocol):
         writes: Sequence[WorkspaceRestoreWrite],
         issued_at_tick: int = 0,
     ) -> WorkspaceRegistrationResult:
+        ...
+
+
+@runtime_checkable
+class CheckpointPinStore(Protocol):
+    """The pin engine's durable-store seam (WV Unit 6 / R9):
+    ``CoordinatorService``'s checkpoint read + pin-state + refcount surface.
+
+    Pin legs are driven FROM the durable member rows and record their answer
+    THROUGH ``set_workspace_checkpoint_member_pin`` — the pin state and any
+    loud tier downgrade land in ONE registry write.
+    ``list_workspace_checkpoints`` feeds the internal release's
+    cross-checkpoint scan (a legal hold shared by another checkpoint's
+    ``held`` member must survive this checkpoint's release).
+    :meth:`WorkspaceVersioner.checkpoint` verifies its service speaks this
+    surface BEFORE capturing anything when pins will be needed (fail-fast on a
+    capture-only seam; pass ``pin=False`` there).
+    """
+
+    def get_workspace_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        ...
+
+    def get_workspace_checkpoint_members(
+        self, checkpoint_id: str
+    ) -> "list[CheckpointMember]":
+        ...
+
+    def list_workspace_checkpoints(self) -> "list[CheckpointRecord]":
+        ...
+
+    def set_workspace_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        ...
+
+    def adjust_workspace_checkpoint_pin_refcount(
+        self, checkpoint_id: str, delta: int
+    ) -> int:
         ...
 
 
@@ -627,14 +722,29 @@ class WorkspaceVersioner:
 
     # --- the capture ----------------------------------------------------------
 
-    def checkpoint(self, name: str) -> WorkspaceCheckpoint:
-        """Capture a named checkpoint: cut → verify → persist (one registration).
+    def checkpoint(self, name: str, *, pin: bool = True) -> WorkspaceCheckpoint:
+        """Capture a named checkpoint: cut → verify → persist (one registration)
+        → pin (the Unit-6 GC pin legs, on by default).
+
+        ``pin=True`` (the fail-closed default) runs the pin legs right after
+        the manifest persists — module docstring, "Pins": an S3 hold lands
+        (``pin_state="held"``) or the tier downgrades LOUDLY in the same
+        registry write; a file member's retention pin is verified or the
+        member downgrades loudly; the returned member rows are re-read from
+        the registry so they carry the durable pin outcome. ``pin=False``
+        captures only (a capture-only service seam, or a caller deliberately
+        deferring to :meth:`pin_checkpoint`) — the persisted pair
+        (``restorable``, ``unpinned``) is the documented
+        claimed-but-not-yet-backed shape, never a guarantee.
 
         Raises :class:`BinaryFileMemberRefused` (typed, BEFORE any persist) for
         a non-UTF-8 file member, and :class:`CheckpointPersistFailed` when the
         coordinator/registry raises during the single-transaction registration
         (no partial manifest either way). ``ValueError`` for an empty member
-        set or a blank name (nothing to checkpoint is a caller bug, not a cut).
+        set or a blank name (nothing to checkpoint is a caller bug, not a
+        cut); ``TypeError`` — BEFORE any capture read — when ``pin=True``
+        needs pin legs this service cannot record (fail-fast, never a silent
+        unpinned pass).
         """
         if not isinstance(name, str) or not name.strip():
             raise ValueError("checkpoint needs a non-empty name")
@@ -644,9 +754,47 @@ class WorkspaceVersioner:
                     "checkpoint needs at least one declared member (an empty "
                     "workspace manifest would describe nothing)"
                 )
+            pin_store = self._require_pin_store_for_checkpoint() if pin else None
             rows = self._capture_all(name)
             rows = self._verify_window(rows)
-            return self._persist(name, rows)
+            result = self._persist(name, rows)
+            if pin_store is None:
+                return result
+            checkpoint_id = result.record.checkpoint_id
+            self._pin_members(pin_store, checkpoint_id)
+            # Return the DURABLE truth: the rows re-read from the registry
+            # carry each member's pin outcome (held / the loud downgrade).
+            return WorkspaceCheckpoint(
+                record=result.record,
+                members=tuple(
+                    pin_store.get_workspace_checkpoint_members(checkpoint_id)
+                ),
+            )
+
+    def pin_checkpoint(self, checkpoint_id: str) -> "tuple[CheckpointMember, ...]":
+        """Re-drive the pin legs for a persisted checkpoint (idempotent).
+
+        The retry half of the fold-in default: a run whose pin legs died
+        mid-way (or a ``pin=False`` capture) is completed here. Only members
+        still ``pin_state="unpinned"`` are attempted — ``held`` is already
+        backed, ``pin_unavailable`` is a structural refusal (re-attempting
+        cannot change the bucket's Object Lock configuration or resurrect a
+        gone version), and ``released`` was deliberately dropped by the
+        internal release. Returns the refreshed durable member rows.
+
+        Raises the typed :class:`~ccs.core.exceptions.CheckpointUnknown` for
+        an unknown id, ``TypeError`` for a service without the pin surface,
+        and ``ValueError`` (pre-flight, before any write) when a pin-eligible
+        S3 member row has no declared binding on this versioner.
+        """
+        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+            raise ValueError("pin_checkpoint needs a non-empty checkpoint id")
+        store = self._require_pin_store()
+        with self._lock:
+            if store.get_workspace_checkpoint(checkpoint_id) is None:
+                raise CheckpointUnknown(checkpoint_id)
+            self._pin_members(store, checkpoint_id)
+            return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
 
     # --- capture pass ---------------------------------------------------------
 
@@ -802,6 +950,274 @@ class WorkspaceVersioner:
                 "retry once the coordinator is reachable."
             ) from exc
         return WorkspaceCheckpoint(record=record, members=tuple(rows))
+
+    # --- the pin legs (WV Unit 6 / R9) ----------------------------------------
+
+    def _require_pin_store(self) -> CheckpointPinStore:
+        if not isinstance(self._service, CheckpointPinStore):
+            raise TypeError(
+                "pin legs need a service speaking the CheckpointPinStore "
+                "surface (checkpoint read + durable pin state + refcounts); "
+                f"this service ({type(self._service).__name__}) does not — a "
+                "capture-only seam cannot record a pin outcome, and an "
+                "unrecorded pin would be the silent-decay lie"
+            )
+        return self._service
+
+    def _require_pin_store_for_checkpoint(self) -> CheckpointPinStore | None:
+        """The fold-in's fail-fast gate, BEFORE any capture read.
+
+        A service speaking the pin surface is used as-is. One that does not is
+        tolerated ONLY when no declared member could need a pin leg (no S3
+        member, and no file member unless a resolver was injected) — anything
+        else raises ``TypeError`` here rather than persisting a manifest whose
+        ``restorable`` claim nothing can back (pass ``pin=False`` explicitly
+        for a capture-only run; the unpinned pair is then the caller's
+        documented choice, not an accident).
+        """
+        if isinstance(self._service, CheckpointPinStore):
+            return self._service
+        needs_pins = any(isinstance(m, _ObjectMember) for m in self._members) or (
+            self._file_resolver is not None
+            and any(isinstance(m, _FileMember) for m in self._members)
+        )
+        if needs_pins:
+            self._require_pin_store()  # raises the descriptive TypeError
+        return None
+
+    def _pin_members(self, store: CheckpointPinStore, checkpoint_id: str) -> None:
+        """Drive one pin leg per eligible DURABLE member row (idempotent).
+
+        Eligible = present, pointer manifested, and still
+        ``pin_state="unpinned"`` — ``held`` is already backed,
+        ``pin_unavailable`` is structural, ``released`` was deliberate. Each
+        leg ends in exactly one durable answer: ``held`` (+1 refcount) or the
+        loud ``pin_unavailable`` downgrade (pin state and tier in ONE registry
+        write). Operational failures outside the typed surface propagate — the
+        member then still reads (``restorable``, ``unpinned``) =
+        claimed-but-not-backed, and :meth:`pin_checkpoint` re-drives it.
+        """
+        rows = store.get_workspace_checkpoint_members(checkpoint_id)
+        declared = {m.member_path: m for m in self._members}
+        eligible = [row for row in rows if self._pin_eligible(row)]
+        problems = [
+            f"{row.member_path}: no declared S3 object member binding on this "
+            "versioner (re-declare the member before pin_checkpoint)"
+            for row in eligible
+            if row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value
+            and not isinstance(declared.get(row.member_path), _ObjectMember)
+        ]
+        if problems:
+            raise ValueError(
+                "pin pre-flight failed (nothing was pinned): " + "; ".join(problems)
+            )
+        for row in eligible:
+            if row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value:
+                member = declared[row.member_path]
+                assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
+                self._pin_object_leg(store, checkpoint_id, row, member)
+            else:
+                self._pin_file_leg(store, checkpoint_id, row)
+
+    def _pin_eligible(self, row: CheckpointMember) -> bool:
+        """One pin-attempt admission rule for both member kinds."""
+        if row.absent or row.native_token is None:
+            return False  # nothing to pin: no captured state / no pointer
+        if row.pin_state != PIN_STATE_UNPINNED:
+            return False  # held is backed; unavailable/released are terminal
+        if (
+            row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value
+            and row.restore_tier == RestoreTier.RESTORABLE.value
+        ):
+            return True  # the S3 legal-hold leg
+        return (
+            row.arbitration_tier == ArbitrationTier.NO_ARBITER.value
+            and row.restore_tier == RestoreTier.RESTORABLE_UNPINNED.value
+            and self._file_resolver is not None
+        )  # the file verification leg (no resolver -> nothing claimed to back)
+
+    def _pin_object_leg(
+        self,
+        store: CheckpointPinStore,
+        checkpoint_id: str,
+        row: CheckpointMember,
+        member: _ObjectMember,
+    ) -> None:
+        """S3: establish the substrate's own per-version pin (legal hold ON)."""
+        assert row.native_token is not None  # eligibility guaranteed
+        try:
+            member.binding.set_legal_hold(member.key, version_id=row.native_token)
+        except LegalHoldUnavailable:
+            # No Object Lock configuration: the pin can NEVER be established on
+            # this bucket — the loud, durable downgrade (tier + pin state in
+            # one write), never a silent restorable claim.
+            store.set_workspace_checkpoint_member_pin(
+                checkpoint_id,
+                row.member_path,
+                pin_state=PIN_STATE_UNAVAILABLE,
+                restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
+            )
+            return
+        except (KeyError, VersionPointerUnconfirmed):
+            # The pinned version is already gone (raced lifecycle/delete) or
+            # the pointer axis broke: nothing left to hold — downgrade loudly;
+            # a later restore reports target_lost for it.
+            store.set_workspace_checkpoint_member_pin(
+                checkpoint_id,
+                row.member_path,
+                pin_state=PIN_STATE_UNAVAILABLE,
+                restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
+            )
+            return
+        store.set_workspace_checkpoint_member_pin(
+            checkpoint_id, row.member_path, pin_state=PIN_STATE_HELD
+        )
+        store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, +1)
+
+    def _pin_file_leg(
+        self, store: CheckpointPinStore, checkpoint_id: str, row: CheckpointMember
+    ) -> None:
+        """File: v1's VERIFICATION pin over the coordinator's declared retention.
+
+        The captured version's retained bytes are read through the resolver
+        seam and checked against the captured fingerprint. Verified → ``held``
+        with the tier kept at ``restorable-unpinned`` (coordinator retention
+        offers no per-version hold in v1 — the R13 disclosure); retention off
+        / the version not retained / a fingerprint mismatch → the captured
+        state is ALREADY unreachable, so the member downgrades LOUDLY to
+        ``forward_only`` (a restore can only describe it and skip).
+        """
+        resolver = self._file_resolver
+        assert resolver is not None and row.native_token is not None  # eligibility
+        try:
+            retained = resolver.content_at(row.member_path, int(row.native_token))
+        except KeyError:
+            store.set_workspace_checkpoint_member_pin(
+                checkpoint_id,
+                row.member_path,
+                pin_state=PIN_STATE_UNAVAILABLE,
+                restore_tier=RestoreTier.FORWARD_ONLY.value,
+            )
+            return
+        if _sha256_hex(retained) != row.fingerprint:
+            store.set_workspace_checkpoint_member_pin(
+                checkpoint_id,
+                row.member_path,
+                pin_state=PIN_STATE_UNAVAILABLE,
+                restore_tier=RestoreTier.FORWARD_ONLY.value,
+            )
+            return
+        store.set_workspace_checkpoint_member_pin(
+            checkpoint_id, row.member_path, pin_state=PIN_STATE_HELD
+        )
+        store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, +1)
+
+    def _release_checkpoint_pins(
+        self, checkpoint_id: str
+    ) -> "tuple[CheckpointMember, ...]":
+        """INTERNAL-ONLY: release every pin this checkpoint holds (idempotent).
+
+        Deliberately underscore-private with NO public CLI/API verb (v1 scope:
+        the GC drop-half is v2 — this method exists so the pin lifecycle is
+        complete and testable, not as an operator surface).
+
+        Per ``held`` member, in the fail-closed order: (1) record
+        ``pin_state="released"`` — downgrading a ``restorable`` tier to
+        ``restorable-unpinned`` in the SAME write, so no instant leaves an
+        unbacked ``restorable`` claim; (2) decrement the checkpoint's pin
+        refcount; (3) for an S3 member, drop the legal hold ONLY when no OTHER
+        checkpoint still holds a ``held`` pin on the same ``(member_path,
+        native_token)`` — the cross-checkpoint scan: a shared hold survives
+        until the LAST holder releases (S3's hold is a flag, not a counter;
+        the scan is the counter). A crash between (1) and (3) leaves an
+        over-retained hold — the safe direction — which the sharing peer's own
+        release still drops (its scan sees this row as ``released``).
+
+        Documented residuals: two checkpoints releasing CONCURRENTLY from
+        different processes can each see the other still ``held`` and both
+        skip the drop (over-retention, never data loss); the refcount write is
+        a separate registry write from the pin record, so a crash between them
+        leaves a benign bookkeeping drift. Cross-checkpoint identity is
+        ``(member_path, native_token)`` — the bucket lives binding-side (real
+        S3 version ids are unique; a cross-bucket collision is a documented
+        residual of the fake's shape, not the engine's).
+
+        Returns the refreshed durable rows. Raises
+        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id,
+        ``TypeError`` for a service without the pin surface, ``ValueError``
+        (pre-flight, before any write) when a held S3 row has no declared
+        binding.
+        """
+        store = self._require_pin_store()
+        with self._lock:
+            if store.get_workspace_checkpoint(checkpoint_id) is None:
+                raise CheckpointUnknown(checkpoint_id)
+            rows = store.get_workspace_checkpoint_members(checkpoint_id)
+            declared = {m.member_path: m for m in self._members}
+            held = [row for row in rows if row.pin_state == PIN_STATE_HELD]
+            problems = [
+                f"{row.member_path}: no declared S3 object member binding on "
+                "this versioner (re-declare the member before releasing)"
+                for row in held
+                if row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value
+                and not isinstance(declared.get(row.member_path), _ObjectMember)
+            ]
+            if problems:
+                raise ValueError(
+                    "release pre-flight failed (nothing was released): "
+                    + "; ".join(problems)
+                )
+            for row in held:
+                downgrade = (
+                    RestoreTier.RESTORABLE_UNPINNED.value
+                    if row.restore_tier == RestoreTier.RESTORABLE.value
+                    else None
+                )
+                store.set_workspace_checkpoint_member_pin(
+                    checkpoint_id,
+                    row.member_path,
+                    pin_state=PIN_STATE_RELEASED,
+                    restore_tier=downgrade,
+                )
+                store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
+                if (
+                    row.arbitration_tier != ArbitrationTier.NATIVE_CAS.value
+                    or row.native_token is None
+                ):
+                    continue  # the file verification pin has no substrate half
+                if self._pin_shared_elsewhere(store, checkpoint_id, row):
+                    continue  # another checkpoint's hold: survives (last-out drops)
+                member = declared[row.member_path]
+                assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
+                try:
+                    member.binding.release_legal_hold(
+                        member.key, version_id=row.native_token
+                    )
+                except (KeyError, LegalHoldUnavailable):
+                    # The hold is moot — the version (or the lock
+                    # configuration) is gone; the release's goal (no dangling
+                    # hold) already stands. The record above is the truth.
+                    continue
+            return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
+
+    @staticmethod
+    def _pin_shared_elsewhere(
+        store: CheckpointPinStore, checkpoint_id: str, row: CheckpointMember
+    ) -> bool:
+        """True iff ANOTHER checkpoint holds a ``held`` pin on the same
+        ``(member_path, native_token)`` — the cross-checkpoint refcount scan
+        (cheap: checkpoints are few and the read is registry-local)."""
+        for record in store.list_workspace_checkpoints():
+            if record.checkpoint_id == checkpoint_id:
+                continue
+            for other in store.get_workspace_checkpoint_members(record.checkpoint_id):
+                if (
+                    other.pin_state == PIN_STATE_HELD
+                    and other.member_path == row.member_path
+                    and other.native_token == row.native_token
+                ):
+                    return True
+        return False
 
     # --- the restore (WV Unit 4 / R3) -----------------------------------------
 

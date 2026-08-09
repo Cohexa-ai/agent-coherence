@@ -24,6 +24,7 @@ from ccs.core.exceptions import (
     FUTURE_VERSION_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    PIN_STATES,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     RETENTION_OFF_REASON,
@@ -45,6 +46,7 @@ from ccs.core.exceptions import (
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
+from ccs.core.substrate import RestoreTier
 from ccs.core.types import (
     Artifact,
     CasCorruption,
@@ -2458,6 +2460,79 @@ class CoordinatorService:
                 restore_outcome=restore_outcome,
                 deleted_at_restore=deleted_at_restore,
             )
+
+    def list_workspace_checkpoints(self) -> "list[CheckpointRecord]":
+        """Every checkpoint header, ordered ``(created_at, checkpoint_id)``.
+
+        The pin engine's cross-checkpoint read (WV plan Unit 6 / R9): before
+        an internal release drops an S3 legal hold, it scans the OTHER
+        checkpoints' members for another ``held`` pin of the same
+        ``(member_path, native_token)`` — a shared hold must survive the
+        first checkpoint's release. Also the Unit-8 ``list`` verb's source.
+        """
+        return self.registry.list_checkpoints()
+
+    def set_workspace_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Record one member's durable pin state (WV plan Unit 6 / R9).
+
+        ``pin_state`` must be one of the closed
+        :data:`~ccs.core.exceptions.PIN_STATES`; ``restore_tier`` (when given)
+        rewrites the member's restore tier IN THE SAME registry write — the
+        loud tier downgrade a failed/released pin must land together with its
+        pin state (two writes could crash apart and leave a ``restorable``
+        member with no backing pin). Both vocabularies fail closed BEFORE any
+        write. ``abort`` threads into :meth:`registry.abort_guard` (the A6
+        lesson: every mutating path threads it). Raises ``KeyError`` for an
+        unknown (checkpoint, member) pair.
+        """
+        if pin_state not in PIN_STATES:
+            raise ValueError(
+                f"unknown pin state {pin_state!r}: the closed vocabulary is "
+                f"{sorted(PIN_STATES)} (fail-closed — the pair "
+                "(restore_tier, pin_state) is the honesty surface and an "
+                "unvetted string would make it unreadable)"
+            )
+        if restore_tier is not None and restore_tier not in {
+            tier.value for tier in RestoreTier
+        }:
+            raise ValueError(
+                f"unknown restore tier {restore_tier!r}: the closed vocabulary "
+                f"is {sorted(tier.value for tier in RestoreTier)} (fail-closed)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_member_pin(
+                checkpoint_id,
+                member_path,
+                pin_state=pin_state,
+                restore_tier=restore_tier,
+            )
+
+    def adjust_workspace_checkpoint_pin_refcount(
+        self,
+        checkpoint_id: str,
+        delta: int,
+        *,
+        abort: threading.Event | None = None,
+    ) -> int:
+        """Atomically adjust a checkpoint's pin refcount; the new value returned.
+
+        The Unit-6 bookkeeping counter: +1 per pin the checkpoint establishes,
+        -1 per pin the internal release drops. The registry refuses a result
+        below zero (``ValueError`` — a release without a matching pin is a
+        bookkeeping bug, fail-closed). ``abort`` threads into
+        :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
+        checkpoint.
+        """
+        with self.registry.abort_guard(abort):
+            return self.registry.adjust_checkpoint_pin_refcount(checkpoint_id, delta)
 
     def register_workspace_restore(
         self,

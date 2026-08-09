@@ -818,6 +818,53 @@ RESTORE_STATUSES: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Workspace-Versioning member PIN-STATE vocabulary (WV plan Unit 6 / R9)
+# ---------------------------------------------------------------------------
+#
+# The ``CheckpointMember.pin_state`` vocabulary (the registry stores the
+# string; THIS is its meaning). Wire-stable constants matched by IDENTITY
+# (add, never rename). The honesty contract is the PAIR (restore_tier,
+# pin_state): tier ``restorable`` is BACKED only when pin_state is ``held`` —
+# every consumer (the Unit-8 ``status`` surface included) must render
+# (``restorable``, ``unpinned``) as claimed-but-not-yet-backed, never as a
+# guarantee. A pin that cannot be established never leaves tier ``restorable``
+# (the fail-closed rule: the failed attempt writes the loud tier downgrade in
+# the SAME registry write as its pin state).
+#
+# - ``unpinned`` — no pin established (the capture-time default; also the
+#   honest durable state when pin orchestration was skipped via ``pin=False``
+#   or died before this member's leg ran).
+# - ``held`` — the pin the member's substrate offers is ESTABLISHED. S3: the
+#   Object Lock legal hold is ON for the manifested versionId (a lifecycle
+#   expiry and a version-targeted delete are refused by the substrate). File:
+#   the captured version was VERIFIED retained-and-readable under the
+#   coordinator's declared retention at pin time — v1's verification pin: the
+#   tier stays ``restorable-unpinned`` because coordinator retention offers no
+#   per-version hold (a bounded K/T policy may still evict; restore then
+#   reports ``target_lost`` loudly — the R13 declared-retention disclosure).
+# - ``pin_unavailable`` — the pin attempt RAN and could not be established
+#   (no Object Lock configuration, the pinned version already gone, retention
+#   off / the version not retained, or retained bytes that no longer match the
+#   captured fingerprint). Always written together with the loud tier
+#   downgrade — never a silent pass.
+# - ``released`` — a previously ``held`` pin was dropped by the INTERNAL
+#   release path (there is no public checkpoint-delete/release verb in v1);
+#   written together with the tier downgrade where the tier was ``restorable``
+#   (the claim is no longer backed).
+PIN_STATE_UNPINNED = "unpinned"
+PIN_STATE_HELD = "held"
+PIN_STATE_UNAVAILABLE = "pin_unavailable"
+PIN_STATE_RELEASED = "released"
+PIN_STATES: frozenset[str] = frozenset(
+    {
+        PIN_STATE_UNPINNED,
+        PIN_STATE_HELD,
+        PIN_STATE_UNAVAILABLE,
+        PIN_STATE_RELEASED,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # Workspace-Versioning restore REGISTRATION vocabulary (WV plan Unit 5 / R4-R5)
 # ---------------------------------------------------------------------------
 #

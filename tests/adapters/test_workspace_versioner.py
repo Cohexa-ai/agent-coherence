@@ -47,6 +47,10 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.core.exceptions import (
     CHECKPOINT_UNKNOWN_REASON,
+    PIN_STATE_HELD,
+    PIN_STATE_RELEASED,
+    PIN_STATE_UNAVAILABLE,
+    PIN_STATE_UNPINNED,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_CONVERGED,
     RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
@@ -867,6 +871,11 @@ def test_happy_full_restore_all_terminal_outcomes(
     files.put("notes/calm.md", b"calm", 5)
     resolver = _FakeResolver()
     resolver.keep("notes/plan.md", 7, b"plan text")
+    # Unit 6: the default checkpoint() runs the pin legs — the file
+    # verification pin consults the resolver, so the converged member's
+    # version must be retained too (else it downgrades loudly to
+    # forward_only, which the retention-gap pin tests cover).
+    resolver.keep("notes/calm.md", 5, b"calm")
 
     versioner = _versioner(service, resolver=resolver)
     versioner.add_file_member(files, "notes/plan.md")
@@ -1150,10 +1159,13 @@ def test_expired_pin_yields_target_lost_and_restore_concludes(
     client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
     versioner = _versioner(service)
     versioner.add_object_member(obj, "cfg.json")
-    checkpoint_id = versioner.checkpoint("pinned").record.checkpoint_id
+    # pin=False: the deliberate capture-only shape — no legal hold lands, so
+    # the manifested version has nothing protecting it (the Unit-6 pin-path
+    # twin of this test proves the held version SURVIVES the same expiry).
+    checkpoint_id = versioner.checkpoint("pinned", pin=False).record.checkpoint_id
 
     # A live writer makes the captured version noncurrent; a lifecycle rule
-    # then expires it (no legal hold established — Unit 6): the pin is gone.
+    # then expires it (no legal hold established): the pin target is gone.
     client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
     expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
     assert expired and not held
@@ -2042,3 +2054,415 @@ def test_route_restore_register_boundary_validation(client) -> None:
         {**base, "writes": [{"member_path": "/etc/passwd", "fingerprint": fp}]},
     )
     assert status == 400
+
+
+# ---------------------------------------------------------------------------
+# WV Unit 6 — pin legs (minimal, fail-closed): "restorable means restorable,
+# or says restorable-unpinned loudly"
+# ---------------------------------------------------------------------------
+
+
+class _CaptureOnlyService:
+    """A persist-only seam (no pin surface): delegates the single-transaction
+    registration to a real service but speaks NOTHING else — the shape the
+    fold-in's fail-fast gate must refuse when pins are needed."""
+
+    def __init__(self, inner: CoordinatorService) -> None:
+        self._inner = inner
+
+    def create_workspace_checkpoint(self, **kwargs: Any) -> Any:
+        return self._inner.create_workspace_checkpoint(**kwargs)
+
+
+def _s3_no_lock() -> tuple[LocalS3Client, CoherentObject]:
+    """A VERSIONED bucket WITHOUT Object Lock: history exists, no pin can."""
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=False)
+    return client, CoherentObject("demo", client=client)
+
+
+def test_pin_established_survives_lifecycle_expiry_and_restore_succeeds(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The pin's whole point: hold ON at checkpoint → the manifested version
+    survives a lifecycle expiry of noncurrent versions → restore serves it."""
+    client, obj = _s3()  # object_lock=True
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+
+    cp = versioner.checkpoint("pinned")  # pin=True is the default
+
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_HELD
+    assert member.restore_tier == "restorable"  # the claim is now BACKED
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 1
+
+    # A live writer makes the captured version noncurrent; the lifecycle rule
+    # REFUSES the held version (the fake's teeth mirror real S3 semantics).
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert held == [put["VersionId"]] and expired == []
+
+    report = versioner.restore(cp.record.checkpoint_id)
+    assert report.members_by_path["s3://cfg.json"].outcome == RESTORE_OUTCOME_RESTORED
+    data, _etag = obj.read("cfg.json")
+    assert data == b"v1"  # the pinned bytes are back
+
+
+def test_no_object_lock_pin_downgrades_loudly_and_durably(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """No Object Lock → the typed LegalHoldUnavailable → the LOUD durable
+    downgrade: tier restorable-unpinned + pin_state pin_unavailable land in
+    one registry write, surfaced in the checkpoint return AND the registry."""
+    client, obj = _s3_no_lock()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+
+    cp = versioner.checkpoint("unpinnable")
+
+    (member,) = cp.members
+    assert member.restore_tier == "restorable-unpinned"  # never restorable
+    assert member.pin_state == PIN_STATE_UNAVAILABLE
+    # Durable, not just the in-memory return: the registry rows agree.
+    (stored,) = registry.get_checkpoint_members(cp.record.checkpoint_id)
+    assert stored.restore_tier == "restorable-unpinned"
+    assert stored.pin_state == PIN_STATE_UNAVAILABLE
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+
+def test_downgraded_unpinned_member_expired_is_target_lost(
+    service: CoordinatorService,
+) -> None:
+    """The pin-path extension of the Unit-4 expired-pin scenario: a member the
+    pin legs DOWNGRADED (no Object Lock) is exactly the member a lifecycle
+    expiry can take — restore then says target_lost, never best-effort."""
+    client, obj = _s3_no_lock()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("unpinnable")
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_UNAVAILABLE  # the loud label, upfront
+
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired and not held  # nothing protected it
+
+    report = versioner.restore(cp.record.checkpoint_id)
+    assert (
+        report.members_by_path["s3://cfg.json"].outcome == RESTORE_OUTCOME_TARGET_LOST
+    )
+
+
+def test_internal_release_decrements_and_releases_hold(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+
+    rows = versioner._release_checkpoint_pins(cp.record.checkpoint_id)
+
+    (member,) = rows
+    assert member.pin_state == PIN_STATE_RELEASED
+    # Releasing un-backs the claim: the tier downgrade rides the same write.
+    assert member.restore_tier == "restorable-unpinned"
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+    # Idempotent: nothing held, nothing changes, no refcount underflow.
+    rows = versioner._release_checkpoint_pins(cp.record.checkpoint_id)
+    assert rows[0].pin_state == PIN_STATE_RELEASED
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+    # A released pin is terminal for the re-drive too (deliberate drop —
+    # pin_checkpoint must not resurrect it).
+    rows_after = versioner.pin_checkpoint(cp.record.checkpoint_id)
+    assert rows_after[0].pin_state == PIN_STATE_RELEASED
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+
+    # And the lifecycle can now take the version (the release is real).
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired == [put["VersionId"]] and held == []
+
+
+def test_shared_version_cross_checkpoint_release_keeps_hold(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """Two checkpoints pin the SAME (member_path, versionId). S3's hold is a
+    flag, not a counter — the release's cross-checkpoint scan is the counter:
+    the first release must leave the hold standing, the LAST drops it."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp1 = versioner.checkpoint("first")
+    cp2 = versioner.checkpoint("second")  # no intervening write: same version
+    assert cp1.members[0].native_token == cp2.members[0].native_token
+    assert cp1.members[0].pin_state == PIN_STATE_HELD
+    assert cp2.members[0].pin_state == PIN_STATE_HELD
+
+    versioner._release_checkpoint_pins(cp1.record.checkpoint_id)
+
+    # cp1's record moved; cp2 still holds, so the SUBSTRATE hold survives.
+    (row1,) = registry.get_checkpoint_members(cp1.record.checkpoint_id)
+    (row2,) = registry.get_checkpoint_members(cp2.record.checkpoint_id)
+    assert row1.pin_state == PIN_STATE_RELEASED
+    assert row2.pin_state == PIN_STATE_HELD
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert held == [put["VersionId"]] and expired == []
+
+    # Last-out: cp2's release finds no other holder and drops the hold.
+    versioner._release_checkpoint_pins(cp2.record.checkpoint_id)
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired == [put["VersionId"]] and held == []
+
+
+def test_pin_checkpoint_redrive_is_idempotent(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """pin=False leaves the documented (restorable, unpinned) claimed-but-not-
+    backed pair; pin_checkpoint completes it; a second re-drive changes
+    nothing (held members are skipped — the refcount cannot double-count)."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+
+    cp = versioner.checkpoint("deferred", pin=False)
+    (member,) = cp.members
+    assert member.restore_tier == "restorable" and member.pin_state == PIN_STATE_UNPINNED
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+
+    rows = versioner.pin_checkpoint(cp.record.checkpoint_id)
+    assert rows[0].pin_state == PIN_STATE_HELD
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 1
+
+    rows = versioner.pin_checkpoint(cp.record.checkpoint_id)  # re-drive: no-op
+    assert rows[0].pin_state == PIN_STATE_HELD
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 1
+
+    with pytest.raises(CheckpointUnknown):
+        versioner.pin_checkpoint("nope")
+
+
+def test_capture_only_service_fails_fast_when_pins_needed(
+    service: CoordinatorService,
+) -> None:
+    """The fold-in's fail-fast gate: a capture-only seam cannot record a pin
+    outcome, so pin=True with pinnable members refuses BEFORE any capture
+    read — never a silently unpinned 'restorable' manifest. pin=False is the
+    explicit capture-only opt-out and still persists the honest pair."""
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    capture_only = _CaptureOnlyService(service)
+    versioner = _versioner(capture_only)
+    versioner.add_object_member(obj, "cfg.json")
+
+    with pytest.raises(TypeError):
+        versioner.checkpoint("needs-pins")
+
+    cp = versioner.checkpoint("explicitly-unpinned", pin=False)
+    (member,) = cp.members
+    assert member.restore_tier == "restorable" and member.pin_state == PIN_STATE_UNPINNED
+
+    # No pinnable work (a file member with NO resolver): the capture-only seam
+    # is fine even at pin=True — nothing above restorable-unpinned is claimed.
+    files = _ScriptedFileSource()
+    files.program("a.txt", (b"a", 1))
+    plain = _versioner(capture_only)
+    plain.add_file_member(files, "a.txt")
+    cp2 = plain.checkpoint("no-pin-work")
+    assert cp2.members[0].restore_tier == "restorable-unpinned"
+    assert cp2.members[0].pin_state == PIN_STATE_UNPINNED
+
+
+def test_file_member_pin_verified_held_and_survives_registry_reopen(
+    tmp_path: Path,
+) -> None:
+    """The file verification pin is durable state: held on the sqlite arm,
+    read back HELD (refcount included) after a full registry reopen — the
+    coordinator-restart survival the plan's Unit 6 scenario names."""
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    db_path = tmp_path / "state.db"
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+
+    reg = SqliteArtifactRegistry(db_path)
+    try:
+        service = CoordinatorService(reg)
+        versioner = _versioner(service, resolver=resolver)
+        versioner.add_file_member(files, "notes/plan.md")
+        cp = versioner.checkpoint("durable-pin")
+        (member,) = cp.members
+        assert member.pin_state == PIN_STATE_HELD
+        # v1 honesty: the verification pin never upgrades the tier — the
+        # coordinator offers no per-version hold (the R13 disclosure).
+        assert member.restore_tier == "restorable-unpinned"
+        checkpoint_id = cp.record.checkpoint_id
+    finally:
+        reg.close()
+
+    reopened = SqliteArtifactRegistry(db_path)
+    try:
+        (stored,) = reopened.get_checkpoint_members(checkpoint_id)
+        assert stored.pin_state == PIN_STATE_HELD
+        assert stored.restore_tier == "restorable-unpinned"
+        record = reopened.get_checkpoint(checkpoint_id)
+        assert record is not None and record.pin_refcount == 1
+    finally:
+        reopened.close()
+
+
+def test_file_member_retention_gap_downgrades_loudly(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """Retention off / the version not retained → KeyError from the resolver
+    seam → the captured state is ALREADY unreachable: the loud downgrade to
+    forward_only; the restore then honestly skips and says so."""
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()  # nothing retained: the retention-off shape
+
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    cp = versioner.checkpoint("gap")
+
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_UNAVAILABLE
+    assert member.restore_tier == "forward_only"
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+    report = versioner.restore(cp.record.checkpoint_id)
+    assert (
+        report.members_by_path["notes/plan.md"].outcome
+        == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+    )
+
+
+def test_file_member_retained_bytes_mismatch_downgrades_loudly(
+    service: CoordinatorService,
+) -> None:
+    """Retained bytes that no longer hash to the captured fingerprint are NOT
+    the captured state — restoring them would be a silent wrong-content
+    restore, so the pin refuses and downgrades loudly instead."""
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"NOT the captured bytes")
+
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    cp = versioner.checkpoint("mismatch")
+
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_UNAVAILABLE
+    assert member.restore_tier == "forward_only"
+
+
+def test_file_member_without_resolver_left_unpinned(
+    service: CoordinatorService,
+) -> None:
+    """No resolver → no verification is possible and nothing above
+    restorable-unpinned was ever claimed: the member is left untouched
+    (unpinned), never downgraded and never falsely held."""
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    versioner = _versioner(service)  # no resolver
+    versioner.add_file_member(files, "notes/plan.md")
+    cp = versioner.checkpoint("unverified")
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_UNPINNED
+    assert member.restore_tier == "restorable-unpinned"
+
+
+def test_pin_vanished_version_downgrades_loudly(
+    service: CoordinatorService,
+) -> None:
+    """The captured version is gone by pin time (raced version-targeted
+    delete): nothing left to hold — the loud downgrade, and restore reports
+    target_lost for it."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("race", pin=False)  # capture first, no hold yet
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    client.delete_object(Bucket="demo", Key="cfg.json", VersionId=put["VersionId"])
+
+    rows = versioner.pin_checkpoint(cp.record.checkpoint_id)
+
+    assert rows[0].pin_state == PIN_STATE_UNAVAILABLE
+    assert rows[0].restore_tier == "restorable-unpinned"
+    report = versioner.restore(cp.record.checkpoint_id)
+    assert (
+        report.members_by_path["s3://cfg.json"].outcome == RESTORE_OUTCOME_TARGET_LOST
+    )
+
+
+def test_pin_checkpoint_missing_binding_preflight_fails_before_any_write(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("orphan", pin=False)
+
+    fresh = _versioner(service)  # no declared members: cannot reach the bucket
+    with pytest.raises(ValueError):
+        fresh.pin_checkpoint(cp.record.checkpoint_id)
+    # Nothing was written: the member is still the unpinned capture shape.
+    (stored,) = registry.get_checkpoint_members(cp.record.checkpoint_id)
+    assert stored.pin_state == PIN_STATE_UNPINNED
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+
+def test_service_pin_vocabulary_fails_closed(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The service refuses unvetted pin/tier strings BEFORE any write — the
+    (restore_tier, pin_state) pair is the honesty surface and must stay
+    readable by identity."""
+    files = _ScriptedFileSource()
+    files.program("a.txt", (b"a", 1))
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "a.txt")
+    cp = versioner.checkpoint("vocab")
+    checkpoint_id = cp.record.checkpoint_id
+
+    with pytest.raises(ValueError):
+        service.set_workspace_checkpoint_member_pin(
+            checkpoint_id, "a.txt", pin_state="super-pinned"
+        )
+    with pytest.raises(ValueError):
+        service.set_workspace_checkpoint_member_pin(
+            checkpoint_id, "a.txt", pin_state=PIN_STATE_HELD, restore_tier="better"
+        )
+    with pytest.raises(ValueError):  # refcount never below zero (fail-closed)
+        service.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
+    (stored,) = registry.get_checkpoint_members(checkpoint_id)
+    assert stored.pin_state == PIN_STATE_UNPINNED  # nothing landed
