@@ -265,6 +265,57 @@ S3 members are different: their checkpoint pin is a legal hold placed in
 **your** bucket on the captured version — the substrate's own retention, subject
 to your bucket's configuration and costs, never the coordinator's.
 
+### S3 credential posture for workspace checkpoints
+
+**Bindings carry credentials; the CLI never does.** S3 members of a workspace
+checkpoint are captured and restored through a `CoherentObject` binding you
+construct in Python — the binding resolves credentials the way the BYO-substrate
+posture above requires (references, never literals). The
+`agent-coherence-workspace` CLI holds no credential path at all: `restore` on a
+checkpoint with pending S3 members refuses cleanly and points you at the Python
+API, rather than growing a second credential surface; `status` and `list` still
+render those members from the durable manifest.
+
+**No credentials in manifests or the registry.** A checkpoint's per-member
+record stores the member path, an opaque restore pointer (the S3 versionId, or
+a file member's version number), a fixed-width content fingerprint, and
+tier/pin/outcome state — nothing credential-shaped, and never your bytes for S3
+members. Copying or inspecting the registry database cannot leak a substrate
+credential, because none is ever written.
+
+**Least-privilege IAM for workspace versioning.** The base binding's emitted
+writer policy (`s3:GetObject` + `s3:PutObject` on the exact key/prefix, with
+explicit delete denies) covers plain coherence use. Workspace checkpoint and
+restore exercise a wider, still-narrow surface — these are exactly the
+operations the binding issues, no others:
+
+| Capability | S3 calls made | IAM actions needed |
+|---|---|---|
+| Capture + live comparand reads | `GetObject` (current version) | `s3:GetObject` |
+| Version-pinned reads (restore source, pin verification) | `GetObject` with a `VersionId` | `s3:GetObjectVersion` |
+| Restore writes | conditional `PutObject` (`If-Match`) | `s3:PutObject` |
+| Checkpoint pins | `PutObjectLegalHold` / `GetObjectLegalHold` | `s3:PutObjectLegalHold`, `s3:GetObjectLegalHold` |
+| Delete legs (restoring an ABSENT fact) | `DeleteObject` (unconditional-latest) | `s3:DeleteObject` |
+
+Scope every action to the same exact key/prefix ARN as the base policy. Two
+deliberate narrownesses: the binding never issues a version-targeted delete —
+on a versioned bucket its delete mints a delete marker and history survives —
+so `s3:DeleteObjectVersion` (true history destruction) is not needed and should
+stay denied; and it never lists bucket versions, so no list permission is
+needed. Grant `s3:DeleteObject` only to the principal that runs restores: it is
+the one addition beyond the base policy's explicit delete deny, and only the
+delete leg uses it.
+
+**Bucket versioning is an expectation, not an assumption.** A `restorable` S3
+member requires a versioned bucket. Against an unversioned bucket the capture
+does not guess: the missing version pointer is a typed refusal at capture time,
+and the member is recorded `forward_only` — described in the manifest, not
+restorable, stated before you ever depend on it. Checkpoint pins additionally
+require Object Lock to be enabled on the bucket (an at-creation setting);
+without it the pin attempt durably downgrades the member to
+`restorable-unpinned` with `pin_state="pin_unavailable"` — loudly, never as a
+quiet claim.
+
 ## Hash-pinned install for security-sensitive users
 
 For reproducible installs with full dependency-graph pinning:

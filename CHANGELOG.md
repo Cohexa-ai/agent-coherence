@@ -6,6 +6,93 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **Workspace versioning & restore — `WorkspaceVersioner` checkpoint +
+  restore over heterogeneous members.** Checkpoint a workspace whose members
+  live in different backends — files (via the coordinator's version
+  retention), S3 objects (via `CoherentObject`), and declared forward-only
+  action surfaces — then bring it back with **per-member honesty** about what
+  can and cannot come back. A checkpoint is a named manifest capturing, per
+  member, a restore pointer (S3 versionId / file content-state version), a
+  fingerprint, and an honest **restore tier** (`restorable` /
+  `restorable-unpinned` / `forward_only`), taken as a **skew-declared cut**:
+  the capture window `[window_min, window_max]` is recorded rather than
+  hidden, and a post-capture verification pass flags any member that moved
+  inside it (`dirty_during_window`). ABSENT is captured as a fact (distinct
+  from present-and-empty), so restore includes **delete legs**. Restore
+  drives one conditional write per member under a **termination contract**:
+  every member reaches exactly one terminal outcome (`restored` /
+  `converged` / `conflict` / `target_lost` / `forward_only_skipped` /
+  `held_unconfirmed`), contended legs re-drive under a bounded budget (a
+  sustained foreign writer wins honestly — never a livelock, never a
+  clobber), progress is durable and crash-resumable, and restore is a
+  *forward* commit carrying old bytes (versions strictly increase).
+  Checkpoint pins are fail-closed and loud: S3 members are pinned with a
+  legal hold on the captured version in *your* bucket; a bucket without
+  Object Lock durably downgrades the member to `restorable-unpinned` with
+  `pin_state="pin_unavailable"`; file-member pins verify the captured
+  version against the bounded retention window (they cannot extend it), and
+  an expired window surfaces as `target_lost`, never silently. Run it:
+  `python -m examples.workspace_versioning.main` (offline, deterministic;
+  `--baseline` demonstrates the loss first). Docs: guide § Workspace
+  versioning & restore; security § workspace-checkpoint retention and S3
+  credential posture.
+
+- **`agent-coherence-workspace` CLI — `checkpoint` / `list` / `status` /
+  `restore`.** The operator surface over the workspace engine for file and
+  forward-only members, with `--root` / `--json` on every verb and a
+  four-way exit-code contract: `0` clean, `1` validation error, `2` typed
+  refusal (binary member, unknown checkpoint), `3` restore **concluded with
+  absorbed outcomes** — the per-member report on stdout is the truth.
+  `status` renders every member's `(restore_tier, pin_state)` pair,
+  including `(restorable, unpinned)` labeled claimed-but-not-yet-backed;
+  `checkpoint` output always carries the file-retention caveat. The CLI owns
+  its durable state at `<root>/.coherence/workspace.db`. S3 members ride the
+  Python API (bindings carry credentials; the CLI refuses cleanly and points
+  there).
+
+- **Packaged conformance corpus — `ccs.testing.substrate_conformance`,
+  now with a workspace family.** The substrate conformance kit moved from
+  the test tree into the installable package, so foreign implementations can
+  consume it as a dev dependency. New `WorkspaceConformanceBinding`
+  protocol: implement it, declare capabilities honestly
+  (`declares_versioned` / `declares_pinnable` /
+  `declares_restart_survival`), and the suite runs **MUST-MATCH** scenarios
+  every implementation must reproduce (one-winner restore arbitration,
+  torn-cut detection, bounded termination, restore-as-forward-commit,
+  ABSENT-is-a-fact) plus **DECLARED** scenarios pinned to the binding's own
+  declarations — passing is by observable outcome, never by mimicking
+  internals.
+
+- **`formal/tla/WorkspaceVersion.tla` — restore registration
+  model-checked, in the CI sweep.** The seventh spec in the `tla-check`
+  matrix. Models the restore-registration split (all-or-nothing commit for
+  written file members; manifest-side records for deletes; the empty
+  write-set path) and checks `NoPartialRestoreRegistered`,
+  `NoVersionRegression`, and `ExactlyOnceRegistration` — including the
+  crash-resume windows — on every push.
+
+- **`CoherentObject` (S3) — additive version-axis extensions.** The shipped
+  ETag CAS surface is unchanged; alongside it the binding now captures the
+  S3 versionId from the same read/write responses (`read_versioned` /
+  `cas_write_versioned`), reads a pinned historical version
+  (`read_pinned`), deletes (unconditional-latest — minting a delete marker
+  on a versioned bucket), and sets/queries/releases **legal holds** per
+  version (`set_legal_hold` / `legal_hold_status` / `release_legal_hold`)
+  with typed errors for unversioned buckets and missing Object Lock. A
+  deterministic local S3-semantics fake (`ccs.testing.s3_local`) models
+  exactly the verified subset for offline tests and demos.
+
+- **Registry schema v5 — durable workspace-checkpoint tables.** New
+  `workspace_checkpoints` + member tables (manifest header, per-member
+  pointer/fingerprint/tier/pin/outcome state, restore progress), written in
+  one transaction per registration. The v4→v5 migration runs in a single
+  transaction, and the v3→v4 step now stamps with a fixed literal instead
+  of the moving current-version constant — a v3-origin database walks
+  v3→4→5 landing every schema at its correct stamp (regression-tested,
+  including kill-mid-migration recovery).
+
 ## [0.13.0] - 2026-07-19
 
 ### Added
