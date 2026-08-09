@@ -40,8 +40,9 @@ Exit codes:
 - 1: not in a git repo / validation error (bad path, no members, pre-flight) /
      a typed coherence contention error (e.g. the observe-commit loop exhausted)
 - 2: typed coherence refusal (binary member, unknown checkpoint, persist
-     failure, member-path containment refusal — symlink component, ``.coherence``
-     self-target, workspace escape, or an unreadable non-file member)
+     failure, member-path containment refusal — symlink component, hardlinked
+     regular file (external co-owner), ``.coherence`` self-target, workspace
+     escape, or an unreadable non-file member)
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
@@ -55,8 +56,10 @@ stderr prose; the human prose stays on stderr unchanged.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -158,8 +161,8 @@ MEMBER_PATH_REFUSED_REASON = "member_path_refused"
 
 class MemberPathRefused(ValueError):
     """Typed refusal: a member path failed containment validation at
-    filesystem-access time (workspace escape, symlink component, ``.coherence``
-    self-target, or an unreadable non-file member).
+    filesystem-access time (workspace escape, symlink component, hardlinked
+    regular file, ``.coherence`` self-target, or an unreadable non-file member).
 
     Mirrors the MCP guard pattern (``ccs.mcp.uri._targets_coherence_state`` +
     ``_reject_path_escape``) at the :class:`WorkingTreeSource` seam. Based on
@@ -204,7 +207,10 @@ def _validated_member_path(root: Path, path: str) -> Path:
       documents (the check-vs-open gap);
     - realpath containment + resolved-``.coherence`` re-check, belt-and-
       suspenders after the two checks above (a ``..``-free, symlink-free path
-      cannot escape, but the mirror keeps the two guards from drifting).
+      cannot escape, but the mirror keeps the two guards from drifting);
+    - refuse a HARDLINKED regular-file leaf (``st_nlink > 1``) — a hard link is
+      not a symlink and resolves in-tree, so it slips the two checks above, but
+      it co-owns an external inode (see the inline note below).
     """
     if not path or "\\" in path:
         raise MemberPathRefused(path, "empty or backslash-carrying path")
@@ -240,7 +246,106 @@ def _validated_member_path(root: Path, path: str) -> Path:
         raise MemberPathRefused(
             path, "resolves into coordinator state (.coherence/**)"
         )
+    # HARDLINK defense: a regular-file member with a second directory entry
+    # (``st_nlink > 1``) has an external co-owner. A hard link's
+    # ``is_symlink()`` is False and ``realpath()`` resolves to this in-tree
+    # path itself, so BOTH guards above pass — yet capturing it would read the
+    # co-owned inode's bytes into ``workspace.db`` (an outside file, or the
+    # ``.coherence/hook.secret`` HMAC secret hardlinked past the ``.coherence``
+    # guard) and restoring would write through the shared inode, mutating the
+    # outside file. ``follow_symlinks=False`` (an ``lstat``) because the leaf
+    # is already proven non-symlink above; an absent/unstattable leaf is left
+    # to the read leg (surfaces ABSENT) or the write leg (may create it fresh
+    # at ``st_nlink == 1``). Directories carry ``st_nlink >= 2`` legitimately,
+    # so :func:`_refuse_hardlinked_stat` gates on ``S_ISREG``.
+    try:
+        leaf_stat = os.stat(candidate, follow_symlinks=False)
+    except OSError:
+        return candidate
+    _refuse_hardlinked_stat(leaf_stat, path)
     return candidate
+
+
+#: Chunk size for the O_NOFOLLOW-guarded member read.
+_MEMBER_READ_CHUNK_BYTES = 1 << 20
+
+#: Stable, distinct reason substring naming the v1 hardlink limitation. Asserted
+#: by tests via the ``"hard link"`` token; kept separate from the symlink reason.
+_HARDLINK_REFUSAL_DETAIL = (
+    "is a hard link (st_nlink={nlinks} > 1) — a regular-file member with a "
+    "second directory entry has an external co-owner; capturing it would read "
+    "foreign bytes and restoring it would write through the shared inode, so it "
+    "cannot be safely contained in v1 (hardlink limitation)"
+)
+
+
+def _refuse_hardlinked_stat(st: os.stat_result, member_path: str) -> None:
+    """Raise :class:`MemberPathRefused` when ``st`` describes a regular file with
+    more than one hard link (an external co-owner). No-op for directories,
+    devices, or a single-link regular file (``st_nlink == 1``)."""
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        raise MemberPathRefused(
+            member_path, _HARDLINK_REFUSAL_DETAIL.format(nlinks=st.st_nlink)
+        )
+
+
+def _read_member_bytes_nofollow(candidate: Path, member_path: str) -> bytes:
+    """Read the leaf through ``O_RDONLY | O_NOFOLLOW`` and re-take the hardlink
+    check on the open fd.
+
+    Narrows the check-vs-open TOCTOU that ``_validated_member_path`` documents:
+    a leaf swapped to a symlink after validation is rejected ATOMICALLY at open
+    (``O_NOFOLLOW`` → ``OSError`` ELOOP), and a hard link swapped in after
+    validation is caught by the ``os.fstat`` re-check on the very fd being read.
+    ``FileNotFoundError`` (the ABSENT fact) and every other ``OSError`` (ELOOP,
+    EISDIR, EACCES, …) propagate for the caller to map; :class:`MemberPathRefused`
+    is raised only for the fd-level hardlink case."""
+    fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        _refuse_hardlinked_stat(os.fstat(fd), member_path)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, _MEMBER_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _write_member_bytes_nofollow(candidate: Path, member_path: str, data: bytes) -> None:
+    """Write the leaf through ``O_WRONLY | O_CREAT | O_NOFOLLOW`` (mode 0600).
+
+    Deliberately NOT ``O_TRUNC``: the fd-level hardlink re-check MUST run before
+    any truncation, so an outside inode co-owned via a hard link is never
+    mutated — refuse first, then ``ftruncate`` + write. A leaf swapped to a
+    symlink after validation is rejected atomically at open (``O_NOFOLLOW`` →
+    ELOOP), so a restore write never follows a re-pointed leaf outside the root.
+    ``0o600`` applies only on CREATE; an existing member keeps its own mode."""
+    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        _refuse_hardlinked_stat(os.fstat(fd), member_path)
+        os.ftruncate(fd, 0)
+        written = 0
+        while written < len(data):
+            n = os.write(fd, data[written:])
+            if n == 0:  # defensive — a regular-file write always progresses
+                break
+            written += n
+    finally:
+        os.close(fd)
+
+
+def _member_access_refusal_detail(exc: OSError) -> str:
+    """Human detail for an ``OSError`` from the guarded member open (capture leg)."""
+    if exc.errno == errno.ELOOP:
+        return (
+            "leaf became a symlink after validation (O_NOFOLLOW rejected it at "
+            "open — the check-vs-open TOCTOU window); a symlinked leaf can be "
+            "re-pointed outside the workspace root between capture and restore"
+        )
+    return f"not a readable regular file ({type(exc).__name__})"
 
 
 # --- the working-tree bridge (FileMemberSource + FileRestoreTarget) -------------
@@ -272,6 +377,21 @@ class WorkingTreeSource:
     Non-UTF-8 disk bytes are returned with version 0 (pointer UNCONFIRMED) and
     are never minted into the ledger — the versioner's typed
     :class:`~ccs.adapters.workspace.BinaryFileMemberRefused` fires at capture.
+
+    Containment TOCTOU (honest residual). ``_validated_member_path`` refuses
+    symlink components and hardlinked regular files at validation time, but the
+    validation and the syscall are separate steps. Both legs close the LEAF
+    window: the read/write go through ``os.open(..., O_NOFOLLOW)`` (a leaf
+    swapped to a symlink after validation is rejected atomically at open with
+    ELOOP) with an ``os.fstat`` hardlink re-check on the very fd (a hard link
+    swapped in after validation is caught too). The INTERMEDIATE-DIRECTORY-
+    COMPONENT window is NOT closed: an attacker who swaps a mid-path directory
+    for a symlink between the walk and the open can still redirect the target,
+    because the open resolves the full path afresh. Full closure needs an
+    ``openat``/``dirfd`` component-by-component walk (``O_NOFOLLOW`` at every
+    hop), which is out of v1 scope. The safe direction is to migrate both legs
+    to a dirfd walk rooted at the workspace root so no intermediate component is
+    ever re-resolved by name. The trust model remains single-uid, single-host.
     """
 
     def __init__(self, root: Path, registry: SqliteArtifactRegistry, agent: UUID) -> None:
@@ -286,16 +406,20 @@ class WorkingTreeSource:
         return _validated_member_path(self._root, path)
 
     def read_with_version(self, path: str) -> tuple[bytes, int]:
+        candidate = self._abs(path)
         try:
-            data = self._abs(path).read_bytes()
+            data = _read_member_bytes_nofollow(candidate, path)
         except FileNotFoundError:
             raise  # the ABSENT fact — the engine's vocabulary, not an error
+        except MemberPathRefused:
+            raise  # hardlink swapped in post-validation (fd re-check)
         except OSError as exc:
-            # A directory member (IsADirectoryError), a mid-path non-dir
-            # (NotADirectoryError), permissions, ... — a typed refusal, never
-            # a raw traceback.
+            # ELOOP (leaf swapped to a symlink after validation — the guarded
+            # open rejects it atomically), a directory member (IsADirectoryError),
+            # a mid-path non-dir (NotADirectoryError), permissions, ... — a typed
+            # refusal at the capture seam, never a raw traceback.
             raise MemberPathRefused(
-                path, f"not a readable regular file ({type(exc).__name__})"
+                path, _member_access_refusal_detail(exc)
             ) from exc
         try:
             text = data.decode("utf-8")
@@ -341,21 +465,26 @@ class WorkingTreeSource:
             raise CasVersionConflict(
                 path, expected_version, current.version if current is not None else 0
             )
-        live = self._abs(path)
+        live = self._abs(path)  # validates + refuses a hardlinked member (exit 2)
         try:
-            disk = live.read_bytes()
+            disk = _read_member_bytes_nofollow(live, path)
         except FileNotFoundError:
             disk = None
-        except OSError as exc:
-            raise MemberPathRefused(
-                path, f"not a readable regular file ({type(exc).__name__})"
-            ) from exc
+        # A hardlink swapped in at the fd raises MemberPathRefused (exit 2). An
+        # ELOOP/EISDIR/... from the guarded open propagates as an OSError so the
+        # restore termination boundary (_drive_member_absorbing) absorbs it into
+        # an honest ``target_lost`` outcome — never a raw traceback, and the disk
+        # is never followed through a swapped-in leaf symlink.
         if disk is not None and sha256_hex(disk) != current.content_hash:
             # DETECTION fired: the disk moved without the ledger observing it —
             # a foreign edit. no-arbiter: typed conflict, never arbitration.
             raise CasVersionConflict(path, expected_version, expected_version)
         live.parent.mkdir(parents=True, exist_ok=True)
-        live.write_bytes(new_content)  # disk first: the safe crash direction
+        # disk first: the safe crash direction. The guarded open (O_NOFOLLOW +
+        # fd hardlink re-check, truncate only AFTER the refusal gate) means a
+        # leaf swapped to a symlink or a hardlinked co-owner is caught before any
+        # bytes land on the outside inode.
+        _write_member_bytes_nofollow(live, path, new_content)
         result = self._registry.commit_cas(
             artifact_id,
             self._agent,

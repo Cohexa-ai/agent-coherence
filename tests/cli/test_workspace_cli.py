@@ -40,6 +40,8 @@ from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
     MEMBER_PATH_REFUSED_REASON,
+    MemberPathRefused,
+    WorkingTreeSource,
 )
 from ccs.cli.workspace import (
     main as workspace_main,
@@ -557,6 +559,122 @@ def test_directory_member_is_a_typed_refusal_not_a_traceback(
     assert "Traceback" not in err
 
 
+# --- member-path containment (hardlink co-owner + leaf O_NOFOLLOW) --------------
+
+
+def test_checkpoint_refuses_hardlink_to_outside_file(tmp_path: Path, capsys) -> None:
+    """FIX 1 (P0): a hard link to an OUTSIDE file has ``is_symlink()==False`` and
+    ``realpath()`` resolves in-tree, so the symlink + realpath guards pass — but
+    capturing it would read the outside file's bytes into workspace.db. The
+    ``st_nlink > 1`` check must refuse it (exit 2), and nothing is captured."""
+    root, outside = _escape_fixture(tmp_path)
+    victim = outside / "secret.txt"  # "outside secret\n"
+    os.link(victim, root / "hardlinked.txt")  # a hard link, NOT a symlink
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "hardlinked.txt", "--root", str(root)
+    )
+    assert rc == 2
+    assert "refused" in err
+    assert "hard link" in err
+    # The outside bytes were never captured — the refusal fires before any read.
+    rc, out, _ = _run(capsys, "list", "--root", str(root))
+    assert "no checkpoints persisted" in out
+    assert victim.read_text() == "outside secret\n"
+
+
+def test_restore_refuses_persisted_hardlinked_member(tmp_path: Path, capsys) -> None:
+    """FIX 1 (P0): restore replays PERSISTED member_paths. A fabricated row whose
+    live path is a hard link to an outside file must refuse at the filesystem-
+    access seam — the outside file is neither read (into the ledger) nor written
+    through the shared inode."""
+    root, outside = _escape_fixture(tmp_path)
+    victim = outside / "secret.txt"
+    ckpt = _fabricate_checkpoint(
+        root,
+        CheckpointMember(
+            member_path="hardlinked.txt",
+            artifact_id=None,
+            native_token="1",
+            fingerprint="e" * 64,
+            captured_at=1.0,
+            arbitration_tier=ArbitrationTier.NO_ARBITER.value,
+            restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
+        ),
+    )
+    os.link(victim, root / "hardlinked.txt")
+    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(root))
+    assert rc == 2
+    assert "hard link" in err
+    # NOT written through: the outside file's bytes are untouched.
+    assert victim.read_text() == "outside secret\n"
+
+
+def test_checkpoint_refuses_hardlinked_coherence_secret(
+    tmp_path: Path, capsys
+) -> None:
+    """FIX 1 (P0): hardlinking ``.coherence/hook.secret`` to a plain member name
+    slips the ``.coherence/**`` string/realpath guard (the plain name resolves
+    in-tree, outside ``.coherence``) — the ``st_nlink > 1`` check is what stops
+    the HMAC secret from being captured."""
+    secret = tmp_path / ".coherence" / "hook.secret"
+    secret.parent.mkdir(mode=0o700, exist_ok=True)
+    secret.write_text("hmac-secret\n")
+    os.link(secret, tmp_path / "innocuous.txt")
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "innocuous.txt", "--root", str(tmp_path)
+    )
+    assert rc == 2
+    assert "hard link" in err
+    rc, out, _ = _run(capsys, "list", "--root", str(tmp_path))
+    assert "no checkpoints persisted" in out
+
+
+def test_checkpoint_single_link_file_is_not_a_false_positive(
+    tmp_path: Path, capsys
+) -> None:
+    """Regression guard for FIX 1: an ordinary single-link file (``st_nlink==1``)
+    must still checkpoint cleanly — the hardlink refusal fires ONLY on a real
+    external co-owner."""
+    path = _seed_file(tmp_path)
+    assert path.stat().st_nlink == 1  # precondition: no external co-owner
+    rc, out, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0, err
+    assert "checkpoint 'cp1' persisted:" in out
+
+
+def test_read_with_version_rejects_leaf_symlink_swapped_after_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """FIX 2 (P1): the check-vs-open TOCTOU. Even when the validator is bypassed
+    (simulating a leaf swapped to a symlink in the gap between validation and the
+    read syscall), the read goes through ``O_NOFOLLOW`` — a leaf symlink is
+    rejected atomically at open (ELOOP), so the outside target is never followed
+    or read into the ledger."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside secret\n")
+    evil_leaf = root / "leaf.md"
+    evil_leaf.symlink_to(outside / "secret.txt")
+
+    db_path = root / ".coherence" / "workspace.db"
+    db_path.parent.mkdir(mode=0o700)
+    registry = SqliteArtifactRegistry(db_path, retain_versions=True)
+    try:
+        source = WorkingTreeSource(root, registry, uuid4())
+        # Stub the validator to wave the leaf through — the O_NOFOLLOW open is
+        # the second, independent line of defense being exercised here.
+        monkeypatch.setattr(source, "_abs", lambda p: evil_leaf)
+        with pytest.raises(MemberPathRefused) as excinfo:
+            source.read_with_version("leaf.md")
+        assert "symlink" in str(excinfo.value)
+    finally:
+        registry.close()
+
+
 # --- fresh-workspace .coherence hardening (0700 + gitignore) --------------------
 
 
@@ -583,6 +701,26 @@ def test_fresh_workspace_coherence_dir_is_0700_and_gitignored(
     )
     assert "!! .coherence/" in status.stdout
     assert "workspace.db" not in status.stdout
+
+
+def test_preexisting_0755_coherence_dir_is_retightened_to_0700(
+    tmp_path: Path, capsys
+) -> None:
+    """FIX 3 (P2): ``mkdir(mode=0o700, exist_ok=True)`` does NOT chmod an
+    already-existing directory, so a ``.coherence/`` that pre-exists at 0755
+    would stay 0755 (exposing state.db, hook.secret, the pidfile). Running any
+    verb must re-tighten it to 0700."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    os.chmod(coherence, 0o755)  # pre-existing loose mode (umask-independent)
+    assert (coherence.stat().st_mode & 0o777) == 0o755
+
+    _seed_file(tmp_path)
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0, err
+    assert (coherence.stat().st_mode & 0o777) == 0o700
 
 
 # --- --json error envelope ------------------------------------------------------
