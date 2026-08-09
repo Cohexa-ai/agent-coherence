@@ -239,6 +239,32 @@ only via `--include-content` / `--output-file`, so terminals, CI logs, and shell
 history don't capture content inadvertently. No HTTP route serves version
 content.
 
+### Workspace checkpoints ride this retention window (file members)
+
+A workspace checkpoint's **file members** depend on exactly the retention
+described above — a **declared, bounded window** (the `artifact_versions` store
+under its configured `max_versions` / `max_age_seconds` bounds), never an
+indefinite hold:
+
+- **The window is a bound, not a pin.** Retention keeps a bounded history and
+  offers no per-version hold a checkpoint could place, so the file version a
+  checkpoint points at can still age out (or be collected by the policy) before
+  you restore. That is why a file member is labeled `restorable-unpinned` —
+  never `restorable`: the label means "history exists now and may expire."
+- **Checkpoint pins on file members verify; they do not extend.** Pinning a
+  checkpoint only checks that the captured file version is currently retained
+  and still matches its captured fingerprint. Verification cannot lengthen the
+  retention window or exempt the version from the configured bounds.
+- **Expiry is reported, never papered over.** If the retained version is gone by
+  restore time, the restore reports that member's target as lost rather than
+  restoring different content. With retention off (the default) — or the version
+  already unreachable when the checkpoint is pinned — the member is labeled
+  `forward_only`: described in the checkpoint, but not restorable.
+
+S3 members are different: their checkpoint pin is a legal hold placed in
+**your** bucket on the captured version — the substrate's own retention, subject
+to your bucket's configuration and costs, never the coordinator's.
+
 ## Hash-pinned install for security-sensitive users
 
 For reproducible installs with full dependency-graph pinning:
