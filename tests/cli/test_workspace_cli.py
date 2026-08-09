@@ -28,6 +28,7 @@ Covers, per the plan's Unit-8 scenarios:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ import pytest
 from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
+    MEMBER_PATH_REFUSED_REASON,
 )
 from ccs.cli.workspace import (
     main as workspace_main,
@@ -417,6 +419,338 @@ def test_restore_refuses_s3_members_with_a_clean_pointer_to_the_api(
     rc, out, _ = _run(capsys, "status", ckpt, "--root", str(tmp_path))
     assert rc == 0
     assert "s3://reports/summary.txt" in out
+
+
+# --- member-path containment (symlink escape / .coherence / directory) ----------
+
+
+def _escape_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    """A workspace root plus a sibling OUTSIDE directory holding a secret."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside secret\n")
+    return root, outside
+
+
+def test_checkpoint_refuses_symlinked_intermediate_dir_escape(
+    tmp_path: Path, capsys
+) -> None:
+    """`--file evil_link/secret.txt` with evil_link -> an outside dir must be a
+    typed exit-2 refusal — never a capture of the outside file."""
+    root, outside = _escape_fixture(tmp_path)
+    (root / "evil_link").symlink_to(outside)
+    rc, _, err = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "evil_link/secret.txt",
+        "--root",
+        str(root),
+    )
+    assert rc == 2
+    assert "refused" in err
+    assert "symlink" in err
+    # Nothing persisted: the refusal fires before any manifest write.
+    rc, out, _ = _run(capsys, "list", "--root", str(root))
+    assert "no checkpoints persisted" in out
+
+
+def test_restore_refuses_persisted_member_crossing_symlink(
+    tmp_path: Path, capsys
+) -> None:
+    """Restore replays PERSISTED member_paths that never re-pass the CLI arg
+    pre-check: a fabricated manifest row crossing a symlink (the re-pointed-
+    between-checkpoint-and-restore shape) must refuse at the filesystem-access
+    seam and never write outside the root."""
+    root, outside = _escape_fixture(tmp_path)
+    victim = outside / "secret.txt"
+    ckpt = _fabricate_checkpoint(
+        root,
+        CheckpointMember(
+            member_path="evil_link/secret.txt",
+            artifact_id=None,
+            native_token="1",
+            fingerprint="c" * 64,
+            captured_at=1.0,
+            arbitration_tier=ArbitrationTier.NO_ARBITER.value,
+            restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
+        ),
+    )
+    (root / "evil_link").symlink_to(outside)
+    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(root))
+    assert rc == 2
+    assert "symlink" in err
+    assert victim.read_text() == "outside secret\n"  # never written through
+
+
+def test_checkpoint_refuses_leaf_symlink(tmp_path: Path, capsys) -> None:
+    root, outside = _escape_fixture(tmp_path)
+    (root / "leaf.md").symlink_to(outside / "secret.txt")
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "leaf.md", "--root", str(root)
+    )
+    assert rc == 2
+    assert "symlink" in err
+
+    # An IN-root leaf symlink is refused too: ANY symlink component (leaf
+    # included) can be re-pointed after the check (the TOCTOU window).
+    (root / "real.md").write_text("real\n")
+    (root / "alias.md").symlink_to(root / "real.md")
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "alias.md", "--root", str(root)
+    )
+    assert rc == 2
+    assert "symlink" in err
+
+
+def test_checkpoint_refuses_coherence_state_member(tmp_path: Path, capsys) -> None:
+    """`.coherence/**` is coordinator state (the hook HMAC secret lives there)
+    — capturing it into workspace.db is an info-disclosure, refused typed."""
+    secret = tmp_path / ".coherence" / "hook.secret"
+    secret.parent.mkdir(mode=0o700)
+    secret.write_text("hmac-secret\n")
+    rc, _, err = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        ".coherence/hook.secret",
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 2
+    assert ".coherence" in err
+    rc, out, _ = _run(capsys, "list", "--root", str(tmp_path))
+    assert "no checkpoints persisted" in out
+
+
+def test_restore_refuses_persisted_coherence_member(tmp_path: Path, capsys) -> None:
+    ckpt = _fabricate_checkpoint(
+        tmp_path,
+        CheckpointMember(
+            member_path=".coherence/hook.secret",
+            artifact_id=None,
+            native_token="1",
+            fingerprint="d" * 64,
+            captured_at=1.0,
+            arbitration_tier=ArbitrationTier.NO_ARBITER.value,
+            restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
+        ),
+    )
+    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    assert rc == 2
+    assert ".coherence" in err
+
+
+def test_directory_member_is_a_typed_refusal_not_a_traceback(
+    tmp_path: Path, capsys
+) -> None:
+    (tmp_path / "somedir").mkdir()
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "somedir", "--root", str(tmp_path)
+    )
+    assert rc == 2
+    assert "refused" in err
+    assert "Traceback" not in err
+
+
+# --- fresh-workspace .coherence hardening (0700 + gitignore) --------------------
+
+
+def test_fresh_workspace_coherence_dir_is_0700_and_gitignored(
+    tmp_path: Path, capsys
+) -> None:
+    """A fresh workspace's .coherence/ must come from the lifecycle's single
+    implementation: 0700 perms + the '*' gitignore, so `git add .` can never
+    stage workspace.db."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _seed_file(tmp_path)
+    rc, _, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0, err
+    coherence = tmp_path / ".coherence"
+    assert (coherence.stat().st_mode & 0o777) == 0o700
+    assert (coherence / ".gitignore").read_text() == "*\n"
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--ignored", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "!! .coherence/" in status.stdout
+    assert "workspace.db" not in status.stdout
+
+
+# --- --json error envelope ------------------------------------------------------
+
+
+def test_json_error_envelope_carries_typed_reason(tmp_path: Path, capsys) -> None:
+    """Every error path under --json emits a parseable envelope on stdout
+    carrying the typed reason; the stderr prose stays for humans."""
+    # Typed refusal: binary member (exit 2).
+    _seed_file(tmp_path, rel="blob.bin", body=b"\xff\xfe\x00\x01binary")
+    rc, out, err = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "blob.bin",
+        "--json",
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 2
+    envelope = json.loads(out)
+    assert envelope["kind"] == "error"
+    assert envelope["exit_code"] == 2
+    assert envelope["reason"] == "binary_file_member_unsupported"
+    assert "non-UTF-8" in err  # stderr prose retained
+
+    # Typed refusal: unknown checkpoint (exit 2).
+    rc, out, _ = _run(capsys, "status", "nope", "--json", "--root", str(tmp_path))
+    assert rc == 2
+    envelope = json.loads(out)
+    assert envelope["reason"] == "checkpoint_unknown"
+
+    # Typed refusal: directory member (exit 2, member-path slug).
+    (tmp_path / "somedir").mkdir()
+    rc, out, _ = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "somedir",
+        "--json",
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 2
+    envelope = json.loads(out)
+    assert envelope["reason"] == MEMBER_PATH_REFUSED_REASON
+
+    # Validation error: traversal path (exit 1).
+    rc, out, _ = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "../outside.md",
+        "--json",
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 1
+    envelope = json.loads(out)
+    assert envelope["kind"] == "error"
+    assert envelope["exit_code"] == 1
+    assert envelope["reason"] == "invalid_member_path"
+
+
+# --- restore registration honesty fields ----------------------------------------
+
+
+def test_restore_surfaces_invalidated_peers_and_attempts(
+    tmp_path: Path, capsys
+) -> None:
+    plan = _seed_file(tmp_path)
+    _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    plan.write_bytes(b"corrupted\n")
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    registration = json.loads(out)["registration"]
+    assert isinstance(registration["invalidated_peers"], int)
+    assert isinstance(registration["attempts"], int)
+
+    # A fresh first restore in HUMAN mode (this run performs registration, so
+    # the report always carries it) surfaces the same honesty fields.
+    _run(capsys, "checkpoint", "cp2", "--file", "docs/plan.md", "--root", str(tmp_path))
+    rc, out, _ = _run(capsys, "list", "--json", "--root", str(tmp_path))
+    records = json.loads(out)["checkpoints"]
+    ckpt2 = next(r["checkpoint_id"] for r in records if r["name"] == "cp2")
+    plan.write_bytes(b"corrupted again\n")
+    rc, out, _ = _run(capsys, "restore", ckpt2, "--root", str(tmp_path))
+    assert rc == 0
+    assert "peers invalidated by registration:" in out
+    assert "attempts=" in out
+
+
+# --- duplicate-name disclosure --------------------------------------------------
+
+
+def test_checkpoint_duplicate_name_is_disclosed_not_refused(
+    tmp_path: Path, capsys
+) -> None:
+    _seed_file(tmp_path)
+    rc, out, _ = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0
+    assert "prior checkpoint" not in out  # first mint: nothing to disclose
+    first_id = _checkpoint_id(capsys, tmp_path)
+
+    rc, out, _ = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0  # disclosed, never refused — names are labels
+    assert first_id in out
+    assert "not unique keys" in out
+
+    rc, out, _ = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "docs/plan.md",
+        "--json",
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 0
+    existing = json.loads(out)["existing_with_same_name"]
+    assert first_id in existing
+    assert len(existing) == 2
+
+
+# --- live-coordinator dual-write warning ----------------------------------------
+
+
+def test_restore_warns_when_live_coordinator_is_serving(tmp_path: Path, capsys) -> None:
+    plan = _seed_file(tmp_path)
+    _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    plan.write_bytes(b"corrupted\n")
+    # Fake a LIVE pidfile: this test process's own pid is provably alive.
+    (tmp_path / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n12345\n")
+
+    rc, out, err = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0  # WARN, never refuse (v1)
+    assert "live hook coordinator" in err
+    assert "bypass" in err
+    payload = json.loads(out)
+    assert payload["live_coordinator_warning"] is True
+    assert plan.read_bytes() == b"plan v1\n"  # the restore still ran
+
+
+def test_restore_does_not_warn_without_a_live_coordinator(
+    tmp_path: Path, capsys
+) -> None:
+    plan = _seed_file(tmp_path)
+    _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    plan.write_bytes(b"corrupted\n")
+    # A malformed pidfile (no parseable pid) is NOT a live coordinator.
+    (tmp_path / ".coherence" / "server.pid").write_text("garbage\n")
+
+    rc, out, err = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    assert "live hook coordinator" not in err
+    assert "live_coordinator_warning" not in json.loads(out)
 
 
 # --- honesty placement #2: the --help constraint note ---------------------------

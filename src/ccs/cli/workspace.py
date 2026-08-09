@@ -37,21 +37,31 @@ them honestly.
 
 Exit codes:
 - 0: verb succeeded (restore: concluded with no absorbing/hold outcome)
-- 1: not in a git repo / validation error (bad path, no members, pre-flight)
-- 2: typed coherence refusal (binary member, unknown checkpoint, persist failure)
+- 1: not in a git repo / validation error (bad path, no members, pre-flight) /
+     a typed coherence contention error (e.g. the observe-commit loop exhausted)
+- 2: typed coherence refusal (binary member, unknown checkpoint, persist
+     failure, member-path containment refusal — symlink component, ``.coherence``
+     self-target, workspace escape, or an unreadable non-file member)
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
+
+Under ``--json`` every error path ALSO emits a one-line JSON error envelope on
+stdout (``{"kind": "error", "exit_code": N, "reason": ..., ...}`` — the
+``coherence_replay`` envelope pattern) so machine consumers never have to parse
+stderr prose; the human prose stays on stderr unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from ccs.adapters.claude_code.lifecycle import _ensure_coherence_dir
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.adapters.workspace import (
     BinaryFileMemberRefused,
@@ -117,7 +127,12 @@ FILE_RETENTION_CAVEAT = (
 #: Honesty placement #3 (the claimed-but-not-yet-backed pair label).
 CLAIMED_NOT_BACKED_LABEL = "claimed-but-not-yet-backed"
 
-_ABSORBING_OUTCOMES = frozenset(
+#: The exit-code-3 outcome set — CLI-PRIVATE and deliberately NOT
+#: :data:`ccs.core.exceptions.RESTORE_ABSORBING_OUTCOMES` (DIFFERENT
+#: membership: exit 3 includes ``held_unconfirmed`` — a HOLD, not an absorbing
+#: outcome — and excludes ``forward_only_skipped``, a clean enumerated skip).
+#: Named for what it decides so it cannot shadow the core vocabulary.
+_EXIT3_OUTCOMES = frozenset(
     {
         RESTORE_OUTCOME_CONFLICT,
         RESTORE_OUTCOME_TARGET_LOST,
@@ -129,6 +144,103 @@ _ABSORBING_OUTCOMES = frozenset(
 #: can move the ledger between the lookup and the CAS; three attempts absorb
 #: any realistic interleave without risking a livelock.
 _OBSERVE_ATTEMPTS = 3
+
+#: The coordinator's own state directory — never a workspace member (mirrors
+#: ``ccs.mcp.uri._COHERENCE_DIR``; matched case-insensitively there and here).
+_COHERENCE_DIR = ".coherence"
+
+#: Envelope-local refusal slug for :class:`MemberPathRefused` — the
+#: ``coherence_replay`` ``argument_error`` precedent, NOT a core wire constant
+#: (no new vocabulary is minted in ``ccs.core.exceptions`` for a CLI-local
+#: refusal).
+MEMBER_PATH_REFUSED_REASON = "member_path_refused"
+
+
+class MemberPathRefused(ValueError):
+    """Typed refusal: a member path failed containment validation at
+    filesystem-access time (workspace escape, symlink component, ``.coherence``
+    self-target, or an unreadable non-file member).
+
+    Mirrors the MCP guard pattern (``ccs.mcp.uri._targets_coherence_state`` +
+    ``_reject_path_escape``) at the :class:`WorkingTreeSource` seam. Based on
+    ``ValueError`` with the stable message prefix ``member path ... refused:``
+    because no existing typed exception carries this vocabulary WITH a stable
+    ``.reason`` (``UriValidationError`` has none), and core reason constants
+    must not be minted for a CLI-local refusal; ``.reason`` here is the
+    envelope-local slug :data:`MEMBER_PATH_REFUSED_REASON`. ``main`` maps it to
+    exit 2 (a refusal, not caller misuse).
+    """
+
+    reason = MEMBER_PATH_REFUSED_REASON
+
+    def __init__(self, member_path: str, detail: str) -> None:
+        super().__init__(f"member path {member_path!r} refused: {detail}")
+        self.member_path = member_path
+
+
+def _is_within(candidate: str, root: str) -> bool:
+    try:
+        Path(candidate).relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _validated_member_path(root: Path, path: str) -> Path:
+    """Validate ``path`` against ``root`` at filesystem-access time; return the
+    absolute target.
+
+    Runs on EVERY ``read_with_version`` AND ``write_cas_at`` call — ``restore``
+    replays PERSISTED member_paths that never re-pass the CLI-arg pre-check
+    (``normalize_workspace_path``), so validating at parse time alone leaves
+    the replay surface open. Mirrors ``ccs.mcp.uri``:
+
+    - string-level: refuse empty/backslash, absolute, ``..`` traversal, and any
+      path whose first normalized component is ``.coherence`` (the SQLite
+      state, hook secret and pidfile are coordinator state, not members);
+    - refuse EVERY symlink component INCLUDING the leaf — resolve-then-check
+      alone leaves a swap-after-check TOCTOU window; refusing symlinks outright
+      narrows the residual to the same stated same-uid window the MCP guard
+      documents (the check-vs-open gap);
+    - realpath containment + resolved-``.coherence`` re-check, belt-and-
+      suspenders after the two checks above (a ``..``-free, symlink-free path
+      cannot escape, but the mirror keeps the two guards from drifting).
+    """
+    if not path or "\\" in path:
+        raise MemberPathRefused(path, "empty or backslash-carrying path")
+    pure = Path(path)
+    if pure.is_absolute():
+        raise MemberPathRefused(path, "absolute paths are not workspace members")
+    parts = pure.parts
+    if any(part == ".." for part in parts):
+        raise MemberPathRefused(path, "'..' traversal")
+    if parts and parts[0].lower() == _COHERENCE_DIR:
+        raise MemberPathRefused(
+            path,
+            "targets coordinator state (.coherence/**), which is never a "
+            "workspace member",
+        )
+    candidate = root
+    for part in parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise MemberPathRefused(
+                path,
+                f"component {part!r} is a symlink — a symlinked member can be "
+                "re-pointed outside the workspace root between capture and "
+                "restore",
+            )
+    root_real = os.path.realpath(root)
+    target_real = os.path.realpath(candidate)
+    if not _is_within(target_real, root_real):
+        raise MemberPathRefused(
+            path, "escapes the workspace root (traversal or symlink)"
+        )
+    if _is_within(target_real, os.path.join(root_real, _COHERENCE_DIR)):
+        raise MemberPathRefused(
+            path, "resolves into coordinator state (.coherence/**)"
+        )
+    return candidate
 
 
 # --- the working-tree bridge (FileMemberSource + FileRestoreTarget) -------------
@@ -168,10 +280,23 @@ class WorkingTreeSource:
         self._agent = agent
 
     def _abs(self, path: str) -> Path:
-        return self._root / path
+        # Containment validation on EVERY filesystem access (both the read and
+        # the write leg route through here) — restore replays persisted
+        # member_paths that never re-pass the CLI-arg pre-check.
+        return _validated_member_path(self._root, path)
 
     def read_with_version(self, path: str) -> tuple[bytes, int]:
-        data = self._abs(path).read_bytes()  # FileNotFoundError = the ABSENT fact
+        try:
+            data = self._abs(path).read_bytes()
+        except FileNotFoundError:
+            raise  # the ABSENT fact — the engine's vocabulary, not an error
+        except OSError as exc:
+            # A directory member (IsADirectoryError), a mid-path non-dir
+            # (NotADirectoryError), permissions, ... — a typed refusal, never
+            # a raw traceback.
+            raise MemberPathRefused(
+                path, f"not a readable regular file ({type(exc).__name__})"
+            ) from exc
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -221,6 +346,10 @@ class WorkingTreeSource:
             disk = live.read_bytes()
         except FileNotFoundError:
             disk = None
+        except OSError as exc:
+            raise MemberPathRefused(
+                path, f"not a readable regular file ({type(exc).__name__})"
+            ) from exc
         if disk is not None and sha256_hex(disk) != current.content_hash:
             # DETECTION fired: the disk moved without the ledger observing it —
             # a foreign edit. no-arbiter: typed conflict, never arbitration.
@@ -435,6 +564,75 @@ def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
 
+def _emit_error_envelope(
+    args: argparse.Namespace,
+    *,
+    exit_code: int,
+    reason: str,
+    message: str,
+    exc: BaseException | None = None,
+) -> None:
+    """Under ``--json``, emit the one-line JSON error envelope on stdout.
+
+    Mirrors ``ccs.cli.coherence_replay``'s ``emit_json_error_envelope``
+    pattern: stdout stays self-contained for machine consumers on EVERY exit
+    path while the human prose stays on stderr. ``reason`` carries the typed
+    ``.reason`` when the raising exception has one; otherwise an
+    envelope-local slug (the ``argument_error`` precedent)."""
+    if not getattr(args, "json", False):
+        return
+    print(
+        json.dumps(
+            {
+                "kind": "error",
+                "exit_code": exit_code,
+                "reason": reason,
+                "exception": type(exc).__name__ if exc is not None else None,
+                "message": message,
+            }
+        ),
+        flush=True,
+    )
+
+
+def _live_coordinator_pid(root: Path) -> int | None:
+    """The pid of a live hook coordinator on this workspace, else ``None``.
+
+    Mirrors the lifecycle module's pidfile discipline: line 1 of
+    ``<root>/.coherence/server.pid`` is the holder's pid; line 2 (the port) may
+    be legitimately absent while idle (``_rewrite_pidfile_drop_port``), so
+    liveness is pid-parses AND process-alive (signal 0) — never port-present.
+    """
+    pid_file = root / _COHERENCE_DIR / "server.pid"
+    try:
+        first_line = pid_file.read_text(encoding="utf-8").splitlines()[0]
+        pid = int(first_line.strip())
+    except (OSError, IndexError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid  # alive under another uid — still a live coordinator
+    except OSError:
+        return None
+    return pid
+
+
+def _live_coordinator_warning(pid: int) -> str:
+    return (
+        f"{_PROG}: WARNING: a live hook coordinator (pid {pid}, "
+        ".coherence/server.pid) is serving this workspace — restored file "
+        "writes land on disk OUTSIDE the live coordinator's grant flow and "
+        "bypass its grants, so peers may keep now-stale views. Stop the "
+        "coordinator before restoring, or have agents re-read affected "
+        "members after it."
+    )
+
+
 # --- the in-process stack --------------------------------------------------------
 
 
@@ -443,8 +641,20 @@ class _Stack:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        # KTD-13: create .coherence/ via the documented single implementation
+        # (0700 perms + the '*' gitignore). A bare mkdir here would race ahead
+        # of SqliteArtifactRegistry's protective mkdir(mode=0o700) (turning it
+        # into a no-op): under umask 022 a fresh workspace would get a 0755
+        # .coherence/ with NO .gitignore, and `git add .` would stage
+        # workspace.db.
+        coherence_dir = _ensure_coherence_dir(root)
+        if coherence_dir is None:
+            raise CoherenceError(
+                f"cannot create {root / _COHERENCE_DIR} — the workspace "
+                "registry needs a writable .coherence directory (read-only "
+                "workspace?)"
+            )
         db_path = root / _WORKSPACE_DB_RELPATH
-        db_path.parent.mkdir(parents=True, exist_ok=True)
         # Retention ON: the file-member resolver reads captured bytes back
         # through get_content_at_version — without it every file restore
         # would honestly (and uselessly) report target_lost.
@@ -480,13 +690,29 @@ def _cmd_checkpoint(stack: _Stack, args: argparse.Namespace) -> int:
     if invalid:
         for raw, reason in invalid:
             err(f"{_PROG}: rejected {raw!r}: {reason}")
-        return 1
-    if not files and not args.forward_only:
-        err(
-            f"{_PROG}: checkpoint needs at least one member "
-            "(--file and/or --forward-only)"
+        _emit_error_envelope(
+            args,
+            exit_code=1,
+            reason="invalid_member_path",
+            message="; ".join(f"{raw!r}: {reason}" for raw, reason in invalid),
         )
         return 1
+    if not files and not args.forward_only:
+        message = (
+            "checkpoint needs at least one member (--file and/or --forward-only)"
+        )
+        err(f"{_PROG}: {message}")
+        _emit_error_envelope(args, exit_code=1, reason="no_members", message=message)
+        return 1
+
+    # Dup-name disclosure: names are labels, NOT unique keys — a second
+    # checkpoint under an existing name is minted, never refused, but the
+    # prior ids are disclosed so the operator is not silently ambiguous.
+    prior_same_name = [
+        record.checkpoint_id
+        for record in stack.service.list_workspace_checkpoints()
+        if record.name == args.name
+    ]
 
     versioner = stack.versioner()
     for path in files:
@@ -496,16 +722,23 @@ def _cmd_checkpoint(stack: _Stack, args: argparse.Namespace) -> int:
     result: WorkspaceCheckpoint = versioner.checkpoint(args.name, pin=not args.no_pin)
 
     if args.json:
-        _print_json(
-            {
-                "checkpoint": _record_payload(result.record),
-                "members": [_member_payload(row) for row in result.members],
-                "retention_caveat": FILE_RETENTION_CAVEAT,
-            }
-        )
+        payload: dict[str, Any] = {
+            "checkpoint": _record_payload(result.record),
+            "members": [_member_payload(row) for row in result.members],
+            "retention_caveat": FILE_RETENTION_CAVEAT,
+        }
+        if prior_same_name:
+            payload["existing_with_same_name"] = prior_same_name
+        _print_json(payload)
         return 0
     record = result.record
     print(f"checkpoint {record.name!r} persisted: {record.checkpoint_id}")
+    if prior_same_name:
+        print(
+            f"note: {len(prior_same_name)} prior checkpoint(s) already carry "
+            f"the name {record.name!r}: {', '.join(prior_same_name)} — names "
+            "are labels, not unique keys; status/restore target an id"
+        )
     print(
         f"window: [{record.window_min:.0f}, {record.window_max:.0f}] "
         "(monotonic seconds; the skew is declared, not hidden)"
@@ -572,22 +805,35 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
         and row.arbitration_tier == ArbitrationTier.NATIVE_CAS.value
     ]
     if undrivable and record.restore_status != RESTORE_STATUS_CONCLUDED:
-        err(
-            f"{_PROG}: cannot restore {args.checkpoint_id}: S3 object members "
+        message = (
+            f"cannot restore {args.checkpoint_id}: S3 object members "
             f"({', '.join(sorted(undrivable))}) need their bindings/credentials, "
             "which live in the Python API (see examples/workspace_versioning) — "
             "nothing was started"
         )
+        err(f"{_PROG}: {message}")
+        _emit_error_envelope(
+            args, exit_code=1, reason="undrivable_members", message=message
+        )
         return 1
+    bound_file_members = 0
     for row in rows:
         if row.arbitration_tier != ArbitrationTier.NO_ARBITER.value:
             continue
         needs_binding = row.absent or row.restore_tier != RestoreTier.FORWARD_ONLY.value
         if needs_binding:
             versioner.add_file_member(stack.source, row.member_path)
+            bound_file_members += 1
+    # Live-coordinator dual-write hazard (v1 remediation: WARN, never refuse).
+    # Restored file writes land outside a live hook coordinator's grant flow;
+    # skipped when this restore binds no file members (nothing will be written
+    # through the working-tree bridge).
+    live_pid = _live_coordinator_pid(stack.root) if bound_file_members else None
+    if live_pid is not None:
+        err(_live_coordinator_warning(live_pid))
     report: WorkspaceRestoreReport = versioner.restore(args.checkpoint_id)
 
-    absorbed = [m for m in report.members if m.outcome in _ABSORBING_OUTCOMES]
+    absorbed = [m for m in report.members if m.outcome in _EXIT3_OUTCOMES]
     registration_refused = (
         report.registration is not None
         and report.registration.status == WORKSPACE_REGISTRATION_REFUSED
@@ -600,6 +846,8 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
             "status": report.status,
             "members": [_outcome_payload(m) for m in report.members],
         }
+        if live_pid is not None:
+            payload["live_coordinator_warning"] = True
         if report.registration is not None:
             payload["registration"] = {
                 "status": report.registration.status,
@@ -609,6 +857,8 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
                 "substrate_registered": list(report.registration.substrate_registered),
                 "deleted_recorded": list(report.registration.deleted_recorded),
                 "refused": dict(report.registration.refused),
+                "invalidated_peers": report.registration.invalidated_peers,
+                "attempts": report.registration.attempts,
             }
         _print_json(payload)
         return rc
@@ -624,6 +874,11 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
     if report.registration is not None:
         print(
             f"registration: {report.registration.status} — {report.registration.detail}"
+        )
+        print(
+            f"  peers invalidated by registration: "
+            f"{report.registration.invalidated_peers}  "
+            f"(attempts={report.registration.attempts})"
         )
     if absorbed:
         print(
@@ -641,12 +896,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root_arg = args.root if args.root is not None else find_coordinator_root()
     if root_arg is None:
-        err(f"{_PROG}: not in a git repository")
+        message = "not in a git repository"
+        err(f"{_PROG}: {message}")
+        _emit_error_envelope(
+            args, exit_code=1, reason="not_a_git_repository", message=message
+        )
         return 1
     root = Path(root_arg).resolve()
 
-    stack = _Stack(root)
+    stack: _Stack | None = None
     try:
+        stack = _Stack(root)
         if args.verb == "checkpoint":
             return _cmd_checkpoint(stack, args)
         if args.verb == "list":
@@ -654,21 +914,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.verb == "status":
             return _cmd_status(stack, args)
         return _cmd_restore(stack, args)
+    except MemberPathRefused as exc:
+        # A ValueError subclass — MUST precede the bare ValueError arm: a
+        # containment refusal is exit 2 (a typed refusal), not caller misuse.
+        err(f"{_PROG}: refused ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
+        return 2
     except BinaryFileMemberRefused as exc:
         # Honesty placement #1: the typed refusal names the UTF-8 limitation.
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
         return 2
     except CheckpointUnknown as exc:
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
         return 2
     except CheckpointPersistFailed as exc:
         err(f"{_PROG}: failed ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
         return 2
+    except CoherenceError as exc:
+        # E.g. read_with_version's 3-attempt observe-commit contention path, or
+        # a CasVersionConflict/CommitUnconfirmed escaping a leg: one line on
+        # stderr, exit 1 — never a raw traceback.
+        err(f"{_PROG}: {exc}")
+        _emit_error_envelope(
+            args,
+            exit_code=1,
+            reason=getattr(exc, "reason", "coherence_error"),
+            message=str(exc),
+            exc=exc,
+        )
+        return 1
     except ValueError as exc:
         err(f"{_PROG}: {exc}")
+        _emit_error_envelope(
+            args, exit_code=1, reason="validation_error", message=str(exc), exc=exc
+        )
         return 1
     finally:
-        stack.close()
+        if stack is not None:
+            stack.close()
 
 
 if __name__ == "__main__":
