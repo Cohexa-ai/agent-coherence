@@ -109,6 +109,19 @@ def test_workspace_protocol_drift_guard_bidirectional() -> None:
     assert workspace_protocol_members() == WORKSPACE_BINDING_MEMBERS
 
 
+def test_portable_protocol_members_match_the_interpreter() -> None:
+    """The portable member computation must agree with CPython's own
+    ``__protocol_attrs__`` on every interpreter that exposes it (3.12+), so the
+    3.11 path — where the attribute does not exist — cannot silently diverge
+    from what newer runtimes consider the Protocol's surface."""
+    builtin = getattr(WorkspaceConformanceBinding, "__protocol_attrs__", None)
+    if builtin is None:  # Python 3.11: nothing to cross-check against.
+        pytest.skip("interpreter does not expose __protocol_attrs__ (Python < 3.12)")
+    assert workspace_protocol_members() == frozenset(
+        name for name in builtin if not name.startswith("_")
+    )
+
+
 def test_reference_binding_satisfies_the_protocol(tmp_path: Path) -> None:
     """The reference arm satisfies the runtime-checkable Protocol statically
     (explicit members, no __getattr__ fallthrough) and passes the

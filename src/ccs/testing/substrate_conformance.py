@@ -991,11 +991,36 @@ WORKSPACE_BINDING_MEMBERS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _declared_protocol_members(protocol: type) -> frozenset[str]:
+    """The public members a Protocol declares, inherited Protocol bases included.
+
+    CPython exposes this as ``__protocol_attrs__``, but only from 3.12 — and this
+    package supports 3.11 (``requires-python = ">=3.11"``), where the attribute
+    does not exist. So the members are computed here instead: walk the MRO,
+    skipping ``object`` and the ``Protocol``/``Generic`` scaffolding, and collect
+    annotations and class attributes. Underscored names are excluded rather than
+    replicating CPython's exclusion list, which differs between versions: a
+    conformance seam is public by construction, so anything underscored is
+    machinery, not contract.
+
+    ``test_portable_protocol_members_match_the_interpreter`` pins this against
+    ``__protocol_attrs__`` on every interpreter that has it, so the portable path
+    cannot drift from CPython's own notion of the surface unnoticed.
+    """
+    return frozenset(
+        name
+        for base in protocol.__mro__
+        if base is not object and base.__name__ not in {"Protocol", "Generic"}
+        for name in (*vars(base), *getattr(base, "__annotations__", {}))
+        if not name.startswith("_")
+    )
+
+
 def workspace_protocol_members() -> frozenset[str]:
     """The members :class:`WorkspaceConformanceBinding` actually declares —
     compared against :data:`WORKSPACE_BINDING_MEMBERS` by the drift-guard test
     (bidirectional: neither the Protocol nor the anchor may move alone)."""
-    return frozenset(WorkspaceConformanceBinding.__protocol_attrs__)
+    return _declared_protocol_members(WorkspaceConformanceBinding)
 
 
 def assert_workspace_binding_declares_all(binding: WorkspaceConformanceBinding) -> None:
