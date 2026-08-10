@@ -41,11 +41,17 @@ Exit codes:
      a typed coherence contention error (e.g. the observe-commit loop exhausted)
 - 2: typed coherence refusal (binary member, unknown checkpoint, persist
      failure, member-path containment refusal — symlink component, hardlinked
-     regular file (external co-owner), ``.coherence`` self-target, workspace
-     escape, or an unreadable non-file member)
+     regular file (external co-owner), non-regular leaf (FIFO/socket/device),
+     ``.coherence`` self-target, workspace escape, or an unreadable non-file
+     member)
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
+
+A containment refusal is exit 2 on the CAPTURE leg (nothing persists). On the
+RESTORE leg it is NOT: the engine's termination contract absorbs it into that
+member's ``target_lost`` so the other members still conclude, and the refusal
+surfaces as that member's outcome detail in the report — exit 3.
 
 Under ``--json`` every error path ALSO emits a one-line JSON error envelope on
 stdout (``{"kind": "error", "exit_code": N, "reason": ..., ...}`` — the
@@ -70,6 +76,7 @@ from ccs.adapters.workspace import (
     BinaryFileMemberRefused,
     CheckpointPersistFailed,
     MemberRestoreOutcome,
+    StructuralMemberRefused,
     WorkspaceCheckpoint,
     WorkspaceRestoreReport,
     WorkspaceVersioner,
@@ -159,19 +166,34 @@ _COHERENCE_DIR = ".coherence"
 MEMBER_PATH_REFUSED_REASON = "member_path_refused"
 
 
-class MemberPathRefused(ValueError):
+class MemberPathRefused(StructuralMemberRefused, ValueError):
     """Typed refusal: a member path failed containment validation at
     filesystem-access time (workspace escape, symlink component, hardlinked
-    regular file, ``.coherence`` self-target, or an unreadable non-file member).
+    regular file, non-regular leaf, ``.coherence`` self-target, or an
+    unreadable non-file member).
 
     Mirrors the MCP guard pattern (``ccs.mcp.uri._targets_coherence_state`` +
-    ``_reject_path_escape``) at the :class:`WorkingTreeSource` seam. Based on
-    ``ValueError`` with the stable message prefix ``member path ... refused:``
-    because no existing typed exception carries this vocabulary WITH a stable
-    ``.reason`` (``UriValidationError`` has none), and core reason constants
-    must not be minted for a CLI-local refusal; ``.reason`` here is the
-    envelope-local slug :data:`MEMBER_PATH_REFUSED_REASON`. ``main`` maps it to
-    exit 2 (a refusal, not caller misuse).
+    ``_reject_path_escape``) at the :class:`WorkingTreeSource` seam. Keeps the
+    stable message prefix ``member path ... refused:`` and the envelope-local
+    slug :data:`MEMBER_PATH_REFUSED_REASON` as ``.reason`` — no core reason
+    constant is minted for a CLI-local refusal.
+
+    Two bases, each load-bearing:
+
+    - :class:`~ccs.adapters.workspace.StructuralMemberRefused` — the ENGINE's
+      vocabulary for "this source can never drive this member". The versioner's
+      termination contract catches that base, so a refused member absorbs into
+      ``target_lost`` and the restore CONCLUDES instead of wedging the
+      checkpoint at ``in_progress`` forever (the engine never imports this
+      module; the dependency points interface → engine, as it already did).
+    - ``ValueError`` — the original base, kept so nothing that classified this
+      as an argument-shaped refusal changes meaning.
+
+    ``main`` maps it to exit 2 (a refusal, not caller misuse) and MUST keep
+    that arm ahead of both the ``CoherenceError`` and the ``ValueError`` arms.
+    A CAPTURE-time refusal still exits 2 unchanged; only the RESTORE leg
+    absorbs, and the absorbed member surfaces in the report (exit 3) carrying
+    this message as its outcome detail.
     """
 
     reason = MEMBER_PATH_REFUSED_REASON
@@ -208,6 +230,8 @@ def _validated_member_path(root: Path, path: str) -> Path:
     - realpath containment + resolved-``.coherence`` re-check, belt-and-
       suspenders after the two checks above (a ``..``-free, symlink-free path
       cannot escape, but the mirror keeps the two guards from drifting);
+    - refuse a NON-REGULAR leaf (FIFO, socket, block/char device) — opening one
+      is not a bounded read (see :func:`_refuse_non_regular_stat`);
     - refuse a HARDLINKED regular-file leaf (``st_nlink > 1``) — a hard link is
       not a symlink and resolves in-tree, so it slips the two checks above, but
       it co-owns an external inode (see the inline note below).
@@ -258,10 +282,15 @@ def _validated_member_path(root: Path, path: str) -> Path:
     # to the read leg (surfaces ABSENT) or the write leg (may create it fresh
     # at ``st_nlink == 1``). Directories carry ``st_nlink >= 2`` legitimately,
     # so :func:`_refuse_hardlinked_stat` gates on ``S_ISREG``.
+    #
+    # An ABSENT (or otherwise unstattable) leaf takes neither check: absence is
+    # a FACT, not a refusal — the read leg surfaces it as the ABSENT member and
+    # the write leg may create it fresh at ``st_nlink == 1``.
     try:
         leaf_stat = os.stat(candidate, follow_symlinks=False)
     except OSError:
         return candidate
+    _refuse_non_regular_stat(leaf_stat, path)
     _refuse_hardlinked_stat(leaf_stat, path)
     return candidate
 
@@ -289,6 +318,51 @@ def _refuse_hardlinked_stat(st: os.stat_result, member_path: str) -> None:
         )
 
 
+#: Stable, distinct reason substring naming the v1 non-regular-file limitation.
+#: Asserted by tests via the ``"not a regular file"`` token; kept separate from
+#: the symlink and hard-link reasons.
+_NON_REGULAR_REFUSAL_DETAIL = (
+    "is not a regular file ({kind}) — a workspace member must be a bounded "
+    "byte sequence: opening a FIFO or socket blocks until a peer appears "
+    "(wedging the capture forever, with no timeout this process controls) and "
+    "a device node is not workspace state at all, so only regular files can "
+    "be members in v1 (non-regular-file limitation)"
+)
+
+#: The leaf shapes refused by :func:`_refuse_non_regular_stat`, most-specific
+#: name first. Directories are deliberately ABSENT: they stat as non-regular
+#: but already route to the established ``IsADirectoryError`` handling, which
+#: names the problem better than a generic non-regular refusal would.
+_NON_REGULAR_KINDS: tuple[tuple[Any, str], ...] = (
+    (stat.S_ISFIFO, "FIFO / named pipe"),
+    (stat.S_ISSOCK, "socket"),
+    (stat.S_ISBLK, "block device"),
+    (stat.S_ISCHR, "character device"),
+)
+
+
+def _refuse_non_regular_stat(st: os.stat_result, member_path: str) -> None:
+    """Raise :class:`MemberPathRefused` when ``st`` describes a FIFO, socket, or
+    block/character device.
+
+    The gate that keeps the guarded opens BOUNDED. ``os.open`` on a FIFO with no
+    peer blocks in the kernel until one appears — before ``O_NOFOLLOW``, before
+    the fd-level hardlink re-check, before any timeout this process controls —
+    so ``checkpoint --file pipe.txt`` hangs forever rather than refusing. Device
+    nodes are the same shape of wrong: unbounded or side-effecting reads of
+    something that is not workspace state.
+
+    No-op for a regular file and for a DIRECTORY (already handled: the guarded
+    open surfaces ``IsADirectoryError``, mapped to a typed refusal naming the
+    directory). Symlinks never reach here — they are refused component-by-
+    component above."""
+    for predicate, kind in _NON_REGULAR_KINDS:
+        if predicate(st.st_mode):
+            raise MemberPathRefused(
+                member_path, _NON_REGULAR_REFUSAL_DETAIL.format(kind=kind)
+            )
+
+
 def _read_member_bytes_nofollow(candidate: Path, member_path: str) -> bytes:
     """Read the leaf through ``O_RDONLY | O_NOFOLLOW`` and re-take the hardlink
     check on the open fd.
@@ -297,12 +371,19 @@ def _read_member_bytes_nofollow(candidate: Path, member_path: str) -> bytes:
     a leaf swapped to a symlink after validation is rejected ATOMICALLY at open
     (``O_NOFOLLOW`` → ``OSError`` ELOOP), and a hard link swapped in after
     validation is caught by the ``os.fstat`` re-check on the very fd being read.
+    ``O_NONBLOCK`` closes the same window for a leaf swapped to a FIFO (the open
+    would otherwise block in the kernel until a peer writer appears, ahead of
+    every check this function makes); it is a no-op on regular files, and the
+    fd-level :func:`_refuse_non_regular_stat` then refuses the swapped-in leaf
+    before any read.
     ``FileNotFoundError`` (the ABSENT fact) and every other ``OSError`` (ELOOP,
     EISDIR, EACCES, …) propagate for the caller to map; :class:`MemberPathRefused`
-    is raised only for the fd-level hardlink case."""
-    fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+    is raised only for the fd-level hardlink / non-regular cases."""
+    fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        _refuse_hardlinked_stat(os.fstat(fd), member_path)
+        leaf_stat = os.fstat(fd)
+        _refuse_non_regular_stat(leaf_stat, member_path)
+        _refuse_hardlinked_stat(leaf_stat, member_path)
         chunks: list[bytes] = []
         while True:
             chunk = os.read(fd, _MEMBER_READ_CHUNK_BYTES)
@@ -322,10 +403,19 @@ def _write_member_bytes_nofollow(candidate: Path, member_path: str, data: bytes)
     mutated — refuse first, then ``ftruncate`` + write. A leaf swapped to a
     symlink after validation is rejected atomically at open (``O_NOFOLLOW`` →
     ELOOP), so a restore write never follows a re-pointed leaf outside the root.
+    ``O_NONBLOCK`` (a no-op on regular files) keeps the open itself bounded when
+    the leaf was swapped to a FIFO after validation — it fails ENXIO instead of
+    blocking on a missing reader — and the fd-level
+    :func:`_refuse_non_regular_stat` refuses any other non-regular shape BEFORE
+    the truncate, alongside the hardlink re-check.
     ``0o600`` applies only on CREATE; an existing member keeps its own mode."""
-    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = os.open(
+        candidate, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600
+    )
     try:
-        _refuse_hardlinked_stat(os.fstat(fd), member_path)
+        leaf_stat = os.fstat(fd)
+        _refuse_non_regular_stat(leaf_stat, member_path)
+        _refuse_hardlinked_stat(leaf_stat, member_path)
         os.ftruncate(fd, 0)
         written = 0
         while written < len(data):
@@ -379,12 +469,15 @@ class WorkingTreeSource:
     :class:`~ccs.adapters.workspace.BinaryFileMemberRefused` fires at capture.
 
     Containment TOCTOU (honest residual). ``_validated_member_path`` refuses
-    symlink components and hardlinked regular files at validation time, but the
-    validation and the syscall are separate steps. Both legs close the LEAF
-    window: the read/write go through ``os.open(..., O_NOFOLLOW)`` (a leaf
-    swapped to a symlink after validation is rejected atomically at open with
-    ELOOP) with an ``os.fstat`` hardlink re-check on the very fd (a hard link
-    swapped in after validation is caught too). The INTERMEDIATE-DIRECTORY-
+    symlink components, non-regular leaves (FIFO, socket, block/char device) and
+    hardlinked regular files at validation time, but the validation and the
+    syscall are separate steps. Both legs close the LEAF window: the read/write
+    go through ``os.open(..., O_NOFOLLOW | O_NONBLOCK)`` (a leaf swapped to a
+    symlink after validation is rejected atomically at open with ELOOP; a leaf
+    swapped to a FIFO cannot block the open waiting for a peer) with an
+    ``os.fstat`` re-check on the very fd for BOTH the hardlink and the
+    non-regular shapes (either one swapped in after validation is caught too,
+    before any byte is read or truncated). The INTERMEDIATE-DIRECTORY-
     COMPONENT window is NOT closed: an attacker who swaps a mid-path directory
     for a symlink between the walk and the open can still redirect the target,
     because the open resolves the full path afresh. Full closure needs an
@@ -1044,8 +1137,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_status(stack, args)
         return _cmd_restore(stack, args)
     except MemberPathRefused as exc:
-        # A ValueError subclass — MUST precede the bare ValueError arm: a
-        # containment refusal is exit 2 (a typed refusal), not caller misuse.
+        # Both a StructuralMemberRefused (→ CoherenceError) and a ValueError —
+        # so this arm MUST precede BOTH of those arms below: a containment
+        # refusal is exit 2 (a typed refusal), not caller misuse and not the
+        # generic exit-1 coherence-error path. Reached on the CAPTURE leg (and
+        # any refusal raised outside a restore leg); a refusal raised INSIDE a
+        # restore leg never arrives here — the engine's termination contract
+        # absorbs it into that member's target_lost and the run concludes.
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc

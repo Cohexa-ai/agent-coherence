@@ -65,7 +65,10 @@ conditional leg per DURABLE member row under a TERMINATION CONTRACT:
   (``restored`` / ``converged``), absorbing (``conflict`` / ``target_lost`` /
   ``forward_only_skipped``), or hold (``held_unconfirmed``). A restore that
   starts always CONCLUDES with a frozen per-member report; per-member failures
-  are absorbed into the report, never raised.
+  are absorbed into the report, never raised — including a source's own
+  :class:`StructuralMemberRefused` (a member the source declares undrivable
+  through its declared surface), which is re-drive-proof by construction and
+  so must never wedge the OTHER members' restore.
 - **Bounded re-drive** — each contended leg re-drives at most
   :data:`MAX_RESTORE_LEG_REDRIVES` times (the ``MAX_CAS_REACQUIRES`` twin);
   sustained foreign-writer contention exhausts the budget into the absorbing
@@ -234,6 +237,8 @@ __all__ = [
     "MAX_RESTORE_LEG_REDRIVES",
     "MemberRestoreOutcome",
     "RestoreRegistration",
+    "STRUCTURAL_MEMBER_REFUSAL_REASON",
+    "StructuralMemberRefused",
     "WorkspaceCheckpoint",
     "WorkspaceRestoreReport",
     "WorkspaceVersioner",
@@ -261,6 +266,12 @@ BINARY_FILE_MEMBER_REASON: Final[str] = "binary_file_member_unsupported"
 # landed (no partial manifest — the registration is all-or-nothing).
 CHECKPOINT_NOT_PERSISTED_REASON: Final[str] = "checkpoint_not_persisted"
 
+# A member source REFUSES this member structurally: its declared surface will
+# never yield or accept the member's state, whatever the caller does. The
+# engine-owned base reason; a concrete source subclasses the exception and
+# narrows the reason to its own vocabulary (the CLI's containment refusal).
+STRUCTURAL_MEMBER_REFUSAL_REASON: Final[str] = "structural_member_refused"
+
 
 class BinaryFileMemberRefused(CoherenceError):
     """A file member holds non-UTF-8 bytes — the typed capture-time refusal.
@@ -280,6 +291,46 @@ class BinaryFileMemberRefused(CoherenceError):
     def __init__(self, message: str, *, member_path: str) -> None:
         super().__init__(message)
         self.member_path = member_path
+
+
+class StructuralMemberRefused(CoherenceError):
+    """A member source STRUCTURALLY refuses this member — the engine-owned base.
+
+    The seam-level twin of :class:`BinaryFileMemberRefused`: both name a member
+    the engine can never drive. The difference is who decides. The binary
+    refusal is the ENGINE's own capture-time content limitation; this one is
+    raised BY a :class:`FileMemberSource` / :class:`FileRestoreTarget`
+    implementation about the member's own shape — the CLI's working-tree bridge
+    refuses a member path that fails containment validation (a symlink
+    component, a hardlinked regular file with an external co-owner, a
+    ``.coherence`` self-target, a non-regular leaf), and any other source may
+    refuse for its own structural reason.
+
+    Sources raise a SUBCLASS carrying their own vocabulary (the CLI's
+    ``MemberPathRefused`` narrows :attr:`reason` and stays a ``ValueError`` for
+    its own arg-validation handling); the engine catches only this base, so it
+    never imports the interface module that defines the subclass.
+
+    The engine's two legs treat it differently, by design:
+
+    - **capture** — it propagates. A member that can never be driven must never
+      land in a manifest, so the operator sees a hard typed refusal and nothing
+      persists.
+    - **restore** — :meth:`WorkspaceVersioner._drive_member_absorbing` ABSORBS
+      it into the absorbing ``target_lost`` (the same "unreachable through its
+      declared surface" meaning the ``OSError`` family already maps there): a
+      re-drive can never succeed, so raising would wedge ``restore_status`` at
+      ``in_progress`` durably and break the termination contract for every
+      OTHER member of the checkpoint.
+
+    Carries :data:`STRUCTURAL_MEMBER_REFUSAL_REASON` unless a subclass narrows
+    it, and (by convention, like the sibling refusals) names the member in
+    :attr:`member_path`.
+    """
+
+    reason = STRUCTURAL_MEMBER_REFUSAL_REASON
+    #: The member the refusal names. Subclasses set it in their constructor.
+    member_path: str = ""
 
 
 class CheckpointPersistFailed(CoherenceError):
@@ -308,6 +359,9 @@ class FileMemberSource(Protocol):
     Raises ``FileNotFoundError`` for an absent member (the ABSENT fact).
     A version ``< 1`` means the pointer could not be resolved (no coordinator
     / degraded) — the capture treats it as UNCONFIRMED (never manifested).
+    May raise :class:`StructuralMemberRefused` (or a subclass) to declare THIS
+    MEMBER undrivable through this surface: capture propagates it as a hard
+    typed refusal, restore absorbs it into that member's ``target_lost``.
     """
 
     def read_with_version(self, path: str) -> tuple[bytes, int]:
@@ -462,7 +516,9 @@ class FileRestoreTarget(FileMemberSource, Protocol):
     :class:`~ccs.core.exceptions.CasVersionConflict`) — it is never substrate
     arbitration, and no restore outcome may present it as such (the cross-host
     carve-out). A confirmed win lands ``new_content`` and advances the version
-    deterministically to ``expected_version + 1``.
+    deterministically to ``expected_version + 1``. Like the read leg it may
+    raise :class:`StructuralMemberRefused` to refuse the member outright (no
+    write lands); the restore absorbs that into ``target_lost``.
     """
 
     def write_cas_at(
@@ -1295,12 +1351,13 @@ class WorkspaceVersioner:
         (caller misconfiguration must never mint an ``in_progress`` record it
         cannot drive).
 
-        Termination-contract boundary (the two unanticipated-exception
-        classes): a DETERMINISTIC member/environment pathology escaping a leg
-        — the OSError family (the member path replaced by a directory,
-        permission denied) minus the transient transport shapes, plus
-        ``UnicodeDecodeError`` — is ABSORBED into the member's terminal
-        ``target_lost`` (re-driving can never succeed; see
+        Termination-contract boundary (the unanticipated-exception classes): a
+        DETERMINISTIC member/environment pathology escaping a leg — the OSError
+        family (the member path replaced by a directory, permission denied)
+        minus the transient transport shapes, plus ``UnicodeDecodeError`` —
+        and a :class:`StructuralMemberRefused` (the source declaring the member
+        undrivable through its own surface) are ABSORBED into that member's
+        terminal ``target_lost`` (re-driving can never succeed; see
         :meth:`_drive_member_absorbing`), so the restore still concludes.
         Everything else (``ConnectionError`` / ``TimeoutError`` transport
         blips, registry raises, genuine bugs) PROPAGATES by design — the
@@ -1661,7 +1718,7 @@ class WorkspaceVersioner:
         """Drive one member's leg, absorbing DETERMINISTIC environment failures.
 
         The termination-contract boundary for exceptions the legs did not
-        anticipate. Two classes:
+        anticipate. Three classes:
 
         - **Deterministic member/environment pathology** — the ``OSError``
           family (the member path replaced by a directory → ``IsADirectoryError``,
@@ -1677,6 +1734,15 @@ class WorkspaceVersioner:
           NOT used: it is arbitration/divergence-shaped (a foreign writer
           losing a CAS, a detected live divergence) and an EISDIR/EACCES has
           neither an arbiter nor a diverging writer.
+        - **Structural member refusal** — :class:`StructuralMemberRefused`, the
+          source declaring THIS MEMBER undrivable through its own surface (the
+          CLI bridge's containment refusal: a symlink component, a hardlinked
+          co-owner, a non-regular leaf). Absorbed for exactly the reason above
+          and into the same ``target_lost``: a refusal is by construction
+          re-drive-proof, so raising it would wedge the whole checkpoint —
+          including the members that restored fine — at ``in_progress`` forever
+          with no report. Catching the ENGINE-owned base (never the interface
+          subclass) keeps the seam one-directional.
         - **Everything else** — ``ConnectionError`` / ``TimeoutError`` (OSError
           subclasses, but TRANSIENT transport shapes: a redrive can succeed
           once the transport heals), registry raises, genuine bugs — PROPAGATES
@@ -1689,13 +1755,18 @@ class WorkspaceVersioner:
         except (ConnectionError, TimeoutError):
             # Transient transport shapes: crash-resume, never terminalized.
             raise
-        except (OSError, UnicodeDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, StructuralMemberRefused) as exc:
+            lead = (
+                "structural member refusal absorbed"
+                if isinstance(exc, StructuralMemberRefused)
+                else "deterministic member-environment failure absorbed"
+            )
             return MemberRestoreOutcome(
                 member_path=row.member_path,
                 outcome=RESTORE_OUTCOME_TARGET_LOST,
                 attempts=0,
                 detail=(
-                    "deterministic member-environment failure absorbed "
+                    f"{lead} "
                     f"({type(exc).__name__}: {exc}) — the member is unreachable "
                     "through its declared surface and a re-drive cannot "
                     "succeed; the restore still concludes (termination "

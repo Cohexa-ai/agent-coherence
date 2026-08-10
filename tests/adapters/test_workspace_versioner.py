@@ -39,8 +39,10 @@ from ccs.adapters.workspace import (
     BINARY_FILE_MEMBER_REASON,
     CHECKPOINT_NOT_PERSISTED_REASON,
     MAX_RESTORE_LEG_REDRIVES,
+    STRUCTURAL_MEMBER_REFUSAL_REASON,
     BinaryFileMemberRefused,
     CheckpointPersistFailed,
+    StructuralMemberRefused,
     WorkspaceVersioner,
 )
 from ccs.coordinator.registry import ArtifactRegistry
@@ -1365,6 +1367,129 @@ def test_transient_transport_failure_still_raises_then_resumes(
     (member,) = report.members
     assert member.outcome == RESTORE_OUTCOME_CONVERGED  # live still matches
     assert report.status == RESTORE_STATUS_CONCLUDED
+
+
+class _PathRefused(StructuralMemberRefused, ValueError):
+    """The interface layer's refusal shape, modelled at the engine seam.
+
+    Mirrors the CLI bridge's ``MemberPathRefused``: a structural refusal that is
+    ALSO a ``ValueError``. Both bases are load-bearing here — the engine must
+    absorb it through its OWN :class:`StructuralMemberRefused` base (it may
+    never import the CLI module), and the ``ValueError`` half is exactly what
+    made the old ``(OSError, UnicodeDecodeError)`` boundary miss it.
+    """
+
+    def __init__(self, member_path: str) -> None:
+        super().__init__(
+            f"member path {member_path!r} refused: hardlinked co-owner "
+            "(external inode) — cannot be safely contained in v1"
+        )
+        self.member_path = member_path
+
+
+class _StructuralRefusalFileStore(_FakeFileStore):
+    """``read_with_version`` structurally REFUSES the armed member paths.
+
+    Armed AFTER capture, so the manifest holds an ordinary drivable-looking row
+    and only the restore leg meets the refusal — the real shape (a member
+    hardlinked/re-pointed between checkpoint and restore).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse: dict[str, BaseException] = {}
+
+    def read_with_version(self, path: str) -> tuple[bytes, int]:
+        refusal = self.refuse.get(path)
+        if refusal is not None:
+            raise refusal
+        return super().read_with_version(path)
+
+
+def _two_member_versioner(
+    service: CoordinatorService, files: _StructuralRefusalFileStore
+) -> WorkspaceVersioner:
+    files.put("notes/plan.md", b"plan text", 7)
+    files.put("notes/refused.md", b"refused body", 3)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    resolver.keep("notes/refused.md", 3, b"refused body")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    versioner.add_file_member(files, "notes/refused.md")
+    return versioner
+
+
+def test_structural_member_refusal_absorbs_and_restore_concludes(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """A source's own structural refusal must NOT wedge the restore.
+
+    Regression for the termination-contract hole: ``StructuralMemberRefused``
+    is a ``ValueError``, so the old ``(OSError, UnicodeDecodeError)`` boundary
+    let it propagate out of ``restore()`` — the sibling member landed durably
+    but no report was ever returned, ``restore_status`` stayed ``in_progress``
+    FOREVER, and every later restore of the id re-raised the identical refusal
+    without terminalizing the poisoned row. It is now absorbed into the same
+    ``target_lost`` the OSError family maps to (unreachable through its
+    declared surface; a re-drive can never succeed).
+    """
+    files = _StructuralRefusalFileStore()
+    versioner = _two_member_versioner(service, files)
+    checkpoint_id = versioner.checkpoint("two-member").record.checkpoint_id
+    files.put("notes/plan.md", b"drifted", 7)  # the sibling has real work to do
+    files.refuse["notes/refused.md"] = _PathRefused("notes/refused.md")
+
+    report = versioner.restore(checkpoint_id)
+
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    by_path = report.members_by_path
+    refused = by_path["notes/refused.md"]
+    assert refused.outcome == RESTORE_OUTCOME_TARGET_LOST
+    assert "structural member refusal absorbed" in refused.detail
+    assert "_PathRefused" in refused.detail  # the refusal is NAMED, not swallowed
+    assert "hardlinked co-owner" in refused.detail
+    # The sibling still restores — one undrivable member must never poison the
+    # whole checkpoint.
+    assert by_path["notes/plan.md"].outcome == RESTORE_OUTCOME_RESTORED
+    assert files.state("notes/plan.md")[0] == b"plan text"
+
+    # Durably terminal on BOTH rows, and the header concluded.
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
+    stored = {m.member_path: m for m in registry.get_checkpoint_members(checkpoint_id)}
+    assert stored["notes/refused.md"].restore_outcome == RESTORE_OUTCOME_TARGET_LOST
+    assert stored["notes/plan.md"].restore_outcome == RESTORE_OUTCOME_RESTORED
+
+    # A SECOND restore (refusal still armed) returns the durable report rather
+    # than wedging: nothing is re-driven, so the refusal is never re-raised.
+    again = versioner.restore(checkpoint_id)
+    assert again.status == RESTORE_STATUS_CONCLUDED
+    assert {m.member_path: m.outcome for m in again.members} == {
+        "notes/plan.md": RESTORE_OUTCOME_RESTORED,
+        "notes/refused.md": RESTORE_OUTCOME_TARGET_LOST,
+    }
+    assert all(m.resumed_from_prior_run for m in again.members)
+
+
+def test_structural_refusal_at_capture_still_raises_nothing_persisted(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The asymmetry is deliberate: only the RESTORE leg absorbs.
+
+    A member the source refuses can never be driven, so it must never land in a
+    manifest — capture propagates the typed refusal and persists nothing.
+    """
+    files = _StructuralRefusalFileStore()
+    versioner = _two_member_versioner(service, files)
+    files.refuse["notes/refused.md"] = _PathRefused("notes/refused.md")
+
+    with pytest.raises(StructuralMemberRefused) as excinfo:
+        versioner.checkpoint("refused-at-capture")
+
+    assert excinfo.value.member_path == "notes/refused.md"
+    assert excinfo.value.reason is STRUCTURAL_MEMBER_REFUSAL_REASON
+    assert registry.list_checkpoints() == []  # no partial manifest
 
 
 # ---------------------------------------------------------------------------

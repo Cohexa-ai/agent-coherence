@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,7 @@ from uuid import uuid4
 
 import pytest
 
+import ccs
 from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
@@ -466,7 +468,12 @@ def test_restore_refuses_persisted_member_crossing_symlink(
     """Restore replays PERSISTED member_paths that never re-pass the CLI arg
     pre-check: a fabricated manifest row crossing a symlink (the re-pointed-
     between-checkpoint-and-restore shape) must refuse at the filesystem-access
-    seam and never write outside the root."""
+    seam and never write outside the root.
+
+    The refusal is ENFORCED identically on the restore leg, but it is no longer
+    RAISED there: the engine's termination contract absorbs it into the
+    member's ``target_lost`` so the run concludes (exit 3) instead of wedging
+    ``restore_status=in_progress`` forever. The refusal text rides the report."""
     root, outside = _escape_fixture(tmp_path)
     victim = outside / "secret.txt"
     ckpt = _fabricate_checkpoint(
@@ -482,9 +489,10 @@ def test_restore_refuses_persisted_member_crossing_symlink(
         ),
     )
     (root / "evil_link").symlink_to(outside)
-    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(root))
-    assert rc == 2
-    assert "symlink" in err
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(root))
+    assert rc == 3
+    assert "outcome=target_lost" in out
+    assert "symlink" in out
     assert victim.read_text() == "outside secret\n"  # never written through
 
 
@@ -542,9 +550,14 @@ def test_restore_refuses_persisted_coherence_member(tmp_path: Path, capsys) -> N
             restore_tier=RestoreTier.RESTORABLE_UNPINNED.value,
         ),
     )
-    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
-    assert rc == 2
-    assert ".coherence" in err
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    # Absorbed into target_lost by the termination contract (the run concludes,
+    # exit 3) — the refusal itself is unchanged: nothing under .coherence/ is
+    # ever read or written by a restore leg.
+    assert rc == 3
+    assert "outcome=target_lost" in out
+    assert ".coherence" in out
+    assert (tmp_path / ".coherence" / "hook.secret").exists() is False
 
 
 def test_directory_member_is_a_typed_refusal_not_a_traceback(
@@ -586,7 +599,11 @@ def test_restore_refuses_persisted_hardlinked_member(tmp_path: Path, capsys) -> 
     """FIX 1 (P0): restore replays PERSISTED member_paths. A fabricated row whose
     live path is a hard link to an outside file must refuse at the filesystem-
     access seam — the outside file is neither read (into the ledger) nor written
-    through the shared inode."""
+    through the shared inode.
+
+    The refusal is absorbed into ``target_lost`` (termination contract), so the
+    restore CONCLUDES at exit 3 and the refusal rides the member's report line
+    — the containment guarantee is identical, only the surfacing changed."""
     root, outside = _escape_fixture(tmp_path)
     victim = outside / "secret.txt"
     ckpt = _fabricate_checkpoint(
@@ -602,9 +619,10 @@ def test_restore_refuses_persisted_hardlinked_member(tmp_path: Path, capsys) -> 
         ),
     )
     os.link(victim, root / "hardlinked.txt")
-    rc, _, err = _run(capsys, "restore", ckpt, "--root", str(root))
-    assert rc == 2
-    assert "hard link" in err
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(root))
+    assert rc == 3
+    assert "outcome=target_lost" in out
+    assert "hard link" in out
     # NOT written through: the outside file's bytes are untouched.
     assert victim.read_text() == "outside secret\n"
 
@@ -642,6 +660,112 @@ def test_checkpoint_single_link_file_is_not_a_false_positive(
     )
     assert rc == 0, err
     assert "checkpoint 'cp1' persisted:" in out
+
+
+# --- member-path containment (non-regular leaves: the unbounded-open gate) ------
+
+
+def _checkpoint_in_subprocess(
+    root: Path, member: str, *, timeout: float = 20.0
+) -> subprocess.CompletedProcess:
+    """Run ONE ``checkpoint --file <member>`` in a child process under a hard
+    timeout.
+
+    The timeout IS the assertion: ``os.open`` on a FIFO with no peer writer
+    blocks in the kernel, which no in-process assertion can catch — a
+    regression would hang the test session forever instead of failing. A child
+    process plus ``subprocess.run(timeout=...)`` turns that hang into a loud
+    ``TimeoutExpired``.
+    """
+    src_dir = Path(ccs.__file__).resolve().parents[1]  # the dir holding ``ccs``
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(src_dir), *(
+        [os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []
+    )])}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from ccs.cli.workspace import main; sys.exit(main(sys.argv[1:]))",
+            "checkpoint",
+            "cp1",
+            "--file",
+            member,
+            "--root",
+            str(root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def test_fifo_member_is_refused_at_checkpoint_and_never_hangs(tmp_path: Path) -> None:
+    """A FIFO member must be a typed exit-2 refusal, NOT an unbounded wait.
+
+    The guarded open had no non-regular gate, so ``checkpoint --file pipe.txt``
+    with no peer writer blocked inside ``os.open`` forever (``Path.read_bytes``
+    blocked identically before it) — an operator-visible hang with no timeout
+    the process controls. The stat gate now refuses the leaf before any open.
+    """
+    os.mkfifo(tmp_path / "pipe.txt")
+    result = _checkpoint_in_subprocess(tmp_path, "pipe.txt")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "refused" in result.stderr
+    assert "not a regular file" in result.stderr
+    assert "FIFO" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_socket_member_is_refused_at_checkpoint(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """The sibling non-regular shape: a unix socket leaf is refused too (exit 2),
+    and nothing is persisted."""
+    monkeypatch.chdir(tmp_path)  # AF_UNIX paths are ~104 bytes; bind relatively
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        sock.bind("sock.txt")
+        rc, _, err = _run(
+            capsys, "checkpoint", "cp1", "--file", "sock.txt", "--root", str(tmp_path)
+        )
+    finally:
+        sock.close()
+    assert rc == 2
+    assert "not a regular file" in err
+    assert "socket" in err
+    rc, out, _ = _run(capsys, "list", "--root", str(tmp_path))
+    assert "no checkpoints persisted" in out
+
+
+def test_regular_file_beside_a_fifo_still_checkpoints(tmp_path: Path, capsys) -> None:
+    """False-positive guard for the non-regular gate: the refusal is per-LEAF.
+    An ordinary regular file in a workspace that also holds a FIFO must still
+    capture cleanly."""
+    os.mkfifo(tmp_path / "pipe.txt")
+    _seed_file(tmp_path)
+    rc, out, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path)
+    )
+    assert rc == 0, err
+    assert "checkpoint 'cp1' persisted:" in out
+
+
+def test_absent_member_is_a_fact_not_a_non_regular_refusal(
+    tmp_path: Path, capsys
+) -> None:
+    """The stat gate must not turn ABSENCE into a refusal: an absent leaf takes
+    no stat-based check at all and stays the ABSENT fact the manifest records."""
+    rc, out, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/never.md", "--root", str(tmp_path)
+    )
+    assert rc == 0, err
+    assert "docs/never.md" in out
+    rc, out, _ = _run(
+        capsys, "status", _checkpoint_id(capsys, tmp_path), "--json", "--root", str(tmp_path)
+    )
+    (member,) = json.loads(out)["members"]
+    assert member["absent"] is True
 
 
 def test_read_with_version_rejects_leaf_symlink_swapped_after_validation(
