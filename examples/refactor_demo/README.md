@@ -6,8 +6,7 @@ fourth caller); the executor's behavior depends on whether write-side
 coherence is on. Real `tsc` against a real TypeScript fixture turns the
 correctness question into an on-screen build error.
 
-Companion to the write-side-coherence positioning post (origin:
-`docs/brainstorms/2026-05-12-cocoindex-positioning-coding-agent-wedge-requirements.md`).
+Companion to the write-side-coherence positioning post.
 
 ## Prerequisites
 

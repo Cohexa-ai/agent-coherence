@@ -430,7 +430,7 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
   version from a stored coordinator, content-safe by default (metadata only
   unless `--include-content` / `--output-file`). Read-at-version is an
   off-protocol read — it grants no MESI state and captures no read-generation
-  fence claim (R6/R7). Formally modelled in `formal/tla/Retention.tla`
+  fence claim. Formally modelled in `formal/tla/Retention.tla`
   (`NoCollectedRead` + a versioned-read-is-a-no-op action property), wired into
   `make tla-check`.
 - **Reproducible temporal-cost sweep + token/$ translation** (benchmark tooling,
@@ -462,7 +462,7 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
 
 ### Fixed
 
-- **Watchdog late-completion phantom grant / late grant-revocation (A6).** When
+- **Watchdog late-completion phantom grant / late grant-revocation.** When
   a coordinator hook handler exceeded its 4s watchdog and returned
   `degraded: true`, its work kept running in the pool and its registry mutation
   could land afterward — the agent could be left holding an `EXCLUSIVE` grant it
@@ -481,7 +481,7 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
   after the check and then blocks on cross-process SQLite contention is still
   observed by `watchdog_late_completion_total`; the complete fix
   (response-and-visibility atomicity) is deferred to a fencing redesign.
-- **Watchdog-degraded reads no longer silently pass as verified-fresh (A7).**
+- **Watchdog-degraded reads no longer silently pass as verified-fresh.**
   When a `pre-read` / `pre-bash` / `pre-grep` handler exceeded its watchdog
   (e.g. its task burned the budget waiting in the executor queue under SQLite
   contention), it returned `{status: "fresh", degraded: true}` with no
@@ -495,8 +495,8 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
   remaining *silent* suppression. Coupling the per-request deadline to dequeue
   time, so queue wait doesn't consume the work budget, is a separate deferred
   improvement.)
-- **Coordinator spawn/idle lifecycle hardening (L1, L3, L5).**
-  - **L1 — `rm -rf .coherence/` during coordinator construction.** The
+- **Coordinator spawn/idle lifecycle hardening.**
+  - **`rm -rf .coherence/` during coordinator construction.** The
     spawn-or-join loop revalidated the `server.pid` inode before acquiring the
     flock, but an external `rm -rf .coherence/ && recreate` landing during
     `CoordinatorHTTPServer` construction (SQLite open + TCP bind, >300ms cold)
@@ -505,12 +505,12 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
     and degraded. The winner now re-validates the inode after construction and
     immediately before writing the port; on mismatch it tears down the
     just-bound coordinator (freeing the socket) and recovers on a fresh inode.
-  - **L5 — idle/uptime now use a monotonic clock.** `idle_seconds` and
+  - **Idle/uptime now use a monotonic clock.** `idle_seconds` and
     `uptime_s` were computed from `time.time()` deltas, so an NTP step or a
     suspend/resume could misfire idle shutdown early or defer it. Both now use
     `time.monotonic()`; `time.time()` is reserved for operator-facing absolute
     timestamps.
-  - **L3 — thundering-herd loser degrade is now observable.** When the loop
+  - **Thundering-herd loser degrade is now observable.** When the loop
     exhausts its inode/retry budget under a cold-start herd and returns `-1`,
     a per-reason process-lifetime counter (`get_spawn_join_exhaustion_total()`
     / `_by_reason()`) records it — surfacing the otherwise-silent degrade and
@@ -554,7 +554,7 @@ script, a tool not on the coordinator) is now caught when an agent re-reads it
   read fell back to `0` and burned one `version_mismatch` CAS round-trip
   before retrying — fail-safe, but wasteful after any preemption (a peer
   pre-edit or the stable-grant sweep). Fixed by spreading the `work()`
-  payload so additive fresh-path keys survive notice attachment; the COR-03
+  payload so additive fresh-path keys survive notice attachment; the
   single-consumer notice-drain semantics are unchanged. Regression:
   `tests/test_claude_code_coordinator_server.py::test_a1_fresh_with_notice_preserves_version_field`.
 
@@ -648,7 +648,7 @@ grants automatically. Operators who depend on the v0.8.x default-disabled behavi
   LLM workloads does not false-reclaim live agents. Benchmark token reductions are
   unchanged — see [`benchmarks/results/v0.9.0/attestation.md`](benchmarks/results/v0.9.0/attestation.md).
 - **Migration caveat — `lease` strategy with `lease_ttl_ticks` ≥ 900.** Because the
-  default is now enabled, the R11 composition rule (`max_hold_ticks` must exceed the
+  default is now enabled, the composition rule (`max_hold_ticks` must exceed the
   strategy's inspectable lease TTL) is enforced at construction for bare `CCSStore()`
   / `CoherenceAdapterCore()`. A `lease` strategy with `lease_ttl_ticks` ≥ 900 (the new
   default `max_hold_ticks`) now raises `ValueError` at startup where v0.8.x silently
@@ -767,7 +767,7 @@ API, core-protocol, or adapter changes.
 A patch release that adds the experimental OpenAI Agents SDK integration and
 two packaging/UX fixes. The OpenAI Agents adapter is **experimental (0.x)** and
 tracks the SDK's own 0.x surface; it brings coherence to the SDK `Session`
-cache (the Q6 probe found the OpenAI and Mistral Conversations *servers*
+cache (the consistency probe found the OpenAI and Mistral Conversations *servers*
 read-after-write consistent, so the coherence value lives on the readers'
 caches, not the server). No changes to the core protocol, the existing
 LangGraph / CrewAI / AutoGen adapters, or the v0.8.3 crash-recovery deprecation
@@ -786,14 +786,14 @@ cycle — the v0.9.0 default flip is still the next behavioral change.
   tool-start. Constructor parity with the other adapters (`strategy_name`,
   `core`, `crash_recovery`, `on_error`) plus `heartbeat` / `recover`; scope is
   in-process multi-agent (v1). The coherence target is the **Session cache**, not
-  the Conversations server — the Q6 probe found the server consistent. See the
+  the Conversations server — the consistency probe found the server consistent. See the
   [user guide](docs/guide.md#openai-agents-sdk-adapter-experimental).
 - **New install extras:** `openai` (Conversations client + httpx), `openai-agents`
   (the adapter; pinned `>=0.17,<0.18`, composes `openai`), and `mistral`. `[all]`
   now includes `openai-agents` and `mistral`.
 - **Conversations stale-read example** (`examples/conversations_stale_read/`): a
   deterministic, offline, no-keys reproducer of client-cache staleness over a
-  consistent store, plus a live Q6 consistency probe (`probe.py`). The probe
+  consistent store, plus a live consistency probe (`probe.py`). The probe
   measured the OpenAI and Mistral Conversations servers read-after-write
   consistent (0 stale over 100 + 20 trials), which is why the demo isolates the
   client cache rather than the server.
@@ -842,7 +842,7 @@ notice; v0.9.0 will flip the default and wire the crash-recovery sweep.
   bare `CrashRecoveryConfig()` construction. The warning names both
   silence paths (`enabled=True` opt-in or `enabled=False` opt-out) and
   the target release.
-- Composition rule (R11) is unaffected: explicit
+- The composition rule is unaffected: explicit
   `CrashRecoveryConfig(enabled=True, max_hold_ticks=…)` continues to
   validate against the longest inspectable strategy lease TTL via
   `validate_crash_recovery_config`. v0.9.0 will additionally retune
@@ -879,15 +879,15 @@ notice; v0.9.0 will flip the default and wire the crash-recovery sweep.
 ## [0.8.2] — 2026-05-28
 
 Consolidated patch release covering both the v0.2 strict-mode track
-(landed earlier on dev) and the D v1 LangGraph cycle replay tooling +
-ce:review gated cluster (shipped to dev 2026-05-27 → 2026-05-28). Both
+(landed earlier on dev) and the LangGraph cycle replay tooling +
+review-gated cluster (shipped to dev 2026-05-27 → 2026-05-28). Both
 tracks are additive: new wire fields for v0.2 strict mode AND a new
 CLI surface (`agent-coherence-replay`) + new module (`src/ccs/replay/`).
-The `coordinator_uptime_s` deprecation alias from the `0.8.0` AC-02
-plan stays in place through `0.8.x`; its removal continues to be
+The `coordinator_uptime_s` deprecation alias from `0.8.0`
+stays in place through `0.8.x`; its removal continues to be
 targeted for a future minor bump per the original SemVer commitment.
 
-### Added — D v1 LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
+### Added — LangGraph cycle replay tooling (2026-05-27 → 2026-05-28 on dev)
 
 - **`agent-coherence-replay` console script** — invariant replay CLI
   that walks a captured coordinator session and reports breaches of
@@ -964,36 +964,36 @@ targeted for a future minor bump per the original SemVer commitment.
 
 ### Added — v0.2 strict mode (Python coordinator)
 
-- **Per-artifact strict-mode opt-in** via `.coherence/strict_mode.yaml`
-  (KTD-O). An artifact is strict iff its path matches both the
+- **Per-artifact strict-mode opt-in** via `.coherence/strict_mode.yaml`.
+  An artifact is strict iff its path matches both the
   `tracked_paths` set AND the new `strict_mode_paths` globs. Empty
   strict_mode_paths preserves v0.1.1 warn-mode for every artifact.
 - **Handler decision-flip in all 4 PreToolUse handlers** (Read,
   Edit/Write, Bash, Grep) — `permissionDecision: "deny"` with the
-  static reason template `STRICT_MODE_DENY_REASON_TEMPLATE` (KTD-P)
+  static reason template `STRICT_MODE_DENY_REASON_TEMPLATE`
   fires when (strict + tracked + invalidated). First-time observers
   (state None on existing artifact) fall through to warn-mode allow
   per the semantic refinement during implementation.
-- **`TERMINAL_DENIAL_CLASSES` security invariant** (KTD-U) — module-
+- **`TERMINAL_DENIAL_CLASSES` security invariant** — module-
   level `frozenset` enumerating denial classes that must never be
   converted to `permissionDecision: "allow"`. All 6 allow-emission
   call sites route through `emit_allow()` which asserts the invariant;
   AST-based meta-test grep-counts call sites in `coordinator_server.py`
   + `hook_payloads.py` so a future contributor adding a new allow
   path is forced to extend the parameter list.
-- **`agent-coherence-migrate-deny` CLI** (KTD-R) — stricter sibling
+- **`agent-coherence-migrate-deny` CLI** — stricter sibling
   to `agent-coherence-migrate-rules`. STDOUT-only (never writes to
   settings.json), symlink-contained (canonical-path containment check),
   never invokes an LLM, never reads files outside resolved workspace
   root. Under-emit bias: only canonical phrasings trigger.
-- **Strict-mode telemetry** (KTD-V minimal + KTD-J extension) —
+- **Strict-mode telemetry** —
   `strict_mode_denials_total`, `strict_mode_routed_around_via_bash_total`
-  (Phase 0 H4 routing pattern detector with 30s window),
+  (routing pattern detector with 30s window),
   `audit_log_mode_drift_total` counters surfaced via
   `/status?detail=metrics`. Minimal deny-only audit log appended as
   JSONL to `.coherence/audit.log` (mode 0o600, no schema_version, no
   command bodies, no user content).
-- **Cross-implementation protocol corpus** (Unit 7) —
+- **Cross-implementation protocol corpus** —
   `tests/protocol_corpus/` harness + 12 warn-mode + 8 strict-mode
   fixtures + opt-in `protocol_corpus` pytest marker + new
   `protocol-corpus` CI job. Catches Python ↔ Node coordinator
@@ -1004,17 +1004,17 @@ targeted for a future minor bump per the original SemVer commitment.
 
 - **Hook payload builders** (`build_stale_response`,
   `build_collision_response`) now route through `emit_allow()` per
-  the KTD-U structural invariant.
+  the `TERMINAL_DENIAL_CLASSES` structural invariant.
 - **Static deny-reason text** for strict-mode replaces v0.1.1's
-  per-invocation-varying warn-mode prose. Phase 0 H1 falsification
+  per-invocation-varying warn-mode prose. Falsification testing
   inverted the original "varied text bounds retries" hypothesis on
   opus; static text byte-identical across retries is the right shape.
 
 ### Plugin compatibility
 
 - v0.2 of the [agent-coherence-plugin](https://github.com/Cohexa-ai/agent-coherence-plugin)
-  consumes this library via its broad-beta launch package (plan Units
-  8-11). The Node coordinator does NOT ship strict mode in v0.2 —
+  consumes this library via its broad-beta launch package.
+  The Node coordinator does NOT ship strict mode in v0.2 —
   strict-mode workspaces must use `coherence.coordinator_backend = "python"`.
 
 ## [0.8.1] — 2026-05-27
@@ -1035,55 +1035,55 @@ Single-fix patch.
 
 ## [0.8.0] — 2026-05-23
 
-**Stable release of the Claude Code plugin coordinator backend.** Promotes the `0.8.0a1` alpha pre-release to a final `0.8.0` after the v0.1.1 marketplace cohort + full ce-review remediation pass landed. Both the coordinator HTTP surface and the wire contract are now considered stable through the `0.8.x` minor line; breaking changes will bump to `0.9.0` per SemVer.
+**Stable release of the Claude Code plugin coordinator backend.** Promotes the `0.8.0a1` alpha pre-release to a final `0.8.0` after the v0.1.1 marketplace cohort + full code-review remediation pass landed. Both the coordinator HTTP surface and the wire contract are now considered stable through the `0.8.x` minor line; breaking changes will bump to `0.9.0` per SemVer.
 
-### Added — Marketplace cohort (Phase A–C of v0.1.1 plan)
+### Added — Marketplace cohort
 
-- **Unit 4 watchdog hardening** — KTD-K `busy_timeout=1500ms` per multi-statement transaction analysis; KTD-N `/hooks/pre-bash` + `/hooks/pre-grep` with shlex-based path detection (closes the model-routing-around-Read H4 finding); KTD-G handler concurrency semaphore + queue-depth gate + three saturation counters.
-- **Unit 5 lifecycle hardening** — KTD-H inode revalidation per retry (handles `rm -rf .coherence/ && recreate` mid-spawn races); KTD-I in-flight handler drain on `shutdown()` (5s deadline before SQLite close); KTD-L3 cold-start instrumentation surfaced via `coordinator.cold_start_duration_ms`.
-- **Unit 6 residual risk fixes** — R10 `_agent_names` lock + public accessors; R11 `ensure_secret` bounded `O_EXCL` retry (fail-closed); R12 `/status` three-tier disclosure (`minimal` / `metrics` / `full` with `Coherence-Local-Operator: true` opt-in for the elevated tier); R14 `_append_policy_yaml` `fcntl.flock` discipline; R21 `MAX_REQUEST_BODY_BYTES = 64 KB` cap.
-- **Unit 8 KTD-J telemetry** — per-endpoint counters (pre_read/pre_edit/post_edit/session_stop/pre_bash/pre_grep/policy_track/policy_untrack/status_total); product-signal counters (`intra_task_acquire_release_total`, `stale_warning_emitted_total`, `stale_warning_reread_total`); free-threading-safe via `threading.Lock`. New `coordinator_uptime_seconds` field (canonical) + `coordinator_uptime_s` deprecated alias for one release. `coordinator_backend` + `coordinator_version` fields for cross-backend dashboards.
-- **Unit 8 `--self-test` smoke** — `agent-coherence-status --self-test` runs a four-step pre-read → pre-edit → post-edit → stale pre-read scenario against a live coordinator. Exit 0 on pass, 3 with actionable diagnostic on fail. Documented as the post-install validation step.
-- **Unit 8 `--prepare-for-migration`** — `agent-coherence-coordinator --prepare-for-migration` enters a draining state that rejects new pre-edit (HTTP 503 with structured `migration in progress` error visible to the model), waits up to 5s for in-flight chains to complete, invalidates remaining M/E grants, then schedules shutdown. Eliminates the silent data-loss race when switching Python↔Node backends.
-- **Unit 9 `agent-coherence-migrate-rules`** — scans CLAUDE.md for prose tool-class rules ("use rg, not grep", "never sudo") and proposes `permissions.deny` entries. Flag-only by default; `--apply` writes to `.claude/settings.local.json` after confirmation.
+- **Watchdog hardening** — `busy_timeout=1500ms` per multi-statement transaction analysis; `/hooks/pre-bash` + `/hooks/pre-grep` with shlex-based path detection (closes the model-routing-around-Read finding); handler concurrency semaphore + queue-depth gate + three saturation counters.
+- **Lifecycle hardening** — inode revalidation per retry (handles `rm -rf .coherence/ && recreate` mid-spawn races); in-flight handler drain on `shutdown()` (5s deadline before SQLite close); cold-start instrumentation surfaced via `coordinator.cold_start_duration_ms`.
+- **Residual risk fixes** — `_agent_names` lock + public accessors; `ensure_secret` bounded `O_EXCL` retry (fail-closed); `/status` three-tier disclosure (`minimal` / `metrics` / `full` with `Coherence-Local-Operator: true` opt-in for the elevated tier); `_append_policy_yaml` `fcntl.flock` discipline; `MAX_REQUEST_BODY_BYTES = 64 KB` cap.
+- **Telemetry** — per-endpoint counters (pre_read/pre_edit/post_edit/session_stop/pre_bash/pre_grep/policy_track/policy_untrack/status_total); product-signal counters (`intra_task_acquire_release_total`, `stale_warning_emitted_total`, `stale_warning_reread_total`); free-threading-safe via `threading.Lock`. New `coordinator_uptime_seconds` field (canonical) + `coordinator_uptime_s` deprecated alias for one release. `coordinator_backend` + `coordinator_version` fields for cross-backend dashboards.
+- **`--self-test` smoke** — `agent-coherence-status --self-test` runs a four-step pre-read → pre-edit → post-edit → stale pre-read scenario against a live coordinator. Exit 0 on pass, 3 with actionable diagnostic on fail. Documented as the post-install validation step.
+- **`--prepare-for-migration`** — `agent-coherence-coordinator --prepare-for-migration` enters a draining state that rejects new pre-edit (HTTP 503 with structured `migration in progress` error visible to the model), waits up to 5s for in-flight chains to complete, invalidates remaining M/E grants, then schedules shutdown. Eliminates the silent data-loss race when switching Python↔Node backends.
+- **`agent-coherence-migrate-rules`** — scans CLAUDE.md for prose tool-class rules ("use rg, not grep", "never sudo") and proposes `permissions.deny` entries. Flag-only by default; `--apply` writes to `.claude/settings.local.json` after confirmation.
 
-### Added — Stable-grant sweep preemption notice (ADV-004)
+### Added — Stable-grant sweep preemption notice
 
-`enforce_stable_grant_timeouts` now records a preemption notice for every reclaimed agent (using a sentinel `SWEEP_RECLAMATION_PREEMPTER_ID`). When the victim's post-edit eventually arrives, the F4 enrichment path emits "your M/E grant was reclaimed by the coordinator sweep (heartbeat timeout or max-hold ceiling)" instead of a generic `CoherenceError` — eliminates a silent data-loss class for the alpha cohort's interactive workflows.
+`enforce_stable_grant_timeouts` now records a preemption notice for every reclaimed agent (using a sentinel `SWEEP_RECLAMATION_PREEMPTER_ID`). When the victim's post-edit eventually arrives, the enrichment path emits "your M/E grant was reclaimed by the coordinator sweep (heartbeat timeout or max-hold ceiling)" instead of a generic `CoherenceError` — eliminates a silent data-loss class for the alpha cohort's interactive workflows.
 
 ### Changed
 
 - **`/status?detail=metrics`** is now the canonical surface for dashboard scrapers. The metrics-tier stability contract (additive in minor, removed only in major after one-release deprecation alias) is documented on `_handle_status`.
-- **`StaleResponse` / `FreshResponse` / `PolicyUntrackResponse` TypedDicts** now match the actual wire shapes (AC-04/06/08 alignment).
-- **`_run_or_degrade` accepts `degraded_response`** so `{ok:bool}`-shape endpoints (pre-edit, post-edit, session-stop) return `{ok:True, degraded:True}` on watchdog timeout instead of the `{status:fresh}` envelope used by pre-read shapes (AC-05).
-- **`coordinator_uptime_s` field renamed to `coordinator_uptime_seconds`** per KTD-J `_seconds` convention. Old name kept as a deprecated alias through `0.8.x`; removal targeted for `0.9.0`.
-- **Shutdown ordering** — `_drain_in_flight` now runs BEFORE `_server.server_close()` (COR-01); `_seq` rollback now fires on COMMIT failure (COR-02); shutdown wall-clock can exceed `IN_FLIGHT_DRAIN_TIMEOUT_SEC` when watchdog timeouts fire (COR-07; documented bound).
+- **`StaleResponse` / `FreshResponse` / `PolicyUntrackResponse` TypedDicts** now match the actual wire shapes.
+- **`_run_or_degrade` accepts `degraded_response`** so `{ok:bool}`-shape endpoints (pre-edit, post-edit, session-stop) return `{ok:True, degraded:True}` on watchdog timeout instead of the `{status:fresh}` envelope used by pre-read shapes.
+- **`coordinator_uptime_s` field renamed to `coordinator_uptime_seconds`** per the `_seconds` convention. Old name kept as a deprecated alias through `0.8.x`; removal targeted for `0.9.0`.
+- **Shutdown ordering** — `_drain_in_flight` now runs BEFORE `_server.server_close()`; `_seq` rollback now fires on COMMIT failure; shutdown wall-clock can exceed `IN_FLIGHT_DRAIN_TIMEOUT_SEC` when watchdog timeouts fire (documented bound).
 
 ### Fixed
 
-- **`resolve_or_register` re-fetch race** (COR-04) — concurrent `remove_artifact` between ROLLBACK and re-fetch now raises an informative `RuntimeError` chained from the original `IntegrityError` instead of an opaque "UNIQUE constraint failed" trace.
-- **`artifact_names_under_prefix` TOCTOU** (REL-08) — combined the LIKE-prefix and exact-match queries into a single UNION under one lock.
-- **G4 abort wedge** (REL-06) — added `shutdown_abort_count` on `_SpawnedEntry`; after 3 consecutive `coordinator.shutdown()` raises, escalate by releasing the flock + marking shutdown_done so a fresh spawn can proceed.
-- **Hook secret rotation race** (ADV-003) — coordinator emits operator-visible WARNING on every 401 (with 60s dedupe) plus a new `auth_401_total` counter so silent auth failures become observable.
+- **`resolve_or_register` re-fetch race** — concurrent `remove_artifact` between ROLLBACK and re-fetch now raises an informative `RuntimeError` chained from the original `IntegrityError` instead of an opaque "UNIQUE constraint failed" trace.
+- **`artifact_names_under_prefix` TOCTOU** — combined the LIKE-prefix and exact-match queries into a single UNION under one lock.
+- **Abort wedge** — added `shutdown_abort_count` on `_SpawnedEntry`; after 3 consecutive `coordinator.shutdown()` raises, escalate by releasing the flock + marking shutdown_done so a fresh spawn can proceed.
+- **Hook secret rotation race** — coordinator emits operator-visible WARNING on every 401 (with 60s dedupe) plus a new `auth_401_total` counter so silent auth failures become observable.
 - **Plugin `hooks.json` Bash + Grep matchers** (cross-repo P0) — the plugin now actually invokes `/hooks/pre-bash` and `/hooks/pre-grep` rather than leaving the endpoints runtime-inert (companion plugin `v0.1.1`).
 
 ### Security
 
-- **R12 `/status` disclosure tiers** make pasting `?detail=metrics` into bug reports safe — no absolute paths, no PIDs, no session identifiers. The `full` tier still exposes those but only with the `Coherence-Local-Operator: true` opt-in header (defense-in-depth within the Adversary 1 boundary).
-- **`MAX_REQUEST_BODY_BYTES` cap** (R21) — coordinator rejects oversized request bodies before `rfile.read` so a hostile or buggy client cannot OOM the coordinator with a single oversized POST.
-- **`ensure_secret` bounded retry** (R11) — fail-closed if the empty-file recovery branch can't acquire `O_EXCL` within 5 attempts, instead of silently `O_TRUNC`-overwriting a concurrent racer's valid secret.
+- **`/status` disclosure tiers** make pasting `?detail=metrics` into bug reports safe — no absolute paths, no PIDs, no session identifiers. The `full` tier still exposes those but only with the `Coherence-Local-Operator: true` opt-in header (defense-in-depth).
+- **`MAX_REQUEST_BODY_BYTES` cap** — coordinator rejects oversized request bodies before `rfile.read` so a hostile or buggy client cannot OOM the coordinator with a single oversized POST.
+- **`ensure_secret` bounded retry** — fail-closed if the empty-file recovery branch can't acquire `O_EXCL` within 5 attempts, instead of silently `O_TRUNC`-overwriting a concurrent racer's valid secret.
 - **`MIGRATION_DRAIN_TIMEOUT_SEC = 5.0`** — backend-switch operator path now refuses new writes during drain instead of relying on the prior 100ms scheduled-shutdown race.
 
 ### Internal
 
-- **78 ce-review findings remediated** across 12 reviewer categories (adversarial, correctness, api-contract, reliability, kieran-python, maintainability, performance, project-standards, security, testing, agent-native, learnings). KP-3/KP-11/M-01/M-06 (large handler / file extractions) explicitly deferred with rationale documented in PR bodies.
-- **PERF-1 `/status` batched snapshot** — `SqliteArtifactRegistry.status_snapshot()` collapses the per-artifact `2N` SELECTs into 2 SQL queries held under one lock.
-- **PS-01..PS-04 risk-code test prefix audit** — `test_a4_*`, `test_a6_*`, `test_a7_*`, `test_a8_*`, `test_l1_*`, `test_l2_*` all present per the v0.1.1 plan's invariant naming policy.
+- **78 code-review findings remediated** across 12 reviewer categories (adversarial, correctness, api-contract, reliability, kieran-python, maintainability, performance, project-standards, security, testing, agent-native, learnings). Large handler / file extractions explicitly deferred with rationale documented in PR bodies.
+- **`/status` batched snapshot** — `SqliteArtifactRegistry.status_snapshot()` collapses the per-artifact `2N` SELECTs into 2 SQL queries held under one lock.
+- **Risk-code test prefix audit** — `test_a4_*`, `test_a6_*`, `test_a7_*`, `test_a8_*`, `test_l1_*`, `test_l2_*` all present per the invariant naming policy.
 
 ## [0.8.0a1] — 2026-05-17
 
 **Alpha pre-release.** This is the first release containing the Claude Code
-plugin work (Phases 0 through F of the v0.1 plan). Packaged as a pre-release
+plugin work. Packaged as a pre-release
 (`a1`) so existing `pip install agent-coherence` users on the 0.7.x line are
 not silently upgraded to a build whose entry points target a new use case.
 
@@ -1111,7 +1111,7 @@ points wired in this release:
   resolves the coordinator port + bearer from `.coherence/`, POSTs to the
   appropriate endpoint, forwards the response to stdout. Required because
   Claude Code v2.1.131's hooks.json schema validator rejects URL templates
-  containing `${COHERENCE_PORT}` at LOAD time (Phase E.0 probe 2A finding),
+  containing `${COHERENCE_PORT}` at LOAD time,
   so HTTP-type hooks with templated URLs are not viable.
 
 ### Added — core library
@@ -1119,9 +1119,9 @@ points wired in this release:
 - **`src/ccs/coordinator/sqlite_registry.py`** — `SqliteArtifactRegistry`,
   a drop-in replacement for `ArtifactRegistry` that persists state to
   SQLite-WAL across coordinator restarts. Preserves the 22-method public
-  surface plus three plugin extensions: `resolve_or_register` (KTD-9
-  first-observation seeding), `artifacts_held_by_agent` (KTD-11 Stop
-  release), `evict_stale_notices` (F2 orphan-notice TTL eviction).
+  surface plus three plugin extensions: `resolve_or_register`
+  (first-observation seeding), `artifacts_held_by_agent` (Stop
+  release), `evict_stale_notices` (orphan-notice TTL eviction).
   Schema includes a `pending_notices` table for cross-session
   preemption surfacing.
 - **`src/ccs/adapters/claude_code/`** — coordinator HTTP server,
@@ -1132,12 +1132,11 @@ points wired in this release:
 ### Added — tests
 
 - `tests/test_claude_code_coordinator_server.py` — 63 tests including
-  boundary validation, A1 preemption-notice surfacing, F1-F5
+  boundary validation, preemption-notice surfacing, and
   hardening regression tests.
 - `tests/test_claude_code_lifecycle.py` — 15 tests including the
   load-bearing 10-process race test (multiprocessing.Pool) and the
-  G3/G4/G5/G6 hardening regression tests from the post-Unit-5
-  adversarial review.
+  hardening regression tests from the adversarial review.
 - `tests/test_claude_code_cli.py` — 21 tests covering all four CLI
   scripts including the detached-subprocess regression that the
   manual smoke surfaced (`8015f80`).
@@ -1147,33 +1146,33 @@ points wired in this release:
   v2.1.131 stdin payloads recorded in `tests/fixtures/cc_hook_stdin/`.
   CI early-warning system for Claude Code version drift.
 - `tests/test_claude_code_e2e.py` — 15 tests for bootstrap permissions,
-  KTD-12 shared-secret auth (401/200/401), DNS-rebinding mitigation,
-  KTD-13 state.db schema verification, coordinator-down graceful
+  shared-secret auth (401/200/401), DNS-rebinding mitigation,
+  state.db schema verification, coordinator-down graceful
   degradation, and subprocess-spawn integration.
 - `tests/integration/test_warn_mode_behavior_change.py` + 40 scenarios —
-  R7 hard-launch-gate harness (`@pytest.mark.launch_gate`). 4 categories
-  × 10 scenarios × 10 phpmac-shape variants. Operator-runnable via
+  hard-launch-gate harness (`@pytest.mark.launch_gate`). 4 categories
+  × 10 scenarios × 10 variants. Operator-runnable via
   `pytest -m launch_gate` (~$1.60, ~3 hours per N=40 run).
 
 Total: 1101 passing, 2 skipped, 2 launch_gate deselected by default.
 
 ### Fixed — Claude Code plugin v0.1 hardening
 
-- **A1 preemption notices** (`a76597a`) — F1 Stop hook pops + surfaces
-  pending notices (canonical phpmac case where X never fires another
-  pre-event); F2 orphan eviction with TTL; F3 10KB prose cap with
-  newest-first coalescing; F4 single-consumer pop on post-edit
-  failure; F5 UPSERT ordering uses wall-clock not commit-order.
-- **Unit 5 lifecycle hardening** (`e545a4a`) — G2 self-probe budget,
-  G3 entry short-circuit, G4 abort-on-shutdown-raise, G5 reorder (drop
-  port BEFORE coordinator.shutdown), G6 per-coordinator shutdown mutex,
-  G8 Windows ImportError guard, G9 retry budget bumped 30 → 60.
-- **Unit 6 detached coordinator** (`8015f80`) — `agent-coherence-coordinator`
+- **Preemption notices** (`a76597a`) — Stop hook pops + surfaces
+  pending notices (canonical case where X never fires another
+  pre-event); orphan eviction with TTL; 10KB prose cap with
+  newest-first coalescing; single-consumer pop on post-edit
+  failure; UPSERT ordering uses wall-clock not commit-order.
+- **Lifecycle hardening** (`e545a4a`) — self-probe budget,
+  entry short-circuit, abort-on-shutdown-raise, reorder (drop
+  port BEFORE coordinator.shutdown), per-coordinator shutdown mutex,
+  Windows ImportError guard, retry budget bumped 30 → 60.
+- **Detached coordinator** (`8015f80`) — `agent-coherence-coordinator`
   now forks a detached subprocess so the coordinator survives the
   launching shim's exit. Previously the daemon-thread coordinator died
   with the parent CLI process (caught by manual hands-on smoke; tests
   passed because they spawn + assert in the same Python process).
-- **KTD-13 .gitignore** — `_ensure_coherence_dir()` now writes
+- **.gitignore** — `_ensure_coherence_dir()` now writes
   `.coherence/.gitignore` containing `*` on first spawn. The README
   claimed this auto-gitignored but the code never did. Idempotent:
   doesn't clobber operator customizations.

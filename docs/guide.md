@@ -1223,7 +1223,7 @@ the reader re-fetches before acting. Runs offline with no API keys. The companio
 consistent (zero stale reads over 100 + 20 live trials), so the demo isolates the real
 failure — the **client cache**, not the server. See
 [`examples/conversations_stale_read/README.md`](../examples/conversations_stale_read/README.md)
-for the full framing and the optional live Q6 probe. This is the same mechanism the
+for the full framing and the optional live consistency probe. This is the same mechanism the
 [OpenAI Agents SDK adapter](#openai-agents-sdk-adapter-experimental) applies to a live
 `Session`.
 
@@ -1684,7 +1684,7 @@ use the `before_node` / `commit_outputs` surface. The coherence target here is t
 SDK's **`Session`** — the agent's local conversation memory
 (`get_items` / `add_items` / `pop_item` / `clear_session`). A peer that mutates a
 shared session leaves this agent's cached view stale, *regardless of how consistent
-the durable store is*. (The Q6 probe measured the OpenAI and Mistral Conversations
+the durable store is*. (The consistency probe measured the OpenAI and Mistral Conversations
 servers read-after-write consistent — so the coherence value lives on the readers'
 caches, not on the server. See the [Conversations stale-read example](#conversations-stale-read).)
 
