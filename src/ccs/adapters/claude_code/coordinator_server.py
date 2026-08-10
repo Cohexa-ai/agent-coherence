@@ -62,12 +62,18 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
+from ccs.coordinator.registry_protocol import CheckpointMember
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CHECKPOINT_UNKNOWN_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
     SessionInvalidated,
@@ -75,6 +81,7 @@ from ccs.core.exceptions import (
     WatchdogAbandoned,
 )
 from ccs.core.states import MESIState
+from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
     ConflictDetail,
     DataPlaneDeferredRead,
@@ -84,6 +91,7 @@ from ccs.core.types import (
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
+    WorkspaceRestoreWrite,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,9 +250,12 @@ def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> st
     return f"claude-session-{session_id}"
 
 
-def monotonic_seconds() -> int:
-    """Tick basis for the coordinator. 1 tick = 1 second of wall clock."""
-    return int(time.time())
+# ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
+# workspace capture engine shares the coordinator's ONE wall-clock tick basis
+# without importing this server module. Re-exported here under the same name —
+# every existing import site (``lifecycle.py``'s lazy import, tests) is
+# unchanged. See the ``ccs.core.clock.monotonic_seconds`` docstring for the
+# wall-clock-not-monotonic rationale (the F1 sweep bug).
 
 
 # ----------------------------------------------------------------------
@@ -3175,6 +3186,617 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
+# ----------------------------------------------------------------------
+# Workspace-checkpoint endpoints (WV plan Unit 3 — R1/R2/R8)
+# ----------------------------------------------------------------------
+#
+# Registered in the central ``_ROUTES`` table so they ride the SAME
+# ``verify_bearer`` + ``verify_host`` seam as every other endpoint (no parallel
+# router). The OWNER is derived SERVER-SIDE from the authenticated
+# ``session_id`` (the R9/R13 boundary lock — a client-supplied ``owner`` field
+# is ignored), and the ``checkpoint_id`` is minted SERVER-SIDE by the service.
+# The member rows themselves are CLIENT-captured facts (tokens, fingerprints,
+# timestamps — the capture engine runs client-side against ITS substrates, the
+# coordinator never sees the bytes); the boundary validates their SHAPE
+# fail-closed (paths, 64-hex fingerprints, bounded opaque tokens, closed tier
+# vocabularies) so a hostile client cannot store unbounded or malformed rows.
+
+MAX_CHECKPOINT_MEMBERS = MAX_SESSION_READ_SET_PATHS
+"""Cap on member rows per ``POST /workspace/checkpoint`` — the checkpoint
+manifest analog of the session read-set cap (same defense-in-depth posture)."""
+
+MAX_CHECKPOINT_NAME_LEN = 256
+"""Cap on the checkpoint name (an operator label, not content)."""
+
+MAX_NATIVE_TOKEN_LEN = 256
+"""Cap on one member's opaque restore pointer — mirrors the never-ship-a-store
+opaque-text bound (``ccs.core.substrate._MAX_OPAQUE_TEXT_LEN``): a token longer
+than this is a content-proportional shadow wearing a token's name."""
+
+_CHECKPOINT_TIER_VALUES: frozenset[str] = frozenset(t.value for t in RestoreTier)
+_CHECKPOINT_ARBITRATION_VALUES: frozenset[str] = frozenset(
+    t.value for t in ArbitrationTier
+)
+
+_CHECKPOINT_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "checkpoint_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /workspace/checkpoint`` (the
+``_OCC_DEGRADED_RESPONSE`` posture): a watchdog-timed-out registration must
+NOT read as success — the manifest may or may not have landed, and the abort
+Event threaded into the service's ``abort_guard`` fails the late write closed
+at the registry lock (the A6 session-commit lesson)."""
+
+
+def _typed_reason_response(exc: BaseException) -> dict:
+    """The stable-reason reject envelope for the workspace routes.
+
+    A typed exception's identity-stable ``reason`` token goes on the wire (the
+    ``/workspace/restore/register`` house pattern — clients classify by token
+    identity, never by substring-matching prose), and the human prose rides in
+    a separate ``detail`` field so nothing is lost. An exception carrying no
+    ``reason`` falls back to its prose as before.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        return {"ok": False, "reason": reason, "detail": str(exc)}
+    return {"ok": False, "reason": str(exc)}
+
+
+def _unknown_checkpoint_response(exc: KeyError) -> dict:
+    """The registry's unknown-checkpoint/member ``KeyError`` mapped to the SAME
+    stable token ``/workspace/restore/register`` emits for that failure class
+    (:data:`~ccs.core.exceptions.CHECKPOINT_UNKNOWN_REASON`), prose preserved
+    in ``detail`` (``KeyError`` str() wraps its arg in quotes, so unwrap)."""
+    detail = str(exc.args[0]) if exc.args else str(exc)
+    return {"ok": False, "reason": CHECKPOINT_UNKNOWN_REASON, "detail": detail}
+
+
+def _parse_checkpoint_member(item: object) -> "CheckpointMember | str":
+    """Validate ONE wire member object into a :class:`CheckpointMember`, or
+    return the boundary-rejection reason string (fail-closed shape gate)."""
+    if not isinstance(item, dict):
+        return "each member must be a JSON object"
+    member_path = item.get("member_path", "")
+    path_err = validate_path(member_path)
+    if path_err:
+        return f"member_path: {path_err}"
+    native_token = item.get("native_token")
+    if native_token is not None and (
+        not isinstance(native_token, str)
+        or not native_token
+        or len(native_token) > MAX_NATIVE_TOKEN_LEN
+    ):
+        return (
+            f"native_token must be null or a non-empty string of at most "
+            f"{MAX_NATIVE_TOKEN_LEN} chars"
+        )
+    fingerprint = item.get("fingerprint")
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint)
+    ):
+        return "fingerprint must be null or a 64-hex sha-256 digest"
+    captured_at = item.get("captured_at")
+    if isinstance(captured_at, bool) or not isinstance(captured_at, (int, float)):
+        return "captured_at must be a number (monotonic_seconds basis)"
+    absent = item.get("absent", False)
+    dirty = item.get("dirty_during_window", False)
+    if not isinstance(absent, bool) or not isinstance(dirty, bool):
+        return "absent and dirty_during_window must be booleans"
+    arbitration_tier = item.get("arbitration_tier", ArbitrationTier.NO_ARBITER.value)
+    if arbitration_tier not in _CHECKPOINT_ARBITRATION_VALUES:
+        return (
+            f"arbitration_tier must be one of "
+            f"{sorted(_CHECKPOINT_ARBITRATION_VALUES)}"
+        )
+    restore_tier = item.get("restore_tier", RestoreTier.FORWARD_ONLY.value)
+    if restore_tier not in _CHECKPOINT_TIER_VALUES:
+        return f"restore_tier must be one of {sorted(_CHECKPOINT_TIER_VALUES)}"
+    return CheckpointMember(
+        member_path=member_path,
+        artifact_id=None,
+        native_token=native_token,
+        fingerprint=fingerprint,
+        captured_at=float(captured_at),
+        absent=absent,
+        dirty_during_window=dirty,
+        arbitration_tier=arbitration_tier,
+        restore_tier=restore_tier,
+    )
+
+
+def _handle_workspace_checkpoint(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/checkpoint — persist one captured checkpoint manifest.
+
+    Request: ``{session_id, name, window_min, window_max, members: [{
+    member_path, native_token?, fingerprint?, captured_at, absent?,
+    dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
+
+    The OWNER is derived from the authenticated ``session_id`` (R9/R13); the
+    ``checkpoint_id`` is minted server-side. The registration is ONE registry
+    transaction (header + owner + every member — the Unit-2 API), so a typed
+    failure means NO partial manifest.
+
+    NOT in ``_MIGRATION_REJECTED_ROUTES`` deliberately: a checkpoint create is
+    durable metadata with no version bump and no MESI grant — like the policy
+    mutations, it either lands durably (surviving the restart) or fails typed;
+    there is no stranded-write hazard for the drain gate to prevent.
+
+    Responses:
+      - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
+        coordinator_epoch}``
+      - validation / registry rejection → ``{ok: false, reason}``; a typed
+        ``CoherenceError`` carries its identity-stable ``reason`` token with
+        the prose in ``detail``
+      - watchdog degrade → ``{ok: false, degraded: true, reason:
+        "checkpoint_unconfirmed"}`` (fail-closed; see
+        :data:`_CHECKPOINT_DEGRADED_RESPONSE`)
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    name = body.get("name")
+    window_min = body.get("window_min")
+    window_max = body.get("window_max")
+    members = body.get("members")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(name, str) or not name.strip():
+        req._json(400, {"error": "name must be a non-empty string"})
+        return
+    if len(name) > MAX_CHECKPOINT_NAME_LEN:
+        req._json(400, {"error": f"name exceeds {MAX_CHECKPOINT_NAME_LEN} chars"})
+        return
+    for label, value in (("window_min", window_min), ("window_max", window_max)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            req._json(400, {"error": f"{label} must be a number"})
+            return
+    if window_max < window_min:
+        req._json(400, {"error": "window_max must be >= window_min"})
+        return
+    if not isinstance(members, list) or not members:
+        req._json(400, {"error": "members must be a non-empty list of member objects"})
+        return
+    if len(members) > MAX_CHECKPOINT_MEMBERS:
+        req._json(400, {"error": f"members exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
+        return
+    member_rows: list[CheckpointMember] = []
+    for item in members:
+        parsed = _parse_checkpoint_member(item)
+        if isinstance(parsed, str):
+            req._json(400, {"error": parsed})
+            return
+        member_rows.append(parsed)
+    # A duplicate member path would reject registry-side mid-transaction;
+    # reject it loud at the boundary instead (mirror the commit_all guard).
+    paths = [m.member_path for m in member_rows]
+    if len(set(paths)) != len(paths):
+        req._json(400, {"error": "members contains duplicate member_path values"})
+        return
+
+    owner = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            record = coordinator.service.create_workspace_checkpoint(
+                name=name,
+                owner=owner,
+                members=member_rows,
+                window_min=float(window_min),
+                window_max=float(window_max),
+                issued_at_tick=now,
+                abort=abort,
+            )
+        except ValueError as exc:
+            # Service/registry validation (defense-in-depth behind the
+            # boundary checks above) — typed reject, nothing persisted.
+            return {"ok": False, "reason": str(exc)}
+        except CoherenceError as exc:
+            # Typed domain failure: identity-stable reason token on the wire
+            # (the restore/register posture), prose preserved in "detail".
+            return _typed_reason_response(exc)
+        return {
+            "ok": True,
+            "checkpoint_id": record.checkpoint_id,
+            "name": record.name,
+            "window_min": record.window_min,
+            "window_max": record.window_max,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    # Fail-closed degrade + abort threading (the A6 session-commit lesson):
+    # a timed-out registration must NOT read as success, and the abort Event
+    # fails the late write closed at the registry lock.
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_CHECKPOINT_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+def _render_checkpoint_member(member: CheckpointMember) -> dict:
+    return {
+        "member_path": member.member_path,
+        "native_token": member.native_token,
+        "fingerprint": member.fingerprint,
+        "captured_at": member.captured_at,
+        "absent": member.absent,
+        "dirty_during_window": member.dirty_during_window,
+        "arbitration_tier": member.arbitration_tier,
+        "restore_tier": member.restore_tier,
+        "pin_state": member.pin_state,
+        "restore_outcome": member.restore_outcome,
+        "deleted_at_restore": member.deleted_at_restore,
+    }
+
+
+def _handle_workspace_checkpoints(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """GET /workspace/checkpoints — list every checkpoint manifest.
+
+    Non-mutating observability (the /status posture): reads the registry's
+    checkpoint store directly and renders each header with its member rows —
+    including the honesty surfaces a consumer must see per member
+    (``restore_tier`` / ``arbitration_tier`` / ``absent`` /
+    ``dirty_during_window`` / ``pin_state``). Deterministic order:
+    ``(created_at, checkpoint_id)`` for headers, ``member_path`` for members
+    (the registry contract).
+
+    Degrades FAIL-CLOSED (``ok: false``) — a timed-out list must not read as
+    "no checkpoints exist".
+    """
+
+    def work() -> dict:
+        checkpoints = []
+        for record in coordinator.registry.list_checkpoints():
+            members = coordinator.registry.get_checkpoint_members(record.checkpoint_id)
+            checkpoints.append(
+                {
+                    "checkpoint_id": record.checkpoint_id,
+                    "name": record.name,
+                    "owner": str(record.owner),
+                    "created_at": record.created_at,
+                    "created_at_tick": record.created_at_tick,
+                    "window_min": record.window_min,
+                    "window_max": record.window_max,
+                    "restore_status": record.restore_status,
+                    "restore_updated_at": record.restore_updated_at,
+                    "pin_refcount": record.pin_refcount,
+                    "members": [_render_checkpoint_member(m) for m in members],
+                }
+            )
+        return {
+            "ok": True,
+            "checkpoints": checkpoints,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response={
+            "ok": False,
+            "degraded": True,
+            "reason": "checkpoint_list_unconfirmed",
+        },
+    )
+
+
+MAX_CHECKPOINT_ID_LEN = 128
+"""Cap on a wire ``checkpoint_id`` (server-minted uuid4 strings are 36 chars;
+the headroom absorbs future id shapes without admitting content-sized text)."""
+
+_RESTORE_PROGRESS_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_progress_unconfirmed",
+}
+"""Fail-closed degrade envelope for the restore progress routes (WV Unit 5):
+a watchdog-timed-out status/outcome write must NOT read as recorded — the
+abort Event threaded into the service's ``abort_guard`` fails the late write
+closed at the registry lock (the A6 lesson)."""
+
+_RESTORE_REGISTER_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_registration_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /workspace/restore/register``: a
+timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
+posture — it is a version-bumping commit path), never as success."""
+
+
+def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
+    """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
+    if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+        return "checkpoint_id must be a non-empty string"
+    if len(checkpoint_id) > MAX_CHECKPOINT_ID_LEN:
+        return f"checkpoint_id exceeds {MAX_CHECKPOINT_ID_LEN} chars"
+    return None
+
+
+def _handle_workspace_restore_status(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/status — record checkpoint-level restore status.
+
+    Request: ``{session_id, checkpoint_id, status}`` where ``status`` is one of
+    the closed :data:`~ccs.core.exceptions.RESTORE_STATUSES` (boundary-gated
+    here AND service-validated — fail-closed twice; crash-resume classifies by
+    identity, so an unvetted string must never land). The remote half of the
+    restore engine's ``CheckpointRestoreStore`` seam (the capture path's
+    mirror: durable metadata write, abort-threaded, degrade fail-closed).
+
+    NOT in ``_MIGRATION_REJECTED_ROUTES``: like the checkpoint create, this is
+    durable metadata with no version bump — it lands durably or fails typed.
+    An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
+    detail}`` — the register route's stable token, matched by identity.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    status = body.get("status")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if status not in RESTORE_STATUSES:
+        req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
+        return
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_restore_status(
+                checkpoint_id, status, updated_at=float(now), abort=abort
+            )
+        except KeyError as exc:
+            # Unknown checkpoint — the register route's stable token, not prose.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "restore_status": status,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_member(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/member — record one member's terminal outcome.
+
+    Request: ``{session_id, checkpoint_id, member_path, restore_outcome,
+    deleted_at_restore?}``. ``restore_outcome`` is ``null`` (the explicit
+    reset) or one of the closed
+    :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (boundary-gated AND
+    service-validated); ``deleted_at_restore`` is the manifest-side delete
+    record — per the plan's registration split, delete legs register HERE,
+    never through ``commit_all`` (which has no delete semantics). An unknown
+    (checkpoint, member) pair answers ``{ok: false, reason:
+    "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    member_path = body.get("member_path")
+    restore_outcome = body.get("restore_outcome")
+    deleted_at_restore = body.get("deleted_at_restore")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    path_err = validate_path(member_path)
+    if path_err:
+        req._json(400, {"error": f"member_path: {path_err}"})
+        return
+    if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
+        req._json(
+            400,
+            {
+                "error": (
+                    f"restore_outcome must be null or one of "
+                    f"{sorted(RESTORE_MEMBER_OUTCOMES)}"
+                )
+            },
+        )
+        return
+    if deleted_at_restore is not None and (
+        isinstance(deleted_at_restore, bool)
+        or not isinstance(deleted_at_restore, (int, float))
+    ):
+        req._json(400, {"error": "deleted_at_restore must be null or a number"})
+        return
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_member_restore(
+                checkpoint_id,
+                member_path,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=(
+                    float(deleted_at_restore) if deleted_at_restore is not None else None
+                ),
+                abort=abort,
+            )
+        except KeyError as exc:
+            # Unknown (checkpoint, member) pair — same stable token as the
+            # register route's unknown-checkpoint class; "detail" says which.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "member_path": member_path,
+            "restore_outcome": restore_outcome,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_register(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/register — the Unit-5 coordinator registration.
+
+    Request: ``{session_id, checkpoint_id, writes: [{member_path,
+    fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
+    (fingerprints, never content bytes; the boundary enforces 64-hex). The
+    CONTROLLER identity derives from the authenticated ``session_id``
+    server-side (R9/R13), never a client field. One
+    ``register_workspace_restore`` call → at most one all-or-nothing
+    ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
+    (``commit_all`` never called, by contract).
+
+    Registered peers holding a member are invalidated ATOMICALLY by the
+    registry commit; peers learn through the protocol (their next read is
+    strict-denied), so — matching the post-edit-cas house pattern — the
+    response surfaces the invalidation COUNT rather than re-broadcasting
+    signals.
+
+    In ``_MIGRATION_REJECTED_ROUTES``: this is a version-bumping write
+    initiation (the post-edit-cas strand hazard applies mid-drain).
+
+    Responses:
+      - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
+        refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
+        from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
+        on ``status == "refused"`` — nothing mutated then, all-or-nothing)
+      - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
+      - watchdog degrade → fail-closed
+        :data:`_RESTORE_REGISTER_DEGRADED_RESPONSE`
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    writes = body.get("writes")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if not isinstance(writes, list):
+        req._json(400, {"error": "writes must be a list of {member_path, fingerprint}"})
+        return
+    if len(writes) > MAX_CHECKPOINT_MEMBERS:
+        req._json(400, {"error": f"writes exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
+        return
+    entries: list[WorkspaceRestoreWrite] = []
+    seen_paths: set[str] = set()
+    for item in writes:
+        if not isinstance(item, dict):
+            req._json(400, {"error": "each write must be a JSON object"})
+            return
+        member_path = item.get("member_path", "")
+        path_err = validate_path(member_path)
+        if path_err:
+            req._json(400, {"error": f"member_path: {path_err}"})
+            return
+        fingerprint = item.get("fingerprint")
+        if not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint):
+            req._json(400, {"error": "fingerprint must be a 64-hex sha-256 digest"})
+            return
+        if member_path in seen_paths:
+            req._json(400, {"error": "writes contains duplicate member_path values"})
+            return
+        seen_paths.add(member_path)
+        entries.append(
+            WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
+        )
+
+    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    controller = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            result = coordinator.service.register_workspace_restore(
+                checkpoint_id=checkpoint_id,
+                controller=controller,
+                writes=entries,
+                issued_at_tick=now,
+                abort=abort,
+            )
+        except CheckpointUnknown as exc:
+            return {"ok": False, "reason": exc.reason}
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        except OccCallerTransientError:
+            # Retry-eligible: the controller is mid-transient (a peer's commit
+            # invalidated it between read and CAS). Byte-stable reason.
+            return {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+        except CoherenceError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "status": result.status,
+            "detail": result.detail,
+            "versions": dict(result.versions),
+            "skipped": list(result.skipped),
+            "refused": {
+                path: conflict.reason for path, conflict in result.refused.items()
+            },
+            "invalidated": len(result.signals),
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_REGISTER_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
 def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
@@ -3516,6 +4138,18 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/commit"): _handle_session_commit,
     ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
+    # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
+    # ride the central verify_bearer + verify_host seam like every route. The
+    # POST threads a watchdog abort Event into the service's abort_guard (the
+    # A6 session-commit lesson: every new mutating route threads abort).
+    ("POST", "/workspace/checkpoint"): _handle_workspace_checkpoint,
+    ("GET", "/workspace/checkpoints"): _handle_workspace_checkpoints,
+    # WV plan Unit 5 — restore progress + registration endpoints (the remote
+    # half of the restore engine's CheckpointRestoreStore seam). Every
+    # mutating handler threads a watchdog abort Event (the A6 lesson).
+    ("POST", "/workspace/restore/status"): _handle_workspace_restore_status,
+    ("POST", "/workspace/restore/member"): _handle_workspace_restore_member,
+    ("POST", "/workspace/restore/register"): _handle_workspace_restore_register,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
 }
@@ -3545,6 +4179,12 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # session.commit_all is the batch OCC write — same strand hazard as
     # /session/commit, multiplied across the write-set. Reject it draining.
     ("POST", "/session/commit_all"),
+    # WV Unit 5: the restore registration is a version-bumping write
+    # initiation (its commit_all rides the same strand hazard). The restore
+    # PROGRESS routes (/workspace/restore/status, /workspace/restore/member)
+    # stay out: durable metadata with no version bump — the checkpoint-create
+    # rationale.
+    ("POST", "/workspace/restore/register"),
 }
 
 

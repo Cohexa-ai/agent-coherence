@@ -8,8 +8,17 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+)
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -37,6 +46,8 @@ from .registry_protocol import (
     RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
+    CheckpointMember,
+    CheckpointRecord,
     ReclamationSlot,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -157,6 +168,17 @@ class ArtifactRegistry:
         # (the asserted divergence). Lets the sweep enumerate sessions uniformly
         # across both registries via :meth:`all_session_meta`.
         self._session_meta: dict[str, tuple[UUID, int]] = {}
+        # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9):
+        # ``{checkpoint_id: header}`` + ``{checkpoint_id: {member_path: member}}``.
+        # The in-memory mirror of the sqlite ``workspace_checkpoints`` /
+        # ``workspace_checkpoint_members`` tables for API parity. PROCESS-SCOPED
+        # like the session pins — an in-memory manifest does NOT survive a
+        # restart (restart-durability is sqlite-only; the parity harness asserts
+        # the divergence rather than masking it). Guarded by ``_capture_lock``
+        # (the manifest create is a multi-row atomic insert, same class of
+        # critical section as the session-pin capture).
+        self._checkpoints: dict[str, CheckpointRecord] = {}
+        self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
         # Cross-artifact capture lock (Unit 2). This registry is otherwise
         # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
         # docstrings). GIL atomicity is per single dict ACCESS, which is
@@ -967,6 +989,163 @@ class ArtifactRegistry:
         with self._capture_lock:
             pins = self._session_pins.get(session_token)
             return dict(pins) if pins is not None else None
+
+    # ------------------------------------------------------------------
+    # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        checkpoint: CheckpointRecord,
+        members: Sequence[CheckpointMember],
+    ) -> None:
+        """Persist a checkpoint manifest atomically under ``_capture_lock`` —
+        the header (owner metadata included, same critical section: the
+        in-memory mirror of the sqlite same-transaction rule) plus every member,
+        or nothing. Parity with
+        :meth:`SqliteArtifactRegistry.create_checkpoint`; divergent only on
+        restart-survival (in-memory manifests are process-scoped).
+
+        Fail-closed owner contract: an absent owner raises ``ValueError`` and
+        nothing is stored. A duplicate ``checkpoint_id`` or duplicate member
+        path raises ``ValueError`` with nothing stored (validated before the
+        first insert — no partial manifest)."""
+        if checkpoint.owner is None:
+            raise ValueError(
+                "create_checkpoint requires an owner: a checkpoint manifest "
+                "without owner metadata is unrepresentable (fail-closed; the "
+                "restore path owner-validates against it)"
+            )
+        with self._capture_lock:
+            if checkpoint.checkpoint_id in self._checkpoints:
+                raise ValueError(
+                    f"create_checkpoint: duplicate checkpoint_id "
+                    f"{checkpoint.checkpoint_id!r}"
+                )
+            member_by_path: dict[str, CheckpointMember] = {}
+            for member in members:
+                if member.member_path in member_by_path:
+                    raise ValueError(
+                        f"create_checkpoint: duplicate member path "
+                        f"{member.member_path!r} in the manifest for checkpoint "
+                        f"{checkpoint.checkpoint_id!r}"
+                    )
+                member_by_path[member.member_path] = member
+            # Both dicts are written inside ONE lock hold, after every
+            # validation passed — all rows land or none do (the in-memory
+            # equivalent of the sqlite single transaction).
+            self._checkpoints[checkpoint.checkpoint_id] = checkpoint
+            self._checkpoint_members[checkpoint.checkpoint_id] = member_by_path
+
+    def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """Return the checkpoint header, or ``None`` when unknown."""
+        with self._capture_lock:
+            return self._checkpoints.get(checkpoint_id)
+
+    def list_checkpoints(self) -> list[CheckpointRecord]:
+        """Return every checkpoint header, ordered by ``(created_at,
+        checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
+        with self._capture_lock:
+            return sorted(
+                self._checkpoints.values(),
+                key=lambda c: (c.created_at, c.checkpoint_id),
+            )
+
+    def get_checkpoint_members(self, checkpoint_id: str) -> list[CheckpointMember]:
+        """Return the manifest's member rows ordered by ``member_path`` (empty
+        list for an unknown checkpoint — :meth:`get_checkpoint` tells known from
+        unknown)."""
+        with self._capture_lock:
+            member_by_path = self._checkpoint_members.get(checkpoint_id, {})
+            return [member_by_path[path] for path in sorted(member_by_path)]
+
+    def set_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, *, updated_at: float
+    ) -> None:
+        """Update the checkpoint-level restore status + its ``updated_at`` stamp.
+        Raises ``KeyError`` for an unknown checkpoint (fail fast, no silent
+        no-op). Frozen records are replaced, never mutated in place."""
+        with self._capture_lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            self._checkpoints[checkpoint_id] = replace(
+                record, restore_status=status, restore_updated_at=updated_at
+            )
+
+    def set_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+    ) -> None:
+        """Record a member's restore progress: BOTH fields are written to the
+        given values (a full member-restore-state write — a new restore run's
+        first write for a member resets any prior run's delete record). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        with self._capture_lock:
+            member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
+            if member is None:
+                raise KeyError(
+                    f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                    f"not in registry"
+                )
+            self._checkpoint_members[checkpoint_id][member_path] = replace(
+                member,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=deleted_at_restore,
+            )
+
+    def set_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        """Update a member's pin state; ``restore_tier`` (when given) rewrites
+        the member's restore tier in the same step — the Unit-6 loud tier
+        downgrade. ``restore_tier=None`` leaves the tier untouched. Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        with self._capture_lock:
+            member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
+            if member is None:
+                raise KeyError(
+                    f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                    f"not in registry"
+                )
+            self._checkpoint_members[checkpoint_id][member_path] = replace(
+                member,
+                pin_state=pin_state,
+                restore_tier=(
+                    member.restore_tier if restore_tier is None else restore_tier
+                ),
+            )
+
+    def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
+        """Atomically add ``delta`` to a checkpoint's pin refcount and return the
+        new value (read + validate + write in one lock hold — two concurrent
+        adjustments cannot lose an update). Raises ``KeyError`` for an unknown
+        checkpoint and ``ValueError`` if the result would go negative (a release
+        without a matching pin is a bookkeeping bug, fail-closed)."""
+        with self._capture_lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            new_count = record.pin_refcount + delta
+            if new_count < 0:
+                raise ValueError(
+                    f"pin refcount for checkpoint {checkpoint_id!r} would go "
+                    f"negative ({record.pin_refcount} + {delta}); a release "
+                    f"without a matching pin is a bookkeeping bug (fail-closed)"
+                )
+            self._checkpoints[checkpoint_id] = replace(
+                record, pin_refcount=new_count
+            )
+            return new_count
 
     def _emit_state_log(
         self,

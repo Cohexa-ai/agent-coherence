@@ -740,6 +740,187 @@ class SubstrateInsecureTransport(ManifestError):
         self.posture = posture
 
 
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore vocabulary (WV plan Unit 4 / R3)
+# ---------------------------------------------------------------------------
+#
+# The restore engine (``ccs.adapters.workspace.WorkspaceVersioner.restore``)
+# concludes with a per-member TERMINAL outcome for EVERY manifest member — the
+# termination contract: bounded re-drive, absorbing outcomes, a complete typed
+# report. Each outcome below is a wire-stable constant matched by IDENTITY
+# (add, never rename); modality is part of the contract:
+#
+# - success  — ``restored`` (the leg landed the pinned state) /
+#   ``converged`` (the live state already matched the manifest, so NO write was
+#   issued — authorship is never claimed, mirroring ReconcileVerdict.CONVERGE);
+# - absorbing — ``conflict`` (live-writer contention absorbed the bounded
+#   re-drive budget, or a divergence the leg cannot converge), ``target_lost``
+#   (the manifested restore pointer no longer resolves — expired/raced pin),
+#   ``forward_only_skipped`` (nothing to restore; enumerated, never silent);
+# - hold — ``held_unconfirmed`` (a write's outcome stayed UNKNOWN after the
+#   binding's reconciliation read: HOLD, never best-effort — coordinator state
+#   must never advance on it).
+#
+# Every outcome is terminal: a restore never leaves a member outcome-less once
+# it concludes, and a crash-resumed run skips members already terminal.
+RESTORE_OUTCOME_RESTORED = "restored"
+RESTORE_OUTCOME_CONVERGED = "converged"
+RESTORE_OUTCOME_CONFLICT = "conflict"
+RESTORE_OUTCOME_HELD_UNCONFIRMED = "held_unconfirmed"
+RESTORE_OUTCOME_TARGET_LOST = "target_lost"
+RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED = "forward_only_skipped"
+
+# The modality split, machine-usable (the report and Unit-5 registration branch
+# on these): success outcomes may carry a freshly minted pointer; absorbing and
+# hold outcomes never do.
+RESTORE_SUCCESS_OUTCOMES: frozenset[str] = frozenset(
+    {RESTORE_OUTCOME_RESTORED, RESTORE_OUTCOME_CONVERGED}
+)
+RESTORE_ABSORBING_OUTCOMES: frozenset[str] = frozenset(
+    {
+        RESTORE_OUTCOME_CONFLICT,
+        RESTORE_OUTCOME_TARGET_LOST,
+        RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
+    }
+)
+RESTORE_HOLD_OUTCOMES: frozenset[str] = frozenset({RESTORE_OUTCOME_HELD_UNCONFIRMED})
+
+# The closed set of member terminal outcomes. Consumers match membership /
+# ``outcome == CONSTANT`` — never a substring of any human detail line.
+RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
+    RESTORE_SUCCESS_OUTCOMES | RESTORE_ABSORBING_OUTCOMES | RESTORE_HOLD_OUTCOMES
+)
+
+# Checkpoint-level restore status (the ``CheckpointRecord.restore_status``
+# vocabulary — the registry stores the string, THIS is its meaning). Kept
+# deliberately small: ``none`` (never restored) → ``in_progress`` (a restore
+# run is driving legs; a checkpoint FOUND in this state by a fresh engine is a
+# crashed run and is RESUMED, never refused) → ``registered`` (WV Unit 5: every
+# member is terminal AND the coordinator-registration step ran to its answer —
+# the durable idempotency marker; a resumed run finding this status skips
+# registration, so a crash between the registration commit and ``concluded``
+# can never double-register) → ``concluded`` (every member holds a terminal
+# outcome; the report is reconstructible from durable rows). ``registered`` is
+# written ONLY on a committed/empty registration — a REFUSED registration
+# concludes without it so a later resume may re-attempt (the refusal may have
+# been transient contention; the fence rejects a superseded controller again).
+RESTORE_STATUS_NONE = "none"
+RESTORE_STATUS_IN_PROGRESS = "in_progress"
+RESTORE_STATUS_REGISTERED = "registered"
+RESTORE_STATUS_CONCLUDED = "concluded"
+RESTORE_STATUSES: frozenset[str] = frozenset(
+    {
+        RESTORE_STATUS_NONE,
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_REGISTERED,
+        RESTORE_STATUS_CONCLUDED,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Workspace-Versioning member PIN-STATE vocabulary (WV plan Unit 6 / R9)
+# ---------------------------------------------------------------------------
+#
+# The ``CheckpointMember.pin_state`` vocabulary (the registry stores the
+# string; THIS is its meaning). Wire-stable constants matched by IDENTITY
+# (add, never rename). The honesty contract is the PAIR (restore_tier,
+# pin_state): tier ``restorable`` is BACKED only when pin_state is ``held`` —
+# every consumer (the Unit-8 ``status`` surface included) must render
+# (``restorable``, ``unpinned``) as claimed-but-not-yet-backed, never as a
+# guarantee. A pin that cannot be established never leaves tier ``restorable``
+# (the fail-closed rule: the failed attempt writes the loud tier downgrade in
+# the SAME registry write as its pin state).
+#
+# - ``unpinned`` — no pin established (the capture-time default; also the
+#   honest durable state when pin orchestration was skipped via ``pin=False``
+#   or died before this member's leg ran).
+# - ``held`` — the pin the member's substrate offers is ESTABLISHED. S3: the
+#   Object Lock legal hold is ON for the manifested versionId (a lifecycle
+#   expiry and a version-targeted delete are refused by the substrate). File:
+#   the captured version was VERIFIED retained-and-readable under the
+#   coordinator's declared retention at pin time — v1's verification pin: the
+#   tier stays ``restorable-unpinned`` because coordinator retention offers no
+#   per-version hold (a bounded K/T policy may still evict; restore then
+#   reports ``target_lost`` loudly — the R13 declared-retention disclosure).
+# - ``pin_unavailable`` — the pin attempt RAN and could not be established
+#   (no Object Lock configuration, the pinned version already gone, retention
+#   off / the version not retained, or retained bytes that no longer match the
+#   captured fingerprint). Always written together with the loud tier
+#   downgrade — never a silent pass.
+# - ``released`` — a previously ``held`` pin was dropped by the INTERNAL
+#   release path (there is no public checkpoint-delete/release verb in v1);
+#   written together with the tier downgrade where the tier was ``restorable``
+#   (the claim is no longer backed).
+PIN_STATE_UNPINNED = "unpinned"
+PIN_STATE_HELD = "held"
+PIN_STATE_UNAVAILABLE = "pin_unavailable"
+PIN_STATE_RELEASED = "released"
+PIN_STATES: frozenset[str] = frozenset(
+    {
+        PIN_STATE_UNPINNED,
+        PIN_STATE_HELD,
+        PIN_STATE_UNAVAILABLE,
+        PIN_STATE_RELEASED,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore REGISTRATION vocabulary (WV plan Unit 5 / R4-R5)
+# ---------------------------------------------------------------------------
+#
+# The terminal answer of the coordinator-registration step that runs after
+# every member holds a terminal outcome and before the restore concludes.
+# Wire-stable constants matched by IDENTITY (add, never rename). The per-
+# member-class registration split (the plan's restore-registration design):
+#
+# - WRITTEN file members (``restored``, no delete record, ``no-arbiter``
+#   tier) register through ``commit_all`` — all-or-nothing, hash-only
+#   (fingerprints, never content bytes), an S/I controller per D4;
+# - WRITTEN S3 members are registered MANIFEST-SIDE ONLY: the coordinator
+#   holds no artifact identity for a BYO substrate member (the substrate owns
+#   identity — ``workspace_checkpoint_members.artifact_id`` is NULL for them
+#   by design), so their registration IS the durable outcome row;
+# - DELETED members are recorded manifest-side (``deleted_at_restore`` —
+#   ``commit_all`` has no delete semantics);
+# - an EMPTY commit write-set NEVER calls ``commit_all`` (it raises on empty).
+WORKSPACE_REGISTRATION_COMMITTED = "committed"
+WORKSPACE_REGISTRATION_EMPTY = "empty_write_set"
+WORKSPACE_REGISTRATION_PRIOR_RUN = "registered_by_prior_run"
+WORKSPACE_REGISTRATION_REFUSED = "refused"
+WORKSPACE_REGISTRATION_STATUSES: frozenset[str] = frozenset(
+    {
+        WORKSPACE_REGISTRATION_COMMITTED,
+        WORKSPACE_REGISTRATION_EMPTY,
+        WORKSPACE_REGISTRATION_PRIOR_RUN,
+        WORKSPACE_REGISTRATION_REFUSED,
+    }
+)
+
+# Pre-flight restore refusal: the checkpoint id names no persisted manifest.
+# The ONLY typed restore exception — a restore that starts always CONCLUDES
+# with a report (failures are per-member absorbing outcomes, never raises).
+CHECKPOINT_UNKNOWN_REASON = "checkpoint_unknown"
+
+
+class CheckpointUnknown(CoherenceError):
+    """``restore(checkpoint_id)`` pre-flight refusal: no such checkpoint.
+
+    Raised BEFORE any status/progress write — an unknown id must never mint an
+    ``in_progress`` record. Carries :data:`CHECKPOINT_UNKNOWN_REASON`, matched
+    by identity (the typed-signal-not-substring house rule), plus the offending
+    ``checkpoint_id``.
+    """
+
+    reason = CHECKPOINT_UNKNOWN_REASON
+
+    def __init__(self, checkpoint_id: str) -> None:
+        super().__init__(
+            f"checkpoint {checkpoint_id!r} is unknown: no persisted manifest — "
+            "nothing was restored (list checkpoints and retry with a known id)"
+        )
+        self.checkpoint_id = checkpoint_id
+
+
 class WatchdogAbandoned(RuntimeError):
     """A handler's 4s watchdog fired, so its still-running work was told to abort
     before it could mutate the registry (finding A6).

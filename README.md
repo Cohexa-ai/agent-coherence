@@ -49,7 +49,7 @@ vol.write("plans/plan.md", revised_plan)   # stale view? denied fail-closed → 
 
 ## What it guarantees
 
-Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all six specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
+Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all seven specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
 
 | The silent failure | What happens instead | Mechanism | Invariant |
 |---|---|---|---|
@@ -87,6 +87,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
 - 🗂️ [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files) — `CoherentVolume`, the data-plane appliance for plain files shared across processes
 - 🧱 [BYO substrate](#byo-substrate-coherence-over-the-store-you-already-run) — `CoherentRow` / `CoherentObject`, the same coherence over a Postgres row or an S3 object you already run
+- ⏪ [Workspace versioning & restore](#workspace-versioning--restore) — `WorkspaceVersioner`, checkpoint a mixed file + S3 workspace and bring it back with per-member honesty
 - 🛡️ [Foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) — catch out-of-band edits (a human, a formatter, a script) at the read/write boundary
 - 🔌 [MCP server](#mcp-server-stale-write-guard-fs) — `stale-write-guard-fs`, the same guarantee for any MCP client, no Python integration required
 - 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input version it decided from
@@ -119,7 +120,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — the transport for invalidation signals; in-memory / in-process today (`InMemoryEventBus`). Networked transports (Redis, Kafka, NATS, gRPC) for a multi-host deployment are on the roadmap, demand-gated.
 
-Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, version retention's no-collected-read, and the snapshot session's no-read-skew-within-cut — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all six specs on every push and PR.
+Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, version retention's no-collected-read, the snapshot session's no-read-skew-within-cut, and workspace restore's no-partial-restore-registered — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all seven specs on every push and PR.
 
 ## Coherent workspace: the data plane for shared files
 
@@ -271,11 +272,41 @@ data, token = row.read("ws-42")
 row.commit("ws-42", expected_token=token, new_bytes=revised)  # -> StaleView; reacquire() and re-decide
 ```
 
-The value over the substrate's own conditional write (`UPDATE … WHERE version=?`, S3 `If-Match`): a bare CAS rejects A's write *at write time*; the binding tells A its **cached view went stale before it acts**, in the **same typed vocabulary** a file (`CoherentVolume`) or a store key (`CCSStore`) uses — one coherence surface over a row, an object, or a file. A declarative [Coherence Manifest](docs/guide.md#byo-substrate-bindings-coherentrow--coherentobject) wires each artifact to a substrate and an honest guarantee **tier**, with credentials as references (`secret-file:` / `aws-default`, never literals) and SSRF-constrained connection targets.
+The value over the substrate's own conditional write (`UPDATE … WHERE version=?`, S3 `If-Match`): a bare CAS rejects A's write *at write time*; the binding tells A its **cached view went stale before it acts**, in the **same typed vocabulary** a file (`CoherentVolume`) or a store key (`CCSStore`) uses — one coherence surface over a row, an object, or a file. A declarative [Coherence Manifest](docs/guide.md#byo-substrate-bindings-coherentrow-coherentobject) wires each artifact to a substrate and an honest guarantee **tier**, with credentials as references (`secret-file:` / `aws-default`, never literals) and SSRF-constrained connection targets.
 
-**Scope, honestly.** v1 ships two `native-CAS` bindings (Postgres + S3) and a `forward-only` tier for action backends (a Slack post, a Gmail send — decision-input freshness only, no CAS). The value is **invalidation-before-act + cross-substrate uniformity**; the read-generation fence over a substrate is a documented roadmap item, **not claimed** — v1 OCC writers ride admit-on-absent + the version-CAS. Single-host and cooperative; when the substrate is itself distributed (S3, managed Postgres) the no-lost-update guarantee is the *substrate's* and identical with or without this layer. Run it: `python -m examples.coherent_row.main` / `examples.coherent_object.main` (offline, deterministic, no keys — an in-memory substrate stand-in; production points the same binding at real Postgres / S3). Full API, per-binding least-privilege, and the honest tier table: [BYO substrate bindings](docs/guide.md#byo-substrate-bindings-coherentrow--coherentobject).
+**Scope, honestly.** v1 ships two `native-CAS` bindings (Postgres + S3) and a `forward-only` tier for action backends (a Slack post, a Gmail send — decision-input freshness only, no CAS). The value is **invalidation-before-act + cross-substrate uniformity**; the read-generation fence over a substrate is a documented roadmap item, **not claimed** — v1 OCC writers ride admit-on-absent + the version-CAS. Single-host and cooperative; when the substrate is itself distributed (S3, managed Postgres) the no-lost-update guarantee is the *substrate's* and identical with or without this layer. Run it: `python -m examples.coherent_row.main` / `examples.coherent_object.main` (offline, deterministic, no keys — an in-memory substrate stand-in; production points the same binding at real Postgres / S3). Full API, per-binding least-privilege, and the honest tier table: [BYO substrate bindings](docs/guide.md#byo-substrate-bindings-coherentrow-coherentobject).
+
+## Workspace versioning & restore
+
+Everything above keeps shared state safe *while* agents write it. Workspace versioning answers the after-the-fact question: an agent mutated a workspace spread across backends — files on disk, objects in S3 — the attempt failed, and you want it **back**, with per-member honesty about what can and cannot come back:
+
+```python
+from ccs.adapters.workspace import WorkspaceVersioner
+
+wv = WorkspaceVersioner(service=service, owner=owner, file_resolver=resolver)
+wv.add_file_member(source, "ws/notes.md")
+wv.add_object_member(binding, "reports/summary.txt")   # a CoherentObject (S3)
+wv.add_forward_only_member("actions/deploy-step")      # named, not captured
+
+checkpoint = wv.checkpoint("before-migration")         # pins on by default
+report = wv.restore(checkpoint.record.checkpoint_id)   # per-member terminal truth
+```
+
+A **checkpoint** is a named manifest of native version pointers (an S3 `versionId`, a file's coordinator version) and content fingerprints — never a second copy of your bytes — captured as a **skew-declared cut**: the capture window is recorded rather than hidden, and a member that moved inside it is flagged, not silently torn. A member missing at capture is recorded as *absent*, so restore includes delete legs. **Restore** drives one conditional write per member under a termination contract, so it always **concludes** with a frozen per-member report — `restored`, `converged` (live state already matched), `conflict` (a live foreign writer won: bounded re-drive, never a livelock, never a clobber), `target_lost` (the captured version is gone — reported, never substituted), `held_unconfirmed`, or `forward_only_skipped`.
+
+Every member carries an honest **restore tier**: `restorable` (versioned S3, backed by a legal hold in *your* bucket), `restorable-unpinned` (history exists **now** and may expire), or `forward_only` (described, not restorable — stated at capture, not discovered at restore). The durable truth is the pair `(restore_tier, pin_state)`: `(restorable, unpinned)` is rendered **claimed-but-not-yet-backed**, never as a plain promise. Scriptable from the shell, where exit code `3` means *the restore concluded — read the report*:
+
+```bash
+agent-coherence-workspace checkpoint before-migration --file notes.md --file plan.md
+agent-coherence-workspace status <checkpoint-id>     # (restore_tier, pin_state) per member
+agent-coherence-workspace restore <checkpoint-id>    # 0 clean · 3 concluded with absorbed outcomes
+```
+
+**Scope, honestly.** Single-host coordinator — checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims. Restore is over **artifacts, never effects**: a file or an object comes back, a sent message does not. File members are detection-only (`no-arbiter`) — only a backend with a native conditional write arbitrates a racing foreign writer — and they ride coordinator retention, which offers no per-version hold: their tier stays `restorable-unpinned`, and a version that ages out surfaces as `target_lost` rather than restoring different content. Restore is a *forward* commit carrying old bytes: versions strictly increase, history is never rewritten. S3 members are captured and restored through the Python API, because their bindings carry credentials the CLI never holds. Run it: `python -m examples.workspace_versioning.main` (offline, deterministic, no keys), or add `--baseline` to see the loss first. Full honesty model — tiers, pin states, the retention caveat, the exit-code contract: [guide § Workspace versioning & restore](docs/guide.md#workspace-versioning--restore-workspaceversioner).
 
 ## Status
+
+**Unreleased (on `dev`) — workspace versioning & restore: checkpoint a mixed file + S3 workspace and bring it back with per-member honesty.** A named checkpoint manifest over heterogeneous members (native version pointers + fingerprints, never a second copy of your bytes), honest restore tiers (`restorable` / `restorable-unpinned` / `forward_only`), fail-closed pins with loud downgrades (S3 legal holds), and a convergent restore engine with a termination contract — plus the `agent-coherence-workspace` CLI, additive versionId / legal-hold / delete extensions to `CoherentObject`, a workspace family in the packaged conformance corpus (`ccs.testing.substrate_conformance`) for foreign implementations, and `WorkspaceVersion.tla` in the CI model-checking sweep. Single-host scope unchanged.
 
 **`v0.13.0` released — BYO-substrate bindings (`CoherentRow` for Postgres, `CoherentObject` for S3) and subagent identity in the Claude Code adapter.** BYO-substrate puts the same deny-stale-writes coherence over state in a store *you already run*: the coordinator holds only metadata (a version, per-agent MESI, a content hash, an opaque substrate token) — never your bytes — and adds the cross-agent layer a bare conditional write can't provide: a peer's commit marks your cached read stale, so the next binding-mediated read or write is denied *before* you act on state that already moved, with the same typed conflict and `reacquire()` recovery on every substrate. Subagent identity makes each Claude Code subagent a first-class coherence peer — correct `last_writer` attribution, sibling-collision detection, and a scoped grant release on `SubagentStop` (main-thread behavior unchanged when no subagent id is present). Single-host scope unchanged. See [CHANGELOG.md](CHANGELOG.md).
 

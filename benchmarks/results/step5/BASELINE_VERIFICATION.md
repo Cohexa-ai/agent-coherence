@@ -1,9 +1,9 @@
-# Step5 Baseline Verification (C3)
+# Step5 Baseline Verification
 
 Verified on: 2026-03-05
 Source baseline: `benchmarks/results/step5/SUMMARY.md`
 
-## Cross-check against plan C3 target values
+## Cross-check against target values
 
 | Scenario | SUMMARY.md value (`lazy_savings_vs_eager`) | Plan target | Status |
 |---|---:|---:|---|

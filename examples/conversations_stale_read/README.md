@@ -40,9 +40,9 @@ is deprecated (it is not, as of 2026-05).
 | `broken.py` | No coherence — agent B acts on a stale local cache over a consistent store |
 | `fixed.py` | `CoherenceAdapterCore` invalidates B's cache; B re-fetches the fresh version |
 | `main.py` | Runs both side by side and prints the divergence |
-| `probe.py` | Q6 consistency probe — measures each vendor's read-after-write behavior |
+| `probe.py` | Consistency probe — measures each vendor's read-after-write behavior |
 
-## Re-running the Q6 probe (optional, needs keys)
+## Re-running the probe (optional, needs keys)
 
 The probe makes live calls. Inject credentials with 1Password so keys never
 touch disk or the command line:

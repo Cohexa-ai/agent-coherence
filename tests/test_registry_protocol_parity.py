@@ -11,7 +11,7 @@ module pins the WHOLE surface:
 
 - both registries are ``isinstance`` of :class:`RegistryBase`, and the SQLite one
   is additionally ``isinstance`` of :class:`SqliteExtended`;
-- the exact expected method names (34 base + 13 extended) are present + callable
+- the exact expected method names (43 base + 13 extended) are present + callable
   on each registry, and the base **property** members (e.g. ``coordinator_epoch``)
   are present as properties — the callable checks cannot see them, so they are
   pinned separately;
@@ -46,15 +46,19 @@ from ccs.core.types import Artifact, FetchRequest
 BASE_METHODS = frozenset(
     {
         "abort_guard",
+        "adjust_checkpoint_pin_refcount",
         "all_session_meta",
         "artifact_ids",
         "capture_version_vector",
         "clear_agent_transient",
         "commit_all",
         "commit_cas",
+        "create_checkpoint",
         "get_agent_state",
         "get_agent_transient",
         "get_artifact",
+        "get_checkpoint",
+        "get_checkpoint_members",
         "get_content",
         "get_content_at_version",
         "get_last_reclamation",
@@ -69,6 +73,7 @@ BASE_METHODS = frozenset(
         "granted_at_tick",
         "has_artifact",
         "last_heartbeat_tick",
+        "list_checkpoints",
         "record_heartbeat",
         "record_last_reclamation",
         "register_artifact",
@@ -79,6 +84,9 @@ BASE_METHODS = frozenset(
         "set_agent_state",
         "set_agent_transient",
         "set_artifact_and_content",
+        "set_checkpoint_member_pin",
+        "set_checkpoint_member_restore",
+        "set_checkpoint_restore_status",
         "valid_holders",
     }
 )
