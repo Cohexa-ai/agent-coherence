@@ -1178,6 +1178,25 @@ class CoherentVolume:
         current version and re-materializing (never retry the publish — it would
         version-mismatch).
 
+        **Foreign-edit boundary (read this too).** The staleness this API
+        detects is VERSION drift at the coordinator — and only volume-mediated
+        writes advance versions. An out-of-band disk edit (a human in an
+        editor, a formatter, a script writing the file directly) advances
+        nothing, so a MULTI-member publish cannot see it: the session path
+        never re-reads disk between the caller's read and materialization, the
+        batch commits, and the foreign bytes are silently overwritten. The
+        SB-23 content-CAS (``on_stale_write``) does NOT run on this path —
+        :meth:`_read_with_version` seeds the foreign-edit baseline, but no
+        publish step consults it. This is a deliberate, regression-pinned
+        boundary (see test_atomic_publish.py's foreign-edit-boundary section),
+        not a gap in the version check. Contrast: plain :meth:`write` denies
+        the same edit with ``StaleView``, and a SINGLE-member publish takes the
+        standalone CAS path, whose hash-checked comparand read fails closed
+        (``ViewWedged``) on a managed path. Publish only write-sets whose every
+        contending writer routes through a volume; for a file that humans or
+        out-of-band tools also edit, use :meth:`write` — its foreign-edit
+        guard covers exactly that case.
+
         **Sizing.** A single-member publish takes the standalone CAS path
         (:meth:`write_cas_at`'s primitive). A multi-member publish opens a
         consistent snapshot session over the write-set so the comparands are
