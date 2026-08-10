@@ -239,6 +239,129 @@ only via `--include-content` / `--output-file`, so terminals, CI logs, and shell
 history don't capture content inadvertently. No HTTP route serves version
 content.
 
+### Workspace checkpoints ride this retention window (file members)
+
+A workspace checkpoint's **file members** depend on exactly the retention
+described above — a **declared, bounded window** (the `artifact_versions` store
+under its configured `max_versions` / `max_age_seconds` bounds), never an
+indefinite hold:
+
+- **The window is a bound, not a pin.** Retention keeps a bounded history and
+  offers no per-version hold a checkpoint could place, so the file version a
+  checkpoint points at can still age out (or be collected by the policy) before
+  you restore. That is why a file member is labeled `restorable-unpinned` —
+  never `restorable`: the label means "history exists now and may expire."
+- **Checkpoint pins on file members verify; they do not extend.** Pinning a
+  checkpoint only checks that the captured file version is currently retained
+  and still matches its captured fingerprint. Verification cannot lengthen the
+  retention window or exempt the version from the configured bounds.
+- **Expiry is reported, never papered over.** If the retained version is gone by
+  restore time, the restore reports that member's target as lost rather than
+  restoring different content. With retention off (the default) — or the version
+  already unreachable when the checkpoint is pinned — the member is labeled
+  `forward_only`: described in the checkpoint, but not restorable.
+
+S3 members are different: their checkpoint pin is a legal hold placed in
+**your** bucket on the captured version — the substrate's own retention, subject
+to your bucket's configuration and costs, never the coordinator's.
+
+**Where the CLI keeps checkpoint state.** `agent-coherence-workspace` owns its
+own durable store, deliberately separate from the Claude Code hook coordinator's
+`state.db`:
+
+| File | Path | Mode | Holds |
+|---|---|---|---|
+| Workspace checkpoint store | `<workspace>/.coherence/workspace.db` | `0600` | Checkpoint manifests (member paths, restore pointers, fingerprints, tier/pin/outcome state) **and** retained file-member version bodies |
+
+Treat it exactly like `state.db` above: it is created `0600` inside a `0700`
+`.coherence/` directory carrying a `*` gitignore, its `-wal` / `-shm` sidecars
+are as sensitive as the file itself, and it holds the **content** of every file
+member the CLI has observed — the CLI runs retention on, because without
+retained bytes a file restore could only ever report `target_lost`. Those bodies
+can contain whatever your files contain (credentials, PII), and they persist for
+as long as the store's retention window keeps them: the CLI sets no count/age
+bound, so in practice they accumulate until you remove the database together with
+its sidecars. That is a content-at-rest and disk-growth fact, **not** a stronger
+restore guarantee — the tier stays `restorable-unpinned` regardless, because
+retention offers no per-version hold to back a stronger claim. Never commit the
+file; copy it only with mode preserved.
+
+### Member-path containment for workspace checkpoints
+
+A checkpoint member names a path that the CLI later **reads at capture and
+writes at restore**, so the path is re-validated on every filesystem access —
+not once at argument-parse time — because restore replays paths persisted by an
+earlier invocation. A member is refused when it is not a plain file living
+wholly inside the workspace root:
+
+| Refused | Why |
+|---|---|
+| A path escaping the workspace root, or containing `..` | Capture and restore stay inside the root, always |
+| Any symlink component, including the leaf | A symlink swapped in after validation would redirect the write; reads and writes use `O_NOFOLLOW` so a late swap is rejected atomically at open |
+| A regular file with more than one link | A hard link means an outside co-owner: capturing it reads foreign bytes, and restoring it writes through the shared inode outside the root |
+| A non-regular file (FIFO, socket, block/char device) | Opening one can block indefinitely; the open is non-blocking and the check is re-taken on the file descriptor |
+| Anything under `.coherence/**` | The coordinator's own state is never a workspace member |
+
+Refusals are typed and land differently by leg, deliberately: at **capture** a
+refusal aborts with exit `2` and nothing persists; inside a **restore** leg the
+same refusal is absorbed as that member's `target_lost` so the rest of the
+restore still concludes and reports honestly, rather than leaving the checkpoint
+stuck mid-restore. One residual is documented rather than claimed away: an
+intermediate *directory* component swapped between validation and open is not
+fully closed (closing it needs a directory-descriptor walk), which the
+single-host, single-uid trust model accepts.
+
+### S3 credential posture for workspace checkpoints
+
+**Bindings carry credentials; the CLI never does.** S3 members of a workspace
+checkpoint are captured and restored through a `CoherentObject` binding you
+construct in Python — the binding resolves credentials the way the BYO-substrate
+posture above requires (references, never literals). The
+`agent-coherence-workspace` CLI holds no credential path at all: `restore` on a
+checkpoint with pending S3 members refuses cleanly and points you at the Python
+API, rather than growing a second credential surface; `status` and `list` still
+render those members from the durable manifest.
+
+**No credentials in manifests or the registry.** A checkpoint's per-member
+record stores the member path, an opaque restore pointer (the S3 versionId, or
+a file member's version number), a fixed-width content fingerprint, and
+tier/pin/outcome state — nothing credential-shaped, and never your bytes for S3
+members. Copying or inspecting the registry database cannot leak a substrate
+credential, because none is ever written.
+
+**Least-privilege IAM for workspace versioning.** The base binding's emitted
+writer policy (`s3:GetObject` + `s3:PutObject` on the exact key/prefix, with
+explicit delete denies) covers plain coherence use. Workspace checkpoint and
+restore exercise a wider, still-narrow surface — these are exactly the
+operations the binding issues, no others:
+
+| Capability | S3 calls made | IAM actions needed |
+|---|---|---|
+| Capture + live comparand reads | `GetObject` (current version) | `s3:GetObject` |
+| Version-pinned reads (restore source, pin verification) | `GetObject` with a `VersionId` | `s3:GetObjectVersion` |
+| Restore writes | conditional `PutObject` (`If-Match`) | `s3:PutObject` |
+| Checkpoint pins | `PutObjectLegalHold` / `GetObjectLegalHold` | `s3:PutObjectLegalHold`, `s3:GetObjectLegalHold` |
+| Delete legs (restoring an ABSENT fact) | `DeleteObject` (unconditional-latest) | `s3:DeleteObject` |
+
+Scope every action to the same exact key/prefix ARN as the base policy. Two
+deliberate narrownesses: the binding never issues a version-targeted delete —
+on a versioned bucket its delete mints a delete marker and history survives —
+so `s3:DeleteObjectVersion` (true history destruction) is not needed and should
+stay denied; and it never lists bucket versions, so no list permission is
+needed. Grant `s3:DeleteObject` only to the principal that runs restores: it is
+the one addition beyond the base policy's explicit delete deny, and only the
+delete leg uses it.
+
+**Bucket versioning is an expectation, not an assumption.** A `restorable` S3
+member requires a versioned bucket. Against an unversioned bucket the capture
+does not guess: the missing version pointer is a typed refusal at capture time,
+and the member is recorded `forward_only` — described in the manifest, not
+restorable, stated before you ever depend on it. Checkpoint pins additionally
+require Object Lock to be enabled on the bucket (an at-creation setting);
+without it the pin attempt durably downgrades the member to
+`restorable-unpinned` with `pin_state="pin_unavailable"` — loudly, never as a
+quiet claim.
+
 ## Hash-pinned install for security-sensitive users
 
 For reproducible installs with full dependency-graph pinning:

@@ -526,8 +526,9 @@ _SPAWNED_REGISTRY: dict[str, _SpawnedEntry] = {}
 
 
 def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
-    """Create ``<root>/.coherence/`` with mode 0700 if missing. Returns
-    the dir path, or None if the parent repo is read-only.
+    """Create ``<root>/.coherence/`` with mode 0700, re-tightening an existing
+    dir to 0700 if it pre-exists at a looser mode. Returns the dir path, or None
+    if the parent repo is read-only.
 
     Also writes ``.coherence/.gitignore`` containing ``*`` per KTD-13 so
     a careless ``git add .`` doesn't accidentally commit the SQLite
@@ -544,6 +545,29 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
             coordinator_root, exc,
         )
         return None
+    # ``mkdir(mode=0o700)`` does NOT chmod an ALREADY-EXISTING directory, so a
+    # ``.coherence/`` that pre-existed at a looser mode (e.g. 0755 from a careless
+    # ``mkdir`` or an older tool) would keep it — leaving the SQLite state.db,
+    # the hook.secret credential, and the pidfile group/world-accessible.
+    # Re-assert the 0700 guarantee unconditionally (idempotent); warn once when
+    # we actually had to tighten an existing dir from a more-permissive mode.
+    try:
+        prior_mode = coherence_dir.stat().st_mode & 0o777
+        if prior_mode != 0o700:
+            os.chmod(coherence_dir, 0o700)
+            if prior_mode & 0o077:
+                logger.warning(
+                    "tightened existing .coherence directory %s from mode %o to "
+                    "0700 (it exposed group/world bits; the SQLite state, the "
+                    "hook.secret credential and the pidfile must not be readable "
+                    "outside the owner)",
+                    coherence_dir, prior_mode,
+                )
+    except OSError as exc:
+        logger.warning(
+            "could not re-assert 0700 on .coherence directory %s: %s",
+            coherence_dir, exc,
+        )
     # Write .gitignore (idempotent — only write if missing to avoid
     # clobbering any operator customization)
     gitignore = coherence_dir / ".gitignore"

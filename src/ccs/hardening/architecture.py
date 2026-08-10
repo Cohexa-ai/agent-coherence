@@ -26,6 +26,11 @@ _LAYER_BY_NAMESPACE = {
     "diagnose": "interface",
     "replay": "interface",
     "mcp": "interface",
+    # In-repo deterministic substrate fakes + the (relocating) conformance
+    # corpus. "interface" because the corpus imports adapters; an unregistered
+    # namespace would be SILENTLY skipped by the gate (the self-concealing
+    # failure), so registration lands with the namespace's first module.
+    "testing": "interface",
 }
 
 _ALLOWED_LAYER_IMPORTS = {
