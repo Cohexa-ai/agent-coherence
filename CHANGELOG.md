@@ -27,7 +27,14 @@ Alpha — APIs may change before `v1.0`.
   `held_unconfirmed`), contended legs re-drive under a bounded budget (a
   sustained foreign writer wins honestly — never a livelock, never a
   clobber), progress is durable and crash-resumable, and restore is a
-  *forward* commit carrying old bytes (versions strictly increase).
+  *forward* commit carrying old bytes (versions strictly increase). A
+  member the engine cannot drive — an unreadable path, or one that became
+  a symlink, a hardlink with an outside co-owner, or a non-regular file —
+  is absorbed as that member's `target_lost` so the run still concludes
+  and reports honestly, instead of aborting and leaving the checkpoint
+  stuck mid-restore; a re-restore of a concluded checkpoint rebuilds its
+  registration answer from durable state (`refused` stays terminal, never
+  re-attempted).
   Checkpoint pins are fail-closed and loud: S3 members are pinned with a
   legal hold on the captured version in *your* bucket; a bucket without
   Object Lock durably downgrades the member to `restorable-unpinned` with
@@ -43,14 +50,26 @@ Alpha — APIs may change before `v1.0`.
   `restore`.** The operator surface over the workspace engine for file and
   forward-only members, with `--root` / `--json` on every verb and a
   four-way exit-code contract: `0` clean, `1` validation error, `2` typed
-  refusal (binary member, unknown checkpoint), `3` restore **concluded with
+  refusal (a non-UTF-8 member, an unknown checkpoint id, a persist failure,
+  or a member path failing containment), `3` restore **concluded with
   absorbed outcomes** — the per-member report on stdout is the truth.
   `status` renders every member's `(restore_tier, pin_state)` pair,
   including `(restorable, unpinned)` labeled claimed-but-not-yet-backed;
-  `checkpoint` output always carries the file-retention caveat. The CLI owns
-  its durable state at `<root>/.coherence/workspace.db`. S3 members ride the
-  Python API (bindings carry credentials; the CLI refuses cleanly and points
-  there).
+  `checkpoint` output always carries the file-retention caveat. Member
+  paths are re-validated on **every** read and write (restore replays paths
+  persisted by an earlier invocation): a workspace escape, any symlink
+  component, a hardlinked regular file with a co-owner outside the root, a
+  non-regular file (FIFO, socket, device), or a `.coherence/**` self-target
+  is refused — at capture as exit `2` with nothing persisted, inside a
+  restore leg as that member's `target_lost`. Under `--json` every error
+  path also emits a one-line JSON error envelope on stdout, so machine
+  consumers never parse stderr prose. A restore that binds file members
+  warns loudly when a live coordinator is serving the workspace (warn,
+  never refuse — restored writes land outside its grant flow). Duplicate
+  checkpoint names are disclosed with the prior ids, never refused: names
+  are labels, `status`/`restore` target an id. The CLI owns its durable
+  state at `<root>/.coherence/workspace.db`. S3 members ride the Python API
+  (bindings carry credentials; the CLI refuses cleanly and points there).
 
 - **Packaged conformance corpus — `ccs.testing.substrate_conformance`,
   now with a workspace family.** The substrate conformance kit moved from
@@ -63,7 +82,9 @@ Alpha — APIs may change before `v1.0`.
   torn-cut detection, bounded termination, restore-as-forward-commit,
   ABSENT-is-a-fact) plus **DECLARED** scenarios pinned to the binding's own
   declarations — passing is by observable outcome, never by mimicking
-  internals.
+  internals. The corpus imports and runs **without pytest**; the new
+  `conformance` extra (`pip install "agent-coherence[conformance]"`) adds it
+  so skipped scenarios report as skips under your own test runner.
 
 - **`formal/tla/WorkspaceVersion.tla` — restore registration
   model-checked, in the CI sweep.** The seventh spec in the `tla-check`

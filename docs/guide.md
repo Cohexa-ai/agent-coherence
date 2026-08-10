@@ -28,7 +28,7 @@ full command-line toolset, and the API reference.
 8. [Crash recovery](#crash-recovery)
 9. [Version retention and read-at-version](#version-retention-and-read-at-version)
 10. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow--coherentobject)
+11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 14. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
@@ -828,7 +828,7 @@ for member in report.members:
 | `restored` | the captured bytes landed via the member's conditional write |
 | `converged` | the live state already matched the manifest — nothing written |
 | `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives** |
-| `target_lost` | the captured version is no longer reachable (expired retention, vanished S3 version) — reported, never substituted |
+| `target_lost` | the captured version is no longer reachable (expired retention, a vanished S3 version), or the member itself can no longer be driven safely (its path became a symlink, a hardlink with an outside co-owner, or a non-regular file) — reported, never substituted |
 | `forward_only_skipped` | a declared action surface (or an uncapturable member) — enumerated, skipped |
 | `held_unconfirmed` | a write whose outcome could not be confirmed — held, never guessed |
 
@@ -861,14 +861,18 @@ agent-coherence-workspace restore <checkpoint-id>
 
 Four verbs — `checkpoint` (with repeatable `--file` / `--forward-only`, and `--no-pin` for capture-only), `list`, `status`, `restore`. Every verb takes `--root` (override the workspace root; default walks up to the git root) and `--json` (machine-parseable output). `status` renders every member's `(restore_tier, pin_state)` pair — including the claimed-but-not-yet-backed label — plus torn-cut flags and restore outcomes; `checkpoint` output always carries the file-retention caveat. The CLI keeps its own durable state in `<root>/.coherence/workspace.db`.
 
+Under `--json`, every error path *also* emits a one-line JSON envelope on stdout — `{"kind": "error", "exit_code": …, "reason": …, "message": …}` — so a script never has to parse stderr prose; the human message stays on stderr unchanged. Capturing a second checkpoint under an existing name is never refused (names are labels, not unique keys), but the prior ids are printed so the ambiguity is never silent — `status` and `restore` always target an id, not a name.
+
 Exit codes:
 
 | Code | Meaning |
 |---|---|
 | `0` | the verb succeeded (restore: concluded with every member clean) |
-| `1` | not in a git repository, or a validation error (bad path, no members) |
-| `2` | a typed refusal (binary member, unknown checkpoint, persist failure) |
-| `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed` — the per-member report on stdout is the truth; the exit code just tells you to read it |
+| `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
+| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
+
+**Where a refusal lands.** A containment refusal at **capture** is a hard exit-`2` refusal with nothing persisted. The same refusal raised inside a **restore** leg is deliberately not: the termination contract absorbs it into that member's `target_lost` so every other member still concludes, and the refusal text becomes that member's outcome detail — exit `3`, never a checkpoint left stuck mid-restore.
 
 **S3 members and the CLI.** S3 object members are captured and restored via the Python API shown above — their bindings carry credentials the CLI cannot (and should not) reconstruct. `restore` on a checkpoint with pending S3 members refuses cleanly and points you at the Python API; `status` and `list` still render those members honestly.
 
@@ -1190,6 +1194,7 @@ Correctness demos lead; the token-savings / hit-rate demos follow.
 | Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
+| Workspace versioning & restore | `python -m examples.workspace_versioning.main` | Checkpoint a mixed file + S3 workspace, then restore it with per-member honesty (`restored` / `conflict` / delete leg / forward-only skip); `--baseline` shows the unrecoverable loss first (offline, no keys) |
 | Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
 | Cross-host (experimental) | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
 | LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |
@@ -1472,6 +1477,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
+| `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 
 Run any command with `--help` for the full option list.
 
