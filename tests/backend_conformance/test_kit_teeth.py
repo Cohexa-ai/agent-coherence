@@ -30,6 +30,7 @@ broken everywhere.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -126,6 +127,64 @@ class _DegradedFactory:
     @property
     def db_path(self) -> Path | None:
         return None
+
+
+class _TornPairRegistry:
+    """A degraded backend whose ``get_version_and_generation`` is TWO reads
+    instead of one atomic snapshot — the exact shortcut a BYO backend author
+    would reach for, and the one the member's contract forbids. Everything else
+    delegates to a real in-memory registry. The `sleep(0)` between the two reads
+    just widens the interleaving window a real two-read backend has anyway."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def get_version_and_generation(self, artifact_id: UUID) -> tuple[int, int]:
+        version = self._inner.get_artifact(artifact_id).version  # type: ignore[union-attr]
+        # A real (GIL-releasing) sleep, so the mutator thread actually runs
+        # between the two reads — the interleaving window every two-read
+        # backend has, made wide enough to hit deterministically.
+        time.sleep(0.0005)
+        return version, self._inner.get_owner_generation(artifact_id)
+
+
+class _TornPairFactory:
+    """A :class:`RegistryFactory` minting one process-scoped
+    :class:`_TornPairRegistry` (same shape as :class:`_DegradedFactory`)."""
+
+    def __init__(self) -> None:
+        self._reg: _TornPairRegistry | None = None
+
+    def __call__(self) -> _TornPairRegistry:
+        if self._reg is None:
+            self._reg = _TornPairRegistry()
+        return self._reg
+
+    def close_all(self) -> None:
+        return None
+
+    @property
+    def db_path(self) -> Path | None:
+        return None
+
+
+def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
+    """THE TEETH for the pair-atomicity scenario. A backend serving
+    ``get_version_and_generation`` as two independent reads MUST FAIL the kit —
+    otherwise the scenario would bless the shortcut that reopens the
+    reclaim-zombie effect hole. The failure message names the obligation."""
+    factory: RegistryFactory = _TornPairFactory()
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_version_and_generation_pair_is_untearable(factory)
+    message = str(excinfo.value)
+    assert "TORN pair" in message
+    assert "ONE atomic snapshot" in message, (
+        "the teeth failure must name the obligation a backend author skipped; "
+        f"got: {message}"
+    )
 
 
 def test_degraded_stub_fails_single_writer_scenario() -> None:

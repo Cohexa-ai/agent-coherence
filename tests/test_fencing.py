@@ -196,3 +196,28 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     # The MWB transient is cleared (not leaked) and no phantom bump landed.
     assert reg.get_agent_transient(art.id, a) is None
     assert reg.get_artifact(art.id).version == 1
+
+
+def test_parity_version_and_generation_is_one_pair(registry) -> None:
+    """``get_version_and_generation`` returns the pair the effect gate compares:
+    a sweep reclamation moves ONLY the generation leg (the shape a version-only
+    comparand cannot see), a commit moves ONLY the version leg, and an unknown
+    artifact raises KeyError like the sibling fence accessors."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    assert reg.get_version_and_generation(art.id) == (1, 0)
+    # Sweep reclamation: generation bumps, version stays put.
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    reg.set_agent_state(
+        art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10
+    )
+    assert reg.get_version_and_generation(art.id) == (1, 1)
+    # A committed write: version bumps, generation stays put. The committer
+    # re-acquires first so its captured claim matches the current epoch.
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=11)
+    res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
+    assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
+    assert reg.get_version_and_generation(art.id) == (2, 1)
+    with pytest.raises(KeyError):
+        reg.get_version_and_generation(uuid4())

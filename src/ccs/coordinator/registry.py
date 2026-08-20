@@ -331,6 +331,22 @@ class ArtifactRegistry:
         not the fence, arbitrates)."""
         return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
+    def get_version_and_generation(self, artifact_id: UUID) -> tuple[int, int]:
+        """Return ``(version, owner_generation)`` as one pair-consistent snapshot.
+
+        This registry is lock-free by contract (GIL per-access atomicity), so the
+        pair is stitched with a seqlock on ``owner_generation``: the generation is
+        monotonic (reclaims only increment it, no ABA), so if it reads equal on
+        both sides of the version read, the returned pair coexisted at the instant
+        the version was read — a concurrent sweep bump or version move retries
+        rather than tearing the pair."""
+        record = self._records[artifact_id]
+        while True:
+            generation = record.owner_generation
+            version = record.artifact.version
+            if record.owner_generation == generation:
+                return version, generation
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,

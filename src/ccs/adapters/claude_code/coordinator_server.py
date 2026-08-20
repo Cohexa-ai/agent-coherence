@@ -1385,6 +1385,51 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
 # ----------------------------------------------------------------------
 
 
+def _attach_owner_generation(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    resp: dict,
+    *,
+    classified_version: int,
+) -> None:
+    """Attach ``owner_generation`` to a pre-read response body — opt-in only
+    (``want_owner_generation`` in the request), so every shipped response shape
+    stays byte-identical for exact-shape status clients.
+
+    The generation comes from ONE registry snapshot together with its version
+    (``get_version_and_generation``), never from two reads a concurrent sweep
+    reclaim could tear.
+
+    ``classified_version`` is the version this response was BUILT from — the
+    artifact snapshot that decided the fresh/stale branch and validated the
+    caller's content hash. Handlers run concurrently, so a peer commit can land
+    between that branch snapshot and this one; attaching a newer pair would hand
+    the caller a comparand that post-dates the bytes and the grant this response
+    is answering for, breaking the split-comparand discipline the effect gate
+    and the OCC comparand read both rely on (a stale-derived decision would then
+    re-validate clean and FIRE). So the generation rides along only when the
+    snapshot still agrees with the classification; otherwise BOTH keys are
+    omitted, which reads as UNCONFIRMED downstream (the gate HOLDs) and leaves
+    the response's own version — the grant-consistent one — untouched.
+
+    This function never writes ``version``: the fresh shapes already carry the
+    classified version, and the stale shape's version is ``summary
+    .current_version``, which the client prefers in exactly that order.
+
+    Strict-mode deny responses never call this — their byte-stable deny payload
+    is a compatibility surface (KTD-T), and the absent key already makes a
+    generation-aware caller HOLD."""
+    try:
+        version, generation = coordinator.registry.get_version_and_generation(
+            artifact_id
+        )
+    except KeyError:
+        return
+    if version != classified_version:
+        return
+    resp["owner_generation"] = generation
+
+
 def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-read — stale-read check + KTD-9 first-observation seeding.
 
@@ -1425,6 +1470,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     session_id = body.get("session_id")
     path = body.get("path", "")
     content_hash = body.get("content_hash") or None
+    # Effect-gate opt-in: a truthy ``want_owner_generation`` asks the fresh and
+    # warn-stale responses to carry the pair-consistent
+    # ``(version, owner_generation)``. Absent (every shipped client), the
+    # response shapes below are byte-unchanged.
+    want_generation = bool(body.get("want_owner_generation"))
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -1472,7 +1522,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # ``expected_version`` for a later ``post-edit-cas`` (additive —
             # status-based clients ignore it). First observation seeds v1.
             seeded = coordinator.registry.get_artifact(artifact_id)
-            return {"status": "fresh", "version": seeded.version if seeded else 1}
+            seeded_version = seeded.version if seeded else 1
+            first: dict[str, Any] = {"status": "fresh", "version": seeded_version}
+            if want_generation:
+                _attach_owner_generation(
+                    coordinator, artifact_id, first,
+                    classified_version=seeded_version,
+                )
+            return first
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the
@@ -1558,6 +1615,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                             source="pre_read_shared_hash_deny",
                         )
                 fresh["hash_differs"] = True
+            if want_generation:
+                _attach_owner_generation(
+                    coordinator, artifact_id, fresh,
+                    classified_version=artifact.version,
+                )
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
@@ -1662,6 +1724,16 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             trigger="post_stale_read", tick=now, content_hash=content_hash,
         )
         resp = _payloads.build_stale_response(summary)
+        if want_generation:
+            # The effect gate re-validates through THIS path after a sweep
+            # reclaim (the zombie's re-read is warn-stale with the version
+            # unchanged) — the attached generation is what lets it see the epoch
+            # moved even though the version did not. The version comparand stays
+            # summary.current_version, the one this response was classified from.
+            _attach_owner_generation(
+                coordinator, artifact_id, resp,
+                classified_version=artifact.version,
+            )
         # KTD-J (Unit 8): bump the stale-warning emission counter +
         # mark the pair so a follow-up pre-read counts as a re-read.
         coordinator.increment_stale_warning_emitted()

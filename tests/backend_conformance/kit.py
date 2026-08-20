@@ -403,6 +403,108 @@ def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None
     assert updated.version == 2, "the admitted OCC writer must WIN and bump the version"
 
 
+def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -> None:
+    """Pair-atomicity of ``get_version_and_generation`` (MUST-MATCH). The
+    member's contract obliges a SINGLE-INSTANT snapshot: the two values must
+    have coexisted, so a concurrent sweep reclaim (which moves the generation
+    WITHOUT moving the version) can never tear the pair. A backend that serves
+    it as two independent reads passes every other scenario in this kit while
+    silently reopening the reclaim-zombie EFFECT hole — the effect gate captures
+    a torn pair, the boundary read returns the same torn pair, and the escaping
+    effect fires through a reclaim.
+
+    Teeth without ground truth: a mutator strictly alternates commit
+    (version + 1) and sweep-class reclaim (generation + 1) from (1, 0), so the
+    true pair sequence is (1,0) → (2,0) → (2,1) → (3,1) → … and therefore
+    ``version - generation`` is ALWAYS 1 or 2. A read that pairs an old version
+    with a newer generation (or the reverse) lands outside that band and is
+    reported as a tear. The alternation is pinned SEQUENTIALLY first, so a
+    backend whose transitions do not produce it fails as a wrong precondition
+    rather than as a phantom tear."""
+    reg = factory()
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+
+    def advance(round_index: int) -> None:
+        """One commit (version + 1) then one reclaim (generation + 1). The
+        re-acquire is load-bearing: ``commit_cas`` leaves the committer in
+        SHARED, and only an M/E holder's reclaim bumps the generation."""
+        agent = uuid4()
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            artifact_id, agent, MESIState.EXCLUSIVE, trigger="write",
+            tick=round_index,
+        )
+        result = reg.commit_cas(  # type: ignore[attr-defined]
+            artifact_id, agent, expected_version=round_index + 1,
+            content_hash=_hash(f"c{round_index}"), tick=round_index,
+        )
+        assert isinstance(result, tuple), (
+            "scenario invariant: the single mutator's commit must WIN "
+            f"(round {round_index}); a loss would desynchronize the band check"
+        )
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            artifact_id, agent, MESIState.EXCLUSIVE, trigger="write",
+            tick=round_index,
+        )
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            artifact_id, agent, MESIState.INVALID, trigger=_RECLAIM_TRIGGER,
+            tick=round_index,
+        )
+
+    assert reg.get_version_and_generation(artifact_id) == (1, 0)  # type: ignore[attr-defined]
+    advance(0)
+    assert reg.get_version_and_generation(artifact_id) == (2, 1), (  # type: ignore[attr-defined]
+        "scenario precondition: one round must move BOTH legs exactly once "
+        "(commit bumps the version, a sweep-class reclaim bumps the generation)"
+    )
+
+    # Feedback coupling, not a fixed round count: the mutator keeps advancing
+    # until the observer has finished ALL its reads, so every observed read
+    # overlaps live mutation — a two-read backend cannot dodge the tear by the
+    # mutator finishing early, and an atomic backend ends the scenario as soon
+    # as the observer is done.
+    observer_reads = 300
+    observer_done = threading.Event()
+    torn: list[tuple[int, int]] = []
+    errors: list[BaseException] = []
+
+    def mutate() -> None:
+        try:
+            i = 1
+            while not observer_done.is_set() and i < 100_000:
+                advance(i)
+                i += 1
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+            observer_done.set()
+
+    def observe() -> None:
+        try:
+            for _ in range(observer_reads):
+                version, generation = reg.get_version_and_generation(artifact_id)  # type: ignore[attr-defined]
+                if version - generation not in (1, 2):
+                    torn.append((version, generation))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            observer_done.set()
+
+    writer = threading.Thread(target=mutate, name="pair-mutator")
+    reader = threading.Thread(target=observe, name="pair-observer")
+    writer.start()
+    reader.start()
+    writer.join()
+    reader.join()
+    if errors:
+        raise errors[0]
+    assert not torn, (
+        "get_version_and_generation returned a TORN pair — the two values never "
+        "coexisted. The mutator alternates commit/reclaim from (1, 0), so "
+        f"version - generation must stay in {{1, 2}}; observed {torn[:5]}. A "
+        "backend must serve this member as ONE atomic snapshot (a single row "
+        "read under the write lock, or an equivalent seqlock), never two reads."
+    )
+
 def assert_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:
     """Session fail-closed refusals (MUST-MATCH). Two typed refusals a conforming
     backend must reproduce identically, NEVER serving live HEAD:

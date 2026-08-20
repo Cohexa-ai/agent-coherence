@@ -88,6 +88,10 @@ def test_fence_rejects_superseded_read_generation(factory: RegistryFactory) -> N
     kit.assert_fence_rejects_superseded_read_generation(factory)
 
 
+def test_version_and_generation_pair_is_untearable(factory: RegistryFactory) -> None:
+    kit.assert_version_and_generation_pair_is_untearable(factory)
+
+
 def test_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:
     kit.assert_fence_admits_absent_read_generation(factory)
 

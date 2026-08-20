@@ -642,3 +642,21 @@ def test_strict_mode_deny_reason_template_is_static() -> None:
         f"per-invocation field (e.g., warning_generated_at) violates "
         f"KTD-P byte-stability."
     )
+
+
+def test_pre_read_strict_deny_ignores_want_owner_generation(
+    strict_client: _Client,
+) -> None:
+    """A strict-mode deny never carries the pair, opt-in or not: the byte-stable
+    deny payload is a compatibility surface (KTD-T), and the ABSENT generation
+    already makes a generation-aware caller (the effect gate) HOLD fail-closed."""
+    _setup_stale(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md",
+         "content_hash": _hash("v1"), "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "owner_generation" not in body
+    assert "version" not in body

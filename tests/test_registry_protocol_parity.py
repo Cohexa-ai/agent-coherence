@@ -69,6 +69,7 @@ BASE_METHODS = frozenset(
         "get_state_map",
         "get_transient_map",
         "get_transient_tick",
+        "get_version_and_generation",
         "get_version_record",
         "granted_at_tick",
         "has_artifact",

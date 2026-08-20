@@ -6,6 +6,44 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`gate()` now HOLDs when the grant its input was read under is gone — not
+  only when the version moved.** The effect-ordering wrapper's re-validation
+  compared versions alone, and the version answers only "is the value still
+  the one `decide` saw" — it never asks "is the grant it was read under still
+  standing". A coordinator sweep that reclaims a stalled holder's grant
+  advances the artifact's ownership generation **without** a version move, so
+  a reclaimed (zombie) holder's escaping effect — the webhook, the deploy,
+  the opened PR — fired straight through the gate on revoked authority; in
+  strict mode it even fired through the deny (the deny's summary still
+  carried the unchanged version, and the denied-read marker was discarded).
+  This is the same distinction the v0.9.1 read-generation fence already draws
+  at the commit seam, now applied at the effect boundary. `gate()` captures
+  the `(version, owner_generation)` pair at decision time — one pair-atomic
+  registry snapshot (`get_version_and_generation`, on both registry arms), so
+  a concurrent sweep can never tear it — re-reads the pair at the boundary,
+  and HOLDs if **either** moved. Fail-closed on both comparands: an
+  unconfirmed version (`0`, degraded) or an unconfirmed generation (`None` —
+  a strict deny, a degraded read, or an older coordinator daemon from before
+  this fix) HOLDs loudly instead of reverting to the generation-blind check.
+  `StaleView` now carries `expected_generation` / `current_generation`
+  alongside the version pair (all default `None`), and the reclaim HOLD is
+  recognizable: versions equal, generations apart ("grant reclaimed …
+  version unchanged"). The pre-read response carries the pair only on the new
+  `want_owner_generation` request opt-in — every shipped response shape is
+  byte-unchanged for exact-shape status clients. Model-checked:
+  `formal/tla/EffectGate.tla` proves `NoStaleAdmit` (the gate never admits an
+  effect whose captured pair had moved as of the re-validate read — scoped to
+  the re-validate point; the residual re-validate→fire window stays
+  disclaimed and model-visible). Surfaced by an external practitioner running
+  a step-granular bounded read fence; the v0.11.0 entry's "orders effects on
+  the inputs they were computed from" was honest only about the value axis,
+  never the authority axis. Run it:
+  `python -m examples.gate_effect_ordering.main` (the reclaimed-lease act:
+  version unchanged, authority revoked, deploy held). Docs: guide § `gate()`;
+  README § Effect-ordering gate.
+
 ### Added
 
 - **Workspace versioning & restore — `WorkspaceVersioner` checkpoint +

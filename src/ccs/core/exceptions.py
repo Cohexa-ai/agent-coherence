@@ -436,15 +436,22 @@ class StaleView(CoherenceError):
     them. Carries :data:`STALE_VIEW_REASON`; the message stays the verbatim
     coordinator ``permissionDecisionReason`` (matched by type, not substring).
 
-    ``expected_version`` / ``current_version`` carry the captured-vs-current
-    drift when raised by ``adapters.effect_gate.gate()``; on every other raise
-    path (the coordinator deny sites) both stay ``None``, so a generic
-    ``except StaleView`` handler reads them uniformly."""
+    ``expected_version`` / ``current_version`` and ``expected_generation`` /
+    ``current_generation`` carry the captured-vs-current drift when raised by
+    ``adapters.effect_gate.gate()`` — the version pair answers "did the value
+    move", the generation pair answers "was the grant it was read under
+    reclaimed" (a sweep reclamation advances the generation WITHOUT a version
+    move). On every other raise path (the coordinator deny sites) all four stay
+    ``None``, so a generic ``except StaleView`` handler reads them uniformly."""
 
     reason = STALE_VIEW_REASON
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
     expected_version: int | None = None
     current_version: int | None = None
+    #: Ownership-epoch drift set by gate()'s HOLD; ``None`` on coordinator-raised
+    #: instances AND when the coordinator never confirmed a generation.
+    expected_generation: int | None = None
+    current_generation: int | None = None
 
 
 class CommitPreempted(CoherenceError):

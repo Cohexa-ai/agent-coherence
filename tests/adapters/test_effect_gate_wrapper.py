@@ -5,20 +5,28 @@
 
 EO-8 regression: an escaping effect is HELD (never fires) when a gated input's
 version advanced between capture and fire, and fires when the input is
-unchanged. Uses a REAL coordinator subprocess (the ``test_coherent_volume.py``
-pattern) with a FIXED-STALE BUFFER: the peer commit is driven explicitly inside
-``decide()`` (between capture and re-validate), never a sleep.
+unchanged. Generation-fence regression: the effect is also HELD when a sweep
+reclaimed the grant the decision was read under — owner_generation advanced
+while the version stayed put, the drift a version-only comparand cannot see.
+Uses a REAL coordinator subprocess (the ``test_coherent_volume.py`` pattern)
+with a FIXED-STALE BUFFER: the peer commit (or the sweep reclaim) is driven
+explicitly inside ``decide()`` (between capture and re-validate), never a
+sleep.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
+from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import gate
+from ccs.cli._coherence_client import post as _cc_post
+from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, StaleView
 
 REL = "data/config.txt"
@@ -107,6 +115,178 @@ def test_escaping_effect_held_when_input_advanced(
         assert exc_info.value.current_version == exc_info.value.expected_version + 1
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_escaping_effect_held_when_grant_reclaimed_strict_deny_leg(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Generation-fence regression, strict leg (the reclaim-zombie
+    interleaving): a sweep reclaims THIS holder's stalled M grant between
+    capture and fire. Nothing else writes the artifact, so the version
+    comparand is UNCHANGED. A CoherentVolume installs its managed globs
+    strict, so the zombie's re-validation read is the byte-stable strict deny
+    — which deliberately carries NO generation. PRE-FIX, gate() extracted the
+    unchanged version from the deny's summary, discarded ``stale_denied``,
+    and FIRED the effect straight through the deny; POST-FIX the unconfirmed
+    generation HOLDs it. The reclaim is a fixed-stale buffer driven
+    explicitly inside ``decide()`` with synthetic far-future ticks, never a
+    sleep."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(REL, b"config-v1")  # M grant, heartbeat seeded at now
+        coordinator = lifecycle._SPAWNED_REGISTRY[str(tmp_path.resolve())].coordinator
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            # FIXED-STALE BUFFER: the sweep reclaims this holder's grant between
+            # capture and re-validate (heartbeat_timeout_ticks=1 against a
+            # far-future tick forces reclaim_heartbeat; max_hold stays off).
+            reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+                current_tick=int(time.time()) + 999_999,
+                heartbeat_timeout_ticks=1,
+                max_hold_ticks=999_999_999,
+            )
+            assert reclaimed == 1, "sweep should have reclaimed exactly one grant"
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(StaleView) as exc_info:
+            gate(vol, REL, decide=decide, effect=effect)
+
+        assert fired == []  # the zombie's effect never fired through the deny
+        exc = exc_info.value
+        # THE pre-fix hole: the version never moved (the deny's summary still
+        # matched), so a version-only comparand admitted the fire…
+        assert exc.current_version == exc.expected_version
+        # …and the HOLD came from the generation leg: confirmed at capture,
+        # deliberately unconfirmed on the strict deny.
+        assert exc.expected_generation is not None
+        assert exc.current_generation is None
+        assert "no confirmed ownership generation" in str(exc)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_escaping_effect_held_when_grant_reclaimed_version_unchanged(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generation-fence regression, warn leg: against a coordinator that
+    TRACKS the artifact without strict mode (the fleet / foreign-coordinator
+    shape), the zombie's re-validation is a warn-stale re-grant carrying the
+    SAME version and an ADVANCED owner_generation — the exact drift a
+    version-only comparand cannot see. PRE-FIX gate() compared versions,
+    found them equal, and FIRED; POST-FIX it HOLDs on the moved epoch, with
+    the g→g+1 drift on the exception."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        # Tracked (versioned + stale detection) but NOT strict: the reclaimed
+        # holder's re-read is a warn-stale re-grant, not a deny.
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+        vol = CoherentVolume(
+            root_w,
+            on_error="strict",
+            on_stale_write="allow",
+            remote_endpoint=resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer),
+        )
+        (root_w / "task.txt").write_bytes(b"task-v1")
+        vol.write("task.txt", b"task-v1")  # M grant, heartbeat seeded at now
+        coordinator = lifecycle._SPAWNED_REGISTRY[
+            str(coord_root.resolve())
+        ].coordinator
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+                current_tick=int(time.time()) + 999_999,
+                heartbeat_timeout_ticks=1,
+                max_hold_ticks=999_999_999,
+            )
+            assert reclaimed == 1, "sweep should have reclaimed exactly one grant"
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(StaleView) as exc_info:
+            gate(vol, "task.txt", decide=decide, effect=effect)
+
+        assert fired == []  # the zombie's effect never fired
+        exc = exc_info.value
+        # THE distinguishing shape: the version never moved…
+        assert exc.current_version == exc.expected_version
+        # …but the ownership epoch advanced by exactly the one reclaim.
+        assert exc.expected_generation is not None
+        assert exc.current_generation == exc.expected_generation + 1
+        assert "grant reclaimed" in str(exc)
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_escaping_effect_held_when_warn_mode_bytes_are_stale(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warn-mode value/comparand binding: the bytes handed to decide() and the
+    comparand pair come from two instants (a disk read, then the coordinator
+    round-trip). On a tracked-but-NOT-strict artifact a superseded reader is
+    warn-allowed — re-granted with the CURRENT pair — so the pair would
+    re-validate clean at the boundary while decide() consumed bytes the
+    coordinator knows are superseded. The coordinator flags exactly that
+    (``hash_differs``), and an unconfirmable view yields NO confirmed
+    generation, so the gate HOLDs rather than firing a stale-derived effect."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    root_p = tmp_path / "p"
+    root_p.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+
+        def vol(root: Path) -> CoherentVolume:
+            return CoherentVolume(
+                root,
+                on_error="strict",
+                on_stale_write="allow",
+                remote_endpoint=resolve_remote_endpoint(
+                    "127.0.0.1", ep.port, ep.bearer
+                ),
+            )
+
+        worker, peer = vol(root_w), vol(root_p)
+        (root_w / "task.txt").write_bytes(b"plan-A")
+        (root_p / "task.txt").write_bytes(b"plan-A")
+        worker.write("task.txt", b"plan-A")
+        # The peer supersedes the content; the worker's own disk still holds
+        # plan-A, so its next read hands decide() superseded bytes.
+        peer.write("task.txt", b"plan-B")
+        fired: list[str] = []
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(StaleView) as exc_info:
+            gate(worker, "task.txt", decide=lambda d: d.decode(), effect=effect)
+
+        assert fired == []  # never fired on a decision derived from plan-A
+        assert exc_info.value.current_generation is None
+        assert "no confirmed ownership generation" in str(exc_info.value)
+    finally:
+        stop_coordinator(coord_root)
 
 
 def test_effect_required(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
@@ -221,13 +401,18 @@ def test_gate_accepts_pathlib_path(tmp_path: Path, fast_cfg: LifecycleConfig) ->
 
 class _StubVolume:
     """A minimal CoherentVolume stand-in for gate()'s pure logic: successive
-    read_with_version calls yield scripted (bytes, version) pairs, or raise."""
+    read_with_version_generation calls yield scripted
+    (bytes, version, owner_generation) triples, or raise. A confirmed but
+    arbitrary generation (7) is the default in version-focused tests so the
+    version semantics stay isolated from the generation leg."""
 
     def __init__(self, reads: list) -> None:
         self._reads = list(reads)
         self._i = 0
 
-    def read_with_version(self, path: str) -> tuple[bytes, int]:
+    def read_with_version_generation(
+        self, path: str
+    ) -> tuple[bytes, int, int | None]:
         item = self._reads[self._i]
         self._i += 1
         if isinstance(item, Exception):
@@ -243,7 +428,7 @@ def test_gate_fires_on_stub_unchanged() -> None:
         return "ok"
 
     result = gate(
-        _StubVolume([(b"cfg", 5), (b"cfg", 5)]),
+        _StubVolume([(b"cfg", 5, 7), (b"cfg", 5, 7)]),
         "p",
         decide=lambda d: "go",
         effect=effect,
@@ -256,7 +441,7 @@ def test_gate_holds_on_stub_moved() -> None:
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
-            _StubVolume([(b"cfg", 5), (b"cfg", 6)]),
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 6, 7)]),
             "p",
             decide=lambda d: "go",
             effect=fired.append,
@@ -272,7 +457,7 @@ def test_gate_holds_on_unconfirmed_version() -> None:
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
-            _StubVolume([(b"cfg", 0), (b"cfg", 0)]),
+            _StubVolume([(b"cfg", 0, 7), (b"cfg", 0, 7)]),
             "p",
             decide=lambda d: "go",
             effect=fired.append,
@@ -285,7 +470,7 @@ def test_gate_holds_on_vanish_carries_none_current() -> None:
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
-            _StubVolume([(b"cfg", 5), FileNotFoundError()]),
+            _StubVolume([(b"cfg", 5, 7), FileNotFoundError()]),
             "p",
             decide=lambda d: "go",
             effect=fired.append,
@@ -300,7 +485,7 @@ def test_gate_holds_when_capture_read_degraded() -> None:
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
-            _StubVolume([(b"cfg", 0), (b"cfg", 5)]),
+            _StubVolume([(b"cfg", 0, 7), (b"cfg", 5, 7)]),
             "p",
             decide=lambda d: "go",
             effect=fired.append,
@@ -319,7 +504,7 @@ def test_gate_holds_when_revalidate_read_degraded() -> None:
     fired: list[str] = []
     with pytest.raises(StaleView) as exc:
         gate(
-            _StubVolume([(b"cfg", 5), (b"cfg", 0)]),
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 0, 7)]),
             "p",
             decide=lambda d: "go",
             effect=fired.append,
@@ -329,15 +514,106 @@ def test_gate_holds_when_revalidate_read_degraded() -> None:
     assert exc.value.current_version == 0
 
 
+def test_gate_holds_on_generation_moved_version_unchanged() -> None:
+    """THE generation-fence case: the version comparand is unchanged (nothing
+    re-wrote the artifact) but the ownership generation advanced (a sweep
+    reclaimed the grant the decision was read under). A version-only check
+    fires here; the gate must HOLD, with the drift on the exception."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 5, 8)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_version == 5
+    assert exc.value.current_version == 5  # the version NEVER moved
+    assert exc.value.expected_generation == 7
+    assert exc.value.current_generation == 8
+    assert "grant reclaimed" in str(exc.value)
+
+
+def test_gate_holds_on_unconfirmed_capture_generation() -> None:
+    """Fail-closed: a capture read with no confirmed generation (an older
+    coordinator that predates the fence, a strict deny, or a degraded read)
+    HOLDs even though both versions match and the re-read carries one."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5, None), (b"cfg", 5, 7)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_generation is None
+    assert exc.value.current_generation == 7
+
+
+def test_gate_holds_on_unconfirmed_revalidate_generation() -> None:
+    """Fail-closed, the other leg: a confirmed capture whose re-read loses the
+    generation confirmation (a deny or degrade mid-flight) HOLDs."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 5, None)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_generation == 7
+    assert exc.value.current_generation is None
+
+
+def test_gate_holds_when_both_comparands_moved_version_detail_wins() -> None:
+    """Both axes moved at once (a peer commit AND a reclaim). It HOLDs, carries
+    both drifts, and the message reports the version move — the deliberate
+    branch priority in _held(), which is otherwise unpinned."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 6, 8)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert (exc.value.expected_version, exc.value.current_version) == (5, 6)
+    assert (exc.value.expected_generation, exc.value.current_generation) == (7, 8)
+    assert "moved to v6" in str(exc.value)
+
+
+def test_gate_holds_when_generation_unconfirmed_on_both_reads() -> None:
+    """The shape an older coordinator produces on EVERY read: matching versions
+    and None generations on both sides. Two Nones are not "no movement" — the
+    gate must HOLD loudly rather than silently reverting to the
+    generation-blind check."""
+    fired: list[str] = []
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _StubVolume([(b"cfg", 5, None), (b"cfg", 5, None)]),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert exc.value.expected_generation is None
+    assert exc.value.current_generation is None
+    assert "no confirmed ownership generation" in str(exc.value)
+
+
 def test_gate_requires_callable_effect() -> None:
     """The explicit non-callable ``effect`` guard (distinct from omitting it)."""
     with pytest.raises(TypeError):
-        gate(_StubVolume([(b"x", 1)]), "p", decide=lambda d: "go", effect=5)  # type: ignore[arg-type]
+        gate(_StubVolume([(b"x", 1, 7)]), "p", decide=lambda d: "go", effect=5)  # type: ignore[arg-type]
 
 
 def test_gate_requires_callable_decide() -> None:
     with pytest.raises(TypeError):
-        gate(_StubVolume([(b"x", 1)]), "p", decide=None, effect=lambda x: x)  # type: ignore[arg-type]
+        gate(_StubVolume([(b"x", 1, 7)]), "p", decide=None, effect=lambda x: x)  # type: ignore[arg-type]
 
 
 def test_gate_hold_tolerates_non_pathlike_path() -> None:
@@ -346,7 +622,7 @@ def test_gate_hold_tolerates_non_pathlike_path() -> None:
     a masking TypeError (a real CoherentVolume rejects such a path earlier)."""
     with pytest.raises(StaleView):
         gate(
-            _StubVolume([(b"cfg", 5), (b"cfg", 6)]),
+            _StubVolume([(b"cfg", 5, 7), (b"cfg", 6, 7)]),
             12345,  # type: ignore[arg-type]
             decide=lambda d: "go",
             effect=lambda x: x,
@@ -355,8 +631,11 @@ def test_gate_hold_tolerates_non_pathlike_path() -> None:
 
 def test_bare_stale_view_exposes_none_version_attrs() -> None:
     """A StaleView raised without drift (the coordinator deny sites) still
-    exposes expected_version/current_version as None, so a generic
-    ``except StaleView`` handler reads the same shape gate() raises."""
+    exposes expected_version/current_version AND the generation pair as None,
+    so a generic ``except StaleView`` handler reads the same shape gate()
+    raises."""
     exc = StaleView("peer committed a newer version")
     assert exc.expected_version is None
     assert exc.current_version is None
+    assert exc.expected_generation is None
+    assert exc.current_generation is None

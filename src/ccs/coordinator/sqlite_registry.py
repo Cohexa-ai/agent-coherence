@@ -1800,6 +1800,20 @@ class SqliteArtifactRegistry:
                 raise KeyError(f"artifact {artifact_id} not in registry")
             return row[0]
 
+    def get_version_and_generation(self, artifact_id: UUID) -> tuple[int, int]:
+        """Return ``(version, owner_generation)`` as one pair-consistent snapshot:
+        both columns live on the one ``artifacts`` row, so a single SELECT under
+        the registry lock cannot observe a torn pair even against a concurrent
+        sweep reclamation's ``BEGIN IMMEDIATE`` bump."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT version, owner_generation FROM artifacts WHERE id = ?",
+                (artifact_id.hex,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"artifact {artifact_id} not in registry")
+            return row[0], row[1]
+
     def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the generation an agent captured at its last claim, or None if
         it never established a fence claim (a plain OCC writer that version-CAS,

@@ -1564,7 +1564,7 @@ from ccs.adapters import OpenAIAgentsAdapter, CoherenceSession
 
 ### `gate(volume, path, *, decide, effect)`
 
-Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input version it was decided from. `gate()` captures the input's version, runs `decide`, re-reads at the effect boundary, and fires `effect` only if the input is unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs.
+Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input state it was decided from. `gate()` captures the input's `(version, ownership generation)` pair (one atomic coordinator snapshot, via `volume.read_with_version_generation`), runs `decide`, re-reads the pair at the effect boundary, and fires `effect` only if **both** are unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs. The two comparands answer different questions: the version answers "is the value still the one `decide` saw"; the generation answers "is the grant it was read under still standing". A coordinator sweep that reclaims a stalled holder's grant advances the generation **without** a version move, so a version-only check would fire a reclaimed (zombie) holder's effect — the generation leg holds it.
 
 ```python
 from ccs.adapters import CoherentVolume, gate
@@ -1579,11 +1579,13 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `volume` | `CoherentVolume` | A volume attached to the coordinator that tracks `path`. |
-| `path` | `str \| os.PathLike[str]` | The workspace-relative managed artifact whose version gates the effect. |
+| `path` | `str \| os.PathLike[str]` | The workspace-relative managed artifact whose `(version, ownership generation)` pair gates the effect. |
 | `decide` | `Callable[[bytes], D]` | Keyword-only. Reads the captured bytes and returns a decision passed to `effect`. |
 | `effect` | `Callable[[D], R]` | Keyword-only. The escaping side effect; fired only if the input is unchanged at the re-read. |
 
-Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version` — if the input moved, vanished, or could not be confirmed; recover with `volume.reacquire(path)`, then re-decide and re-gate.
+Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version` and `expected_generation` / `current_generation` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed; recover with `volume.reacquire(path)`, then re-decide and re-gate. The reclaim case is recognizable on the exception: the versions match while the generations differ (the HOLD message says "grant reclaimed … version unchanged").
+
+**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a strict-mode deny, a degraded read, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
 **Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
 

@@ -66,6 +66,7 @@ The numbers above are a **cost/simulation** proxy, not a correctness proof. The 
 | A stale write-back is denied (write-side lost-update prevention) | [`examples/coherent_volume`](../examples/coherent_volume/README.md) |
 | Concurrent writers to one artifact — the stale writer is rejected | [`examples/concurrent_writers`](../examples/concurrent_writers/README.md) |
 | `gate()` orders side effects behind a fresh read (it orders effects; it does not roll back) | [`examples/effect_gate`](../examples/effect_gate/README.md) |
+| `gate()` holds an effect whose grant was reclaimed while the version never moved (revoked authority, not changed data) | [`examples/gate_effect_ordering`](../examples/gate_effect_ordering/README.md) |
 | Machine-checked TLA+ safety models (the CI-run specs and their named invariants) | [`formal/tla/`](../formal/tla/README.md) |
 
 Enforcement is single-host (one coordinator). Cross-host coordination is on the roadmap, demand-gated.
