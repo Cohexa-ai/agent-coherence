@@ -162,3 +162,12 @@ select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["E402", "E501", "E701", "E702", "E741", "F841"]
+# Every runnable example bootstraps ``sys.path``/``PYTHONPATH`` to the repo's
+# ``src`` BEFORE importing ``ccs``, so the demos run from a bare checkout — the
+# imports cannot move to the top of the file.
+"examples/**/*.py" = ["E402"]
+# ``examples/shared_codebase/fixture_repo`` is sample application code the demo
+# READS as data (a 4-agent review pipeline reviews it, and its bytes feed the
+# demo's token-savings arithmetic). Its unused imports and unsorted blocks are
+# representative of the real-world code under review, not lint debt to clean.
+"examples/shared_codebase/fixture_repo/**/*.py" = ["E401", "E402", "F401", "F841", "I001"]

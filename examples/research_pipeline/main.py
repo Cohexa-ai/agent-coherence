@@ -27,12 +27,15 @@ Run:
 from __future__ import annotations
 
 import json
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from langgraph.config import get_store as lg_get_store
 from langgraph.graph import END, START, StateGraph
 
 from ccs.adapters.ccsstore import CCSStore, StoreMetricEvent
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from langgraph.graph.state import CompiledStateGraph
 
 # ---------------------------------------------------------------------------
 # Shared artifact content
@@ -168,7 +171,6 @@ def run() -> None:
     get_events = [e for e in events if e.operation == "get"]
     put_events = [e for e in events if e.operation == "put"]
     hits = [e for e in get_events if e.cache_hit]
-    misses = [e for e in get_events if not e.cache_hit]
 
     content_tokens = max(1, len(json.dumps(BRIEF, separators=(",", ":"))) // 4)
     baseline_tokens = (len(put_events) + len(get_events)) * content_tokens
