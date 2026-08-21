@@ -733,3 +733,52 @@ def test_hold_cause_is_typed_per_class() -> None:
         assert exc.value.hold_cause == expected_cause, reads
     # A bare coordinator-raised StaleView carries no cause (uniform shape).
     assert StaleView("peer committed").hold_cause is None
+
+
+def test_gate_does_not_absolve_a_foreign_edit_it_never_showed_the_caller(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Python-API twin of the MCP surface's paired-write regression.
+
+    ``gate()`` makes TWO reads, and only the first is an observation: its bytes
+    go to ``decide()``, so seeding the foreign-edit baseline there is correct.
+    The boundary re-read is a VERIFICATION — it compares comparands and discards
+    the bytes — so it must leave the baseline alone. An out-of-band edit landing
+    between the two (the fixed-stale buffer below) is therefore one the caller
+    demonstrably never saw, and the caller's next write must still be denied.
+
+    Without ``observe=False`` on the boundary read the baseline advances to the
+    foreign bytes, the write-side guard sees them as already-observed, and the
+    agent silently clobbers an edit it was never shown — calling the safety
+    check making the NEXT write less safe than skipping it."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(REL, b"config-v1")
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            assert data == b"config-v1", "the caller observes v1, and only v1"
+            # FIXED-STALE BUFFER: an out-of-band editor lands AFTER the caller's
+            # observation and BEFORE the boundary re-read — deterministic, no sleep.
+            (tmp_path / REL).write_bytes(b"foreign-v2")
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(StaleView):
+            gate(vol, REL, decide=decide, effect=effect)
+        assert fired == []
+
+        # THE POINT: the caller was shown config-v1 and never foreign-v2, so the
+        # write-side foreign-edit guard must still fire.
+        with pytest.raises(StaleView):
+            vol.write(REL, b"agent-write")
+        assert (tmp_path / REL).read_bytes() == b"foreign-v2", (
+            "the foreign bytes must survive — the gate must not have laundered "
+            "an edit it read only to compare and then discarded"
+        )
+    finally:
+        stop_coordinator(tmp_path)
