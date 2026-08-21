@@ -51,13 +51,14 @@ vol.write("plans/plan.md", revised_plan)   # stale view? denied fail-closed → 
 
 ## What it guarantees
 
-Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all seven specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
+Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all eight specs in CI on every push, and every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
 
 | The silent failure | What happens instead | Mechanism | Invariant |
 |---|---|---|---|
 | **Stale-read overwrite** — an agent acts on an old snapshot and writes over a newer version (two sessions, one `plan.md`) | the write is **denied fail-closed**; the writer must `reacquire()` and read the current version | MESI single-writer ownership + invalidation | `SingleWriter`, `MonotonicVersion` |
 | **Concurrent lost update** — two writers hit the same key and both "succeed" | exactly one wins; the loser gets a **typed conflict + bounded retry**, never a silent drop | optimistic commit-CAS (`write_cas`) | `NoLostUpdate` |
 | **Reclaim-zombie write** — a stalled writer is reclaimed by crash recovery, wakes later, and lands its stale commit; the version never moved, so a version check passes | the commit is **rejected** with a typed `stale_read_generation` conflict | read-generation fence — reclamation bumps the artifact's ownership epoch, checked atomically at commit | `NoStaleApply` |
+| **Reclaim-zombie effect** — the same reclaimed writer's *escaping* effect (a webhook, a deploy, an opened PR) fires on a decision made under the revoked grant; the version never moved, so a version-only re-check passes | the effect is **held** (`StaleView`) at the effect boundary — versions equal, ownership generations apart | `gate()` re-validates a pair-atomic `(version, ownership generation)` snapshot before firing | `NoStaleAdmit` |
 | **Torn multi-artifact read (read-skew)** — an agent reads several artifacts one by one while a peer commits in between; each read was individually current, but the *combination* never coexisted | session reads serve from a **pinned consistent cut**; commits validate against the pinned base; a lapsed session **fails closed** with a typed rejection, never a silent fall-through to live state | [multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) | `NoReadSkewWithinCut`, `PinAlwaysRetained` |
 | **Dead owner blocks the fleet** — a crashed agent holds EXCLUSIVE forever | the heartbeat/TTL sweep reclaims the grant (on by default; best-effort, rate-limited) | crash-recovery sweep | sweep invariants I3–I6 |
 
@@ -92,7 +93,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - ⏪ [Workspace versioning & restore](#workspace-versioning--restore) — `WorkspaceVersioner`, checkpoint a mixed file + S3 workspace and bring it back with per-member honesty
 - 🛡️ [Foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) — catch out-of-band edits (a human, a formatter, a script) at the read/write boundary
 - 🔌 [MCP server](#mcp-server-stale-write-guard-fs) — `stale-write-guard-fs`, the same guarantee for any MCP client, no Python integration required
-- 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input version it decided from
+- 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input state — value and grant — it decided from
 - 📸 [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) — read several artifacts as one consistent cut; no torn reads
 - 📦 [Atomic multi-file publish](#atomic-multi-file-publish) — `atomic_publish`, land a set of files all-or-nothing; never a torn pair
 - 🧮 [Formal verification](formal/tla/README.md) — the TLA+ specs, invariant ↔ implementation map, mutant recipes
@@ -122,7 +123,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — the transport for invalidation signals; in-memory / in-process today (`InMemoryEventBus`). Networked transports (Redis, Kafka, NATS, gRPC) for a multi-host deployment are on the roadmap, demand-gated.
 
-Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, version retention's no-collected-read, the snapshot session's no-read-skew-within-cut, and workspace restore's no-partial-restore-registered — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all seven specs on every push and PR.
+Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, the effect gate's no-stale-admit, version retention's no-collected-read, the snapshot session's no-read-skew-within-cut, and workspace restore's no-partial-restore-registered — are model-checked with [TLA+/TLC](formal/tla/README.md). The `tla-check` CI job runs all eight specs on every push and PR.
 
 ## Coherent workspace: the data plane for shared files
 
@@ -168,7 +169,7 @@ fresh = vol.reacquire("plans/plan.md")  # recover: fresh read, re-derive, re-wri
 
 ## MCP server: `stale-write-guard-fs`
 
-The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as five tools:
+The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as six tools:
 
 ```bash
 pip install "agent-coherence[mcp]"
@@ -191,6 +192,7 @@ pip install "agent-coherence[mcp]"
 | `swg_write` | Guarded write — a stale view or a foreign edit gets a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery — fresh identity + mandatory fresh read after a deny |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
 The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory; the whole workspace is guarded unless `SWG_MANAGED` — a comma-separated glob list — narrows it), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).
@@ -199,7 +201,7 @@ The server binds one workspace per session (`SWG_ROOT`, defaulting to its workin
 
 ## Effect-ordering gate
 
-Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a shell command) computed from inputs they read earlier. If the input moved in between, the effect fires on stale state. `gate()` narrows that window: it captures the input's version at decision time, re-reads at the effect boundary, and fires only if the input is unchanged at that re-read — otherwise it holds the effect before it runs.
+Agents don't only overwrite files — they fire *effects* (a deploy, a PR, a shell command) computed from inputs they read earlier. If the input moved in between, the effect fires on stale state. `gate()` narrows that window: it captures the input's `(version, ownership generation)` pair at decision time, re-reads the pair at the effect boundary, and fires only if **both** are unchanged at that re-read — otherwise it holds the effect before it runs. The two comparands catch different failures: the version catches a peer that changed the input; the generation catches a coordinator sweep that reclaimed the grant the input was read under while the bytes never moved — a stalled agent whose lease lapsed mid-decision would otherwise fire its effect on revoked authority, with the version check none the wiser.
 
 ```python
 from ccs.adapters import CoherentVolume, gate
@@ -213,7 +215,7 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 
 It's plain Python, so the same call drops into a LangGraph node, a CrewAI task, or a raw script unchanged.
 
-**Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a [snapshot-session](#multi-artifact-snapshot-sessions) operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it catches.
+**Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. Both comparands are fail-closed: an unconfirmed version (degraded read) or an unconfirmed generation (a strict-mode deny, or an older coordinator daemon from before this release's generation reporting) HOLDs rather than firing. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a [snapshot-session](#multi-artifact-snapshot-sessions) operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it catches; `python -m examples.gate_effect_ordering.main` adds the reclaimed-lease act (version unchanged, authority revoked, deploy held).
 
 ## Multi-artifact snapshot sessions
 

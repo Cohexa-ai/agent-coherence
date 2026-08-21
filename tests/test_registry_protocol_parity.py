@@ -57,6 +57,7 @@ BASE_METHODS = frozenset(
         "get_agent_state",
         "get_agent_transient",
         "get_artifact",
+        "get_artifact_and_generation",
         "get_checkpoint",
         "get_checkpoint_members",
         "get_content",

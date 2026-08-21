@@ -3451,3 +3451,140 @@ def test_l5_idle_and_uptime_use_monotonic_immune_to_wall_clock(
         srv.mark_request()
         clock["t"] = 1105.0
         assert srv.idle_seconds == 5.0
+
+
+# ----------------------------------------------------------------------
+# /hooks/pre-read — want_owner_generation opt-in (the effect gate's
+# pair-consistent comparand read). Absent the flag, every shipped shape is
+# byte-unchanged (pinned by the exact-dict tests above).
+# ----------------------------------------------------------------------
+
+
+def test_pre_read_want_owner_generation_fresh_carries_pair(client: _Client) -> None:
+    """The opt-in fresh response carries (version, owner_generation) from ONE
+    registry snapshot; first observation seeds v1 at generation 0."""
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen1"), "path": "CLAUDE.md",
+         "content_hash": _hash("abc"), "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+
+
+def test_pre_read_want_owner_generation_valid_grant_carries_pair(client: _Client) -> None:
+    """The already-granted fresh branch (not just first observation) also
+    carries the pair on opt-in."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("gen2"), "path": "CLAUDE.md", "content_hash": _hash("h1")})
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen2"), "path": "CLAUDE.md",
+         "content_hash": _hash("h1"), "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+
+
+def test_pre_read_want_owner_generation_stale_after_reclaim_shows_moved_epoch(
+    coordinator, client: _Client
+) -> None:
+    """THE zombie re-validation read: a sweep reclaimed this session's grant, so
+    the warn-stale response carries the SAME version but an ADVANCED
+    owner_generation — the drift a version-only comparand cannot see."""
+    sid = _sid("gen-zombie")
+    status, _ = client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert status == 200
+    reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+    )
+    assert reclaimed == 1, "sweep should have reclaimed exactly one M/E grant"
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "plan.md", "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert body["owner_generation"] == 1  # the reclaim bumped the epoch
+    # The generation rides top-level; the VERSION comparand stays the one this
+    # response was classified from (summary.current_version) — the attach never
+    # overwrites it with a later snapshot.
+    assert "version" not in body
+    assert body["summary"]["current_version"] == 1  # the version did NOT move
+
+
+def test_pre_read_stale_without_flag_omits_generation_keys(
+    coordinator, client: _Client
+) -> None:
+    """No opt-in → the shipped warn-stale envelope is untouched: neither the
+    top-level version nor owner_generation appears."""
+    sid = _sid("gen-noflag")
+    status, _ = client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert status == 200
+    coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+    )
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "plan.md"},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert "owner_generation" not in body
+    assert "version" not in body
+
+
+def test_pre_read_want_owner_generation_untracked_fastpath_unchanged(
+    client: _Client,
+) -> None:
+    """The untracked fast-path never consults the registry, flag or no flag —
+    no pair to attach, and the exact two-field shape stays."""
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen3"), "path": "untracked.bin",
+         "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_pre_read_pair_comes_from_the_classifying_snapshot(
+    coordinator, client: _Client
+) -> None:
+    """The reported generation must belong to the SAME snapshot as the version
+    the response was classified from — never a later read a peer commit could
+    slip past. That is now structural: one ``get_artifact_and_generation`` call
+    backs both, so there is no second read to race. This pins the property
+    directly by making the ONLY registry pair-read observably atomic, and
+    asserting the handler never reaches for a second one.
+
+    (This replaces an earlier guard that tolerated the two-read shape by
+    discarding a mismatched pair; folding the reads made that window
+    unrepresentable rather than merely detected.)"""
+    sid = _sid("pair-snapshot")
+    reads: list[str] = []
+    real_pair = coordinator.registry.get_artifact_and_generation
+
+    def counting_pair(aid):
+        reads.append("pair")
+        return real_pair(aid)
+
+    coordinator.registry.get_artifact_and_generation = counting_pair  # type: ignore[method-assign]
+    try:
+        status, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("v1"),
+             "want_owner_generation": True},
+        )
+    finally:
+        coordinator.registry.get_artifact_and_generation = real_pair  # type: ignore[method-assign]
+
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+    assert len(reads) == 1, (
+        "the handler must derive the classification version AND the reported "
+        f"generation from ONE pair-atomic read; saw {len(reads)}"
+    )

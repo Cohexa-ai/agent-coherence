@@ -1425,6 +1425,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     session_id = body.get("session_id")
     path = body.get("path", "")
     content_hash = body.get("content_hash") or None
+    # Effect-gate opt-in: a truthy ``want_owner_generation`` asks the fresh and
+    # warn-stale responses to carry the pair-consistent
+    # ``(version, owner_generation)``. Absent (every shipped client), the
+    # response shapes below are byte-unchanged.
+    want_generation = bool(body.get("want_owner_generation"))
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -1471,8 +1476,18 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # Unit 6: surface the version so an OCC writer can source
             # ``expected_version`` for a later ``post-edit-cas`` (additive —
             # status-based clients ignore it). First observation seeds v1.
-            seeded = coordinator.registry.get_artifact(artifact_id)
-            return {"status": "fresh", "version": seeded.version if seeded else 1}
+            seeded_pair = coordinator.registry.get_artifact_and_generation(
+                artifact_id
+            )
+            seeded_version = seeded_pair[0].version if seeded_pair else 1
+            first: dict[str, Any] = {"status": "fresh", "version": seeded_version}
+            # The generation rides the SAME snapshot as the version it is
+            # reported beside (opt-in only, so shipped shapes stay
+            # byte-identical) — never a second read a peer commit could
+            # overtake.
+            if want_generation and seeded_pair is not None:
+                first["owner_generation"] = seeded_pair[1]
+            return first
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the
@@ -1481,7 +1496,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if coordinator.consume_stale_marker(agent_id, artifact_id):
             coordinator.increment_stale_warning_reread()
 
-        artifact = coordinator.registry.get_artifact(artifact_id)
+        # ONE pair-atomic read backs BOTH the branch classification (version,
+        # content hash) and the ownership generation reported alongside it, so
+        # the comparand pair a caller receives is the very snapshot this
+        # response was classified from. Reading them separately is what let a
+        # peer commit slip between the two and hand back a version newer than
+        # the bytes and grant the response answers for.
+        artifact_pair = coordinator.registry.get_artifact_and_generation(artifact_id)
+        artifact = artifact_pair[0] if artifact_pair else None
+        owner_generation = artifact_pair[1] if artifact_pair else None
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
         if agent_state is not None and agent_state != MESIState.INVALID:
@@ -1558,6 +1581,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                             source="pre_read_shared_hash_deny",
                         )
                 fresh["hash_differs"] = True
+            if want_generation and owner_generation is not None:
+                fresh["owner_generation"] = owner_generation
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
@@ -1662,6 +1687,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             trigger="post_stale_read", tick=now, content_hash=content_hash,
         )
         resp = _payloads.build_stale_response(summary)
+        if want_generation and owner_generation is not None:
+            # The effect gate re-validates through THIS path after a sweep
+            # reclaim (the zombie's re-read is warn-stale with the version
+            # unchanged) — the attached generation is what lets it see the epoch
+            # moved even though the version did not. It shares the snapshot that
+            # produced summary.current_version, so the pair cannot disagree.
+            resp["owner_generation"] = owner_generation
         # KTD-J (Unit 8): bump the stale-warning emission counter +
         # mark the pair so a follow-up pre-read counts as a re-read.
         coordinator.increment_stale_warning_emitted()

@@ -8,6 +8,70 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **`swg_gate` — the effect fence on the MCP tool surface.** The
+  `stale-write-guard-fs` server gains a sixth tool, closing the same
+  reclaim-zombie hole for agents that speak MCP instead of Python. `gate()`
+  itself cannot be a tool — its `decide`/`effect` are Python callables, while an
+  MCP agent's decision and effect happen between tool calls, outside the
+  process. So the agent carries the `(version, owner_generation)` pair its
+  `swg_read` now returns and calls `swg_gate(path, expected_version,
+  expected_generation)` immediately before anything irreversible (a webhook, a
+  deploy, an opened PR, a posted message). It answers `decision: "proceed"`, or
+  DENIES with the surface's existing `reason: "stale_view"` vocabulary when the
+  value moved, when the grant the agent read under was reclaimed (the version
+  alone cannot see that), or when either comparand is unconfirmed. The deny
+  also carries a typed `hold_cause` naming WHICH class fired, so an agent
+  branches on a value rather than on prose. Omitting the generation comparand
+  is refused as its own typed agent error rather than a retryable deny, so a
+  cooperating agent cannot loop on advice that could never clear. Same honest boundary as the
+  Python gate: the verdict is true as of that call, and the dispatch after it
+  is still the agent's own step. `swg_read`'s added `owner_generation` field is
+  additive; every other tool is byte-unchanged.
+
+### Fixed
+
+- **`gate()` now HOLDs when the grant its input was read under is gone — not
+  only when the version moved.** The effect-ordering wrapper's re-validation
+  compared versions alone, and the version answers only "is the value still
+  the one `decide` saw" — it never asks "is the grant it was read under still
+  standing". A coordinator sweep that reclaims a stalled holder's grant
+  advances the artifact's ownership generation **without** a version move, so
+  a reclaimed (zombie) holder's escaping effect — the webhook, the deploy,
+  the opened PR — fired straight through the gate on revoked authority; in
+  strict mode it even fired through the deny (the deny's summary still
+  carried the unchanged version, and the denied-read marker was discarded).
+  This is the same distinction the v0.9.1 read-generation fence already draws
+  at the commit seam, now applied at the effect boundary. `gate()` captures
+  the `(version, owner_generation)` pair at decision time — one pair-atomic
+  registry snapshot (`get_artifact_and_generation`, on both registry arms), so
+  a concurrent sweep can never tear it — re-reads the pair at the boundary,
+  and HOLDs if **either** moved. Fail-closed on both comparands: an
+  unconfirmed version (`0`, degraded) or an unconfirmed generation (`None` —
+  a strict deny, a degraded read, or an older coordinator daemon from before
+  this fix) HOLDs loudly instead of reverting to the generation-blind check.
+  `StaleView` now carries `expected_generation` / `current_generation`
+  alongside the version pair (all default `None`), and the reclaim HOLD is
+  recognizable: versions equal, generations apart ("grant reclaimed …
+  version unchanged"), and every HOLD class carries a typed `hold_cause` so a
+  caller branches on a value rather than on prose. The causes are honest about
+  their own limits: five are specific and recoverable, while
+  `generation_unconfirmed` is the residual bucket — retry first, and let a HOLD
+  that survives a successful `reacquire()` be what points at the daemon. The pre-read response carries the pair only on the new
+  `want_owner_generation` request opt-in — every shipped response shape is
+  byte-unchanged for exact-shape status clients. Model-checked:
+  `formal/tla/EffectGate.tla` proves `NoStaleAdmit` (the gate never admits an
+  effect whose captured pair had moved as of the re-validate read — scoped to
+  the re-validate point; the residual re-validate→fire window stays
+  disclaimed and model-visible). Surfaced by an external practitioner running
+  a step-granular bounded read fence; the v0.11.0 entry's "orders effects on
+  the inputs they were computed from" was honest only about the value axis,
+  never the authority axis. Run it:
+  `python -m examples.gate_effect_ordering.main` (the reclaimed-lease act:
+  version unchanged, authority revoked, deploy held). Docs: guide § `gate()`;
+  README § Effect-ordering gate.
+
+### Added
+
 - **Workspace versioning & restore — `WorkspaceVersioner` checkpoint +
   restore over heterogeneous members.** Checkpoint a workspace whose members
   live in different backends — files (via the coordinator's version

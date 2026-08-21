@@ -331,6 +331,42 @@ class ArtifactRegistry:
         not the fence, arbitrates)."""
         return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> tuple[Artifact, int] | None:
+        """Return ``(artifact, owner_generation)`` as one pair-consistent
+        snapshot, or None when the artifact is absent.
+
+        This registry is lock-free by contract (GIL per-access atomicity), so
+        the pair is stitched with a seqlock on ``owner_generation``: within the
+        life of one record the generation only ever increments (reclaims bump
+        it; nothing decrements or resets it), so if it reads equal on both sides
+        of the artifact read, the returned pair coexisted at the instant the
+        artifact was read — a concurrent sweep bump retries rather than tearing
+        the pair. ``record.artifact`` is a frozen dataclass swapped wholesale on
+        a version move, so reading it is itself one atomic access.
+
+        Scope of that no-ABA property: it holds for a LIVE record, which is what
+        the seqlock needs. It is NOT an identity guarantee across the record's
+        lifetime — deleting an artifact and re-registering the same name mints a
+        fresh record back at ``(version=1, owner_generation=0)``, so a comparand
+        pair captured before such a cycle can numerically match one read after
+        it. Callers comparing pairs across a window (see
+        ``adapters.effect_gate.gate``) inherit that boundary; it is unchanged
+        from the version-only comparand that preceded the generation leg. Note
+        the cycle needs an actual delete: no HTTP route, MCP tool, or CLI verb
+        wires ``CoordinatorService.delete``, so none of the surfaces the gate
+        runs over can drive it — but the in-process ``CCSStore.delete()`` can,
+        so it is a reachable boundary, not an impossible one."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        while True:
+            generation = record.owner_generation
+            artifact = record.artifact
+            if record.owner_generation == generation:
+                return artifact, generation
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,

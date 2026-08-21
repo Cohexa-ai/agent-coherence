@@ -41,6 +41,14 @@ def _register(reg) -> Artifact:
     return art
 
 
+def _pair(reg, artifact_id) -> tuple[int, int]:
+    """(version, owner_generation) from the one pair-atomic accessor."""
+    got = reg.get_artifact_and_generation(artifact_id)
+    assert got is not None
+    artifact, generation = got
+    return artifact.version, generation
+
+
 def test_parity_owner_generation_bumps_on_reclaim_only(registry) -> None:
     reg = registry
     art = _register(reg)
@@ -196,3 +204,27 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     # The MWB transient is cleared (not leaked) and no phantom bump landed.
     assert reg.get_agent_transient(art.id, a) is None
     assert reg.get_artifact(art.id).version == 1
+
+
+def test_parity_version_and_generation_is_one_pair(registry) -> None:
+    """``get_artifact_and_generation`` returns the pair the effect gate compares:
+    a sweep reclamation moves ONLY the generation leg (the shape a version-only
+    comparand cannot see), a commit moves ONLY the version leg, and an unknown
+    artifact raises KeyError like the sibling fence accessors."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    assert _pair(reg, art.id) == (1, 0)
+    # Sweep reclamation: generation bumps, version stays put.
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    reg.set_agent_state(
+        art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10
+    )
+    assert _pair(reg, art.id) == (1, 1)
+    # A committed write: version bumps, generation stays put. The committer
+    # re-acquires first so its captured claim matches the current epoch.
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=11)
+    res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
+    assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
+    assert _pair(reg, art.id) == (2, 1)
+    assert reg.get_artifact_and_generation(uuid4()) is None

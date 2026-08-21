@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 57-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 58-member ``RegistryBase`` + ``SqliteExtended``
 Protocols), this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
@@ -109,7 +109,7 @@ class MemberContract:
     rationale: str
 
 
-# The 57 members of RegistryBase (43 methods + 1 property) and SqliteExtended
+# The 58 members of RegistryBase (44 methods + 1 property) and SqliteExtended
 # (+13 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
@@ -400,6 +400,16 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / set_artifact_and_content.",
     ),
     MemberContract(
+        "get_artifact_and_generation",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads an artifact together with the per-artifact fence counter as ONE "
+        "snapshot. Non-mutating, but carries a consistency obligation beyond "
+        "plain READ_ONLY: the two values must have coexisted, since a backend "
+        "serving them as two reads lets a sweep reclaim tear the pair and "
+        "silently reopens the reclaim-zombie EFFECT hole in adapters.effect_gate.",
+    ),
+    MemberContract(
         "granted_at_tick",
         MemberClass.READ_ONLY,
         "base",
@@ -584,7 +594,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 57-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 58-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

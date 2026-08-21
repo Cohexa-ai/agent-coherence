@@ -1,6 +1,6 @@
 # TLA+ Formal Verification
 
-TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, bounded version retention with read-at-version, consistent multi-artifact snapshot sessions, atomic multi-artifact publish, and workspace-restore registration.
+TLC model checking for the MESI coherence protocol, its crash-recovery extension, the optimistic commit-CAS (OCC), the read-generation fence, the effect-ordering gate, bounded version retention with read-at-version, consistent multi-artifact snapshot sessions, atomic multi-artifact publish, and workspace-restore registration.
 
 ## What is modeled
 
@@ -13,6 +13,7 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 - **Reclamation slot lifecycle** — slot preserved through I→S, cleared on I→M∪E re-acquire.
 - **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to `commit_cas` in `src/ccs/coordinator/`.
 - **Read-generation fence (Fencing)** — a per-artifact ownership epoch (`ownerGeneration`) bumped atomically on every sweep reclamation, captured into `readGeneration` when an agent establishes its write-claim (`ObserveGenAction` — deliberately decoupled so the sweep can interleave between capture and commit), and enforced by a generation-guarded commit (`FencingCommitAction`): a writer whose captured generation was superseded by a reclamation is rejected even when the version is unchanged — the reclaim-zombie write the version CAS cannot see. Corresponds to `owner_generation` / `read_generation` in `src/ccs/coordinator/`.
+- **Effect-ordering gate (EffectGate)** — the builder-facing `gate()` wrapper modeled over the fence world: a per-artifact gate machine captures the `(version, ownerGeneration)` pair at decision time (`EffectDecideAction` — one atomic read, matching the registry's pair-atomic `get_artifact_and_generation`), re-validates it at the effect boundary (`EffectAdmitAction`, guarded on BOTH comparands), HOLDs on a moved pair (`EffectHoldAction`), and fires from an unguarded separate action (`EffectFireAction`) — the admit/fire split keeps the disclaimed re-validate→fire residual window model-visible instead of proving it away. Proves `NoStaleAdmit`: the gate never admits an effect whose captured pair had moved as of the re-validate read — in particular the reclaim case, where a sweep bumps the generation while the version never moves. Two exact abstractions keep it CI-convergent: moved-since-capture (a boolean; both comparands are monotonic, so equality-with-captured IS unchanged-since-capture — no ABA) instead of concrete captured values, and one gate machine per artifact (the admit consults only per-artifact registry state; the caller's identity never enters the check). Corresponds to `gate()` in `src/ccs/adapters/effect_gate.py`.
 - **Bounded version retention + read-at-version (Retention)** — a per-artifact K-bounded history of committed versions (`history`, content abstracted as the version number), extended and garbage-collected atomically inside the fence-guarded commit (`RetentionCommitAction` — commit + retain + K-GC are one action, mirroring the same-transaction capture discipline), plus an off-protocol read-at-version request (`VersionedReadAction`) proven to be a protocol no-op. Every inherited invariant is re-checked with retention composed in — safety **preservation**, not behavioral equivalence (no refinement mapping). Corresponds to the retention capture points and `CoordinatorService.read_at_version`.
 - **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — atomic multi-artifact *publish* is modeled separately in `AtomicPublish.tla` (below). The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer.
 - **Atomic multi-artifact publish (AtomicPublish)** — a write-set-quantified commit action (no other spec in the chain has one; all inherited commits are single-`(agent, artifact)`): a batch of members either all advance to their next version atomically or none do (`NoPartialPublish`), and no peer observes an INVALID for a member of a batch that did not commit (broadcast-after-commit). `EXTENDS OCC` — the write race lives in the version-CAS, which keeps the state space lighter than extending Snapshot. Corresponds to `commit_all` in `src/ccs/coordinator/`. **Held out of the `make tla-check` CI sweep:** the write-set state space (≈ 2^|Artifacts| × MaxVersion^|Artifacts|) exceeds the 5-minute CI budget on the reference machine; the spec parses and the invariant is checkable on a smaller/longer local run, with CI-budget convergence tuning tracked as a follow-up.
@@ -52,6 +53,9 @@ formal/tla/
 ├── Fencing.tla             # amendment: EXTENDS CrashRecovery, adds the read-generation fence
 ├── Fencing.cfg             # TLC config: 3 agents (local deep runs)
 ├── Fencing_CI.cfg          # TLC config: 2 agents (CI, fits 5-min budget)
+├── EffectGate.tla          # amendment: EXTENDS Fencing, adds the effect-ordering gate machine
+├── EffectGate.cfg          # TLC config: 3 agents (local deep runs)
+├── EffectGate_CI.cfg       # TLC config: 2 agents, MaxTicks=3, HeartbeatTimeout=1 (CI; see budget notes)
 ├── Retention.tla           # amendment: EXTENDS Fencing, adds bounded retention + read-at-version
 ├── Retention.cfg           # TLC config: 3 agents (local deep runs)
 ├── Retention_CI.cfg        # TLC config: 2 agents, MaxRetained=2 (CI, fits 5-min budget)
@@ -104,16 +108,18 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 
 | ID | TLA+ Name | Checked In | Description |
 |----|-----------|-----------|-------------|
-| I1 | `SingleWriter` | All six | At most one agent holds M∪E per artifact |
-| I2 | `MonotonicVersion` | All six | Artifact version never decreases (≥ 1) |
-| — | `TypeOK` / `CRTypeOK` / `OCCTypeOK` / `FencingTypeOK` / `RetentionTypeOK` / `SnapshotTypeOK` | All six | State variables have correct types and bounds (Retention pins the history domain ⊆ `1..MaxVersion`, row count ≤ `MaxRetained`, and the marker-is-the-version abstraction; Snapshot relaxes the row-count bound to `MaxRetained + |Sessions|` for the exemptions seam and types the session vars) |
+| I1 | `SingleWriter` | All seven | At most one agent holds M∪E per artifact |
+| I2 | `MonotonicVersion` | All seven | Artifact version never decreases (≥ 1) |
+| — | `TypeOK` / `CRTypeOK` / `OCCTypeOK` / `FencingTypeOK` / `EffectGateTypeOK` / `RetentionTypeOK` / `SnapshotTypeOK` | All seven | State variables have correct types and bounds (Retention pins the history domain ⊆ `1..MaxVersion`, row count ≤ `MaxRetained`, and the marker-is-the-version abstraction; Snapshot relaxes the row-count bound to `MaxRetained + |Sessions|` for the exemptions seam and types the session vars) |
 | I3 | `SweepExclusivity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | No (agent, artifact) reclaimed twice in one tick |
 | I4 | `TriggerExclusivity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | Each reclamation has exactly one trigger |
 | I5 | `TickMonotonicity` | CrashRecovery, OCC, Fencing, Retention, Snapshot | `lastHeartbeat` never decreases |
 | I6 | `SlotPreservedThroughSHARED` | CrashRecovery, OCC, Fencing, Retention, Snapshot | Reclamation slot persists across I→S, cleared only on I→M∪E |
 | — | `NoLostUpdate` | OCC | No successful `commit_cas` ever landed on a stale observed version — the concurrent lost-update is prevented |
-| — | `ReadGenBounded` | Fencing, Retention, Snapshot | A captured read-generation never exceeds the artifact's current ownership epoch |
-| — | `NoStaleApply` | Fencing, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
+| — | `ReadGenBounded` | Fencing, EffectGate, Retention, Snapshot | A captured read-generation never exceeds the artifact's current ownership epoch |
+| — | `NoStaleApply` | Fencing, EffectGate, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
+| — | `NoStaleAdmit` | EffectGate | The effect gate never ADMITS an escaping effect whose captured `(version, ownerGeneration)` pair had moved as of the re-validate read — the reclaim-zombie *effect* (generation moved, version unchanged) is held. Scoped to the re-validate point; the admit→fire residual window is deliberately unguarded and model-visible (recipe 15 gives it teeth) |
+| — | `PairMovedScoped` | EffectGate | Canonicalization sanity: the moved-since-capture flag is FALSE outside the decided window, so the abstraction adds no spurious state |
 | — | `NoCollectedRead` | Retention, Snapshot | No versioned read ever observed a hole inside the promised K-window strictly below the current version — the GC never collects what the bounded-retention contract promises (current version included, by construction) |
 | — | `ReadAtVersionIsProtocolNoOp` | Retention (action property, cfg `PROPERTY`) | `[][VersionedReadAction => UNCHANGED fenceVars]_retentionVars` — any transition satisfying the read action changes no MESI/crash-recovery/fence variable. A state invariant cannot express this: a fence-refreshing read is extensionally identical to a legitimate `ObserveGenAction`, so only an action-level check can catch it |
 | — | `NoReadSkewWithinCut` | Snapshot | No commit ever interleaved a partially-captured session — every session reads a coherent multi-artifact cut. Atomic capture makes a partial cut unreachable (vacuous-TRUE in the correct spec); the split mutant (recipe 9) gives it teeth — the `staleApply`/`collectedRead` sticky-flag idiom |
@@ -124,7 +130,7 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `NoVersionRegression` | WorkspaceVersion | A restored member's coordinator version strictly increases while carrying OLD bytes (restore-as-forward-commit) — never a decrement; mirrors `check_monotonic_version` defense-in-depth (recipe 14 gives it teeth) |
 | — | `ExactlyOnceRegistration` | WorkspaceVersion | No registration commit ever re-bumped a member already at its manifest fingerprint — the `registered` marker ∨ the hash filter covers every crash window, incl. crash-after-commit-before-marker and crash-after-marker-before-conclude (recipe 13 gives it teeth) |
 
-"All six" above = the MESI-chain specs (`MESI_Standalone` … `Snapshot`); `WorkspaceVersion` is a **standalone** module (see its base-choice header) with its own type/monotonicity analogs, listed separately.
+"All seven" above = the MESI-chain specs (`MESI_Standalone` … `Snapshot`, plus `EffectGate` off the Fencing branch); `WorkspaceVersion` is a **standalone** module (see its base-choice header) with its own type/monotonicity analogs, listed separately.
 
 I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 
@@ -148,6 +154,10 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `FencingSweepAction` | the `owner_generation` bump on reclaim triggers in `set_agent_state` |
 | `FencingCommitAction` | the generation guard in `commit_cas` + `set_artifact_and_content(fence_agent_id=…)` |
 | `NoStaleApply` | dual-registry parity + regression suite (`tests/test_fencing.py`) |
+| `EffectDecideAction` | `gate()`'s decision read — `CoherentVolume.read_with_version_generation()` → registry `get_artifact_and_generation()` (one pair-atomic snapshot on both registry arms) |
+| `EffectAdmitAction` / `EffectHoldAction` | `gate()`'s effect-boundary re-read + pair comparison; the HOLD is the raised `StaleView` carrying the version and generation drift |
+| `EffectFireAction` | `effect(decision)` after the admit — the disclaimed residual re-validate→fire window (unguarded in the model on purpose) |
+| `NoStaleAdmit` | the wrapper regression suite (`tests/adapters/test_effect_gate_wrapper.py`: the strict fire-through-deny leg and the warn moved-epoch leg) |
 | `RetentionCommitAction` | the version-bumping registry capture points — `set_artifact_and_content` and `commit_cas` WIN — retaining + inline K-GC (`collectible_versions`) in the same transaction / apply step as the commit; `register_artifact`'s capture is the model's initial state |
 | `VersionedReadAction` | `CoordinatorService.read_at_version()` — off-protocol read; never calls `set_agent_state`/`set_agent_transient`, so no fence capture and no MESI transition |
 | `NoCollectedRead` | bounded-retention parity suite (`tests/test_retention.py`) |
@@ -205,6 +215,8 @@ quick check: measured ≥95M distinct states (703M generated, queue still growin
 the true size of `Fencing.cfg`'s local space.
 
 Snapshot **inverts** the usual CI shape — **1 agent × 2 artifacts** (the other CI specs are 2 agents × 1 artifact). Read skew is a cross-artifact phenomenon, so ≥ 2 artifacts is mandatory; the agent-contention re-check of the inherited fence invariants is already discharged by the other specs and by the local `Snapshot.cfg` (2 agents). The CI config also disables the sweep (`HeartbeatTimeout` > `MaxTicks`) — the session machinery is fence-uniform and adds no sweep interaction, so suppressing it keeps the run to ~18s without losing Snapshot-specific coverage. The local `Snapshot.cfg` (2 agents, `MaxTicks=4`, sweeps on) is the deep composition check and the home for the mutant recipes.
+
+EffectGate multiplies Fencing's space by the gate machine (5 phases × the moved-flag), so its CI config **tightens the tick horizon instead of dropping coverage**: `MaxTicks=3, HeartbeatTimeout=1, MaxHoldTicks=2` keeps every hazard reachable — the mutant (recipe 15) still finds the reclaim-between-capture-and-admit trace in ~1s, which is the reachability proof — while the correct spec converges at 40,015,043 generated / 3,724,900 distinct states in ~1min40s on 8 cores (measured 2026-08-20). The naive encoding with concrete captured comparands diverges (>80M distinct, queue still growing); the moved-since-capture abstraction in the spec header is what makes the spec checkable at all. The local `EffectGate.cfg` (3 agents, `MaxTicks=6`) is overnight-class.
 
 CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=6) to fit the budget.
 The full 3-agent config (`CrashRecovery.cfg`) is for local deep runs:
@@ -353,9 +365,18 @@ and confirm TLC finds a counterexample:
    discipline (`check_monotonic_version`) excludes. (Verified 2026-08-09:
    violation found in ~1s, 74,767 states generated.)
 
+15. **NoStaleAdmit mutation (admit a moved pair)**: In `EffectGate.tla`, delete
+    the `/\ ~pairMoved[art]` guard conjunct from `EffectAdmitAction` (so a gate
+    whose captured `(version, ownerGeneration)` pair moved can still admit).
+    Run TLC on `EffectGate_CI.cfg`. TLC should fail with a `NoStaleAdmit`
+    violation, showing a trace where a sweep reclamation (or a peer commit)
+    lands between the decide capture and the admit and the effect is admitted
+    anyway. (Verified 2026-08-20: violation found in ~1s, 879 distinct states.)
+
 These mutations are run manually during development to validate TLC's
 bug-detection capability. The mutated files are not committed. Recipes 5–10
 run TLC directly on their amendment's CI config (`Retention_CI.cfg` /
 `Snapshot_CI.cfg`); recipe 11 runs on `AtomicPublish.cfg`; recipes 12–14 run
-on `WorkspaceVersion_CI.cfg`. Mutating one amendment cannot affect the other
-specs, so the full `make tla-check` adds nothing.
+on `WorkspaceVersion_CI.cfg`; recipe 15 runs on `EffectGate_CI.cfg`. Mutating
+one amendment cannot affect the other specs, so the full `make tla-check` adds
+nothing.

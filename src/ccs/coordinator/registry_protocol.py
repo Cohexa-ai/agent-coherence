@@ -315,6 +315,20 @@ class RegistryBase(Protocol):
     def get_transient_tick(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         ...
 
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> "tuple[Artifact, int] | None":
+        """Return ``(artifact, owner_generation)`` from ONE snapshot, or None if
+        the artifact is absent. The pair MUST have coexisted at a single
+        instant: a backend serving it as two independent reads lets a concurrent
+        sweep reclamation (which bumps the generation WITHOUT a version move)
+        tear the pair, silently reopening the reclaim-zombie EFFECT hole
+        downstream (see ``adapters.effect_gate``). Any caller needing a
+        version and its ownership epoch together must use this, never two
+        separate accessors.
+        """
+        ...
+
     def get_version_record(
         self, artifact_id: UUID, version: int
     ) -> tuple[str | bytes, float] | None:
