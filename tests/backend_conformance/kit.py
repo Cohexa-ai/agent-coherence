@@ -403,8 +403,16 @@ def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None
     assert updated.version == 2, "the admitted OCC writer must WIN and bump the version"
 
 
+def _pair_of(reg: object, artifact_id: UUID) -> tuple[int, int]:
+    """``(version, owner_generation)`` via the one pair-atomic accessor."""
+    got = reg.get_artifact_and_generation(artifact_id)  # type: ignore[attr-defined]
+    assert got is not None, "artifact vanished mid-scenario"
+    artifact, generation = got
+    return artifact.version, generation
+
+
 def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -> None:
-    """Pair-atomicity of ``get_version_and_generation`` (MUST-MATCH). The
+    """Pair-atomicity of ``get_artifact_and_generation`` (MUST-MATCH). The
     member's contract obliges a SINGLE-INSTANT snapshot: the two values must
     have coexisted, so a concurrent sweep reclaim (which moves the generation
     WITHOUT moving the version) can never tear the pair. A backend that serves
@@ -450,13 +458,21 @@ def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -
             artifact_id, agent, MESIState.INVALID, trigger=_RECLAIM_TRIGGER,
             tick=round_index,
         )
+        # Re-check the alternation EVERY round, via the single-value accessors
+        # rather than the pair read under test -- those cannot tear, so a
+        # backend whose transition semantics differ fails here as an explicit
+        # PRECONDITION error instead of being misreported as a torn pair.
+        seen_version = reg.get_artifact(artifact_id).version  # type: ignore[union-attr]
+        seen_generation = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+        assert (seen_version, seen_generation) == (round_index + 2, round_index + 1), (
+            "scenario precondition: each round must move BOTH legs exactly once "
+            "(a commit bumps the version, a sweep-class reclaim bumps the "
+            f"generation); round {round_index} left the artifact at "
+            f"({seen_version}, {seen_generation})"
+        )
 
-    assert reg.get_version_and_generation(artifact_id) == (1, 0)  # type: ignore[attr-defined]
+    assert _pair_of(reg, artifact_id) == (1, 0)
     advance(0)
-    assert reg.get_version_and_generation(artifact_id) == (2, 1), (  # type: ignore[attr-defined]
-        "scenario precondition: one round must move BOTH legs exactly once "
-        "(commit bumps the version, a sweep-class reclaim bumps the generation)"
-    )
 
     # Feedback coupling, not a fixed round count: the mutator keeps advancing
     # until the observer has finished ALL its reads, so every observed read
@@ -481,7 +497,7 @@ def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -
     def observe() -> None:
         try:
             for _ in range(observer_reads):
-                version, generation = reg.get_version_and_generation(artifact_id)  # type: ignore[attr-defined]
+                version, generation = _pair_of(reg, artifact_id)
                 if version - generation not in (1, 2):
                     torn.append((version, generation))
         except BaseException as exc:  # pragma: no cover - surfaced below
@@ -498,12 +514,13 @@ def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -
     if errors:
         raise errors[0]
     assert not torn, (
-        "get_version_and_generation returned a TORN pair — the two values never "
+        "get_artifact_and_generation returned a TORN pair — the two values never "
         "coexisted. The mutator alternates commit/reclaim from (1, 0), so "
         f"version - generation must stay in {{1, 2}}; observed {torn[:5]}. A "
         "backend must serve this member as ONE atomic snapshot (a single row "
         "read under the write lock, or an equivalent seqlock), never two reads."
     )
+
 
 def assert_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:
     """Session fail-closed refusals (MUST-MATCH). Two typed refusals a conforming

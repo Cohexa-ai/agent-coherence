@@ -43,7 +43,7 @@ import uuid
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import yaml
 
@@ -86,6 +86,19 @@ from ccs.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
+
+
+class _ReadResult(NamedTuple):
+    """What one coordinator-mediated read yields. Named rather than a bare
+    tuple because two of the four fields are int-shaped and adjacent
+    (``version`` and ``owner_generation``), so a positional transposition would
+    type-check in one direction while silently swapping a value comparand for
+    an authority one."""
+
+    data: bytes
+    version: int
+    stale_denied: bool
+    owner_generation: int | None
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -1597,8 +1610,13 @@ class CoherentVolume:
             data, version, _stale_denied, _generation = self._read_with_version(path)
             return data, version
 
+    #: Whether the most recent :meth:`read_with_version_generation` was refused
+    #: by the coordinator (strict-mode deny). Read by the effect fence to name
+    #: the HOLD cause precisely; per-instance and overwritten each call.
+    _last_read_denied: bool = False
+
     def read_with_version_generation(
-        self, path: str | os.PathLike[str]
+        self, path: str | os.PathLike[str], *, observe: bool = True
     ) -> tuple[bytes, int, int | None]:
         """Read current bytes + the coordinator's authoritative
         ``(version, owner_generation)`` pair.
@@ -1614,12 +1632,25 @@ class CoherentVolume:
         coordinator, a strict-mode deny, or a degraded read — and callers must
         treat ``None`` as UNCONFIRMED (the gate HOLDs on it), never as "no
         movement". ``FileNotFoundError`` for a missing file.
+
+        ``observe=False`` marks a VERIFICATION read whose bytes the caller
+        discards (the effect fence re-reading to compare comparands). It leaves
+        the foreign-edit baseline where it was, so checking freshness cannot
+        absolve an out-of-band edit the caller never actually saw.
         """
         with self._single_op_guard():
-            data, version, _stale_denied, generation = self._read_with_version(path)
+            data, version, stale_denied, generation = self._read_with_version(
+                path, observe=observe
+            )
+            # A strict-mode deny is reported as a REFUSED read, not merely as a
+            # missing generation: they need different answers (a deny clears
+            # with reacquire; a coordinator that cannot report generations at
+            # all does not), and on the strict path a sweep reclaim reaches the
+            # client precisely AS a deny.
+            self._last_read_denied = stale_denied
             return data, version, generation
 
-    def _read_with_version(self, rel: str) -> tuple[bytes, int, bool, int | None]:
+    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation)``.
 
@@ -1648,8 +1679,15 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        # SB-23: the OCC read path also seeds the foreign-edit baseline.
-        self._last_observed_hash[_rel] = content_hash
+        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
+        # ONLY when the caller actually OBSERVES these bytes. A verification
+        # read (``observe=False``, used by the effect fence) reads the file to
+        # compare comparands and then DISCARDS the bytes; advancing the
+        # baseline there would silently absolve a foreign edit the caller never
+        # saw, so the next write would clobber it instead of denying. A
+        # fail-closed check must not have a fail-open side effect.
+        if observe:
+            self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
         owner_generation: int | None = None
@@ -1683,7 +1721,7 @@ class CoherentVolume:
                 hook_output = resp.get("hookSpecificOutput")
                 if isinstance(hook_output, dict):
                     stale_denied = hook_output.get("permissionDecision") == "deny"
-        return data, version, stale_denied, owner_generation
+        return _ReadResult(data, version, stale_denied, owner_generation)
 
     @staticmethod
     def _pre_read_version(resp: dict) -> int:

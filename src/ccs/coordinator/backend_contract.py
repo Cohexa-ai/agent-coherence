@@ -400,13 +400,14 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / set_artifact_and_content.",
     ),
     MemberContract(
-        "get_version_and_generation",
+        "get_artifact_and_generation",
         MemberClass.READ_ONLY,
         "base",
-        "Pair-consistent read of (version, owner_generation) — the effect gate's "
-        "decision/boundary comparands. Non-mutating, but carries a consistency "
-        "obligation: the pair must be a single-instant snapshot, never torn by a "
-        "concurrent sweep bump (which moves the generation without the version).",
+        "Reads an artifact together with the per-artifact fence counter as ONE "
+        "snapshot. Non-mutating, but carries a consistency obligation beyond "
+        "plain READ_ONLY: the two values must have coexisted, since a backend "
+        "serving them as two reads lets a sweep reclaim tear the pair and "
+        "silently reopens the reclaim-zombie EFFECT hole in adapters.effect_gate.",
     ),
     MemberContract(
         "granted_at_tick",

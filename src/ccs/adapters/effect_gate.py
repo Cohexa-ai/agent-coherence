@@ -39,7 +39,15 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Callable, TypeVar
 
-from ccs.core.exceptions import StaleView
+from ccs.core.exceptions import (
+    HOLD_GENERATION_UNCONFIRMED,
+    HOLD_GRANT_RECLAIMED,
+    HOLD_INPUT_VANISHED,
+    HOLD_READ_DENIED,
+    HOLD_VERSION_MOVED,
+    HOLD_VERSION_UNCONFIRMED,
+    StaleView,
+)
 
 if TYPE_CHECKING:
     from ccs.adapters.coherent_volume import CoherentVolume
@@ -110,13 +118,119 @@ def gate(
         path
     )
     decision = decide(data)
+    check_fence(
+        volume,
+        path,
+        expected_version=expected_version,
+        expected_generation=expected_generation,
+    )
+
+    # Re-validate passed: fire. The residual re-validate -> fire window is
+    # unclosable for an escaping effect; the gate gates pre-fire and never rolls
+    # back.
+    return effect(decision)
+
+
+def _held(
+    path: str | os.PathLike[str],
+    expected_version: int,
+    current_version: int | None,
+    expected_generation: int | None,
+    current_generation: int | None,
+    *,
+    denied: bool = False,
+) -> StaleView:
+    """Build the HOLD exception, carrying the drift, for a moved / vanished /
+    unconfirmed / reclaimed input."""
+    generation_unconfirmed = expected_generation is None or current_generation is None
+    if current_version is None:
+        cause = HOLD_INPUT_VANISHED
+        detail = "vanished"
+    elif expected_version == 0 or current_version == 0:
+        cause = HOLD_VERSION_UNCONFIRMED
+        detail = "could not be confirmed (coordinator degraded or unresolved)"
+    elif current_version != expected_version:
+        cause = HOLD_VERSION_MOVED
+        detail = f"moved to v{current_version}"
+    elif denied and generation_unconfirmed:
+        # The coordinator REFUSED the re-read (strict mode). That is a distinct,
+        # recoverable answer — and on the strict path it is how a sweep reclaim
+        # actually reaches the client, so folding it into the residual bucket
+        # would hide the very case this fence exists for.
+        cause = HOLD_READ_DENIED
+        detail = "was denied at re-read by the coordinator (view is INVALID)"
+    elif generation_unconfirmed:
+        cause = HOLD_GENERATION_UNCONFIRMED
+        detail = (
+            "has no confirmed ownership generation (degraded read, an "
+            "unconfirmable out-of-band edit, or a coordinator that does not "
+            "report generations)"
+        )
+    else:
+        cause = HOLD_GRANT_RECLAIMED
+        # Version unchanged, both generations confirmed: the grant was reclaimed
+        # out from under the decision -- the failure class a version-only check
+        # cannot see.
+        detail = (
+            f"had its grant reclaimed (ownership generation "
+            f"g{expected_generation} -> g{current_generation}, version unchanged)"
+        )
+    # A real CoherentVolume rejects a non-PathLike path before gate() runs, but
+    # volume is duck-typed at runtime -- never let fspath() mask the HOLD.
+    try:
+        target = os.fspath(path)
+    except TypeError:
+        target = str(path)
+    exc = StaleView(
+        f"effect held: {target} {detail} since it was read at "
+        f"v{expected_version}; effect not fired (reacquire and re-decide)"
+    )
+    exc.expected_version = expected_version
+    exc.current_version = current_version
+    exc.expected_generation = expected_generation
+    exc.current_generation = current_generation
+    exc.hold_cause = cause
+    return exc
+
+
+def check_fence(
+    volume: "CoherentVolume",
+    path: str | os.PathLike[str],
+    *,
+    expected_version: int,
+    expected_generation: int | None,
+) -> None:
+    """Re-validate a comparand the caller captured earlier; raise
+    :class:`~ccs.core.exceptions.StaleView` (a HOLD) unless the input is
+    provably unchanged AND still under the grant it was read from.
+
+    This is the pull-based half of :func:`gate` -- the same check, for callers
+    whose decision step happens somewhere this process cannot reach with a
+    callable: an agent that read through one tool call, reasoned, and is about
+    to dispatch an irreversible effect through another (the ``swg_gate`` MCP
+    tool is exactly that shape). Such a caller holds ``(expected_version,
+    expected_generation)`` from the earlier read and pulls a verdict here
+    immediately before dispatching.
+
+    Returns None when the effect may proceed; raises otherwise -- including when
+    either comparand is UNCONFIRMED, since firing on something the coordinator
+    never confirmed is precisely what this layer exists to prevent. Same honest
+    boundary as :func:`gate`: the verdict is true as of THIS check, and the
+    caller's dispatch still follows it.
+    """
 
     try:
+        # observe=False: this read exists only to COMPARE comparands and its
+        # bytes are discarded, so it must not advance the volume's foreign-edit
+        # baseline. Otherwise checking freshness would quietly absolve an
+        # out-of-band edit the caller never saw, and the caller's next write —
+        # which the foreign-edit guard would have denied — would clobber it.
         _, current_version, current_generation = volume.read_with_version_generation(
-            path
+            path, observe=False
         )
     except FileNotFoundError:
         raise _held(path, expected_version, None, expected_generation, None) from None
+    denied = bool(getattr(volume, "_last_read_denied", False))
 
     # HOLD unless the coordinator CONFIRMED an unchanged (version, generation)
     # pair. Version 0 is the "could not resolve" sentinel (an older/degraded
@@ -145,55 +259,6 @@ def gate(
             current_version,
             expected_generation,
             current_generation,
+            denied=denied,
         )
 
-    # Re-validate passed: fire. The residual re-validate -> fire window is
-    # unclosable for an escaping effect; the gate gates pre-fire and never rolls
-    # back.
-    return effect(decision)
-
-
-def _held(
-    path: str | os.PathLike[str],
-    expected_version: int,
-    current_version: int | None,
-    expected_generation: int | None,
-    current_generation: int | None,
-) -> StaleView:
-    """Build the HOLD exception, carrying the drift, for a moved / vanished /
-    unconfirmed / reclaimed input."""
-    generation_unconfirmed = expected_generation is None or current_generation is None
-    if current_version is None:
-        detail = "vanished"
-    elif expected_version == 0 or current_version == 0:
-        detail = "could not be confirmed (coordinator degraded or unresolved)"
-    elif current_version != expected_version:
-        detail = f"moved to v{current_version}"
-    elif generation_unconfirmed:
-        detail = (
-            "has no confirmed ownership generation (coordinator predates "
-            "generation reporting, denied the read, or degraded)"
-        )
-    else:
-        # Version unchanged, both generations confirmed: the grant was reclaimed
-        # out from under the decision -- the failure class a version-only check
-        # cannot see.
-        detail = (
-            f"had its grant reclaimed (ownership generation "
-            f"g{expected_generation} -> g{current_generation}, version unchanged)"
-        )
-    # A real CoherentVolume rejects a non-PathLike path before gate() runs, but
-    # volume is duck-typed at runtime -- never let fspath() mask the HOLD.
-    try:
-        target = os.fspath(path)
-    except TypeError:
-        target = str(path)
-    exc = StaleView(
-        f"effect held: {target} {detail} since it was read at "
-        f"v{expected_version}; effect not fired (reacquire and re-decide)"
-    )
-    exc.expected_version = expected_version
-    exc.current_version = current_version
-    exc.expected_generation = expected_generation
-    exc.current_generation = current_generation
-    return exc

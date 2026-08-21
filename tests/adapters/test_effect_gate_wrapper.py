@@ -27,7 +27,12 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import gate
 from ccs.cli._coherence_client import post as _cc_post
 from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
-from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, StaleView
+from ccs.core.exceptions import (
+    HOLD_READ_DENIED,
+    CoherenceDegradedWarning,
+    CoherenceError,
+    StaleView,
+)
 
 REL = "data/config.txt"
 
@@ -163,10 +168,15 @@ def test_escaping_effect_held_when_grant_reclaimed_strict_deny_leg(
         # matched), so a version-only comparand admitted the fire…
         assert exc.current_version == exc.expected_version
         # …and the HOLD came from the generation leg: confirmed at capture,
-        # deliberately unconfirmed on the strict deny.
+        # deliberately unconfirmed on the strict deny. The cause names the DENY
+        # specifically — on the strict path that is how a reclaim reaches the
+        # client, and it is recoverable, so it must not hide in the residual
+        # "no generation reported" bucket (which includes the one case a
+        # reacquire cannot fix).
         assert exc.expected_generation is not None
         assert exc.current_generation is None
-        assert "no confirmed ownership generation" in str(exc)
+        assert exc.hold_cause == HOLD_READ_DENIED
+        assert "denied at re-read" in str(exc)
     finally:
         stop_coordinator(tmp_path)
 
@@ -285,6 +295,59 @@ def test_escaping_effect_held_when_warn_mode_bytes_are_stale(
         assert fired == []  # never fired on a decision derived from plan-A
         assert exc_info.value.current_generation is None
         assert "no confirmed ownership generation" in str(exc_info.value)
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_gate_fires_on_the_callers_own_recent_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The fail-closed ``hash_differs`` rule must not over-trigger on the most
+    common path there is: a caller gating an artifact it just wrote itself. Its
+    own committed bytes ARE the canonical content, so the generation stays
+    confirmed and the effect fires. Repeated write -> gate cycles too, so a
+    commit-to-disk lag cannot accumulate into a permanent HOLD."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        fired: list[str] = []
+        for content in (b"config-v1", b"config-v2"):
+            vol.write(REL, content)
+            fired.clear()
+            gate(vol, REL, decide=lambda d: d.decode(), effect=fired.append)
+            assert fired == [content.decode()], (
+                "gating a path the caller just wrote must FIRE, never HOLD"
+            )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_gate_fires_on_own_write_in_warn_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same guarantee on the tracked-but-NOT-strict topology, where a superseded
+    read is a warn-mode re-grant rather than a deny — the arm where an
+    over-eager unconfirmed-generation rule would silently wedge every gate."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+        vol = CoherentVolume(
+            root_w,
+            on_error="strict",
+            on_stale_write="allow",
+            remote_endpoint=resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer),
+        )
+        (root_w / "task.txt").write_bytes(b"plan-A")
+        vol.write("task.txt", b"plan-A")
+        fired: list[str] = []
+        gate(vol, "task.txt", decide=lambda d: d.decode(), effect=fired.append)
+        assert fired == ["plan-A"]
     finally:
         stop_coordinator(coord_root)
 
@@ -411,7 +474,7 @@ class _StubVolume:
         self._i = 0
 
     def read_with_version_generation(
-        self, path: str
+        self, path: str, *, observe: bool = True
     ) -> tuple[bytes, int, int | None]:
         item = self._reads[self._i]
         self._i += 1
@@ -477,6 +540,10 @@ def test_gate_holds_on_vanish_carries_none_current() -> None:
         )
     assert fired == []
     assert exc.value.current_version is None
+    # _held() threads the capture generation through the vanish branch too, so
+    # a handler reading the drift sees the same shape on every HOLD class.
+    assert exc.value.expected_generation == 7
+    assert exc.value.current_generation is None
 
 
 def test_gate_holds_when_capture_read_degraded() -> None:
@@ -639,3 +706,30 @@ def test_bare_stale_view_exposes_none_version_attrs() -> None:
     assert exc.current_version is None
     assert exc.expected_generation is None
     assert exc.current_generation is None
+
+
+def test_hold_cause_is_typed_per_class() -> None:
+    """Every HOLD class carries a distinct typed cause, so an agent branches on
+    a value rather than substring-matching the human message — and can tell a
+    HOLD reacquire() clears from one that it never will."""
+    from ccs.core.exceptions import (
+        HOLD_GENERATION_UNCONFIRMED,
+        HOLD_GRANT_RECLAIMED,
+        HOLD_INPUT_VANISHED,
+        HOLD_VERSION_MOVED,
+        HOLD_VERSION_UNCONFIRMED,
+    )
+
+    cases = [
+        ([(b"c", 5, 7), (b"c", 6, 7)], HOLD_VERSION_MOVED),
+        ([(b"c", 5, 7), (b"c", 5, 8)], HOLD_GRANT_RECLAIMED),
+        ([(b"c", 5, 7), FileNotFoundError()], HOLD_INPUT_VANISHED),
+        ([(b"c", 5, 7), (b"c", 0, 7)], HOLD_VERSION_UNCONFIRMED),
+        ([(b"c", 5, 7), (b"c", 5, None)], HOLD_GENERATION_UNCONFIRMED),
+    ]
+    for reads, expected_cause in cases:
+        with pytest.raises(StaleView) as exc:
+            gate(_StubVolume(reads), "p", decide=lambda d: "go", effect=lambda x: x)
+        assert exc.value.hold_cause == expected_cause, reads
+    # A bare coordinator-raised StaleView carries no cause (uniform shape).
+    assert StaleView("peer committed").hold_cause is None

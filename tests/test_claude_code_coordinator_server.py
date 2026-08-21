@@ -3551,57 +3551,40 @@ def test_pre_read_want_owner_generation_untracked_fastpath_unchanged(
     assert body == {"status": "fresh"}
 
 
-def test_pre_read_attach_omits_pair_when_a_peer_commit_races_the_snapshot(
-    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+def test_pre_read_pair_comes_from_the_classifying_snapshot(
+    coordinator, client: _Client
 ) -> None:
-    """The attach must never hand back a pair NEWER than the view the response
-    was classified from. Handlers run concurrently, so a peer commit can land
-    between the branch snapshot (which chose 'fresh' and validated the caller's
-    hash) and the pair snapshot. Attaching the post-commit pair would let a
-    stale-derived decision re-validate clean at an effect boundary and FIRE, and
-    would feed write_cas an expected_version newer than the bytes it derived
-    from. Both keys are omitted instead: absent generation reads as UNCONFIRMED
-    (the gate HOLDs), and the response keeps its grant-consistent version.
+    """The reported generation must belong to the SAME snapshot as the version
+    the response was classified from — never a later read a peer commit could
+    slip past. That is now structural: one ``get_artifact_and_generation`` call
+    backs both, so there is no second read to race. This pins the property
+    directly by making the ONLY registry pair-read observably atomic, and
+    asserting the handler never reaches for a second one.
 
-    The race is driven deterministically by advancing the artifact's version
-    inside the pair read, between the classification and the attach."""
-    sid = _sid("attach-race")
-    status, body = client.post(
-        "/hooks/pre-read",
-        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("v1")},
-    )
-    assert status == 200
-    assert body == {"status": "fresh", "version": 1}
+    (This replaces an earlier guard that tolerated the two-read shape by
+    discarding a mismatched pair; folding the reads made that window
+    unrepresentable rather than merely detected.)"""
+    sid = _sid("pair-snapshot")
+    reads: list[str] = []
+    real_pair = coordinator.registry.get_artifact_and_generation
 
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name("CLAUDE.md")
-    assert artifact_id is not None
-    real_pair = coordinator.registry.get_version_and_generation
-
-    def racing_pair(aid):
-        # A peer commit lands after the branch snapshot, before the pair read.
-        agent_b = session_to_agent_id(_sid("attach-race-peer"))
-        coordinator.registry.set_agent_state(
-            aid, agent_b, MESIState.EXCLUSIVE, trigger="write", tick=1,
-        )
-        coordinator.registry.commit_cas(
-            aid, agent_b, expected_version=1, content_hash=_hash("v2"),
-        )
-        coordinator.registry.get_version_and_generation = real_pair  # once only
+    def counting_pair(aid):
+        reads.append("pair")
         return real_pair(aid)
 
-    monkeypatch.setattr(
-        coordinator.registry, "get_version_and_generation", racing_pair,
-        raising=False,
-    )
-    status, body = client.post(
-        "/hooks/pre-read",
-        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("v1"),
-         "want_owner_generation": True},
-    )
+    coordinator.registry.get_artifact_and_generation = counting_pair  # type: ignore[method-assign]
+    try:
+        status, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("v1"),
+             "want_owner_generation": True},
+        )
+    finally:
+        coordinator.registry.get_artifact_and_generation = real_pair  # type: ignore[method-assign]
+
     assert status == 200
-    # Classified fresh at v1; the pair snapshot saw v2 -> neither key rides.
-    assert body["status"] == "fresh"
-    assert body["version"] == 1, "the grant-consistent version must survive"
-    assert "owner_generation" not in body, (
-        "a pair newer than the classification must be omitted, not attached"
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+    assert len(reads) == 1, (
+        "the handler must derive the classification version AND the reported "
+        f"generation from ONE pair-atomic read; saw {len(reads)}"
     )

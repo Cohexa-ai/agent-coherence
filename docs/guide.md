@@ -1010,6 +1010,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
 Denials are machine-readable: an agent parses the typed payload (for example
@@ -1583,9 +1584,22 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 | `decide` | `Callable[[bytes], D]` | Keyword-only. Reads the captured bytes and returns a decision passed to `effect`. |
 | `effect` | `Callable[[D], R]` | Keyword-only. The escaping side effect; fired only if the input is unchanged at the re-read. |
 
-Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version` and `expected_generation` / `current_generation` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed; recover with `volume.reacquire(path)`, then re-decide and re-gate. The reclaim case is recognizable on the exception: the versions match while the generations differ (the HOLD message says "grant reclaimed … version unchanged").
+Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version`, `expected_generation` / `current_generation`, and a typed `hold_cause` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed.
 
-**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a strict-mode deny, a degraded read, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
+Branch on `hold_cause` rather than the message:
+
+| `hold_cause` | Meaning | Recovery |
+|---|---|---|
+| `version_moved` | a peer committed a newer version | `reacquire()`, re-decide, re-gate |
+| `grant_reclaimed` | the grant the decision was read under was reclaimed; the version never moved | `reacquire()`, re-decide, re-gate |
+| `read_denied` | the coordinator refused the re-read (strict mode; this view is INVALID) — **on a strict-mode volume this is how a reclaim usually surfaces** | `reacquire()`, re-decide, re-gate |
+| `input_vanished` | the artifact is gone at the effect boundary | re-establish the input, then re-gate |
+| `version_unconfirmed` | a degraded read returned no confirmed version | restore coordinator health, then re-gate |
+| `generation_unconfirmed` | the residual bucket: no confirmed ownership generation, from a degraded read, an out-of-band edit the coordinator could not confirm, **or** a coordinator that does not report generations at all | `reacquire()` and re-gate **first** — that clears the first two. A HOLD that survives a *successful* reacquire is the third: check the daemon's version and restart it |
+
+**What the causes do and don't tell you.** The first five are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
+
+**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
 **Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
 

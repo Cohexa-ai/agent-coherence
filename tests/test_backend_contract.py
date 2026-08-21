@@ -71,7 +71,7 @@ def test_member_map_covers_exactly_the_protocol_surface() -> None:
 def test_member_map_has_exactly_58_members() -> None:
     """Pin the count explicitly: 44 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
-    ``get_version_and_generation`` added) + 13 extended methods + 1
+    ``get_artifact_and_generation`` added) + 13 extended methods + 1
     base property = 58. Guards against a same-size add+remove that would slip
     past the set-equality check on cardinality alone."""
     assert len(MEMBER_CLASSIFICATION) == 58

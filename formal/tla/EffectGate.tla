@@ -31,12 +31,18 @@
       values of MONOTONIC counters (MonotonicVersion is an inherited checked
       invariant; ownerGeneration only ever increments, FencingSweepAction), so
       "current equals captured" is EXACTLY "unchanged since capture" -- no ABA
-      is possible. The model therefore tracks a per-artifact boolean
+      is possible. That holds because `Artifacts` is a CONSTANT throughout this
+      spec chain: there is no delete/re-register action, so a counter can never
+      restart. Artifact deletion is excluded chain-wide (see the exclusions
+      table in README.md), and the implementation inherits the same boundary --
+      re-registering a deleted name restarts the pair at (1, 0), which this
+      spec does not model and the gate does not detect (unchanged from the
+      version-only comparand that preceded it). The model therefore tracks a per-artifact boolean
       `pairMoved` (did version or ownerGeneration move since the decide
       capture?) instead of the concrete pair, sparing TLC the concrete value
       space (which made the naive encoding diverge: >80M distinct states).
       The decide capture is one atomic read in the implementation too -- the
-      registry's `get_version_and_generation` returns the pair from one
+      registry's `get_artifact_and_generation` returns the pair from one
       SQLite row under one lock (durable arm) / a seqlock on the monotonic
       generation (in-memory arm) -- so a torn capture needs no modeling.
 

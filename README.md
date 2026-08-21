@@ -167,7 +167,7 @@ fresh = vol.reacquire("plans/plan.md")  # recover: fresh read, re-derive, re-wri
 
 ## MCP server: `stale-write-guard-fs`
 
-The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as five tools:
+The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as six tools:
 
 ```bash
 pip install "agent-coherence[mcp]"
@@ -190,6 +190,7 @@ pip install "agent-coherence[mcp]"
 | `swg_write` | Guarded write — a stale view or a foreign edit gets a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery — fresh identity + mandatory fresh read after a deny |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
 The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory; the whole workspace is guarded unless `SWG_MANAGED` — a comma-separated glob list — narrows it), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).

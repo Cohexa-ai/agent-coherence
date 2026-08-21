@@ -130,7 +130,7 @@ class _DegradedFactory:
 
 
 class _TornPairRegistry:
-    """A degraded backend whose ``get_version_and_generation`` is TWO reads
+    """A degraded backend whose ``get_artifact_and_generation`` is TWO reads
     instead of one atomic snapshot — the exact shortcut a BYO backend author
     would reach for, and the one the member's contract forbids. Everything else
     delegates to a real in-memory registry. The `sleep(0)` between the two reads
@@ -142,13 +142,13 @@ class _TornPairRegistry:
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)
 
-    def get_version_and_generation(self, artifact_id: UUID) -> tuple[int, int]:
-        version = self._inner.get_artifact(artifact_id).version  # type: ignore[union-attr]
+    def get_artifact_and_generation(self, artifact_id: UUID):
+        artifact = self._inner.get_artifact(artifact_id)
         # A real (GIL-releasing) sleep, so the mutator thread actually runs
         # between the two reads — the interleaving window every two-read
         # backend has, made wide enough to hit deterministically.
         time.sleep(0.0005)
-        return version, self._inner.get_owner_generation(artifact_id)
+        return artifact, self._inner.get_owner_generation(artifact_id)
 
 
 class _TornPairFactory:
@@ -173,7 +173,7 @@ class _TornPairFactory:
 
 def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
     """THE TEETH for the pair-atomicity scenario. A backend serving
-    ``get_version_and_generation`` as two independent reads MUST FAIL the kit —
+    ``get_artifact_and_generation`` as two independent reads MUST FAIL the kit —
     otherwise the scenario would bless the shortcut that reopens the
     reclaim-zombie effect hole. The failure message names the obligation."""
     factory: RegistryFactory = _TornPairFactory()

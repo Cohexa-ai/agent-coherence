@@ -21,6 +21,26 @@ OCC_CALLER_TRANSIENT_REASON = "caller_in_transient_state"
 # (pessimistic path) so the two surfaces cannot drift.
 STALE_READ_GENERATION_REASON = "stale_read_generation"
 
+# Effect-gate HOLD classes. A HOLD says "the effect did not fire"; the cause
+# says WHY. Kept as typed constants (never substring-matched on the message) so
+# an agent or operator can branch.
+#
+# Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
+# INPUT_VANISHED and READ_DENIED are recoverable — reacquire, re-decide,
+# re-gate. GENERATION_UNCONFIRMED is the residual bucket and is NOT a clean
+# permanent/transient signal: a degraded read, an unconfirmable foreign edit,
+# and a coordinator that predates generation reporting all land there. Treat it
+# as "reacquire and re-gate first"; a HOLD that survives a SUCCESSFUL reacquire
+# is the one that needs an operator (check the daemon's version). Splitting
+# READ_DENIED out is what keeps the common strict-mode reclaim — which reaches
+# the client as a deny, not as a missing field — from hiding in that bucket.
+HOLD_VERSION_MOVED = "version_moved"
+HOLD_GRANT_RECLAIMED = "grant_reclaimed"
+HOLD_INPUT_VANISHED = "input_vanished"
+HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
+HOLD_READ_DENIED = "read_denied"
+HOLD_GENERATION_UNCONFIRMED = "generation_unconfirmed"
+
 # ---------------------------------------------------------------------------
 # read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
 # ---------------------------------------------------------------------------
@@ -448,6 +468,12 @@ class StaleView(CoherenceError):
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
     expected_version: int | None = None
     current_version: int | None = None
+    #: WHICH hold class fired, as a typed value (see the ``HOLD_*`` constants).
+    #: ``None`` on coordinator-raised instances. Matched on this, never on the
+    #: human message — and it is the difference between a HOLD ``reacquire()``
+    #: clears and one it never can (``HOLD_GENERATION_UNCONFIRMED`` against a
+    #: coordinator that does not report generations is an operator fix).
+    hold_cause: str | None = None
     #: Ownership-epoch drift set by gate()'s HOLD; ``None`` on coordinator-raised
     #: instances AND when the coordinator never confirmed a generation.
     expected_generation: int | None = None

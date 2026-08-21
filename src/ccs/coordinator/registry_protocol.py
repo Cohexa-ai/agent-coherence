@@ -315,14 +315,18 @@ class RegistryBase(Protocol):
     def get_transient_tick(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         ...
 
-    def get_version_and_generation(self, artifact_id: UUID) -> tuple[int, int]:
-        """Return the artifact's ``(version, owner_generation)`` as ONE
-        pair-consistent snapshot: the two values must have coexisted at a single
-        instant, so a concurrent sweep reclamation (which bumps the generation
-        WITHOUT a version move) can never tear the pair. This is the effect
-        gate's comparand read — the version answers "is the value still the one
-        the decision saw", the generation answers "is the grant it was read
-        under still standing". ``KeyError`` on an unknown artifact."""
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> "tuple[Artifact, int] | None":
+        """Return ``(artifact, owner_generation)`` from ONE snapshot, or None if
+        the artifact is absent. The pair MUST have coexisted at a single
+        instant: a backend serving it as two independent reads lets a concurrent
+        sweep reclamation (which bumps the generation WITHOUT a version move)
+        tear the pair, silently reopening the reclaim-zombie EFFECT hole
+        downstream (see ``adapters.effect_gate``). Any caller needing a
+        version and its ownership epoch together must use this, never two
+        separate accessors.
+        """
         ...
 
     def get_version_record(
