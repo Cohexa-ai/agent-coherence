@@ -1125,6 +1125,18 @@ class CoordinatorHTTPServer:
         with self._compact_pending_lock:
             return self._compact_pending.pop(session_id, None) is not None
 
+    def has_compact_pending(self, session_id: str) -> bool:
+        """SB-10 U4 (KTD6): NON-consuming advisory peek at the flag — the
+        cheap process-local dict lookup the admit handlers hoist above
+        their untracked fast-path exits, so no-flag traffic keeps today's
+        exact response bytes and never touches the registry. Advisory
+        only: the answer can go stale the instant the lock is released;
+        the authoritative at-most-once decision stays with the locked
+        test-and-clear in :meth:`consume_compact_pending` at the
+        allow-attach seam."""
+        with self._compact_pending_lock:
+            return session_id in self._compact_pending
+
     def expire_compact_pending(self, session_id: str) -> None:
         """SB-10 (KTD5): drop an unconsumed flag without delivering. Wired
         to the parent Stop by the deferred-delivery unit (R2: the flag's
@@ -1515,9 +1527,17 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
-    # touching SQLite (R8 false-positive budget protection).
+    # touching SQLite (R8 false-positive budget protection). SB-10 U4
+    # (KTD6): the advisory compact-pending peek — a process-local dict
+    # lookup, never a registry touch — is hoisted above this exit so a
+    # pending re-grounding payload still reaches an untracked admit; with
+    # no flag pending, response bytes and the no-registry behavior are
+    # exactly today's.
     if not coordinator.policy.is_tracked(path):
-        req._json(200, {"status": "fresh"})
+        fast: dict[str, Any] = {"status": "fresh"}
+        if coordinator.has_compact_pending(session_id):
+            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
+        req._json(200, fast)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -1795,14 +1815,18 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # Spread work()'s payload so additive fresh-path keys
                 # (Unit 6 ``version``) survive the notice attachment —
                 # rebuilding a literal dict here drops them.
-                return {
+                result = {
                     **result,
                     "hookSpecificOutput": _payloads.emit_allow(
                         source="pre_read_fresh_with_notice",
                         additional_context=notice_text,
                     ),
                 }
-        return result
+        # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
+        # deny decision inside work() — a strict deny returns untouched and
+        # keeps the flag pending — and AFTER the notice drain above, so
+        # notices render before the re-grounding block.
+        return _deliver_pending_reground(coordinator, session_id, body, result)
 
     _run_or_degrade(req, coordinator, work_with_notice_surfacing)
 
@@ -1823,8 +1847,13 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
+    # see the pre-read twin for the no-flag byte/behavior guarantee.
     if not coordinator.policy.is_tracked(path):
-        req._json(200, {"ok": True})
+        fast: dict[str, Any] = {"ok": True}
+        if coordinator.has_compact_pending(session_id):
+            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
+        req._json(200, fast)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -1955,6 +1984,12 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             }
         return {"ok": True}
 
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after every deny decision
+        # inside work(); notices are already merged into the result's
+        # additionalContext, so the re-grounding block always lands last.
+        return _deliver_pending_reground(coordinator, session_id, body, work())
+
     # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
     # On watchdog timeout, return the ok-shape degraded envelope so a
     # client doing result.get("ok") sees True rather than None.
@@ -1962,7 +1997,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
     # invalidating peers) the agent never saw.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(req, coordinator, work_with_reground, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2265,6 +2300,16 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(200, {"ok": True, "released_artifacts": []})
         return
 
+    # SB-10 U4 (R2): the deferred re-grounding flag lives at most one
+    # parent turn. A PARENT Stop — the wire carries NO agent_id field;
+    # SubagentStop always carries one (SB-25) — ends that turn, so an
+    # undelivered flag expires here instead of leaking into a later turn.
+    # A SubagentStop (or a malformed subagent id, which also presents the
+    # field and returned above) leaves the flag untouched: the parent turn
+    # is still in flight and its next admit may yet deliver.
+    if not has_subagent_id_field(body):
+        coordinator.expire_compact_pending(session_id)
+
     agent_id = coordinator.register_session(session_id, subagent_id)
     now = monotonic_seconds()
 
@@ -2560,9 +2605,14 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
+    # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
+    # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
     tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
     if not tracked_paths:
-        req._json(200, {"status": "fresh"})
+        fast: dict[str, Any] = {"status": "fresh"}
+        if coordinator.has_compact_pending(session_id):
+            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
+        req._json(200, fast)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2693,7 +2743,12 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             resp["status"] = "fresh"
         return resp
 
-    _run_or_degrade(req, coordinator, work)
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
+        # decision inside work(); notices/stale prose render first.
+        return _deliver_pending_reground(coordinator, session_id, body, work())
+
+    _run_or_degrade(req, coordinator, work_with_reground)
 
 
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2728,9 +2783,14 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             return
 
     # Find registry-known tracked artifacts under the search root.
+    # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
+    # artifacts exit so a pending payload still reaches this admit.
     tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
     if not tracked_paths:
-        req._json(200, {"status": "fresh"})
+        fast: dict[str, Any] = {"status": "fresh"}
+        if coordinator.has_compact_pending(session_id):
+            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
+        req._json(200, fast)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2836,7 +2896,12 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             resp["status"] = "fresh"
         return resp
 
-    _run_or_degrade(req, coordinator, work)
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
+        # decision inside work(); notices/stale prose render first.
+        return _deliver_pending_reground(coordinator, session_id, body, work())
+
+    _run_or_degrade(req, coordinator, work_with_reground)
 
 
 # ----------------------------------------------------------------------
@@ -4765,6 +4830,108 @@ def _build_session_start_context(
         )
     rendered.append(_payloads.SESSION_START_CLOSING_LINE)
     return "\n".join(rendered), workspace_has_state
+
+
+def _reground_qualifies(result: dict) -> bool:
+    """SB-10 U4 (R8): does this admit response qualify to carry — and
+    therefore consume — the deferred re-grounding payload?
+
+    The payload attaches ONLY to allow envelopes. A response already
+    carrying a ``hookSpecificOutput`` qualifies iff its decision is
+    ``allow`` — a strict-mode deny must stay byte-identical (KTD-P) and
+    must NOT consume: the flag survives for the next qualifying admit
+    (AE3). An envelope-less response qualifies iff it is an admit body —
+    ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
+    pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
+    is neither a deny envelope nor an admit: no attach, no consume."""
+    hso = result.get("hookSpecificOutput")
+    if hso is not None:
+        return hso.get("permissionDecision") == "allow"
+    return result.get("ok") is True or result.get("status") == "fresh"
+
+
+def _claim_reground_context(
+    coordinator: CoordinatorHTTPServer, session_id: str, body: dict
+) -> str | None:
+    """SB-10 U4: atomically claim the session's pending re-grounding
+    delivery and rebuild its prose.
+
+    Returns the payload text when THIS call wins the claim; ``None`` when
+    the request carries a subagent identity (R8: a parent request carries
+    NO agent_id field on the wire — a request presenting one must neither
+    consume nor attach), when no flag is pending, when a concurrent admit
+    won the pop (R2's at-most-once hangs on ``consume_compact_pending``'s
+    locked test-and-clear), or when the rebuild came back empty (state
+    drained since the compact event — nothing left worth re-grounding).
+
+    KTD2 rebuild-at-delivery: the prose is rebuilt from registry truth via
+    ``_build_session_start_context`` at the moment of attach, so the
+    deferred payload says what a fresh /hooks/session-start would say NOW
+    — never a snapshot cached at compact time. The session-scoped build
+    covers the parent agent plus every registered subagent, and carries
+    the R5 verbatim cap, so the delivery budget matches the direct path.
+
+    Failure containment: re-grounding is advisory (KD3). A rebuild error
+    after a won claim must not turn an otherwise-successful admit into an
+    internal-error body, so the build is guarded and the delivery is
+    forfeited (R2 permits at-most-once → zero) rather than propagated."""
+    if has_subagent_id_field(body):
+        return None
+    if not coordinator.consume_compact_pending(session_id):
+        return None
+    try:
+        text, _ = _build_session_start_context(coordinator, session_id)
+        return text
+    except Exception:  # advisory delivery must never break the admit it rides
+        logger.exception(
+            "deferred re-grounding rebuild failed for session %s; "
+            "delivery forfeited",
+            session_id,
+        )
+        return None
+
+
+def _attach_reground(result: dict, text: str) -> dict:
+    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
+    admit response. An existing allow envelope keeps its text and gets the
+    block appended AFTER it (notices and stale warnings render first —
+    KTD6 ordering); a bare admit body is promoted to an allow envelope.
+    The deferred path rides the PreToolUse allow wrapper — never the
+    SessionStart ``hookSpecificOutput`` shape."""
+    hso = result.get("hookSpecificOutput")
+    if hso is None:
+        return {
+            **result,
+            "hookSpecificOutput": _payloads.emit_allow(
+                source="deferred_reground_attach",
+                additional_context=text,
+            ),
+        }
+    existing = hso.get("additionalContext")
+    merged = dict(hso)
+    merged["additionalContext"] = (
+        text if existing is None else existing + "\n\n" + text
+    )
+    return {**result, "hookSpecificOutput": merged}
+
+
+def _deliver_pending_reground(
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    result: dict,
+) -> dict:
+    """SB-10 U4 (KTD6): the allow-attach seam shared by the four admit
+    surfaces (pre-read, pre-edit, pre-bash, pre-grep). Runs AFTER any deny
+    decision: a non-qualifying result is returned untouched — the same
+    object, so deny bodies stay byte-identical — and only then does the
+    atomic pop race; exactly one concurrent qualifying admit attaches."""
+    if not _reground_qualifies(result):
+        return result
+    text = _claim_reground_context(coordinator, session_id, body)
+    if text is None:
+        return result
+    return _attach_reground(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:

@@ -3996,3 +3996,302 @@ def test_session_start_prose_constants_byte_pinned() -> None:
         "Versions are as of this re-grounding; a more recent read supersedes "
         "this notice."
     )
+
+
+# ======================================================================
+# SB-10 U4 — deferred re-grounding delivery on the next qualifying admit
+# ======================================================================
+#
+# R2: at-most-once per delivery path; the flag is consumed by the FIRST
+# qualifying PARENT admit and expires at parent Stop. R8: the payload
+# attaches ONLY to allow envelopes; a request carrying agent_id neither
+# consumes nor attaches. KTD6: the check rides the four admit surfaces
+# (pre-read, pre-edit, pre-bash, pre-grep), with the advisory flag peek
+# hoisted above the untracked fast-path exits.
+
+
+def _arm_reground(client: _Client, sid: str) -> str:
+    """Give the session coordination state (SHARED on CLAUDE.md), then arm
+    the deferred flag via the REAL /hooks/session-start endpoint (KTD5).
+    Returns the payload text the arming call rendered — KTD2's
+    rebuild-at-delivery means the deferred copy must byte-match it as long
+    as no state moves in between."""
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body != {}
+    return body["hookSpecificOutput"]["additionalContext"]
+
+
+def _reground_text_of(body: dict) -> str | None:
+    """The additionalContext of an admit response's allow envelope, or None."""
+    hso = body.get("hookSpecificOutput")
+    if hso is None:
+        return None
+    return hso.get("additionalContext")
+
+
+def test_deferred_reground_tracked_pre_read_delivers_exactly_once(
+    coordinator, client: _Client
+) -> None:
+    """Pending flag + tracked pre-read allow → the fresh admit carries the
+    re-grounding block (byte-identical to the session-start rendering —
+    KTD2 rebuild-at-delivery), and the following admit is clean."""
+    sid = _sid("dr-tracked")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body["status"] == "fresh"
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"
+    assert out["additionalContext"] == armed_text
+    # Consumed: the very next admit is today's bare fresh shape.
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body2 == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_untracked_pre_read_delivers_then_bare(
+    coordinator, client: _Client
+) -> None:
+    """Pending flag + UNTRACKED pre-read → the payload still rides the new
+    allow envelope on the fast path; the next untracked call returns
+    today's bare body."""
+    sid = _sid("dr-untracked")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body["status"] == "fresh"
+    out = body["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert out["permissionDecision"] == "allow"
+    assert out["additionalContext"] == armed_text
+    status, body2 = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body2 == {"status": "fresh"}
+
+
+def test_untracked_pre_read_no_flag_byte_identical_and_registry_free(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No flag + untracked → byte-identical to today's fast-path response
+    AND zero registry access (the KTD6 advisory peek is a process-local
+    dict lookup). The registry is swapped for a proxy that explodes on ANY
+    attribute access; a touched registry would 500 the request."""
+    sid = _sid("dr-noflag")
+
+    class _ExplodingRegistry:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"registry touched on untracked fast path: {name}")
+
+    monkeypatch.setattr(coordinator, "registry", _ExplodingRegistry())
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_deferred_reground_subagent_admit_neither_consumes_nor_attaches(
+    coordinator, client: _Client
+) -> None:
+    """R8: a request carrying agent_id (subagent identity) must neither
+    consume nor attach — the payload waits for the PARENT's next admit.
+    Covered on BOTH the untracked fast path (bare bytes preserved) and the
+    tracked seam (the subagent's own warn envelope carries no re-ground)."""
+    sid = _sid("dr-subagent")
+    _arm_reground(client, sid)
+    # Untracked subagent admit: today's bare fast-path bytes, flag intact.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "agent_id": "sub1", "path": "notes.txt"})
+    assert status == 200
+    assert body == {"status": "fresh"}
+    assert coordinator.has_compact_pending(sid) is True
+    # Tracked subagent admit: the subagent's first read of the existing
+    # artifact yields the ordinary warn-stale envelope — but never the
+    # re-grounding block, and the flag survives.
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "agent_id": "sub1", "path": "CLAUDE.md",
+         "content_hash": _hash("rg1")})
+    assert status == 200
+    assert "Post-compaction re-grounding" not in (_reground_text_of(body2) or "")
+    assert coordinator.has_compact_pending(sid) is True
+    # The parent's next admit delivers (rebuilt from CURRENT registry truth
+    # per KTD2 — the subagent's grants above now render as their own group).
+    status, body3 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    delivered = _reground_text_of(body3) or ""
+    assert delivered.startswith("Post-compaction re-grounding (agent-coherence):")
+    assert "Subagent sub1:" in delivered
+    assert coordinator.has_compact_pending(sid) is False
+
+
+def test_subagent_stop_keeps_flag_parent_stop_expires(
+    coordinator, client: _Client
+) -> None:
+    """R2 lifetime: SubagentStop (agent_id present) leaves the flag
+    untouched — the parent turn is still in flight; a parent Stop (no
+    agent_id) expires it, so the next admit is clean."""
+    sid = _sid("dr-stop")
+    _arm_reground(client, sid)
+    status, _ = client.post(
+        "/hooks/session-stop", {"session_id": sid, "agent_id": "sub1"})
+    assert status == 200
+    assert coordinator.has_compact_pending(sid) is True
+    status, _ = client.post("/hooks/session-stop", {"session_id": sid})
+    assert status == 200
+    assert coordinator.has_compact_pending(sid) is False
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_second_session_start_re_marks_idempotently_one_delivery(
+    coordinator, client: _Client
+) -> None:
+    """A second compaction before delivery re-stamps the same flag: still
+    exactly one delivery, and the admit after it is clean."""
+    sid = _sid("dr-remark")
+    _arm_reground(client, sid)
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    armed_text = body["hookSpecificOutput"]["additionalContext"]
+    status, first = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert _reground_text_of(first) == armed_text
+    status, second = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert second == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_pre_edit_delivers(
+    coordinator, client: _Client
+) -> None:
+    """Pre-edit attach point: a pending flag rides the {ok: true} admit as
+    a new allow envelope; the next pre-edit is today's bare shape. KTD2
+    rebuild-at-delivery: this pre-edit acquires EXCLUSIVE BEFORE the attach
+    seam runs, so the delivered prose renders the CURRENT grant state —
+    EXCLUSIVE — not the SHARED snapshot the arming call saw."""
+    sid = _sid("dr-edit")
+    _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "CLAUDE.md"})
+    assert status == 200
+    assert body["ok"] is True
+    delivered = _reground_text_of(body) or ""
+    assert delivered.startswith("Post-compaction re-grounding (agent-coherence):")
+    assert (
+        "At compaction you held EXCLUSIVE on CLAUDE.md (v1) — re-acquire "
+        "before writing." in delivered
+    )
+    status, body2 = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "CLAUDE.md"})
+    assert status == 200
+    assert body2 == {"ok": True}
+
+
+def test_deferred_reground_pre_bash_delivers_untracked_and_tracked(
+    coordinator, client: _Client
+) -> None:
+    """Pre-bash attach point: delivery works from BOTH the zero-tracked-
+    paths fast path and the tracked work path."""
+    sid = _sid("dr-bash")
+    armed_text = _arm_reground(client, sid)
+    # Fast path: no tracked paths detected in the command.
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "echo hello"})
+    assert status == 200
+    assert body["status"] == "fresh"
+    assert _reground_text_of(body) == armed_text
+    status, bare = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "echo hello"})
+    assert status == 200
+    assert bare == {"status": "fresh"}
+    # Tracked path: session is fresh on CLAUDE.md; the flag re-armed.
+    coordinator.mark_compact_pending(sid)
+    status, body2 = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "cat CLAUDE.md"})
+    assert status == 200
+    assert body2["status"] == "fresh"
+    assert _reground_text_of(body2) == armed_text
+
+
+def test_deferred_reground_pre_grep_delivers_tracked_and_empty_root(
+    coordinator, client: _Client
+) -> None:
+    """Pre-grep attach point: delivery works from BOTH the tracked work
+    path (artifacts under the search root) and the zero-tracked-artifacts
+    fast path."""
+    sid = _sid("dr-grep")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": ""})
+    assert status == 200
+    assert body["status"] == "fresh"
+    assert _reground_text_of(body) == armed_text
+    # Fast path: a root with no registry-known artifacts.
+    coordinator.mark_compact_pending(sid)
+    status, body2 = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": "src/empty"})
+    assert status == 200
+    assert body2["status"] == "fresh"
+    assert _reground_text_of(body2) == armed_text
+    status, bare = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": "src/empty"})
+    assert status == 200
+    assert bare == {"status": "fresh"}
+
+
+def test_deferred_reground_concurrent_parent_admits_exactly_one_delivery(
+    coordinator, client: _Client
+) -> None:
+    """R2 at-most-once under contention: 6 concurrent qualifying parent
+    admits race one pending flag; EXACTLY ONE response carries the
+    re-grounding block (the atomic pop at the attach seam)."""
+    sid = _sid("dr-race")
+    _arm_reground(client, sid)
+    barrier = threading.Barrier(6)
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    def admit(i: int) -> None:
+        barrier.wait()
+        # Distinct tracked paths so first-observation seeding never contends
+        # on one artifact row; every response is a qualifying fresh admit.
+        _, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": f"docs/plans/p{i}.md",
+             "content_hash": _hash(f"p{i}")})
+        with results_lock:
+            results.append(body)
+
+    threads = [threading.Thread(target=admit, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    delivered = [
+        body for body in results
+        if "Post-compaction re-grounding" in (_reground_text_of(body) or "")
+    ]
+    assert len(delivered) == 1, (
+        f"expected exactly one re-grounding delivery, got {len(delivered)} "
+        f"of {len(results)} admits"
+    )
+    assert coordinator.has_compact_pending(sid) is False
