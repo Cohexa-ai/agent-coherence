@@ -640,10 +640,13 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
     "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
-    # coordinator_server._attach_reground — the SB-10 U4 deferred
-    # re-grounding attach shared by all four admit surfaces (pre-read,
-    # pre-edit, pre-bash, pre-grep, tracked seams + untracked fast paths).
-    "deferred_reground_attach",
+    # NOT listed: coordinator_server._attach_reground. The SB-10 deferred
+    # re-grounding attach no longer emits an allow — a bare admit body now
+    # gains a CONTEXT-ONLY PreToolUse envelope (hookEventName +
+    # additionalContext, no permissionDecision) via
+    # hook_payloads.emit_pretooluse_context, because an advisory payload
+    # must never widen a permission decision. No emit_allow call site, so
+    # no entry here.
 ]
 
 

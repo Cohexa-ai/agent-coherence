@@ -4035,9 +4035,13 @@ def _reground_text_of(body: dict) -> str | None:
 def test_deferred_reground_tracked_pre_read_delivers_exactly_once(
     coordinator, client: _Client
 ) -> None:
-    """Pending flag + tracked pre-read allow → the fresh admit carries the
+    """Pending flag + tracked pre-read admit → the fresh admit carries the
     re-grounding block (byte-identical to the session-start rendering —
-    KTD2 rebuild-at-delivery), and the following admit is clean."""
+    KTD2 rebuild-at-delivery), and the following admit is clean.
+
+    This tracked fresh-no-notice admit has no envelope of its own, so the
+    attach mints the CONTEXT-ONLY shape: prose without a permission
+    decision (advisory payloads never widen one)."""
     sid = _sid("dr-tracked")
     armed_text = _arm_reground(client, sid)
     status, body = client.post(
@@ -4046,7 +4050,8 @@ def test_deferred_reground_tracked_pre_read_delivers_exactly_once(
     assert status == 200
     assert body["status"] == "fresh"
     out = body["hookSpecificOutput"]
-    assert out["permissionDecision"] == "allow"
+    assert out["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in out
     assert out["additionalContext"] == armed_text
     # Consumed: the very next admit is today's bare fresh shape.
     status, body2 = client.post(
@@ -4059,9 +4064,10 @@ def test_deferred_reground_tracked_pre_read_delivers_exactly_once(
 def test_deferred_reground_untracked_pre_read_delivers_then_bare(
     coordinator, client: _Client
 ) -> None:
-    """Pending flag + UNTRACKED pre-read → the payload still rides the new
-    allow envelope on the fast path; the next untracked call returns
-    today's bare body."""
+    """Pending flag + UNTRACKED pre-read → the payload rides a CONTEXT-ONLY
+    PreToolUse envelope on the fast path (no permission decision — the
+    advisory delivery must not auto-approve an otherwise-promptable tool
+    call); the next untracked call returns today's bare body."""
     sid = _sid("dr-untracked")
     armed_text = _arm_reground(client, sid)
     status, body = client.post(
@@ -4070,12 +4076,72 @@ def test_deferred_reground_untracked_pre_read_delivers_then_bare(
     assert body["status"] == "fresh"
     out = body["hookSpecificOutput"]
     assert out["hookEventName"] == "PreToolUse"
-    assert out["permissionDecision"] == "allow"
+    assert "permissionDecision" not in out
     assert out["additionalContext"] == armed_text
     status, body2 = client.post(
         "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
     assert status == 200
     assert body2 == {"status": "fresh"}
+
+
+def test_deferred_reground_untracked_admit_emits_no_permission_decision(
+    coordinator, client: _Client
+) -> None:
+    """Security pin (explicit absence): the deferred delivery must never
+    widen a permission decision. An untracked admit whose base body has no
+    envelope of its own gets prose ONLY — hookEventName + additionalContext
+    and NOTHING else. A ``permissionDecision: "allow"`` here would
+    short-circuit Claude Code's permission prompting for that tool call,
+    once per compaction, purely as a side effect of delivery.
+
+    Verified empirically (A/B capture, Claude Code CLI 2.1.233,
+    2026-08-25): the CLI renders additionalContext on a PreToolUse
+    envelope carrying no permissionDecision, so the allow was never
+    needed to get the prose in front of the model."""
+    sid = _sid("dr-no-decision")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert "permissionDecision" not in out
+    assert "permissionDecisionReason" not in out
+    assert set(out) == {"hookEventName", "additionalContext"}
+    assert out["hookEventName"] == "PreToolUse"
+    # The advisory still lands — absence of the decision costs no prose.
+    assert out["additionalContext"] == armed_text
+    assert armed_text.startswith("Post-compaction re-grounding (agent-coherence):")
+
+
+def test_deferred_reground_merge_preserves_existing_permission_decision(
+    coordinator, client: _Client
+) -> None:
+    """The OTHER branch is untouched: when the base admit already carries
+    an envelope (here a warn-mode stale-read allow), the attach merges the
+    re-grounding block into it and the pre-existing permissionDecision
+    survives verbatim — the advisory neither widens nor narrows a decision
+    the admit already made. KTD6 ordering: the stale warning renders
+    first, the re-ground block after it."""
+    sid = _sid("dr-merge")
+    peer = _sid("dr-merge-peer")
+    # Session A first-reads plan.md (SHARED v1); peer commits v2 → A stale.
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "plan.md", "content_hash": _hash("m1")})
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": peer, "path": "plan.md",
+                 "content_hash": _hash("m2"), "success": True})
+    coordinator.mark_compact_pending(sid)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "plan.md", "content_hash": _hash("m1")})
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"  # warn-mode decision preserved
+    text = out["additionalContext"]
+    assert text.index("Stale read") < text.index(
+        "Post-compaction re-grounding (agent-coherence):")
+    assert coordinator.has_compact_pending(sid) is False
 
 
 def test_untracked_pre_read_no_flag_byte_identical_and_registry_free(
@@ -4294,4 +4360,121 @@ def test_deferred_reground_concurrent_parent_admits_exactly_one_delivery(
         f"expected exactly one re-grounding delivery, got {len(delivered)} "
         f"of {len(results)} admits"
     )
+    assert coordinator.has_compact_pending(sid) is False
+
+
+def test_deferred_reground_rebuild_failure_forfeits_without_breaking_admit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """KTD2 rebuild-at-delivery can fail AFTER the claim won the pop. The
+    guard in ``_claim_reground_context`` forfeits that delivery (R2 permits
+    at-most-once → zero) instead of turning an otherwise-successful admit
+    into an internal-error body: the admit answers its ordinary bare shape,
+    the flag stays consumed, and the forfeit is logged."""
+    import logging
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    caplog.set_level(logging.ERROR, logger=_CSRV)
+    sid = _sid("dr-rebuild-fail")
+
+    # Explode on the DELIVERY rebuild only — the arming session-start is
+    # call #1 and must succeed, or the flag would never be set at all.
+    real_build = mod._build_session_start_context
+    calls = {"n": 0}
+
+    def build_then_explode(coord, sid_arg, *, abort=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_build(coord, sid_arg, abort=abort)
+        raise RuntimeError("registry exploded mid-rebuild")
+
+    monkeypatch.setattr(mod, "_build_session_start_context", build_then_explode)
+    _arm_reground(client, sid)
+    assert calls["n"] == 1
+    caplog.clear()
+
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    # The admit is NOT broken: today's bare fresh shape, not the
+    # {ok: false, reason: "internal: ..."} body _run_or_degrade emits when
+    # work() raises.
+    assert body == {"status": "fresh", "version": 1}
+    assert calls["n"] == 2
+    # The claim won the pop before the rebuild raised, so the delivery is
+    # forfeited rather than re-queued.
+    assert coordinator.has_compact_pending(sid) is False
+    assert "delivery forfeited" in caplog.text
+
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body2 == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_fast_path_slow_rebuild_degrades_to_bare_base(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fast-path delivery rebuild walks the registry, so it runs under
+    the handler watchdog: a slow/contended rebuild must not hang the hook
+    past its budget. On timeout the response is the bare ``base`` —
+    byte-identical to the no-flag fast path — the request raises nothing,
+    and the degradation is observable via the /status counter."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("dr-fast-slow")
+    _arm_reground(client, sid)
+
+    def slow_build(coord, sid_arg, *, abort=None):
+        time.sleep(1.0)
+        return ("never reaches the client", True)
+
+    monkeypatch.setattr(mod, "_build_session_start_context", slow_build)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 0.1)
+
+    before = coordinator._watchdog_timeouts_total
+    started = time.monotonic()
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    elapsed = time.monotonic() - started
+    assert status == 200
+    assert body == {"status": "fresh"}
+    assert elapsed < 0.8, (
+        f"fast-path delivery waited {elapsed:.2f}s on a 1.0s rebuild; the "
+        f"watchdog did not cut it"
+    )
+    assert coordinator._watchdog_timeouts_total == before + 1
+
+
+def test_deferred_reground_preset_abort_does_not_consume_flag(
+    coordinator, client: _Client
+) -> None:
+    """A6: the abort check runs BEFORE the pop, so a request already known
+    doomed leaves the flag pending — the delivery survives for the next
+    live admit instead of being burned by a response nobody will read."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("dr-abort-preset")
+    armed_text = _arm_reground(client, sid)
+
+    doomed = threading.Event()
+    doomed.set()
+    base = {"status": "fresh"}
+    out = mod._deliver_pending_reground(
+        coordinator, sid, {"session_id": sid}, base, abort=doomed
+    )
+    # Same object back — the qualifying admit body stays byte-identical.
+    assert out is base
+    assert coordinator.has_compact_pending(sid) is True
+
+    # The next live admit still delivers.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert _reground_text_of(body) == armed_text
     assert coordinator.has_compact_pending(sid) is False

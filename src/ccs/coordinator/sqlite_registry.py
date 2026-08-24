@@ -188,10 +188,12 @@ table, no index, and deliberately NOT joined to any GC/retention exemption
 seam). The step also carries the ``_V5_USER_VERSION`` literal conversion —
 the same trap as the v5 bump: ``_migrate_v4_to_v5`` stamped the constant while
 it was the final chain step; it now stamps the intermediate literal 5 and the
-chained ``_migrate_v5_to_v6`` lands the column + the v6 stamp. The column is
-Python-lineage only; the Node ledger's own ``agent_states`` ALTER
-(``deadline_tick``, below) stays the foreign fingerprint and NEITHER runtime
-may add the other's column.
+chained ``_migrate_v5_to_v6`` lands the column + the v6 stamp. The column NAME
+is not a lineage discriminator and must never be used as one: the Node ledger's
+paired v4 adds an ``agent_states.last_observed_version`` of its own, so BOTH
+ledgers carry it. The disjoint load-bearing fingerprint is
+``agent_states.deadline_tick`` (Node-only, below — this repo must never add
+that column), backed by the ``registry_meta.schema_runtime`` stamp.
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -901,10 +903,12 @@ class SqliteArtifactRegistry:
 
         The v6 bump (``agent_states.last_observed_version``, SB-10) adds NO
         probe by review (KTD9): it is a column on an existing table, and the
-        two ledgers' ``agent_states`` fingerprints stay disjoint — probe 2's
-        ``deadline_tick`` marker remains Node-only (this repo must never add
-        that column) and ``last_observed_version`` is Python-only, so probe 2
-        neither misses a Node db nor false-positives on a Python v6 one.
+        Node ledger's paired v4 adds a column of the SAME name — so
+        ``last_observed_version`` is COMMON to both ledgers and must never be
+        probed as a lineage discriminator. What stays disjoint is probe 2's
+        ``deadline_tick`` marker, which remains Node-only (this repo must never
+        add that column), so probe 2 still neither misses a Node db nor
+        false-positives on a Python v6 one.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -1477,16 +1481,19 @@ class SqliteArtifactRegistry:
         txn, sees the winner already at >= v6, and no-ops.
 
         NODE-LEDGER COORDINATION (KTD9 review): the sibling Node coordinator's
-        ledger still tops out at ``user_version=3`` and its
-        ``rejectForeignLedgerDb`` refuses any Python-lineage db on markers every
-        Python v2+ db carries (the ``schema_runtime='python'`` stamp, the
-        ``artifact_versions`` table, ``artifacts.owner_generation``) BEFORE the
-        integer 6 is interpreted against the Node ledger. The reverse direction
-        stays covered by the ``deadline_tick`` structural probe (``>= 3``) plus
-        the ``schema_runtime='node'`` stamp — this step adds
-        ``last_observed_version``, never ``deadline_tick``, so the two ledgers'
-        ``agent_states`` fingerprints remain disjoint and adding only a column
-        obliges NO new probe in ``_reject_foreign_ledger_db``.
+        ledger tops out at ``user_version=4``, and its paired v4 adds an
+        ``agent_states.last_observed_version`` of its own — the column this step
+        lands is therefore COMMON to both ledgers and must never be read as a
+        lineage discriminator. Its ``rejectForeignLedgerDb`` refuses any
+        Python-lineage db on markers every Python v2+ db carries (the
+        ``schema_runtime='python'`` stamp, the ``artifact_versions`` table,
+        ``artifacts.owner_generation``) BEFORE the integer 6 is interpreted
+        against the Node ledger. The reverse direction stays covered by the
+        ``deadline_tick`` structural probe (``>= 3``) plus the
+        ``schema_runtime='node'`` stamp — this step adds
+        ``last_observed_version``, never ``deadline_tick``, so the LOAD-BEARING
+        ``agent_states`` fingerprint remains disjoint and adding only a shared
+        column obliges NO new probe in ``_reject_foreign_ledger_db``.
         """
         c = self._conn
         c.execute("BEGIN IMMEDIATE")

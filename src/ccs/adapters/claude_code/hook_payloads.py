@@ -248,6 +248,23 @@ class PreToolUseHookOutput(TypedDict):
     permissionDecisionReason: NotRequired[str]
 
 
+class PreToolUseContextOutput(TypedDict):
+    """SB-10: context-only ``hookSpecificOutput`` envelope for a PreToolUse
+    response — advisory prose with NO permission decision.
+
+    Distinct from :class:`PreToolUseHookOutput` by the ABSENCE of
+    ``permissionDecision``: this envelope delivers text to the model
+    without touching the tool call's permission outcome, so Claude Code's
+    ordinary prompting still applies. Used by the SB-10 deferred
+    re-grounding attach, whose payload is advisory (KD3) and must never
+    widen a permission decision. Empirically the CLI renders
+    ``additionalContext`` on a PreToolUse envelope carrying no
+    ``permissionDecision`` (A/B capture against Claude Code CLI 2.1.233,
+    2026-08-25)."""
+    hookEventName: Literal["PreToolUse"]
+    additionalContext: str
+
+
 class SessionStartHookOutput(TypedDict):
     """SB-10 U2: ``hookSpecificOutput`` envelope for the SessionStart hook.
 
@@ -476,6 +493,30 @@ SESSION_START_CLOSING_LINE: str = (
 """Self-qualifier, always the last line when any lines rendered — R2
 accepts one residual duplicate delivery, so the prose must read correctly
 when seen twice (a later read wins over a stale re-emission)."""
+
+
+def emit_pretooluse_context(*, additional_context: str) -> PreToolUseContextOutput:
+    """Build a context-only ``hookSpecificOutput`` envelope for a PreToolUse
+    response: ``additionalContext`` prose and nothing else.
+
+    Deliberately NOT routed through :func:`emit_allow` — and deliberately
+    emitting no ``permissionDecision``. An advisory payload must never
+    widen a permission decision: promoting a bare admit body to
+    ``permissionDecision: "allow"`` just to carry prose would
+    short-circuit Claude Code's own permission prompting for that tool
+    call. The KTD-U meta-test counts ``emit_allow`` call sites as
+    allow-path surface, which this is not.
+
+    Empirical basis: a PreToolUse ``hookSpecificOutput`` with
+    ``hookEventName`` + ``additionalContext`` and no ``permissionDecision``
+    IS rendered to the model — A/B capture against the installed Claude
+    Code CLI 2.1.233 on 2026-08-25 (the marker-primed model quoted the
+    injected line verbatim in both arms).
+    """
+    return {
+        "hookEventName": "PreToolUse",
+        "additionalContext": additional_context,
+    }
 
 
 def emit_session_start(*, additional_context: str) -> SessionStartHookOutput:

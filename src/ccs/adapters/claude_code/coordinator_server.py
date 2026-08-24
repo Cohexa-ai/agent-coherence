@@ -1824,10 +1824,20 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
-        # notices render before the re-grounding block.
-        return _deliver_pending_reground(coordinator, session_id, body, result)
+        # notices render before the re-grounding block. The abort token
+        # rides along so a timed-out request never consumes the
+        # compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, result, abort=abort
+        )
 
-    _run_or_degrade(req, coordinator, work_with_notice_surfacing)
+    # A6: pre-read never threaded an abort into work() — its SHARED
+    # re-grants are idempotent, so a late one is harmless. The token is
+    # introduced here solely for the re-grounding delivery, whose pop is
+    # NOT idempotent: a zombie that outlives the degraded response must not
+    # claim the flag out from under the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_notice_surfacing, abort=abort)
 
 
 def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1984,7 +1994,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # SB-10 U4 (KTD6): allow-attach seam — after every deny decision
         # inside work(); notices are already merged into the result's
         # additionalContext, so the re-grounding block always lands last.
-        return _deliver_pending_reground(coordinator, session_id, body, work())
+        # The abort token rides along so a timed-out request never
+        # consumes the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
 
     # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
     # On watchdog timeout, return the ok-shape degraded envelope so a
@@ -2739,10 +2753,20 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     def work_with_reground() -> dict:
         # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
-        # decision inside work(); notices/stale prose render first.
-        return _deliver_pending_reground(coordinator, session_id, body, work())
+        # decision inside work(); notices/stale prose render first. The
+        # abort token rides along so a timed-out request never consumes
+        # the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
 
-    _run_or_degrade(req, coordinator, work_with_reground)
+    # A6: pre-bash never threaded an abort into work() — its SHARED
+    # re-grants are idempotent. The token is introduced here solely for the
+    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # outlives the degraded response must not claim the flag out from under
+    # the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
 
 
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2889,10 +2913,20 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     def work_with_reground() -> dict:
         # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
-        # decision inside work(); notices/stale prose render first.
-        return _deliver_pending_reground(coordinator, session_id, body, work())
+        # decision inside work(); notices/stale prose render first. The
+        # abort token rides along so a timed-out request never consumes
+        # the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
 
-    _run_or_degrade(req, coordinator, work_with_reground)
+    # A6: pre-grep never threaded an abort into work() — its SHARED
+    # re-grants are idempotent. The token is introduced here solely for the
+    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # outlives the degraded response must not claim the flag out from under
+    # the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
 
 
 # ----------------------------------------------------------------------
@@ -4850,7 +4884,11 @@ def _reground_qualifies(result: dict) -> bool:
 
 
 def _claim_reground_context(
-    coordinator: CoordinatorHTTPServer, session_id: str, body: dict
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    *,
+    abort: threading.Event | None = None,
 ) -> str | None:
     """SB-10 U4: atomically claim the session's pending re-grounding
     delivery and rebuild its prose.
@@ -4858,10 +4896,13 @@ def _claim_reground_context(
     Returns the payload text when THIS call wins the claim; ``None`` when
     the request carries a subagent identity (R8: a parent request carries
     NO agent_id field on the wire — a request presenting one must neither
-    consume nor attach), when no flag is pending, when a concurrent admit
-    won the pop (R2's at-most-once hangs on ``consume_compact_pending``'s
-    locked test-and-clear), or when the rebuild came back empty (state
-    drained since the compact event — nothing left worth re-grounding).
+    consume nor attach), when the caller's watchdog ``abort`` is already
+    set (a doomed request must not consume the flag — the abort check runs
+    BEFORE the pop so the delivery survives for the next live admit), when
+    no flag is pending, when a concurrent admit won the pop (R2's
+    at-most-once hangs on ``consume_compact_pending``'s locked
+    test-and-clear), or when the rebuild came back empty (state drained
+    since the compact event — nothing left worth re-grounding).
 
     KTD2 rebuild-at-delivery: the prose is rebuilt from registry truth via
     ``_build_session_start_context`` at the moment of attach, so the
@@ -4876,10 +4917,12 @@ def _claim_reground_context(
     forfeited (R2 permits at-most-once → zero) rather than propagated."""
     if has_subagent_id_field(body):
         return None
+    if abort is not None and abort.is_set():
+        return None
     if not coordinator.consume_compact_pending(session_id):
         return None
     try:
-        text, _ = _build_session_start_context(coordinator, session_id)
+        text, _ = _build_session_start_context(coordinator, session_id, abort=abort)
         return text
     except Exception:  # advisory delivery must never break the admit it rides
         logger.exception(
@@ -4892,17 +4935,30 @@ def _claim_reground_context(
 
 def _attach_reground(result: dict, text: str) -> dict:
     """SB-10 U4: merge the claimed re-grounding prose into a qualifying
-    admit response. An existing allow envelope keeps its text and gets the
-    block appended AFTER it (notices and stale warnings render first —
-    KTD6 ordering); a bare admit body is promoted to an allow envelope.
-    The deferred path rides the PreToolUse allow wrapper — never the
-    SessionStart ``hookSpecificOutput`` shape."""
+    admit response. An existing envelope keeps its text AND its existing
+    permission decision, and gets the block appended AFTER it (notices and
+    stale warnings render first — KTD6 ordering); a bare admit body gains
+    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
+    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
+    shape."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
+        # WHY context-only rather than emit_allow: re-grounding is
+        # advisory (KD3), and an advisory payload must NEVER widen a
+        # permission decision. A bare body here is the untracked
+        # fast-path admit — a tool call Claude Code would ordinarily
+        # prompt the user about. Stamping permissionDecision "allow" on
+        # it just to carry prose auto-approved that call once per
+        # compaction, purely as a side effect of delivery.
+        # Empirical basis: a PreToolUse hookSpecificOutput carrying only
+        # hookEventName + additionalContext IS rendered to the model —
+        # A/B capture against the installed Claude Code CLI 2.1.233 on
+        # 2026-08-25 showed the marker-primed model quoting the injected
+        # line verbatim with and without permissionDecision. The allow
+        # bought nothing the context-only envelope does not already give.
         return {
             **result,
-            "hookSpecificOutput": _payloads.emit_allow(
-                source="deferred_reground_attach",
+            "hookSpecificOutput": _payloads.emit_pretooluse_context(
                 additional_context=text,
             ),
         }
@@ -4924,9 +4980,36 @@ def _fast_path_json(
     """SB-10 U4 (KTD6): shared exit for the four hoisted fast paths. The
     advisory peek keeps no-flag traffic registry-free with the exact
     pre-SB-10 response bytes; a pending flag routes through the deferred
-    re-ground attach, which claims it atomically at the allow seam."""
+    re-ground attach, which claims it atomically at the allow seam.
+
+    The delivery rebuild walks the registry, so it runs under the same
+    handler-side watchdog as the tracked seams (a slow/contended rebuild
+    must not hang the hook past its budget). On timeout the response is
+    the bare ``base`` — byte-identical to the no-flag fast path — and the
+    abort token (A6 pattern, set by ``run_with_watchdog`` on timeout)
+    stops the zombie delivery from consuming the flag or landing a
+    payload nobody will read; a zombie that already won the pop forfeits
+    the delivery (R2 permits at-most-once → zero)."""
     if coordinator.has_compact_pending(session_id):
-        base = _deliver_pending_reground(coordinator, session_id, body, base)
+        abort = threading.Event()
+
+        def deliver() -> dict:
+            return _deliver_pending_reground(
+                coordinator, session_id, body, base, abort=abort
+            )
+
+        try:
+            base = coordinator.run_with_watchdog(deliver, abort=abort)
+        except FuturesTimeout:
+            # KTD-G item 3 mirror of _run_or_degrade: surface the
+            # degradation via the /status counter, then fall through to
+            # the bare fast-path body.
+            coordinator.increment_watchdog_timeout()
+            logger.warning(
+                "deferred re-grounding delivery timed out after %ss; "
+                "degrading to the bare fast-path response",
+                HANDLER_TIMEOUT_SEC,
+            )
     req._json(200, base)
 
 
@@ -4935,15 +5018,22 @@ def _deliver_pending_reground(
     session_id: str,
     body: dict,
     result: dict,
+    *,
+    abort: threading.Event | None = None,
 ) -> dict:
     """SB-10 U4 (KTD6): the allow-attach seam shared by the four admit
     surfaces (pre-read, pre-edit, pre-bash, pre-grep). Runs AFTER any deny
     decision: a non-qualifying result is returned untouched — the same
     object, so deny bodies stay byte-identical — and only then does the
-    atomic pop race; exactly one concurrent qualifying admit attaches."""
+    atomic pop race; exactly one concurrent qualifying admit attaches.
+
+    ``abort`` is the caller's per-request watchdog token (A6 pattern):
+    threaded into the claim so a timed-out request neither consumes the
+    flag (checked before the pop) nor holds the registry walk hostage
+    (the rebuild aborts at the registry lock)."""
     if not _reground_qualifies(result):
         return result
-    text = _claim_reground_context(coordinator, session_id, body)
+    text = _claim_reground_context(coordinator, session_id, body, abort=abort)
     if text is None:
         return result
     return _attach_reground(result, text)
