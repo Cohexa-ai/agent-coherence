@@ -3588,3 +3588,411 @@ def test_pre_read_pair_comes_from_the_classifying_snapshot(
         "the handler must derive the classification version AND the reported "
         f"generation from ONE pair-atomic read; saw {len(reads)}"
     )
+
+
+# ======================================================================
+# SB-10 U2 — POST /hooks/session-start: post-compaction re-grounding
+# ======================================================================
+#
+# Prose lines are byte-pinned here on purpose: the Node coordinator (U6)
+# mirrors these exact strings, and the protocol corpus byte-matches them.
+# Any wording change must land in BOTH backends plus the corpus fixtures.
+
+_SS_HEADER = "Post-compaction re-grounding (agent-coherence):"
+_SS_CLOSING = (
+    "Versions are as of this re-grounding; a more recent read supersedes "
+    "this notice."
+)
+
+
+def _session_start_text(body: dict) -> str:
+    """Unwrap the additionalContext from a session-start response body."""
+    return body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_missing_authorization_returns_401(coordinator) -> None:
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/session-start"
+    req = urlrequest.Request(url, data=b"{}", method="POST",
+                             headers={"Host": "127.0.0.1", "Content-Type": "application/json"})
+    try:
+        urlrequest.urlopen(req, timeout=5)
+        assert False, "expected 401"
+    except urlerror.HTTPError as e:
+        assert e.code == 401
+
+
+def test_session_start_bad_host_returns_403(client: _Client) -> None:
+    status, body = client.post(
+        "/hooks/session-start", {"session_id": _sid("ss-host")},
+        headers_override={"Host": "attacker.example.com"},
+    )
+    assert status == 403
+
+
+def test_session_start_malformed_session_id_returns_400(client: _Client) -> None:
+    status, body = client.post("/hooks/session-start", {"session_id": "not-a-uuid"})
+    assert status == 400
+
+
+def test_session_start_empty_session_returns_empty_and_no_flag(
+    coordinator, client: _Client
+) -> None:
+    """AE4 (R5): a session with no coordination state gets `{}` and no
+    compact-pending flag — the model sees nothing, the deferred path stays
+    unarmed."""
+    sid = _sid("ss-empty")
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body == {}
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_counter_increments(coordinator, client: _Client) -> None:
+    before = coordinator.endpoint_counters_snapshot()["session_start_total"]
+    client.post("/hooks/session-start", {"session_id": _sid("ss-counter")})
+    after = coordinator.endpoint_counters_snapshot()["session_start_total"]
+    assert after == before + 1
+
+
+def test_session_start_peer_advanced_renders_stale_line(
+    coordinator, client: _Client
+) -> None:
+    """AE1 (R4/R7): A observed v1, peer B committed v2 → A's re-grounding
+    flags the divergence with BOTH versions. B's own grant lines must not
+    leak into A's payload."""
+    sid_a, sid_b = _sid("ss-ae1-a"), _sid("ss-ae1-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    assert set(body.keys()) == {"hookSpecificOutput"}
+    hso = body["hookSpecificOutput"]
+    assert set(hso.keys()) == {"hookEventName", "additionalContext"}
+    assert hso["hookEventName"] == "SessionStart"
+    text = hso["additionalContext"]
+    lines = text.split("\n")
+    assert lines[0] == _SS_HEADER
+    assert lines[1] == (
+        "plan.md advanced to v2 past your last-observed v1 — re-read before "
+        "relying on it."
+    )
+    assert lines[-1] == _SS_CLOSING
+    # B's E/M grant belongs to B's session — never rendered for A.
+    assert "At compaction you held" not in text
+    # KTD8: no timestamps anywhere in the re-grounding prose (no notices in
+    # this scenario, so the whole payload must be timestamp-free).
+    assert "+00:00" not in text
+
+
+def test_session_start_own_last_writer_renders_non_stale_line(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AE2 (R7, KTD4 second layer): even when the version advanced past the
+    recorded last-observed value, a row whose artifact last_writer is the
+    requesting agent itself renders the plain version line, never the stale
+    flag."""
+    sid_a, sid_b = _sid("ss-ae2-a"), _sid("ss-ae2-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+    # Force the own-edit exemption arm: pretend A itself is the last writer
+    # (the natural flow advances the writer's own last_observed in the same
+    # transaction — KTD4's FIRST layer — so the second layer is only
+    # reachable via this seam).
+    own_agent = session_to_agent_id(sid_a)
+    monkeypatch.setattr(coordinator.registry, "last_writer_for", lambda aid: own_agent)
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "plan.md is at v2." in text
+    assert "advanced to" not in text
+
+
+def test_session_start_null_last_observed_renders_non_stale(
+    coordinator, client: _Client
+) -> None:
+    """R7: a never-observed row (NULL last_observed) is admitted, never
+    flagged — no 0-sentinel comparison may sneak in."""
+    sid_a, sid_b = _sid("ss-null-a"), _sid("ss-null-b")
+    # B seeds the artifact and advances it to v2.
+    client.post("/hooks/pre-read",
+                {"session_id": sid_b, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+    # A gets a state row WITHOUT ever observing bytes: an INVALID upsert on a
+    # fresh pair records nothing (U1 contract), leaving last_observed NULL.
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert artifact_id is not None
+    coordinator.registry.set_agent_state(
+        artifact_id, session_to_agent_id(sid_a), MESIState.INVALID,
+        trigger="peer_invalidation", tick=1,
+    )
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "plan.md is at v2." in text
+    assert "advanced to" not in text
+
+
+def test_session_start_held_exclusive_renders_event_anchored_grant_line(
+    coordinator, client: _Client
+) -> None:
+    """R3 + KTD8: grant prose is event-anchored ("At compaction you held"),
+    never present-tense — a turn-end Stop drain may release E/M before the
+    attachment renders."""
+    sid = _sid("ss-grant")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert (
+        "At compaction you held EXCLUSIVE on plan.md (v1) — re-acquire "
+        "before writing."
+    ) in text
+
+
+def test_session_start_cap_renders_three_verbatim_plus_overflow_under_10kb(
+    coordinator, client: _Client
+) -> None:
+    """R5: 5 touched artifacts → 3 verbatim lines + a single "Plus 2 more"
+    overflow pointing at the status surface; total payload far below the
+    10KB additionalContext ceiling."""
+    sid = _sid("ss-cap")
+    paths = [f"docs/plans/{n}.md" for n in ("a", "b", "c", "d", "e")]
+    for p in paths:
+        client.post("/hooks/pre-read",
+                    {"session_id": sid, "path": p, "content_hash": _hash(p)})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    for p in paths[:3]:
+        assert (
+            f"At compaction you held SHARED on {p} (v1) — re-acquire "
+            f"before writing."
+        ) in text
+    for p in paths[3:]:
+        assert p not in text
+    assert "Plus 2 more — run agent-coherence-status for the full picture." in text
+    assert len(text.encode("utf-8")) < 10_000
+
+
+def test_session_start_pending_notice_rendered_read_only(
+    coordinator, client: _Client
+) -> None:
+    """R3: pending preemption notices appear in the payload via the existing
+    preemption prose builder — AFTER the header, BEFORE grant lines — and the
+    queue is NOT drained: the next pre-read still surfaces (and consumes)
+    the same notice. Consumption ownership stays with the admit endpoints."""
+    sid = _sid("ss-notice")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "AGENTS.md", "content_hash": _hash("n1")})
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("AGENTS.md")
+    assert artifact_id is not None
+    agent_id = session_to_agent_id(sid)
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=agent_id,
+        artifact_id=artifact_id,
+        preempter_agent_id=uuid.uuid4(),
+        preempted_at_unix_ts=1_700_000_000.0,
+    )
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert text.split("\n")[0] == _SS_HEADER
+    notice_at = text.index("⚠ Coordinator notice:")
+    grant_at = text.index("At compaction you held")
+    assert notice_at < grant_at
+    # Read-only proof: the queue still holds the notice for the admit drain.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "AGENTS.md", "content_hash": _hash("n1")},
+    )
+    assert status == 200
+    assert "AGENTS.md" in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_subagent_grants_grouped_and_released_absent(
+    coordinator, client: _Client
+) -> None:
+    """R3 + KTD8: the parent's lines render first, then subagent groups
+    under a `Subagent {name}:` prefix. After the subagent stops (grants
+    released), its grant line disappears from the next payload."""
+    sid = _sid("ss-sub")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("c1")})
+    client.post("/hooks/pre-edit",
+                {"session_id": sid, "path": "plan.md", "agent_id": "worker-1"})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    parent_at = text.index("At compaction you held SHARED on CLAUDE.md (v1)")
+    prefix_at = text.index("Subagent worker-1:")
+    sub_at = text.index("At compaction you held EXCLUSIVE on plan.md (v1)")
+    assert parent_at < prefix_at < sub_at
+
+    # Stop the subagent — its E grant is released (row goes INVALID).
+    client.post("/hooks/session-stop", {"session_id": sid, "agent_id": "worker-1"})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "At compaction you held EXCLUSIVE on plan.md" not in text
+    # The released row is still a touched row — rendered without a flag.
+    assert "Subagent worker-1:" in text
+    assert "plan.md is at v1." in text
+
+
+def test_session_start_two_identical_calls_byte_identical(
+    coordinator, client: _Client
+) -> None:
+    """KTD8 determinism: with no state movement between them, two calls
+    produce byte-identical additionalContext (no timestamps, stable sort)."""
+    sid_a, sid_b = _sid("ss-det-a"), _sid("ss-det-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "CLAUDE.md", "content_hash": _hash("d1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("d2"), "success": True})
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "docs/plans/x.md", "content_hash": _hash("d3")})
+
+    _, first = client.post("/hooks/session-start", {"session_id": sid_a})
+    _, second = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert _session_start_text(first) == _session_start_text(second)
+
+
+def test_session_start_sets_flag_consume_is_test_and_clear(
+    coordinator, client: _Client
+) -> None:
+    """KTD5: a non-empty session-start marks compact-pending; the first
+    consume wins, the second sees nothing."""
+    sid = _sid("ss-flag")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("f1")})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body != {}
+    assert coordinator.consume_compact_pending(sid) is True
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_consume_compact_pending_race_exactly_one_winner(coordinator) -> None:
+    """KTD5: consume is an atomic test-and-clear — 8 racing consumers get
+    exactly one True (the deferred-delivery unit's TOCTOU safety)."""
+    sid = _sid("ss-race")
+    coordinator.mark_compact_pending(sid)
+    barrier = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def racer() -> None:
+        barrier.wait()
+        got = coordinator.consume_compact_pending(sid)
+        with results_lock:
+            results.append(got)
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(results) == 1
+
+
+def test_expire_compact_pending_clears_flag(coordinator) -> None:
+    """KTD5: expire drops an unconsumed flag (parent-Stop wiring lands in
+    the deferred-delivery unit; the primitive is pinned here)."""
+    sid = _sid("ss-expire")
+    coordinator.mark_compact_pending(sid)
+    coordinator.expire_compact_pending(sid)
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_degraded_returns_empty_and_no_flag(
+    coordinator, client: _Client
+) -> None:
+    """KTD7: a watchdog-degraded session-start answers `{}` — advisory
+    re-grounding must never block — and the compact-pending flag stays
+    unset (nothing to deliver later that was never built)."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
+
+    sid = _sid("ss-degraded")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("g1")})
+    with patch.object(coordinator, "run_with_watchdog", side_effect=FuturesTimeout()):
+        status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body == {}
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_breadcrumb_only_for_never_seen_with_state(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R8: the debug breadcrumb fires exactly when a never-seen session
+    arrives while the workspace holds coordination state — converting a
+    silent session-id-rotation regression into an observable."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="ccs.adapters.claude_code.coordinator_server")
+
+    # (a) never-seen session + EMPTY workspace → no breadcrumb.
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-empty")})
+    assert "never-seen session" not in caplog.text
+
+    # Seed workspace state with an unrelated session.
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("ss-bc-other"), "path": "CLAUDE.md",
+                 "content_hash": _hash("b1")})
+
+    # (b) never-seen session + NONEMPTY workspace → breadcrumb.
+    caplog.clear()
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-new")})
+    assert "never-seen session" in caplog.text
+
+    # (c) already-seen session + nonempty workspace → no breadcrumb.
+    caplog.clear()
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-new")})
+    assert "never-seen session" not in caplog.text
+
+
+def test_session_start_prose_constants_byte_pinned() -> None:
+    """KTD8: the Node coordinator byte-matches these module-level constants;
+    a wording tweak here must ship in both backends + the corpus."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.SESSION_START_HEADER == "Post-compaction re-grounding (agent-coherence):"
+    assert hp.SESSION_START_GRANT_LINE_TEMPLATE == (
+        "At compaction you held {state} on {path} (v{version}) — re-acquire "
+        "before writing."
+    )
+    assert hp.SESSION_START_STALE_LINE_TEMPLATE == (
+        "{path} advanced to v{current} past your last-observed v{last} — "
+        "re-read before relying on it."
+    )
+    assert hp.SESSION_START_TOUCHED_LINE_TEMPLATE == "{path} is at v{current}."
+    assert hp.SESSION_START_OVERFLOW_LINE_TEMPLATE == (
+        "Plus {count} more — run agent-coherence-status for the full picture."
+    )
+    assert hp.SESSION_START_SUBAGENT_PREFIX_TEMPLATE == "Subagent {name}:"
+    assert hp.SESSION_START_CLOSING_LINE == (
+        "Versions are as of this re-grounding; a more recent read supersedes "
+        "this notice."
+    )

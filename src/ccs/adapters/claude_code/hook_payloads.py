@@ -248,6 +248,16 @@ class PreToolUseHookOutput(TypedDict):
     permissionDecisionReason: NotRequired[str]
 
 
+class SessionStartHookOutput(TypedDict):
+    """SB-10 U2: ``hookSpecificOutput`` envelope for the SessionStart hook.
+
+    Unlike PreToolUse there is no permissionDecision — SessionStart cannot
+    gate anything (KD3: re-grounding is advisory, never blocking); the
+    envelope carries only the re-grounding prose."""
+    hookEventName: Literal["SessionStart"]
+    additionalContext: str
+
+
 class OkResponse(TypedDict):
     ok: Literal[True]
 
@@ -410,6 +420,76 @@ def build_collision_response(
         ),
         "ok": True,
         "collision": True,
+    }
+
+
+# ----------------------------------------------------------------------
+# SB-10 post-compaction re-grounding prose (KTD8)
+# ----------------------------------------------------------------------
+#
+# Byte-parity contract: the Node coordinator (plan U6) mirrors these exact
+# strings, and the protocol corpus byte-matches the rendered payload. NO
+# timestamps may appear in any of them (corpus normalization keys stay
+# untouched), and grant prose is EVENT-ANCHORED, not present-tense — a
+# turn-end Stop drain can release E/M before the attachment ever renders,
+# so "you hold" would emit a false claim. Any wording change must land in
+# both backends plus the corpus fixtures in the same change.
+
+
+SESSION_START_HEADER: str = "Post-compaction re-grounding (agent-coherence):"
+"""First line of every non-empty re-grounding payload."""
+
+SESSION_START_GRANT_LINE_TEMPLATE: str = (
+    "At compaction you held {state} on {path} (v{version}) — re-acquire "
+    "before writing."
+)
+"""R3 held-grant line. ``state`` is the full MESI state name
+(EXCLUSIVE/MODIFIED/SHARED); ``version`` is the CURRENT coordinated
+version from the snapshot, not the granted-at version."""
+
+SESSION_START_STALE_LINE_TEMPLATE: str = (
+    "{path} advanced to v{current} past your last-observed v{last} — "
+    "re-read before relying on it."
+)
+"""R4 stale-divergence line (KD1 shape B): both versions render so the
+model can judge how far behind its cached view is."""
+
+SESSION_START_TOUCHED_LINE_TEMPLATE: str = "{path} is at v{current}."
+"""R4 touched-but-current line — also the R7 admit rendering for
+never-observed rows and own-edit-exempt rows."""
+
+SESSION_START_OVERFLOW_LINE_TEMPLATE: str = (
+    "Plus {count} more — run agent-coherence-status for the full picture."
+)
+"""R5 overflow line, mirroring the ``_build_preemption_text`` cap pattern:
+at most 3 artifact lines render verbatim; the rest coalesce here."""
+
+SESSION_START_SUBAGENT_PREFIX_TEMPLATE: str = "Subagent {name}:"
+"""KTD8 grouping: the parent agent's lines render first (no prefix), then
+each registered subagent's lines under this prefix, groups sorted by
+agent name."""
+
+SESSION_START_CLOSING_LINE: str = (
+    "Versions are as of this re-grounding; a more recent read supersedes "
+    "this notice."
+)
+"""Self-qualifier, always the last line when any lines rendered — R2
+accepts one residual duplicate delivery, so the prose must read correctly
+when seen twice (a later read wins over a stale re-emission)."""
+
+
+def emit_session_start(*, additional_context: str) -> SessionStartHookOutput:
+    """Build the ``hookSpecificOutput`` envelope for a SessionStart response.
+
+    The first non-PreToolUse builder in this module — hookEventName is
+    hardcoded per envelope kind, matching the existing builders' style.
+    Deliberately NOT routed through :func:`emit_allow`: there is no
+    permissionDecision on SessionStart, and the KTD-U meta-test counts
+    ``emit_allow`` call sites as allow-path surface, which this is not.
+    """
+    return {
+        "hookEventName": "SessionStart",
+        "additionalContext": additional_context,
     }
 
 

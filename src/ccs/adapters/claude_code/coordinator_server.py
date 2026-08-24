@@ -13,6 +13,7 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /hooks/post-edit-cas`` — OCC commit (Unit 6); version-checked CAS,
   NO pre-edit acquire (the OCC writer stays S/I); fail-closed degrade
 - ``POST /hooks/session-stop``  — KTD-11 release on end-of-turn
+- ``POST /hooks/session-start`` — SB-10 post-compaction re-grounding payload
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
@@ -543,6 +544,7 @@ class CoordinatorHTTPServer:
             "post_edit_total": 0,
             "post_edit_cas_total": 0,
             "session_stop_total": 0,
+            "session_start_total": 0,
             "pre_bash_total": 0,
             "pre_grep_total": 0,
             "policy_track_total": 0,
@@ -623,6 +625,17 @@ class CoordinatorHTTPServer:
         # own state map.
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
+
+        # SB-10 U2 (KTD5): compact-pending flags, keyed by session_id. Set by
+        # /hooks/session-start when it emitted a non-empty re-grounding
+        # payload; consumed by the next qualifying PreToolUse allow (deferred
+        # delivery, wired in a later unit) and expired on parent Stop.
+        # PROCESS-LOCAL on purpose — a restarted coordinator loses the flag,
+        # an accepted degradation (the restart is a bigger re-grounding event
+        # than a compaction). Value is the monotonic mark time so the
+        # deferred-delivery unit can reason about flag age if it needs to.
+        self._compact_pending: dict[str, float] = {}
+        self._compact_pending_lock = threading.Lock()
 
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
@@ -853,6 +866,35 @@ class CoordinatorHTTPServer:
         with self._agent_names_lock:
             return self._agent_names.get(agent_id)
 
+    def agents_for_session(self, session_id: str) -> list[tuple[UUID, str | None]]:
+        """SB-10 U2: the session's coherence agents as ``(agent_id,
+        subagent_name)`` pairs — the parent first (``subagent_name=None``,
+        derivable via uuid5 WITHOUT prior registration), then registered
+        subagents sorted by agent name (KTD8 group order).
+
+        Enumeration is a prefix scan of the in-memory ``_agent_names`` map
+        using the deterministic SB-25 naming scheme
+        (``claude-session-<sid>:subagent-<name>``) — neither registry has a
+        session→subagents accessor, and the adapter-owned map is the SB-25
+        source of truth for registration. Session ids are fixed-shape UUIDs
+        (A3 validation), so one session's prefix can never be a prefix of
+        another's. Restart-empty maps are an accepted degradation (KTD5):
+        subagents re-enter on their next hook call."""
+        subagent_prefix = f"claude-session-{session_id}:subagent-"
+        with self._agent_names_lock:
+            subagents = [
+                (agent_id, name[len(subagent_prefix):])
+                for agent_id, name in self._agent_names.items()
+                if name.startswith(subagent_prefix)
+            ]
+        # Same-prefix names sort identically by full name or by suffix; the
+        # suffix is what the Subagent group prefix renders.
+        subagents.sort(key=lambda pair: pair[1])
+        parent: list[tuple[UUID, str | None]] = [
+            (session_to_agent_id(session_id), None)
+        ]
+        return parent + subagents
+
     def increment_endpoint_counter(self, name: str) -> None:
         """KTD-J (Unit 8): bump a per-endpoint counter. Names match the
         keys in ``_endpoint_counters`` (e.g., ``pre_read_total``). Unknown
@@ -1064,6 +1106,31 @@ class CoordinatorHTTPServer:
                 self._stale_warned_pairs.remove(pair)
                 return True
             return False
+
+    def mark_compact_pending(self, session_id: str) -> None:
+        """SB-10 (KTD5): flag the session for deferred re-grounding delivery.
+        Set only by /hooks/session-start after it built a NON-empty payload —
+        an empty session must leave the deferred path unarmed (R5).
+        Idempotent: a second compaction before delivery simply re-stamps."""
+        with self._compact_pending_lock:
+            self._compact_pending[session_id] = time.monotonic()
+
+    def consume_compact_pending(self, session_id: str) -> bool:
+        """SB-10 (KTD5): ATOMIC test-and-clear of the compact-pending flag.
+
+        The deferred-delivery unit's at-most-once contract (R2) hangs on
+        this primitive: two concurrent qualifying admits must never both
+        see True, so the check and the clear happen under one lock hold —
+        a separate has/clear pair would reopen the TOCTOU window."""
+        with self._compact_pending_lock:
+            return self._compact_pending.pop(session_id, None) is not None
+
+    def expire_compact_pending(self, session_id: str) -> None:
+        """SB-10 (KTD5): drop an unconsumed flag without delivering. Wired
+        to the parent Stop by the deferred-delivery unit (R2: the flag's
+        lifetime ends at turn end; coordinator restart clears implicitly)."""
+        with self._compact_pending_lock:
+            self._compact_pending.pop(session_id, None)
 
     def run_with_watchdog(
         self, fn: Callable[[], Any], abort: threading.Event | None = None
@@ -2262,6 +2329,91 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # aborts before revoking a grant the registry handed to the next session.
     abort = threading.Event()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+
+
+def _handle_session_start(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /hooks/session-start — SB-10 U2 post-compaction re-grounding.
+
+    Returns the re-grounding ``additionalContext`` payload for a compacted
+    session and arms the process-local compact-pending flag for deferred
+    delivery on the next qualifying admit (consumption is wired in a later
+    unit). The ``source == "compact"`` gate lives client-side (U3, the
+    hook-client ladder): this endpoint trusts its caller and treats every
+    request as a compact event (R1).
+
+    Shape notes:
+    - Empty session → literal ``{}`` and NO flag (R5): the deferred path
+      must stay unarmed when there is nothing to deliver.
+    - Optional ``agent_id`` resolves per SB-25 like the read paths, but the
+      payload and the flag are SESSION-scoped either way — the parent agent
+      id is derivable without prior registration, and the payload always
+      covers the parent plus every registered subagent.
+    - No heartbeat and no observation recording: the endpoint is read-only
+      toward the registry (R6 — its own snapshot must never count as the
+      session "seeing" bytes; KTD-2 liveness resumes with the session's
+      next admit).
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    subagent_id = read_subagent_id(body)
+
+    # R8 breadcrumb precondition: sample seen-ness BEFORE registration
+    # erases it — registration below makes this session "seen" for every
+    # later request, which is exactly what keeps the breadcrumb a
+    # once-per-rotation signal rather than log spam.
+    never_seen = coordinator.agent_name_for(session_to_agent_id(session_id)) is None
+    coordinator.register_session(session_id)
+    if subagent_id is not None:
+        coordinator.register_session(session_id, subagent_id)
+
+    abort = threading.Event()
+
+    def work() -> dict:
+        text, workspace_has_state = _build_session_start_context(
+            coordinator, session_id, abort=abort
+        )
+        if never_seen and workspace_has_state:
+            # R8: a compact event for a session this coordinator never saw,
+            # while the workspace demonstrably holds coordination state,
+            # is the signature of a silent session-id rotation (or a
+            # coordinator restart) — debug-level so it is an observable,
+            # not an alarm.
+            logger.debug(
+                "session-start for never-seen session %s while the workspace "
+                "holds coordination state — possible session-id rotation or "
+                "coordinator restart (SB-10 R8)",
+                session_id,
+            )
+        if text is None:
+            return {}
+        # Non-empty payload → arm deferred delivery (KTD5). Ordering matters:
+        # the flag is set only AFTER a successful build, so a degraded or
+        # failed request leaves the deferred path unarmed.
+        coordinator.mark_compact_pending(session_id)
+        return {
+            "hookSpecificOutput": _payloads.emit_session_start(
+                additional_context=text
+            )
+        }
+
+    # A6 pattern: abort threads into the builder's abort_guard so a
+    # watchdog-timed-out request fails closed at the registry lock instead
+    # of arming the flag after the client already saw the degraded `{}`.
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_SESSION_START_DEGRADED_RESPONSE,
+        abort=abort,
+    )
 
 
 def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -4154,6 +4306,11 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     # EXCLUSIVE acquire (the OCC writer stays S/I).
     ("POST", "/hooks/post-edit-cas"): _handle_post_edit_cas,
     ("POST", "/hooks/session-stop"): _handle_session_stop,
+    # SB-10 U2 — post-compaction re-grounding. Registered HERE so it rides
+    # the central verify_bearer + verify_host seam (KTD7: no operator
+    # header, no parallel router). Read-only toward the registry; stays out
+    # of _MIGRATION_REJECTED_ROUTES because it initiates no writes.
+    ("POST", "/hooks/session-start"): _handle_session_start,
     # v0.1.1 KTD-N — H4 mitigation: catch model routing-around-via-Bash/Grep
     # to bypass the Read-only stale-read warning. Per the v0.2 Phase 0
     # falsifiability experiment, the model retries Read 2-5 times then
@@ -4230,6 +4387,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/hooks/post-edit"): "post_edit_total",
     ("POST", "/hooks/post-edit-cas"): "post_edit_cas_total",
     ("POST", "/hooks/session-stop"): "session_stop_total",
+    ("POST", "/hooks/session-start"): "session_start_total",
     ("POST", "/hooks/pre-bash"): "pre_bash_total",
     ("POST", "/hooks/pre-grep"): "pre_grep_total",
     ("POST", "/policy/track"): "policy_track_total",
@@ -4276,6 +4434,15 @@ pass ``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
 """AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
 post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+
+_SESSION_START_DEGRADED_RESPONSE: dict = {}
+"""SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
+empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
+exactly like "nothing to say", never block, and never claim state it could
+not read. The compact-pending flag is armed INSIDE the timed work only
+after a successful non-empty build (with the A6 abort threaded into the
+builder's ``abort_guard``), so a degraded response also means the deferred
+path stays unarmed."""
 
 _OCC_DEGRADED_RESPONSE: dict = {
     "ok": False,
@@ -4406,6 +4573,14 @@ def _iso_utc(unix_ts: float) -> str:
 #: well under 4KB before any stale-read prepend).
 _PREEMPTION_PROSE_VERBATIM_CAP = 3
 
+#: SB-10 U2 (R5) — same cap pattern for the post-compaction re-grounding
+#: payload: at most this many artifact lines render verbatim; the rest
+#: coalesce into one overflow line pointing at the status surface. Keeps the
+#: payload constant-size regardless of how many artifacts a session touched,
+#: comfortably under Claude Code's 10KB additionalContext ceiling even when
+#: the preemption-notice block (its own cap above) is prepended.
+_SESSION_START_ARTIFACT_VERBATIM_CAP = 3
+
 
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
@@ -4463,6 +4638,133 @@ def _build_preemption_text(
         "local-only until you re-acquire and commit."
     )
     return "\n".join(lines)
+
+
+def _build_session_start_context(
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    *,
+    abort: threading.Event | None = None,
+) -> tuple[str | None, bool]:
+    """SB-10 U2: render the post-compaction re-grounding prose for a session.
+
+    Returns ``(additional_context, workspace_has_state)`` where the context is
+    ``None`` when the session holds no coordination state (R5's no-op arm) and
+    ``workspace_has_state`` feeds the R8 breadcrumb decision in the handler.
+
+    KTD2: the payload is rebuilt from registry truth on EVERY delivery, from
+    ONE consistent read pass — the whole registry walk happens under a single
+    ``abort_guard`` hold (a plain re-entrant lock acquire for the inner read
+    calls), so a peer commit cannot tear the view between the snapshot and
+    the per-row last-observed / last-writer reads. The pass is read-only:
+    R6 forbids this endpoint from recording observations, and the pending
+    preemption notices are PEEKED, never popped — consumption ownership
+    stays with the admit-endpoint drains.
+
+    Rendering (KTD8, byte-mirrored by the Node coordinator):
+    - header first; the existing preemption-notice prose (if any) next;
+      then artifact lines — the parent agent's first, then each registered
+      subagent's under a ``Subagent {name}:`` prefix, groups sorted by name,
+      artifacts sorted by path within a group;
+    - a held E/M/S row renders the event-anchored grant line with the
+      CURRENT version; any other row (INVALID) renders the stale line only
+      when the version advanced past a RECORDED last-observed value and the
+      last writer is not this very agent (R7: never-observed admits, own
+      edits are exempt — KTD4's second layer — and no 0-sentinel compares);
+    - at most ``_SESSION_START_ARTIFACT_VERBATIM_CAP`` artifact lines render
+      verbatim, the rest coalesce into the overflow line (R5);
+    - the self-qualifying closing line is always last. No timestamps.
+    """
+    # Agent enumeration takes only the agent-names lock; done BEFORE the
+    # registry lock so the two locks never nest in names→registry order.
+    agents = coordinator.agents_for_session(session_id)
+
+    with coordinator.registry.abort_guard(abort):
+        artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
+        workspace_has_state = bool(artifact_by_id)
+        # KTD8: artifacts sorted by path (ASCII-lexicographic — identical to
+        # the Node backend's default string sort for the path charset).
+        sorted_artifacts = sorted(
+            artifact_by_id.items(), key=lambda item: item[1]["name"]
+        )
+        notices: list[tuple[UUID, UUID, float]] = []
+        groups: list[tuple[str | None, list[str]]] = []
+        for agent_id, subagent_name in agents:
+            lines: list[str] = []
+            for artifact_id, meta in sorted_artifacts:
+                pending = coordinator.registry.peek_preemption_notice(
+                    agent_id, artifact_id
+                )
+                if pending is not None:
+                    notices.append((artifact_id, pending[0], pending[1]))
+                state = state_by_artifact.get(artifact_id, {}).get(agent_id)
+                if state is None:
+                    continue
+                path = meta["name"]
+                current = meta["version"]
+                if state is not MESIState.INVALID:
+                    lines.append(
+                        _payloads.SESSION_START_GRANT_LINE_TEMPLATE.format(
+                            state=state.name, path=path, version=current
+                        )
+                    )
+                    continue
+                last = coordinator.registry.last_observed_version_for(
+                    artifact_id, agent_id
+                )
+                stale = (
+                    last is not None
+                    and current > last
+                    and coordinator.registry.last_writer_for(artifact_id)
+                    != agent_id
+                )
+                if stale:
+                    lines.append(
+                        _payloads.SESSION_START_STALE_LINE_TEMPLATE.format(
+                            path=path, current=current, last=last
+                        )
+                    )
+                else:
+                    lines.append(
+                        _payloads.SESSION_START_TOUCHED_LINE_TEMPLATE.format(
+                            path=path, current=current
+                        )
+                    )
+            if lines:
+                groups.append((subagent_name, lines))
+        if not groups and not notices:
+            return None, workspace_has_state
+        # Rendered inside the guard: _build_preemption_text re-reads artifact
+        # names from the registry, and those reads belong to the same
+        # consistent pass as the snapshot the notices came from.
+        notice_text = (
+            _build_preemption_text(coordinator, notices) if notices else None
+        )
+
+    rendered: list[str] = [_payloads.SESSION_START_HEADER]
+    if notice_text is not None:
+        rendered.append(notice_text)
+    total_lines = sum(len(lines) for _, lines in groups)
+    budget = _SESSION_START_ARTIFACT_VERBATIM_CAP
+    for subagent_name, lines in groups:
+        if budget <= 0:
+            break
+        take = lines[:budget]
+        if subagent_name is not None:
+            rendered.append(
+                _payloads.SESSION_START_SUBAGENT_PREFIX_TEMPLATE.format(
+                    name=subagent_name
+                )
+            )
+        rendered.extend(take)
+        budget -= len(take)
+    overflow = total_lines - _SESSION_START_ARTIFACT_VERBATIM_CAP
+    if overflow > 0:
+        rendered.append(
+            _payloads.SESSION_START_OVERFLOW_LINE_TEMPLATE.format(count=overflow)
+        )
+    rendered.append(_payloads.SESSION_START_CLOSING_LINE)
+    return "\n".join(rendered), workspace_has_state
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
