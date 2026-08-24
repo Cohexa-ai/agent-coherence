@@ -1,0 +1,78 @@
+{
+  "name": "session-start-cap-overflow",
+  "description": "SB-10 R5 verbatim cap: session A pre-reads five tracked artifacts (five SHARED grants). The session-start payload renders exactly SESSION_START_ARTIFACT_VERBATIM_CAP (3) grant lines verbatim in path-sorted order, then coalesces the remaining two into the single overflow line pointing at the status surface, then the closing line. Pins that the cap and the overflow arithmetic are identical across backends.",
+  "setup": {
+    "tracked": [
+      "docs/a.md",
+      "docs/b.md",
+      "docs/c.md",
+      "docs/d.md",
+      "docs/e.md"
+    ],
+    "files": {
+      "docs/a.md": "a v1\n",
+      "docs/b.md": "b v1\n",
+      "docs/c.md": "c v1\n",
+      "docs/d.md": "d v1\n",
+      "docs/e.md": "e v1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/a.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/b.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/c.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/d.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/e.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-start",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "Post-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on docs/a.md (v1) — re-acquire before writing.\nAt compaction you held SHARED on docs/b.md (v1) — re-acquire before writing.\nAt compaction you held SHARED on docs/c.md (v1) — re-acquire before writing.\nPlus 2 more — run agent-coherence-status for the full picture.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+      }
+    }
+  }
+}

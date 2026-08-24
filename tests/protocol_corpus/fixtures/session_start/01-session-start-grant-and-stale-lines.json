@@ -1,0 +1,75 @@
+{
+  "name": "session-start-grant-and-stale-lines",
+  "description": "SB-10 U2/U6 canonical /hooks/session-start payload. Session A pre-reads two tracked files (SHARED grants record last-observed v1); peer B pre-edits + post-edits docs/alpha.md to v2, invalidating A. A's session-start renders the full SessionStart wrapper: header, the R4 stale-divergence line for docs/alpha.md (current v2 past recorded last-observed v1, writer is B not A), the R3 event-anchored grant line for the still-SHARED docs/beta.md at the CURRENT version, and the self-qualifying closing line. Artifact lines sort by path (KTD8). No timestamps anywhere in the payload — the whole additionalContext byte-matches across backends with no normalization sentinels needed.",
+  "setup": {
+    "tracked": [
+      "docs/alpha.md",
+      "docs/beta.md"
+    ],
+    "files": {
+      "docs/alpha.md": "# Alpha\nv1 content\n",
+      "docs/beta.md": "# Beta\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/alpha.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/beta.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/alpha.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/alpha.md",
+          "content_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/beta.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-start",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "Post-compaction re-grounding (agent-coherence):\ndocs/alpha.md advanced to v2 past your last-observed v1 — re-read before relying on it.\nAt compaction you held SHARED on docs/beta.md (v1) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+      }
+    }
+  },
+  "_comment": "The final preflight (A's fresh re-read of docs/beta.md, response discarded) drains A's pending preemption notices so the session-start payload contains ONLY the byte-mirrored SESSION_START templates. This sidesteps two pre-existing cross-backend notice asymmetries that predate SB-10 and are masked elsewhere by warn_mode/14's ignore_keys: (a) the Node registry records a notice for EVERY invalidated peer including SHARED victims (registry.ts acquireExclusive) while Python records only for M∪E victims (_peers_in_me_excluding), and (b) the notice prose itself differs byte-wise between _build_preemption_text and preemptionNoticeText. The stale line proves U1/U5 last-observed recording end-to-end: pre-read grant records v1, B's commit advances to v2 while preserving A's recorded value across the INVALID transition."
+}
