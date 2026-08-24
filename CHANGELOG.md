@@ -30,6 +30,22 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The protocol corpus stopped ignoring the preemption-notice prose, and
+  immediately caught a real Python ↔ Node divergence.** Three warn-mode
+  fixtures now byte-assert the whole `additionalContext` a preempted session
+  receives (the harness scrubs the embedded timestamps) instead of waving it
+  through with an `ignore_keys` entry. That prose is the only thing telling a
+  model its edit landed in its worktree but not in the coordinator's version,
+  so "both backends return a stale-read envelope" was never a strong enough
+  contract for it. Under the narrowed fixtures the Node coordinator failed on
+  two counts: it queued a notice for **SHARED** readers — telling a reader it
+  had lost an EXCLUSIVE grant it never held, where Python correctly stays
+  silent — and it worded the notice differently, with no warning that the
+  stranded edit is worktree-local and no cap on how many accumulate. Python's
+  behavior is unchanged; the divergence is fixed in the plugin repo, and two
+  new fixtures pin both the notice-bearing and the no-notice case against the
+  two backends together.
+
 - **`gate()` now HOLDs when the grant its input was read under is gone — not
   only when the version moved.** The effect-ordering wrapper's re-validation
   compared versions alone, and the version answers only "is the value still

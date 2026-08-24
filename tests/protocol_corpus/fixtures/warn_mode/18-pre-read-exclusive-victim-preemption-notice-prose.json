@@ -1,0 +1,67 @@
+{
+  "name": "pre-read-exclusive-victim-preemption-notice-prose",
+  "description": "Preemption-notice prose bytes. Preflight: session A pre-edits (EXCLUSIVE), session B pre-edits — silently revoking A's EXCLUSIVE grant — then commits v2. A held E, so a notice IS recorded, and A's next stale pre-read prepends the notice block to the stale-read warning separated by a blank line. The whole additionalContext is byte-asserted (the harness scrubs the three ISO timestamps): header wording, the per-line 'lands in your worktree but is NOT reflected' warning, and the closing re-read guidance are all part of the cross-backend contract, because this same prose is what tells the model its edit was stranded.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "55555555-5555-4555-8555-555555555555",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "path": "CLAUDE.md",
+          "success": true,
+          "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "55555555-5555-4555-8555-555555555555",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "⚠ Coordinator notice: your EXCLUSIVE grant was preempted:\n  • CLAUDE.md — preempted/revoked by session 66666666 at <TS>. Any local edit you made to this file will land in your worktree but is NOT reflected in the coordinator's version.\nRe-read affected files before continuing if you need the latest coordinator-tracked version, or proceed knowing your edits remain local-only until you re-acquire and commit.\n\n⚠ Stale read [warning emitted <TS>]: CLAUDE.md was updated by session 66666666 at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading CLAUDE.md before acting on stale assumptions."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "66666666-6666-4666-8666-666666666666",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "ignore_keys": ["last_writer_at_unix_ts", "warning_generated_at_unix_ts"]
+}

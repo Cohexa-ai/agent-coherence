@@ -1,6 +1,6 @@
 {
   "name": "pre-read-subagent-attribution",
-  "description": "SB-25 R2 attribution: a subagent's commit is credited to the SUBAGENT id, not the parent session. Preflight: the parent reads (SHARED), then subagent A edits + commits v2 under the composite identity — invalidating the parent. The parent's re-read is stale and summary.last_writer_session_id MUST be the subagent id (the [:8] short form in prose then names the actual writer). Timestamps + prose are ignored (vary per run); the attribution field is the parity contract.",
+  "description": "SB-25 R2 attribution: a subagent's commit is credited to the SUBAGENT id, not the parent session. Preflight: the parent reads (SHARED), then subagent A edits + commits v2 under the composite identity — invalidating the parent. The parent's re-read is stale and summary.last_writer_session_id MUST be the subagent id (the [:8] short form in prose then names the actual writer). The prose is byte-asserted too (the harness scrubs the two ISO timestamps), which pins the short form actually reaching the model; only the raw timestamps are ignored.",
   "setup": {
     "tracked": ["CLAUDE.md"],
     "files": {
@@ -51,7 +51,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "additionalContext": "<ignored>"
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: CLAUDE.md was updated by session a0826622 at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading CLAUDE.md before acting on stale assumptions."
       },
       "status": "stale",
       "summary": {
@@ -65,5 +65,5 @@
       }
     }
   },
-  "ignore_keys": ["additionalContext", "last_writer_at_unix_ts", "warning_generated_at_unix_ts"]
+  "ignore_keys": ["last_writer_at_unix_ts", "warning_generated_at_unix_ts"]
 }
