@@ -2837,15 +2837,29 @@ class SqliteArtifactRegistry:
                         (artifact_id.hex,),
                     )
 
-                # Upsert agent state.
+                # Upsert agent state. SB-10 R6/R7 rides the same statement: the
+                # ``last_observed_version`` operand was SELECTed above in this
+                # txn; non-INVALID targets record it (the version whose bytes
+                # this agent now holds -- the post-compaction staleness
+                # comparand), a transition TO INVALID preserves the prior
+                # recorded value via the CASE guard, and a never-observed row
+                # keeps NULL (never a 0-sentinel).
+                observe = state != MESIState.INVALID
                 if prior_row is None:
                     self._conn.execute(
                         """
                         INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
-                                                  last_reclaim_trigger, last_reclaim_tick)
-                        VALUES (?, ?, ?, ?, NULL, NULL)
+                                                  last_reclaim_trigger, last_reclaim_tick,
+                                                  last_observed_version)
+                        VALUES (?, ?, ?, ?, NULL, NULL, ?)
                         """,
-                        (artifact_id.hex, agent_id.hex, state.name, granted_at_tick),
+                        (
+                            artifact_id.hex,
+                            agent_id.hex,
+                            state.name,
+                            granted_at_tick,
+                            version if observe else None,
+                        ),
                     )
                 else:
                     if clear_reclaim:
@@ -2853,19 +2867,37 @@ class SqliteArtifactRegistry:
                             """
                             UPDATE agent_states
                             SET state = ?, granted_at_tick = ?, last_reclaim_trigger = NULL,
-                                last_reclaim_tick = NULL
+                                last_reclaim_tick = NULL,
+                                last_observed_version =
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
-                            (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
+                            (
+                                state.name,
+                                granted_at_tick,
+                                1 if observe else 0,
+                                version,
+                                artifact_id.hex,
+                                agent_id.hex,
+                            ),
                         )
                     else:
                         self._conn.execute(
                             """
                             UPDATE agent_states
-                            SET state = ?, granted_at_tick = ?
+                            SET state = ?, granted_at_tick = ?,
+                                last_observed_version =
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
-                            (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
+                            (
+                                state.name,
+                                granted_at_tick,
+                                1 if observe else 0,
+                                version,
+                                artifact_id.hex,
+                                agent_id.hex,
+                            ),
                         )
 
                 # Read-generation fence: capture the current ownership epoch into
@@ -2883,20 +2915,6 @@ class SqliteArtifactRegistry:
                         "(SELECT owner_generation FROM artifacts WHERE id = ?) "
                         "WHERE artifact_id = ? AND agent_id = ?",
                         (artifact_id.hex, artifact_id.hex, agent_id.hex),
-                    )
-
-                # SB-10 R6/R7: record the version whose bytes this agent now
-                # holds, atomic with the upsert in this BEGIN IMMEDIATE (the
-                # ``version`` operand was SELECTed above in this same txn).
-                # Non-INVALID targets only -- a transition TO INVALID preserves
-                # the prior recorded value (the last version actually observed,
-                # the post-compaction staleness comparand) and a never-observed
-                # row keeps NULL (never a 0-sentinel).
-                if state != MESIState.INVALID:
-                    self._conn.execute(
-                        "UPDATE agent_states SET last_observed_version = ? "
-                        "WHERE artifact_id = ? AND agent_id = ?",
-                        (version, artifact_id.hex, agent_id.hex),
                     )
 
                 # Mutation-then-log: emit state_log BEFORE commit. If the callback

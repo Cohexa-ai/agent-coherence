@@ -626,15 +626,14 @@ class CoordinatorHTTPServer:
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
 
-        # SB-10 U2 (KTD5): compact-pending flags, keyed by session_id. Set by
+        # SB-10 (KTD5): compact-pending flags, keyed by session_id. Set by
         # /hooks/session-start when it emitted a non-empty re-grounding
-        # payload; consumed by the next qualifying PreToolUse allow (deferred
-        # delivery, wired in a later unit) and expired on parent Stop.
+        # payload; consumed by the next qualifying parent allow via
+        # _deliver_pending_reground (SB-10 U4) and expired on parent Stop.
         # PROCESS-LOCAL on purpose — a restarted coordinator loses the flag,
         # an accepted degradation (the restart is a bigger re-grounding event
-        # than a compaction). Value is the monotonic mark time so the
-        # deferred-delivery unit can reason about flag age if it needs to.
-        self._compact_pending: dict[str, float] = {}
+        # than a compaction).
+        self._compact_pending: set[str] = set()
         self._compact_pending_lock = threading.Lock()
 
         # Wire storage + coordinator service.
@@ -1111,9 +1110,9 @@ class CoordinatorHTTPServer:
         """SB-10 (KTD5): flag the session for deferred re-grounding delivery.
         Set only by /hooks/session-start after it built a NON-empty payload —
         an empty session must leave the deferred path unarmed (R5).
-        Idempotent: a second compaction before delivery simply re-stamps."""
+        Idempotent: a second compaction before delivery simply re-marks."""
         with self._compact_pending_lock:
-            self._compact_pending[session_id] = time.monotonic()
+            self._compact_pending.add(session_id)
 
     def consume_compact_pending(self, session_id: str) -> bool:
         """SB-10 (KTD5): ATOMIC test-and-clear of the compact-pending flag.
@@ -1123,7 +1122,10 @@ class CoordinatorHTTPServer:
         see True, so the check and the clear happen under one lock hold —
         a separate has/clear pair would reopen the TOCTOU window."""
         with self._compact_pending_lock:
-            return self._compact_pending.pop(session_id, None) is not None
+            if session_id in self._compact_pending:
+                self._compact_pending.remove(session_id)
+                return True
+            return False
 
     def has_compact_pending(self, session_id: str) -> bool:
         """SB-10 U4 (KTD6): NON-consuming advisory peek at the flag — the
@@ -1142,7 +1144,7 @@ class CoordinatorHTTPServer:
         to the parent Stop by the deferred-delivery unit (R2: the flag's
         lifetime ends at turn end; coordinator restart clears implicitly)."""
         with self._compact_pending_lock:
-            self._compact_pending.pop(session_id, None)
+            self._compact_pending.discard(session_id)
 
     def run_with_watchdog(
         self, fn: Callable[[], Any], abort: threading.Event | None = None
@@ -1534,10 +1536,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # no flag pending, response bytes and the no-registry behavior are
     # exactly today's.
     if not coordinator.policy.is_tracked(path):
-        fast: dict[str, Any] = {"status": "fresh"}
-        if coordinator.has_compact_pending(session_id):
-            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
-        req._json(200, fast)
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -1850,10 +1849,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.
     if not coordinator.policy.is_tracked(path):
-        fast: dict[str, Any] = {"ok": True}
-        if coordinator.has_compact_pending(session_id):
-            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
-        req._json(200, fast)
+        _fast_path_json(req, coordinator, session_id, body, {"ok": True})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2383,8 +2379,9 @@ def _handle_session_start(
 
     Returns the re-grounding ``additionalContext`` payload for a compacted
     session and arms the process-local compact-pending flag for deferred
-    delivery on the next qualifying admit (consumption is wired in a later
-    unit). The ``source == "compact"`` gate lives client-side (U3, the
+    delivery on the next qualifying admit (consumed by
+    ``_deliver_pending_reground`` at the allow-attach seam, SB-10 U4).
+    The ``source == "compact"`` gate lives client-side (U3, the
     hook-client ladder): this endpoint trusts its caller and treats every
     request as a compact event (R1).
 
@@ -2609,10 +2606,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
     tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
     if not tracked_paths:
-        fast: dict[str, Any] = {"status": "fresh"}
-        if coordinator.has_compact_pending(session_id):
-            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
-        req._json(200, fast)
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2787,10 +2781,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # artifacts exit so a pending payload still reaches this admit.
     tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
     if not tracked_paths:
-        fast: dict[str, Any] = {"status": "fresh"}
-        if coordinator.has_compact_pending(session_id):
-            fast = _deliver_pending_reground(coordinator, session_id, body, fast)
-        req._json(200, fast)
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -4754,17 +4745,24 @@ def _build_session_start_context(
         )
         notices: list[tuple[UUID, UUID, float]] = []
         groups: list[tuple[str | None, list[str]]] = []
+        # last_writer depends only on the artifact; cache it across agents so
+        # the loop stays O(pairs-with-state) single SELECTs, not O(A x P).
+        last_writer_cache: dict[UUID, UUID | None] = {}
         for agent_id, subagent_name in agents:
             lines: list[str] = []
             for artifact_id, meta in sorted_artifacts:
+                state = state_by_artifact.get(artifact_id, {}).get(agent_id)
+                if state is None:
+                    # A pending notice implies the victim held a grant, so its
+                    # state row exists (rows are never deleted; preemption
+                    # transitions them to INVALID) -- stateless pairs cannot
+                    # carry a notice and are skipped before any per-pair SQL.
+                    continue
                 pending = coordinator.registry.peek_preemption_notice(
                     agent_id, artifact_id
                 )
                 if pending is not None:
                     notices.append((artifact_id, pending[0], pending[1]))
-                state = state_by_artifact.get(artifact_id, {}).get(agent_id)
-                if state is None:
-                    continue
                 path = meta["name"]
                 current = meta["version"]
                 if state is not MESIState.INVALID:
@@ -4777,12 +4775,13 @@ def _build_session_start_context(
                 last = coordinator.registry.last_observed_version_for(
                     artifact_id, agent_id
                 )
-                stale = (
-                    last is not None
-                    and current > last
-                    and coordinator.registry.last_writer_for(artifact_id)
-                    != agent_id
-                )
+                stale = last is not None and current > last
+                if stale:
+                    if artifact_id not in last_writer_cache:
+                        last_writer_cache[artifact_id] = (
+                            coordinator.registry.last_writer_for(artifact_id)
+                        )
+                    stale = last_writer_cache[artifact_id] != agent_id
                 if stale:
                     lines.append(
                         _payloads.SESSION_START_STALE_LINE_TEMPLATE.format(
@@ -4913,6 +4912,22 @@ def _attach_reground(result: dict, text: str) -> dict:
         text if existing is None else existing + "\n\n" + text
     )
     return {**result, "hookSpecificOutput": merged}
+
+
+def _fast_path_json(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    base: dict,
+) -> None:
+    """SB-10 U4 (KTD6): shared exit for the four hoisted fast paths. The
+    advisory peek keeps no-flag traffic registry-free with the exact
+    pre-SB-10 response bytes; a pending flag routes through the deferred
+    re-ground attach, which claims it atomically at the allow seam."""
+    if coordinator.has_compact_pending(session_id):
+        base = _deliver_pending_reground(coordinator, session_id, body, base)
+    req._json(200, base)
 
 
 def _deliver_pending_reground(
