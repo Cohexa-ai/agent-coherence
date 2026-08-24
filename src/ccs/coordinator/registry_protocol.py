@@ -343,6 +343,15 @@ class RegistryBase(Protocol):
     def last_heartbeat_tick(self, agent_id: UUID) -> int | None:
         ...
 
+    def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the artifact version whose bytes this agent last observed
+        (SB-10: recorded atomically with every non-INVALID grant/commit upsert),
+        or None when the pair was never observed. Absence semantics are part of
+        the contract: never a 0-sentinel, and a transition to INVALID preserves
+        the prior recorded value — this is the durable comparand the
+        post-compaction stale flag is computed from."""
+        ...
+
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,
         checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""

@@ -6,8 +6,9 @@
 WV plan Unit 2 (docs/plans/2026-08-08-001-feat-workspace-versioning-e2e-plan.md).
 Covers, per the unit's test scenarios:
 
-- fresh v5 init lands the complete schema (both checkpoint tables + the name
-  index) at ``user_version=5``;
+- fresh init lands the complete schema (both checkpoint tables + the name
+  index) at the current stamp (v5 at authoring; SB-10 later chained v6, so the
+  stamp asserts use ``SCHEMA_USER_VERSION``);
 - **the v3 -> 4 -> 5 walk regression** (the migration trap): ``_migrate_v3_to_v4``
   used to guard AND stamp with the ``SCHEMA_USER_VERSION`` constant, so bumping
   the constant to 5 would have stamped a v3-origin db ``user_version=5`` WITHOUT
@@ -104,14 +105,15 @@ def _indexes(db_path: Path) -> set[str]:
 
 
 def _revert_to_v4_shape(db_path: Path) -> None:
-    """Mutate a current (v5) db on disk back to the v4 shape: workspace tables
-    + name index ABSENT, stamped ``user_version=4`` (what a pre-WV build
-    produced)."""
+    """Mutate a current db on disk back to the v4 shape: workspace tables +
+    name index AND the v6 ``last_observed_version`` column (SB-10) ABSENT,
+    stamped ``user_version=4`` (what a pre-WV build produced)."""
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("DROP TABLE IF EXISTS workspace_checkpoint_members")
         conn.execute("DROP TABLE IF EXISTS workspace_checkpoints")
         conn.execute("DROP INDEX IF EXISTS idx_workspace_checkpoints_name")
+        conn.execute("ALTER TABLE agent_states DROP COLUMN last_observed_version")
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
     finally:
@@ -217,11 +219,15 @@ def _members() -> list[CheckpointMember]:
 
 
 def test_fresh_v5_init_complete(db_path: Path) -> None:
-    """A fresh db is created at v5 directly: both workspace-checkpoint tables +
-    the name index present, ``user_version=5`` — no migration shim ever runs."""
+    """A fresh db carries the complete v5 checkpoint surface directly: both
+    workspace-checkpoint tables + the name index present — no migration shim
+    ever runs. (The fresh stamp is the CURRENT schema version; SB-10 later
+    chained v6 on top, so it is asserted via the constant, not a literal 5.)"""
     with SqliteArtifactRegistry(db_path) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 5
-    assert SCHEMA_USER_VERSION == 5
+        assert (
+            reg._conn.execute("PRAGMA user_version").fetchone()[0]
+            == SCHEMA_USER_VERSION
+        )
     tables = _tables(db_path)
     assert "workspace_checkpoints" in tables
     assert "workspace_checkpoint_members" in tables
@@ -249,9 +255,13 @@ def test_v3_to_v4_to_v5_walk_lands_v5_ddl_at_v5_stamp(db_path: Path) -> None:
     assert "workspace_checkpoints" not in _tables(db_path)
 
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        # The v5 stamp AND the v5 DDL, together — the trap produced the stamp
-        # without the DDL.
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        # The current stamp AND the v5 DDL, together — the trap produced the
+        # stamp without the DDL. (SB-10 chained v6 on top, so the walk now ends
+        # at SCHEMA_USER_VERSION; the v5 DDL must still be present there.)
+        assert (
+            reg._conn.execute("PRAGMA user_version").fetchone()[0]
+            == SCHEMA_USER_VERSION
+        )
         tables = {
             r[0]
             for r in reg._conn.execute(
@@ -286,7 +296,10 @@ def test_v4_to_v5_preserves_existing_data(db_path: Path) -> None:
     assert _user_version(db_path) == 4
 
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            reg._conn.execute("PRAGMA user_version").fetchone()[0]
+            == SCHEMA_USER_VERSION
+        )
         # Pre-migration data intact.
         got = reg.get_artifact(art.id)
         assert got is not None and got.version == 1 and got.content_hash == "h1"
@@ -353,7 +366,10 @@ def test_sigkill_mid_v4_to_v5_migration_leaves_bootable_pre_state(
     # A clean reopen completes the migration (idempotent, no
     # "table already exists"), with the pre-migration data intact.
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            reg._conn.execute("PRAGMA user_version").fetchone()[0]
+            == SCHEMA_USER_VERSION
+        )
         got = reg.get_artifact(art.id)
         assert got is not None and got.content_hash == "h1"
         reg.create_checkpoint(_checkpoint(), [])
@@ -376,7 +392,12 @@ def test_v5_stamp_without_checkpoint_tables_is_refused(db_path: Path) -> None:
     try:
         conn.execute("DROP TABLE IF EXISTS workspace_checkpoint_members")
         conn.execute("DROP TABLE IF EXISTS workspace_checkpoints")
-        conn.commit()  # user_version stays 5
+        # A fresh db is stamped at the CURRENT version (v6 since SB-10); forge
+        # the exact v5-era trap state the probe pins: v5 stamp, no checkpoint
+        # tables, and no v6 column (a pre-v6 build never had it).
+        conn.execute("ALTER TABLE agent_states DROP COLUMN last_observed_version")
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
     finally:
         conn.close()
 

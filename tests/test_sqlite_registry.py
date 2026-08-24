@@ -826,9 +826,11 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         # db too — the fresh apply always lands the COMPLETE current schema.
         assert "workspace_checkpoints" in tables
         assert "workspace_checkpoint_members" in tables
-        # WV Unit 2 bumped the schema to v5; a fresh db is created at v5.
+        # The v6 observed-version comparand column (SB-10) is inline as well.
+        assert "last_observed_version" in state_cols
+        # SB-10 bumped the schema to v6; a fresh db is created at v6.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 5
+        assert SCHEMA_USER_VERSION == 6
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
