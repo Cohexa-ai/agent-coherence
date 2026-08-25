@@ -119,6 +119,7 @@ def _revert_to_v5_shape(db_path: Path) -> None:
     ``last_observed_version`` ABSENT, stamped ``user_version=5`` (what a pre-SB-10
     build produced). DROP COLUMN needs sqlite >= 3.35 (2021) — every supported
     interpreter's bundled sqlite clears that."""
+    _revert_to_v6_shape(db_path)
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("ALTER TABLE agent_states DROP COLUMN last_observed_version")
@@ -140,6 +141,32 @@ def _revert_to_v4_shape(db_path: Path) -> None:
         conn.execute("DROP INDEX IF EXISTS idx_workspace_checkpoints_name")
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _revert_to_v6_shape(db_path: Path) -> None:
+    """Mutate a current (v7) db on disk back to the v6 shape: the
+    ``idx_agent_states_agent`` index ABSENT, stamped ``user_version=6`` (what
+    an SB-10-era build produced before the index migration)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_agent_states_agent")
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _indexes(db_path: Path) -> set[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+            ).fetchall()
+        }
     finally:
         conn.close()
 
@@ -176,8 +203,8 @@ def test_fresh_v6_init_has_column(db_path: Path) -> None:
     """A fresh db is created at v6 directly: ``last_observed_version`` inline in
     the ``agent_states`` DDL, ``user_version=6`` — no migration shim ever runs."""
     with SqliteArtifactRegistry(db_path) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 6
-    assert SCHEMA_USER_VERSION == 6
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
+    assert SCHEMA_USER_VERSION == 7
     cols = {row[1] for row in _agent_states_shape(db_path)}
     assert "last_observed_version" in cols
 
@@ -194,7 +221,7 @@ def test_v5_db_upgrades_to_v6_and_prior_rows_read_null(db_path: Path) -> None:
     assert _user_version(db_path) == 5
 
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         # Pre-migration data intact.
         got = reg.get_artifact(art.id)
         assert got is not None and got.version == 1 and got.content_hash == "h"
@@ -218,7 +245,7 @@ def test_upgraded_and_fresh_agent_states_shapes_identical(
         pass
     _revert_to_v5_shape(upgraded)
     with SqliteArtifactRegistry(upgraded) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
     assert _agent_states_shape(upgraded) == _agent_states_shape(fresh)
 
 
@@ -226,12 +253,13 @@ def test_v4_to_v5_to_v6_walk_lands_v6_column_at_v6_stamp(db_path: Path) -> None:
     """THE RE-STAMP TRAP REGRESSION (KTD9). A v4-origin db must walk 4 -> 5 -> 6
     and end with the v5 DDL AND the v6 column present AT the v6 stamp.
 
-    If ``_migrate_v4_to_v5`` still guarded/stamped ``SCHEMA_USER_VERSION`` (the
-    correct shape while the constant was 5), a v4-origin db would be stamped 6
-    by the v4->v5 step WITHOUT the v6 column, and the chained v5->v6 step's
-    loser-guard would see >= 6 and no-op — the write-free rehydrate then never
-    adds the column and the first recording UPDATE fails. This test fails if
-    the ``_V5_USER_VERSION`` literal conversion is ever reverted."""
+    Two literal conversions are load-bearing, one per constant bump. If
+    ``_migrate_v4_to_v5`` still stamped ``SCHEMA_USER_VERSION``, a v4-origin
+    db would be stamped past v6 WITHOUT the column; if ``_migrate_v5_to_v6``
+    still stamped the constant (correct while it was 6), a v5-origin db would
+    be stamped 7 WITHOUT the index and the chained v6->v7 loser-guard would
+    no-op. This test fails if EITHER the ``_V5_USER_VERSION`` or the
+    ``_V6_USER_VERSION`` literal conversion is ever reverted."""
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
         art = _register(reg)
     _revert_to_v4_shape(db_path)
@@ -240,7 +268,7 @@ def test_v4_to_v5_to_v6_walk_lands_v6_column_at_v6_stamp(db_path: Path) -> None:
 
     agent = uuid4()
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         # The intermediate v5 surface landed too (the chain did not skip a step).
         tables = {
             r[0]
@@ -248,6 +276,13 @@ def test_v4_to_v5_to_v6_walk_lands_v6_column_at_v6_stamp(db_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
+        idx = {
+            r[0]
+            for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_agent_states_agent" in idx
         assert "workspace_checkpoints" in tables
         assert "workspace_checkpoint_members" in tables
         # The column is USABLE, not just present: a grant records through it.
@@ -309,7 +344,7 @@ def test_sigkill_mid_v5_to_v6_migration_leaves_bootable_v5(
 
     # A clean reopen completes the migration (idempotent), data intact.
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         got = reg.get_artifact(art.id)
         assert got is not None and got.content_hash == "h"
         assert reg.last_observed_version_for(art.id, uuid4()) is None
@@ -336,7 +371,7 @@ def test_genuine_v6_db_reopens_fine_both_paths(db_path: Path) -> None:
     with SqliteArtifactRegistry(db_path) as reg:
         _register(reg)
     with SqliteArtifactRegistry(db_path) as rw:
-        assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert rw._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
     with SqliteArtifactRegistry(db_path, read_only=True) as ro:
         assert ro.instance_id
 
@@ -474,3 +509,49 @@ def test_parity_service_commit_advances_writer(registry) -> None:
     assert reg.last_observed_version_for(art.id, writer) == 2
     assert reg.get_agent_state(art.id, peer) is MESIState.INVALID
     assert reg.last_observed_version_for(art.id, peer) == 1
+
+# ---------------------------------------------------------------------------
+# Migration v7 — the agent_states(agent_id) index (SB-10 perf follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_v7_init_has_agent_states_agent_index(db_path: Path) -> None:
+    """A fresh db is created at v7 directly: the ``idx_agent_states_agent``
+    index inline in the fresh DDL, ``user_version=7`` — no migration shim."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert "idx_agent_states_agent" in _indexes(db_path)
+
+
+def test_v6_db_upgrades_to_v7_and_gains_the_index(db_path: Path) -> None:
+    """A v6 db (SB-10-era: column present, index absent) migrates on open:
+    index created, stamped v7, pre-migration data intact."""
+    agent = uuid4()
+    with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+        art = _register(reg)
+        reg.set_agent_state(art.id, agent, MESIState.SHARED, trigger="fetch", tick=1)
+    _revert_to_v6_shape(db_path)
+    assert _user_version(db_path) == 6
+    assert "idx_agent_states_agent" not in _indexes(db_path)
+
+    with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert reg.get_agent_state(art.id, agent) is MESIState.SHARED
+        assert reg.last_observed_version_for(art.id, agent) == 1
+    assert "idx_agent_states_agent" in _indexes(db_path)
+
+
+def test_upgraded_and_fresh_index_sets_identical(tmp_path: Path) -> None:
+    """A v6->v7-migrated db and a fresh-v7 db expose the same idx_* set — the
+    migration creates exactly what the fresh DDL declares."""
+    fresh = tmp_path / "fresh.db"
+    upgraded = tmp_path / "upgraded.db"
+    with SqliteArtifactRegistry(fresh):
+        pass
+    with SqliteArtifactRegistry(upgraded):
+        pass
+    _revert_to_v6_shape(upgraded)
+    with SqliteArtifactRegistry(upgraded):
+        pass
+    assert _indexes(upgraded) == _indexes(fresh)
+

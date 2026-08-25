@@ -828,9 +828,16 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         assert "workspace_checkpoint_members" in tables
         # The v6 observed-version comparand column (SB-10) is inline as well.
         assert "last_observed_version" in state_cols
-        # SB-10 bumped the schema to v6; a fresh db is created at v6.
+        # The v7 agent_id index (SB-10 perf follow-up) is inline as well.
+        indexes = {
+            r[0] for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_agent_states_agent" in indexes
+        # A fresh db is created directly at the current head.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 6
+        assert SCHEMA_USER_VERSION == 7
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
@@ -2242,3 +2249,22 @@ def test_status_snapshot_scoped_to_no_agents_reads_no_state(db_path: Path) -> No
         artifact_by_id, state_by_artifact = reg.status_snapshot(agent_ids=[])
         assert set(artifact_by_id) == {art.id}
         assert state_by_artifact == {art.id: {}}
+
+
+def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:
+    """SB-10 perf follow-up: the scoped state read must SEARCH via
+    ``idx_agent_states_agent``, never SCAN. Without the index the scope only
+    trims per-row materialization — the page walk over a table nothing
+    garbage-collects still runs on the hook path, and dropping the index in a
+    later migration would regress it silently (every query stays correct)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        plan = " | ".join(
+            r[3]
+            for r in reg._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT artifact_id, agent_id, state "
+                "FROM agent_states WHERE agent_id IN (?, ?)",
+                ("a" * 32, "b" * 32),
+            ).fetchall()
+        )
+    assert "idx_agent_states_agent" in plan, plan
+    assert "SCAN agent_states" not in plan, plan

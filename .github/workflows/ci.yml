@@ -189,19 +189,20 @@ jobs:
       # then merged on a maintainer's local run, which is the one place the
       # parity contract must not be taken on trust.
       #
-      # So: on a pull request, if the plugin repo carries a branch with the
-      # SAME name as this PR's head (the convention for a paired change),
-      # build that. Otherwise `main`, which is the historical behaviour and
-      # the behaviour of every push build — `github.head_ref` is empty off
-      # the pull_request event. An absent or unreachable sibling degrades to
-      # `main` rather than failing the job.
+      # So: build the plugin branch whose name matches the branch under
+      # test — the PR's head branch on pull_request (`head_ref`), the pushed
+      # branch on push (`ref_name`, so a push to `dev` pairs with the
+      # plugin's `dev` and a push to `main` with its `main`) — and fall back
+      # to `main` when no same-named plugin branch exists (tags fall back
+      # too: no plugin branch is named `v*`). An absent or unreachable
+      # sibling degrades to `main` rather than failing the job.
       #
       # `head_ref` is attacker-controlled on a fork PR, so it reaches the
       # script through the environment and is never interpolated into it.
       - name: Resolve plugin ref
         id: plugin_ref
         env:
-          SIBLING_REF: ${{ github.head_ref }}
+          SIBLING_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           remote=https://github.com/Cohexa-ai/agent-coherence-plugin.git
           ref=main
