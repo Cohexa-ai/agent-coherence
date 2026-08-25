@@ -1,0 +1,23 @@
+{
+  "name": "session-start-empty-session-noop",
+  "description": "SB-10 R5 no-op arm: a session-start for a session with no coordination state (nothing ever read or edited in the workspace) answers the literal empty object {} on both backends — no SessionStart envelope, no additionalContext. The tracked policy file exists but no artifact was ever observed, so the registry snapshot is empty. The deferred-delivery flag also stays unarmed on this path (pinned behaviorally by fixtures 04/05, which require an armed flag to attach).",
+  "setup": {
+    "tracked": [
+      "docs/alpha.md"
+    ],
+    "files": {
+      "docs/alpha.md": "# Alpha\nv1 content\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-start",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {}
+  }
+}

@@ -94,6 +94,16 @@ class ArtifactRecord:
     # (resets to 0 per construction in-memory).
     owner_generation: int = 0
     read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
+    # SB-10 (compaction re-emission, R6/R7): the artifact version whose BYTES
+    # an agent last observed, recorded atomically with every non-INVALID grant
+    # transition (set_agent_state) and advanced by the commit WIN paths
+    # (commit_cas / commit_all / the pessimistic service.commit's MODIFIED
+    # upsert). An ABSENT key means never-observed (surfaced as None, never a
+    # 0-sentinel); a transition to INVALID deliberately preserves the prior
+    # value -- it is the durable comparand the post-compaction stale flag is
+    # computed from. Mirrors the sqlite agent_states.last_observed_version
+    # column (nullable INTEGER, schema v6).
+    last_observed_version_by_agent: dict[UUID, int] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -331,6 +341,14 @@ class ArtifactRegistry:
         not the fence, arbitrates)."""
         return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
+    def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the artifact version whose bytes this agent last observed
+        (SB-10 R6/R7: recorded atomically with every non-INVALID grant/commit
+        transition), or None when the pair was never observed — absence is an
+        absent key, never a 0-sentinel, and a transition to INVALID preserved
+        the prior recorded value. The post-compaction staleness comparand."""
+        return self._records[artifact_id].last_observed_version_by_agent.get(agent_id)
+
     def get_artifact_and_generation(
         self, artifact_id: UUID
     ) -> tuple[Artifact, int] | None:
@@ -513,6 +531,16 @@ class ArtifactRegistry:
             trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
         ):
             record.read_generation_by_agent[agent_id] = record.owner_generation
+
+        # SB-10 R6/R7: record the version whose bytes this agent now holds,
+        # GIL-atomic with the state write above (parity: the sqlite side writes
+        # it inside the same BEGIN IMMEDIATE as the upsert). Non-INVALID
+        # targets only -- a transition TO INVALID preserves the prior recorded
+        # value (the last version actually observed, the post-compaction
+        # staleness comparand) and a never-observed agent keeps no key (absent
+        # == None, never a 0-sentinel).
+        if state != MESIState.INVALID:
+            record.last_observed_version_by_agent[agent_id] = record.artifact.version
 
         if self._state_log is not None:
             self._seq += 1
@@ -707,6 +735,10 @@ class ArtifactRegistry:
         # clear the reclaim slot (mirror set_agent_state's non-M/E-from-non-M/E
         # path, which leaves both untouched).
         record.state_by_agent[agent_id] = MESIState.SHARED
+        # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
+        # last_observed_version to the version it just produced; the
+        # invalidated peers above keep their prior values.
+        record.last_observed_version_by_agent[agent_id] = next_version
 
         return updated, invalidated
 
@@ -849,6 +881,10 @@ class ArtifactRegistry:
                     # other per-record state the apply touches.
                     dict(record.version_history),
                     dict(record.version_captured_at),
+                    # SB-10: the apply advances the committer's observed-version
+                    # slot per member; a mid-apply raise must restore it with
+                    # the rest (sqlite's ROLLBACK undoes the column write).
+                    dict(record.last_observed_version_by_agent),
                 )
                 for _art, record, *_rest in staged
             ]
@@ -869,10 +905,14 @@ class ArtifactRegistry:
                     if member_invalidated:
                         invalidated[art_id] = member_invalidated
                     record.state_by_agent[agent_id] = MESIState.SHARED
+                    # SB-10 R6/R7 (KTD4 first layer): each member's WIN advances
+                    # the WRITER's observed version to that member's
+                    # next_version; invalidated peers keep theirs.
+                    record.last_observed_version_by_agent[agent_id] = next_version
                     versions[art_id] = next_version
             except Exception:
                 # Total apply: restore every mutated record, roll back the logs.
-                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at) in snapshots:
+                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at, observed) in snapshots:
                     rec.artifact = art_obj
                     rec.content = content
                     rec.state_by_agent = state_by
@@ -880,6 +920,7 @@ class ArtifactRegistry:
                     rec.last_writer = last_w
                     rec.version_history = ver_hist
                     rec.version_captured_at = ver_at
+                    rec.last_observed_version_by_agent = observed
                 self._seq -= emitted_here
                 raise
 

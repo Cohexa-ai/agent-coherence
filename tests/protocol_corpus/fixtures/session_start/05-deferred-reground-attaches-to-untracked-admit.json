@@ -1,0 +1,48 @@
+{
+  "name": "deferred-reground-attaches-to-untracked-admit",
+  "description": "SB-10 U4/U8 untracked-admit carriage — a brand-new wire shape and this fixture is its only cross-backend pin. Preflight: A pre-reads tracked docs/notes.md (SHARED v1); A's session-start arms the compact-pending flag. The test request is A's pre-read of an UNTRACKED path: the coordinator's fast path answers {status: fresh} without touching the registry, and the hoisted compact-pending peek attaches a CONTEXT-ONLY PreToolUse envelope carrying the re-ground block. The envelope has exactly two keys — hookEventName and additionalContext — and NO permissionDecision: re-grounding is advisory (KD3) and must never widen a permission decision, so a bare untracked admit that Claude Code would ordinarily prompt about is not auto-approved as a side effect of delivery. The whole body byte-matches across backends with no normalization sentinels — the re-ground block carries no timestamps.",
+  "setup": {
+    "tracked": [
+      "docs/notes.md"
+    ],
+    "files": {
+      "docs/notes.md": "# Notes\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-start",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "scratch/tmp.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": "Post-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on docs/notes.md (v1) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+      }
+    }
+  },
+  "_comment": "The bare untracked fast path stays {status: fresh} with NO hookSpecificOutput when no flag pends (pinned by warn_mode/01); this fixture pins the flag-pending promotion. KTD2: the block is rebuilt at attach from registry truth — A still holds SHARED at v1, so the R3 grant line renders v1. PERMISSION CONTAINMENT: the harness compares exact normalized dicts, so the ABSENCE of permissionDecision under hookSpecificOutput is asserted, not merely unmentioned — a backend that went back to minting an allow envelope here would produce a three-key hookSpecificOutput and fail this fixture's body compare on the extra key, on BOTH backends. Before 2026-08-25 this fixture did expect permissionDecision 'allow'; that expectation was the bug (an advisory payload short-circuiting Claude Code's permission prompt once per compaction) and was corrected alongside the backends. Context-only delivery is empirically sufficient: an A/B capture against Claude Code CLI 2.1.233 showed additionalContext with no permissionDecision is rendered to the model, identically to the allow-stamped control arm. The sibling fixture 04 is the OTHER branch — there the envelope pre-exists (a warn-mode stale allow) and the merge path must leave its permissionDecision untouched."
+}

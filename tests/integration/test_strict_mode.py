@@ -529,6 +529,100 @@ def test_strict_deny_reason_byte_stable_across_retries(strict_client: _Client) -
 
 
 # ----------------------------------------------------------------------
+# SB-10 U4 (AE3): deferred re-grounding must never touch strict-deny bodies
+# ----------------------------------------------------------------------
+
+
+def test_strict_deny_with_pending_reground_flag_byte_identical_and_flag_survives(
+    strict_coordinator, strict_client: _Client,
+) -> None:
+    """AE3 first half (KTD-P preservation): a strict-mode deny issued while
+    the session's compact-pending flag is armed carries a deny envelope
+    byte-identical to the no-flag baseline — the deferred re-grounding
+    payload attaches ONLY to allow envelopes (R8) — and the deny neither
+    consumes nor expires the flag (only a qualifying admit consumes, R2).
+
+    Written FIRST per the unit's execution note: this test passes against
+    the pre-U4 coordinator (no admit consumes the flag today) and must stay
+    green throughout the deferred-injection implementation."""
+    _setup_stale(strict_client, "CLAUDE.md")
+    # Baseline deny envelope with NO flag armed.
+    status, baseline = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    assert baseline["hookSpecificOutput"]["permissionDecision"] == "deny"
+    # Arm the deferred-delivery flag, then retry the same denied read.
+    strict_coordinator.mark_compact_pending(_sid("A"))
+    status, with_flag = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    # The deny envelope is byte-stable (KTD-P) AND untouched by the pending
+    # flag — no re-grounding prose may ride a deny.
+    assert with_flag["hookSpecificOutput"] == baseline["hookSpecificOutput"]
+    assert set(with_flag.keys()) == set(baseline.keys())
+    # Flag still pending: the deny consumed nothing (asserted via the
+    # test-and-clear primitive, which also cleans up the armed flag).
+    assert strict_coordinator.consume_compact_pending(_sid("A")) is True
+
+
+def test_strict_deny_then_allowed_warn_read_orders_notices_before_reground(
+    strict_coordinator, strict_client: _Client,
+) -> None:
+    """AE3 second half: after a strict deny left the flag pending, the NEXT
+    qualifying admit — a warn-mode stale re-read that also drains a pending
+    preemption notice — delivers everything in one additionalContext, in
+    the order notices → stale warning → re-grounding block."""
+    # Stale strict artifact FIRST — its fresh pre-reads would otherwise
+    # drain the preemption notice staged below (fresh-path notice surfacing).
+    _setup_stale(strict_client, "CLAUDE.md")
+    # Session A holds EXCLUSIVE on the warn-mode path; B preempts (recording
+    # a notice for A) and commits, leaving A INVALID on docs/plans/x.md.
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "docs/plans/x.md", "content_hash": _hash("v1")},
+    )
+    strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "docs/plans/x.md"},
+    )
+    strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("B"), "path": "docs/plans/x.md"},
+    )
+    strict_client.post(
+        "/hooks/post-edit",
+        {"session_id": _sid("B"), "path": "docs/plans/x.md",
+         "content_hash": _hash("v2"), "success": True},
+    )
+    # Strict deny for A on CLAUDE.md with the flag armed: flag must survive
+    # the deny (no consume) so the next qualifying admit can deliver.
+    strict_coordinator.mark_compact_pending(_sid("A"))
+    status, denied = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    # Follow-up ALLOWED warn-mode re-read: notice + stale warning + re-ground.
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "docs/plans/x.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"
+    text = out["additionalContext"]
+    notice_at = text.index("Coordinator notice")
+    stale_at = text.index("Stale read")
+    reground_at = text.index("Post-compaction re-grounding (agent-coherence):")
+    assert notice_at < stale_at < reground_at
+    # Delivered exactly once: the flag is gone.
+    assert strict_coordinator.consume_compact_pending(_sid("A")) is False
+
+
+# ----------------------------------------------------------------------
 # KTD-U structural invariant: emit_allow refuses terminal-denial conversion
 # ----------------------------------------------------------------------
 
@@ -546,6 +640,13 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
     "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
+    # NOT listed: coordinator_server._attach_reground. The SB-10 deferred
+    # re-grounding attach no longer emits an allow — a bare admit body now
+    # gains a CONTEXT-ONLY PreToolUse envelope (hookEventName +
+    # additionalContext, no permissionDecision) via
+    # hook_payloads.emit_pretooluse_context, because an advisory payload
+    # must never widen a permission decision. No emit_allow call site, so
+    # no entry here.
 ]
 
 

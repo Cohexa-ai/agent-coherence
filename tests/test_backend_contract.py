@@ -8,7 +8,7 @@ frozen dataclasses, string constants) formalizing what a networked registry
 backend must provide to re-home the coordinator's atomic boundary. These tests
 are the DRIFT GUARDS the plan calls for:
 
-- the member-classification map covers EXACTLY the 58 ``RegistryBase`` +
+- the member-classification map covers EXACTLY the 59 ``RegistryBase`` +
   ``SqliteExtended`` members — no more, no fewer — so a Protocol member added or
   removed in ``registry_protocol.py`` without a matching contract update FAILS
   CI (bidirectional guard);
@@ -19,7 +19,7 @@ are the DRIFT GUARDS the plan calls for:
 - a classification value outside the enum is unrepresentable (typed);
 - the tier enum has exactly ``TIER_1`` and ``TIER_2``.
 
-The expected 58-member set is FROZEN here (imported from the parity test's own
+The expected 59-member set is FROZEN here (imported from the parity test's own
 frozen name-sets), NOT derived from the Protocol at runtime — so a silent
 Protocol edit cannot move the goalposts this test guards (the same discipline
 ``tests/test_registry_protocol_parity.py`` uses).
@@ -42,8 +42,8 @@ from ccs.coordinator.backend_contract import (
     Tier,
 )
 
-# The 58-member expected surface, imported from the parity test's FROZEN
-# name-sets (44 base methods + 13 extended methods + 1 base property). Reusing
+# The 59-member expected surface, imported from the parity test's FROZEN
+# name-sets (45 base methods + 13 extended methods + 1 base property). Reusing
 # those frozensets means this contract and the Protocol parity share ONE
 # source of truth for the surface: if either the parity test or the Protocol
 # changes the surface, the two drift guards fire together.
@@ -62,20 +62,21 @@ EXPECTED_MEMBERS = BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES
 
 
 def test_member_map_covers_exactly_the_protocol_surface() -> None:
-    """The classification map keys equal the 58-member Protocol surface EXACTLY
+    """The classification map keys equal the 59-member Protocol surface EXACTLY
     — no more, no fewer. A member added to (or removed from) ``registry_protocol.py``
     without a matching contract update fails HERE (bidirectional drift guard)."""
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_58_members() -> None:
-    """Pin the count explicitly: 44 base methods (SB-18 ``commit_all``, the
+def test_member_map_has_exactly_59_members() -> None:
+    """Pin the count explicitly: 45 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
-    ``get_artifact_and_generation`` added) + 13 extended methods + 1
-    base property = 58. Guards against a same-size add+remove that would slip
+    ``get_artifact_and_generation``, then the SB-10 comparand read
+    ``last_observed_version_for`` added) + 13 extended methods + 1
+    base property = 59. Guards against a same-size add+remove that would slip
     past the set-equality check on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 58
-    assert len(EXPECTED_MEMBERS) == 58
+    assert len(MEMBER_CLASSIFICATION) == 59
+    assert len(EXPECTED_MEMBERS) == 59
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:

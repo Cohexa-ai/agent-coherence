@@ -826,9 +826,18 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         # db too — the fresh apply always lands the COMPLETE current schema.
         assert "workspace_checkpoints" in tables
         assert "workspace_checkpoint_members" in tables
-        # WV Unit 2 bumped the schema to v5; a fresh db is created at v5.
+        # The v6 observed-version comparand column (SB-10) is inline as well.
+        assert "last_observed_version" in state_cols
+        # The v7 agent_id index (SB-10 perf follow-up) is inline as well.
+        indexes = {
+            r[0] for r in reg._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_agent_states_agent" in indexes
+        # A fresh db is created directly at the current head.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 5
+        assert SCHEMA_USER_VERSION == 7
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
@@ -2181,3 +2190,81 @@ class TestV3ToV4Migration:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                     (table,),
                 ).fetchone() is not None, table
+
+
+# --------------------------------------------------------------------
+# status_snapshot agent scoping (SB-10 review)
+# --------------------------------------------------------------------
+
+
+def test_status_snapshot_unscoped_reads_every_agent(db_path: Path) -> None:
+    """The /status caller passes no scope and keeps the whole-ledger view."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+        a1, a2 = uuid4(), uuid4()
+        reg.set_agent_state(art.id, a1, MESIState.SHARED, tick=1)
+        reg.set_agent_state(art.id, a2, MESIState.EXCLUSIVE, tick=2)
+
+        artifact_by_id, state_by_artifact = reg.status_snapshot()
+        assert set(artifact_by_id) == {art.id}
+        assert state_by_artifact[art.id] == {
+            a1: MESIState.SHARED,
+            a2: MESIState.EXCLUSIVE,
+        }
+
+
+def test_status_snapshot_scoped_reads_only_the_named_agents(db_path: Path) -> None:
+    """SB-10 review: the session-start builder runs on a HOOK path, twice per
+    compaction, under the registry lock — and can only ever render its own
+    session's agents. Nothing garbage-collects ``agent_states``, so an
+    unscoped read would drag the workspace's entire coordination history
+    through that lock to discard all but a handful of rows."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        mine = _make_artifact(name="mine.md")
+        theirs = _make_artifact(name="theirs.md", content_hash="h2")
+        reg.register_artifact(mine, content="")
+        reg.register_artifact(theirs, content="")
+        ours, foreign = uuid4(), uuid4()
+        reg.set_agent_state(mine.id, ours, MESIState.SHARED, tick=1)
+        reg.set_agent_state(mine.id, foreign, MESIState.EXCLUSIVE, tick=2)
+        reg.set_agent_state(theirs.id, foreign, MESIState.SHARED, tick=3)
+
+        artifact_by_id, state_by_artifact = reg.status_snapshot(agent_ids=[ours])
+        # Artifact metadata stays workspace-wide on purpose: SB-10's R8
+        # breadcrumb asks whether the WORKSPACE holds state, not this session.
+        assert set(artifact_by_id) == {mine.id, theirs.id}
+        assert state_by_artifact[mine.id] == {ours: MESIState.SHARED}
+        assert state_by_artifact[theirs.id] == {}
+
+
+def test_status_snapshot_scoped_to_no_agents_reads_no_state(db_path: Path) -> None:
+    """An empty scope is 'no agents', never 'every agent' — the degenerate
+    case must not silently widen back to a full scan."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+        reg.set_agent_state(art.id, uuid4(), MESIState.SHARED, tick=1)
+
+        artifact_by_id, state_by_artifact = reg.status_snapshot(agent_ids=[])
+        assert set(artifact_by_id) == {art.id}
+        assert state_by_artifact == {art.id: {}}
+
+
+def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:
+    """SB-10 perf follow-up: the scoped state read must SEARCH via
+    ``idx_agent_states_agent``, never SCAN. Without the index the scope only
+    trims per-row materialization — the page walk over a table nothing
+    garbage-collects still runs on the hook path, and dropping the index in a
+    later migration would regress it silently (every query stays correct)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        plan = " | ".join(
+            r[3]
+            for r in reg._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT artifact_id, agent_id, state "
+                "FROM agent_states WHERE agent_id IN (?, ?)",
+                ("a" * 32, "b" * 32),
+            ).fetchall()
+        )
+    assert "idx_agent_states_agent" in plan, plan
+    assert "SCAN agent_states" not in plan, plan

@@ -437,3 +437,242 @@ def test_pre_grep_empty_path_does_not_crash(
     # {"status": "fresh"}. We just need a parseable JSON response, not
     # specifically empty or non-empty.
     assert isinstance(response, dict)
+
+
+# ----------------------------------------------------------------------
+# session-start (SB-10 U3) — post-compaction re-grounding bridge
+#
+# The coordinator endpoint trusts its caller and treats EVERY request as a
+# compact event (R1), so the ``source == "compact"`` gate lives in the
+# hook-client builder. These tests pin both halves of that contract: a
+# compact SessionStart reaches /hooks/session-start and its response is
+# passed through verbatim; every other source (startup/resume/clear/absent)
+# never touches the network; and every failure mode stays fail-open ({}).
+# ----------------------------------------------------------------------
+
+
+def _fake_coherence_dir(workspace: Path, port: int) -> None:
+    """Fabricate .coherence/{server.pid,hook.secret} so resolve_endpoint
+    (pure file reads — no network) succeeds and the dispatch ladder is
+    reachable without spawning a real coordinator."""
+    coherence = workspace / ".coherence"
+    coherence.mkdir(exist_ok=True)
+    # Port-file format per lifecycle.read_port_from_file: line 1 pid, line 2 port.
+    (coherence / "server.pid").write_text(f"12345\n{port}\n")
+    (coherence / "hook.secret").write_text("test-secret")
+
+
+def test_session_start_compact_posts_and_passes_response_through(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """source:"compact" with coordination state → non-empty re-grounding
+    payload on stdout, byte-for-byte identical to what the coordinator
+    returns for a direct POST (the passthrough contract: the client must
+    not reshape, filter, or annotate the coordinator's response)."""
+    workspace, _ = live_coordinator
+    from ccs.cli import coherence_track
+    from ccs.cli._coherence_client import post, resolve_endpoint
+
+    (workspace / "docs").mkdir(parents=True, exist_ok=True)
+    (workspace / "docs" / "plan.md").write_text("plan v1")
+    coherence_track.main(["--root", str(workspace), "docs/plan.md"])
+    capsys.readouterr()  # drain track output
+
+    # Give the session coordination state: a pre-read on the tracked file
+    # grants this session's agent a MESI state, which is exactly what makes
+    # the session-start payload non-empty (R5's has-state arm).
+    session_id = _sid()
+    read_payload = {
+        "session_id": session_id,
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(workspace / "docs" / "plan.md")},
+    }
+    rc, _ = _drive("pre-read", read_payload, workspace, monkeypatch, capsys)
+    assert rc == 0
+
+    cc_payload = {
+        "session_id": session_id,
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+    }
+    rc, out = _drive("session-start", cc_payload, workspace, monkeypatch, capsys)
+    assert rc == 0
+    response = json.loads(out)
+    hso = response.get("hookSpecificOutput")
+    assert hso is not None, (
+        f"compact session-start with a grant must return a re-grounding "
+        f"payload, got {response!r}"
+    )
+    assert hso["hookEventName"] == "SessionStart"
+    assert "docs/plan.md" in hso["additionalContext"]
+
+    # Verbatim passthrough: a direct POST with the translated body must
+    # yield the exact bytes the client printed (the build is read-only
+    # toward the registry — R6 — so back-to-back calls are stable).
+    endpoint = resolve_endpoint(workspace)
+    direct = post(endpoint, "/hooks/session-start", {"session_id": session_id})
+    assert out.strip() == json.dumps(direct)
+
+
+def test_session_start_non_compact_sources_never_hit_network(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """startup/resume/clear/absent → {} exit 0 with NO request made. A
+    live coordinator is running, so if the source gate ever regressed the
+    recorded-call list would be non-empty (and the response non-{})."""
+    workspace, _ = live_coordinator
+    calls: list[tuple[str, dict[str, Any]]] = []
+    real_post = coherence_hook_client.post
+
+    def recording_post(endpoint, path, body, **kwargs):
+        calls.append((path, body))
+        return real_post(endpoint, path, body, **kwargs)
+
+    monkeypatch.setattr(coherence_hook_client, "post", recording_post)
+    for source in ("startup", "resume", "clear", None):
+        cc_payload: dict[str, Any] = {"session_id": _sid()}
+        if source is not None:
+            cc_payload["source"] = source
+        rc, out = _drive("session-start", cc_payload, workspace, monkeypatch, capsys)
+        assert rc == 0, f"source={source!r}"
+        assert out.strip() == "{}", f"source={source!r} must skip, got {out!r}"
+    assert calls == [], f"non-compact sources must not reach the network: {calls}"
+
+
+def test_session_start_body_is_session_only(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The translated body is exactly {"session_id": ...}: source is
+    stripped, and a stray agent_id is NOT forwarded (SessionStart carries
+    no subagent context — the re-grounding payload is session-scoped, so
+    the builder deliberately bypasses _with_agent_id). Also pins verbatim
+    passthrough of an arbitrary coordinator response."""
+    _fake_coherence_dir(git_workspace, port=65000)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def canned_post(endpoint, path, body, **kwargs):
+        calls.append((path, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(coherence_hook_client, "post", canned_post)
+    session_id = _sid()
+    cc_payload = {
+        "session_id": session_id,
+        "source": "compact",
+        "agent_id": "worker-1",  # never expected on SessionStart; must be dropped
+    }
+    rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
+    assert rc == 0
+    assert calls == [("/hooks/session-start", {"session_id": session_id})]
+    assert out.strip() == json.dumps({"ok": True})
+
+
+def test_session_start_missing_session_id_emits_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Compact source but no session_id → skip before any network call."""
+    _fake_coherence_dir(git_workspace, port=65000)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        coherence_hook_client,
+        "post",
+        lambda endpoint, path, body, **kwargs: calls.append(path) or {},
+    )
+    rc, out = _drive("session-start", {"source": "compact"}, git_workspace,
+                     monkeypatch, capsys)
+    assert rc == 0
+    assert out.strip() == "{}"
+    assert calls == []
+
+
+def test_session_start_tty_stdin_emits_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Developer runs the subcommand manually (stdin is a TTY) → usage
+    hint on stderr, {} on stdout, exit 0 — never a blocking read."""
+    class _TtyStdin(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("sys.stdin", _TtyStdin())
+    rc = coherence_hook_client.main(["session-start", "--root", str(git_workspace)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "{}"
+
+
+def test_session_start_empty_stdin_emits_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    rc = coherence_hook_client.main(["session-start", "--root", str(git_workspace)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "{}"
+
+
+def test_session_start_malformed_stdin_emits_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json at all"))
+    rc = coherence_hook_client.main(["session-start", "--root", str(git_workspace)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "{}"
+
+
+def test_session_start_no_coordinator_returns_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Compact event with no coordinator running → {} exit 0."""
+    cc_payload = {"session_id": _sid(), "source": "compact"}
+    rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
+    assert rc == 0
+    assert out.strip() == "{}"
+
+
+def test_session_start_unreachable_coordinator_returns_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Port file exists but nothing is listening (stale pid file after a
+    coordinator crash) → the POST raises CoordinatorUnavailable → {}."""
+    import socket
+
+    # Bind-then-close: the freed ephemeral port is near-certainly unbound,
+    # so the client's connect gets refused instead of talking to a stranger.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+    _fake_coherence_dir(git_workspace, port=dead_port)
+
+    cc_payload = {"session_id": _sid(), "source": "compact"}
+    rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
+    assert rc == 0
+    assert out.strip() == "{}"
+
+
+def test_session_start_builder_exception_emits_empty(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unexpected exception inside the builder (refactor regression)
+    must be swallowed by the dispatch ladder's catch-all → {} exit 0."""
+    _fake_coherence_dir(git_workspace, port=65000)
+    monkeypatch.setattr(
+        coherence_hook_client,
+        "_build_session_start",
+        lambda cc: (_ for _ in ()).throw(RuntimeError("builder regression")),
+    )
+    cc_payload = {"session_id": _sid(), "source": "compact"}
+    rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
+    assert rc == 0
+    assert out.strip() == "{}"
