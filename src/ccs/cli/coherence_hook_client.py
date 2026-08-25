@@ -15,12 +15,16 @@ directly (no env-var dependency).
 Each subcommand maps to one coordinator endpoint and translates the
 Claude Code stdin contract → the coordinator's payload contract:
 
-| Subcommand     | CC hook         | Coordinator endpoint    |
-|----------------|-----------------|-------------------------|
-| pre-read       | PreToolUse:Read | POST /hooks/pre-read    |
-| pre-edit       | PreToolUse:Edit | POST /hooks/pre-edit    |
-| post-edit      | PostToolUse     | POST /hooks/post-edit   |
-| session-stop   | Stop            | POST /hooks/session-stop|
+| Subcommand     | CC hook          | Coordinator endpoint     |
+|----------------|------------------|--------------------------|
+| pre-read       | PreToolUse:Read  | POST /hooks/pre-read     |
+| pre-edit       | PreToolUse:Edit  | POST /hooks/pre-edit     |
+| post-edit      | PostToolUse      | POST /hooks/post-edit    |
+| session-stop   | Stop             | POST /hooks/session-stop |
+| subagent-stop  | SubagentStop     | POST /hooks/session-stop (scoped to the subagent's grants) |
+| pre-bash       | PreToolUse:Bash  | POST /hooks/pre-bash     |
+| pre-grep       | PreToolUse:Grep  | POST /hooks/pre-grep     |
+| session-start  | SessionStart     | POST /hooks/session-start (post-compaction re-grounding; only ``source: "compact"`` calls out) |
 
 ## stdin contract
 

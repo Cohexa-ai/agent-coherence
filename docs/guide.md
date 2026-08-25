@@ -74,7 +74,14 @@ pip install "agent-coherence[openai-agents]"
 # stale-write-guard-fs MCP server (coordinated file access for any MCP client)
 pip install "agent-coherence[mcp]"
 
-# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral + mcp)
+# BYO-substrate bindings (CoherentRow for Postgres / CoherentObject for S3)
+pip install "agent-coherence[coherent-row]"
+pip install "agent-coherence[coherent-object]"
+
+# Substrate conformance corpus (for foreign implementations; not part of [all])
+pip install "agent-coherence[conformance]"
+
+# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral + mcp + coherent-row + coherent-object)
 pip install "agent-coherence[all]"
 ```
 
@@ -1046,6 +1053,37 @@ without one skips the release rather than stripping the parent's grants
 mid-session. The Python and Node coordinator backends derive the identity
 byte-identically; the protocol corpus pins the parity (sibling collision,
 attribution, scoped release fixtures).
+
+**Compaction-aware re-grounding (v0.14.0).** When Claude Code compacts a
+session (auto-compaction or a manual `/compact`), the model's summary can
+silently drop what the session held and what peers changed around the
+boundary. Wire Claude Code's `SessionStart` hook to
+`agent-coherence-hook-client session-start` and the coordinator re-grounds
+the compacted session with a bounded payload: the grants it held at
+compaction, event-anchored ("At compaction you held EXCLUSIVE on `plan.md`
+(v7) — re-acquire before writing."), and each touched artifact's current
+coordinated version — with a stale flag when a peer advanced it past the
+session's last-observed version ("`plan.md` advanced to v9 past your
+last-observed v7 — re-read before relying on it."). The payload is
+session-scoped: the parent's lines render first, then each registered
+subagent's under a `Subagent <name>:` prefix. The subcommand gates on
+`source: "compact"` client-side, so ordinary starts, resumes, and clears
+never reach the coordinator. Delivery: the payload renders at the next
+user message and on `--resume`; a live autonomous loop additionally
+receives it on its next tool admit — attached only to allow responses,
+never to a strict-mode deny (deny bodies stay byte-identical). Bounded and
+honest: at most three artifact lines plus an overflow summary pointing at
+`agent-coherence-status`; a session with no coordination state emits
+nothing; a coordinator that is down at the compact boundary fails open
+with an empty response — coordination never blocks the session. One benign
+duplicate is possible (a mid-loop delivery followed by the next user
+turn's render); the closing line — "Versions are as of this re-grounding;
+a more recent read supersedes this notice." — makes a second sighting
+harmless. The Python and Node coordinator backends emit byte-identical
+prose (protocol-corpus pinned). Staleness flags need an observation
+baseline: rows recorded before this release have no last-observed version
+and are deliberately never flagged, so detection becomes accurate as
+sessions read and commit after the upgrade.
 
 Run the red→green demo: `python -m examples.mcp_stale_write_guard.main`
 (offline, deterministic, no keys).

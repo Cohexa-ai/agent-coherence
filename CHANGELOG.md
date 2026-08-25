@@ -4,7 +4,7 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.14.0] - 2026-08-25
 
 ### Added
 
@@ -28,49 +28,36 @@ Alpha — APIs may change before `v1.0`.
   is still the agent's own step. `swg_read`'s added `owner_generation` field is
   additive; every other tool is byte-unchanged.
 
-### Fixed
-
-- **`gate()` now HOLDs when the grant its input was read under is gone — not
-  only when the version moved.** The effect-ordering wrapper's re-validation
-  compared versions alone, and the version answers only "is the value still
-  the one `decide` saw" — it never asks "is the grant it was read under still
-  standing". A coordinator sweep that reclaims a stalled holder's grant
-  advances the artifact's ownership generation **without** a version move, so
-  a reclaimed (zombie) holder's escaping effect — the webhook, the deploy,
-  the opened PR — fired straight through the gate on revoked authority; in
-  strict mode it even fired through the deny (the deny's summary still
-  carried the unchanged version, and the denied-read marker was discarded).
-  This is the same distinction the v0.9.1 read-generation fence already draws
-  at the commit seam, now applied at the effect boundary. `gate()` captures
-  the `(version, owner_generation)` pair at decision time — one pair-atomic
-  registry snapshot (`get_artifact_and_generation`, on both registry arms), so
-  a concurrent sweep can never tear it — re-reads the pair at the boundary,
-  and HOLDs if **either** moved. Fail-closed on both comparands: an
-  unconfirmed version (`0`, degraded) or an unconfirmed generation (`None` —
-  a strict deny, a degraded read, or an older coordinator daemon from before
-  this fix) HOLDs loudly instead of reverting to the generation-blind check.
-  `StaleView` now carries `expected_generation` / `current_generation`
-  alongside the version pair (all default `None`), and the reclaim HOLD is
-  recognizable: versions equal, generations apart ("grant reclaimed …
-  version unchanged"), and every HOLD class carries a typed `hold_cause` so a
-  caller branches on a value rather than on prose. The causes are honest about
-  their own limits: five are specific and recoverable, while
-  `generation_unconfirmed` is the residual bucket — retry first, and let a HOLD
-  that survives a successful `reacquire()` be what points at the daemon. The pre-read response carries the pair only on the new
-  `want_owner_generation` request opt-in — every shipped response shape is
-  byte-unchanged for exact-shape status clients. Model-checked:
-  `formal/tla/EffectGate.tla` proves `NoStaleAdmit` (the gate never admits an
-  effect whose captured pair had moved as of the re-validate read — scoped to
-  the re-validate point; the residual re-validate→fire window stays
-  disclaimed and model-visible). Surfaced by an external practitioner running
-  a step-granular bounded read fence; the v0.11.0 entry's "orders effects on
-  the inputs they were computed from" was honest only about the value axis,
-  never the authority axis. Run it:
-  `python -m examples.gate_effect_ordering.main` (the reclaimed-lease act:
-  version unchanged, authority revoked, deploy held). Docs: guide § `gate()`;
-  README § Effect-ordering gate.
-
-### Added
+- **Compaction-aware re-grounding — the Claude Code adapter re-anchors a
+  session after context compaction.** When Claude Code compacts a session
+  (auto-compaction or a manual `/compact`), the model's summary can silently
+  drop what the session held and what peers changed around the boundary. The
+  coordinator now answers `POST /hooks/session-start` with a bounded
+  re-grounding payload: the grants the session held at compaction
+  (event-anchored — "At compaction you held EXCLUSIVE on `plan.md` (v7) —
+  re-acquire before writing.") and, for each artifact the session touched,
+  the current coordinated version with a stale flag when a peer advanced it
+  past the session's last-observed version. That comparand is durable — a
+  nullable `agent_states.last_observed_version` column (registry schema v6),
+  recorded in the same transaction as the grant or commit that observed it,
+  with an `agent_states(agent_id)` index so the session-scoped read stays
+  indexed rather than scanning. The `agent-coherence-hook-client` gains a
+  `session-start` subcommand for Claude Code's `SessionStart` hook; it gates
+  on `source: "compact"` client-side, so ordinary starts, resumes, and
+  clears never reach the coordinator. The payload renders at the next user
+  message and on `--resume`; a live autonomous loop additionally receives it
+  on its next tool admit via a compact-pending flag claimed exactly once at
+  the allow seam — delivery is bounded and contained: it attaches only to
+  admit-shaped allow responses, and strict-mode deny bodies stay
+  byte-identical and never carry it. Payload prose is byte-identical between
+  the Python and Node coordinator backends, pinned by six new
+  protocol-corpus fixtures; capped at three artifact lines plus an overflow
+  summary; a session with no coordination state emits nothing. Fail-open by
+  design: a coordinator that is down at the compact boundary emits `{}` and
+  that compaction's re-grounding is lost — coordination never blocks the
+  session. One benign duplicate is possible (a mid-loop delivery followed by
+  the next user turn's render); the payload's closing line — a more recent
+  read supersedes the notice — makes a second sighting harmless.
 
 - **Workspace versioning & restore — `WorkspaceVersioner` checkpoint +
   restore over heterogeneous members.** Checkpoint a workspace whose members
@@ -177,6 +164,61 @@ Alpha — APIs may change before `v1.0`.
   of the moving current-version constant — a v3-origin database walks
   v3→4→5 landing every schema at its correct stamp (regression-tested,
   including kill-mid-migration recovery).
+
+### Changed
+
+- **`atomic_publish`'s foreign-edit boundary is now named and test-pinned.**
+  The multi-file publish path is version-OCC against the coordinator and
+  never re-reads disk between the caller's read and materialization, so an
+  edit that bypasses the volume entirely (a human in an editor, a formatter)
+  is invisible to it and gets overwritten — while plain `write()` denies
+  that same edit via the foreign-edit guards and a single-member publish
+  wedges on its hash-checked comparand read. No behavior changed; the
+  boundary is now stated in the API docs, the guide's scope notes, and the
+  README, with a regression test pinning the asymmetry. Use `atomic_publish`
+  only for file sets whose every contending writer goes through a volume.
+
+### Fixed
+
+- **`gate()` now HOLDs when the grant its input was read under is gone — not
+  only when the version moved.** The effect-ordering wrapper's re-validation
+  compared versions alone, and the version answers only "is the value still
+  the one `decide` saw" — it never asks "is the grant it was read under still
+  standing". A coordinator sweep that reclaims a stalled holder's grant
+  advances the artifact's ownership generation **without** a version move, so
+  a reclaimed (zombie) holder's escaping effect — the webhook, the deploy,
+  the opened PR — fired straight through the gate on revoked authority; in
+  strict mode it even fired through the deny (the deny's summary still
+  carried the unchanged version, and the denied-read marker was discarded).
+  This is the same distinction the v0.9.1 read-generation fence already draws
+  at the commit seam, now applied at the effect boundary. `gate()` captures
+  the `(version, owner_generation)` pair at decision time — one pair-atomic
+  registry snapshot (`get_artifact_and_generation`, on both registry arms), so
+  a concurrent sweep can never tear it — re-reads the pair at the boundary,
+  and HOLDs if **either** moved. Fail-closed on both comparands: an
+  unconfirmed version (`0`, degraded) or an unconfirmed generation (`None` —
+  a strict deny, a degraded read, or an older coordinator daemon from before
+  this fix) HOLDs loudly instead of reverting to the generation-blind check.
+  `StaleView` now carries `expected_generation` / `current_generation`
+  alongside the version pair (all default `None`), and the reclaim HOLD is
+  recognizable: versions equal, generations apart ("grant reclaimed …
+  version unchanged"), and every HOLD class carries a typed `hold_cause` so a
+  caller branches on a value rather than on prose. The causes are honest about
+  their own limits: five are specific and recoverable, while
+  `generation_unconfirmed` is the residual bucket — retry first, and let a HOLD
+  that survives a successful `reacquire()` be what points at the daemon. The pre-read response carries the pair only on the new
+  `want_owner_generation` request opt-in — every shipped response shape is
+  byte-unchanged for exact-shape status clients. Model-checked:
+  `formal/tla/EffectGate.tla` proves `NoStaleAdmit` (the gate never admits an
+  effect whose captured pair had moved as of the re-validate read — scoped to
+  the re-validate point; the residual re-validate→fire window stays
+  disclaimed and model-visible). Surfaced by an external practitioner running
+  a step-granular bounded read fence; the v0.11.0 entry's "orders effects on
+  the inputs they were computed from" was honest only about the value axis,
+  never the authority axis. Run it:
+  `python -m examples.gate_effect_ordering.main` (the reclaimed-lease act:
+  version unchanged, authority revoked, deploy held). Docs: guide § `gate()`;
+  README § Effect-ordering gate.
 
 ## [0.13.0] - 2026-07-19
 
