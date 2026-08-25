@@ -180,6 +180,44 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      # Which Node backend does this gate prove parity against?
+      #
+      # Pinning `main` unconditionally makes a PAIRED cross-repo change
+      # unverifiable before merge: the sibling Node half sits on its own
+      # plugin branch, so every fixture the pair adds fails here until a
+      # plugin release promotes dev to main — long after review. The pair is
+      # then merged on a maintainer's local run, which is the one place the
+      # parity contract must not be taken on trust.
+      #
+      # So: on a pull request, if the plugin repo carries a branch with the
+      # SAME name as this PR's head (the convention for a paired change),
+      # build that. Otherwise `main`, which is the historical behaviour and
+      # the behaviour of every push build — `github.head_ref` is empty off
+      # the pull_request event. An absent or unreachable sibling degrades to
+      # `main` rather than failing the job.
+      #
+      # `head_ref` is attacker-controlled on a fork PR, so it reaches the
+      # script through the environment and is never interpolated into it.
+      - name: Resolve plugin ref
+        id: plugin_ref
+        env:
+          SIBLING_REF: ${{ github.head_ref }}
+        run: |
+          remote=https://github.com/Cohexa-ai/agent-coherence-plugin.git
+          ref=main
+          if [ -n "$SIBLING_REF" ] &&
+             git ls-remote --exit-code --heads "$remote" "$SIBLING_REF" \
+               >/dev/null 2>&1; then
+            ref="$SIBLING_REF"
+          fi
+          # Record the SHA too: the sibling branch can move without a commit
+          # here, so the ref name alone does not identify what was proven.
+          sha=$(git ls-remote "$remote" "refs/heads/$ref" | cut -f1)
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Node backend: agent-coherence-plugin@$ref ($sha)"
+          echo "Parity proven against \`agent-coherence-plugin@$ref\` \`$sha\`." \
+            >> "$GITHUB_STEP_SUMMARY"
+
       # Check out the plugin repo INSIDE the workspace so actions/checkout
       # accepts the path (it rejects paths outside $GITHUB_WORKSPACE). The
       # harness's resolve_node_dist_path() picks up the explicit env var below
@@ -188,7 +226,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           repository: Cohexa-ai/agent-coherence-plugin
-          ref: main
+          ref: ${{ steps.plugin_ref.outputs.ref }}
           path: _plugin_checkout
 
       - name: Build Node coordinator
