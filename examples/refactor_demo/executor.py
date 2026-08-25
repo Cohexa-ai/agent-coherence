@@ -32,7 +32,7 @@ from langgraph.config import get_store as lg_get_store
 
 from ccs.adapters.ccsstore import CCSStore
 
-from .planner import PLANNER_AGENT, SHARED_SCOPE, TASK_KEY
+from .planner import SHARED_SCOPE, TASK_KEY
 
 EXECUTOR_AGENT = "executor"
 

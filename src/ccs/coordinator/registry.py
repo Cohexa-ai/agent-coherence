@@ -8,8 +8,17 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+)
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -37,6 +46,8 @@ from .registry_protocol import (
     RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
+    CheckpointMember,
+    CheckpointRecord,
     ReclamationSlot,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -83,6 +94,16 @@ class ArtifactRecord:
     # (resets to 0 per construction in-memory).
     owner_generation: int = 0
     read_generation_by_agent: dict[UUID, int] = field(default_factory=dict)
+    # SB-10 (compaction re-emission, R6/R7): the artifact version whose BYTES
+    # an agent last observed, recorded atomically with every non-INVALID grant
+    # transition (set_agent_state) and advanced by the commit WIN paths
+    # (commit_cas / commit_all / the pessimistic service.commit's MODIFIED
+    # upsert). An ABSENT key means never-observed (surfaced as None, never a
+    # 0-sentinel); a transition to INVALID deliberately preserves the prior
+    # value -- it is the durable comparand the post-compaction stale flag is
+    # computed from. Mirrors the sqlite agent_states.last_observed_version
+    # column (nullable INTEGER, schema v6).
+    last_observed_version_by_agent: dict[UUID, int] = field(default_factory=dict)
 
 
 class ArtifactRegistry:
@@ -157,6 +178,17 @@ class ArtifactRegistry:
         # (the asserted divergence). Lets the sweep enumerate sessions uniformly
         # across both registries via :meth:`all_session_meta`.
         self._session_meta: dict[str, tuple[UUID, int]] = {}
+        # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9):
+        # ``{checkpoint_id: header}`` + ``{checkpoint_id: {member_path: member}}``.
+        # The in-memory mirror of the sqlite ``workspace_checkpoints`` /
+        # ``workspace_checkpoint_members`` tables for API parity. PROCESS-SCOPED
+        # like the session pins — an in-memory manifest does NOT survive a
+        # restart (restart-durability is sqlite-only; the parity harness asserts
+        # the divergence rather than masking it). Guarded by ``_capture_lock``
+        # (the manifest create is a multi-row atomic insert, same class of
+        # critical section as the session-pin capture).
+        self._checkpoints: dict[str, CheckpointRecord] = {}
+        self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
         # Cross-artifact capture lock (Unit 2). This registry is otherwise
         # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
         # docstrings). GIL atomicity is per single dict ACCESS, which is
@@ -309,6 +341,50 @@ class ArtifactRegistry:
         not the fence, arbitrates)."""
         return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
+    def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the artifact version whose bytes this agent last observed
+        (SB-10 R6/R7: recorded atomically with every non-INVALID grant/commit
+        transition), or None when the pair was never observed — absence is an
+        absent key, never a 0-sentinel, and a transition to INVALID preserved
+        the prior recorded value. The post-compaction staleness comparand."""
+        return self._records[artifact_id].last_observed_version_by_agent.get(agent_id)
+
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> tuple[Artifact, int] | None:
+        """Return ``(artifact, owner_generation)`` as one pair-consistent
+        snapshot, or None when the artifact is absent.
+
+        This registry is lock-free by contract (GIL per-access atomicity), so
+        the pair is stitched with a seqlock on ``owner_generation``: within the
+        life of one record the generation only ever increments (reclaims bump
+        it; nothing decrements or resets it), so if it reads equal on both sides
+        of the artifact read, the returned pair coexisted at the instant the
+        artifact was read — a concurrent sweep bump retries rather than tearing
+        the pair. ``record.artifact`` is a frozen dataclass swapped wholesale on
+        a version move, so reading it is itself one atomic access.
+
+        Scope of that no-ABA property: it holds for a LIVE record, which is what
+        the seqlock needs. It is NOT an identity guarantee across the record's
+        lifetime — deleting an artifact and re-registering the same name mints a
+        fresh record back at ``(version=1, owner_generation=0)``, so a comparand
+        pair captured before such a cycle can numerically match one read after
+        it. Callers comparing pairs across a window (see
+        ``adapters.effect_gate.gate``) inherit that boundary; it is unchanged
+        from the version-only comparand that preceded the generation leg. Note
+        the cycle needs an actual delete: no HTTP route, MCP tool, or CLI verb
+        wires ``CoordinatorService.delete``, so none of the surfaces the gate
+        runs over can drive it — but the in-process ``CCSStore.delete()`` can,
+        so it is a reachable boundary, not an impossible one."""
+        record = self._records.get(artifact_id)
+        if record is None:
+            return None
+        while True:
+            generation = record.owner_generation
+            artifact = record.artifact
+            if record.owner_generation == generation:
+                return artifact, generation
+
     def set_artifact_and_content(
         self,
         artifact_id: UUID,
@@ -455,6 +531,16 @@ class ArtifactRegistry:
             trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
         ):
             record.read_generation_by_agent[agent_id] = record.owner_generation
+
+        # SB-10 R6/R7: record the version whose bytes this agent now holds,
+        # GIL-atomic with the state write above (parity: the sqlite side writes
+        # it inside the same BEGIN IMMEDIATE as the upsert). Non-INVALID
+        # targets only -- a transition TO INVALID preserves the prior recorded
+        # value (the last version actually observed, the post-compaction
+        # staleness comparand) and a never-observed agent keeps no key (absent
+        # == None, never a 0-sentinel).
+        if state != MESIState.INVALID:
+            record.last_observed_version_by_agent[agent_id] = record.artifact.version
 
         if self._state_log is not None:
             self._seq += 1
@@ -649,6 +735,10 @@ class ArtifactRegistry:
         # clear the reclaim slot (mirror set_agent_state's non-M/E-from-non-M/E
         # path, which leaves both untouched).
         record.state_by_agent[agent_id] = MESIState.SHARED
+        # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
+        # last_observed_version to the version it just produced; the
+        # invalidated peers above keep their prior values.
+        record.last_observed_version_by_agent[agent_id] = next_version
 
         return updated, invalidated
 
@@ -791,6 +881,10 @@ class ArtifactRegistry:
                     # other per-record state the apply touches.
                     dict(record.version_history),
                     dict(record.version_captured_at),
+                    # SB-10: the apply advances the committer's observed-version
+                    # slot per member; a mid-apply raise must restore it with
+                    # the rest (sqlite's ROLLBACK undoes the column write).
+                    dict(record.last_observed_version_by_agent),
                 )
                 for _art, record, *_rest in staged
             ]
@@ -811,10 +905,14 @@ class ArtifactRegistry:
                     if member_invalidated:
                         invalidated[art_id] = member_invalidated
                     record.state_by_agent[agent_id] = MESIState.SHARED
+                    # SB-10 R6/R7 (KTD4 first layer): each member's WIN advances
+                    # the WRITER's observed version to that member's
+                    # next_version; invalidated peers keep theirs.
+                    record.last_observed_version_by_agent[agent_id] = next_version
                     versions[art_id] = next_version
             except Exception:
                 # Total apply: restore every mutated record, roll back the logs.
-                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at) in snapshots:
+                for (rec, art_obj, content, state_by, granted, last_w, ver_hist, ver_at, observed) in snapshots:
                     rec.artifact = art_obj
                     rec.content = content
                     rec.state_by_agent = state_by
@@ -822,6 +920,7 @@ class ArtifactRegistry:
                     rec.last_writer = last_w
                     rec.version_history = ver_hist
                     rec.version_captured_at = ver_at
+                    rec.last_observed_version_by_agent = observed
                 self._seq -= emitted_here
                 raise
 
@@ -967,6 +1066,163 @@ class ArtifactRegistry:
         with self._capture_lock:
             pins = self._session_pins.get(session_token)
             return dict(pins) if pins is not None else None
+
+    # ------------------------------------------------------------------
+    # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        checkpoint: CheckpointRecord,
+        members: Sequence[CheckpointMember],
+    ) -> None:
+        """Persist a checkpoint manifest atomically under ``_capture_lock`` —
+        the header (owner metadata included, same critical section: the
+        in-memory mirror of the sqlite same-transaction rule) plus every member,
+        or nothing. Parity with
+        :meth:`SqliteArtifactRegistry.create_checkpoint`; divergent only on
+        restart-survival (in-memory manifests are process-scoped).
+
+        Fail-closed owner contract: an absent owner raises ``ValueError`` and
+        nothing is stored. A duplicate ``checkpoint_id`` or duplicate member
+        path raises ``ValueError`` with nothing stored (validated before the
+        first insert — no partial manifest)."""
+        if checkpoint.owner is None:
+            raise ValueError(
+                "create_checkpoint requires an owner: a checkpoint manifest "
+                "without owner metadata is unrepresentable (fail-closed; the "
+                "restore path owner-validates against it)"
+            )
+        with self._capture_lock:
+            if checkpoint.checkpoint_id in self._checkpoints:
+                raise ValueError(
+                    f"create_checkpoint: duplicate checkpoint_id "
+                    f"{checkpoint.checkpoint_id!r}"
+                )
+            member_by_path: dict[str, CheckpointMember] = {}
+            for member in members:
+                if member.member_path in member_by_path:
+                    raise ValueError(
+                        f"create_checkpoint: duplicate member path "
+                        f"{member.member_path!r} in the manifest for checkpoint "
+                        f"{checkpoint.checkpoint_id!r}"
+                    )
+                member_by_path[member.member_path] = member
+            # Both dicts are written inside ONE lock hold, after every
+            # validation passed — all rows land or none do (the in-memory
+            # equivalent of the sqlite single transaction).
+            self._checkpoints[checkpoint.checkpoint_id] = checkpoint
+            self._checkpoint_members[checkpoint.checkpoint_id] = member_by_path
+
+    def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """Return the checkpoint header, or ``None`` when unknown."""
+        with self._capture_lock:
+            return self._checkpoints.get(checkpoint_id)
+
+    def list_checkpoints(self) -> list[CheckpointRecord]:
+        """Return every checkpoint header, ordered by ``(created_at,
+        checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
+        with self._capture_lock:
+            return sorted(
+                self._checkpoints.values(),
+                key=lambda c: (c.created_at, c.checkpoint_id),
+            )
+
+    def get_checkpoint_members(self, checkpoint_id: str) -> list[CheckpointMember]:
+        """Return the manifest's member rows ordered by ``member_path`` (empty
+        list for an unknown checkpoint — :meth:`get_checkpoint` tells known from
+        unknown)."""
+        with self._capture_lock:
+            member_by_path = self._checkpoint_members.get(checkpoint_id, {})
+            return [member_by_path[path] for path in sorted(member_by_path)]
+
+    def set_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, *, updated_at: float
+    ) -> None:
+        """Update the checkpoint-level restore status + its ``updated_at`` stamp.
+        Raises ``KeyError`` for an unknown checkpoint (fail fast, no silent
+        no-op). Frozen records are replaced, never mutated in place."""
+        with self._capture_lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            self._checkpoints[checkpoint_id] = replace(
+                record, restore_status=status, restore_updated_at=updated_at
+            )
+
+    def set_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+    ) -> None:
+        """Record a member's restore progress: BOTH fields are written to the
+        given values (a full member-restore-state write — a new restore run's
+        first write for a member resets any prior run's delete record). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        with self._capture_lock:
+            member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
+            if member is None:
+                raise KeyError(
+                    f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                    f"not in registry"
+                )
+            self._checkpoint_members[checkpoint_id][member_path] = replace(
+                member,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=deleted_at_restore,
+            )
+
+    def set_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        """Update a member's pin state; ``restore_tier`` (when given) rewrites
+        the member's restore tier in the same step — the Unit-6 loud tier
+        downgrade. ``restore_tier=None`` leaves the tier untouched. Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        with self._capture_lock:
+            member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
+            if member is None:
+                raise KeyError(
+                    f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                    f"not in registry"
+                )
+            self._checkpoint_members[checkpoint_id][member_path] = replace(
+                member,
+                pin_state=pin_state,
+                restore_tier=(
+                    member.restore_tier if restore_tier is None else restore_tier
+                ),
+            )
+
+    def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
+        """Atomically add ``delta`` to a checkpoint's pin refcount and return the
+        new value (read + validate + write in one lock hold — two concurrent
+        adjustments cannot lose an update). Raises ``KeyError`` for an unknown
+        checkpoint and ``ValueError`` if the result would go negative (a release
+        without a matching pin is a bookkeeping bug, fail-closed)."""
+        with self._capture_lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            new_count = record.pin_refcount + delta
+            if new_count < 0:
+                raise ValueError(
+                    f"pin refcount for checkpoint {checkpoint_id!r} would go "
+                    f"negative ({record.pin_refcount} + {delta}); a release "
+                    f"without a matching pin is a bookkeeping bug (fail-closed)"
+                )
+            self._checkpoints[checkpoint_id] = replace(
+                record, pin_refcount=new_count
+            )
+            return new_count
 
     def _emit_state_log(
         self,

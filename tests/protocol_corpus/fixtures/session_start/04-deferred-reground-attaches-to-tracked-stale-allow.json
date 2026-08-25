@@ -1,0 +1,90 @@
+{
+  "name": "deferred-reground-attaches-to-tracked-stale-allow",
+  "description": "SB-10 U4/U8 deferred-injection carriage on a TRACKED admit. Preflight: A pre-reads docs/notes.md (SHARED, last-observed v1); peer B pre-edits + commits v2 (invalidates A); A pre-reads docs/aux.md (notice drain, see _comment); A's session-start builds a non-empty payload and arms the compact-pending flag. The test request is A's next pre-read — a warn-mode stale allow — and the deferred re-grounding block rides that envelope: additionalContext is the stale-read warning, then a blank line, then the re-ground block (KTD6 ordering: existing prose first, re-ground last). KTD2 rebuild-at-delivery is visible in the bytes: the block is rebuilt AFTER the stale path re-granted SHARED, so it renders the R3 grant line for docs/notes.md at the CURRENT v2 — not the stale line the session-start preflight rendered when the flag was armed.",
+  "setup": {
+    "tracked": [
+      "docs/aux.md",
+      "docs/notes.md"
+    ],
+    "files": {
+      "docs/aux.md": "# Aux\nv1 content\n",
+      "docs/notes.md": "# Notes\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/notes.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/aux.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-start",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "docs/notes.md"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: docs/notes.md was updated by session bbbbbbbb at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading docs/notes.md before acting on stale assumptions.\n\nPost-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on docs/aux.md (v1) — re-acquire before writing.\nAt compaction you held SHARED on docs/notes.md (v2) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "docs/notes.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "_comment": "additionalContext IS byte-asserted (unlike warn_mode/14): the stale-read warning prose is byte-mirrored across backends and its ISO timestamps are scrubbed in string position by the harness's existing _ISO_TS_RE rule; the re-ground block carries no timestamps at all. The docs/aux.md preflight (response discarded) drains A's pending preemption notices before the session-start arms the flag — the notice subsystem has two pre-existing cross-backend asymmetries (Node records notices for SHARED victims where Python is M∪E-only, and the notice prose bytes differ) that predate SB-10 and are masked elsewhere by warn_mode/14's ignore_keys; without the drain they would leak into this byte pin. The two summary unix-ts floats are ignored per the warn_mode/14 precedent; every other summary field is compared."
+}

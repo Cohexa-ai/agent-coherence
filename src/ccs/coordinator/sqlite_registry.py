@@ -57,6 +57,7 @@ Schema (KTD-3, applied via ``PRAGMA user_version`` on init):
     last_reclaim_tick INTEGER,
     PRIMARY KEY (artifact_id, agent_id)
   );
+  CREATE INDEX idx_agent_states_agent ON agent_states(agent_id);
   CREATE TABLE heartbeats (
     agent_id   TEXT PRIMARY KEY,
     last_tick  INTEGER NOT NULL
@@ -84,7 +85,17 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, NoReturn, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+)
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -116,6 +127,8 @@ from .registry_protocol import (
     RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
+    CheckpointMember,
+    CheckpointRecord,
     ReclamationSlot,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -126,7 +139,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 4
+SCHEMA_USER_VERSION = 7
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -152,6 +165,36 @@ already stamped ``user_version=3`` with ``session_pins`` but WITHOUT
 ``session_meta`` (it opens via the write-free rehydrate path). The dedicated
 ``_migrate_v3_to_v4`` creates both for any v3 db; a Node-v3 db is rejected by
 ``_reject_foreign_ledger_db`` before reaching it.
+
+**v4 -> v5** (Workspace Versioning, WV plan Unit 2 / R1, R9) adds the
+``workspace_checkpoints`` + ``workspace_checkpoint_members`` tables (the durable
+checkpoint MANIFEST: per-member tokens/fingerprints/tiers/flags + owner metadata
++ pin refcounts + restore-progress state — FIXED-WIDTH data only, never content
+bytes) and the ``idx_workspace_checkpoints_name`` index. Additive-only (no
+existing table touched). The step also carries the ``_V4_USER_VERSION`` literal
+conversion: ``_migrate_v3_to_v4`` previously guarded AND stamped with the
+``SCHEMA_USER_VERSION`` constant, so bumping the constant to 5 would have made a
+v3-origin db stamp user_version=5 WITHOUT the v5 DDL — exactly the state the
+structural probes refuse. It now stamps the intermediate literal 4 and the
+chained ``_migrate_v4_to_v5`` lands the v5 DDL + the v5 stamp.
+
+**v5 -> v6** (SB-10 / compaction re-emission, R6/R7, KTD3/KTD9) adds the
+nullable ``agent_states.last_observed_version`` column — the durable
+per-(agent, artifact) record of the artifact version whose BYTES that agent
+last observed (written atomically with every non-INVALID state upsert and the
+commit WIN paths; a transition to INVALID preserves the prior value and a
+never-observed row stays NULL, never a 0-sentinel). It is the comparand the
+post-compaction stale flag is computed from. Column-only and additive (no new
+table, no index, and deliberately NOT joined to any GC/retention exemption
+seam). The step also carries the ``_V5_USER_VERSION`` literal conversion —
+the same trap as the v5 bump: ``_migrate_v4_to_v5`` stamped the constant while
+it was the final chain step; it now stamps the intermediate literal 5 and the
+chained ``_migrate_v5_to_v6`` lands the column + the v6 stamp. The column NAME
+is not a lineage discriminator and must never be used as one: the Node ledger's
+paired v4 adds an ``agent_states.last_observed_version`` of its own, so BOTH
+ledgers carry it. The disjoint load-bearing fingerprint is
+``agent_states.deadline_tick`` (Node-only, below — this repo must never add
+that column), backed by the ``registry_meta.schema_runtime`` stamp.
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -179,6 +222,38 @@ before the chained ``_migrate_v3_to_v4`` step adds ``session_meta`` + the
 ``session_pins`` artifact index and advances to ``SCHEMA_USER_VERSION``. A
 literal because session_pins-at-v3 is a distinct on-disk state earlier commits
 of this branch already produced."""
+
+_V4_USER_VERSION = 4
+"""The intermediate v4 stamp ``_migrate_v3_to_v4`` writes (session_meta + the
+session_pins artifact index), before the chained ``_migrate_v4_to_v5`` step adds
+the workspace-checkpoint tables and advances to ``SCHEMA_USER_VERSION``. A
+literal for the same reason as ``_V2_USER_VERSION``/``_V3_USER_VERSION`` — and
+the fix for the v5 migration trap: ``_migrate_v3_to_v4`` originally guarded AND
+stamped with the ``SCHEMA_USER_VERSION`` constant (correct while the constant
+was 4), so the v5 bump alone would have made a v3-origin db skip the v4->v5
+step's loser-guard and get stamped 5 without the v5 DDL. Every intermediate
+migration must pin its own stamp as a literal; only the FINAL step in the chain
+may stamp the constant."""
+
+_V5_USER_VERSION = 5
+"""The intermediate v5 stamp ``_migrate_v4_to_v5`` writes (the
+workspace-checkpoint tables + name index), before the chained
+``_migrate_v5_to_v6`` step adds ``agent_states.last_observed_version`` and
+advances to ``SCHEMA_USER_VERSION``. A literal for the same reason as the
+earlier intermediates (the re-stamp trap): while ``_migrate_v4_to_v5`` was the
+final step it correctly guarded/stamped the constant, but with the constant at
+6 that would stamp a v4-origin db ``user_version=6`` WITHOUT the v6 column —
+the chained v5->v6 loser-guard then no-ops and the write-free rehydrate never
+adds it. Only the FINAL step in the chain may stamp the constant."""
+
+_V6_USER_VERSION = 6
+"""``_migrate_v5_to_v6``'s guard/stamp literal: it adds the
+``agent_states.last_observed_version`` column and advances to v6 — NO LONGER
+the final step once v7 (the ``agent_states(agent_id)`` index) landed. A
+literal for the same reason as ``_V4_USER_VERSION``/``_V5_USER_VERSION``:
+stamping the constant would mark a v5-origin db ``user_version=7`` WITHOUT
+the index, and the chained v6->v7 loser-guard would no-op (the re-stamp
+trap, third arming)."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -261,6 +336,74 @@ CREATE TABLE session_meta (
     created_at_tick INTEGER NOT NULL
 )
 """
+
+# Workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9; schema v5).
+# One row per named checkpoint: identity + owner metadata (owner is NOT NULL —
+# an ownerless manifest is unrepresentable on disk, the fail-closed half of the
+# owner-absent contract enforced in create_checkpoint), the skew-declared cut
+# window [window_min, window_max] (monotonic-seconds endpoints; the clock caveat
+# is a manifest-surface concern, not a storage one), the checkpoint-level
+# restore-progress fields (restore_status + restore_updated_at — restore is
+# crash-resumable, so its status must be durable), and the GC pin refcount
+# (Unit 6's minimal pin legs: one refcount per checkpoint, adjusted through
+# adjust_checkpoint_pin_refcount, never below zero). FIXED-WIDTH data only —
+# ids/paths/tokens/flags/timestamps; NEVER content bytes (KTD-13 posture: the
+# manifest points at member versions, it does not store them).
+_WORKSPACE_CHECKPOINTS_DDL = """
+CREATE TABLE workspace_checkpoints (
+    checkpoint_id      TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    owner              TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    created_at_tick    INTEGER NOT NULL,
+    window_min         REAL NOT NULL,
+    window_max         REAL NOT NULL,
+    restore_status     TEXT NOT NULL DEFAULT 'none',
+    restore_updated_at REAL,
+    pin_refcount       INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# Per-member manifest rows (WV plan Unit 2 / R1). One row per (checkpoint,
+# member path): the member's native CAS token + fingerprint + capture timestamp,
+# the ABSENT marker (absent-at-capture is a recorded fact, distinct from empty),
+# the torn-cut flag (dirty_during_window), the two tier axes (arbitration_tier:
+# native-cas / no-arbiter; restore_tier: restorable / restorable-unpinned /
+# forward_only), per-member pin state, and the restore-progress columns
+# (restore_outcome: the per-member typed terminal outcome a crash-resumable
+# restore records durably; deleted_at_restore: the manifest-side delete record —
+# ``commit_all`` has no delete semantics, so delete legs are recorded HERE, per
+# the plan's restore-registration design). ``artifact_id`` is nullable and has
+# NO foreign key to ``artifacts`` on PURPOSE (the session_pins rationale): an S3
+# member has no coordinator artifact at all, and a file member's artifact being
+# removed later must surface as a typed restore outcome (target-lost), never as
+# a silent cascade-delete of manifest history. The parent-checkpoint FK DOES
+# cascade: members belong to their manifest. Fixed-width data only.
+_WORKSPACE_CHECKPOINT_MEMBERS_DDL = """
+CREATE TABLE workspace_checkpoint_members (
+    checkpoint_id       TEXT NOT NULL,
+    member_path         TEXT NOT NULL,
+    artifact_id         TEXT,
+    native_token        TEXT,
+    fingerprint         TEXT,
+    captured_at         REAL NOT NULL,
+    absent              INTEGER NOT NULL DEFAULT 0,
+    dirty_during_window INTEGER NOT NULL DEFAULT 0,
+    arbitration_tier    TEXT NOT NULL,
+    restore_tier        TEXT NOT NULL,
+    pin_state           TEXT NOT NULL DEFAULT 'unpinned',
+    restore_outcome     TEXT,
+    deleted_at_restore  REAL,
+    PRIMARY KEY (checkpoint_id, member_path),
+    FOREIGN KEY (checkpoint_id) REFERENCES workspace_checkpoints(checkpoint_id) ON DELETE CASCADE
+)
+"""
+
+# The CLI's ``list``/``restore <name>`` verbs resolve checkpoints by NAME, which
+# is not the PK — without this index every name lookup is a full scan.
+_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL = (
+    "CREATE INDEX idx_workspace_checkpoints_name ON workspace_checkpoints(name)"
+)
 
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
@@ -563,23 +706,30 @@ class SqliteArtifactRegistry:
 
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
-          + the artifact index) in one atomic transaction (no shim ever runs on a
+          + the workspace-checkpoint tables + the v6 ``last_observed_version``
+          column + the indexes) in one atomic transaction (no shim ever runs on a
           fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
-          ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4``: idempotently subsumes
-          BOTH additive shims (fence columns + epoch seed, and ``pending_notices``),
-          adds ``artifact_versions`` (v2), ``session_pins`` (v3), then
-          ``session_meta`` + the artifact index (v4). The wild v1 population is a
-          2x2 matrix ({±fence columns} x {±pending_notices}) because both shims
-          shipped with no version bump; ``IF NOT EXISTS`` guards make each piece
-          apply only when missing.
-        - ``user_version == 2`` → ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4``:
-          adds ``session_pins`` (v3), then ``session_meta`` + the index (v4).
-        - ``user_version == 3`` → ``_migrate_v3_to_v4``: an existing v3 db
-          (``session_pins`` present, ``session_meta`` ABSENT — earlier commits of
-          this branch stamped it) gains ``session_meta`` + the index. Without this
-          branch such a db would open write-free and crash on the first session op.
-        - ``user_version == 4`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+          ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
+          ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``: idempotently subsumes
+          BOTH additive shims (fence columns + epoch seed, and
+          ``pending_notices``), adds ``artifact_versions`` (v2), ``session_pins``
+          (v3), ``session_meta`` + the artifact index (v4), the
+          workspace-checkpoint tables (v5), then the ``last_observed_version``
+          column (v6). The wild v1 population is a 2x2 matrix ({±fence columns} x
+          {±pending_notices}) because both shims shipped with no version bump;
+          ``IF NOT EXISTS`` guards make each piece apply only when missing.
+        - ``user_version == 2`` → the chained ``2 -> 3 -> 4 -> 5 -> 6`` steps.
+        - ``user_version == 3`` → the chained ``3 -> 4 -> 5 -> 6`` steps: an
+          existing v3 db (``session_pins`` present, ``session_meta`` ABSENT —
+          earlier commits of that branch stamped it) gains ``session_meta`` + the
+          index, then the workspace-checkpoint tables, then the v6 column.
+          Without the v3 branch such a db would open write-free and crash on the
+          first session op.
+        - ``user_version == 4`` → ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``.
+        - ``user_version == 5`` → ``_migrate_v5_to_v6``: an existing v5 db gains
+          the ``agent_states.last_observed_version`` column.
+        - ``user_version == 7`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -597,23 +747,48 @@ class SqliteArtifactRegistry:
             if current == 0:
                 self._apply_v2_schema(instance_id)
             elif current == 1:
-                # v1 → v2 → v3 → v4: each step is its own atomic BEGIN IMMEDIATE
-                # and rehydrates meta; the chain lands the full current schema.
+                # v1 → v2 → v3 → v4 → v5 → v6: each step is its own atomic BEGIN
+                # IMMEDIATE and rehydrates meta; the chain lands the full schema.
                 self._migrate_v1_to_v2(instance_id)
                 self._migrate_v2_to_v3(instance_id)
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
+                self._migrate_v5_to_v6(instance_id)
+                self._migrate_v6_to_v7(instance_id)
             elif current == 2:
-                # 2 → 3 → 4: add session_pins, then session_meta + the index.
+                # 2 → 3 → 4 → 5 → 6: session_pins, session_meta + index,
+                # checkpoints, last_observed_version.
                 self._migrate_v2_to_v3(instance_id)
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
+                self._migrate_v5_to_v6(instance_id)
+                self._migrate_v6_to_v7(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
-                # commits of this branch stamped it) → add session_meta + index.
-                # WITHOUT this branch such a db would open write-free and crash on
-                # the first session op with 'no such table: session_meta'.
+                # commits of that branch stamped it) → add session_meta + index,
+                # then chain to v6. WITHOUT the v3 branch such a db would open
+                # write-free and crash on the first session op with 'no such
+                # table: session_meta'.
                 self._migrate_v3_to_v4(instance_id)
+                self._migrate_v4_to_v5(instance_id)
+                self._migrate_v5_to_v6(instance_id)
+                self._migrate_v6_to_v7(instance_id)
+            elif current == _V4_USER_VERSION:
+                # An existing v4 db → the workspace-checkpoint tables (v5), then
+                # the last_observed_version column (v6).
+                self._migrate_v4_to_v5(instance_id)
+                self._migrate_v5_to_v6(instance_id)
+                self._migrate_v6_to_v7(instance_id)
+            elif current == _V5_USER_VERSION:
+                # An existing v5 db → last_observed_version (v6), then the
+                # agent_id index (v7).
+                self._migrate_v5_to_v6(instance_id)
+                self._migrate_v6_to_v7(instance_id)
+            elif current == _V6_USER_VERSION:
+                # An existing v6 db (SB-10-era) → index agent_states(agent_id).
+                self._migrate_v6_to_v7(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v4 database — rehydrate; NO writes on this path (the
+                # Existing v7 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -736,6 +911,23 @@ class SqliteArtifactRegistry:
            for a Node-v3 db whose ``deadline_tick`` probe somehow missed (and
            defense-in-depth alongside the ``schema_runtime`` stamp). Literal
            ``3`` — pins Python-v3 semantics.
+        5. ``user_version == 5`` WITHOUT ``workspace_checkpoints`` — a Python-v5
+           db ALWAYS has the table (``_migrate_v4_to_v5`` / the fresh apply
+           creates it atomically with the v5 stamp; the ``_V4_USER_VERSION``
+           literal conversion is what makes that guarantee hold for every
+           migration origin). NO ledger this build recognizes stamps 5 without
+           it, so the state is foreign-or-corrupt either way and the fail-closed
+           refusal is the honest response. Literal ``5`` — pins Python-v5
+           semantics.
+
+        The v6 bump (``agent_states.last_observed_version``, SB-10) adds NO
+        probe by review (KTD9): it is a column on an existing table, and the
+        Node ledger's paired v4 adds a column of the SAME name — so
+        ``last_observed_version`` is COMMON to both ledgers and must never be
+        probed as a lineage discriminator. What stays disjoint is probe 2's
+        ``deadline_tick`` marker, which remains Node-only (this repo must never
+        add that column), so probe 2 still neither misses a Node db nor
+        false-positives on a Python v6 one.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -766,6 +958,13 @@ class SqliteArtifactRegistry:
                 "Python-v3 store always has it; the Node ledger's v3 is the "
                 "agent_states.deadline_tick ALTER, not session_pins)"
             )
+        if current == 5 and not self._has_table("workspace_checkpoints"):
+            self._raise_cross_runtime(
+                "is user_version=5 without the workspace_checkpoints table (a "
+                "Python-v5 store always has it — the v4->v5 migration creates "
+                "it atomically with the v5 stamp; no ledger this build "
+                "recognizes stamps 5 without it)"
+            )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
         """Compose the single :class:`CrossRuntimeSchemaError` message shape.
@@ -791,7 +990,9 @@ class SqliteArtifactRegistry:
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:
         """Create the COMPLETE current schema (v2 tables + the v3 ``session_pins``
-        table) + seed registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
+        table + the v4 ``session_meta`` table/index + the v5 workspace-checkpoint
+        tables + the v6 ``agent_states.last_observed_version`` column) + seed
+        registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
         Caller holds lock. (The method keeps its historical ``_apply_v2_schema``
         name; a fresh db is always built at the latest schema directly so no
         migration shim ever runs against it.)
@@ -840,19 +1041,23 @@ class SqliteArtifactRegistry:
             c.execute(
                 """
                 CREATE TABLE agent_states (
-                    artifact_id          TEXT NOT NULL,
-                    agent_id             TEXT NOT NULL,
-                    state                TEXT NOT NULL,
-                    transient_state      TEXT,
-                    transient_tick       INTEGER,
-                    granted_at_tick      INTEGER,
-                    last_reclaim_trigger TEXT,
-                    last_reclaim_tick    INTEGER,
-                    read_generation      INTEGER,
+                    artifact_id           TEXT NOT NULL,
+                    agent_id              TEXT NOT NULL,
+                    state                 TEXT NOT NULL,
+                    transient_state       TEXT,
+                    transient_tick        INTEGER,
+                    granted_at_tick       INTEGER,
+                    last_reclaim_trigger  TEXT,
+                    last_reclaim_tick     INTEGER,
+                    read_generation       INTEGER,
+                    last_observed_version INTEGER,
                     PRIMARY KEY (artifact_id, agent_id),
                     FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
                 )
                 """
+            )
+            c.execute(
+                "CREATE INDEX idx_agent_states_agent ON agent_states(agent_id)"
             )
             c.execute(
                 """
@@ -894,6 +1099,13 @@ class SqliteArtifactRegistry:
             c.execute(_SESSION_PINS_DDL)
             c.execute(_SESSION_PINS_ARTIFACT_INDEX_DDL)
             c.execute(_SESSION_META_DDL)
+            # Workspace-checkpoint manifest tables (v5, WV Unit 2): same rule —
+            # the fresh apply lands the COMPLETE current schema so the v4->v5
+            # migration never runs against a fresh db and the steady-state open
+            # stays write-free.
+            c.execute(_WORKSPACE_CHECKPOINTS_DDL)
+            c.execute(_WORKSPACE_CHECKPOINT_MEMBERS_DDL)
+            c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -1122,11 +1334,12 @@ class SqliteArtifactRegistry:
 
     def _migrate_v3_to_v4(self, instance_id: str | None) -> None:
         """Migrate a v3 db (``session_pins`` present, ``session_meta`` absent) to
-        v4 in ONE atomic transaction (SB-17 / TX-1, durable owner-binding). Caller
-        holds lock.
+        the INTERMEDIATE v4 in ONE atomic transaction (SB-17 / TX-1, durable
+        owner-binding). Caller holds lock. Chained to ``_migrate_v4_to_v5`` by
+        the open dispatcher (a v3 db steps 3 -> 4 -> 5).
 
         Why a dedicated step rather than folding it into the v2->v3 add: earlier
-        commits of THIS branch already shipped ``user_version=3`` with
+        commits of the SB-17 branch already shipped ``user_version=3`` with
         ``session_pins`` but no ``session_meta``. Such a db opens via the
         write-free rehydrate path (``current == SCHEMA_USER_VERSION`` once that was
         4) and would NEVER gain ``session_meta`` — so every ``begin_session`` /
@@ -1134,6 +1347,15 @@ class SqliteArtifactRegistry:
         ``current == 3`` through this step creates the table (and the
         ``session_pins`` artifact index) for any v3 db, fresh-this-build or
         earlier-branch.
+
+        Guard + stamp use the ``_V4_USER_VERSION`` LITERAL, not the constant (the
+        v5 migration trap, WV plan Unit 2 / review P1): while this was the final
+        step it guarded and stamped ``SCHEMA_USER_VERSION``, which was correct at
+        4 — but once the constant moved to 5, a v3-origin db running this step
+        would have been stamped 5 WITHOUT the v5 DDL (and the chained v4->v5
+        step's loser-guard would then see >= 5 and no-op), exactly the state the
+        structural foreign-ledger probe refuses. Intermediate migrations pin
+        their own stamp; only the final chain step stamps the constant.
 
         Additive-only (``session_meta`` + ``idx_session_pins_artifact``), same
         atomicity discipline as the other migrations. Idempotent via ``IF NOT
@@ -1143,8 +1365,9 @@ class SqliteArtifactRegistry:
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
-            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
-                # A racing winner already advanced to v4 — nothing to do.
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V4_USER_VERSION:
+                # A racing winner already advanced to >= v4 — nothing to do here
+                # (the chained v4->v5 step runs next regardless).
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
@@ -1155,6 +1378,215 @@ class SqliteArtifactRegistry:
                 _SESSION_PINS_ARTIFACT_INDEX_DDL.replace(
                     "CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1
                 )
+            )
+            c.execute(f"PRAGMA user_version = {_V4_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v4_to_v5(self, instance_id: str | None) -> None:
+        """Migrate a v4 db to the INTERMEDIATE v5 in ONE atomic transaction (WV
+        plan Unit 2 / R1, R9): add the ``workspace_checkpoints`` +
+        ``workspace_checkpoint_members`` tables and the name index, then stamp
+        ``user_version=5``. Caller holds lock. Chained to ``_migrate_v5_to_v6``
+        by the open dispatcher (a v4 db steps 4 -> 5 -> 6).
+
+        Guard + stamp use the ``_V5_USER_VERSION`` LITERAL, not the constant
+        (the recurring re-stamp trap, third occurrence): while this was the
+        final chain step it guarded and stamped ``SCHEMA_USER_VERSION``, which
+        was correct at 5 — but once the constant moved to 6, a v4-origin db
+        running this step would have been stamped 6 WITHOUT the v6 column (and
+        the chained v5->v6 step's loser-guard would then see >= 6 and no-op).
+        Intermediate migrations pin their own stamp; only the final chain step
+        stamps the constant.
+
+        Additive-only — it touches NO existing table, so there is no shim to
+        subsume and no content/mode posture change (the new tables hold
+        fixed-width manifest data only, never content bytes). Same atomicity
+        discipline as every other migration (the
+        sqlite-schema-init-non-atomic-leaves-unbootable-db learning): ONE
+        explicit ``BEGIN IMMEDIATE`` wrapping all DDL + the ``PRAGMA
+        user_version`` stamp, individual ``execute()`` calls (never
+        ``executescript``), ``except BaseException`` ROLLBACK so a SIGKILL
+        mid-migration leaves the v4 db intact for a clean re-migrate, and ``IF
+        NOT EXISTS`` guards for the half-migrated-db case (tables created by a
+        prior crashed migration whose stamp never committed).
+
+        Concurrent-loser path: two processes can both read ``user_version == 4``
+        (a bare pre-lock read) and both land here; they serialize on the ``BEGIN
+        IMMEDIATE`` write lock. The loser re-reads ``user_version`` INSIDE its
+        txn, sees the winner already at >= v5, and no-ops (the chained v5->v6
+        step runs next regardless).
+
+        NODE-LEDGER COORDINATION (checked at authoring, 2026-08-08, against the
+        local agent-coherence-plugin checkout): the sibling Node coordinator's
+        ledger tops out at ``user_version=3`` (``src/migrations/`` has exactly
+        v1_initial / v2_validate_pending_notices / v3_watchdog_deadline; no
+        migration consumes 4 or 5). Its ``rejectForeignLedgerDb`` runs BEFORE its
+        version dispatch and refuses any Python-lineage db on three markers that
+        every Python v2+ db carries — the ``schema_runtime='python'`` stamp, the
+        ``artifact_versions`` table, and the ``artifacts.owner_generation``
+        column — so a Python-v5 db is rejected by lineage before the integer 5 is
+        ever interpreted against the Node ledger, and its ``startVersion >
+        SCHEMA_USER_VERSION`` guard would refuse it even if the probes were
+        bypassed. No Node-side change is required by this bump; the reverse
+        direction (a future Node v4+/v5 db opened here) stays covered by the
+        ``deadline_tick`` structural probe (``>= 3``, columns are never dropped)
+        plus the ``schema_runtime='node'`` stamp.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V5_USER_VERSION:
+                # A racing winner already advanced to >= v5 — nothing to do here
+                # (the chained v5->v6 step runs next regardless).
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _WORKSPACE_CHECKPOINTS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(
+                _WORKSPACE_CHECKPOINT_MEMBERS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(
+                _WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL.replace(
+                    "CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1
+                )
+            )
+            c.execute(f"PRAGMA user_version = {_V5_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v5_to_v6(self, instance_id: str | None) -> None:
+        """Migrate a v5 db to v6 in ONE atomic transaction (SB-10, R6/R7 /
+        KTD9): add the nullable ``agent_states.last_observed_version`` column,
+        then stamp ``user_version=6``. Caller holds lock. Guards and stamps
+        the ``_V6_USER_VERSION`` literal — v7 (the agent_states(agent_id)
+        index) made this a chained step, so stamping the constant would
+        re-arm the re-stamp trap this module's docstrings catalogue.
+
+        Column-only and additive — it creates no table and no index, so there
+        is no shim to subsume and no content/mode posture change (the column
+        holds a version INTEGER, never content bytes). Nullable on purpose: a
+        pre-v6 grant observed no version under the new comparand, and NULL (not
+        a 0-sentinel) is the absence the accessor surfaces as ``None``. Same
+        atomicity discipline as every other migration (the
+        sqlite-schema-init-non-atomic-leaves-unbootable-db learning): ONE
+        explicit ``BEGIN IMMEDIATE`` wrapping the ALTER + the ``PRAGMA
+        user_version`` stamp, individual ``execute()`` calls (never
+        ``executescript``), ``except BaseException`` ROLLBACK so a SIGKILL
+        mid-migration leaves the v5 db intact for a clean re-migrate, and a
+        ``_has_column`` guard for the half-migrated-db case (column added by a
+        prior crashed migration whose stamp never committed — ALTER TABLE has
+        no IF NOT EXISTS, so the probe is the guard, mirroring
+        ``_migrate_v1_to_v2``'s fence-column idiom).
+
+        Concurrent-loser path: two processes can both read ``user_version == 5``
+        (a bare pre-lock read) and both land here; they serialize on the ``BEGIN
+        IMMEDIATE`` write lock. The loser re-reads ``user_version`` INSIDE its
+        txn, sees the winner already at >= v6, and no-ops.
+
+        NODE-LEDGER COORDINATION (KTD9 review): the sibling Node coordinator's
+        ledger tops out at ``user_version=4``, and its paired v4 adds an
+        ``agent_states.last_observed_version`` of its own — the column this step
+        lands is therefore COMMON to both ledgers and must never be read as a
+        lineage discriminator. Its ``rejectForeignLedgerDb`` refuses any
+        Python-lineage db on markers every Python v2+ db carries (the
+        ``schema_runtime='python'`` stamp, the ``artifact_versions`` table,
+        ``artifacts.owner_generation``) BEFORE the integer 6 is interpreted
+        against the Node ledger. The reverse direction stays covered by the
+        ``deadline_tick`` structural probe (``>= 3``) plus the
+        ``schema_runtime='node'`` stamp — this step adds
+        ``last_observed_version``, never ``deadline_tick``, so the LOAD-BEARING
+        ``agent_states`` fingerprint remains disjoint and adding only a shared
+        column obliges NO new probe in ``_reject_foreign_ledger_db``.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V6_USER_VERSION:
+                # A racing winner already advanced to v6 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            if not self._has_column("agent_states", "last_observed_version"):
+                c.execute(
+                    "ALTER TABLE agent_states ADD COLUMN last_observed_version INTEGER"
+                )
+            c.execute(f"PRAGMA user_version = {_V6_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v6_to_v7(self, instance_id: str | None) -> None:
+        """Migrate a v6 db to v7 in ONE atomic transaction (SB-10 perf
+        follow-up): index ``agent_states(agent_id)``, then stamp
+        ``user_version=7``. Caller holds lock. The FINAL step of the chain,
+        so it stamps ``SCHEMA_USER_VERSION``.
+
+        WHY: the post-compaction session-start builder reads ``agent_states``
+        scoped by ``agent_id IN (...)`` (``status_snapshot(agent_ids=...)``),
+        but the table is keyed ``(artifact_id, agent_id)`` and nothing indexed
+        ``agent_id`` alone — the predicate still walked every page of a table
+        nothing garbage-collects, on a hook path, twice per compaction, under
+        this registry's lock. Measured on a 500k-row ledger with a four-agent
+        session: 61ms -> 1.5ms (SCAN -> SEARCH), a gain that grows with
+        accumulated agents — the dimension that grows forever. The write tax
+        is a single-row upsert moving p50 ~24us -> ~40us.
+
+        Index-only and additive: no table, no column, no content. ``CREATE
+        INDEX IF NOT EXISTS`` is itself the half-migrated-db guard (a crash
+        after the CREATE but before the stamp leaves a v6-stamped db whose
+        re-migrate no-ops the CREATE), same atomicity discipline as every
+        other step: ONE ``BEGIN IMMEDIATE`` wrapping CREATE + stamp,
+        ``except BaseException`` ROLLBACK.
+
+        NODE-LEDGER COORDINATION (KTD9): the sibling Node coordinator's v5
+        lands the SAME index name — the pair moves together because the
+        cross-runtime schema guard treats a one-sided ``user_version`` bump
+        as a foreign ledger. An index carries no lineage signal (the guards
+        probe columns, tables, and the ``schema_runtime`` stamp, never index
+        names), so neither direction needs a new probe.
+
+        Concurrent-loser path: both processes can read ``user_version == 6``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v7 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_states_agent "
+                "ON agent_states(agent_id)"
             )
             c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
@@ -1579,6 +2011,32 @@ class SqliteArtifactRegistry:
                 raise KeyError(f"artifact {artifact_id} not in registry")
             return row[0]
 
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> Optional[tuple[Artifact, int]]:
+        """Return ``(artifact, owner_generation)`` from ONE row read under the
+        registry lock, or None when absent. Both live on the same ``artifacts``
+        row, so a single SELECT cannot observe a torn pair even against a
+        concurrent sweep reclamation's ``BEGIN IMMEDIATE`` bump."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT name, version, content_hash, size_tokens, owner_generation
+                FROM artifacts WHERE id = ?
+                """,
+                (artifact_id.hex,),
+            ).fetchone()
+        if row is None:
+            return None
+        artifact = Artifact(
+            id=artifact_id,
+            name=row[0],
+            version=row[1],
+            content_hash=row[2] or None,
+            size_tokens=row[3],
+        )
+        return artifact, row[4]
+
     def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the generation an agent captured at its last claim, or None if
         it never established a fence claim (a plain OCC writer that version-CAS,
@@ -1586,6 +2044,20 @@ class SqliteArtifactRegistry:
         with self._lock:
             row = self._conn.execute(
                 "SELECT read_generation FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (artifact_id.hex, agent_id.hex),
+            ).fetchone()
+            return row[0] if row is not None else None
+
+    def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the artifact version whose bytes this agent last observed
+        (SB-10 R6/R7: recorded atomically with every non-INVALID grant/commit
+        upsert), or None when the pair was never observed — absence is NULL,
+        never a 0-sentinel, and a transition to INVALID preserved the prior
+        recorded value. The post-compaction staleness comparand."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_observed_version FROM agent_states "
                 "WHERE artifact_id = ? AND agent_id = ?",
                 (artifact_id.hex, agent_id.hex),
             ).fetchone()
@@ -2033,6 +2505,293 @@ class SqliteArtifactRegistry:
         return {UUID(hex=r[0]): int(r[1]) for r in rows}
 
     # ------------------------------------------------------------------
+    # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        checkpoint: CheckpointRecord,
+        members: Sequence[CheckpointMember],
+    ) -> None:
+        """Persist a checkpoint manifest atomically: the header row (owner
+        metadata INCLUDED — written in the SAME transaction, per the plan's
+        owner-metadata-same-txn rule) plus every member row land in ONE ``BEGIN
+        IMMEDIATE``, or none do. Parity with
+        :meth:`ArtifactRegistry.create_checkpoint`; divergent only on
+        restart-survival (sqlite manifests are durable).
+
+        Fail-closed owner contract: an absent owner raises ``ValueError`` BEFORE
+        the transaction opens — an ownerless manifest is never persisted (the
+        ``owner TEXT NOT NULL`` column is the schema-level backstop). A
+        duplicate ``checkpoint_id`` or duplicate member path raises
+        ``ValueError`` (mapped from the PK ``IntegrityError``) with the whole
+        insert rolled back.
+        """
+        self._guard_writable()
+        if checkpoint.owner is None:
+            raise ValueError(
+                "create_checkpoint requires an owner: a checkpoint manifest "
+                "without owner metadata is unrepresentable (fail-closed; the "
+                "restore path owner-validates against it)"
+            )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO workspace_checkpoints
+                        (checkpoint_id, name, owner, created_at, created_at_tick,
+                         window_min, window_max, restore_status,
+                         restore_updated_at, pin_refcount)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint.checkpoint_id,
+                        checkpoint.name,
+                        checkpoint.owner.hex,
+                        checkpoint.created_at,
+                        checkpoint.created_at_tick,
+                        checkpoint.window_min,
+                        checkpoint.window_max,
+                        checkpoint.restore_status,
+                        checkpoint.restore_updated_at,
+                        checkpoint.pin_refcount,
+                    ),
+                )
+                for member in members:
+                    self._conn.execute(
+                        """
+                        INSERT INTO workspace_checkpoint_members
+                            (checkpoint_id, member_path, artifact_id, native_token,
+                             fingerprint, captured_at, absent, dirty_during_window,
+                             arbitration_tier, restore_tier, pin_state,
+                             restore_outcome, deleted_at_restore)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            checkpoint.checkpoint_id,
+                            member.member_path,
+                            member.artifact_id.hex if member.artifact_id else None,
+                            member.native_token,
+                            member.fingerprint,
+                            member.captured_at,
+                            1 if member.absent else 0,
+                            1 if member.dirty_during_window else 0,
+                            member.arbitration_tier,
+                            member.restore_tier,
+                            member.pin_state,
+                            member.restore_outcome,
+                            member.deleted_at_restore,
+                        ),
+                    )
+                self._conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValueError(
+                    f"create_checkpoint: duplicate checkpoint_id "
+                    f"{checkpoint.checkpoint_id!r} or duplicate member path in "
+                    f"the manifest ({exc})"
+                ) from exc
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """Return the checkpoint header, or ``None`` when unknown."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
+                "window_min, window_max, restore_status, restore_updated_at, "
+                "pin_refcount FROM workspace_checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+        return self._checkpoint_record_from_row(row) if row is not None else None
+
+    def list_checkpoints(self) -> list[CheckpointRecord]:
+        """Return every checkpoint header, ordered by ``(created_at,
+        checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
+                "window_min, window_max, restore_status, restore_updated_at, "
+                "pin_refcount FROM workspace_checkpoints "
+                "ORDER BY created_at, checkpoint_id"
+            ).fetchall()
+        return [self._checkpoint_record_from_row(r) for r in rows]
+
+    def get_checkpoint_members(self, checkpoint_id: str) -> list[CheckpointMember]:
+        """Return the manifest's member rows ordered by ``member_path`` (empty
+        list for an unknown checkpoint — :meth:`get_checkpoint` tells known from
+        unknown)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT member_path, artifact_id, native_token, fingerprint, "
+                "captured_at, absent, dirty_during_window, arbitration_tier, "
+                "restore_tier, pin_state, restore_outcome, deleted_at_restore "
+                "FROM workspace_checkpoint_members WHERE checkpoint_id = ? "
+                "ORDER BY member_path",
+                (checkpoint_id,),
+            ).fetchall()
+        return [
+            CheckpointMember(
+                member_path=r[0],
+                artifact_id=UUID(hex=r[1]) if r[1] else None,
+                native_token=r[2],
+                fingerprint=r[3],
+                captured_at=float(r[4]),
+                absent=bool(r[5]),
+                dirty_during_window=bool(r[6]),
+                arbitration_tier=r[7],
+                restore_tier=r[8],
+                pin_state=r[9],
+                restore_outcome=r[10],
+                deleted_at_restore=float(r[11]) if r[11] is not None else None,
+            )
+            for r in rows
+        ]
+
+    def set_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, *, updated_at: float
+    ) -> None:
+        """Update the checkpoint-level restore status + its ``updated_at`` stamp
+        (the crash-resumable restore's durable progress marker). Raises
+        ``KeyError`` for an unknown checkpoint (fail fast, no silent no-op)."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoints "
+                    "SET restore_status = ?, restore_updated_at = ? "
+                    "WHERE checkpoint_id = ?",
+                    (status, updated_at, checkpoint_id),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def set_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+    ) -> None:
+        """Record a member's restore progress: BOTH columns are written to the
+        given values (a full member-restore-state write — a new restore run's
+        first write for a member resets any prior run's delete record). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoint_members "
+                    "SET restore_outcome = ?, deleted_at_restore = ? "
+                    "WHERE checkpoint_id = ? AND member_path = ?",
+                    (restore_outcome, deleted_at_restore, checkpoint_id, member_path),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(
+                        f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                        f"not in registry"
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def set_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        """Update a member's pin state; ``restore_tier`` (when given) rewrites
+        the member's restore tier in the same step — the Unit-6 loud tier
+        downgrade (``restorable`` -> ``restorable-unpinned`` on a failed pin
+        leg). ``restore_tier=None`` leaves the tier untouched (COALESCE). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE workspace_checkpoint_members "
+                    "SET pin_state = ?, restore_tier = COALESCE(?, restore_tier) "
+                    "WHERE checkpoint_id = ? AND member_path = ?",
+                    (pin_state, restore_tier, checkpoint_id, member_path),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(
+                        f"member {member_path!r} of checkpoint {checkpoint_id!r} "
+                        f"not in registry"
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
+        """Atomically add ``delta`` to a checkpoint's pin refcount and return the
+        new value — read + validate + write in ONE ``BEGIN IMMEDIATE`` so two
+        concurrent adjustments cannot lose an update. Raises ``KeyError`` for an
+        unknown checkpoint and ``ValueError`` if the result would go negative (a
+        release without a matching pin is a bookkeeping bug, fail-closed — the
+        refcount never wraps below zero)."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT pin_refcount FROM workspace_checkpoints "
+                    "WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                new_count = int(row[0]) + delta
+                if new_count < 0:
+                    raise ValueError(
+                        f"pin refcount for checkpoint {checkpoint_id!r} would go "
+                        f"negative ({row[0]} + {delta}); a release without a "
+                        f"matching pin is a bookkeeping bug (fail-closed)"
+                    )
+                self._conn.execute(
+                    "UPDATE workspace_checkpoints SET pin_refcount = ? "
+                    "WHERE checkpoint_id = ?",
+                    (new_count, checkpoint_id),
+                )
+                self._conn.execute("COMMIT")
+                return new_count
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _checkpoint_record_from_row(row: "tuple[Any, ...]") -> CheckpointRecord:
+        """Decode one ``workspace_checkpoints`` row (column order matches the
+        SELECTs above) into the contract dataclass."""
+        return CheckpointRecord(
+            checkpoint_id=row[0],
+            name=row[1],
+            owner=UUID(hex=row[2]),
+            created_at=float(row[3]),
+            created_at_tick=int(row[4]),
+            window_min=float(row[5]),
+            window_max=float(row[6]),
+            restore_status=row[7],
+            restore_updated_at=float(row[8]) if row[8] is not None else None,
+            pin_refcount=int(row[9]),
+        )
+
+    # ------------------------------------------------------------------
     # ArtifactRegistry surface — agent state map
     # ------------------------------------------------------------------
 
@@ -2047,6 +2806,8 @@ class SqliteArtifactRegistry:
 
     def status_snapshot(
         self,
+        *,
+        agent_ids: Iterable[UUID] | None = None,
     ) -> tuple[
         dict[UUID, dict[str, Any]],
         dict[UUID, dict[UUID, MESIState]],
@@ -2064,9 +2825,32 @@ class SqliteArtifactRegistry:
         per-artifact loop that issued ``2 * N`` separate SELECTs
         (``get_artifact`` + ``get_state_map`` for each id) — eliminates
         the N+1 hot path in ``_handle_status``.
+
+        ``agent_ids`` narrows the SECOND query to those agents (SB-10
+        review). ``/status`` renders every holder and passes nothing, keeping
+        the whole-ledger view; the session-start builder can only render its
+        own session's parent + subagents, and it runs on a hook path twice
+        per compaction — under this same lock — so it scopes. Nothing
+        garbage-collects ``agent_states``, which makes the unscoped read grow
+        with the workspace's entire coordination history. An EMPTY iterable
+        means no agents, never all of them: the artifact half is still read,
+        so the workspace-level emptiness signal is unaffected either way.
+
+        The predicate is NOT index-backed: ``agent_states`` is keyed
+        ``(artifact_id, agent_id)`` and nothing indexes ``agent_id`` alone,
+        so SQLite walks the table either way (``EXPLAIN QUERY PLAN`` reports
+        ``SCAN`` for both forms). What the scope removes is the per-row cost
+        — a ``UUID(hex=...)`` and a ``MESIState`` lookup for every row the
+        caller would then discard. Measured on a 500k-row table with a
+        four-agent session: 2804ms unscoped, 174ms scoped. An index on
+        ``agent_id`` would turn the remaining constant into a bound, but it
+        needs a migration in BOTH backends (a one-sided ``user_version`` bump
+        trips the cross-runtime schema guard), so it is deliberately not done
+        here.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
                 "SELECT id, name, version FROM artifacts"
@@ -2074,9 +2858,20 @@ class SqliteArtifactRegistry:
                 aid = UUID(hex=row[0])
                 artifact_by_id[aid] = {"name": row[1], "version": row[2]}
                 state_by_artifact[aid] = {}
-            for row in self._conn.execute(
-                "SELECT artifact_id, agent_id, state FROM agent_states"
-            ).fetchall():
+            if scoped_hexes is None:
+                state_rows = self._conn.execute(
+                    "SELECT artifact_id, agent_id, state FROM agent_states"
+                ).fetchall()
+            elif scoped_hexes:
+                placeholders = ", ".join("?" * len(scoped_hexes))
+                state_rows = self._conn.execute(
+                    "SELECT artifact_id, agent_id, state FROM agent_states "
+                    f"WHERE agent_id IN ({placeholders})",
+                    scoped_hexes,
+                ).fetchall()
+            else:
+                state_rows = []
+            for row in state_rows:
                 aid = UUID(hex=row[0])
                 gid = UUID(hex=row[1])
                 # Only artifacts present in artifact_by_id get state rows.
@@ -2166,15 +2961,29 @@ class SqliteArtifactRegistry:
                         (artifact_id.hex,),
                     )
 
-                # Upsert agent state.
+                # Upsert agent state. SB-10 R6/R7 rides the same statement: the
+                # ``last_observed_version`` operand was SELECTed above in this
+                # txn; non-INVALID targets record it (the version whose bytes
+                # this agent now holds -- the post-compaction staleness
+                # comparand), a transition TO INVALID preserves the prior
+                # recorded value via the CASE guard, and a never-observed row
+                # keeps NULL (never a 0-sentinel).
+                observe = state != MESIState.INVALID
                 if prior_row is None:
                     self._conn.execute(
                         """
                         INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
-                                                  last_reclaim_trigger, last_reclaim_tick)
-                        VALUES (?, ?, ?, ?, NULL, NULL)
+                                                  last_reclaim_trigger, last_reclaim_tick,
+                                                  last_observed_version)
+                        VALUES (?, ?, ?, ?, NULL, NULL, ?)
                         """,
-                        (artifact_id.hex, agent_id.hex, state.name, granted_at_tick),
+                        (
+                            artifact_id.hex,
+                            agent_id.hex,
+                            state.name,
+                            granted_at_tick,
+                            version if observe else None,
+                        ),
                     )
                 else:
                     if clear_reclaim:
@@ -2182,19 +2991,37 @@ class SqliteArtifactRegistry:
                             """
                             UPDATE agent_states
                             SET state = ?, granted_at_tick = ?, last_reclaim_trigger = NULL,
-                                last_reclaim_tick = NULL
+                                last_reclaim_tick = NULL,
+                                last_observed_version =
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
-                            (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
+                            (
+                                state.name,
+                                granted_at_tick,
+                                1 if observe else 0,
+                                version,
+                                artifact_id.hex,
+                                agent_id.hex,
+                            ),
                         )
                     else:
                         self._conn.execute(
                             """
                             UPDATE agent_states
-                            SET state = ?, granted_at_tick = ?
+                            SET state = ?, granted_at_tick = ?,
+                                last_observed_version =
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
-                            (state.name, granted_at_tick, artifact_id.hex, agent_id.hex),
+                            (
+                                state.name,
+                                granted_at_tick,
+                                1 if observe else 0,
+                                version,
+                                artifact_id.hex,
+                                agent_id.hex,
+                            ),
                         )
 
                 # Read-generation fence: capture the current ownership epoch into
@@ -2764,14 +3591,19 @@ class SqliteArtifactRegistry:
                 committer_from = (
                     MESIState[committer_row[0]] if committer_row else MESIState.INVALID
                 )
+                # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
+                # last_observed_version to next_version atomically in this txn
+                # — it produced (and therefore observed) the new version's
+                # bytes. Peers going INVALID above keep their prior value.
                 if committer_row is None:
                     self._conn.execute(
                         """
                         INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
-                                                  last_reclaim_trigger, last_reclaim_tick)
-                        VALUES (?, ?, ?, NULL, NULL, NULL)
+                                                  last_reclaim_trigger, last_reclaim_tick,
+                                                  last_observed_version)
+                        VALUES (?, ?, ?, NULL, NULL, NULL, ?)
                         """,
-                        (artifact_id.hex, agent_id.hex, MESIState.SHARED.name),
+                        (artifact_id.hex, agent_id.hex, MESIState.SHARED.name, next_version),
                     )
                 else:
                     # Preserve granted_at_tick (None for an S/I committer); the
@@ -2781,10 +3613,11 @@ class SqliteArtifactRegistry:
                     self._conn.execute(
                         """
                         UPDATE agent_states
-                        SET state = ?, granted_at_tick = ?
+                        SET state = ?, granted_at_tick = ?, last_observed_version = ?
                         WHERE artifact_id = ? AND agent_id = ?
                         """,
-                        (MESIState.SHARED.name, prior_granted_at, artifact_id.hex, agent_id.hex),
+                        (MESIState.SHARED.name, prior_granted_at, next_version,
+                         artifact_id.hex, agent_id.hex),
                     )
                 seq_incremented_count += self._emit_state_log(
                     artifact_id=artifact_id,
@@ -2951,17 +3784,23 @@ class SqliteArtifactRegistry:
                     committer_from = (
                         MESIState[committer_row[0]] if committer_row else MESIState.INVALID
                     )
+                    # SB-10 R6/R7 (KTD4 first layer): each member's WIN advances
+                    # the WRITER's last_observed_version to that member's
+                    # next_version in this same txn; invalidated peers keep theirs.
                     if committer_row is None:
                         self._conn.execute(
                             "INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick, "
-                            "last_reclaim_trigger, last_reclaim_tick) VALUES (?, ?, ?, NULL, NULL, NULL)",
-                            (art_id.hex, agent_id.hex, MESIState.SHARED.name),
+                            "last_reclaim_trigger, last_reclaim_tick, last_observed_version) "
+                            "VALUES (?, ?, ?, NULL, NULL, NULL, ?)",
+                            (art_id.hex, agent_id.hex, MESIState.SHARED.name, next_version),
                         )
                     else:
                         self._conn.execute(
-                            "UPDATE agent_states SET state = ?, granted_at_tick = ? "
+                            "UPDATE agent_states SET state = ?, granted_at_tick = ?, "
+                            "last_observed_version = ? "
                             "WHERE artifact_id = ? AND agent_id = ?",
-                            (MESIState.SHARED.name, committer_row[1], art_id.hex, agent_id.hex),
+                            (MESIState.SHARED.name, committer_row[1], next_version,
+                             art_id.hex, agent_id.hex),
                         )
                     seq_incremented_count += self._emit_state_log(
                         artifact_id=art_id, agent_id=agent_id, from_state=committer_from,

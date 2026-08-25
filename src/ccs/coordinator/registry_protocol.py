@@ -35,8 +35,18 @@ registry classes themselves (the registries import this module's Protocols under
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from threading import Event
-from typing import Any, Iterable, Mapping, Optional, Protocol, TypeAlias, runtime_checkable
+from typing import (
+    Any,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeAlias,
+    runtime_checkable,
+)
 from uuid import UUID
 
 from ccs.core.states import MESIState, TransientState
@@ -69,6 +79,72 @@ MultiCasResult: TypeAlias = "MultiCommitResult | MultiCommitConflict | CasCorrup
 # {artifact_id: version}; a read_set with an unknown id = VersionedReadRejection,
 # NO pins inserted. Neither is raised by the registry.
 CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
+
+
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """One workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9).
+
+    The contract row both registries store and return — DEFINED here (the
+    contract module) like the other contract return types. Frozen: a manifest
+    record is a fact; updates go through the targeted registry mutators
+    (:meth:`RegistryBase.set_checkpoint_restore_status` /
+    :meth:`RegistryBase.adjust_checkpoint_pin_refcount`), never in-place edits.
+
+    ``owner`` is REQUIRED metadata (fail-closed: ``create_checkpoint`` raises on
+    an absent owner — an ownerless manifest is unrepresentable). ``window_min`` /
+    ``window_max`` are the skew-declared cut window's endpoints (monotonic
+    seconds as captured by the engine). ``restore_status`` +
+    ``restore_updated_at`` are the checkpoint-level restore-progress fields
+    (durable because restore is crash-resumable); the vocabulary is the service
+    layer's — the registry stores the string. ``pin_refcount`` is the Unit-6 GC
+    pin bookkeeping (never negative; adjusted only through the registry).
+    """
+
+    checkpoint_id: str
+    name: str
+    owner: UUID
+    created_at: float
+    created_at_tick: int
+    window_min: float
+    window_max: float
+    restore_status: str = "none"
+    restore_updated_at: float | None = None
+    pin_refcount: int = 0
+
+
+@dataclass(frozen=True)
+class CheckpointMember:
+    """One member row of a workspace-checkpoint manifest (WV plan Unit 2 / R1).
+
+    Fixed-width capture facts only — tokens, fingerprints, flags, tiers,
+    timestamps; NEVER content bytes. ``member_path`` keys the member within its
+    checkpoint; ``artifact_id`` is the optional coordinator artifact ref (an S3
+    member has none). ``native_token`` is the member's substrate CAS token as
+    captured (opaque here). ``absent`` records absent-at-capture (ABSENT is a
+    fact distinct from empty); ``dirty_during_window`` is the torn-cut flag.
+    ``arbitration_tier`` (``native-cas`` / ``no-arbiter``) and ``restore_tier``
+    (``restorable`` / ``restorable-unpinned`` / ``forward_only``) default to the
+    WEAKEST claims — honesty is the default, upgrades are explicit.
+    ``restore_outcome`` + ``deleted_at_restore`` are the per-member
+    restore-progress columns: the typed terminal outcome a crash-resumable
+    restore records, and the manifest-side delete record (``commit_all`` has no
+    delete semantics, so delete legs are recorded here per the plan's
+    restore-registration design).
+    """
+
+    member_path: str
+    artifact_id: UUID | None
+    native_token: str | None
+    fingerprint: str | None
+    captured_at: float
+    absent: bool = False
+    dirty_during_window: bool = False
+    arbitration_tier: str = "no-arbiter"
+    restore_tier: str = "forward_only"
+    pin_state: str = "unpinned"
+    restore_outcome: str | None = None
+    deleted_at_restore: float | None = None
 
 # Shared registry trigger constants — DEFINED here (canonical) and re-exported by
 # both registries, which previously each kept an identical copy pinned equal by
@@ -110,6 +186,13 @@ class RegistryBase(Protocol):
     """
 
     def abort_guard(self, abort: "Event | None" = None) -> AbstractContextManager[None]:
+        ...
+
+    def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
+        """Atomically add ``delta`` to a checkpoint's pin refcount and return the
+        new value. Raises ``KeyError`` for an unknown checkpoint and
+        ``ValueError`` if the result would go negative (a release without a
+        matching pin is a bookkeeping bug, fail-closed)."""
         ...
 
     def all_session_meta(self) -> "dict[str, tuple[UUID, int]]":
@@ -160,6 +243,18 @@ class RegistryBase(Protocol):
         (parity)."""
         ...
 
+    def create_checkpoint(
+        self,
+        checkpoint: CheckpointRecord,
+        members: Sequence[CheckpointMember],
+    ) -> None:
+        """Persist a checkpoint manifest — the header row (owner metadata
+        INCLUDED, same transaction) plus every member row — atomically: all rows
+        land or none do. Raises ``ValueError`` on an absent owner (fail-closed:
+        an ownerless manifest is never persisted), on a duplicate
+        ``checkpoint_id``, and on duplicate member paths within the manifest."""
+        ...
+
     @property
     def coordinator_epoch(self) -> str:
         """Fence token identifying this coordinator incarnation. A ``@property``
@@ -177,6 +272,15 @@ class RegistryBase(Protocol):
         ...
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
+        ...
+
+    def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        ...
+
+    def get_checkpoint_members(self, checkpoint_id: str) -> list[CheckpointMember]:
+        """Return the manifest's member rows ordered by ``member_path`` (empty
+        list for an unknown checkpoint — the header getter tells known from
+        unknown)."""
         ...
 
     def get_content(self, artifact_id: UUID) -> str | bytes | None:
@@ -211,6 +315,20 @@ class RegistryBase(Protocol):
     def get_transient_tick(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         ...
 
+    def get_artifact_and_generation(
+        self, artifact_id: UUID
+    ) -> "tuple[Artifact, int] | None":
+        """Return ``(artifact, owner_generation)`` from ONE snapshot, or None if
+        the artifact is absent. The pair MUST have coexisted at a single
+        instant: a backend serving it as two independent reads lets a concurrent
+        sweep reclamation (which bumps the generation WITHOUT a version move)
+        tear the pair, silently reopening the reclaim-zombie EFFECT hole
+        downstream (see ``adapters.effect_gate``). Any caller needing a
+        version and its ownership epoch together must use this, never two
+        separate accessors.
+        """
+        ...
+
     def get_version_record(
         self, artifact_id: UUID, version: int
     ) -> tuple[str | bytes, float] | None:
@@ -223,6 +341,20 @@ class RegistryBase(Protocol):
         ...
 
     def last_heartbeat_tick(self, agent_id: UUID) -> int | None:
+        ...
+
+    def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
+        """Return the artifact version whose bytes this agent last observed
+        (SB-10: recorded atomically with every non-INVALID grant/commit upsert),
+        or None when the pair was never observed. Absence semantics are part of
+        the contract: never a 0-sentinel, and a transition to INVALID preserves
+        the prior recorded value — this is the durable comparand the
+        post-compaction stale flag is computed from."""
+        ...
+
+    def list_checkpoints(self) -> list[CheckpointRecord]:
+        """Return every checkpoint header, ordered by ``(created_at,
+        checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
         ...
 
     def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
@@ -268,6 +400,42 @@ class RegistryBase(Protocol):
         *,
         entered_tick: int,
     ) -> None:
+        ...
+
+    def set_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+    ) -> None:
+        """Update a member's pin state; ``restore_tier`` (when given) rewrites
+        the member's restore tier in the same step — the Unit-6 loud tier
+        downgrade (``restorable`` -> ``restorable-unpinned`` on a failed pin
+        leg). ``restore_tier=None`` leaves the tier untouched. Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        ...
+
+    def set_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+    ) -> None:
+        """Record a member's restore progress: BOTH columns are written to the
+        given values (a full member-restore-state write — a new restore run's
+        first write for a member resets any prior run's delete record). Raises
+        ``KeyError`` for an unknown (checkpoint, member) pair."""
+        ...
+
+    def set_checkpoint_restore_status(
+        self, checkpoint_id: str, status: str, *, updated_at: float
+    ) -> None:
+        """Update the checkpoint-level restore status + its ``updated_at``
+        stamp. Raises ``KeyError`` for an unknown checkpoint."""
         ...
 
     def set_artifact_and_content(
@@ -359,6 +527,8 @@ class SqliteExtended(RegistryBase, Protocol):
 
     def status_snapshot(
         self,
+        *,
+        agent_ids: Iterable[UUID] | None = None,
     ) -> tuple[
         dict[UUID, dict[str, Any]],
         dict[UUID, dict[UUID, MESIState]],

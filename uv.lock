@@ -40,6 +40,9 @@ coherent-object = [
 coherent-row = [
     { name = "psycopg", extra = ["binary"] },
 ]
+conformance = [
+    { name = "pytest" },
+]
 crewai = [
     { name = "crewai" },
 ]
@@ -98,11 +101,12 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'coherent-row'", specifier = ">=3.1" },
+    { name = "pytest", marker = "extra == 'conformance'", specifier = ">=7.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
 ]
-provides-extras = ["dev", "langgraph", "crewai", "otel", "langsmith", "benchmark", "diagnose", "openai", "openai-agents", "mistral", "mcp", "coherent-row", "coherent-object", "all"]
+provides-extras = ["dev", "conformance", "langgraph", "crewai", "otel", "langsmith", "benchmark", "diagnose", "openai", "openai-agents", "mistral", "mcp", "coherent-row", "coherent-object", "all"]
 
 [[package]]
 name = "aiohappyeyeballs"

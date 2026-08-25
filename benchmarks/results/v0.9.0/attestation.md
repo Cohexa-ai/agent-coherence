@@ -1,8 +1,7 @@
 ---
 title: v0.9.0 crash-recovery default-flip benchmark attestation
 date: 2026-06-03
-requirement: R10 (D-bench three-step)
-plan: docs/plans/2026-05-28-001-feat-c-flip-crash-recovery-default-on-plan.md (Unit 10)
+requirement: three-step benchmark validation
 ---
 
 # v0.9.0 Benchmark Validation Attestation
@@ -18,7 +17,7 @@ plus the rate-limited `_maybe_sweep` wiring in `CoherenceAdapterCore`) introduce
 The committed `benchmarks/expected.json` is the frozen main baseline. The benchmark
 generator (`tools/run_benchmarks.py`) is fully deterministic — no RNG seeding variance,
 no wall-clock dependence — so a single capture suffices for the noise check (the
-"two identical runs" step of D-bench is trivially satisfied by determinism, and a second
+"two identical runs" step is trivially satisfied by determinism, and a second
 run was confirmed identical during development).
 
 - Raw C-flip-branch run: [`c_flip_branch_run.txt`](c_flip_branch_run.txt)
@@ -31,7 +30,7 @@ run was confirmed identical during development).
 | 4-agent high-churn (write-heavy) | 28.71% | 28.71% | **0.00pp** |
 
 `expected.json` is therefore **unchanged** — no re-anchoring was performed, and none
-was warranted (ADV-07 / RM-3: never silently rebaseline).
+was warranted (never silently rebaseline).
 
 ## 2. Why there is zero drift (source attribution)
 
@@ -48,9 +47,9 @@ sweep. Two reasons this does not move the benchmark token counts:
    sweep runs but reclaims nothing — no `reclaim_*` event is emitted on any of
    `bench_planner.py`, `bench_code_review.py`, `bench_high_churn.py`.
 
-## 3. Reclamation correctness (empirical, OOM-kill shape — RM-10 fallback)
+## 3. Reclamation correctness (empirical, OOM-kill shape — fallback)
 
-The contributed `cron-fan-out` fixture is not yet in-repo (RM-10). Its OOM-kill fallback —
+The contributed `cron-fan-out` fixture is not yet in-repo. Its OOM-kill fallback —
 "construct one M/E grant-holder, kill it mid-run so its heartbeat gaps past the timeout,
 assert the sweep reclaims exactly that agent and no live agent" — is exercised
 deterministically and as CI-runnable tests rather than as a standalone benchmark fixture:
@@ -71,4 +70,4 @@ Each asserts reclamation fires on exactly the stale grant and never on a live ag
 Zero unexplained `expected.json` drift; zero unexplained reclamations under the
 real-workload benchmarks; reclamation correctness covered by the CI-runnable tests above.
 
-Author: Vlad (hipvlady) — prepared ahead of the v0.9.0 release gate (≥ 2026-06-09, R13).
+Author: Vlad (hipvlady) — prepared ahead of the v0.9.0 release gate (≥ 2026-06-09).

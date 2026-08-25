@@ -3451,3 +3451,1075 @@ def test_l5_idle_and_uptime_use_monotonic_immune_to_wall_clock(
         srv.mark_request()
         clock["t"] = 1105.0
         assert srv.idle_seconds == 5.0
+
+
+# ----------------------------------------------------------------------
+# /hooks/pre-read — want_owner_generation opt-in (the effect gate's
+# pair-consistent comparand read). Absent the flag, every shipped shape is
+# byte-unchanged (pinned by the exact-dict tests above).
+# ----------------------------------------------------------------------
+
+
+def test_pre_read_want_owner_generation_fresh_carries_pair(client: _Client) -> None:
+    """The opt-in fresh response carries (version, owner_generation) from ONE
+    registry snapshot; first observation seeds v1 at generation 0."""
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen1"), "path": "CLAUDE.md",
+         "content_hash": _hash("abc"), "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+
+
+def test_pre_read_want_owner_generation_valid_grant_carries_pair(client: _Client) -> None:
+    """The already-granted fresh branch (not just first observation) also
+    carries the pair on opt-in."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("gen2"), "path": "CLAUDE.md", "content_hash": _hash("h1")})
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen2"), "path": "CLAUDE.md",
+         "content_hash": _hash("h1"), "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+
+
+def test_pre_read_want_owner_generation_stale_after_reclaim_shows_moved_epoch(
+    coordinator, client: _Client
+) -> None:
+    """THE zombie re-validation read: a sweep reclaimed this session's grant, so
+    the warn-stale response carries the SAME version but an ADVANCED
+    owner_generation — the drift a version-only comparand cannot see."""
+    sid = _sid("gen-zombie")
+    status, _ = client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert status == 200
+    reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+    )
+    assert reclaimed == 1, "sweep should have reclaimed exactly one M/E grant"
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "plan.md", "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert body["owner_generation"] == 1  # the reclaim bumped the epoch
+    # The generation rides top-level; the VERSION comparand stays the one this
+    # response was classified from (summary.current_version) — the attach never
+    # overwrites it with a later snapshot.
+    assert "version" not in body
+    assert body["summary"]["current_version"] == 1  # the version did NOT move
+
+
+def test_pre_read_stale_without_flag_omits_generation_keys(
+    coordinator, client: _Client
+) -> None:
+    """No opt-in → the shipped warn-stale envelope is untouched: neither the
+    top-level version nor owner_generation appears."""
+    sid = _sid("gen-noflag")
+    status, _ = client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert status == 200
+    coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=int(time.time()) + 999_999,
+        heartbeat_timeout_ticks=1,
+        max_hold_ticks=999_999_999,
+    )
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "plan.md"},
+    )
+    assert status == 200
+    assert body["status"] == "stale"
+    assert "owner_generation" not in body
+    assert "version" not in body
+
+
+def test_pre_read_want_owner_generation_untracked_fastpath_unchanged(
+    client: _Client,
+) -> None:
+    """The untracked fast-path never consults the registry, flag or no flag —
+    no pair to attach, and the exact two-field shape stays."""
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("gen3"), "path": "untracked.bin",
+         "want_owner_generation": True},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_pre_read_pair_comes_from_the_classifying_snapshot(
+    coordinator, client: _Client
+) -> None:
+    """The reported generation must belong to the SAME snapshot as the version
+    the response was classified from — never a later read a peer commit could
+    slip past. That is now structural: one ``get_artifact_and_generation`` call
+    backs both, so there is no second read to race. This pins the property
+    directly by making the ONLY registry pair-read observably atomic, and
+    asserting the handler never reaches for a second one.
+
+    (This replaces an earlier guard that tolerated the two-read shape by
+    discarding a mismatched pair; folding the reads made that window
+    unrepresentable rather than merely detected.)"""
+    sid = _sid("pair-snapshot")
+    reads: list[str] = []
+    real_pair = coordinator.registry.get_artifact_and_generation
+
+    def counting_pair(aid):
+        reads.append("pair")
+        return real_pair(aid)
+
+    coordinator.registry.get_artifact_and_generation = counting_pair  # type: ignore[method-assign]
+    try:
+        status, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("v1"),
+             "want_owner_generation": True},
+        )
+    finally:
+        coordinator.registry.get_artifact_and_generation = real_pair  # type: ignore[method-assign]
+
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1, "owner_generation": 0}
+    assert len(reads) == 1, (
+        "the handler must derive the classification version AND the reported "
+        f"generation from ONE pair-atomic read; saw {len(reads)}"
+    )
+
+
+# ======================================================================
+# SB-10 U2 — POST /hooks/session-start: post-compaction re-grounding
+# ======================================================================
+#
+# Prose lines are byte-pinned here on purpose: the Node coordinator (U6)
+# mirrors these exact strings, and the protocol corpus byte-matches them.
+# Any wording change must land in BOTH backends plus the corpus fixtures.
+
+_SS_HEADER = "Post-compaction re-grounding (agent-coherence):"
+_SS_CLOSING = (
+    "Versions are as of this re-grounding; a more recent read supersedes "
+    "this notice."
+)
+
+
+def _session_start_text(body: dict) -> str:
+    """Unwrap the additionalContext from a session-start response body."""
+    return body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_missing_authorization_returns_401(coordinator) -> None:
+    url = f"http://127.0.0.1:{coordinator.port}/hooks/session-start"
+    req = urlrequest.Request(url, data=b"{}", method="POST",
+                             headers={"Host": "127.0.0.1", "Content-Type": "application/json"})
+    try:
+        urlrequest.urlopen(req, timeout=5)
+        assert False, "expected 401"
+    except urlerror.HTTPError as e:
+        assert e.code == 401
+
+
+def test_session_start_bad_host_returns_403(client: _Client) -> None:
+    status, body = client.post(
+        "/hooks/session-start", {"session_id": _sid("ss-host")},
+        headers_override={"Host": "attacker.example.com"},
+    )
+    assert status == 403
+
+
+def test_session_start_malformed_session_id_returns_400(client: _Client) -> None:
+    status, body = client.post("/hooks/session-start", {"session_id": "not-a-uuid"})
+    assert status == 400
+
+
+def test_session_start_empty_session_returns_empty_and_no_flag(
+    coordinator, client: _Client
+) -> None:
+    """AE4 (R5): a session with no coordination state gets `{}` and no
+    compact-pending flag — the model sees nothing, the deferred path stays
+    unarmed."""
+    sid = _sid("ss-empty")
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body == {}
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_counter_increments(coordinator, client: _Client) -> None:
+    before = coordinator.endpoint_counters_snapshot()["session_start_total"]
+    client.post("/hooks/session-start", {"session_id": _sid("ss-counter")})
+    after = coordinator.endpoint_counters_snapshot()["session_start_total"]
+    assert after == before + 1
+
+
+def test_session_start_peer_advanced_renders_stale_line(
+    coordinator, client: _Client
+) -> None:
+    """AE1 (R4/R7): A observed v1, peer B committed v2 → A's re-grounding
+    flags the divergence with BOTH versions. B's own grant lines must not
+    leak into A's payload."""
+    sid_a, sid_b = _sid("ss-ae1-a"), _sid("ss-ae1-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    assert set(body.keys()) == {"hookSpecificOutput"}
+    hso = body["hookSpecificOutput"]
+    assert set(hso.keys()) == {"hookEventName", "additionalContext"}
+    assert hso["hookEventName"] == "SessionStart"
+    text = hso["additionalContext"]
+    lines = text.split("\n")
+    assert lines[0] == _SS_HEADER
+    assert lines[1] == (
+        "plan.md advanced to v2 past your last-observed v1 — re-read before "
+        "relying on it."
+    )
+    assert lines[-1] == _SS_CLOSING
+    # B's E/M grant belongs to B's session — never rendered for A.
+    assert "At compaction you held" not in text
+    # KTD8: no timestamps anywhere in the re-grounding prose (no notices in
+    # this scenario, so the whole payload must be timestamp-free).
+    assert "+00:00" not in text
+
+
+def test_session_start_scopes_the_state_read_to_this_sessions_agents(
+    coordinator, client: _Client, monkeypatch
+) -> None:
+    """SB-10 review: the builder must narrow ``status_snapshot`` to its own
+    session's agents.
+
+    No behavioural test can pin this — the walk looks each pair up per agent
+    (``state_by_artifact.get(artifact_id, {}).get(agent_id)``), so surplus
+    rows are unobservable and dropping the scope would render byte-identical
+    and ship green. Assert the ARGUMENT instead, or the whole point of the
+    fix — a hook path that stops reading the workspace's entire never-GC'd
+    ``agent_states`` ledger, twice per compaction, under the registry lock —
+    is revertible in silence."""
+    sid_a, sid_b = _sid("ss-scope-a"), _sid("ss-scope-b")
+    # A peer session's rows on the same artifact: present in the ledger,
+    # never in scope.
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-read",
+                {"session_id": sid_b, "path": "plan.md", "content_hash": _hash("v1")})
+
+    scopes: list[list[uuid.UUID] | None] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args, **kwargs):
+        scopes.append(
+            None if kwargs.get("agent_ids") is None else list(kwargs["agent_ids"])
+        )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+
+    status, _ = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    assert len(scopes) == 1, "the builder reads state exactly once"
+    expected = [agent_id for agent_id, _ in coordinator.agents_for_session(sid_a)]
+    assert scopes[0] == expected
+    peer_agent_ids = {
+        agent_id for agent_id, _ in coordinator.agents_for_session(sid_b)
+    }
+    assert not peer_agent_ids.intersection(scopes[0] or []), (
+        "a peer session's agent must never enter the scope"
+    )
+
+
+def test_session_start_own_last_writer_renders_non_stale_line(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AE2 (R7, KTD4 second layer): even when the version advanced past the
+    recorded last-observed value, a row whose artifact last_writer is the
+    requesting agent itself renders the plain version line, never the stale
+    flag."""
+    sid_a, sid_b = _sid("ss-ae2-a"), _sid("ss-ae2-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+    # Force the own-edit exemption arm: pretend A itself is the last writer
+    # (the natural flow advances the writer's own last_observed in the same
+    # transaction — KTD4's FIRST layer — so the second layer is only
+    # reachable via this seam).
+    own_agent = session_to_agent_id(sid_a)
+    monkeypatch.setattr(coordinator.registry, "last_writer_for", lambda aid: own_agent)
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "plan.md is at v2." in text
+    assert "advanced to" not in text
+
+
+def test_session_start_null_last_observed_renders_non_stale(
+    coordinator, client: _Client
+) -> None:
+    """R7: a never-observed row (NULL last_observed) is admitted, never
+    flagged — no 0-sentinel comparison may sneak in."""
+    sid_a, sid_b = _sid("ss-null-a"), _sid("ss-null-b")
+    # B seeds the artifact and advances it to v2.
+    client.post("/hooks/pre-read",
+                {"session_id": sid_b, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("v2"), "success": True})
+    # A gets a state row WITHOUT ever observing bytes: an INVALID upsert on a
+    # fresh pair records nothing (U1 contract), leaving last_observed NULL.
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert artifact_id is not None
+    coordinator.registry.set_agent_state(
+        artifact_id, session_to_agent_id(sid_a), MESIState.INVALID,
+        trigger="peer_invalidation", tick=1,
+    )
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "plan.md is at v2." in text
+    assert "advanced to" not in text
+
+
+def test_session_start_held_exclusive_renders_event_anchored_grant_line(
+    coordinator, client: _Client
+) -> None:
+    """R3 + KTD8: grant prose is event-anchored ("At compaction you held"),
+    never present-tense — a turn-end Stop drain may release E/M before the
+    attachment renders."""
+    sid = _sid("ss-grant")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert (
+        "At compaction you held EXCLUSIVE on plan.md (v1) — re-acquire "
+        "before writing."
+    ) in text
+
+
+def test_session_start_cap_renders_three_verbatim_plus_overflow_under_10kb(
+    coordinator, client: _Client
+) -> None:
+    """R5: 5 touched artifacts → 3 verbatim lines + a single "Plus 2 more"
+    overflow pointing at the status surface; total payload far below the
+    10KB additionalContext ceiling."""
+    sid = _sid("ss-cap")
+    paths = [f"docs/plans/{n}.md" for n in ("a", "b", "c", "d", "e")]
+    for p in paths:
+        client.post("/hooks/pre-read",
+                    {"session_id": sid, "path": p, "content_hash": _hash(p)})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    for p in paths[:3]:
+        assert (
+            f"At compaction you held SHARED on {p} (v1) — re-acquire "
+            f"before writing."
+        ) in text
+    for p in paths[3:]:
+        assert p not in text
+    assert "Plus 2 more — run agent-coherence-status for the full picture." in text
+    assert len(text.encode("utf-8")) < 10_000
+
+
+def test_session_start_pending_notice_rendered_read_only(
+    coordinator, client: _Client
+) -> None:
+    """R3: pending preemption notices appear in the payload via the existing
+    preemption prose builder — AFTER the header, BEFORE grant lines — and the
+    queue is NOT drained: the next pre-read still surfaces (and consumes)
+    the same notice. Consumption ownership stays with the admit endpoints."""
+    sid = _sid("ss-notice")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "AGENTS.md", "content_hash": _hash("n1")})
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("AGENTS.md")
+    assert artifact_id is not None
+    agent_id = session_to_agent_id(sid)
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=agent_id,
+        artifact_id=artifact_id,
+        preempter_agent_id=uuid.uuid4(),
+        preempted_at_unix_ts=1_700_000_000.0,
+    )
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert text.split("\n")[0] == _SS_HEADER
+    notice_at = text.index("⚠ Coordinator notice:")
+    grant_at = text.index("At compaction you held")
+    assert notice_at < grant_at
+    # Read-only proof: the queue still holds the notice for the admit drain.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "AGENTS.md", "content_hash": _hash("n1")},
+    )
+    assert status == 200
+    assert "AGENTS.md" in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_subagent_grants_grouped_and_released_absent(
+    coordinator, client: _Client
+) -> None:
+    """R3 + KTD8: the parent's lines render first, then subagent groups
+    under a `Subagent {name}:` prefix. After the subagent stops (grants
+    released), its grant line disappears from the next payload."""
+    sid = _sid("ss-sub")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("c1")})
+    client.post("/hooks/pre-edit",
+                {"session_id": sid, "path": "plan.md", "agent_id": "worker-1"})
+
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    parent_at = text.index("At compaction you held SHARED on CLAUDE.md (v1)")
+    prefix_at = text.index("Subagent worker-1:")
+    sub_at = text.index("At compaction you held EXCLUSIVE on plan.md (v1)")
+    assert parent_at < prefix_at < sub_at
+
+    # Stop the subagent — its E grant is released (row goes INVALID).
+    client.post("/hooks/session-stop", {"session_id": sid, "agent_id": "worker-1"})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    text = _session_start_text(body)
+    assert "At compaction you held EXCLUSIVE on plan.md" not in text
+    # The released row is still a touched row — rendered without a flag.
+    assert "Subagent worker-1:" in text
+    assert "plan.md is at v1." in text
+
+
+def test_session_start_two_identical_calls_byte_identical(
+    coordinator, client: _Client
+) -> None:
+    """KTD8 determinism: with no state movement between them, two calls
+    produce byte-identical additionalContext (no timestamps, stable sort)."""
+    sid_a, sid_b = _sid("ss-det-a"), _sid("ss-det-b")
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "CLAUDE.md", "content_hash": _hash("d1")})
+    client.post("/hooks/pre-edit", {"session_id": sid_b, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid_b, "path": "plan.md",
+                 "content_hash": _hash("d2"), "success": True})
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "docs/plans/x.md", "content_hash": _hash("d3")})
+
+    _, first = client.post("/hooks/session-start", {"session_id": sid_a})
+    _, second = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert _session_start_text(first) == _session_start_text(second)
+
+
+def test_session_start_sets_flag_consume_is_test_and_clear(
+    coordinator, client: _Client
+) -> None:
+    """KTD5: a non-empty session-start marks compact-pending; the first
+    consume wins, the second sees nothing."""
+    sid = _sid("ss-flag")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("f1")})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body != {}
+    assert coordinator.consume_compact_pending(sid) is True
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_consume_compact_pending_race_exactly_one_winner(coordinator) -> None:
+    """KTD5: consume is an atomic test-and-clear — 8 racing consumers get
+    exactly one True (the deferred-delivery unit's TOCTOU safety)."""
+    sid = _sid("ss-race")
+    coordinator.mark_compact_pending(sid)
+    barrier = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def racer() -> None:
+        barrier.wait()
+        got = coordinator.consume_compact_pending(sid)
+        with results_lock:
+            results.append(got)
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(results) == 1
+
+
+def test_expire_compact_pending_clears_flag(coordinator) -> None:
+    """KTD5: expire drops an unconsumed flag (parent-Stop wiring lands in
+    the deferred-delivery unit; the primitive is pinned here)."""
+    sid = _sid("ss-expire")
+    coordinator.mark_compact_pending(sid)
+    coordinator.expire_compact_pending(sid)
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_degraded_returns_empty_and_no_flag(
+    coordinator, client: _Client
+) -> None:
+    """KTD7: a watchdog-degraded session-start answers `{}` — advisory
+    re-grounding must never block — and the compact-pending flag stays
+    unset (nothing to deliver later that was never built)."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
+
+    sid = _sid("ss-degraded")
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("g1")})
+    with patch.object(coordinator, "run_with_watchdog", side_effect=FuturesTimeout()):
+        status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body == {}
+    assert coordinator.consume_compact_pending(sid) is False
+
+
+def test_session_start_breadcrumb_only_for_never_seen_with_state(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R8: the debug breadcrumb fires exactly when a never-seen session
+    arrives while the workspace holds coordination state — converting a
+    silent session-id-rotation regression into an observable."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="ccs.adapters.claude_code.coordinator_server")
+
+    # (a) never-seen session + EMPTY workspace → no breadcrumb.
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-empty")})
+    assert "never-seen session" not in caplog.text
+
+    # Seed workspace state with an unrelated session.
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("ss-bc-other"), "path": "CLAUDE.md",
+                 "content_hash": _hash("b1")})
+
+    # (b) never-seen session + NONEMPTY workspace → breadcrumb.
+    caplog.clear()
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-new")})
+    assert "never-seen session" in caplog.text
+
+    # (c) already-seen session + nonempty workspace → no breadcrumb.
+    caplog.clear()
+    client.post("/hooks/session-start", {"session_id": _sid("ss-bc-new")})
+    assert "never-seen session" not in caplog.text
+
+
+def test_session_start_prose_constants_byte_pinned() -> None:
+    """KTD8: the Node coordinator byte-matches these module-level constants;
+    a wording tweak here must ship in both backends + the corpus."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.SESSION_START_HEADER == "Post-compaction re-grounding (agent-coherence):"
+    assert hp.SESSION_START_GRANT_LINE_TEMPLATE == (
+        "At compaction you held {state} on {path} (v{version}) — re-acquire "
+        "before writing."
+    )
+    assert hp.SESSION_START_STALE_LINE_TEMPLATE == (
+        "{path} advanced to v{current} past your last-observed v{last} — "
+        "re-read before relying on it."
+    )
+    assert hp.SESSION_START_TOUCHED_LINE_TEMPLATE == "{path} is at v{current}."
+    assert hp.SESSION_START_OVERFLOW_LINE_TEMPLATE == (
+        "Plus {count} more — run agent-coherence-status for the full picture."
+    )
+    assert hp.SESSION_START_SUBAGENT_PREFIX_TEMPLATE == "Subagent {name}:"
+    assert hp.SESSION_START_CLOSING_LINE == (
+        "Versions are as of this re-grounding; a more recent read supersedes "
+        "this notice."
+    )
+
+
+# ======================================================================
+# SB-10 U4 — deferred re-grounding delivery on the next qualifying admit
+# ======================================================================
+#
+# R2: at-most-once per delivery path; the flag is consumed by the FIRST
+# qualifying PARENT admit and expires at parent Stop. R8: the payload
+# attaches ONLY to allow envelopes; a request carrying agent_id neither
+# consumes nor attaches. KTD6: the check rides the four admit surfaces
+# (pre-read, pre-edit, pre-bash, pre-grep), with the advisory flag peek
+# hoisted above the untracked fast-path exits.
+
+
+def _arm_reground(client: _Client, sid: str) -> str:
+    """Give the session coordination state (SHARED on CLAUDE.md), then arm
+    the deferred flag via the REAL /hooks/session-start endpoint (KTD5).
+    Returns the payload text the arming call rendered — KTD2's
+    rebuild-at-delivery means the deferred copy must byte-match it as long
+    as no state moves in between."""
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    assert body != {}
+    return body["hookSpecificOutput"]["additionalContext"]
+
+
+def _reground_text_of(body: dict) -> str | None:
+    """The additionalContext of an admit response's allow envelope, or None."""
+    hso = body.get("hookSpecificOutput")
+    if hso is None:
+        return None
+    return hso.get("additionalContext")
+
+
+def test_deferred_reground_tracked_pre_read_delivers_exactly_once(
+    coordinator, client: _Client
+) -> None:
+    """Pending flag + tracked pre-read admit → the fresh admit carries the
+    re-grounding block (byte-identical to the session-start rendering —
+    KTD2 rebuild-at-delivery), and the following admit is clean.
+
+    This tracked fresh-no-notice admit has no envelope of its own, so the
+    attach mints the CONTEXT-ONLY shape: prose without a permission
+    decision (advisory payloads never widen one)."""
+    sid = _sid("dr-tracked")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body["status"] == "fresh"
+    out = body["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in out
+    assert out["additionalContext"] == armed_text
+    # Consumed: the very next admit is today's bare fresh shape.
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body2 == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_untracked_pre_read_delivers_then_bare(
+    coordinator, client: _Client
+) -> None:
+    """Pending flag + UNTRACKED pre-read → the payload rides a CONTEXT-ONLY
+    PreToolUse envelope on the fast path (no permission decision — the
+    advisory delivery must not auto-approve an otherwise-promptable tool
+    call); the next untracked call returns today's bare body."""
+    sid = _sid("dr-untracked")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body["status"] == "fresh"
+    out = body["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in out
+    assert out["additionalContext"] == armed_text
+    status, body2 = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body2 == {"status": "fresh"}
+
+
+def test_deferred_reground_untracked_admit_emits_no_permission_decision(
+    coordinator, client: _Client
+) -> None:
+    """Security pin (explicit absence): the deferred delivery must never
+    widen a permission decision. An untracked admit whose base body has no
+    envelope of its own gets prose ONLY — hookEventName + additionalContext
+    and NOTHING else. A ``permissionDecision: "allow"`` here would
+    short-circuit Claude Code's permission prompting for that tool call,
+    once per compaction, purely as a side effect of delivery.
+
+    Verified empirically (A/B capture, Claude Code CLI 2.1.233,
+    2026-08-25): the CLI renders additionalContext on a PreToolUse
+    envelope carrying no permissionDecision, so the allow was never
+    needed to get the prose in front of the model."""
+    sid = _sid("dr-no-decision")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert "permissionDecision" not in out
+    assert "permissionDecisionReason" not in out
+    assert set(out) == {"hookEventName", "additionalContext"}
+    assert out["hookEventName"] == "PreToolUse"
+    # The advisory still lands — absence of the decision costs no prose.
+    assert out["additionalContext"] == armed_text
+    assert armed_text.startswith("Post-compaction re-grounding (agent-coherence):")
+
+
+def test_deferred_reground_merge_preserves_existing_permission_decision(
+    coordinator, client: _Client
+) -> None:
+    """The OTHER branch is untouched: when the base admit already carries
+    an envelope (here a warn-mode stale-read allow), the attach merges the
+    re-grounding block into it and the pre-existing permissionDecision
+    survives verbatim — the advisory neither widens nor narrows a decision
+    the admit already made. KTD6 ordering: the stale warning renders
+    first, the re-ground block after it."""
+    sid = _sid("dr-merge")
+    peer = _sid("dr-merge-peer")
+    # Session A first-reads plan.md (SHARED v1); peer commits v2 → A stale.
+    client.post("/hooks/pre-read",
+                {"session_id": sid, "path": "plan.md", "content_hash": _hash("m1")})
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": peer, "path": "plan.md",
+                 "content_hash": _hash("m2"), "success": True})
+    coordinator.mark_compact_pending(sid)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "plan.md", "content_hash": _hash("m1")})
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"  # warn-mode decision preserved
+    text = out["additionalContext"]
+    assert text.index("Stale read") < text.index(
+        "Post-compaction re-grounding (agent-coherence):")
+    assert coordinator.has_compact_pending(sid) is False
+
+
+def test_untracked_pre_read_no_flag_byte_identical_and_registry_free(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No flag + untracked → byte-identical to today's fast-path response
+    AND zero registry access (the KTD6 advisory peek is a process-local
+    dict lookup). The registry is swapped for a proxy that explodes on ANY
+    attribute access; a touched registry would 500 the request."""
+    sid = _sid("dr-noflag")
+
+    class _ExplodingRegistry:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"registry touched on untracked fast path: {name}")
+
+    monkeypatch.setattr(coordinator, "registry", _ExplodingRegistry())
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    assert status == 200
+    assert body == {"status": "fresh"}
+
+
+def test_deferred_reground_subagent_admit_neither_consumes_nor_attaches(
+    coordinator, client: _Client
+) -> None:
+    """R8: a request carrying agent_id (subagent identity) must neither
+    consume nor attach — the payload waits for the PARENT's next admit.
+    Covered on BOTH the untracked fast path (bare bytes preserved) and the
+    tracked seam (the subagent's own warn envelope carries no re-ground)."""
+    sid = _sid("dr-subagent")
+    _arm_reground(client, sid)
+    # Untracked subagent admit: today's bare fast-path bytes, flag intact.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "agent_id": "sub1", "path": "notes.txt"})
+    assert status == 200
+    assert body == {"status": "fresh"}
+    assert coordinator.has_compact_pending(sid) is True
+    # Tracked subagent admit: the subagent's first read of the existing
+    # artifact yields the ordinary warn-stale envelope — but never the
+    # re-grounding block, and the flag survives.
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "agent_id": "sub1", "path": "CLAUDE.md",
+         "content_hash": _hash("rg1")})
+    assert status == 200
+    assert "Post-compaction re-grounding" not in (_reground_text_of(body2) or "")
+    assert coordinator.has_compact_pending(sid) is True
+    # The parent's next admit delivers (rebuilt from CURRENT registry truth
+    # per KTD2 — the subagent's grants above now render as their own group).
+    status, body3 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    delivered = _reground_text_of(body3) or ""
+    assert delivered.startswith("Post-compaction re-grounding (agent-coherence):")
+    assert "Subagent sub1:" in delivered
+    assert coordinator.has_compact_pending(sid) is False
+
+
+def test_subagent_stop_keeps_flag_parent_stop_expires(
+    coordinator, client: _Client
+) -> None:
+    """R2 lifetime: SubagentStop (agent_id present) leaves the flag
+    untouched — the parent turn is still in flight; a parent Stop (no
+    agent_id) expires it, so the next admit is clean."""
+    sid = _sid("dr-stop")
+    _arm_reground(client, sid)
+    status, _ = client.post(
+        "/hooks/session-stop", {"session_id": sid, "agent_id": "sub1"})
+    assert status == 200
+    assert coordinator.has_compact_pending(sid) is True
+    status, _ = client.post("/hooks/session-stop", {"session_id": sid})
+    assert status == 200
+    assert coordinator.has_compact_pending(sid) is False
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body == {"status": "fresh", "version": 1}
+
+
+def test_second_session_start_re_marks_idempotently_one_delivery(
+    coordinator, client: _Client
+) -> None:
+    """A second compaction before delivery re-stamps the same flag: still
+    exactly one delivery, and the admit after it is clean."""
+    sid = _sid("dr-remark")
+    _arm_reground(client, sid)
+    status, body = client.post("/hooks/session-start", {"session_id": sid})
+    assert status == 200
+    armed_text = body["hookSpecificOutput"]["additionalContext"]
+    status, first = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert _reground_text_of(first) == armed_text
+    status, second = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert second == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_pre_edit_delivers(
+    coordinator, client: _Client
+) -> None:
+    """Pre-edit attach point: a pending flag rides the {ok: true} admit as
+    a new allow envelope; the next pre-edit is today's bare shape. KTD2
+    rebuild-at-delivery: this pre-edit acquires EXCLUSIVE BEFORE the attach
+    seam runs, so the delivered prose renders the CURRENT grant state —
+    EXCLUSIVE — not the SHARED snapshot the arming call saw."""
+    sid = _sid("dr-edit")
+    _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "CLAUDE.md"})
+    assert status == 200
+    assert body["ok"] is True
+    delivered = _reground_text_of(body) or ""
+    assert delivered.startswith("Post-compaction re-grounding (agent-coherence):")
+    assert (
+        "At compaction you held EXCLUSIVE on CLAUDE.md (v1) — re-acquire "
+        "before writing." in delivered
+    )
+    status, body2 = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "CLAUDE.md"})
+    assert status == 200
+    assert body2 == {"ok": True}
+
+
+def test_deferred_reground_pre_bash_delivers_untracked_and_tracked(
+    coordinator, client: _Client
+) -> None:
+    """Pre-bash attach point: delivery works from BOTH the zero-tracked-
+    paths fast path and the tracked work path."""
+    sid = _sid("dr-bash")
+    armed_text = _arm_reground(client, sid)
+    # Fast path: no tracked paths detected in the command.
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "echo hello"})
+    assert status == 200
+    assert body["status"] == "fresh"
+    assert _reground_text_of(body) == armed_text
+    status, bare = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "echo hello"})
+    assert status == 200
+    assert bare == {"status": "fresh"}
+    # Tracked path: session is fresh on CLAUDE.md; the flag re-armed.
+    coordinator.mark_compact_pending(sid)
+    status, body2 = client.post(
+        "/hooks/pre-bash", {"session_id": sid, "command": "cat CLAUDE.md"})
+    assert status == 200
+    assert body2["status"] == "fresh"
+    assert _reground_text_of(body2) == armed_text
+
+
+def test_deferred_reground_pre_grep_delivers_tracked_and_empty_root(
+    coordinator, client: _Client
+) -> None:
+    """Pre-grep attach point: delivery works from BOTH the tracked work
+    path (artifacts under the search root) and the zero-tracked-artifacts
+    fast path."""
+    sid = _sid("dr-grep")
+    armed_text = _arm_reground(client, sid)
+    status, body = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": ""})
+    assert status == 200
+    assert body["status"] == "fresh"
+    assert _reground_text_of(body) == armed_text
+    # Fast path: a root with no registry-known artifacts.
+    coordinator.mark_compact_pending(sid)
+    status, body2 = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": "src/empty"})
+    assert status == 200
+    assert body2["status"] == "fresh"
+    assert _reground_text_of(body2) == armed_text
+    status, bare = client.post(
+        "/hooks/pre-grep", {"session_id": sid, "search_root": "src/empty"})
+    assert status == 200
+    assert bare == {"status": "fresh"}
+
+
+def test_deferred_reground_concurrent_parent_admits_exactly_one_delivery(
+    coordinator, client: _Client
+) -> None:
+    """R2 at-most-once under contention: 6 concurrent qualifying parent
+    admits race one pending flag; EXACTLY ONE response carries the
+    re-grounding block (the atomic pop at the attach seam)."""
+    sid = _sid("dr-race")
+    _arm_reground(client, sid)
+    barrier = threading.Barrier(6)
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    def admit(i: int) -> None:
+        barrier.wait()
+        # Distinct tracked paths so first-observation seeding never contends
+        # on one artifact row; every response is a qualifying fresh admit.
+        _, body = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": f"docs/plans/p{i}.md",
+             "content_hash": _hash(f"p{i}")})
+        with results_lock:
+            results.append(body)
+
+    threads = [threading.Thread(target=admit, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    delivered = [
+        body for body in results
+        if "Post-compaction re-grounding" in (_reground_text_of(body) or "")
+    ]
+    assert len(delivered) == 1, (
+        f"expected exactly one re-grounding delivery, got {len(delivered)} "
+        f"of {len(results)} admits"
+    )
+    assert coordinator.has_compact_pending(sid) is False
+
+
+def test_deferred_reground_rebuild_failure_forfeits_without_breaking_admit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """KTD2 rebuild-at-delivery can fail AFTER the claim won the pop. The
+    guard in ``_claim_reground_context`` forfeits that delivery (R2 permits
+    at-most-once → zero) instead of turning an otherwise-successful admit
+    into an internal-error body: the admit answers its ordinary bare shape,
+    the flag stays consumed, and the forfeit is logged."""
+    import logging
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    caplog.set_level(logging.ERROR, logger=_CSRV)
+    sid = _sid("dr-rebuild-fail")
+
+    # Explode on the DELIVERY rebuild only — the arming session-start is
+    # call #1 and must succeed, or the flag would never be set at all.
+    real_build = mod._build_session_start_context
+    calls = {"n": 0}
+
+    def build_then_explode(coord, sid_arg, *, abort=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_build(coord, sid_arg, abort=abort)
+        raise RuntimeError("registry exploded mid-rebuild")
+
+    monkeypatch.setattr(mod, "_build_session_start_context", build_then_explode)
+    _arm_reground(client, sid)
+    assert calls["n"] == 1
+    caplog.clear()
+
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    # The admit is NOT broken: today's bare fresh shape, not the
+    # {ok: false, reason: "internal: ..."} body _run_or_degrade emits when
+    # work() raises.
+    assert body == {"status": "fresh", "version": 1}
+    assert calls["n"] == 2
+    # The claim won the pop before the rebuild raised, so the delivery is
+    # forfeited rather than re-queued.
+    assert coordinator.has_compact_pending(sid) is False
+    assert "delivery forfeited" in caplog.text
+
+    status, body2 = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert body2 == {"status": "fresh", "version": 1}
+
+
+def test_deferred_reground_fast_path_slow_rebuild_degrades_to_bare_base(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fast-path delivery rebuild walks the registry, so it runs under
+    the handler watchdog: a slow/contended rebuild must not hang the hook
+    past its budget. On timeout the response is the bare ``base`` —
+    byte-identical to the no-flag fast path — the request raises nothing,
+    and the degradation is observable via the /status counter."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("dr-fast-slow")
+    _arm_reground(client, sid)
+
+    def slow_build(coord, sid_arg, *, abort=None):
+        time.sleep(1.0)
+        return ("never reaches the client", True)
+
+    monkeypatch.setattr(mod, "_build_session_start_context", slow_build)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 0.1)
+
+    before = coordinator._watchdog_timeouts_total
+    started = time.monotonic()
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "notes.txt"})
+    elapsed = time.monotonic() - started
+    assert status == 200
+    assert body == {"status": "fresh"}
+    assert elapsed < 0.8, (
+        f"fast-path delivery waited {elapsed:.2f}s on a 1.0s rebuild; the "
+        f"watchdog did not cut it"
+    )
+    assert coordinator._watchdog_timeouts_total == before + 1
+
+
+def test_deferred_reground_preset_abort_does_not_consume_flag(
+    coordinator, client: _Client
+) -> None:
+    """A6: the abort check runs BEFORE the pop, so a request already known
+    doomed leaves the flag pending — the delivery survives for the next
+    live admit instead of being burned by a response nobody will read."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("dr-abort-preset")
+    armed_text = _arm_reground(client, sid)
+
+    doomed = threading.Event()
+    doomed.set()
+    base = {"status": "fresh"}
+    out = mod._deliver_pending_reground(
+        coordinator, sid, {"session_id": sid}, base, abort=doomed
+    )
+    # Same object back — the qualifying admit body stays byte-identical.
+    assert out is base
+    assert coordinator.has_compact_pending(sid) is True
+
+    # The next live admit still delivers.
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert _reground_text_of(body) == armed_text
+    assert coordinator.has_compact_pending(sid) is False

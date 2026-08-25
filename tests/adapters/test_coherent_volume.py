@@ -633,8 +633,9 @@ def test_write_cas_deny_raises_in_both_on_error_modes(
             assert vol.read("data/shared.txt") == b"v1"
             # Force expected_version far above current → corruption body
             # ({ok:false, reason:commit_cas_corruption...}) which must raise.
-            # (bytes, version, stale_denied) — not stale, so no reacquire.
-            vol._read_with_version = lambda rel: (b"v1", 999, False)  # type: ignore[assignment]
+            # (bytes, version, stale_denied, generation) — not stale, so no
+            # reacquire.
+            vol._read_with_version = lambda rel: (b"v1", 999, False, 0)  # type: ignore[assignment]
             with pytest.raises(CoherenceError):
                 vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
             assert not vol.is_degraded, (
@@ -926,7 +927,7 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
 
         # Confirm B really is in the sticky-deny state BEFORE write_cas: a bare
         # version-aware read reports stale_denied=True (INVALID, not re-granted).
-        _bytes, _ver, stale_denied = vol_b._read_with_version("data/shared.txt")
+        _bytes, _ver, stale_denied, _gen = vol_b._read_with_version("data/shared.txt")
         assert stale_denied is True, "precondition: B must be a sticky strict-deny"
 
         seen: list[bytes] = []
@@ -968,9 +969,10 @@ def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
         calls = {"n": 0}
 
         def always_denied(rel: str):
-            # (bytes, version, stale_denied) — every comparand read is a deny.
+            # (bytes, version, stale_denied, generation) — every comparand read
+            # is a deny (a deny carries no confirmed generation).
             calls["n"] += 1
-            return (b"v1", 1, True)
+            return (b"v1", 1, True, None)
 
         vol._read_with_version = always_denied  # type: ignore[assignment]
 

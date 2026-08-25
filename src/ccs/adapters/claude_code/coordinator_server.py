@@ -13,6 +13,7 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /hooks/post-edit-cas`` — OCC commit (Unit 6); version-checked CAS,
   NO pre-edit acquire (the OCC writer stays S/I); fail-closed degrade
 - ``POST /hooks/session-stop``  — KTD-11 release on end-of-turn
+- ``POST /hooks/session-start`` — SB-10 post-compaction re-grounding payload
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
@@ -62,12 +63,18 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
+from ccs.coordinator.registry_protocol import CheckpointMember
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CHECKPOINT_UNKNOWN_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
     SessionInvalidated,
@@ -75,6 +82,7 @@ from ccs.core.exceptions import (
     WatchdogAbandoned,
 )
 from ccs.core.states import MESIState
+from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
     ConflictDetail,
     DataPlaneDeferredRead,
@@ -84,6 +92,7 @@ from ccs.core.types import (
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
+    WorkspaceRestoreWrite,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,9 +251,12 @@ def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> st
     return f"claude-session-{session_id}"
 
 
-def monotonic_seconds() -> int:
-    """Tick basis for the coordinator. 1 tick = 1 second of wall clock."""
-    return int(time.time())
+# ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
+# workspace capture engine shares the coordinator's ONE wall-clock tick basis
+# without importing this server module. Re-exported here under the same name —
+# every existing import site (``lifecycle.py``'s lazy import, tests) is
+# unchanged. See the ``ccs.core.clock.monotonic_seconds`` docstring for the
+# wall-clock-not-monotonic rationale (the F1 sweep bug).
 
 
 # ----------------------------------------------------------------------
@@ -532,6 +544,7 @@ class CoordinatorHTTPServer:
             "post_edit_total": 0,
             "post_edit_cas_total": 0,
             "session_stop_total": 0,
+            "session_start_total": 0,
             "pre_bash_total": 0,
             "pre_grep_total": 0,
             "policy_track_total": 0,
@@ -612,6 +625,16 @@ class CoordinatorHTTPServer:
         # own state map.
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
+
+        # SB-10 (KTD5): compact-pending flags, keyed by session_id. Set by
+        # /hooks/session-start when it emitted a non-empty re-grounding
+        # payload; consumed by the next qualifying parent allow via
+        # _deliver_pending_reground (SB-10 U4) and expired on parent Stop.
+        # PROCESS-LOCAL on purpose — a restarted coordinator loses the flag,
+        # an accepted degradation (the restart is a bigger re-grounding event
+        # than a compaction).
+        self._compact_pending: set[str] = set()
+        self._compact_pending_lock = threading.Lock()
 
         # Wire storage + coordinator service.
         db_path = self.coordinator_root / ".coherence" / "state.db"
@@ -842,6 +865,35 @@ class CoordinatorHTTPServer:
         with self._agent_names_lock:
             return self._agent_names.get(agent_id)
 
+    def agents_for_session(self, session_id: str) -> list[tuple[UUID, str | None]]:
+        """SB-10 U2: the session's coherence agents as ``(agent_id,
+        subagent_name)`` pairs — the parent first (``subagent_name=None``,
+        derivable via uuid5 WITHOUT prior registration), then registered
+        subagents sorted by agent name (KTD8 group order).
+
+        Enumeration is a prefix scan of the in-memory ``_agent_names`` map
+        using the deterministic SB-25 naming scheme
+        (``claude-session-<sid>:subagent-<name>``) — neither registry has a
+        session→subagents accessor, and the adapter-owned map is the SB-25
+        source of truth for registration. Session ids are fixed-shape UUIDs
+        (A3 validation), so one session's prefix can never be a prefix of
+        another's. Restart-empty maps are an accepted degradation (KTD5):
+        subagents re-enter on their next hook call."""
+        subagent_prefix = f"claude-session-{session_id}:subagent-"
+        with self._agent_names_lock:
+            subagents = [
+                (agent_id, name[len(subagent_prefix):])
+                for agent_id, name in self._agent_names.items()
+                if name.startswith(subagent_prefix)
+            ]
+        # Same-prefix names sort identically by full name or by suffix; the
+        # suffix is what the Subagent group prefix renders.
+        subagents.sort(key=lambda pair: pair[1])
+        parent: list[tuple[UUID, str | None]] = [
+            (session_to_agent_id(session_id), None)
+        ]
+        return parent + subagents
+
     def increment_endpoint_counter(self, name: str) -> None:
         """KTD-J (Unit 8): bump a per-endpoint counter. Names match the
         keys in ``_endpoint_counters`` (e.g., ``pre_read_total``). Unknown
@@ -1053,6 +1105,46 @@ class CoordinatorHTTPServer:
                 self._stale_warned_pairs.remove(pair)
                 return True
             return False
+
+    def mark_compact_pending(self, session_id: str) -> None:
+        """SB-10 (KTD5): flag the session for deferred re-grounding delivery.
+        Set only by /hooks/session-start after it built a NON-empty payload —
+        an empty session must leave the deferred path unarmed (R5).
+        Idempotent: a second compaction before delivery simply re-marks."""
+        with self._compact_pending_lock:
+            self._compact_pending.add(session_id)
+
+    def consume_compact_pending(self, session_id: str) -> bool:
+        """SB-10 (KTD5): ATOMIC test-and-clear of the compact-pending flag.
+
+        The deferred-delivery unit's at-most-once contract (R2) hangs on
+        this primitive: two concurrent qualifying admits must never both
+        see True, so the check and the clear happen under one lock hold —
+        a separate has/clear pair would reopen the TOCTOU window."""
+        with self._compact_pending_lock:
+            if session_id in self._compact_pending:
+                self._compact_pending.remove(session_id)
+                return True
+            return False
+
+    def has_compact_pending(self, session_id: str) -> bool:
+        """SB-10 U4 (KTD6): NON-consuming advisory peek at the flag — the
+        cheap process-local dict lookup the admit handlers hoist above
+        their untracked fast-path exits, so no-flag traffic keeps today's
+        exact response bytes and never touches the registry. Advisory
+        only: the answer can go stale the instant the lock is released;
+        the authoritative at-most-once decision stays with the locked
+        test-and-clear in :meth:`consume_compact_pending` at the
+        allow-attach seam."""
+        with self._compact_pending_lock:
+            return session_id in self._compact_pending
+
+    def expire_compact_pending(self, session_id: str) -> None:
+        """SB-10 (KTD5): drop an unconsumed flag without delivering. Wired
+        to the parent Stop by the deferred-delivery unit (R2: the flag's
+        lifetime ends at turn end; coordinator restart clears implicitly)."""
+        with self._compact_pending_lock:
+            self._compact_pending.discard(session_id)
 
     def run_with_watchdog(
         self, fn: Callable[[], Any], abort: threading.Event | None = None
@@ -1414,6 +1506,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     session_id = body.get("session_id")
     path = body.get("path", "")
     content_hash = body.get("content_hash") or None
+    # Effect-gate opt-in: a truthy ``want_owner_generation`` asks the fresh and
+    # warn-stale responses to carry the pair-consistent
+    # ``(version, owner_generation)``. Absent (every shipped client), the
+    # response shapes below are byte-unchanged.
+    want_generation = bool(body.get("want_owner_generation"))
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -1432,9 +1529,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
-    # touching SQLite (R8 false-positive budget protection).
+    # touching SQLite (R8 false-positive budget protection). SB-10 U4
+    # (KTD6): the advisory compact-pending peek — a process-local dict
+    # lookup, never a registry touch — is hoisted above this exit so a
+    # pending re-grounding payload still reaches an untracked admit; with
+    # no flag pending, response bytes and the no-registry behavior are
+    # exactly today's.
     if not coordinator.policy.is_tracked(path):
-        req._json(200, {"status": "fresh"})
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -1460,8 +1562,18 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # Unit 6: surface the version so an OCC writer can source
             # ``expected_version`` for a later ``post-edit-cas`` (additive —
             # status-based clients ignore it). First observation seeds v1.
-            seeded = coordinator.registry.get_artifact(artifact_id)
-            return {"status": "fresh", "version": seeded.version if seeded else 1}
+            seeded_pair = coordinator.registry.get_artifact_and_generation(
+                artifact_id
+            )
+            seeded_version = seeded_pair[0].version if seeded_pair else 1
+            first: dict[str, Any] = {"status": "fresh", "version": seeded_version}
+            # The generation rides the SAME snapshot as the version it is
+            # reported beside (opt-in only, so shipped shapes stay
+            # byte-identical) — never a second read a peer commit could
+            # overtake.
+            if want_generation and seeded_pair is not None:
+                first["owner_generation"] = seeded_pair[1]
+            return first
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the
@@ -1470,7 +1582,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if coordinator.consume_stale_marker(agent_id, artifact_id):
             coordinator.increment_stale_warning_reread()
 
-        artifact = coordinator.registry.get_artifact(artifact_id)
+        # ONE pair-atomic read backs BOTH the branch classification (version,
+        # content hash) and the ownership generation reported alongside it, so
+        # the comparand pair a caller receives is the very snapshot this
+        # response was classified from. Reading them separately is what let a
+        # peer commit slip between the two and hand back a version newer than
+        # the bytes and grant the response answers for.
+        artifact_pair = coordinator.registry.get_artifact_and_generation(artifact_id)
+        artifact = artifact_pair[0] if artifact_pair else None
+        owner_generation = artifact_pair[1] if artifact_pair else None
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
         if agent_state is not None and agent_state != MESIState.INVALID:
@@ -1547,6 +1667,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                             source="pre_read_shared_hash_deny",
                         )
                 fresh["hash_differs"] = True
+            if want_generation and owner_generation is not None:
+                fresh["owner_generation"] = owner_generation
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
@@ -1651,6 +1773,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             trigger="post_stale_read", tick=now, content_hash=content_hash,
         )
         resp = _payloads.build_stale_response(summary)
+        if want_generation and owner_generation is not None:
+            # The effect gate re-validates through THIS path after a sweep
+            # reclaim (the zombie's re-read is warn-stale with the version
+            # unchanged) — the attached generation is what lets it see the epoch
+            # moved even though the version did not. It shares the snapshot that
+            # produced summary.current_version, so the pair cannot disagree.
+            resp["owner_generation"] = owner_generation
         # KTD-J (Unit 8): bump the stale-warning emission counter +
         # mark the pair so a follow-up pre-read counts as a re-read.
         coordinator.increment_stale_warning_emitted()
@@ -1685,16 +1814,30 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # Spread work()'s payload so additive fresh-path keys
                 # (Unit 6 ``version``) survive the notice attachment —
                 # rebuilding a literal dict here drops them.
-                return {
+                result = {
                     **result,
                     "hookSpecificOutput": _payloads.emit_allow(
                         source="pre_read_fresh_with_notice",
                         additional_context=notice_text,
                     ),
                 }
-        return result
+        # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
+        # deny decision inside work() — a strict deny returns untouched and
+        # keeps the flag pending — and AFTER the notice drain above, so
+        # notices render before the re-grounding block. The abort token
+        # rides along so a timed-out request never consumes the
+        # compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, result, abort=abort
+        )
 
-    _run_or_degrade(req, coordinator, work_with_notice_surfacing)
+    # A6: pre-read never threaded an abort into work() — its SHARED
+    # re-grants are idempotent, so a late one is harmless. The token is
+    # introduced here solely for the re-grounding delivery, whose pop is
+    # NOT idempotent: a zombie that outlives the degraded response must not
+    # claim the flag out from under the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_notice_surfacing, abort=abort)
 
 
 def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -1713,8 +1856,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
+    # see the pre-read twin for the no-flag byte/behavior guarantee.
     if not coordinator.policy.is_tracked(path):
-        req._json(200, {"ok": True})
+        _fast_path_json(req, coordinator, session_id, body, {"ok": True})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -1845,6 +1990,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             }
         return {"ok": True}
 
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after every deny decision
+        # inside work(); notices are already merged into the result's
+        # additionalContext, so the re-grounding block always lands last.
+        # The abort token rides along so a timed-out request never
+        # consumes the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
+
     # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
     # On watchdog timeout, return the ok-shape degraded envelope so a
     # client doing result.get("ok") sees True rather than None.
@@ -1852,7 +2007,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
     # invalidating peers) the agent never saw.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(req, coordinator, work_with_reground, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2155,6 +2310,16 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(200, {"ok": True, "released_artifacts": []})
         return
 
+    # SB-10 U4 (R2): the deferred re-grounding flag lives at most one
+    # parent turn. A PARENT Stop — the wire carries NO agent_id field;
+    # SubagentStop always carries one (SB-25) — ends that turn, so an
+    # undelivered flag expires here instead of leaking into a later turn.
+    # A SubagentStop (or a malformed subagent id, which also presents the
+    # field and returned above) leaves the flag untouched: the parent turn
+    # is still in flight and its next admit may yet deliver.
+    if not has_subagent_id_field(body):
+        coordinator.expire_compact_pending(session_id)
+
     agent_id = coordinator.register_session(session_id, subagent_id)
     now = monotonic_seconds()
 
@@ -2219,6 +2384,92 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # aborts before revoking a grant the registry handed to the next session.
     abort = threading.Event()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+
+
+def _handle_session_start(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /hooks/session-start — SB-10 U2 post-compaction re-grounding.
+
+    Returns the re-grounding ``additionalContext`` payload for a compacted
+    session and arms the process-local compact-pending flag for deferred
+    delivery on the next qualifying admit (consumed by
+    ``_deliver_pending_reground`` at the allow-attach seam, SB-10 U4).
+    The ``source == "compact"`` gate lives client-side (U3, the
+    hook-client ladder): this endpoint trusts its caller and treats every
+    request as a compact event (R1).
+
+    Shape notes:
+    - Empty session → literal ``{}`` and NO flag (R5): the deferred path
+      must stay unarmed when there is nothing to deliver.
+    - Optional ``agent_id`` resolves per SB-25 like the read paths, but the
+      payload and the flag are SESSION-scoped either way — the parent agent
+      id is derivable without prior registration, and the payload always
+      covers the parent plus every registered subagent.
+    - No heartbeat and no observation recording: the endpoint is read-only
+      toward the registry (R6 — its own snapshot must never count as the
+      session "seeing" bytes; KTD-2 liveness resumes with the session's
+      next admit).
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    subagent_id = read_subagent_id(body)
+
+    # R8 breadcrumb precondition: sample seen-ness BEFORE registration
+    # erases it — registration below makes this session "seen" for every
+    # later request, which is exactly what keeps the breadcrumb a
+    # once-per-rotation signal rather than log spam.
+    never_seen = coordinator.agent_name_for(session_to_agent_id(session_id)) is None
+    coordinator.register_session(session_id)
+    if subagent_id is not None:
+        coordinator.register_session(session_id, subagent_id)
+
+    abort = threading.Event()
+
+    def work() -> dict:
+        text, workspace_has_state = _build_session_start_context(
+            coordinator, session_id, abort=abort
+        )
+        if never_seen and workspace_has_state:
+            # R8: a compact event for a session this coordinator never saw,
+            # while the workspace demonstrably holds coordination state,
+            # is the signature of a silent session-id rotation (or a
+            # coordinator restart) — debug-level so it is an observable,
+            # not an alarm.
+            logger.debug(
+                "session-start for never-seen session %s while the workspace "
+                "holds coordination state — possible session-id rotation or "
+                "coordinator restart (SB-10 R8)",
+                session_id,
+            )
+        if text is None:
+            return {}
+        # Non-empty payload → arm deferred delivery (KTD5). Ordering matters:
+        # the flag is set only AFTER a successful build, so a degraded or
+        # failed request leaves the deferred path unarmed.
+        coordinator.mark_compact_pending(session_id)
+        return {
+            "hookSpecificOutput": _payloads.emit_session_start(
+                additional_context=text
+            )
+        }
+
+    # A6 pattern: abort threads into the builder's abort_guard so a
+    # watchdog-timed-out request fails closed at the registry lock instead
+    # of arming the flag after the client already saw the degraded `{}`.
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_SESSION_START_DEGRADED_RESPONSE,
+        abort=abort,
+    )
 
 
 def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2365,9 +2616,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
+    # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
+    # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
     tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
     if not tracked_paths:
-        req._json(200, {"status": "fresh"})
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2498,7 +2751,22 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             resp["status"] = "fresh"
         return resp
 
-    _run_or_degrade(req, coordinator, work)
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
+        # decision inside work(); notices/stale prose render first. The
+        # abort token rides along so a timed-out request never consumes
+        # the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
+
+    # A6: pre-bash never threaded an abort into work() — its SHARED
+    # re-grants are idempotent. The token is introduced here solely for the
+    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # outlives the degraded response must not claim the flag out from under
+    # the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
 
 
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2533,9 +2801,11 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             return
 
     # Find registry-known tracked artifacts under the search root.
+    # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
+    # artifacts exit so a pending payload still reaches this admit.
     tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
     if not tracked_paths:
-        req._json(200, {"status": "fresh"})
+        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -2641,7 +2911,22 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             resp["status"] = "fresh"
         return resp
 
-    _run_or_degrade(req, coordinator, work)
+    def work_with_reground() -> dict:
+        # SB-10 U4 (KTD6): allow-attach seam — after the strict-deny
+        # decision inside work(); notices/stale prose render first. The
+        # abort token rides along so a timed-out request never consumes
+        # the compact-pending flag.
+        return _deliver_pending_reground(
+            coordinator, session_id, body, work(), abort=abort
+        )
+
+    # A6: pre-grep never threaded an abort into work() — its SHARED
+    # re-grants are idempotent. The token is introduced here solely for the
+    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # outlives the degraded response must not claim the flag out from under
+    # the next live admit.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
 
 
 # ----------------------------------------------------------------------
@@ -3175,6 +3460,617 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
 
 
+# ----------------------------------------------------------------------
+# Workspace-checkpoint endpoints (WV plan Unit 3 — R1/R2/R8)
+# ----------------------------------------------------------------------
+#
+# Registered in the central ``_ROUTES`` table so they ride the SAME
+# ``verify_bearer`` + ``verify_host`` seam as every other endpoint (no parallel
+# router). The OWNER is derived SERVER-SIDE from the authenticated
+# ``session_id`` (the R9/R13 boundary lock — a client-supplied ``owner`` field
+# is ignored), and the ``checkpoint_id`` is minted SERVER-SIDE by the service.
+# The member rows themselves are CLIENT-captured facts (tokens, fingerprints,
+# timestamps — the capture engine runs client-side against ITS substrates, the
+# coordinator never sees the bytes); the boundary validates their SHAPE
+# fail-closed (paths, 64-hex fingerprints, bounded opaque tokens, closed tier
+# vocabularies) so a hostile client cannot store unbounded or malformed rows.
+
+MAX_CHECKPOINT_MEMBERS = MAX_SESSION_READ_SET_PATHS
+"""Cap on member rows per ``POST /workspace/checkpoint`` — the checkpoint
+manifest analog of the session read-set cap (same defense-in-depth posture)."""
+
+MAX_CHECKPOINT_NAME_LEN = 256
+"""Cap on the checkpoint name (an operator label, not content)."""
+
+MAX_NATIVE_TOKEN_LEN = 256
+"""Cap on one member's opaque restore pointer — mirrors the never-ship-a-store
+opaque-text bound (``ccs.core.substrate._MAX_OPAQUE_TEXT_LEN``): a token longer
+than this is a content-proportional shadow wearing a token's name."""
+
+_CHECKPOINT_TIER_VALUES: frozenset[str] = frozenset(t.value for t in RestoreTier)
+_CHECKPOINT_ARBITRATION_VALUES: frozenset[str] = frozenset(
+    t.value for t in ArbitrationTier
+)
+
+_CHECKPOINT_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "checkpoint_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /workspace/checkpoint`` (the
+``_OCC_DEGRADED_RESPONSE`` posture): a watchdog-timed-out registration must
+NOT read as success — the manifest may or may not have landed, and the abort
+Event threaded into the service's ``abort_guard`` fails the late write closed
+at the registry lock (the A6 session-commit lesson)."""
+
+
+def _typed_reason_response(exc: BaseException) -> dict:
+    """The stable-reason reject envelope for the workspace routes.
+
+    A typed exception's identity-stable ``reason`` token goes on the wire (the
+    ``/workspace/restore/register`` house pattern — clients classify by token
+    identity, never by substring-matching prose), and the human prose rides in
+    a separate ``detail`` field so nothing is lost. An exception carrying no
+    ``reason`` falls back to its prose as before.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        return {"ok": False, "reason": reason, "detail": str(exc)}
+    return {"ok": False, "reason": str(exc)}
+
+
+def _unknown_checkpoint_response(exc: KeyError) -> dict:
+    """The registry's unknown-checkpoint/member ``KeyError`` mapped to the SAME
+    stable token ``/workspace/restore/register`` emits for that failure class
+    (:data:`~ccs.core.exceptions.CHECKPOINT_UNKNOWN_REASON`), prose preserved
+    in ``detail`` (``KeyError`` str() wraps its arg in quotes, so unwrap)."""
+    detail = str(exc.args[0]) if exc.args else str(exc)
+    return {"ok": False, "reason": CHECKPOINT_UNKNOWN_REASON, "detail": detail}
+
+
+def _parse_checkpoint_member(item: object) -> "CheckpointMember | str":
+    """Validate ONE wire member object into a :class:`CheckpointMember`, or
+    return the boundary-rejection reason string (fail-closed shape gate)."""
+    if not isinstance(item, dict):
+        return "each member must be a JSON object"
+    member_path = item.get("member_path", "")
+    path_err = validate_path(member_path)
+    if path_err:
+        return f"member_path: {path_err}"
+    native_token = item.get("native_token")
+    if native_token is not None and (
+        not isinstance(native_token, str)
+        or not native_token
+        or len(native_token) > MAX_NATIVE_TOKEN_LEN
+    ):
+        return (
+            f"native_token must be null or a non-empty string of at most "
+            f"{MAX_NATIVE_TOKEN_LEN} chars"
+        )
+    fingerprint = item.get("fingerprint")
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint)
+    ):
+        return "fingerprint must be null or a 64-hex sha-256 digest"
+    captured_at = item.get("captured_at")
+    if isinstance(captured_at, bool) or not isinstance(captured_at, (int, float)):
+        return "captured_at must be a number (monotonic_seconds basis)"
+    absent = item.get("absent", False)
+    dirty = item.get("dirty_during_window", False)
+    if not isinstance(absent, bool) or not isinstance(dirty, bool):
+        return "absent and dirty_during_window must be booleans"
+    arbitration_tier = item.get("arbitration_tier", ArbitrationTier.NO_ARBITER.value)
+    if arbitration_tier not in _CHECKPOINT_ARBITRATION_VALUES:
+        return (
+            f"arbitration_tier must be one of "
+            f"{sorted(_CHECKPOINT_ARBITRATION_VALUES)}"
+        )
+    restore_tier = item.get("restore_tier", RestoreTier.FORWARD_ONLY.value)
+    if restore_tier not in _CHECKPOINT_TIER_VALUES:
+        return f"restore_tier must be one of {sorted(_CHECKPOINT_TIER_VALUES)}"
+    return CheckpointMember(
+        member_path=member_path,
+        artifact_id=None,
+        native_token=native_token,
+        fingerprint=fingerprint,
+        captured_at=float(captured_at),
+        absent=absent,
+        dirty_during_window=dirty,
+        arbitration_tier=arbitration_tier,
+        restore_tier=restore_tier,
+    )
+
+
+def _handle_workspace_checkpoint(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/checkpoint — persist one captured checkpoint manifest.
+
+    Request: ``{session_id, name, window_min, window_max, members: [{
+    member_path, native_token?, fingerprint?, captured_at, absent?,
+    dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
+
+    The OWNER is derived from the authenticated ``session_id`` (R9/R13); the
+    ``checkpoint_id`` is minted server-side. The registration is ONE registry
+    transaction (header + owner + every member — the Unit-2 API), so a typed
+    failure means NO partial manifest.
+
+    NOT in ``_MIGRATION_REJECTED_ROUTES`` deliberately: a checkpoint create is
+    durable metadata with no version bump and no MESI grant — like the policy
+    mutations, it either lands durably (surviving the restart) or fails typed;
+    there is no stranded-write hazard for the drain gate to prevent.
+
+    Responses:
+      - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
+        coordinator_epoch}``
+      - validation / registry rejection → ``{ok: false, reason}``; a typed
+        ``CoherenceError`` carries its identity-stable ``reason`` token with
+        the prose in ``detail``
+      - watchdog degrade → ``{ok: false, degraded: true, reason:
+        "checkpoint_unconfirmed"}`` (fail-closed; see
+        :data:`_CHECKPOINT_DEGRADED_RESPONSE`)
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    name = body.get("name")
+    window_min = body.get("window_min")
+    window_max = body.get("window_max")
+    members = body.get("members")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    if not isinstance(name, str) or not name.strip():
+        req._json(400, {"error": "name must be a non-empty string"})
+        return
+    if len(name) > MAX_CHECKPOINT_NAME_LEN:
+        req._json(400, {"error": f"name exceeds {MAX_CHECKPOINT_NAME_LEN} chars"})
+        return
+    for label, value in (("window_min", window_min), ("window_max", window_max)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            req._json(400, {"error": f"{label} must be a number"})
+            return
+    if window_max < window_min:
+        req._json(400, {"error": "window_max must be >= window_min"})
+        return
+    if not isinstance(members, list) or not members:
+        req._json(400, {"error": "members must be a non-empty list of member objects"})
+        return
+    if len(members) > MAX_CHECKPOINT_MEMBERS:
+        req._json(400, {"error": f"members exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
+        return
+    member_rows: list[CheckpointMember] = []
+    for item in members:
+        parsed = _parse_checkpoint_member(item)
+        if isinstance(parsed, str):
+            req._json(400, {"error": parsed})
+            return
+        member_rows.append(parsed)
+    # A duplicate member path would reject registry-side mid-transaction;
+    # reject it loud at the boundary instead (mirror the commit_all guard).
+    paths = [m.member_path for m in member_rows]
+    if len(set(paths)) != len(paths):
+        req._json(400, {"error": "members contains duplicate member_path values"})
+        return
+
+    owner = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            record = coordinator.service.create_workspace_checkpoint(
+                name=name,
+                owner=owner,
+                members=member_rows,
+                window_min=float(window_min),
+                window_max=float(window_max),
+                issued_at_tick=now,
+                abort=abort,
+            )
+        except ValueError as exc:
+            # Service/registry validation (defense-in-depth behind the
+            # boundary checks above) — typed reject, nothing persisted.
+            return {"ok": False, "reason": str(exc)}
+        except CoherenceError as exc:
+            # Typed domain failure: identity-stable reason token on the wire
+            # (the restore/register posture), prose preserved in "detail".
+            return _typed_reason_response(exc)
+        return {
+            "ok": True,
+            "checkpoint_id": record.checkpoint_id,
+            "name": record.name,
+            "window_min": record.window_min,
+            "window_max": record.window_max,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    # Fail-closed degrade + abort threading (the A6 session-commit lesson):
+    # a timed-out registration must NOT read as success, and the abort Event
+    # fails the late write closed at the registry lock.
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_CHECKPOINT_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+def _render_checkpoint_member(member: CheckpointMember) -> dict:
+    return {
+        "member_path": member.member_path,
+        "native_token": member.native_token,
+        "fingerprint": member.fingerprint,
+        "captured_at": member.captured_at,
+        "absent": member.absent,
+        "dirty_during_window": member.dirty_during_window,
+        "arbitration_tier": member.arbitration_tier,
+        "restore_tier": member.restore_tier,
+        "pin_state": member.pin_state,
+        "restore_outcome": member.restore_outcome,
+        "deleted_at_restore": member.deleted_at_restore,
+    }
+
+
+def _handle_workspace_checkpoints(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """GET /workspace/checkpoints — list every checkpoint manifest.
+
+    Non-mutating observability (the /status posture): reads the registry's
+    checkpoint store directly and renders each header with its member rows —
+    including the honesty surfaces a consumer must see per member
+    (``restore_tier`` / ``arbitration_tier`` / ``absent`` /
+    ``dirty_during_window`` / ``pin_state``). Deterministic order:
+    ``(created_at, checkpoint_id)`` for headers, ``member_path`` for members
+    (the registry contract).
+
+    Degrades FAIL-CLOSED (``ok: false``) — a timed-out list must not read as
+    "no checkpoints exist".
+    """
+
+    def work() -> dict:
+        checkpoints = []
+        for record in coordinator.registry.list_checkpoints():
+            members = coordinator.registry.get_checkpoint_members(record.checkpoint_id)
+            checkpoints.append(
+                {
+                    "checkpoint_id": record.checkpoint_id,
+                    "name": record.name,
+                    "owner": str(record.owner),
+                    "created_at": record.created_at,
+                    "created_at_tick": record.created_at_tick,
+                    "window_min": record.window_min,
+                    "window_max": record.window_max,
+                    "restore_status": record.restore_status,
+                    "restore_updated_at": record.restore_updated_at,
+                    "pin_refcount": record.pin_refcount,
+                    "members": [_render_checkpoint_member(m) for m in members],
+                }
+            )
+        return {
+            "ok": True,
+            "checkpoints": checkpoints,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response={
+            "ok": False,
+            "degraded": True,
+            "reason": "checkpoint_list_unconfirmed",
+        },
+    )
+
+
+MAX_CHECKPOINT_ID_LEN = 128
+"""Cap on a wire ``checkpoint_id`` (server-minted uuid4 strings are 36 chars;
+the headroom absorbs future id shapes without admitting content-sized text)."""
+
+_RESTORE_PROGRESS_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_progress_unconfirmed",
+}
+"""Fail-closed degrade envelope for the restore progress routes (WV Unit 5):
+a watchdog-timed-out status/outcome write must NOT read as recorded — the
+abort Event threaded into the service's ``abort_guard`` fails the late write
+closed at the registry lock (the A6 lesson)."""
+
+_RESTORE_REGISTER_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "restore_registration_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /workspace/restore/register``: a
+timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
+posture — it is a version-bumping commit path), never as success."""
+
+
+def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
+    """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
+    if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+        return "checkpoint_id must be a non-empty string"
+    if len(checkpoint_id) > MAX_CHECKPOINT_ID_LEN:
+        return f"checkpoint_id exceeds {MAX_CHECKPOINT_ID_LEN} chars"
+    return None
+
+
+def _handle_workspace_restore_status(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/status — record checkpoint-level restore status.
+
+    Request: ``{session_id, checkpoint_id, status}`` where ``status`` is one of
+    the closed :data:`~ccs.core.exceptions.RESTORE_STATUSES` (boundary-gated
+    here AND service-validated — fail-closed twice; crash-resume classifies by
+    identity, so an unvetted string must never land). The remote half of the
+    restore engine's ``CheckpointRestoreStore`` seam (the capture path's
+    mirror: durable metadata write, abort-threaded, degrade fail-closed).
+
+    NOT in ``_MIGRATION_REJECTED_ROUTES``: like the checkpoint create, this is
+    durable metadata with no version bump — it lands durably or fails typed.
+    An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
+    detail}`` — the register route's stable token, matched by identity.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    status = body.get("status")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if status not in RESTORE_STATUSES:
+        req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
+        return
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_restore_status(
+                checkpoint_id, status, updated_at=float(now), abort=abort
+            )
+        except KeyError as exc:
+            # Unknown checkpoint — the register route's stable token, not prose.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "restore_status": status,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_member(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/member — record one member's terminal outcome.
+
+    Request: ``{session_id, checkpoint_id, member_path, restore_outcome,
+    deleted_at_restore?}``. ``restore_outcome`` is ``null`` (the explicit
+    reset) or one of the closed
+    :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (boundary-gated AND
+    service-validated); ``deleted_at_restore`` is the manifest-side delete
+    record — per the plan's registration split, delete legs register HERE,
+    never through ``commit_all`` (which has no delete semantics). An unknown
+    (checkpoint, member) pair answers ``{ok: false, reason:
+    "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    member_path = body.get("member_path")
+    restore_outcome = body.get("restore_outcome")
+    deleted_at_restore = body.get("deleted_at_restore")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    path_err = validate_path(member_path)
+    if path_err:
+        req._json(400, {"error": f"member_path: {path_err}"})
+        return
+    if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
+        req._json(
+            400,
+            {
+                "error": (
+                    f"restore_outcome must be null or one of "
+                    f"{sorted(RESTORE_MEMBER_OUTCOMES)}"
+                )
+            },
+        )
+        return
+    if deleted_at_restore is not None and (
+        isinstance(deleted_at_restore, bool)
+        or not isinstance(deleted_at_restore, (int, float))
+    ):
+        req._json(400, {"error": "deleted_at_restore must be null or a number"})
+        return
+
+    def work() -> dict:
+        try:
+            coordinator.service.set_workspace_checkpoint_member_restore(
+                checkpoint_id,
+                member_path,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=(
+                    float(deleted_at_restore) if deleted_at_restore is not None else None
+                ),
+                abort=abort,
+            )
+        except KeyError as exc:
+            # Unknown (checkpoint, member) pair — same stable token as the
+            # register route's unknown-checkpoint class; "detail" says which.
+            return _unknown_checkpoint_response(exc)
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "member_path": member_path,
+            "restore_outcome": restore_outcome,
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_PROGRESS_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
+def _handle_workspace_restore_register(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer
+) -> None:
+    """POST /workspace/restore/register — the Unit-5 coordinator registration.
+
+    Request: ``{session_id, checkpoint_id, writes: [{member_path,
+    fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
+    (fingerprints, never content bytes; the boundary enforces 64-hex). The
+    CONTROLLER identity derives from the authenticated ``session_id``
+    server-side (R9/R13), never a client field. One
+    ``register_workspace_restore`` call → at most one all-or-nothing
+    ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
+    (``commit_all`` never called, by contract).
+
+    Registered peers holding a member are invalidated ATOMICALLY by the
+    registry commit; peers learn through the protocol (their next read is
+    strict-denied), so — matching the post-edit-cas house pattern — the
+    response surfaces the invalidation COUNT rather than re-broadcasting
+    signals.
+
+    In ``_MIGRATION_REJECTED_ROUTES``: this is a version-bumping write
+    initiation (the post-edit-cas strand hazard applies mid-drain).
+
+    Responses:
+      - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
+        refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
+        from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
+        on ``status == "refused"`` — nothing mutated then, all-or-nothing)
+      - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
+      - watchdog degrade → fail-closed
+        :data:`_RESTORE_REGISTER_DEGRADED_RESPONSE`
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    checkpoint_id = body.get("checkpoint_id")
+    writes = body.get("writes")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    cid_err = _validate_checkpoint_id(checkpoint_id)
+    if cid_err:
+        req._json(400, {"error": cid_err})
+        return
+    if not isinstance(writes, list):
+        req._json(400, {"error": "writes must be a list of {member_path, fingerprint}"})
+        return
+    if len(writes) > MAX_CHECKPOINT_MEMBERS:
+        req._json(400, {"error": f"writes exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
+        return
+    entries: list[WorkspaceRestoreWrite] = []
+    seen_paths: set[str] = set()
+    for item in writes:
+        if not isinstance(item, dict):
+            req._json(400, {"error": "each write must be a JSON object"})
+            return
+        member_path = item.get("member_path", "")
+        path_err = validate_path(member_path)
+        if path_err:
+            req._json(400, {"error": f"member_path: {path_err}"})
+            return
+        fingerprint = item.get("fingerprint")
+        if not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint):
+            req._json(400, {"error": "fingerprint must be a 64-hex sha-256 digest"})
+            return
+        if member_path in seen_paths:
+            req._json(400, {"error": "writes contains duplicate member_path values"})
+            return
+        seen_paths.add(member_path)
+        entries.append(
+            WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
+        )
+
+    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    controller = _session_owner_from_request(coordinator, session_id)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        try:
+            result = coordinator.service.register_workspace_restore(
+                checkpoint_id=checkpoint_id,
+                controller=controller,
+                writes=entries,
+                issued_at_tick=now,
+                abort=abort,
+            )
+        except CheckpointUnknown as exc:
+            return {"ok": False, "reason": exc.reason}
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        except OccCallerTransientError:
+            # Retry-eligible: the controller is mid-transient (a peer's commit
+            # invalidated it between read and CAS). Byte-stable reason.
+            return {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+        except CoherenceError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {
+            "ok": True,
+            "checkpoint_id": checkpoint_id,
+            "status": result.status,
+            "detail": result.detail,
+            "versions": dict(result.versions),
+            "skipped": list(result.skipped),
+            "refused": {
+                path: conflict.reason for path, conflict in result.refused.items()
+            },
+            "invalidated": len(result.signals),
+            "coordinator_epoch": coordinator.registry.coordinator_epoch,
+        }
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req,
+        coordinator,
+        work,
+        degraded_response=_RESTORE_REGISTER_DEGRADED_RESPONSE,
+        abort=abort,
+    )
+
+
 def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """GET /status — drives the agent-coherence-status console script.
 
@@ -3500,6 +4396,11 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     # EXCLUSIVE acquire (the OCC writer stays S/I).
     ("POST", "/hooks/post-edit-cas"): _handle_post_edit_cas,
     ("POST", "/hooks/session-stop"): _handle_session_stop,
+    # SB-10 U2 — post-compaction re-grounding. Registered HERE so it rides
+    # the central verify_bearer + verify_host seam (KTD7: no operator
+    # header, no parallel router). Read-only toward the registry; stays out
+    # of _MIGRATION_REJECTED_ROUTES because it initiates no writes.
+    ("POST", "/hooks/session-start"): _handle_session_start,
     # v0.1.1 KTD-N — H4 mitigation: catch model routing-around-via-Bash/Grep
     # to bypass the Read-only stale-read warning. Per the v0.2 Phase 0
     # falsifiability experiment, the model retries Read 2-5 times then
@@ -3516,6 +4417,18 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/commit"): _handle_session_commit,
     ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
+    # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
+    # ride the central verify_bearer + verify_host seam like every route. The
+    # POST threads a watchdog abort Event into the service's abort_guard (the
+    # A6 session-commit lesson: every new mutating route threads abort).
+    ("POST", "/workspace/checkpoint"): _handle_workspace_checkpoint,
+    ("GET", "/workspace/checkpoints"): _handle_workspace_checkpoints,
+    # WV plan Unit 5 — restore progress + registration endpoints (the remote
+    # half of the restore engine's CheckpointRestoreStore seam). Every
+    # mutating handler threads a watchdog abort Event (the A6 lesson).
+    ("POST", "/workspace/restore/status"): _handle_workspace_restore_status,
+    ("POST", "/workspace/restore/member"): _handle_workspace_restore_member,
+    ("POST", "/workspace/restore/register"): _handle_workspace_restore_register,
     ("GET", "/status"): _handle_status,
     ("POST", "/admin/prepare-for-migration"): _handle_prepare_for_migration,
 }
@@ -3545,6 +4458,12 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # session.commit_all is the batch OCC write — same strand hazard as
     # /session/commit, multiplied across the write-set. Reject it draining.
     ("POST", "/session/commit_all"),
+    # WV Unit 5: the restore registration is a version-bumping write
+    # initiation (its commit_all rides the same strand hazard). The restore
+    # PROGRESS routes (/workspace/restore/status, /workspace/restore/member)
+    # stay out: durable metadata with no version bump — the checkpoint-create
+    # rationale.
+    ("POST", "/workspace/restore/register"),
 }
 
 
@@ -3558,6 +4477,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/hooks/post-edit"): "post_edit_total",
     ("POST", "/hooks/post-edit-cas"): "post_edit_cas_total",
     ("POST", "/hooks/session-stop"): "session_stop_total",
+    ("POST", "/hooks/session-start"): "session_start_total",
     ("POST", "/hooks/pre-bash"): "pre_bash_total",
     ("POST", "/hooks/pre-grep"): "pre_grep_total",
     ("POST", "/policy/track"): "policy_track_total",
@@ -3604,6 +4524,15 @@ pass ``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
 """AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
 post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+
+_SESSION_START_DEGRADED_RESPONSE: dict = {}
+"""SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
+empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
+exactly like "nothing to say", never block, and never claim state it could
+not read. The compact-pending flag is armed INSIDE the timed work only
+after a successful non-empty build (with the A6 abort threaded into the
+builder's ``abort_guard``), so a degraded response also means the deferred
+path stays unarmed."""
 
 _OCC_DEGRADED_RESPONSE: dict = {
     "ok": False,
@@ -3734,6 +4663,14 @@ def _iso_utc(unix_ts: float) -> str:
 #: well under 4KB before any stale-read prepend).
 _PREEMPTION_PROSE_VERBATIM_CAP = 3
 
+#: SB-10 U2 (R5) — same cap pattern for the post-compaction re-grounding
+#: payload: at most this many artifact lines render verbatim; the rest
+#: coalesce into one overflow line pointing at the status surface. Keeps the
+#: payload constant-size regardless of how many artifacts a session touched,
+#: comfortably under Claude Code's 10KB additionalContext ceiling even when
+#: the preemption-notice block (its own cap above) is prepended.
+_SESSION_START_ARTIFACT_VERBATIM_CAP = 3
+
 
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
@@ -3791,6 +4728,323 @@ def _build_preemption_text(
         "local-only until you re-acquire and commit."
     )
     return "\n".join(lines)
+
+
+def _build_session_start_context(
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    *,
+    abort: threading.Event | None = None,
+) -> tuple[str | None, bool]:
+    """SB-10 U2: render the post-compaction re-grounding prose for a session.
+
+    Returns ``(additional_context, workspace_has_state)`` where the context is
+    ``None`` when the session holds no coordination state (R5's no-op arm) and
+    ``workspace_has_state`` feeds the R8 breadcrumb decision in the handler.
+
+    KTD2: the payload is rebuilt from registry truth on EVERY delivery, from
+    ONE consistent read pass — the whole registry walk happens under a single
+    ``abort_guard`` hold (a plain re-entrant lock acquire for the inner read
+    calls), so a peer commit cannot tear the view between the snapshot and
+    the per-row last-observed / last-writer reads. The pass is read-only:
+    R6 forbids this endpoint from recording observations, and the pending
+    preemption notices are PEEKED, never popped — consumption ownership
+    stays with the admit-endpoint drains.
+
+    Rendering (KTD8, byte-mirrored by the Node coordinator):
+    - header first; the existing preemption-notice prose (if any) next;
+      then artifact lines — the parent agent's first, then each registered
+      subagent's under a ``Subagent {name}:`` prefix, groups sorted by name,
+      artifacts sorted by path within a group;
+    - a held E/M/S row renders the event-anchored grant line with the
+      CURRENT version; any other row (INVALID) renders the stale line only
+      when the version advanced past a RECORDED last-observed value and the
+      last writer is not this very agent (R7: never-observed admits, own
+      edits are exempt — KTD4's second layer — and no 0-sentinel compares);
+    - at most ``_SESSION_START_ARTIFACT_VERBATIM_CAP`` artifact lines render
+      verbatim, the rest coalesce into the overflow line (R5);
+    - the self-qualifying closing line is always last. No timestamps.
+    """
+    # Agent enumeration takes only the agent-names lock; done BEFORE the
+    # registry lock so the two locks never nest in names→registry order.
+    agents = coordinator.agents_for_session(session_id)
+
+    with coordinator.registry.abort_guard(abort):
+        # Scoped to THIS session's agents (SB-10 review): the walk below can
+        # only render rows belonging to `agents`, this runs on a hook path
+        # twice per compaction, and nothing garbage-collects `agent_states` —
+        # so an unscoped read would pull the workspace's whole history through
+        # the registry lock only to discard it. The artifact half stays
+        # workspace-wide: R8's breadcrumb asks about the WORKSPACE.
+        artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot(
+            agent_ids=[agent_id for agent_id, _ in agents]
+        )
+        workspace_has_state = bool(artifact_by_id)
+        # KTD8: artifacts sorted by path (ASCII-lexicographic — identical to
+        # the Node backend's default string sort for the path charset).
+        sorted_artifacts = sorted(
+            artifact_by_id.items(), key=lambda item: item[1]["name"]
+        )
+        notices: list[tuple[UUID, UUID, float]] = []
+        groups: list[tuple[str | None, list[str]]] = []
+        # last_writer depends only on the artifact; cache it across agents so
+        # the loop stays O(pairs-with-state) single SELECTs, not O(A x P).
+        last_writer_cache: dict[UUID, UUID | None] = {}
+        for agent_id, subagent_name in agents:
+            lines: list[str] = []
+            for artifact_id, meta in sorted_artifacts:
+                state = state_by_artifact.get(artifact_id, {}).get(agent_id)
+                if state is None:
+                    # A pending notice implies the victim held a grant, so its
+                    # state row exists (rows are never deleted; preemption
+                    # transitions them to INVALID) -- stateless pairs cannot
+                    # carry a notice and are skipped before any per-pair SQL.
+                    continue
+                pending = coordinator.registry.peek_preemption_notice(
+                    agent_id, artifact_id
+                )
+                if pending is not None:
+                    notices.append((artifact_id, pending[0], pending[1]))
+                path = meta["name"]
+                current = meta["version"]
+                if state is not MESIState.INVALID:
+                    lines.append(
+                        _payloads.SESSION_START_GRANT_LINE_TEMPLATE.format(
+                            state=state.name, path=path, version=current
+                        )
+                    )
+                    continue
+                last = coordinator.registry.last_observed_version_for(
+                    artifact_id, agent_id
+                )
+                stale = last is not None and current > last
+                if stale:
+                    if artifact_id not in last_writer_cache:
+                        last_writer_cache[artifact_id] = (
+                            coordinator.registry.last_writer_for(artifact_id)
+                        )
+                    stale = last_writer_cache[artifact_id] != agent_id
+                if stale:
+                    lines.append(
+                        _payloads.SESSION_START_STALE_LINE_TEMPLATE.format(
+                            path=path, current=current, last=last
+                        )
+                    )
+                else:
+                    lines.append(
+                        _payloads.SESSION_START_TOUCHED_LINE_TEMPLATE.format(
+                            path=path, current=current
+                        )
+                    )
+            if lines:
+                groups.append((subagent_name, lines))
+        if not groups and not notices:
+            return None, workspace_has_state
+        # Rendered inside the guard: _build_preemption_text re-reads artifact
+        # names from the registry, and those reads belong to the same
+        # consistent pass as the snapshot the notices came from.
+        notice_text = (
+            _build_preemption_text(coordinator, notices) if notices else None
+        )
+
+    rendered: list[str] = [_payloads.SESSION_START_HEADER]
+    if notice_text is not None:
+        rendered.append(notice_text)
+    total_lines = sum(len(lines) for _, lines in groups)
+    budget = _SESSION_START_ARTIFACT_VERBATIM_CAP
+    for subagent_name, lines in groups:
+        if budget <= 0:
+            break
+        take = lines[:budget]
+        if subagent_name is not None:
+            rendered.append(
+                _payloads.SESSION_START_SUBAGENT_PREFIX_TEMPLATE.format(
+                    name=subagent_name
+                )
+            )
+        rendered.extend(take)
+        budget -= len(take)
+    overflow = total_lines - _SESSION_START_ARTIFACT_VERBATIM_CAP
+    if overflow > 0:
+        rendered.append(
+            _payloads.SESSION_START_OVERFLOW_LINE_TEMPLATE.format(count=overflow)
+        )
+    rendered.append(_payloads.SESSION_START_CLOSING_LINE)
+    return "\n".join(rendered), workspace_has_state
+
+
+def _reground_qualifies(result: dict) -> bool:
+    """SB-10 U4 (R8): does this admit response qualify to carry — and
+    therefore consume — the deferred re-grounding payload?
+
+    The payload attaches ONLY to allow envelopes. A response already
+    carrying a ``hookSpecificOutput`` qualifies iff its decision is
+    ``allow`` — a strict-mode deny must stay byte-identical (KTD-P) and
+    must NOT consume: the flag survives for the next qualifying admit
+    (AE3). An envelope-less response qualifies iff it is an admit body —
+    ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
+    pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
+    is neither a deny envelope nor an admit: no attach, no consume."""
+    hso = result.get("hookSpecificOutput")
+    if hso is not None:
+        return hso.get("permissionDecision") == "allow"
+    return result.get("ok") is True or result.get("status") == "fresh"
+
+
+def _claim_reground_context(
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    *,
+    abort: threading.Event | None = None,
+) -> str | None:
+    """SB-10 U4: atomically claim the session's pending re-grounding
+    delivery and rebuild its prose.
+
+    Returns the payload text when THIS call wins the claim; ``None`` when
+    the request carries a subagent identity (R8: a parent request carries
+    NO agent_id field on the wire — a request presenting one must neither
+    consume nor attach), when the caller's watchdog ``abort`` is already
+    set (a doomed request must not consume the flag — the abort check runs
+    BEFORE the pop so the delivery survives for the next live admit), when
+    no flag is pending, when a concurrent admit won the pop (R2's
+    at-most-once hangs on ``consume_compact_pending``'s locked
+    test-and-clear), or when the rebuild came back empty (state drained
+    since the compact event — nothing left worth re-grounding).
+
+    KTD2 rebuild-at-delivery: the prose is rebuilt from registry truth via
+    ``_build_session_start_context`` at the moment of attach, so the
+    deferred payload says what a fresh /hooks/session-start would say NOW
+    — never a snapshot cached at compact time. The session-scoped build
+    covers the parent agent plus every registered subagent, and carries
+    the R5 verbatim cap, so the delivery budget matches the direct path.
+
+    Failure containment: re-grounding is advisory (KD3). A rebuild error
+    after a won claim must not turn an otherwise-successful admit into an
+    internal-error body, so the build is guarded and the delivery is
+    forfeited (R2 permits at-most-once → zero) rather than propagated."""
+    if has_subagent_id_field(body):
+        return None
+    if abort is not None and abort.is_set():
+        return None
+    if not coordinator.consume_compact_pending(session_id):
+        return None
+    try:
+        text, _ = _build_session_start_context(coordinator, session_id, abort=abort)
+        return text
+    except Exception:  # advisory delivery must never break the admit it rides
+        logger.exception(
+            "deferred re-grounding rebuild failed for session %s; "
+            "delivery forfeited",
+            session_id,
+        )
+        return None
+
+
+def _attach_reground(result: dict, text: str) -> dict:
+    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
+    admit response. An existing envelope keeps its text AND its existing
+    permission decision, and gets the block appended AFTER it (notices and
+    stale warnings render first — KTD6 ordering); a bare admit body gains
+    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
+    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
+    shape."""
+    hso = result.get("hookSpecificOutput")
+    if hso is None:
+        # WHY context-only rather than emit_allow: re-grounding is
+        # advisory (KD3), and an advisory payload must NEVER widen a
+        # permission decision. A bare body here is the untracked
+        # fast-path admit — a tool call Claude Code would ordinarily
+        # prompt the user about. Stamping permissionDecision "allow" on
+        # it just to carry prose auto-approved that call once per
+        # compaction, purely as a side effect of delivery.
+        # Empirical basis: a PreToolUse hookSpecificOutput carrying only
+        # hookEventName + additionalContext IS rendered to the model —
+        # A/B capture against the installed Claude Code CLI 2.1.233 on
+        # 2026-08-25 showed the marker-primed model quoting the injected
+        # line verbatim with and without permissionDecision. The allow
+        # bought nothing the context-only envelope does not already give.
+        return {
+            **result,
+            "hookSpecificOutput": _payloads.emit_pretooluse_context(
+                additional_context=text,
+            ),
+        }
+    existing = hso.get("additionalContext")
+    merged = dict(hso)
+    merged["additionalContext"] = (
+        text if existing is None else existing + "\n\n" + text
+    )
+    return {**result, "hookSpecificOutput": merged}
+
+
+def _fast_path_json(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    base: dict,
+) -> None:
+    """SB-10 U4 (KTD6): shared exit for the four hoisted fast paths. The
+    advisory peek keeps no-flag traffic registry-free with the exact
+    pre-SB-10 response bytes; a pending flag routes through the deferred
+    re-ground attach, which claims it atomically at the allow seam.
+
+    The delivery rebuild walks the registry, so it runs under the same
+    handler-side watchdog as the tracked seams (a slow/contended rebuild
+    must not hang the hook past its budget). On timeout the response is
+    the bare ``base`` — byte-identical to the no-flag fast path — and the
+    abort token (A6 pattern, set by ``run_with_watchdog`` on timeout)
+    stops the zombie delivery from consuming the flag or landing a
+    payload nobody will read; a zombie that already won the pop forfeits
+    the delivery (R2 permits at-most-once → zero)."""
+    if coordinator.has_compact_pending(session_id):
+        abort = threading.Event()
+
+        def deliver() -> dict:
+            return _deliver_pending_reground(
+                coordinator, session_id, body, base, abort=abort
+            )
+
+        try:
+            base = coordinator.run_with_watchdog(deliver, abort=abort)
+        except FuturesTimeout:
+            # KTD-G item 3 mirror of _run_or_degrade: surface the
+            # degradation via the /status counter, then fall through to
+            # the bare fast-path body.
+            coordinator.increment_watchdog_timeout()
+            logger.warning(
+                "deferred re-grounding delivery timed out after %ss; "
+                "degrading to the bare fast-path response",
+                HANDLER_TIMEOUT_SEC,
+            )
+    req._json(200, base)
+
+
+def _deliver_pending_reground(
+    coordinator: CoordinatorHTTPServer,
+    session_id: str,
+    body: dict,
+    result: dict,
+    *,
+    abort: threading.Event | None = None,
+) -> dict:
+    """SB-10 U4 (KTD6): the allow-attach seam shared by the four admit
+    surfaces (pre-read, pre-edit, pre-bash, pre-grep). Runs AFTER any deny
+    decision: a non-qualifying result is returned untouched — the same
+    object, so deny bodies stay byte-identical — and only then does the
+    atomic pop race; exactly one concurrent qualifying admit attaches.
+
+    ``abort`` is the caller's per-request watchdog token (A6 pattern):
+    threaded into the claim so a timed-out request neither consumes the
+    flag (checked before the pop) nor holds the registry walk hostage
+    (the rebuild aborts at the registry lock)."""
+    if not _reground_qualifies(result):
+        return result
+    text = _claim_reground_context(coordinator, session_id, body, abort=abort)
+    if text is None:
+        return result
+    return _attach_reground(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:

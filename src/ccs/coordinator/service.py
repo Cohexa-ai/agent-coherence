@@ -14,8 +14,8 @@ import time
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional
-from uuid import NAMESPACE_URL, UUID, uuid5
+from typing import Callable, Iterable, Mapping, Optional, Sequence
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ccs.coordinator.retention import collectible_versions
 from ccs.core.exceptions import (
@@ -24,6 +24,9 @@ from ccs.core.exceptions import (
     FUTURE_VERSION_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    PIN_STATES,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_STATUSES,
     RETENTION_OFF_REASON,
     SESSION_ARTIFACT_NOT_IN_CUT_REASON,
     SESSION_CAP_EXCEEDED_REASON,
@@ -31,6 +34,10 @@ from ccs.core.exceptions import (
     SESSION_NOT_FOUND_REASON,
     SESSION_READ_SET_TOO_LARGE_REASON,
     UNKNOWN_ARTIFACT_REASON,
+    WORKSPACE_REGISTRATION_COMMITTED,
+    WORKSPACE_REGISTRATION_EMPTY,
+    WORKSPACE_REGISTRATION_REFUSED,
+    CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
     SessionInvalidated,
@@ -39,6 +46,7 @@ from ccs.core.exceptions import (
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
+from ccs.core.substrate import RestoreTier
 from ccs.core.types import (
     Artifact,
     CasCorruption,
@@ -57,9 +65,16 @@ from ccs.core.types import (
     SnapshotSession,
     VersionedContent,
     VersionedReadRejection,
+    WorkspaceRegistrationResult,
+    WorkspaceRestoreWrite,
 )
 
-from .registry_protocol import RegistryBase
+from .registry_protocol import (
+    CheckpointMember,
+    CheckpointRecord,
+    RegistryBase,
+    SqliteExtended,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +448,18 @@ class CoordinatorService:
         # ``looks_like_session_token`` (the shape predicate), so the fail-closed
         # guarantee never depends on the tombstone, only the precise attribution.
         self._reaped_tombstone: "OrderedDict[str, None]" = OrderedDict()
+        # Workspace-registration first-observation mint (WV Unit 5): the
+        # IN-MEMORY registry has no ``resolve_or_register``, so the fallback in
+        # :meth:`_resolve_workspace_member_artifact` is a name scan followed by
+        # a mint — a compound check-then-act with no UNIQUE constraint behind
+        # it. This lock serializes that scan+mint so two concurrent first
+        # observations of one member_path mint ONE artifact (parity with the
+        # sqlite path's atomic ``resolve_or_register``; free-threading
+        # discipline F4 — correctness never rides the GIL). Lock order stays
+        # service-lock → registry-lock (the registry never calls back into the
+        # service), and this lock is never held together with
+        # ``_session_lock``.
+        self._workspace_mint_lock = threading.Lock()
 
     def register_artifact(
         self,
@@ -2294,6 +2321,462 @@ class CoordinatorService:
         return self.commit_all(
             agent_id=committer_id, writes=batch, issued_at_tick=issued_at_tick, abort=abort
         )
+
+    def create_workspace_checkpoint(
+        self,
+        *,
+        name: str,
+        owner: UUID,
+        members: "Sequence[CheckpointMember]",
+        window_min: float,
+        window_max: float,
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> CheckpointRecord:
+        """Persist ONE workspace-checkpoint manifest (WV plan Unit 3 / R1–R2).
+
+        The single registration point for the capture engine
+        (``ccs.adapters.workspace.WorkspaceVersioner``): mints the
+        ``checkpoint_id`` SERVER-SIDE (a caller never names its own id) and
+        hands the header + every member row to the Unit-2 registry API
+        (:meth:`~ccs.coordinator.registry_protocol.RegistryBase.create_checkpoint`),
+        which lands them in ONE transaction — owner metadata included, all rows
+        or none. A raise from the registry therefore leaves NO partial
+        manifest; the adapter maps it to its typed
+        ``CheckpointPersistFailed``.
+
+        Validation fails closed BEFORE minting anything: a blank name, an
+        absent owner, an empty member set, or an inverted window raise
+        ``ValueError`` (an empty manifest describes nothing; the window
+        endpoints come from the capture pass and can never invert unless the
+        caller is buggy).
+
+        ``abort`` threads into :meth:`registry.abort_guard` (the A6
+        session-commit lesson — every mutating path threads it): a
+        watchdog-timed-out ``/workspace/checkpoint`` request fails closed at
+        the registry write lock instead of landing a manifest AFTER the client
+        already received the degraded ``checkpoint_unconfirmed`` response.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("create_workspace_checkpoint requires a non-empty name")
+        if owner is None:
+            raise ValueError(
+                "create_workspace_checkpoint requires an owner: an ownerless "
+                "manifest is unrepresentable (fail-closed)"
+            )
+        member_rows = list(members)
+        if not member_rows:
+            raise ValueError(
+                "create_workspace_checkpoint requires at least one member row "
+                "(an empty manifest describes nothing)"
+            )
+        if window_max < window_min:
+            raise ValueError(
+                f"inverted capture window: window_max={window_max!r} < "
+                f"window_min={window_min!r}"
+            )
+        record = CheckpointRecord(
+            checkpoint_id=str(uuid4()),
+            name=name,
+            owner=owner,
+            created_at=float(issued_at_tick),
+            created_at_tick=issued_at_tick,
+            window_min=float(window_min),
+            window_max=float(window_max),
+        )
+        with self.registry.abort_guard(abort):
+            self.registry.create_checkpoint(record, member_rows)
+        return record
+
+    def get_workspace_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        """The checkpoint header (durable), or ``None`` when unknown.
+
+        The restore engine's pre-flight read (WV plan Unit 4 / R3): ``None``
+        maps to its typed ``CheckpointUnknown`` refusal — the service never
+        raises for an unknown id on the read side (the header getter tells
+        known from unknown; the member getter below returns ``[]`` either way).
+        """
+        return self.registry.get_checkpoint(checkpoint_id)
+
+    def get_workspace_checkpoint_members(
+        self, checkpoint_id: str
+    ) -> "list[CheckpointMember]":
+        """The manifest's member rows (durable), ordered by ``member_path``.
+
+        THE restore engine's member source (WV plan Unit 4 / R3): legs are
+        driven from these durable rows — never from an in-memory capture
+        return — so a fresh engine can resume a crashed restore from exactly
+        the state the registry holds. Empty list for an unknown checkpoint.
+        """
+        return self.registry.get_checkpoint_members(checkpoint_id)
+
+    def set_workspace_checkpoint_restore_status(
+        self,
+        checkpoint_id: str,
+        status: str,
+        *,
+        updated_at: float,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Update the checkpoint-level restore status (durable, crash-visible).
+
+        The vocabulary is the SERVICE layer's (the registry stores the string):
+        only :data:`~ccs.core.exceptions.RESTORE_STATUSES` pass — an unknown
+        status is a caller bug and fails closed BEFORE any write (a misspelled
+        status would silently orphan a crash-resume that matches by identity).
+        ``abort`` threads into :meth:`registry.abort_guard` (the A6 lesson:
+        every mutating path threads it). Raises ``KeyError`` for an unknown
+        checkpoint.
+        """
+        if status not in RESTORE_STATUSES:
+            raise ValueError(
+                f"unknown restore status {status!r}: the closed vocabulary is "
+                f"{sorted(RESTORE_STATUSES)} (fail-closed — an unknown status "
+                "would orphan crash-resume, which matches by identity)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_restore_status(
+                checkpoint_id, status, updated_at=updated_at
+            )
+
+    def set_workspace_checkpoint_member_restore(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        restore_outcome: str | None,
+        deleted_at_restore: float | None = None,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Record one member's durable restore progress (both columns written).
+
+        ``restore_outcome`` must be one of the closed
+        :data:`~ccs.core.exceptions.RESTORE_MEMBER_OUTCOMES` (or ``None`` — the
+        explicit reset a new run may write); anything else fails closed BEFORE
+        the write, because crash-resume decides skip-vs-redrive by matching
+        this value against the closed set — an unvetted string would make a
+        non-terminal member look terminal. ``abort`` threads into
+        :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
+        (checkpoint, member) pair.
+        """
+        if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
+            raise ValueError(
+                f"unknown restore outcome {restore_outcome!r}: the closed "
+                f"vocabulary is {sorted(RESTORE_MEMBER_OUTCOMES)} (fail-closed "
+                "— crash-resume classifies terminality by identity against it)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_member_restore(
+                checkpoint_id,
+                member_path,
+                restore_outcome=restore_outcome,
+                deleted_at_restore=deleted_at_restore,
+            )
+
+    def list_workspace_checkpoints(self) -> "list[CheckpointRecord]":
+        """Every checkpoint header, ordered ``(created_at, checkpoint_id)``.
+
+        The pin engine's cross-checkpoint read (WV plan Unit 6 / R9): before
+        an internal release drops an S3 legal hold, it scans the OTHER
+        checkpoints' members for another ``held`` pin of the same
+        ``(member_path, native_token)`` — a shared hold must survive the
+        first checkpoint's release. Also the Unit-8 ``list`` verb's source.
+        """
+        return self.registry.list_checkpoints()
+
+    def set_workspace_checkpoint_member_pin(
+        self,
+        checkpoint_id: str,
+        member_path: str,
+        *,
+        pin_state: str,
+        restore_tier: str | None = None,
+        abort: threading.Event | None = None,
+    ) -> None:
+        """Record one member's durable pin state (WV plan Unit 6 / R9).
+
+        ``pin_state`` must be one of the closed
+        :data:`~ccs.core.exceptions.PIN_STATES`; ``restore_tier`` (when given)
+        rewrites the member's restore tier IN THE SAME registry write — the
+        loud tier downgrade a failed/released pin must land together with its
+        pin state (two writes could crash apart and leave a ``restorable``
+        member with no backing pin). Both vocabularies fail closed BEFORE any
+        write. ``abort`` threads into :meth:`registry.abort_guard` (the A6
+        lesson: every mutating path threads it). Raises ``KeyError`` for an
+        unknown (checkpoint, member) pair.
+        """
+        if pin_state not in PIN_STATES:
+            raise ValueError(
+                f"unknown pin state {pin_state!r}: the closed vocabulary is "
+                f"{sorted(PIN_STATES)} (fail-closed — the pair "
+                "(restore_tier, pin_state) is the honesty surface and an "
+                "unvetted string would make it unreadable)"
+            )
+        if restore_tier is not None and restore_tier not in {
+            tier.value for tier in RestoreTier
+        }:
+            raise ValueError(
+                f"unknown restore tier {restore_tier!r}: the closed vocabulary "
+                f"is {sorted(tier.value for tier in RestoreTier)} (fail-closed)"
+            )
+        with self.registry.abort_guard(abort):
+            self.registry.set_checkpoint_member_pin(
+                checkpoint_id,
+                member_path,
+                pin_state=pin_state,
+                restore_tier=restore_tier,
+            )
+
+    def adjust_workspace_checkpoint_pin_refcount(
+        self,
+        checkpoint_id: str,
+        delta: int,
+        *,
+        abort: threading.Event | None = None,
+    ) -> int:
+        """Atomically adjust a checkpoint's pin refcount; the new value returned.
+
+        The Unit-6 bookkeeping counter: +1 per pin the checkpoint establishes,
+        -1 per pin the internal release drops. The registry refuses a result
+        below zero (``ValueError`` — a release without a matching pin is a
+        bookkeeping bug, fail-closed). ``abort`` threads into
+        :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
+        checkpoint.
+        """
+        with self.registry.abort_guard(abort):
+            return self.registry.adjust_checkpoint_pin_refcount(checkpoint_id, delta)
+
+    def register_workspace_restore(
+        self,
+        *,
+        checkpoint_id: str,
+        controller: UUID,
+        writes: "Sequence[WorkspaceRestoreWrite]",
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> WorkspaceRegistrationResult:
+        """Register a restore run's WRITTEN file members with the coordinator —
+        all-or-nothing (WV plan Unit 5 / R4–R5).
+
+        The coordinator half of the plan's restore-registration split. The
+        caller (the restore engine's registration seam) hands the written FILE
+        members only; the other member classes never reach this method by
+        design:
+
+        - **S3 members** — the coordinator holds no artifact identity for a
+          BYO-substrate member (the substrate owns identity; their
+          ``artifact_id`` is NULL in the manifest by design), so their
+          registration is the manifest-side outcome row alone;
+        - **deleted members** — recorded manifest-side
+          (``deleted_at_restore``); ``commit_all`` has no delete semantics;
+        - **an empty ``writes``** — answers the typed ``empty_write_set``
+          result; ``commit_all`` is NEVER called (it raises on an empty set).
+
+        Per write, hash-only (never content bytes into the coordinator):
+
+        1. ``member_path`` resolves to the coordinator artifact — via the
+           durable registry's ``resolve_or_register`` (first observation mints
+           the artifact at version 1 carrying the FINGERPRINT as its content
+           hash: for a path the coordinator never saw, the mint IS the
+           registration), or a name-scan + hash-only first-observation seed on
+           the in-memory registry (content ``""`` — the coordinator stays
+           metadata-only; parity: both backends mint at version 1 with the
+           fingerprint).
+        2. Members whose artifact ALREADY carries the fingerprint are
+           ``skipped`` — the idempotency filter: a crash-resumed registration
+           whose prior run's ``commit_all`` landed re-answers without a second
+           version bump (exactly-once), and a member whose leg rode a
+           coordinator-connected volume (its ``write_cas_at`` already
+           committed) is never double-registered.
+        3. The rest form ONE :meth:`commit_all` batch — ``expected_version``
+           read here per member, ``content_hash`` = the fingerprint,
+           ``content=None`` — under the D4 preconditions (the CONTROLLER must
+           be S/I and not mid-transient; those raises propagate as caller
+           bugs / retry-eligible signals, matching ``commit_all``). WIN →
+           ``committed`` with per-path NEW versions (defense-in-depth
+           ``check_monotonic_version`` against the pre-read version: restore
+           registers FORWARD, old bytes at a NEW version, never a decrement)
+           plus the invalidation signals for broadcast-after-commit (peers
+           holding S on a registered member are invalidated atomically by the
+           registry; the signals let a server surface it). HELD →
+           ``refused`` mapping each failing member path to its own typed
+           :class:`ConflictDetail` — including ``stale_read_generation``, the
+           fence rejecting a superseded controller's late apply. Nothing
+           mutates on a refusal (all-or-nothing).
+
+        The per-member ``expected_version`` reads are sequential (no pinned
+        cut): a racing commit between the read and the batch simply HELDs the
+        batch ``version_mismatch`` — the CAS arbitrates; the caller re-drives
+        bounded. ``abort`` threads into ``commit_all`` → ``abort_guard`` (the
+        A6 lesson: every mutating path threads it).
+
+        Raises:
+            CheckpointUnknown: ``checkpoint_id`` names no persisted manifest.
+            ValueError: blank/duplicate member paths or a blank fingerprint
+                (caller bugs, refused before any resolution).
+        """
+        if self.registry.get_checkpoint(checkpoint_id) is None:
+            raise CheckpointUnknown(checkpoint_id)
+        entries = list(writes)
+        seen: set[str] = set()
+        for write in entries:
+            if not write.member_path or not write.member_path.strip():
+                raise ValueError("register_workspace_restore: blank member_path")
+            if not write.fingerprint or not write.fingerprint.strip():
+                raise ValueError(
+                    f"register_workspace_restore: member {write.member_path!r} "
+                    "carries no fingerprint (a written member always has one)"
+                )
+            if write.member_path in seen:
+                raise ValueError(
+                    f"register_workspace_restore: duplicate member_path "
+                    f"{write.member_path!r} in the write-set"
+                )
+            seen.add(write.member_path)
+        if not entries:
+            return WorkspaceRegistrationResult(
+                checkpoint_id=checkpoint_id,
+                status=WORKSPACE_REGISTRATION_EMPTY,
+                detail=(
+                    "empty write-set: no written file members to register — "
+                    "commit_all was never called (it raises on an empty set)"
+                ),
+            )
+
+        skipped: list[str] = []
+        batch: dict[UUID, CommitAllEntry] = {}
+        path_by_artifact: dict[UUID, str] = {}
+        pre_versions: dict[UUID, int] = {}
+        for write in entries:
+            artifact_id = self._resolve_workspace_member_artifact(
+                write.member_path, write.fingerprint
+            )
+            artifact = self.registry.get_artifact(artifact_id)
+            if artifact is None:  # pragma: no cover - resolve just minted/found it
+                raise CoherenceError(
+                    f"register_workspace_restore: artifact {artifact_id} for "
+                    f"member {write.member_path!r} vanished mid-registration"
+                )
+            if artifact.content_hash == write.fingerprint:
+                # Already registered at the manifest fingerprint (a prior run's
+                # landed commit, a coordinator-connected leg, or the first-
+                # observation mint above): exactly-once, no second bump.
+                skipped.append(write.member_path)
+                continue
+            path_by_artifact[artifact_id] = write.member_path
+            pre_versions[artifact_id] = artifact.version
+            batch[artifact_id] = CommitAllEntry(
+                expected_version=artifact.version,
+                content_hash=write.fingerprint,
+            )
+
+        if not batch:
+            return WorkspaceRegistrationResult(
+                checkpoint_id=checkpoint_id,
+                status=WORKSPACE_REGISTRATION_EMPTY,
+                detail=(
+                    "every written member is already registered at its manifest "
+                    "fingerprint — commit_all was never called"
+                ),
+                skipped=tuple(skipped),
+            )
+
+        out = self.commit_all(
+            agent_id=controller,
+            writes=batch,
+            issued_at_tick=issued_at_tick,
+            abort=abort,
+        )
+        if isinstance(out, MultiCommitConflict):
+            # All-or-nothing HELD: nothing mutated, no signals. Typed per-path
+            # reasons — stale_read_generation is the fence rejecting a
+            # superseded controller's late apply.
+            return WorkspaceRegistrationResult(
+                checkpoint_id=checkpoint_id,
+                status=WORKSPACE_REGISTRATION_REFUSED,
+                detail=(
+                    "commit_all HELD the registration batch (all-or-nothing: "
+                    "no member registered); per-member typed reasons attached"
+                ),
+                skipped=tuple(skipped),
+                refused={
+                    path_by_artifact[art_id]: conflict
+                    for art_id, conflict in out.per_artifact.items()
+                },
+            )
+        result, signals = out
+        versions: dict[str, int] = {}
+        for art_id, new_version in result.versions.items():
+            # Defense-in-depth (the commit_cas mirror): the CAS computed N+1
+            # atomically; assert the registration never regressed a version —
+            # restore is a FORWARD commit carrying old bytes.
+            check_monotonic_version(pre_versions[art_id], new_version)
+            versions[path_by_artifact[art_id]] = new_version
+        return WorkspaceRegistrationResult(
+            checkpoint_id=checkpoint_id,
+            status=WORKSPACE_REGISTRATION_COMMITTED,
+            detail=(
+                f"registered {len(versions)} written file member(s) via one "
+                "all-or-nothing commit_all (hash-only; peers invalidated "
+                "atomically, signals returned for broadcast-after-commit)"
+            ),
+            versions=versions,
+            skipped=tuple(skipped),
+            signals=tuple(signals),
+        )
+
+    def _resolve_workspace_member_artifact(
+        self, member_path: str, fingerprint: str
+    ) -> UUID:
+        """Resolve a file member path to its coordinator artifact id, hash-only.
+
+        Durable registry: :meth:`SqliteExtended.resolve_or_register` (one
+        ``BEGIN IMMEDIATE``; a first observation mints the artifact at version
+        1 carrying the fingerprint). In-memory registry (no
+        ``resolve_or_register`` — it is SqliteExtended-only): a name scan over
+        the registered artifacts, with the SAME first-observation semantics on
+        a miss — an ``Artifact(name, version=1, content_hash=fingerprint)``
+        seeded with EMPTY content (hash-only: member bytes never enter the
+        coordinator; parity with the sqlite mint, which stores no body either).
+
+        The in-memory scan+mint is a compound check-then-act, so it runs under
+        ``_workspace_mint_lock`` — two concurrent first observations of one
+        ``member_path`` serialize and mint ONE artifact, keeping the parity
+        claim with sqlite's UNIQUE-backed ``resolve_or_register`` honest
+        instead of GIL-dependent.
+        """
+        if isinstance(self.registry, SqliteExtended):
+            return self.registry.resolve_or_register(member_path, fingerprint)
+        with self._workspace_mint_lock:
+            for artifact_id in self.registry.artifact_ids():
+                artifact = self.registry.get_artifact(artifact_id)
+                if artifact is not None and artifact.name == member_path:
+                    return artifact_id
+            minted = Artifact(name=member_path, version=1, content_hash=fingerprint)
+            self.registry.register_artifact(minted, "")
+            return minted.id
+
+    def workspace_member_registered(self, member_path: str, fingerprint: str) -> bool:
+        """READ-ONLY: is ``member_path`` currently registered at ``fingerprint``?
+
+        True iff a coordinator artifact named ``member_path`` exists AND its
+        current ``content_hash`` equals ``fingerprint`` — the same predicate
+        :meth:`register_workspace_restore`'s idempotency filter applies,
+        exposed as a pure read so the restore engine can REBUILD the
+        registration answer for an already-``concluded`` checkpoint (WV Unit
+        5: a refused-terminal registration must never re-read as
+        ``None``-means-fine on a re-restore). Never resolves, never mints,
+        never mutates: an unknown path answers ``False`` (nothing registered).
+        A plain name scan on BOTH registry backends — sqlite's
+        ``resolve_or_register`` is mint-on-miss and therefore unusable for a
+        read — matching the first-match semantics of
+        :meth:`_resolve_workspace_member_artifact`'s in-memory scan.
+        """
+        for artifact_id in self.registry.artifact_ids():
+            artifact = self.registry.get_artifact(artifact_id)
+            if artifact is not None and artifact.name == member_path:
+                return artifact.content_hash == fingerprint
+        return False
 
     def invalidate(
         self,

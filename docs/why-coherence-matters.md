@@ -6,6 +6,41 @@ evidence of the gap: framework documentation, unresolved community questions,
 and production bug reports. All sources are linked and dated so readers can
 verify independently.
 
+## Why this class of bug is hard to see
+
+Before the evidence, the reason it stays invisible long enough to reach
+production.
+
+An agent system keeps **two records of what happened**. The first is the one
+your infrastructure can verify: which version each agent read, what actually
+committed, what was refused, what the store holds now. The second is the one
+the model narrates: *"task complete"*, *"the plan is updated"*, *"I applied the
+change"*. Both are always present, and most of the time they agree.
+
+They come apart exactly when an agent acts on a version that moved underneath
+it. The write succeeds at the storage layer, so no exception is raised. The
+agent reports what it intended to do, because from inside its own execution
+that is what happened. The run is green in both records, and only the state is
+wrong.
+
+The narrated record is the one a team reads first, and it is the one that
+cannot be trusted here — not because the model is badly behaved, but because a
+worker reasoning over a stale copy has no way to observe its own staleness. So
+the incident is filed against the model. Someone tightens a prompt, and the
+same interleaving fires again a week later on a different record.
+
+Coherence is the discipline of keeping the verified record authoritative for
+the state a fleet shares: track which version each agent holds, refuse a write
+built on a view that has already moved, and return a typed conflict the caller
+can act on rather than a silent overwrite. Everything below is evidence that
+this record is currently missing from the frameworks teams build on.
+
+**One boundary, stated up front.** This is the verified record for **shared
+artifact state**, not for actions taken in the world. Whether an email was
+really sent or a webhook really fired is a different ledger, and it belongs to
+your outbox, your idempotency keys, and your connectors. Guarantees here hold
+on the artifacts a fleet shares, never on the fleet's actions.
+
 ---
 
 ## 1. The consistency model is unspecified

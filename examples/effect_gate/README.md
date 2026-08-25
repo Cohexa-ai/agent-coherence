@@ -19,7 +19,11 @@ absence rather than asserted.
 An agent reads a shared config, decides a deploy, and gates the deploy on the
 config version it just read. A peer changes the config before the deploy runs.
 The gate re-reads at the effect boundary, sees the version moved, and **holds**:
-the deploy never fires on the version that no longer exists. The agent reacquires
+the deploy never fires on the version that no longer exists. (The gate compares
+the full `(version, ownership generation)` pair, so it also holds when a
+coordinator sweep reclaimed the grant the config was read under while the bytes
+never moved — the sibling demo `examples/gate_effect_ordering` runs that act.)
+The agent reacquires
 the fresh config, re-decides, and fires.
 
 ```python

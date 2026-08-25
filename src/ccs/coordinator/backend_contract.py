@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 48-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 59-member ``RegistryBase`` + ``SqliteExtended``
 Protocols), this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
@@ -109,7 +109,7 @@ class MemberContract:
     rationale: str
 
 
-# The 48 members of RegistryBase (34 methods + 1 property) and SqliteExtended
+# The 59 members of RegistryBase (45 methods + 1 property) and SqliteExtended
 # (+13 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
@@ -258,6 +258,53 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "release / effect-gate teardown). Individually durable and idempotent; "
         "not part of the write-arbitration RMW.",
     ),
+    MemberContract(
+        "create_checkpoint",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Persists a workspace-checkpoint manifest (WV Unit 2): the header row + "
+        "owner metadata + every member row in ONE registry transaction (sqlite: "
+        "one BEGIN IMMEDIATE; in-memory: one _capture_lock hold with validate-"
+        "before-first-insert) — individually atomic, all rows or none. NOT part "
+        "of the R9 single-writer RMW: the manifest records capture facts, it "
+        "arbitrates no writer (the capture engine's version reads ride the "
+        "session machinery; restore registration rides commit_all).",
+    ),
+    MemberContract(
+        "set_checkpoint_restore_status",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Updates the checkpoint-level restore-progress status (crash-resumable "
+        "restore's durable marker). Individually durable; not part of the "
+        "write-arbitration RMW — the arbitration of restore WRITES happens in "
+        "commit_all / the member legs, never in this bookkeeping update.",
+    ),
+    MemberContract(
+        "set_checkpoint_member_restore",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Records one member's typed restore outcome + the manifest-side "
+        "deleted_at_restore record (commit_all has no delete semantics, so "
+        "delete legs are recorded here per the restore-registration design). "
+        "Individually durable bookkeeping; arbitration lives in the member leg.",
+    ),
+    MemberContract(
+        "set_checkpoint_member_pin",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Updates one member's pin state, optionally rewriting its restore tier "
+        "in the same step (the Unit-6 loud restorable -> restorable-unpinned "
+        "downgrade). Individually durable; not part of the R9 boundary.",
+    ),
+    MemberContract(
+        "adjust_checkpoint_pin_refcount",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Atomic read-validate-write refcount adjustment (never below zero, "
+        "fail-closed) for the Unit-6 GC pin legs. Individually atomic in the "
+        "backend (one BEGIN IMMEDIATE / one lock hold) but not part of the "
+        "single-writer RMW — it arbitrates pin bookkeeping, not artifact writes.",
+    ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(
         "coordinator_epoch",
@@ -353,6 +400,25 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / set_artifact_and_content.",
     ),
     MemberContract(
+        "last_observed_version_for",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads the artifact version whose bytes an agent last observed (the "
+        "SB-10 post-compaction staleness comparand). Non-mutating; the RECORD "
+        "side rides the atomic non-INVALID upserts (set_agent_state and the "
+        "commit_cas / commit_all WIN paths), which are already classified.",
+    ),
+    MemberContract(
+        "get_artifact_and_generation",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads an artifact together with the per-artifact fence counter as ONE "
+        "snapshot. Non-mutating, but carries a consistency obligation beyond "
+        "plain READ_ONLY: the two values must have coexisted, since a backend "
+        "serving them as two reads lets a sweep reclaim tear the pair and "
+        "silently reopens the reclaim-zombie EFFECT hole in adapters.effect_gate.",
+    ),
+    MemberContract(
         "granted_at_tick",
         MemberClass.READ_ONLY,
         "base",
@@ -399,6 +465,26 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Reads a session's pinned cut (session_read / session_commit / owner "
         "validation). Non-mutating; the cut was written atomically by "
         "capture_version_vector.",
+    ),
+    MemberContract(
+        "get_checkpoint",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads one workspace-checkpoint header (status / restore verbs). "
+        "Non-mutating; the manifest was written atomically by create_checkpoint.",
+    ),
+    MemberContract(
+        "get_checkpoint_members",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads a manifest's member rows, ordered by member_path (restore / "
+        "status enumeration). Non-mutating.",
+    ),
+    MemberContract(
+        "list_checkpoints",
+        MemberClass.READ_ONLY,
+        "base",
+        "Enumerates checkpoint headers (the CLI list verb). Non-mutating.",
     ),
     MemberContract(
         "get_session_meta",
@@ -508,8 +594,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "status_snapshot",
         MemberClass.READ_ONLY,
         "sqlite_extended",
-        "Batch read of the artifact + state maps for the /status surface. "
-        "Non-mutating.",
+        "Batch read of the artifact + state maps for the /status surface, "
+        "optionally scoping the state half to named agents. Non-mutating.",
     ),
 )
 
@@ -517,7 +603,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 48-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 59-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

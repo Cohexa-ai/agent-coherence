@@ -43,7 +43,7 @@ import uuid
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import yaml
 
@@ -86,6 +86,19 @@ from ccs.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
+
+
+class _ReadResult(NamedTuple):
+    """What one coordinator-mediated read yields. Named rather than a bare
+    tuple because two of the four fields are int-shaped and adjacent
+    (``version`` and ``owner_generation``), so a positional transposition would
+    type-check in one direction while silently swapping a value comparand for
+    an authority one."""
+
+    data: bytes
+    version: int
+    stale_denied: bool
+    owner_generation: int | None
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -938,7 +951,9 @@ class CoherentVolume:
             # SHARED and route the next comparand read through the coordinator's
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
-            current_bytes, expected_version, stale_denied = self._read_with_version(rel)
+            current_bytes, expected_version, stale_denied, _gen = (
+                self._read_with_version(rel)
+            )
             if stale_denied:
                 # Cannot CAS from this view: INVALID, or the disk lags a just-
                 # committed version whose peer write has not landed yet
@@ -1093,7 +1108,9 @@ class CoherentVolume:
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU).
         self._remint()
-        _current_bytes, current_version, stale_denied = self._read_with_version(rel)
+        _current_bytes, current_version, stale_denied, _gen = self._read_with_version(
+            rel
+        )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
             # the agent must reacquire / re-read before it can CAS.
@@ -1177,6 +1194,25 @@ class CoherentVolume:
         coordinator is ahead of disk; recover by re-reading each member at its
         current version and re-materializing (never retry the publish — it would
         version-mismatch).
+
+        **Foreign-edit boundary (read this too).** The staleness this API
+        detects is VERSION drift at the coordinator — and only volume-mediated
+        writes advance versions. An out-of-band disk edit (a human in an
+        editor, a formatter, a script writing the file directly) advances
+        nothing, so a MULTI-member publish cannot see it: the session path
+        never re-reads disk between the caller's read and materialization, the
+        batch commits, and the foreign bytes are silently overwritten. The
+        SB-23 content-CAS (``on_stale_write``) does NOT run on this path —
+        :meth:`_read_with_version` seeds the foreign-edit baseline, but no
+        publish step consults it. This is a deliberate, regression-pinned
+        boundary (see test_atomic_publish.py's foreign-edit-boundary section),
+        not a gap in the version check. Contrast: plain :meth:`write` denies
+        the same edit with ``StaleView``, and a SINGLE-member publish takes the
+        standalone CAS path, whose hash-checked comparand read fails closed
+        (``ViewWedged``) on a managed path. Publish only write-sets whose every
+        contending writer routes through a volume; for a file that humans or
+        out-of-band tools also edit, use :meth:`write` — its foreign-edit
+        guard covers exactly that case.
 
         **Sizing.** A single-member publish takes the standalone CAS path
         (:meth:`write_cas_at`'s primitive). A multi-member publish opens a
@@ -1571,12 +1607,52 @@ class CoherentVolume:
         :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
         """
         with self._single_op_guard():
-            data, version, _stale_denied = self._read_with_version(path)
+            data, version, _stale_denied, _generation = self._read_with_version(path)
             return data, version
 
-    def _read_with_version(self, rel: str) -> tuple[bytes, int, bool]:
+    #: Whether the most recent :meth:`read_with_version_generation` was refused
+    #: by the coordinator (strict-mode deny). Read by the effect fence to name
+    #: the HOLD cause precisely; per-instance and overwritten each call.
+    _last_read_denied: bool = False
+
+    def read_with_version_generation(
+        self, path: str | os.PathLike[str], *, observe: bool = True
+    ) -> tuple[bytes, int, int | None]:
+        """Read current bytes + the coordinator's authoritative
+        ``(version, owner_generation)`` pair.
+
+        The generation-bearing sibling of :meth:`read_with_version`, driven by
+        ``adapters.effect_gate.gate()``: the version answers "is the value still
+        the one the decision saw", the ownership generation answers "is the
+        grant it was read under still standing" — a sweep reclamation of a
+        stalled holder advances the generation WITHOUT a version move, which a
+        version-only comparand cannot see. The pair is a single coordinator-side
+        snapshot (never torn by a concurrent reclaim). ``owner_generation`` is
+        ``None`` when the coordinator did not confirm one — an older
+        coordinator, a strict-mode deny, or a degraded read — and callers must
+        treat ``None`` as UNCONFIRMED (the gate HOLDs on it), never as "no
+        movement". ``FileNotFoundError`` for a missing file.
+
+        ``observe=False`` marks a VERIFICATION read whose bytes the caller
+        discards (the effect fence re-reading to compare comparands). It leaves
+        the foreign-edit baseline where it was, so checking freshness cannot
+        absolve an out-of-band edit the caller never actually saw.
+        """
+        with self._single_op_guard():
+            data, version, stale_denied, generation = self._read_with_version(
+                path, observe=observe
+            )
+            # A strict-mode deny is reported as a REFUSED read, not merely as a
+            # missing generation: they need different answers (a deny clears
+            # with reacquire; a coordinator that cannot report generations at
+            # all does not), and on the strict path a sweep reclaim reaches the
+            # client precisely AS a deny.
+            self._last_read_denied = stale_denied
+            return data, version, generation
+
+    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
         """OCC helper: register a SHARED view and return
-        ``(bytes, version, stale_denied)``.
+        ``(bytes, version, stale_denied, owner_generation)``.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
         handling) but also surfaces the coordinator's authoritative ``version``
@@ -1594,16 +1670,27 @@ class CoherentVolume:
         / degraded status surface) ``0`` is used — a CAS against
         ``expected_version=0`` on a non-empty artifact loses cleanly
         (``version_mismatch``), so the fallback never causes a silent overwrite.
+        ``owner_generation`` rides the same fail-closed discipline: ``None``
+        when the coordinator did not confirm one (older coordinator, deny,
+        degraded), which generation-aware callers treat as UNCONFIRMED.
         """
         abs_path, _rel = self._to_relative(rel)
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        # SB-23: the OCC read path also seeds the foreign-edit baseline.
-        self._last_observed_hash[_rel] = content_hash
+        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
+        # ONLY when the caller actually OBSERVES these bytes. A verification
+        # read (``observe=False``, used by the effect fence) reads the file to
+        # compare comparands and then DISCARDS the bytes; advancing the
+        # baseline there would silently absolve a foreign edit the caller never
+        # saw, so the next write would clobber it instead of denying. A
+        # fail-closed check must not have a fail-open side effect.
+        if observe:
+            self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
+        owner_generation: int | None = None
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -1611,6 +1698,10 @@ class CoherentVolume:
                     "session_id": self._session_id,
                     "path": _rel,
                     "content_hash": content_hash,
+                    # Opt-in: ask for the pair-consistent (version,
+                    # owner_generation). Older coordinators ignore the flag and
+                    # answer without the key (generation stays None).
+                    "want_owner_generation": True,
                 },
             )
             if isinstance(resp, dict):
@@ -1619,6 +1710,7 @@ class CoherentVolume:
                         f"coordinator watchdog timeout during read of {_rel}"
                     )
                 version = self._pre_read_version(resp)
+                owner_generation = self._pre_read_owner_generation(resp)
                 # A strict-deny (INVALID, NOT re-granted — KTD-T) is the only
                 # pre-read outcome that leaves this instance unable to CAS: it
                 # stays INVALID AND keeps the invalidation transient the peer
@@ -1629,7 +1721,7 @@ class CoherentVolume:
                 hook_output = resp.get("hookSpecificOutput")
                 if isinstance(hook_output, dict):
                     stale_denied = hook_output.get("permissionDecision") == "deny"
-        return data, version, stale_denied
+        return _ReadResult(data, version, stale_denied, owner_generation)
 
     @staticmethod
     def _pre_read_version(resp: dict) -> int:
@@ -1644,6 +1736,41 @@ class CoherentVolume:
             if isinstance(cv, int) and not isinstance(cv, bool):
                 return cv
         return 0
+
+    @staticmethod
+    def _pre_read_owner_generation(resp: dict) -> int | None:
+        """Extract the ownership generation from a pre-read response. ``None``
+        when absent or malformed — the fail-closed sentinel for "the coordinator
+        never confirmed a generation" (older coordinator, strict deny,
+        degraded); never coerced to 0, which is a REAL generation.
+
+        ``None`` ALSO when the coordinator reports the caller's content hash
+        differs from the content it records at that version (``hash_differs``,
+        on either the fresh or the stale shape). The generation is the
+        *authority* comparand — "is the grant these bytes were read under still
+        standing" — and a hash mismatch means the coordinator cannot vouch that
+        the bytes in hand ARE the content at that version. In warn mode such a
+        read is a fail-open allow (a re-grant, or a `hash_differs` fresh), so the
+        version comparand alone would re-validate clean at an effect boundary and
+        fire a decision derived from superseded bytes. Reporting the generation
+        as UNCONFIRMED makes the effect gate HOLD instead; the plain
+        ``read``/``read_with_version`` paths are unaffected."""
+        if CoherentVolume._pre_read_hash_differs(resp):
+            return None
+        g = resp.get("owner_generation")
+        if isinstance(g, int) and not isinstance(g, bool):
+            return g
+        return None
+
+    @staticmethod
+    def _pre_read_hash_differs(resp: dict) -> bool:
+        """True when the coordinator flagged the caller's content hash as
+        differing from the content it records — top-level on the fresh shape,
+        under ``summary`` on the stale shape."""
+        if resp.get("hash_differs") is True:
+            return True
+        summary = resp.get("summary")
+        return isinstance(summary, dict) and summary.get("hash_differs") is True
 
     def _current_bytes_or_empty(self, abs_path: Path) -> bytes:
         """Degrade-path read of the on-disk bytes (b\"\" if the file is absent),

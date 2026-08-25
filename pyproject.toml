@@ -66,6 +66,10 @@ agent-coherence-hook-client = "ccs.cli.coherence_hook_client:main"
 # predicate engine (single-writer / monotonic-version / stale-read /
 # lost-write) and emits human or JSON findings with per-reason exit codes.
 agent-coherence-replay = "ccs.cli.coherence_replay:main"
+# Workspace-Versioning operator CLI (WV R6): checkpoint / list / restore /
+# status over heterogeneous workspace members, driving an in-process
+# coordinator service (pin legs have no HTTP surface by design).
+agent-coherence-workspace = "ccs.cli.workspace:main"
 # The stale-write-guard-fs stdio MCP server (requires the `mcp` extra).
 # Single-host coherence guard over CoherentVolume; configured via SWG_ROOT /
 # SWG_MANAGED. See src/ccs/mcp/.
@@ -78,6 +82,10 @@ stale-write-guard-fs = "ccs.mcp.server:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4"]
+# The packaged conformance corpus (ccs.testing.substrate_conformance) imports
+# and runs WITHOUT pytest; this extra adds it so scenario skips report as
+# skips when a foreign implementation runs the corpus under its test suite.
+conformance = ["pytest>=7.0"]
 langgraph = ["langgraph>=0.2"]
 crewai = ["crewai>=0.80"]
 # `opentelemetry-api` is the runtime dep (the OtelExporter no-ops without an
@@ -154,3 +162,12 @@ select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["E402", "E501", "E701", "E702", "E741", "F841"]
+# Every runnable example bootstraps ``sys.path``/``PYTHONPATH`` to the repo's
+# ``src`` BEFORE importing ``ccs``, so the demos run from a bare checkout — the
+# imports cannot move to the top of the file.
+"examples/**/*.py" = ["E402"]
+# ``examples/shared_codebase/fixture_repo`` is sample application code the demo
+# READS as data (a 4-agent review pipeline reviews it, and its bytes feed the
+# demo's token-savings arithmetic). Its unused imports and unsorted blocks are
+# representative of the real-world code under review, not lint debt to clean.
+"examples/shared_codebase/fixture_repo/**/*.py" = ["E401", "E402", "F401", "F841", "I001"]

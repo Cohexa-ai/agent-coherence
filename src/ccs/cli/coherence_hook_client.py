@@ -15,12 +15,21 @@ directly (no env-var dependency).
 Each subcommand maps to one coordinator endpoint and translates the
 Claude Code stdin contract → the coordinator's payload contract:
 
-| Subcommand     | CC hook         | Coordinator endpoint    |
-|----------------|-----------------|-------------------------|
-| pre-read       | PreToolUse:Read | POST /hooks/pre-read    |
-| pre-edit       | PreToolUse:Edit | POST /hooks/pre-edit    |
-| post-edit      | PostToolUse     | POST /hooks/post-edit   |
-| session-stop   | Stop            | POST /hooks/session-stop|
+| Subcommand     | CC hook          | Coordinator endpoint      |
+|----------------|------------------|---------------------------|
+| pre-read       | PreToolUse:Read  | POST /hooks/pre-read      |
+| pre-edit       | PreToolUse:Edit  | POST /hooks/pre-edit      |
+| post-edit      | PostToolUse      | POST /hooks/post-edit     |
+| session-stop   | Stop             | POST /hooks/session-stop  |
+| subagent-stop  | SubagentStop     | POST /hooks/session-stop  |
+| pre-bash       | PreToolUse:Bash  | POST /hooks/pre-bash      |
+| pre-grep       | PreToolUse:Grep  | POST /hooks/pre-grep      |
+| session-start  | SessionStart     | POST /hooks/session-start |
+
+``subagent-stop`` shares the session-stop endpoint but scopes the release
+to the one subagent's grants. ``session-start`` is the post-compaction
+re-grounding hook: only ``source: "compact"`` payloads call out to the
+coordinator — ordinary starts, resumes, and clears skip locally.
 
 ## stdin contract
 
@@ -89,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
             # v0.1.1 KTD-N — H4 mitigation: extended hook coverage.
             "pre-bash",
             "pre-grep",
+            # SB-10 U3: post-compaction re-grounding (SessionStart hook).
+            "session-start",
         ],
         help="Which coordinator endpoint to invoke. Maps 1:1 to the CC hook event.",
     )
@@ -201,6 +212,12 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
         elif args.subcommand == "pre-grep":
             payload = _build_pre_grep(cc_payload, root_path)
             response = _call(endpoint, "/hooks/pre-grep", payload)
+        elif args.subcommand == "session-start":
+            # SB-10 U3: CC's SessionStart event → post-compaction
+            # re-grounding. The builder gates on source == "compact", so
+            # startup/resume/clear never reach the coordinator.
+            payload = _build_session_start(cc_payload)
+            response = _call(endpoint, "/hooks/session-start", payload)
         else:  # pragma: no cover — argparse already validates
             _emit_empty()
             return 0
@@ -332,6 +349,24 @@ def _build_subagent_stop(cc: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(aid, str) or not _SUBAGENT_ID_RE.fullmatch(aid):
         raise _SkipHook("agent_id missing or malformed for subagent-stop")
     return {"session_id": session_id, "agent_id": aid}
+
+
+def _build_session_start(cc: dict[str, Any]) -> dict[str, Any]:
+    """SB-10 U3: SessionStart → post-compaction re-grounding request.
+
+    Only the ``compact`` source qualifies: the coordinator endpoint trusts
+    its caller and treats EVERY request as a compact event (R1), so the
+    source gate lives HERE — ``startup``/``resume``/``clear`` (and an
+    absent source) must skip before any network call. SessionStart carries
+    no subagent identity, so the body is session-only: deliberately NOT
+    routed through ``_with_agent_id`` — the re-grounding payload is
+    session-scoped (it always covers the parent plus every registered
+    subagent), and a stray agent field must not narrow it.
+    """
+    if cc.get("source") != "compact":
+        raise _SkipHook("SessionStart source is not 'compact'")
+    session_id = _require_session_id(cc)
+    return {"session_id": session_id}
 
 
 def _build_pre_bash(cc: dict[str, Any]) -> dict[str, Any]:

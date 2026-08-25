@@ -20,12 +20,15 @@ Run:
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from langgraph.config import get_store as lg_get_store
 from langgraph.graph import END, START, StateGraph
 
 from ccs.adapters.ccsstore import CCSStore
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from langgraph.graph.state import CompiledStateGraph
 
 # ---------------------------------------------------------------------------
 # Shared artifact content  (~100 tokens to make the numbers meaningful)

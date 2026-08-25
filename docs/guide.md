@@ -28,22 +28,23 @@ full command-line toolset, and the API reference.
 8. [Crash recovery](#crash-recovery)
 9. [Version retention and read-at-version](#version-retention-and-read-at-version)
 10. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow--coherentobject)
-12. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-13. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-14. [Inline benchmark mode](#inline-benchmark-mode)
-15. [Telemetry](#telemetry)
-16. [Graceful degradation](#graceful-degradation)
-17. [Examples](#examples)
-18. [Real-workload benchmarks](#real-workload-benchmarks)
-19. [Benchmarking your own workload](#benchmarking-your-own-workload)
-20. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-21. [Replay (v0.8.2+)](#replay-v082)
-22. [Command-line tools](#command-line-tools)
-23. [API reference](#api-reference)
-24. [Low-level adapter API](#low-level-adapter-api)
-25. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-26. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
+12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
+13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+14. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+15. [Inline benchmark mode](#inline-benchmark-mode)
+16. [Telemetry](#telemetry)
+17. [Graceful degradation](#graceful-degradation)
+18. [Examples](#examples)
+19. [Real-workload benchmarks](#real-workload-benchmarks)
+20. [Benchmarking your own workload](#benchmarking-your-own-workload)
+21. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+22. [Replay (v0.8.2+)](#replay-v082)
+23. [Command-line tools](#command-line-tools)
+24. [API reference](#api-reference)
+25. [Low-level adapter API](#low-level-adapter-api)
+26. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+27. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -73,7 +74,14 @@ pip install "agent-coherence[openai-agents]"
 # stale-write-guard-fs MCP server (coordinated file access for any MCP client)
 pip install "agent-coherence[mcp]"
 
-# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral + mcp)
+# BYO-substrate bindings (CoherentRow for Postgres / CoherentObject for S3)
+pip install "agent-coherence[coherent-row]"
+pip install "agent-coherence[coherent-object]"
+
+# Substrate conformance corpus (for foreign implementations; not part of [all])
+pip install "agent-coherence[conformance]"
+
+# Everything (langgraph + crewai + otel + langsmith + benchmark + diagnose + openai-agents + mistral + mcp + coherent-row + coherent-object)
 pip install "agent-coherence[all]"
 ```
 
@@ -632,6 +640,18 @@ re-materialize (don't retry the publish — it would version-mismatch). Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 
+**Volume-mediated writers only.** The staleness `atomic_publish` detects is
+*version* drift, and only writes routed through a volume advance versions. An edit
+that bypasses the volume — a human in an editor, a formatter, a script writing a
+member directly — advances nothing, so a multi-file publish cannot see it: the
+batch still commits and the out-of-band edit is silently overwritten. (A
+single-file publish takes the direct CAS path, whose content-checked comparand
+read fails closed on such an edit, as does plain `write()` — see
+[Foreign-edit guards](#foreign-edit-guards).) Use `atomic_publish` only for file
+sets whose every contending writer goes through a volume; for files that humans
+or out-of-band tools also edit, use `write()` — its foreign-edit guard covers
+exactly that case.
+
 ### Foreign-edit guards
 
 Files also change *outside* the fleet — a human edit, a formatter, a regenerating
@@ -653,6 +673,12 @@ These guards are **content-hash checks at the volume boundary** — best-effort
 point-in-time detection, not filesystem interception. An edit that bypasses the
 volume is caught at the *next* volume read or write of that file, not blocked as
 it happens.
+
+They cover `read()` and `write()`. The CAS paths check *versions* instead:
+`write_cas` / `write_cas_at` still fail closed on a foreign edit (their
+content-checked comparand read wedges rather than clobbering), but a multi-file
+`atomic_publish` **does not check disk content at all** — see the scope note in
+[Atomic multi-file publish](#atomic-multi-file-publish-atomic_publish-v0120).
 
 ### The `open()` shim (demo-grade)
 
@@ -794,6 +820,110 @@ python -m examples.coherent_object.main --baseline # see the silent stale act th
 
 The demos run offline against a local coordinator with an in-memory substrate stand-in so the coordinator-mediated value (invalidation-before-act) is visible with zero setup. For production, point the same binding at a real Postgres / S3 and provision the least-privilege role/policy above. The tier-honesty conformance suite exercises both bindings against **real** substrates behind the `real_substrate` pytest marker (credentialed; `CCS_TEST_PG_DSN`, `CCS_REAL_S3_BUCKET`) — Moto/LocalStack are excluded because they serialize and would false-green a concurrency test.
 
+## Workspace versioning & restore (`WorkspaceVersioner`)
+
+Everything above keeps shared state *coherent while agents write it*. Workspace versioning answers a different question: an agent mutated a workspace whose members live in different backends — files on disk, objects in S3 — the attempt failed, and you want the workspace **back the way it was**, with per-member honesty about what can and cannot come back.
+
+A **workspace checkpoint** is a named manifest over heterogeneous members, captured as a **skew-declared cut**:
+
+- **Per-member capture.** One read per member records a restore pointer (the S3 versionId; the coordinator's content-state version for a file), a content fingerprint, and a timestamp. The checkpoint stores pointers and fingerprints — never a second copy of your bytes (S3 history lives in your bucket; file history in the coordinator's bounded retention).
+- **The window is declared, not hidden.** Members are captured one at a time, so the manifest carries the capture window `[window_min, window_max]` rather than pretending the cut was instantaneous. After the window closes, every member is re-read once; any observed movement marks that member `dirty_during_window` — "not verified quiescent", never silently torn.
+- **ABSENT is a fact.** A member missing at capture is recorded as absent — distinct from present-and-empty — and restore includes **delete legs**: a member captured absent that exists live is deleted to match the manifest (on a versioned bucket this mints a delete marker, so the object's history survives).
+
+```python
+from ccs.adapters.workspace import WorkspaceVersioner
+
+wv = WorkspaceVersioner(service=service, owner=owner, file_resolver=resolver)
+wv.add_file_member(source, "ws/notes.md")
+wv.add_object_member(binding, "reports/summary.txt")   # a CoherentObject (S3)
+wv.add_forward_only_member("actions/deploy-step")      # an action surface — named, not captured
+
+checkpoint = wv.checkpoint("before-migration")         # pins on by default
+report = wv.restore(checkpoint.record.checkpoint_id)
+for member in report.members:
+    print(member.member_path, member.outcome)          # per-member terminal truth
+```
+
+### Restore: one conditional leg per member, and it always concludes
+
+`restore()` drives one conditional write per member under a **termination contract**: every member reaches exactly one terminal outcome, and the restore concludes with a frozen per-member report — never a livelock, never silent partial success.
+
+| Outcome | Meaning |
+|---|---|
+| `restored` | the captured bytes landed via the member's conditional write |
+| `converged` | the live state already matched the manifest — nothing written |
+| `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives** |
+| `target_lost` | the captured version is no longer reachable (expired retention, a vanished S3 version), or the member itself can no longer be driven safely (its path became a symlink, a hardlink with an outside co-owner, or a non-regular file) — reported, never substituted |
+| `forward_only_skipped` | a declared action surface (or an uncapturable member) — enumerated, skipped |
+| `held_unconfirmed` | a write whose outcome could not be confirmed — held, never guessed |
+
+Each member's leg rides its own backend's arbitration: S3 legs are a native conditional write (`If-Match` — the substrate arbitrates a racing foreign writer); file legs are a version-checked write whose foreign-edit signal is **detection only** (`no-arbiter`) — a foreign edit racing a file restore is detected and reported as a typed conflict, never presented as substrate arbitration. Restore progress is durable, so a restore interrupted mid-way resumes idempotently: already-terminal members are skipped, and a member whose live state already matches concludes `converged` without a second write.
+
+### The honesty model: restore tiers and pin states
+
+Every member carries a **restore tier**, derived from what its backend can actually promise — never asserted:
+
+| Tier | Backend shape | What it honestly means |
+|---|---|---|
+| `restorable` | versioned S3 bucket (history + a per-version legal hold) | the captured version exists and a pin can back it |
+| `restorable-unpinned` | file member over coordinator retention | history exists **now** and may expire — the retention window is a bound, not a pin |
+| `forward_only` | unversioned bucket, action surface, unconfirmable pointer | described in the manifest, not restorable — stated at capture, not discovered at restore |
+
+The durable truth is the **pair** `(restore_tier, pin_state)`. `restorable` is backed only by `pin_state="held"`; the pair `(restorable, unpinned)` — a capture whose pin legs haven't run, or a run that died before them — is rendered as **claimed-but-not-yet-backed**, never as a plain restorable state. Pins are fail-closed and loud: an S3 member whose bucket has no Object Lock configuration is durably downgraded to `restorable-unpinned` with `pin_state="pin_unavailable"` — the tier and the pin state land in one write, never silently.
+
+**The file-member retention caveat, precisely.** File members ride the coordinator's [declared version retention](#version-retention-and-read-at-version), which is a bounded window (a count/age policy), not a per-version hold. A checkpoint pin on a file member **verifies** — it checks the captured version is currently retained and still matches its fingerprint — it **cannot extend** the window or exempt the version from the policy. If the version has aged out by restore time, the restore reports that member `target_lost` rather than restoring different content; expiry always surfaces, never silently. S3 members are the stronger case: their pin is a legal hold in *your* bucket on the captured version — the substrate's own retention, at your bucket's configuration and cost.
+
+**Binary members (v1 limitation).** A file member whose bytes are not UTF-8 text is refused at capture with a typed error — before anything persists. The file restore path rides a text wire, so capturing a member that could never be restored would be a silent over-claim.
+
+### The CLI: `agent-coherence-workspace`
+
+```bash
+agent-coherence-workspace checkpoint before-migration --file notes.md --file plan.md
+agent-coherence-workspace list
+agent-coherence-workspace status <checkpoint-id>
+agent-coherence-workspace restore <checkpoint-id>
+```
+
+Four verbs — `checkpoint` (with repeatable `--file` / `--forward-only`, and `--no-pin` for capture-only), `list`, `status`, `restore`. Every verb takes `--root` (override the workspace root; default walks up to the git root) and `--json` (machine-parseable output). `status` renders every member's `(restore_tier, pin_state)` pair — including the claimed-but-not-yet-backed label — plus torn-cut flags and restore outcomes; `checkpoint` output always carries the file-retention caveat. The CLI keeps its own durable state in `<root>/.coherence/workspace.db`.
+
+Under `--json`, every error path *also* emits a one-line JSON envelope on stdout — `{"kind": "error", "exit_code": …, "reason": …, "message": …}` — so a script never has to parse stderr prose; the human message stays on stderr unchanged. Capturing a second checkpoint under an existing name is never refused (names are labels, not unique keys), but the prior ids are printed so the ambiguity is never silent — `status` and `restore` always target an id, not a name.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | the verb succeeded (restore: concluded with every member clean) |
+| `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
+| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
+
+**Where a refusal lands.** A containment refusal at **capture** is a hard exit-`2` refusal with nothing persisted. The same refusal raised inside a **restore** leg is deliberately not: the termination contract absorbs it into that member's `target_lost` so every other member still concludes, and the refusal text becomes that member's outcome detail — exit `3`, never a checkpoint left stuck mid-restore.
+
+**S3 members and the CLI.** S3 object members are captured and restored via the Python API shown above — their bindings carry credentials the CLI cannot (and should not) reconstruct. `restore` on a checkpoint with pending S3 members refuses cleanly and points you at the Python API; `status` and `list` still render those members honestly.
+
+**The HTTP surface.** The coordinator serves the workspace verbs over local HTTP — `POST /workspace/checkpoint`, `GET /workspace/checkpoints`, `POST /workspace/restore/status`, `POST /workspace/restore/member`, and `POST /workspace/restore/register` — the same routes the Python API and the CLI ride. Pin orchestration has no HTTP route by design: pins are placed and released through the Python API only, because the substrate bindings that hold them carry your credentials, and credentials never belong on the coordinator's wire.
+
+### Try it
+
+```bash
+python -m examples.workspace_versioning.main             # the guarded demo
+python -m examples.workspace_versioning.main --baseline  # loss-first, then guarded
+```
+
+Offline, deterministic, no API keys. `--baseline` first demonstrates the loss (no history, no pointer — the original bytes are unrecoverable), then the guarded arm prevents it: a file restore, an S3 If-Match restore, a delete leg restoring the ABSENT fact, a sustained foreign writer honestly reported as `conflict` (the foreign winner survives), and a forward-only member enumerated and skipped. Exit code `0` iff the whole contract holds — the exit code is the contract.
+
+### For implementers: the conformance corpus
+
+The workspace family ships in the packaged conformance corpus (`ccs.testing.substrate_conformance`), so a foreign implementation of workspace checkpoint/restore can be tested against the same scenarios ours is. Implement the `WorkspaceConformanceBinding` protocol and **declare your capabilities honestly** (`declares_versioned` / `declares_pinnable` / `declares_restart_survival`); the suite splits into **MUST-MATCH** scenarios every implementation must reproduce (one-winner restore arbitration, torn-cut detection, bounded termination under contention, restore-as-forward-commit, ABSENT-is-a-fact) and **DECLARED** scenarios pinned to your own declarations (versioned vs unversioned history, pinnable vs `restorable-unpinned`, restart survival) — a binding passes by satisfying observable outcomes, never by mimicking our internals. The corpus imports and runs without pytest; `pip install 'agent-coherence[conformance]'` adds it so skipped scenarios report as skips under your test runner. The restore-registration design is model-checked (`formal/tla/WorkspaceVersion.tla`, run in CI).
+
+**Scope, honestly.**
+
+- Single-host coordinator: checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims.
+- Restore is over **artifacts, never effects** — files and objects come back; a sent message does not.
+- File members are detection-only (`no-arbiter`); only backends with a native conditional write arbitrate. And restore is a **forward** commit carrying old bytes — versions strictly increase, history is never rewritten.
+- Restoring file members while a live coordinator session is running bypasses that session's grants — the session learns of the change on its next read, not before. The CLI warns when it detects a live coordinator; it does not refuse.
+- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores of the same checkpoint assume a single controller — run one restore at a time.
+
 ## Multi-artifact snapshot sessions
 
 An agent that reads *several* artifacts one at a time can see a torn combination:
@@ -887,6 +1017,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
 Denials are machine-readable: an agent parses the typed payload (for example
@@ -922,6 +1053,37 @@ without one skips the release rather than stripping the parent's grants
 mid-session. The Python and Node coordinator backends derive the identity
 byte-identically; the protocol corpus pins the parity (sibling collision,
 attribution, scoped release fixtures).
+
+**Compaction-aware re-grounding (v0.14.0).** When Claude Code compacts a
+session (auto-compaction or a manual `/compact`), the model's summary can
+silently drop what the session held and what peers changed around the
+boundary. Wire Claude Code's `SessionStart` hook to
+`agent-coherence-hook-client session-start` and the coordinator re-grounds
+the compacted session with a bounded payload: the grants it held at
+compaction, event-anchored ("At compaction you held EXCLUSIVE on `plan.md`
+(v7) — re-acquire before writing."), and each touched artifact's current
+coordinated version — with a stale flag when a peer advanced it past the
+session's last-observed version ("`plan.md` advanced to v9 past your
+last-observed v7 — re-read before relying on it."). The payload is
+session-scoped: the parent's lines render first, then each registered
+subagent's under a `Subagent <name>:` prefix. The subcommand gates on
+`source: "compact"` client-side, so ordinary starts, resumes, and clears
+never reach the coordinator. Delivery: the payload renders at the next
+user message and on `--resume`; a live autonomous loop additionally
+receives it on its next tool admit — attached only to allow responses,
+never to a strict-mode deny (deny bodies stay byte-identical). Bounded and
+honest: at most three artifact lines plus an overflow summary pointing at
+`agent-coherence-status`; a session with no coordination state emits
+nothing; a coordinator that is down at the compact boundary fails open
+with an empty response — coordination never blocks the session. One benign
+duplicate is possible (a mid-loop delivery followed by the next user
+turn's render); the closing line — "Versions are as of this re-grounding;
+a more recent read supersedes this notice." — makes a second sighting
+harmless. The Python and Node coordinator backends emit byte-identical
+prose (protocol-corpus pinned). Staleness flags need an observation
+baseline: rows recorded before this release have no last-observed version
+and are deliberately never flagged, so detection becomes accurate as
+sessions read and commit after the upgrade.
 
 Run the red→green demo: `python -m examples.mcp_stale_write_guard.main`
 (offline, deterministic, no keys).
@@ -1089,6 +1251,7 @@ Correctness demos lead; the token-savings / hit-rate demos follow.
 | Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
+| Workspace versioning & restore | `python -m examples.workspace_versioning.main` | Checkpoint a mixed file + S3 workspace, then restore it with per-member honesty (`restored` / `conflict` / delete leg / forward-only skip); `--baseline` shows the unrecoverable loss first (offline, no keys) |
 | Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
 | Cross-host (experimental) | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
 | LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |
@@ -1117,7 +1280,7 @@ the reader re-fetches before acting. Runs offline with no API keys. The companio
 consistent (zero stale reads over 100 + 20 live trials), so the demo isolates the real
 failure — the **client cache**, not the server. See
 [`examples/conversations_stale_read/README.md`](../examples/conversations_stale_read/README.md)
-for the full framing and the optional live Q6 probe. This is the same mechanism the
+for the full framing and the optional live consistency probe. This is the same mechanism the
 [OpenAI Agents SDK adapter](#openai-agents-sdk-adapter-experimental) applies to a live
 `Session`.
 
@@ -1371,6 +1534,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
+| `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 
 Run any command with `--help` for the full option list.
 
@@ -1439,7 +1603,7 @@ from ccs.adapters import OpenAIAgentsAdapter, CoherenceSession
 
 ### `gate(volume, path, *, decide, effect)`
 
-Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input version it was decided from. `gate()` captures the input's version, runs `decide`, re-reads at the effect boundary, and fires `effect` only if the input is unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs.
+Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input state it was decided from. `gate()` captures the input's `(version, ownership generation)` pair (one atomic coordinator snapshot, via `volume.read_with_version_generation`), runs `decide`, re-reads the pair at the effect boundary, and fires `effect` only if **both** are unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs. The two comparands answer different questions: the version answers "is the value still the one `decide` saw"; the generation answers "is the grant it was read under still standing". A coordinator sweep that reclaims a stalled holder's grant advances the generation **without** a version move, so a version-only check would fire a reclaimed (zombie) holder's effect — the generation leg holds it.
 
 ```python
 from ccs.adapters import CoherentVolume, gate
@@ -1454,11 +1618,26 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `volume` | `CoherentVolume` | A volume attached to the coordinator that tracks `path`. |
-| `path` | `str \| os.PathLike[str]` | The workspace-relative managed artifact whose version gates the effect. |
+| `path` | `str \| os.PathLike[str]` | The workspace-relative managed artifact whose `(version, ownership generation)` pair gates the effect. |
 | `decide` | `Callable[[bytes], D]` | Keyword-only. Reads the captured bytes and returns a decision passed to `effect`. |
 | `effect` | `Callable[[D], R]` | Keyword-only. The escaping side effect; fired only if the input is unchanged at the re-read. |
 
-Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version` — if the input moved, vanished, or could not be confirmed; recover with `volume.reacquire(path)`, then re-decide and re-gate.
+Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version`, `expected_generation` / `current_generation`, and a typed `hold_cause` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed.
+
+Branch on `hold_cause` rather than the message:
+
+| `hold_cause` | Meaning | Recovery |
+|---|---|---|
+| `version_moved` | a peer committed a newer version | `reacquire()`, re-decide, re-gate |
+| `grant_reclaimed` | the grant the decision was read under was reclaimed; the version never moved | `reacquire()`, re-decide, re-gate |
+| `read_denied` | the coordinator refused the re-read (strict mode; this view is INVALID) — **on a strict-mode volume this is how a reclaim usually surfaces** | `reacquire()`, re-decide, re-gate |
+| `input_vanished` | the artifact is gone at the effect boundary | re-establish the input, then re-gate |
+| `version_unconfirmed` | a degraded read returned no confirmed version | restore coordinator health, then re-gate |
+| `generation_unconfirmed` | the residual bucket: no confirmed ownership generation, from a degraded read, an out-of-band edit the coordinator could not confirm, **or** a coordinator that does not report generations at all | `reacquire()` and re-gate **first** — that clears the first two. A HOLD that survives a *successful* reacquire is the third: check the daemon's version and restart it |
+
+**What the causes do and don't tell you.** The first five are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
+
+**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
 **Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
 
@@ -1577,7 +1756,7 @@ use the `before_node` / `commit_outputs` surface. The coherence target here is t
 SDK's **`Session`** — the agent's local conversation memory
 (`get_items` / `add_items` / `pop_item` / `clear_session`). A peer that mutates a
 shared session leaves this agent's cached view stale, *regardless of how consistent
-the durable store is*. (The Q6 probe measured the OpenAI and Mistral Conversations
+the durable store is*. (The consistency probe measured the OpenAI and Mistral Conversations
 servers read-after-write consistent — so the coherence value lives on the readers'
 caches, not on the server. See the [Conversations stale-read example](#conversations-stale-read).)
 

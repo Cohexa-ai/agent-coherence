@@ -148,6 +148,65 @@ class CommitAllEntry:
 
 
 @dataclass(frozen=True)
+class WorkspaceRestoreWrite:
+    """One WRITTEN file member handed to the restore-registration step (WV
+    plan Unit 5 / R4–R5).
+
+    Hash-only by construction: the coordinator registration of a restore is
+    METADATA — ``fingerprint`` (the captured sha-256 the leg re-imposed on the
+    substrate) is the only content-shaped field, and no variant of this entry
+    ever carries bytes. ``member_path`` doubles as the coordinator artifact
+    NAME (``resolve_or_register``'s key), which is how the registration
+    resolves — never mints — content-carrying identity.
+    """
+
+    member_path: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class WorkspaceRegistrationResult:
+    """The typed terminal answer of one restore-registration call (WV plan
+    Unit 5 / R4–R5) — ``CoordinatorService.register_workspace_restore``.
+
+    A typed RETURN, never an exception (the ``ConflictDetail`` discipline).
+    ``status`` is one of the closed
+    :data:`ccs.core.exceptions.WORKSPACE_REGISTRATION_STATUSES` (matched by
+    identity):
+
+    - ``committed`` — the ``commit_all`` batch landed all-or-nothing:
+      ``versions`` maps each registered member path to its NEW coordinator
+      version (strictly greater than the pre-registration version — restore is
+      a forward commit carrying old bytes, never a decrement) and ``signals``
+      carries one :class:`InvalidationSignal` per (member, invalidated peer)
+      for broadcast-after-commit;
+    - ``empty_write_set`` — nothing needed a commit (every write was already
+      registered — ``skipped`` names the hash-identical members — or the
+      caller handed no writes): **``commit_all`` was never called** (it raises
+      on an empty write-set, by contract);
+    - ``refused`` — the batch was HELD: NOTHING mutated (all-or-nothing) and
+      ``refused`` names each failing member's own typed
+      :class:`ConflictDetail` (``version_mismatch`` / ``other_holder`` /
+      ``stale_read_generation`` — the last is the read-generation fence
+      rejecting a superseded controller's late apply).
+
+    ``skipped`` members were already registered at the manifest fingerprint
+    (the artifact's current ``content_hash`` equals the write's fingerprint):
+    the idempotency filter that makes crash-resumed registration exactly-once
+    — a re-run of an already-landed registration re-answers without a second
+    version bump.
+    """
+
+    checkpoint_id: str
+    status: str
+    detail: str
+    versions: Mapping[str, int] = field(default_factory=dict)
+    skipped: tuple[str, ...] = ()
+    signals: tuple["InvalidationSignal", ...] = ()
+    refused: Mapping[str, ConflictDetail] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class VersionedContent:
     """A successfully resolved retained version (plan item N v1, Unit 4 / R5).
 
