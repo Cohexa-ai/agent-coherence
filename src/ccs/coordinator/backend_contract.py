@@ -594,8 +594,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "status_snapshot",
         MemberClass.READ_ONLY,
         "sqlite_extended",
-        "Batch read of the artifact + state maps for the /status surface. "
-        "Non-mutating.",
+        "Batch read of the artifact + state maps for the /status surface, "
+        "optionally scoping the state half to named agents. Non-mutating.",
     ),
 )
 

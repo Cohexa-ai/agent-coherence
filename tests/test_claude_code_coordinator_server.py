@@ -3689,6 +3689,51 @@ def test_session_start_peer_advanced_renders_stale_line(
     assert "+00:00" not in text
 
 
+def test_session_start_scopes_the_state_read_to_this_sessions_agents(
+    coordinator, client: _Client, monkeypatch
+) -> None:
+    """SB-10 review: the builder must narrow ``status_snapshot`` to its own
+    session's agents.
+
+    No behavioural test can pin this — the walk looks each pair up per agent
+    (``state_by_artifact.get(artifact_id, {}).get(agent_id)``), so surplus
+    rows are unobservable and dropping the scope would render byte-identical
+    and ship green. Assert the ARGUMENT instead, or the whole point of the
+    fix — a hook path that stops reading the workspace's entire never-GC'd
+    ``agent_states`` ledger, twice per compaction, under the registry lock —
+    is revertible in silence."""
+    sid_a, sid_b = _sid("ss-scope-a"), _sid("ss-scope-b")
+    # A peer session's rows on the same artifact: present in the ledger,
+    # never in scope.
+    client.post("/hooks/pre-read",
+                {"session_id": sid_a, "path": "plan.md", "content_hash": _hash("v1")})
+    client.post("/hooks/pre-read",
+                {"session_id": sid_b, "path": "plan.md", "content_hash": _hash("v1")})
+
+    scopes: list[list[uuid.UUID] | None] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args, **kwargs):
+        scopes.append(
+            None if kwargs.get("agent_ids") is None else list(kwargs["agent_ids"])
+        )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+
+    status, _ = client.post("/hooks/session-start", {"session_id": sid_a})
+    assert status == 200
+    assert len(scopes) == 1, "the builder reads state exactly once"
+    expected = [agent_id for agent_id, _ in coordinator.agents_for_session(sid_a)]
+    assert scopes[0] == expected
+    peer_agent_ids = {
+        agent_id for agent_id, _ in coordinator.agents_for_session(sid_b)
+    }
+    assert not peer_agent_ids.intersection(scopes[0] or []), (
+        "a peer session's agent must never enter the scope"
+    )
+
+
 def test_session_start_own_last_writer_renders_non_stale_line(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -527,6 +527,8 @@ class SqliteExtended(RegistryBase, Protocol):
 
     def status_snapshot(
         self,
+        *,
+        agent_ids: Iterable[UUID] | None = None,
     ) -> tuple[
         dict[UUID, dict[str, Any]],
         dict[UUID, dict[UUID, MESIState]],

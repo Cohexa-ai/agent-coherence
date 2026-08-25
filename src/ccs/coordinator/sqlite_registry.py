@@ -2725,6 +2725,8 @@ class SqliteArtifactRegistry:
 
     def status_snapshot(
         self,
+        *,
+        agent_ids: Iterable[UUID] | None = None,
     ) -> tuple[
         dict[UUID, dict[str, Any]],
         dict[UUID, dict[UUID, MESIState]],
@@ -2742,9 +2744,32 @@ class SqliteArtifactRegistry:
         per-artifact loop that issued ``2 * N`` separate SELECTs
         (``get_artifact`` + ``get_state_map`` for each id) — eliminates
         the N+1 hot path in ``_handle_status``.
+
+        ``agent_ids`` narrows the SECOND query to those agents (SB-10
+        review). ``/status`` renders every holder and passes nothing, keeping
+        the whole-ledger view; the session-start builder can only render its
+        own session's parent + subagents, and it runs on a hook path twice
+        per compaction — under this same lock — so it scopes. Nothing
+        garbage-collects ``agent_states``, which makes the unscoped read grow
+        with the workspace's entire coordination history. An EMPTY iterable
+        means no agents, never all of them: the artifact half is still read,
+        so the workspace-level emptiness signal is unaffected either way.
+
+        The predicate is NOT index-backed: ``agent_states`` is keyed
+        ``(artifact_id, agent_id)`` and nothing indexes ``agent_id`` alone,
+        so SQLite walks the table either way (``EXPLAIN QUERY PLAN`` reports
+        ``SCAN`` for both forms). What the scope removes is the per-row cost
+        — a ``UUID(hex=...)`` and a ``MESIState`` lookup for every row the
+        caller would then discard. Measured on a 500k-row table with a
+        four-agent session: 2804ms unscoped, 174ms scoped. An index on
+        ``agent_id`` would turn the remaining constant into a bound, but it
+        needs a migration in BOTH backends (a one-sided ``user_version`` bump
+        trips the cross-runtime schema guard), so it is deliberately not done
+        here.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
                 "SELECT id, name, version FROM artifacts"
@@ -2752,9 +2777,20 @@ class SqliteArtifactRegistry:
                 aid = UUID(hex=row[0])
                 artifact_by_id[aid] = {"name": row[1], "version": row[2]}
                 state_by_artifact[aid] = {}
-            for row in self._conn.execute(
-                "SELECT artifact_id, agent_id, state FROM agent_states"
-            ).fetchall():
+            if scoped_hexes is None:
+                state_rows = self._conn.execute(
+                    "SELECT artifact_id, agent_id, state FROM agent_states"
+                ).fetchall()
+            elif scoped_hexes:
+                placeholders = ", ".join("?" * len(scoped_hexes))
+                state_rows = self._conn.execute(
+                    "SELECT artifact_id, agent_id, state FROM agent_states "
+                    f"WHERE agent_id IN ({placeholders})",
+                    scoped_hexes,
+                ).fetchall()
+            else:
+                state_rows = []
+            for row in state_rows:
                 aid = UUID(hex=row[0])
                 gid = UUID(hex=row[1])
                 # Only artifacts present in artifact_by_id get state rows.

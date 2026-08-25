@@ -4770,7 +4770,15 @@ def _build_session_start_context(
     agents = coordinator.agents_for_session(session_id)
 
     with coordinator.registry.abort_guard(abort):
-        artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
+        # Scoped to THIS session's agents (SB-10 review): the walk below can
+        # only render rows belonging to `agents`, this runs on a hook path
+        # twice per compaction, and nothing garbage-collects `agent_states` —
+        # so an unscoped read would pull the workspace's whole history through
+        # the registry lock only to discard it. The artifact half stays
+        # workspace-wide: R8's breadcrumb asks about the WORKSPACE.
+        artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot(
+            agent_ids=[agent_id for agent_id, _ in agents]
+        )
         workspace_has_state = bool(artifact_by_id)
         # KTD8: artifacts sorted by path (ASCII-lexicographic — identical to
         # the Node backend's default string sort for the path charset).
