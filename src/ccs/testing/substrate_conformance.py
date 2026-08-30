@@ -62,6 +62,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from multiprocessing.managers import BaseManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Iterator, NoReturn, Protocol, Sequence, runtime_checkable
 from uuid import UUID, uuid4
@@ -106,6 +107,7 @@ from ccs.core.substrate import (
     Tier,
     retention_is_empty_for,
 )
+from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness
 from ccs.testing.s3_local import LocalS3Client
 
 if TYPE_CHECKING:
@@ -132,6 +134,9 @@ __all__ = [
     "WorkspaceRestoreFacts",
     "assert_abort_after_partial_visibility",
     "assert_coordinator_retention_empty",
+    "assert_cross_process_one_winner_native_cas",
+    "assert_cross_process_rejects_read_then_write",
+    "CrossProcessLostUpdate",
     "assert_detect_only_silent_lost_update",
     "assert_forward_only_honest",
     "assert_invalidation_before_act",
@@ -664,6 +669,162 @@ def assert_detect_only_silent_lost_update() -> None:
     assert "cannot prevent a concurrent race" in text
     for word in _FORBIDDEN_ENFORCEMENT_WORDS:
         assert word not in text, f"detect-only text must not contain {word!r}"
+
+
+
+# ===========================================================================
+# Cross-process substrate-CAS races (guarantee-ladder plan U2; R-1/R-2).
+#
+# In-process serialization does not satisfy any clause of this contract: the
+# original race assertions above are hand-sequenced interleavings and remain
+# valuable as TYPED-OUTCOME contract tests, but only a race between separate
+# OS processes proves a binding's conditional write is atomic rather than
+# read-then-write. The packaged S3 stand-in is an in-process fake, so the
+# harness owns the sharing vehicle: a substrate-owner process serves ONE
+# LocalS3Client instance and contenders reach it through a manager proxy.
+# The raced boundary: each contender's read and conditional write are separate
+# proxied calls into the one shared instance -- the proxy serializes
+# individual calls, so a NATIVE conditional put (check+write inside one call)
+# is atomic, while a client-side check-then-write (two calls with a real gap)
+# races and is caught. A real PG/S3 endpoint, when configured, replaces the
+# proxy with the true network boundary (the `real_substrate` arm).
+# ===========================================================================
+
+
+class CrossProcessLostUpdate(AssertionError):
+    """A cross-process race produced a lost update (more than one apparent
+    winner, or a winner whose bytes did not survive). For a conforming binding
+    this is a conformance FAILURE; for the read-then-write teeth control it is
+    the expected, asserted detection."""
+
+
+class _SubstrateManager(BaseManager):
+    """The substrate-owner process: serves ONE stand-in instance to all
+    contenders. Each proxied method call executes atomically inside the owner
+    process; the gap BETWEEN calls is the raced boundary."""
+
+
+_SubstrateManager.register("LocalS3Client", LocalS3Client)
+_SubstrateManager.register("InMemoryStore", InMemoryStore)
+
+_XP_BUCKET = "xp-race"
+_XP_KEY = "artifact"
+
+
+def _xp_native_cas_contender(ctx, client_proxy, etag: str, payload: bytes) -> str:
+    """Conforming contender: both phases barrier-aligned, then ONE proxied
+    conditional put -- the check and the write execute atomically inside the
+    substrate-owner process (native CAS, the S3 If-Match shape)."""
+    ctx.barrier_wait()  # phase 1: everyone is running
+    ctx.barrier_wait()  # phase 2: everyone holds the same pre-read token
+    ctx.delay()
+    try:
+        client_proxy.put_object(Bucket=_XP_BUCKET, Key=_XP_KEY, Body=payload, IfMatch=etag)
+    except Exception as exc:  # noqa: BLE001 - manager transports remote errors opaquely
+        if "PreconditionFailed" in repr(exc):
+            return "conflict"
+        raise
+    return "won"
+
+
+def _xp_read_then_write_contender(ctx, store_proxy, expected_token: str, payload: bytes) -> str:
+    """The qm defect class: the conditional is assembled CLIENT-side from two
+    proxied calls (read+compare, then unconditional write) with a real gap."""
+    ctx.barrier_wait()  # phase 1: everyone is running
+    entry = store_proxy.get(_XP_KEY)
+    ctx.barrier_wait()  # phase 2: everyone has read the SAME token
+    ctx.delay()
+    if entry is None or entry[1] != expected_token:
+        return "conflict"
+    store_proxy.set(_XP_KEY, payload)  # unconditional -- the gap is the bug
+    return "won"
+
+
+def assert_cross_process_one_winner_native_cas(
+    *, contenders: int = 2, delays: tuple[float, ...] = (0.0, 0.05), timeout_sec: float = 60.0
+) -> None:
+    """R-1 + R-2, positive arm: N contender OS processes race one native
+    conditional write; exactly one wins, every loser gets the typed conflict,
+    and a final authoritative read shows the winner's bytes (the loser's write
+    left no trace). Must hold at EVERY delay vector including all-zero."""
+    assert len(delays) == contenders, "one delay per contender"
+    manager = _SubstrateManager()
+    manager.start()
+    try:
+        client = manager.LocalS3Client()
+        client.create_bucket(_XP_BUCKET, versioned=True)
+        seeded = client.put_object(Bucket=_XP_BUCKET, Key=_XP_KEY, Body=b"seed")
+        etag = seeded["ETag"]
+        payloads = [f"contender-{i}".encode() for i in range(contenders)]
+        harness = ProcessRaceHarness(timeout_sec=timeout_sec)
+        result = harness.race(
+            [
+                ContenderSpec(
+                    _xp_native_cas_contender,
+                    args=(client, etag, payloads[i]),
+                    delay_seconds=delays[i],
+                )
+                for i in range(contenders)
+            ]
+        )
+        for outcome in result.outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+        verdicts = [o.value for o in result.outcomes]
+        winners = [i for i, v in enumerate(verdicts) if v == "won"]
+        if len(winners) != 1:
+            raise CrossProcessLostUpdate(
+                f"expected exactly one winner, got {len(winners)}: {verdicts} (lost update)"
+            )
+        assert verdicts.count("conflict") == contenders - 1, verdicts
+        final = client.get_object(Bucket=_XP_BUCKET, Key=_XP_KEY)["Body"].read()
+        assert final == payloads[winners[0]], (
+            "the winner's bytes did not survive -- a loser's write left a trace (R-2)"
+        )
+    finally:
+        manager.shutdown()
+
+
+def _run_broken_read_then_write_race(*, raise_on_loss: bool = False) -> list[str]:
+    """Race the read-then-write control; return verdicts. With
+    ``raise_on_loss`` the detected lost update raises CrossProcessLostUpdate,
+    mirroring the conforming assertion's failure shape."""
+    manager = _SubstrateManager()
+    manager.start()
+    try:
+        store = manager.InMemoryStore()
+        token = store.set(_XP_KEY, b"seed")
+        harness = ProcessRaceHarness(timeout_sec=60.0)
+        result = harness.race(
+            [
+                ContenderSpec(_xp_read_then_write_contender, args=(store, token, b"A"), delay_seconds=0.0),
+                ContenderSpec(_xp_read_then_write_contender, args=(store, token, b"B"), delay_seconds=0.1),
+            ]
+        )
+        for outcome in result.outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+        verdicts = [o.value for o in result.outcomes]
+        if raise_on_loss and verdicts.count("won") != 1:
+            raise CrossProcessLostUpdate(
+                f"read-then-write binding produced a lost update: {verdicts}"
+            )
+        return verdicts
+    finally:
+        manager.shutdown()
+
+
+def assert_cross_process_rejects_read_then_write() -> None:
+    """R-1 teeth certification (the suite would be vacuous without it): a
+    binding whose conditional is assembled client-side from separate calls
+    MUST be caught -- both contenders report "won" and one update is silently
+    lost. The two-phase barrier makes the catch deterministic: both contenders
+    hold the same pre-read token before either writes."""
+    verdicts = _run_broken_read_then_write_race()
+    assert verdicts.count("won") == 2, (
+        f"the read-then-write control was NOT caught (verdicts: {verdicts}); "
+        "the cross-process race has lost its teeth"
+    )
 
 
 def assert_forward_only_honest() -> None:
