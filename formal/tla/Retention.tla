@@ -256,7 +256,7 @@ RetentionCommitAction ==
                  /\ UNCHANGED <<version, staleApply, history>>
         /\ UNCHANGED <<clock, mesiState, lastHeartbeat, grantedAtTick,
                        lastReclamation, ownerGeneration, readGeneration,
-                       collectedRead>>
+                       silentRevoke, collectedRead>>
 
 --------------------------------------------------------------------
 (* VersionedReadAction: a read-at-version request. A pure protocol no-op:
@@ -277,7 +277,7 @@ RetentionCommitAction ==
 VersionedReadAction ==
     /\ UNCHANGED <<mesiState, readGeneration, version, lastHeartbeat,
                    clock, grantedAtTick, lastReclamation, ownerGeneration,
-                   staleApply, history>>
+                   staleApply, silentRevoke, history>>
     /\ \E art \in Artifacts :
          \E v \in ServableHistory(art) :
            collectedRead' = (collectedRead \/ WouldServeCollected(art, v))
@@ -292,11 +292,11 @@ VersionedReadAction ==
    replaced by RetentionCommitAction (the crux modeling decision above) --
    in the retention world every version-bumping commit retains atomically. *)
 RetentionNext ==
-    \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
+    \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
     \/ (FencingWriteAction /\ UNCHANGED <<history, collectedRead>>)
-    \/ (CRInvalidateAction /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
-    \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
-    \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead>>)
+    \/ (FencingInvalidateAction /\ UNCHANGED <<history, collectedRead>>)
+    \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
+    \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
     \/ (FencingSweepAction /\ UNCHANGED <<history, collectedRead>>)
     \/ (ObserveGenAction   /\ UNCHANGED <<history, collectedRead>>)
     \/ RetentionCommitAction

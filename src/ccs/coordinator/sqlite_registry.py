@@ -124,7 +124,8 @@ from ccs.core.types import (
 # `ccs.coordinator.sqlite_registry.CasResult` a stable public import path.
 from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
-    RECLAIM_TRIGGERS,
+    EPOCH_BUMP_TRIGGERS,
+    RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -2950,11 +2951,13 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
 
-                # Read-generation fence: on a sweep reclamation (M/E -> INVALID
-                # via a reclaim trigger) bump the artifact's ownership epoch,
+                # Read-generation fence: when an M/E -> INVALID transition
+                # revokes the write claim WITHOUT moving the version (a sweep
+                # reclaim or the voluntary "invalidate" release — see
+                # EPOCH_BUMP_TRIGGERS), bump the artifact's ownership epoch
                 # atomically with the state transition in this BEGIN IMMEDIATE,
-                # so a commit by the reclaimed holder fails the generation check.
-                if prev_in_me and not new_in_me and trigger in RECLAIM_TRIGGERS:
+                # so a commit by the ex-holder fails the generation check.
+                if prev_in_me and not new_in_me and trigger in EPOCH_BUMP_TRIGGERS:
                     self._conn.execute(
                         "UPDATE artifacts SET owner_generation = owner_generation + 1 "
                         "WHERE id = ?",

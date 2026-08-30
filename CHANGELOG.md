@@ -4,6 +4,63 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Fixed
+
+- **The read-generation fence is now an operation-class property, not a
+  commit-path one — `invalidate` could both bypass it and suppress it.** The
+  fence (`owner_generation` vs a committer's captured `read_generation`) was
+  checked on the three commit paths and nowhere else. The other grant-revoking
+  operation, `CoordinatorService.invalidate`, neither consulted it nor
+  maintained it, and both halves were reachable on a single host in one process
+  — the registry `RLock` serializes each mutation but not the decision to revoke
+  against the revoke itself.
+
+  *A revoke minted at one epoch could destroy a grant issued at a later one.*
+  Invalidation signals are minted inside the registry lock and delivered after
+  it is released, so a peer could be reclaimed, re-acquire and re-read in
+  between; the stale signal then revoked the fresh grant. Reachable through
+  `CoherenceAdapterCore` (the CCSStore/LangGraph base) with the concurrent
+  callers it already documents, where nothing threads the A6 abort Event and
+  `abort_guard` is therefore a plain lock acquire. A peer-issued invalidation is
+  now pinned to the target's `last_observed_version`: a target that has already
+  observed a version at least as new as the one announced is not behind the
+  signal, so the signal is dropped as obsolete. The pin is deliberately narrow,
+  because wrongly dropping an invalidation is far worse than wrongly applying
+  one — a self-issued release (post-edit failure, session-stop, operator drain)
+  is never pinned, an already-INVALID target is never pinned (its stranded
+  SIA/EIA transient still needs clearing), and an absent observation is admitted
+  rather than dropped, matching the commit-path fence's admit-on-absent rule.
+
+  *A voluntary release could disarm the fence entirely.* `invalidate` moved an
+  M/E holder to INVALID under a trigger outside `RECLAIM_TRIGGERS`, so the
+  epoch never moved — and the sweep could not arm it later either, there being
+  no M/E grant left to reclaim. Identical end-state, opposite verdict: a
+  sweep-reclaimed holder's later commit at an unchanged version was rejected
+  `stale_read_generation`, while an `invalidate`-released one was silently
+  admitted. Epoch movement now keys on `EPOCH_BUMP_TRIGGERS` — every reclaim
+  trigger plus `invalidate` — the rule being "a write claim was revoked without
+  the version moving", which is the one condition version-CAS is structurally
+  blind to. The version-moving peer invalidations (`write` / `commit`) are
+  unchanged and still do not bump.
+
+  Both registries; `backend_contract.py` R9 restated to match. Expect more
+  `stale_read_generation` rejections where a release previously left the fence
+  unarmed — that is the fix, not a regression.
+
+  Both defects were in the formal model too: `Fencing.tla` inherited the
+  unguarded `CRInvalidateAction`, which *is* F2 encoded. `Fencing.tla` now bumps
+  the epoch on a release and carries `NoSilentRevoke`; the pin and
+  `NoZombieRevoke` live in a new sibling amendment, `ZombieRevoke.tla`, kept out
+  of `Fencing` because its per-agent observation variable would cost every
+  downstream spec (EffectGate, Retention, Snapshot) state space for a property
+  none of them is about. `NoStaleApply` structurally cannot see F2 — it is
+  defined relative to the very counter that fails to move — which is why the
+  second invariant exists; confirmed by mutation. Both new invariants carry
+  documented mutants (`formal/tla/README.md` recipes 16 and 17). `make
+  tla-check` now sweeps nine specs, ~7min20s.
+
 ## [0.14.0] - 2026-08-25
 
 ### Added

@@ -135,19 +135,26 @@ def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None
 
 
 def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
-    """The RECLAIM_TRIGGERS / CLAIM_CAPTURE_TRIGGERS constants are duplicated
-    (the registries share no base class); this pins the copies equal so the
-    bump and the capture can never silently diverge. The capture pin also
+    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS
+    constants are duplicated (the registries share no base class); this pins the
+    copies equal so the bump and the capture can never silently diverge. The capture pin also
     guards the service.fetch() trigger string: a rename there without updating
     the constants would silently disable read-generation capture on fetches."""
     from ccs.coordinator.registry import CLAIM_CAPTURE_TRIGGERS as MEM_CAPTURE
+    from ccs.coordinator.registry import EPOCH_BUMP_TRIGGERS as MEM_BUMP
     from ccs.coordinator.registry import RECLAIM_TRIGGERS as IN_MEMORY
     from ccs.coordinator.sqlite_registry import CLAIM_CAPTURE_TRIGGERS as SQL_CAPTURE
+    from ccs.coordinator.sqlite_registry import EPOCH_BUMP_TRIGGERS as SQL_BUMP
     from ccs.coordinator.sqlite_registry import RECLAIM_TRIGGERS as SQLITE
 
     assert IN_MEMORY == SQLITE == frozenset(
         {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
     )
+    # EPOCH_BUMP_TRIGGERS is what the bump sites actually key on: every reclaim
+    # trigger PLUS the voluntary "invalidate" release, which also ends a write
+    # claim without moving the version. The version-moving peer
+    # invalidations ("write"/"commit") stay out.
+    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate"})
     assert MEM_CAPTURE == SQL_CAPTURE == frozenset({"fetch"})
 
 

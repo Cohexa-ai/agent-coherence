@@ -2788,11 +2788,21 @@ class CoordinatorService:
         issued_at_tick: int,
         abort: threading.Event | None = None,
     ) -> InvalidationSignal | None:
-        """Apply invalidation for one agent under the A6 abort guard.
+        """Apply invalidation for one agent under the A6 abort guard and the
+        NoZombieRevoke pin.
 
         Wrapped in :meth:`registry.abort_guard` (finding A6): a late
         session-stop release whose handler already timed out aborts here rather
         than revoking a grant the registry has since handed to another session.
+        That guard is a *time* predicate on the local watchdog, so it covers
+        only the callers that thread an ``abort`` Event; a PEER-issued
+        invalidation delivered late through the event bus threads none.
+
+        The version pin covers the rest: an invalidation whose target has since
+        observed a version at least as new as the one announced is dropped as
+        obsolete, and returns ``None`` (see
+        :meth:`_revoke_is_superseded` for the two guards that keep the drop
+        conservative). Self-issued releases are never pinned.
         """
         with self.registry.abort_guard(abort):
             return self._invalidate_impl(
@@ -2814,6 +2824,13 @@ class CoordinatorService:
     ) -> InvalidationSignal | None:
         if not self.registry.has_artifact(artifact_id):
             return None
+        if self._revoke_is_superseded(
+            agent_id=agent_id,
+            artifact_id=artifact_id,
+            new_version=new_version,
+            issuer_agent_id=issuer_agent_id,
+        ):
+            return None
         self.registry.set_agent_state(
             artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
         )
@@ -2824,6 +2841,59 @@ class CoordinatorService:
             issued_at_tick=issued_at_tick,
             issuer_agent_id=issuer_agent_id,
         )
+
+    def _revoke_is_superseded(
+        self,
+        *,
+        agent_id: UUID,
+        artifact_id: UUID,
+        new_version: int,
+        issuer_agent_id: UUID,
+    ) -> bool:
+        """NoZombieRevoke: is this PEER-issued invalidation obsolete for its
+        target? (``NoZombieRevoke``; see ``formal/tla/ZombieRevoke.tla``.)
+
+        An invalidation announces "the artifact reached ``new_version``; the
+        copy you hold is behind it". It is minted inside the issuer's registry
+        lock and applied later, outside it — so between mint and apply the
+        target may have been reclaimed, re-acquired, and re-read. Applying the
+        stale signal then revokes a grant established AFTER the signal was
+        issued: Temporal's late-release-Signal shape, which they close with
+        signal pinning.
+
+        The pin is the target's own ``last_observed_version`` (SB-10 R6/R7) —
+        recorded atomically with every non-INVALID grant, preserved across a
+        transition to INVALID. A target that has already observed a version at
+        least as new as the one announced is not behind this signal, so the
+        signal cannot be authority over its claim.
+
+        Two guards keep the drop conservative, because wrongly DROPPING an
+        invalidation is far worse than wrongly applying one (it would leave a
+        genuinely stale copy marked valid — the stale-read → write hole this
+        layer exists to close):
+
+        1. **Self-issued releases are always honoured.** ``issuer_agent_id ==
+           agent_id`` is an agent giving back its OWN claim (a post-edit
+           failure, a session-stop release, an operator drain), never a
+           cross-agent revoke. It is not pinned.
+        2. **Only a target currently holding a claim is pinned.** An already-
+           INVALID target is pinned by nothing: applying is a state no-op, and
+           the call still has to run — ``_write_impl`` / ``_commit_impl``
+           invalidate peers directly and leave their SIA/EIA transient set for
+           the bus-delivered invalidation to clear. Skipping that would strand
+           the transient and stall both the sweep and the peer's next
+           ``commit_cas``.
+
+        Admit-on-absent, matching the commit-path fence: a target with NO
+        recorded observation is never dropped — absence is not evidence of
+        freshness.
+        """
+        if issuer_agent_id == agent_id:
+            return False
+        if self.registry.get_agent_state(artifact_id, agent_id) == MESIState.INVALID:
+            return False
+        observed = self.registry.last_observed_version_for(artifact_id, agent_id)
+        return observed is not None and observed >= new_version
 
     def delete(
         self,

@@ -266,6 +266,19 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
 
+The last four triggers move the artifact's **ownership epoch** when they take a
+holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
+*without the version moving* — the one case a version check cannot see. A later
+commit from that ex-holder is then rejected with `stale_read_generation` rather
+than silently applied. `"write"` and `"commit"` do not move the epoch: those
+paths move the version, so the version check already arbitrates them.
+
+An explicit invalidation is also **pinned**: one issued by a peer is dropped as
+obsolete if the agent it names has since observed a version at least as new as
+the one the signal announces. Without that, an invalidation minted before a peer
+was reclaimed and re-acquired would revoke the fresh grant it knows nothing
+about. An agent releasing its *own* claim is never pinned.
+
 ### Error handling
 
 The callback is called synchronously on the critical path. An exception in `state_log`

@@ -42,6 +42,23 @@
                             that never acquired and never read.
      - FencingSweepAction: SweepAction + bump ownerGeneration on each
                            reclaimed artifact, atomically.
+     - silentRevoke    : a sticky history flag -- TRUE iff any step ever
+                         revoked a write claim WITHOUT moving the ownership
+                         epoch. NoStaleApply cannot see that failure (it is
+                         defined relative to the very counter that fails to
+                         move), so it is stated separately.
+     - FencingInvalidateAction: the OTHER grant-revoking operation, likewise
+                           bumping ownerGeneration on an M/E -> I transition.
+                           The rule the bump keys on is NOT "the sweep did it"
+                           but "a write claim was revoked WITHOUT the version
+                           moving" -- and a release ends a claim at an unchanged
+                           version exactly as a reclaim does. Modelling it as
+                           the inherited unguarded CRInvalidateAction let a
+                           release SUPPRESS the fence: the holder is already I,
+                           so no later sweep has an M/E grant to reclaim and the
+                           generation never moves at all -- a shipped-code defect
+                           fixed alongside this amendment (EPOCH_BUMP_TRIGGERS
+                           in registry_protocol.py).
      - FencingCommitAction: the generation-guarded commit. WIN iff
                             readGeneration = ownerGeneration (strict-> reject,
                             EQUALITY ADMITS); a present-but-superseded
@@ -75,6 +92,14 @@
    ADMITS it; version-CAS arbitrates. The two invariants compose (NoStaleApply
    here, NoLostUpdate there); neither subsumes the other.
 
+   SIBLING AMENDMENT: the pin on the revoke itself -- a signal minted at one
+   epoch must not revoke a claim established later -- lives in ZombieRevoke.tla
+   (NoZombieRevoke). It is kept OUT of this module on purpose: it
+   needs a per-(agent, artifact) observation variable, and Fencing is EXTENDed
+   by EffectGate, Retention and Snapshot, which would all pay that state-space
+   cost for a property none of them is about. The epoch bump below adds no
+   variable, so it stays here where every downstream amendment inherits it.
+
    LIVENESS is discharged as safety + prose, consistent with OCC.tla and the
    repo's safety-only TLC convention (README). TLC checks the NoStaleApply
    safety invariant only.
@@ -92,14 +117,26 @@
 
 EXTENDS CrashRecovery
 
-(* Generation space bound for finite model checking: each sweep bumps a
-   reclaimed artifact's generation by 1, and sweeps are bounded by the tick
-   horizon, so ownerGeneration never needs to exceed MaxTicks. *)
+(* Generation space bound for finite model checking. Each sweep bumps a
+   reclaimed artifact's generation by 1 and sweeps are bounded by the tick
+   horizon; FencingInvalidateAction also bumps and is NOT tick-bounded, so both
+   bump sites carry an explicit `< MaxGen` guard rather than relying on the
+   horizon. Safety-only checking, so a guard that disables the action at the
+   ceiling is sound (it truncates the space, it does not admit anything). *)
 MaxGen == MaxTicks
 
-VARIABLES ownerGeneration, readGeneration, staleApply
+VARIABLES ownerGeneration, readGeneration, staleApply, silentRevoke
 
-fenceVars == <<allVars, ownerGeneration, readGeneration, staleApply>>
+fenceVars == <<allVars, ownerGeneration, readGeneration, staleApply,
+               silentRevoke>>
+
+(* The artifacts whose write claim this step revokes. Derived from unprimed vs
+   primed state, so every conjunct that uses it must come AFTER mesiState' is
+   assigned. Its binders are named apart from the callers' to avoid shadowing. *)
+RevokedMorE ==
+    { a \in Artifacts :
+        \E g \in Agents : mesiState[a][g] \in MorE
+                         /\ mesiState'[a][g] \notin MorE }
 
 --------------------------------------------------------------------
 (* Initialization *)
@@ -110,6 +147,7 @@ FencingInit ==
     /\ ownerGeneration = [art \in Artifacts |-> 0]
     /\ readGeneration  = [ag \in Agents |-> [art \in Artifacts |-> None]]
     /\ staleApply = FALSE
+    /\ silentRevoke = FALSE
 
 --------------------------------------------------------------------
 (* ObserveGenAction: the genuine-read capture leg -- an agent captures the
@@ -122,7 +160,8 @@ FencingInit ==
 ObserveGenAction ==
     \E ag \in Agents, art \in Artifacts :
         /\ readGeneration' = [readGeneration EXCEPT ![ag][art] = ownerGeneration[art]]
-        /\ UNCHANGED <<baseVars, crVars, ownerGeneration, staleApply>>
+        /\ UNCHANGED <<baseVars, crVars, ownerGeneration, staleApply,
+                      silentRevoke>>
 
 --------------------------------------------------------------------
 (* FencingWriteAction: the pessimistic E/M acquire (inherited CRWriteAction)
@@ -144,7 +183,7 @@ FencingWriteAction ==
          IF mesiState[art][ag] \notin MorE /\ mesiState'[art][ag] \in MorE
          THEN ownerGeneration[art]
          ELSE readGeneration[ag][art]]]
-    /\ UNCHANGED <<ownerGeneration, staleApply>>
+    /\ UNCHANGED <<ownerGeneration, staleApply, silentRevoke>>
 
 --------------------------------------------------------------------
 (* FencingCommitAction: generation-guarded commit (both paths, uniform).
@@ -190,7 +229,8 @@ FencingCommitAction ==
                  /\ ~(rg = og)
                  /\ UNCHANGED <<version, staleApply>>
         /\ UNCHANGED <<clock, mesiState, lastHeartbeat, grantedAtTick,
-                       lastReclamation, ownerGeneration, readGeneration>>
+                       lastReclamation, ownerGeneration, readGeneration,
+                       silentRevoke>>
 
 --------------------------------------------------------------------
 (* FencingSweepAction: SweepAction + bump ownerGeneration on every reclaimed
@@ -223,24 +263,54 @@ FencingSweepAction ==
           /\ ownerGeneration' = [art \in Artifacts |->
                IF art \in reclaimedArts THEN ownerGeneration[art] + 1
                ELSE ownerGeneration[art]]
+    /\ silentRevoke' = (silentRevoke
+                       \/ (\E a2 \in RevokedMorE :
+                             ownerGeneration'[a2] = ownerGeneration[a2]))
     /\ UNCHANGED <<clock, version, lastHeartbeat, readGeneration, staleApply>>
+
+--------------------------------------------------------------------
+(* FencingInvalidateAction: the voluntary release (service.invalidate) + the
+   SAME generation bump the sweep performs, atomically with the M/E -> I
+   transition. Both operations revoke a write claim without moving the version,
+   which is the one condition version-CAS is structurally blind to, so both
+   must move the epoch. Keyed on the M/E -> I transition computed from
+   mesiState vs mesiState' (the UpdatedGrantedAtTick discipline), never reaching
+   into CRInvalidateAction's existential binding. A release from S or I leaves
+   the generation alone: no write claim was revoked. *)
+--------------------------------------------------------------------
+
+FencingInvalidateAction ==
+    /\ CRInvalidateAction
+    /\ \A a2 \in RevokedMorE : ownerGeneration[a2] < MaxGen   (* finite bound *)
+    /\ ownerGeneration' = [a2 \in Artifacts |->
+         IF a2 \in RevokedMorE THEN ownerGeneration[a2] + 1
+         ELSE ownerGeneration[a2]]
+    /\ silentRevoke' = (silentRevoke
+                       \/ (\E a2 \in RevokedMorE :
+                             ownerGeneration'[a2] = ownerGeneration[a2]))
+    /\ UNCHANGED <<readGeneration, staleApply>>
 
 --------------------------------------------------------------------
 (* Specification *)
 --------------------------------------------------------------------
 
-(* Inherited CR actions keep the fence variables unchanged, EXCEPT the write:
-   CRFetchAction models the read -> S. The unguarded CRCommitAction, the
-   inherited CRWriteAction, and the inherited SweepAction are DELIBERATELY
-   replaced by FencingCommitAction, FencingWriteAction (which captures the
-   read-generation at the E/M acquire), and FencingSweepAction (the crux
-   modeling decision above). *)
+(* Inherited CR actions keep the fence variables unchanged, EXCEPT the write
+   and the invalidate: CRFetchAction models the read -> S. The unguarded
+   CRCommitAction, the inherited CRWriteAction, the inherited SweepAction and
+   the inherited CRInvalidateAction are DELIBERATELY replaced by
+   FencingCommitAction, FencingWriteAction (which captures the read-generation
+   at the E/M acquire), FencingSweepAction (the crux modeling decision above)
+   and FencingInvalidateAction (which bumps the generation on the OTHER
+   grant-revoking operation). *)
 FencingNext ==
-    \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
+    \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration,
+                                        staleApply, silentRevoke>>)
     \/ FencingWriteAction
-    \/ (CRInvalidateAction /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
-    \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
-    \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply>>)
+    \/ FencingInvalidateAction
+    \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,
+                                        silentRevoke>>)
+    \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,
+                                        silentRevoke>>)
     \/ FencingSweepAction
     \/ ObserveGenAction
     \/ FencingCommitAction
@@ -254,6 +324,7 @@ FencingSpec == FencingInit /\ [][FencingNext]_fenceVars
 FencingTypeOK ==
     /\ CRTypeOK
     /\ staleApply \in BOOLEAN
+    /\ silentRevoke \in BOOLEAN
     /\ \A art \in Artifacts : ownerGeneration[art] \in 0..MaxGen
     /\ \A ag \in Agents, art \in Artifacts :
          readGeneration[ag][art] \in ({None} \cup (0..MaxGen))
@@ -277,5 +348,20 @@ ReadGenBounded ==
    MonotonicVersion, and the CR invariants (I3-I6) are inherited and re-checked
    to validate composition. *)
 NoStaleApply == staleApply = FALSE
+
+(* F2's own property, because NoStaleApply structurally cannot see it: that flag
+   is defined RELATIVE to ownerGeneration, and the failure here is the
+   generation not moving at all. (Confirmed by mutation: reverting the
+   invalidate bump leaves NoStaleApply, ReadGenBounded and SingleWriter all
+   satisfied -- the model reported no error.) So state it directly: a write
+   claim is never revoked without the ownership epoch moving.
+
+   Scoped to the two REVOKE actions (sweep reclaim, voluntary release), NOT to
+   every M/E -> I transition. The acquire leg (WriteAction invalidating peers)
+   also ends a claim at an unchanged version and deliberately does NOT bump, and
+   that is sound because every exit from the acquirer's grant is covered: it
+   commits (the version moves, version-CAS arbitrates), it is reclaimed (bump),
+   or it releases (bump, since this amendment). There is no fourth exit. *)
+NoSilentRevoke == silentRevoke = FALSE
 
 ==========================================================================

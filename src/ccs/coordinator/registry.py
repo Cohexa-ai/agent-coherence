@@ -43,7 +43,8 @@ from ccs.core.types import (
 # `ccs.coordinator.registry.CasResult` a stable public import path.
 from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
-    RECLAIM_TRIGGERS,
+    EPOCH_BUMP_TRIGGERS,
+    RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -513,11 +514,13 @@ class ArtifactRegistry:
                 record.last_reclamation_by_agent.pop(agent_id, None)
         elif prev_in_me:
             record.granted_at_tick_by_agent.pop(agent_id, None)
-            # Read-generation fence: a sweep reclamation of this M/E grant bumps
-            # the artifact's ownership epoch, atomically (GIL) with the INVALID
-            # transition, so a commit by the reclaimed (or any pre-reclaim)
-            # holder fails the generation check. Only sweep triggers bump.
-            if trigger in RECLAIM_TRIGGERS:
+            # Read-generation fence: revoking this M/E grant WITHOUT moving the
+            # version bumps the artifact's ownership epoch, atomically (GIL)
+            # with the INVALID transition, so a commit by the ex-holder (or any
+            # pre-revocation holder) fails the generation check. Both the sweep
+            # reclaims and the voluntary release ("invalidate") qualify — see
+            # EPOCH_BUMP_TRIGGERS. The version-moving peer invalidations do not.
+            if trigger in EPOCH_BUMP_TRIGGERS:
                 record.owner_generation += 1
 
         # Read-generation fence: capture the current ownership epoch into the
