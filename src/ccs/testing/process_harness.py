@@ -235,6 +235,10 @@ class ProcessRaceHarness:
 
         A hung or lost child is a :class:`HarnessFailure`, never a pass: the
         remaining children are terminated (then killed) and the run aborts.
+        A contender that crashes *before* the rendezvous aborts the barrier,
+        so its siblings unblock immediately (surfacing as
+        ``BrokenBarrierError`` outcomes) instead of stranding until the
+        timeout.
         """
         if len(contenders) < 2:
             raise HarnessFailure("a race needs at least two contenders")
@@ -252,16 +256,36 @@ class ProcessRaceHarness:
             proc.start()
         deadline = time.monotonic() + self._timeout_sec
         raw: dict[int, tuple[Any, ...]] = {}
+        barrier_aborted = False
         try:
             while len(raw) < len(procs):
                 item = _next_message(queue, deadline)
                 if item is None:
                     missing = sorted(set(range(len(procs))) - set(raw))
-                    raise HarnessFailure(
+                    message = (
                         f"race timed out after {self._timeout_sec}s; "
                         f"contender(s) {missing} never reported (killed)"
                     )
+                    collected = ", ".join(
+                        f"contender[{i}] {raw[i][3]}"
+                        for i in sorted(raw)
+                        if raw[i][1] == "error"
+                    )
+                    if collected:
+                        message += f"; collected errors: {collected}"
+                    raise HarnessFailure(message)
                 raw[item[0]] = item
+                if item[1] == "error" and not barrier_aborted:
+                    # A pre-barrier crash must not strand its siblings at the
+                    # rendezvous until the timeout: abort the barrier so
+                    # current and future waiters unblock immediately with
+                    # BrokenBarrierError (which _child_main reports as their
+                    # own error outcomes, pointing at the root cause alongside
+                    # the crasher's error). Contenders already past the
+                    # barrier are unaffected — abort only breaks current and
+                    # future waits.
+                    barrier.abort()
+                    barrier_aborted = True
         finally:
             _terminate_and_join(procs)
         outcomes = []

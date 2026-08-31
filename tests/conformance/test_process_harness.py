@@ -58,6 +58,15 @@ def _return_delay(ctx) -> float:
     return ctx.delay_seconds
 
 
+def _raise_before_barrier(ctx) -> None:
+    raise RuntimeError("crashed before the rendezvous")
+
+
+def _barrier_then_return(ctx) -> str:
+    ctx.barrier_wait()
+    return "made it"
+
+
 # ---------------------------------------------------------------------------
 # Scenarios (plan U1)
 # ---------------------------------------------------------------------------
@@ -107,6 +116,35 @@ def test_hanging_contender_is_killed_and_reported_as_harness_failure() -> None:
                 ContenderSpec(_hang_forever),
             ]
         )
+
+
+def test_pre_barrier_crash_aborts_the_barrier_so_the_sibling_is_not_stranded() -> None:
+    """A contender that crashes BEFORE the rendezvous must not strand its
+    sibling at the barrier until the harness timeout: the harness aborts the
+    barrier on the first collected error, so the run finishes promptly with
+    the crasher's root-cause error in the result."""
+    harness = ProcessRaceHarness(timeout_sec=30.0)
+    start = time.monotonic()
+    result = harness.race(
+        [
+            ContenderSpec(_raise_before_barrier),
+            ContenderSpec(_barrier_then_return),
+        ]
+    )
+    elapsed = time.monotonic() - start
+    # Generous bound (spawn startup only) — well under the 30s harness timeout,
+    # which the run would have ridden out before the abort existed.
+    assert elapsed < 15.0
+    crasher, sibling = result.outcomes
+    assert isinstance(crasher.error, ContenderError)
+    assert "RuntimeError" in crasher.error.exc_repr
+    assert "crashed before the rendezvous" in str(crasher.error)
+    # The sibling either broke at the aborted barrier (its own error outcome
+    # pointing at the root cause) or happened to finish before the abort.
+    if sibling.error is not None:
+        assert "BrokenBarrierError" in sibling.error.exc_repr
+    else:
+        assert sibling.value == "made it"
 
 
 def test_delay_parameter_reaches_the_child() -> None:

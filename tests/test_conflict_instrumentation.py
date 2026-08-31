@@ -222,3 +222,90 @@ def test_offline_reader_tolerates_a_pre_instrumentation_db(tmp_path: Path) -> No
     db = tmp_path / "old.db"
     sqlite3.connect(db).close()
     assert read_conflict_totals(db) == {}
+
+
+# ---------------------------------------------------------------------------
+# BaseException pass-through and read-only handles (regressions for the
+# in_transaction-guarded handler and the tolerant read-only totals path)
+# ---------------------------------------------------------------------------
+
+
+def test_base_exception_in_callback_propagates_clean_after_commit(tmp_path: Path) -> None:
+    """An observer letting a BaseException through must not be shadowed by a
+    'cannot rollback - no transaction is active' error: the deny's COMMIT lands
+    before callbacks fire, so the in_transaction guard skips the moot ROLLBACK
+    and the original SystemExit propagates with the counter row durable."""
+    reg = SqliteArtifactRegistry(tmp_path / "state.db")
+    try:
+        art = _mk_artifact()
+        agent = uuid4()
+        _seed(reg, art, agent)
+
+        def _exit(a: UUID, g: UUID, r: str) -> None:
+            raise SystemExit("observer")
+
+        reg.conflict_callbacks.append(_exit)
+        with pytest.raises(SystemExit):
+            reg.commit_cas(art.id, agent, expected_version=0, content_hash="h")
+        # Same handle stays usable: the COMMIT preceded the raise.
+        reg.conflict_callbacks.clear()
+        assert reg.conflict_outcome_totals() == {(art.id, agent, "version_mismatch"): 1}
+    finally:
+        reg.close()
+
+
+def test_base_exception_in_callback_propagates_clean_after_commit_all(
+    tmp_path: Path,
+) -> None:
+    reg = SqliteArtifactRegistry(tmp_path / "state.db")
+    try:
+        art = _mk_artifact()
+        agent = uuid4()
+        _seed(reg, art, agent)
+
+        def _exit(a: UUID, g: UUID, r: str) -> None:
+            raise SystemExit("observer")
+
+        reg.conflict_callbacks.append(_exit)
+        with pytest.raises(SystemExit):
+            reg.commit_all(
+                agent, {art.id: CommitAllEntry(expected_version=0, content_hash="h")}
+            )
+        reg.conflict_callbacks.clear()
+        assert reg.conflict_outcome_totals() == {(art.id, agent, "version_mismatch"): 1}
+    finally:
+        reg.close()
+
+
+def test_read_only_handle_tolerates_pre_instrumentation_db(tmp_path: Path) -> None:
+    """A read-only open of a pre-U5 db (valid coordinator schema, no
+    conflict_counters table — simulated by dropping the table the writer
+    created, keeping the schema stamp valid) reports zero, not an error."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE conflict_counters")
+    conn.commit()
+    conn.close()
+    ro = SqliteArtifactRegistry(db, read_only=True)
+    try:
+        assert ro.conflict_outcome_totals() == {}
+    finally:
+        ro.close()
+
+
+def test_read_only_handle_serves_persisted_counts(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    art = _mk_artifact()
+    agent = uuid4()
+    _seed(reg, art, agent)
+    reg.commit_cas(art.id, agent, expected_version=0, content_hash="h")
+    reg.close()
+    ro = SqliteArtifactRegistry(db, read_only=True)
+    try:
+        assert ro.conflict_outcome_totals() == {(art.id, agent, "version_mismatch"): 1}
+    finally:
+        ro.close()

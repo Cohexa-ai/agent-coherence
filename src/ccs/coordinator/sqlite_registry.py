@@ -3442,18 +3442,37 @@ class SqliteArtifactRegistry:
         ``_ensure_conflict_counters_table`` guarantees the table exists, so
         any ``OperationalError`` caught there is a real failure and is
         re-raised rather than silently swallowed."""
-        try:
-            rows = self._conn.execute(
-                "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
-            ).fetchall()
-        except sqlite3.OperationalError as exc:
-            if self._read_only and "no such table" in str(exc):
-                return {}
-            raise
-        return {
-            (UUID(hex=art_hex), UUID(hex=agent_hex), reason): count
-            for art_hex, agent_hex, reason, count in rows
-        }
+        # Read-under-lock convention (matches every sibling accessor on the
+        # shared connection): an unlocked read could observe another thread's
+        # uncommitted BEGIN IMMEDIATE upserts. RLock, so re-entrant callers
+        # cannot deadlock.
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return {}
+                raise
+            return {
+                (UUID(hex=art_hex), UUID(hex=agent_hex), reason): count
+                for art_hex, agent_hex, reason, count in rows
+            }
+
+    def _deny(
+        self, artifact_id: UUID, agent_id: UUID, reason: str, current: int
+    ) -> ConflictDetail:
+        """One typed deny: count it inside the open txn, COMMIT so the count
+        lands atomically with the decision, fire observers only after the txn
+        closes, and hand back the ConflictDetail. The count -> COMMIT -> fire
+        -> return ordering is a correctness invariant; single-sourced here so
+        the three commit_cas branches cannot drift apart."""
+        detail = ConflictDetail(reason, current)
+        self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
+        self._conn.execute("COMMIT")
+        self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
+        return detail
 
     def commit_cas(
         self,
@@ -3538,20 +3557,16 @@ class SqliteArtifactRegistry:
                 current = version_row[0]
                 current_size_tokens = version_row[1]
 
-                # 3-outcome discrimination. Each ConflictDetail branch upserts
-                # its counter row (U5 instrumentation) then COMMITs, so the
-                # count lands atomically with the deny; corruption COMMITs a
+                # 3-outcome discrimination. Each ConflictDetail branch resolves
+                # via _deny (U5 instrumentation; see its docstring for the
+                # count -> COMMIT -> fire ordering); corruption COMMITs a
                 # genuinely read-only txn (corruption is not one of the three
                 # counted reasons).
                 if expected_version > current:
                     self._conn.execute("COMMIT")
                     return CasCorruption(current_version=current)
                 if expected_version < current:
-                    detail = ConflictDetail("version_mismatch", current)
-                    self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
-                    self._conn.execute("COMMIT")
-                    self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
-                    return detail
+                    return self._deny(artifact_id, agent_id, "version_mismatch", current)
                 # Version matches. Holder check is the OCC-vs-pessimistic guard;
                 # exclude the committer itself (it is S/I, but be defensive).
                 other_holder = self._conn.execute(
@@ -3568,11 +3583,7 @@ class SqliteArtifactRegistry:
                     ),
                 ).fetchone()
                 if other_holder is not None:
-                    detail = ConflictDetail("other_holder", current)
-                    self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
-                    self._conn.execute("COMMIT")
-                    self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
-                    return detail
+                    return self._deny(artifact_id, agent_id, "other_holder", current)
 
                 # Read-generation fence: reject a committer whose CAPTURED
                 # read-claim was superseded by a sweep reclamation (a reclaimed
@@ -3595,11 +3606,9 @@ class SqliteArtifactRegistry:
                     if og_row is None:
                         raise KeyError(f"artifact {artifact_id} not in registry")
                     if rg_row[0] < og_row[0]:
-                        detail = ConflictDetail("stale_read_generation", current)
-                        self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
-                        self._conn.execute("COMMIT")
-                        self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
-                        return detail
+                        return self._deny(
+                            artifact_id, agent_id, "stale_read_generation", current
+                        )
 
                 # ---- WIN: mutate atomically ----
                 next_version = current + 1

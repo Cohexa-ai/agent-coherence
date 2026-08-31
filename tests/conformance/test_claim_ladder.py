@@ -74,10 +74,11 @@ def _decorator_dotted_name(node: ast.expr) -> str:
     return ".".join(reversed(parts))
 
 
-def _pytestmark_values(tree: ast.Module) -> list[ast.expr]:
-    """Mark expressions from module-level ``pytestmark = ...`` (bare or list)."""
+def _pytestmark_values(body: list[ast.stmt]) -> list[ast.expr]:
+    """Mark expressions from ``pytestmark = ...`` assignments in a statement
+    body — module-level or class-body — bare mark, call, or list/tuple."""
     values: list[ast.expr] = []
-    for stmt in tree.body:
+    for stmt in body:
         if isinstance(stmt, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id == "pytestmark"
             for target in stmt.targets
@@ -87,27 +88,74 @@ def _pytestmark_values(tree: ast.Module) -> list[ast.expr]:
     return values
 
 
+def _enclosing_class_stack(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> list[ast.ClassDef]:
+    """Every ClassDef enclosing ``node``, innermost first."""
+    stack: list[ast.ClassDef] = []
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, ast.ClassDef):
+            stack.append(current)
+        current = parents.get(current)
+    return stack
+
+
+def _marks_applied_to(tree: ast.Module, functions: list[ast.AST]) -> list[ast.expr]:
+    """Every mark pytest would apply to the functions: their own decorators,
+    each enclosing class's decorators and class-body ``pytestmark``, and the
+    module-level ``pytestmark``."""
+    parents = {
+        child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+    }
+    marks = [mark for function in functions for mark in function.decorator_list]
+    for function in functions:
+        for enclosing in _enclosing_class_stack(function, parents):
+            marks.extend(enclosing.decorator_list)
+            marks.extend(_pytestmark_values(enclosing.body))
+    marks.extend(_pytestmark_values(tree.body))
+    return marks
+
+
+def _is_literal_true_skipif(mark: ast.expr) -> bool:
+    """A ``skipif`` call whose first positional argument is a truthy literal —
+    a non-Call skipif or a non-literal condition stays allowed."""
+    return (
+        isinstance(mark, ast.Call)
+        and _decorator_dotted_name(mark).endswith("mark.skipif")
+        and bool(mark.args)
+        and isinstance(mark.args[0], ast.Constant)
+        and bool(mark.args[0].value)
+    )
+
+
 def _assert_not_unconditionally_skipped(
     source: str, bare_name: str, rung: str, file_label: str
 ) -> None:
     """AST-level skip guard — immune to formatting (multi-line decorators,
-    ``pytestmark`` assignments) that evades line-oriented string checks."""
+    ``pytestmark`` assignments, class-level marks) that evades line-oriented
+    string checks."""
     tree = ast.parse(source)
-    functions = [
+    functions: list[ast.AST] = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == bare_name
     ]
     assert functions, f"rung {rung!r}: {bare_name!r} not found in {file_label}"
-    marks = [mark for function in functions for mark in function.decorator_list]
-    marks.extend(_pytestmark_values(tree))
+    marks = _marks_applied_to(tree, functions)
     # endswith keeps ``mark.skipif`` (the platform-gate exception) allowed while
     # catching every ``pytest.mark.skip`` spelling — bare, called, or aliased.
     skips = [mark for mark in marks if _decorator_dotted_name(mark).endswith("mark.skip")]
     assert not skips, (
         f"rung {rung!r}: {bare_name!r} in {file_label} is unconditionally skipped "
         "(skipif with a stated platform reason is the only allowed guard)"
+    )
+    literal_skipifs = [mark for mark in marks if _is_literal_true_skipif(mark)]
+    assert not literal_skipifs, (
+        f"rung {rung!r}: {bare_name!r} in {file_label} carries a skipif with a "
+        "truthy-literal condition — an unconditional skip in disguise "
+        "(skipif must gate on a real, evaluated condition)"
     )
 
 
@@ -144,11 +192,47 @@ def test_skip_guard_catches_module_level_pytestmark_skip() -> None:
         _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
 
 
-def test_skip_guard_allows_skipif_platform_gate() -> None:
-    """Positive control: skipif-with-reason is the sanctioned platform gate."""
+def test_skip_guard_catches_class_level_skip_decorator() -> None:
+    """Teeth: ``@pytest.mark.skip`` on the enclosing class pins its methods."""
     source = (
         "import pytest\n\n"
-        '@pytest.mark.skipif(True, reason="platform")\n'
+        '@pytest.mark.skip(reason="x")\n'
+        "class TestX:\n"
+        "    def test_foo(self): ...\n"
+    )
+    with pytest.raises(AssertionError, match="unconditionally skipped"):
+        _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
+
+
+def test_skip_guard_catches_class_body_pytestmark_skip() -> None:
+    """Teeth: ``pytestmark`` inside a class body cannot evade the guard."""
+    source = (
+        "import pytest\n\n"
+        "class TestX:\n"
+        '    pytestmark = pytest.mark.skip(reason="x")\n'
+        "    def test_foo(self): ...\n"
+    )
+    with pytest.raises(AssertionError, match="unconditionally skipped"):
+        _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
+
+
+def test_skip_guard_catches_literal_true_skipif() -> None:
+    """Teeth: ``skipif(True, ...)`` is an unconditional skip in disguise."""
+    source = (
+        "import pytest\n\n"
+        '@pytest.mark.skipif(True, reason="flaky")\n'
+        "def test_foo(): ...\n"
+    )
+    with pytest.raises(AssertionError, match="in disguise"):
+        _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
+
+
+def test_skip_guard_allows_skipif_platform_gate() -> None:
+    """Positive control: a CONDITIONAL skipif is the sanctioned platform gate."""
+    source = (
+        "import sys\n\n"
+        "import pytest\n\n"
+        '@pytest.mark.skipif(sys.platform == "win32", reason="platform")\n'
         "def test_foo(): ...\n"
     )
     _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
