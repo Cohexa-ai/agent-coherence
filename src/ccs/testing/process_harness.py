@@ -52,6 +52,7 @@ __all__ = [
     "HarnessFailure",
     "ProcessRaceHarness",
     "RaceResult",
+    "run_in_subprocess",
 ]
 
 
@@ -244,3 +245,45 @@ class ProcessRaceHarness:
             f"EXEMPT [{e.clause}] {e.subject}: {e.reason}"
             for e in self._exemptions
         ]
+
+
+def run_in_subprocess(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any:
+    """Run ONE contender in its own OS process and return its value.
+
+    The single-step sibling of :meth:`ProcessRaceHarness.race` for sequential
+    cross-process scenarios (acquire in one process, commit from another):
+    same spawn context, same typed channel, same kill-on-hang discipline. The
+    child's :class:`ContenderContext` carries a one-party barrier, so the
+    contender's ``ctx.barrier_wait()`` returns immediately.
+
+    A raise in the child re-raises here as :class:`ContenderError`; a hang is
+    a :class:`HarnessFailure` — never a pass.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(1)
+    queue = ctx.SimpleQueue()
+    proc = ctx.Process(
+        target=_child_main,
+        args=(0, spec.fn, spec.args, spec.delay_seconds, barrier, queue),
+        daemon=True,
+    )
+    proc.start()
+    deadline = time.monotonic() + timeout_sec
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessFailure(f"subprocess step timed out after {timeout_sec}s (killed)")
+            if queue._reader.poll(min(remaining, 0.1)):  # noqa: SLF001
+                index, kind, value, exc_repr, tb_text = queue.get()
+                break
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+        proc.join(timeout=5.0)
+        if proc.is_alive():  # pragma: no cover - stubborn child
+            proc.kill()
+            proc.join(timeout=5.0)
+    if kind == "error":
+        raise ContenderError(index, exc_repr, tb_text)
+    return value
