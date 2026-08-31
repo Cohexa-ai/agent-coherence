@@ -12,6 +12,7 @@ importing the packaged registry never inherits repo-local test references.
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -60,22 +61,97 @@ def test_every_proving_test_resolves_at_collection(rung: str, node_id: str) -> N
     )
 
 
+def _decorator_dotted_name(node: ast.expr) -> str:
+    """Dotted name of a decorator/mark expression, unwrapping a call to its func."""
+    if isinstance(node, ast.Call):
+        node = node.func
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _pytestmark_values(tree: ast.Module) -> list[ast.expr]:
+    """Mark expressions from module-level ``pytestmark = ...`` (bare or list)."""
+    values: list[ast.expr] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in stmt.targets
+        ):
+            value = stmt.value
+            values.extend(value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value])
+    return values
+
+
+def _assert_not_unconditionally_skipped(
+    source: str, bare_name: str, rung: str, file_label: str
+) -> None:
+    """AST-level skip guard — immune to formatting (multi-line decorators,
+    ``pytestmark`` assignments) that evades line-oriented string checks."""
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == bare_name
+    ]
+    assert functions, f"rung {rung!r}: {bare_name!r} not found in {file_label}"
+    marks = [mark for function in functions for mark in function.decorator_list]
+    marks.extend(_pytestmark_values(tree))
+    # endswith keeps ``mark.skipif`` (the platform-gate exception) allowed while
+    # catching every ``pytest.mark.skip`` spelling — bare, called, or aliased.
+    skips = [mark for mark in marks if _decorator_dotted_name(mark).endswith("mark.skip")]
+    assert not skips, (
+        f"rung {rung!r}: {bare_name!r} in {file_label} is unconditionally skipped "
+        "(skipif with a stated platform reason is the only allowed guard)"
+    )
+
+
 @pytest.mark.parametrize(("rung", "node_id"), _all_proving_tests())
 def test_no_proving_test_is_unconditionally_skipped(rung: str, node_id: str) -> None:
     """A proving test behind an unconditional skip proves nothing."""
     file_part, test_name = node_id.split("::", 1)
     source = (_REPO_ROOT / file_part).read_text()
     bare_name = test_name.rsplit("::", 1)[-1]
-    match = re.search(
-        rf"((?:^\s*@.*\n)*)^\s*def {re.escape(bare_name)}\(", source, re.MULTILINE
+    _assert_not_unconditionally_skipped(source, bare_name, rung, file_part)
+
+
+def test_skip_guard_catches_multiline_skip_decorator() -> None:
+    """Teeth: a multi-line ``@pytest.mark.skip(...)`` cannot evade the guard."""
+    source = (
+        "import pytest\n\n"
+        "@pytest.mark.skip(\n"
+        '    reason="x"\n'
+        ")\n"
+        "def test_foo(): ...\n"
     )
-    assert match is not None, f"rung {rung!r}: {bare_name!r} not found in {file_part}"
-    decorators = match.group(1)
-    assert "pytest.mark.skip(" not in decorators and "pytest.mark.skip\n" not in decorators, (
-        f"rung {rung!r}: {node_id!r} is unconditionally skipped (skipif with a "
-        "stated platform reason is the only allowed guard)"
+    with pytest.raises(AssertionError, match="unconditionally skipped"):
+        _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
+
+
+def test_skip_guard_catches_module_level_pytestmark_skip() -> None:
+    """Teeth: ``pytestmark = pytest.mark.skip(...)`` cannot evade the guard."""
+    source = (
+        "import pytest\n\n"
+        'pytestmark = pytest.mark.skip(reason="x")\n\n'
+        "def test_foo(): ...\n"
     )
-    assert "pytestmark = pytest.mark.skip\n" not in source
+    with pytest.raises(AssertionError, match="unconditionally skipped"):
+        _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
+
+
+def test_skip_guard_allows_skipif_platform_gate() -> None:
+    """Positive control: skipif-with-reason is the sanctioned platform gate."""
+    source = (
+        "import pytest\n\n"
+        '@pytest.mark.skipif(True, reason="platform")\n'
+        "def test_foo(): ...\n"
+    )
+    _assert_not_unconditionally_skipped(source, "test_foo", "rung-x", "<inline>")
 
 
 def _claim_section() -> str:
@@ -102,10 +178,17 @@ def test_every_readme_claim_row_has_a_rung() -> None:
     assert row_leads, "the README claim table was not found — update the drift guard"
     all_pins = {pin for rung in CLAIM_LADDER for pin in rung.readme_pins}
     for lead in row_leads:
-        assert any(lead.startswith(pin) or pin.startswith(lead) for pin in all_pins), (
+        assert lead in all_pins, (
             f"README claims {lead!r} but no rung backs it — add the rung (with "
             "proving tests) or remove the claim"
         )
+
+
+def test_readme_row_guard_rejects_extending_lead() -> None:
+    """Teeth: a lead that merely extends a real pin (broader claim, same prefix)
+    must not satisfy the exact-membership check."""
+    all_pins = {pin for rung in CLAIM_LADDER for pin in rung.readme_pins}
+    assert "Stale-read overwrite across hosts" not in all_pins
 
 
 def test_no_cross_host_rung_exists_to_claim() -> None:

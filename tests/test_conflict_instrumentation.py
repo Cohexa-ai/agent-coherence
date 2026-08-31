@@ -83,6 +83,16 @@ def test_stale_read_generation_counted_distinctly(registry) -> None:
     }
 
 
+def test_other_holder_counted_distinctly(registry) -> None:
+    art = _mk_artifact()
+    holder, committer = uuid4(), uuid4()
+    _seed(registry, art, holder, committer)
+    registry.set_agent_state(art.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    result = registry.commit_cas(art.id, committer, expected_version=art.version, content_hash="h")
+    assert isinstance(result, ConflictDetail) and result.reason == "other_holder"
+    assert registry.conflict_outcome_totals() == {(art.id, committer, "other_holder"): 1}
+
+
 def test_win_counts_nothing_and_zero_is_the_reported_result(registry) -> None:
     art = _mk_artifact()
     agent = uuid4()
@@ -200,4 +210,15 @@ def test_offline_reader_missing_file_raises_not_zero(tmp_path: Path) -> None:
 def test_offline_reader_reports_zero_for_a_conflict_free_db(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()
+    assert read_conflict_totals(db) == {}
+
+
+def test_offline_reader_tolerates_a_pre_instrumentation_db(tmp_path: Path) -> None:
+    """A db that predates the instrumentation has no conflict_counters table at
+    all — created here with raw sqlite, bypassing the registry writer whose
+    open would create it. That reads as zero recorded, not an error."""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    sqlite3.connect(db).close()
     assert read_conflict_totals(db) == {}

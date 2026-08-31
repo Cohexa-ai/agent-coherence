@@ -3421,8 +3421,12 @@ class SqliteArtifactRegistry:
         self, artifact_id: UUID, agent_id: UUID, reason: str
     ) -> None:
         """Notify observers AFTER the counter upsert committed. Each call is
-        exception-guarded: an observer crash never alters the typed outcome
-        (and never triggers the outer rollback handler — the txn is closed)."""
+        exception-guarded: an observer crash never alters the typed outcome.
+        A BaseException an observer deliberately lets through (e.g.
+        KeyboardInterrupt) still reaches the outer handler, but the txn is
+        already closed by then — the handler's ``in_transaction`` guard skips
+        the now-moot ROLLBACK so the exception propagates cleanly instead of
+        being shadowed by a "no transaction is active" error."""
         for callback in self.conflict_callbacks:
             try:
                 callback(artifact_id, agent_id, reason)
@@ -3433,14 +3437,19 @@ class SqliteArtifactRegistry:
         """Return the per-(artifact, agent, reason) typed-deny counts.
 
         Zero conflicts → an empty dict (zero is a reportable result). Tolerates
-        a missing table — a read-only open of a pre-U5 db never created it —
-        by reporting empty rather than raising."""
+        a missing table ONLY on a read-only open of a pre-U5 db that never
+        created it — reporting empty rather than raising. On a writer handle,
+        ``_ensure_conflict_counters_table`` guarantees the table exists, so
+        any ``OperationalError`` caught there is a real failure and is
+        re-raised rather than silently swallowed."""
         try:
             rows = self._conn.execute(
                 "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
             ).fetchall()
-        except sqlite3.OperationalError:
-            return {}
+        except sqlite3.OperationalError as exc:
+            if self._read_only and "no such table" in str(exc):
+                return {}
+            raise
         return {
             (UUID(hex=art_hex), UUID(hex=agent_hex), reason): count
             for art_hex, agent_hex, reason, count in rows
@@ -3737,7 +3746,12 @@ class SqliteArtifactRegistry:
                 # BaseException (not Exception) so KeyboardInterrupt/SystemExit
                 # mid-transaction still ROLLBACK before propagating — the same
                 # idiom every mutating method here uses.
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    # A deny branch above may have already COMMITted before
+                    # this raise (e.g. KeyboardInterrupt inside an observer
+                    # callback); a ROLLBACK with no open txn would itself
+                    # raise and shadow the real exception.
+                    self._conn.execute("ROLLBACK")
                 # Roll the in-memory _seq back to match the rolled-back DB so
                 # the next successful emission does not leave a phantom gap.
                 if seq_incremented_count:
@@ -3910,7 +3924,12 @@ class SqliteArtifactRegistry:
                 self._conn.execute("COMMIT")
                 seq_incremented_count = 0
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    # A deny branch above may have already COMMITted before
+                    # this raise (e.g. KeyboardInterrupt inside an observer
+                    # callback); a ROLLBACK with no open txn would itself
+                    # raise and shadow the real exception.
+                    self._conn.execute("ROLLBACK")
                 if seq_incremented_count:
                     self._seq -= seq_incremented_count
                 raise

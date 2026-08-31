@@ -204,6 +204,11 @@ class ArtifactRegistry:
         # never turn a typed deny into an exception.
         self._conflict_counts: dict[tuple[UUID, UUID, str], int] = {}
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
+        # The increment below is a compound get-then-set, which exceeds the
+        # class's per-single-access lock-free contract (GIL atomicity only
+        # covers ONE dict access, not read-modify-write). This lock is scoped
+        # to the counter dict alone — never held around callbacks or arbitration.
+        self._conflict_counts_lock = threading.Lock()
         # Cross-artifact capture lock (Unit 2). This registry is otherwise
         # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
         # docstrings). GIL atomicity is per single dict ACCESS, which is
@@ -586,11 +591,14 @@ class ArtifactRegistry:
 
         Called ONLY where a ``ConflictDetail`` is actually returned to the
         caller (never for :class:`CasCorruption`, never mid-``commit_all``
-        before the aggregate is decided). The increment is a GIL-atomic dict
-        op; each callback is exception-guarded so an observer crash cannot
-        alter the typed outcome already decided."""
+        before the aggregate is decided). The increment is a compound
+        read-modify-write (get-then-set), which exceeds per-single-access GIL
+        atomicity, so it is guarded by its own dedicated ``_conflict_counts_lock``;
+        callbacks fire outside that lock, each exception-guarded so an
+        observer crash cannot alter the typed outcome already decided."""
         key = (artifact_id, agent_id, reason)
-        self._conflict_counts[key] = self._conflict_counts.get(key, 0) + 1
+        with self._conflict_counts_lock:
+            self._conflict_counts[key] = self._conflict_counts.get(key, 0) + 1
         for callback in self.conflict_callbacks:
             try:
                 callback(artifact_id, agent_id, reason)
@@ -603,7 +611,8 @@ class ArtifactRegistry:
         Zero conflicts → an empty dict — zero is a reportable result, not an
         error. Process-scoped for this registry (parity divergence asserted,
         not masked: durability is the sqlite registry's job)."""
-        return dict(self._conflict_counts)
+        with self._conflict_counts_lock:
+            return dict(self._conflict_counts)
 
     def commit_cas(
         self,

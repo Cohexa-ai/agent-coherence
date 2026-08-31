@@ -70,6 +70,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from multiprocessing.managers import BaseManager
@@ -738,13 +739,16 @@ def assert_detect_only_silent_lost_update() -> None:
 # OS processes proves a binding's conditional write is atomic rather than
 # read-then-write. The packaged S3 stand-in is an in-process fake, so the
 # harness owns the sharing vehicle: a substrate-owner process serves ONE
-# LocalS3Client instance and contenders reach it through a manager proxy.
-# The raced boundary: each contender's read and conditional write are separate
-# proxied calls into the one shared instance -- the proxy serializes
-# individual calls, so a NATIVE conditional put (check+write inside one call)
-# is atomic, while a client-side check-then-write (two calls with a real gap)
-# races and is caught. A real PG/S3 endpoint, when configured, replaces the
-# proxy with the true network boundary (the `real_substrate` arm).
+# locked stand-in instance and contenders reach it through a manager proxy.
+# The manager Server dispatches each client CONNECTION on its own thread with
+# no dispatch lock, and the packaged fake is single-threaded by design -- so
+# call-atomicity is NOT free. The served stand-ins below run every public
+# call under one per-call lock, making a NATIVE conditional put (check+write
+# inside one call) atomic by construction rather than by GIL scheduling
+# accident. The raced boundary stays BETWEEN proxied calls: a client-side
+# check-then-write (two calls with a real gap) races and is caught. A real
+# PG/S3 endpoint, when configured, replaces the proxy with the true network
+# boundary (the `real_substrate` arm).
 # ===========================================================================
 
 
@@ -756,13 +760,60 @@ class CrossProcessLostUpdate(AssertionError):
 
 
 class _SubstrateManager(BaseManager):
-    """The substrate-owner process: serves ONE stand-in instance to all
-    contenders. Each proxied method call executes atomically inside the owner
-    process; the gap BETWEEN calls is the raced boundary."""
+    """The substrate-owner process: serves ONE locked stand-in instance to all
+    contenders. The stand-in's per-call lock makes each proxied method call
+    atomic inside the owner process (the manager Server would otherwise
+    interleave them, one dispatch thread per client connection); the gap
+    BETWEEN calls is the raced boundary."""
 
 
-_SubstrateManager.register("LocalS3Client", LocalS3Client)
-_SubstrateManager.register("InMemoryStore", InMemoryStore)
+class _CallAtomicS3Client(LocalS3Client):
+    """Manager-served stand-in whose every public call runs under one lock.
+
+    The manager Server dispatches each client CONNECTION on its own thread,
+    and the packaged fake is single-threaded by design — so without this
+    lock the conditional put's check-then-append would be atomic only by
+    GIL scheduling accident. The lock makes call-atomicity a property of
+    the substrate-owner process by construction; the raced boundary stays
+    BETWEEN proxied calls, exactly what the contenders race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._call_lock = threading.Lock()
+
+    def create_bucket(self, name: str, **kwargs: Any) -> None:
+        with self._call_lock:
+            return super().create_bucket(name, **kwargs)
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        with self._call_lock:
+            return super().put_object(**kwargs)
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        with self._call_lock:
+            return super().get_object(**kwargs)
+
+
+class _CallAtomicInMemoryStore(InMemoryStore):
+    """Same construction for the read-then-write control's store."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._call_lock = threading.Lock()
+
+    def set(self, ref: str, data: bytes) -> str:
+        with self._call_lock:
+            return super().set(ref, data)
+
+    def get(self, ref: str) -> tuple[bytes, str] | None:
+        with self._call_lock:
+            return super().get(ref)
+
+
+# The registered NAMES stay the packaged classes' names so every call site is
+# unchanged; the SERVED classes are the locked stand-ins above.
+_SubstrateManager.register("LocalS3Client", _CallAtomicS3Client)
+_SubstrateManager.register("InMemoryStore", _CallAtomicInMemoryStore)
 
 _XP_BUCKET = "xp-race"
 _XP_KEY = "artifact"

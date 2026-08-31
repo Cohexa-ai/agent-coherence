@@ -275,6 +275,16 @@ def test_shim_still_resolves_old_and_new_names() -> None:
     assert shim.assert_in_process_binding_exemption_is_declared is not None
 
 
+def test_shim_all_mirrors_the_packaged_corpus() -> None:
+    """Every packaged __all__ name is re-exported by the in-repo shim — the
+    spot-check above cannot catch a newly added name the shim missed."""
+    import ccs.testing.substrate_conformance as corpus
+    from tests.conformance import substrate_conformance as shim
+
+    missing = set(corpus.__all__) - set(shim.__all__)
+    assert not missing, f"shim __all__ is missing: {sorted(missing)}"
+
+
 def test_in_memory_binding_exemption_is_declared_and_reported() -> None:
     """KTD-4 / R-8 — Covers AE5: the in-memory binding is refused the
     cross-process race with its declared reason in the run report."""
