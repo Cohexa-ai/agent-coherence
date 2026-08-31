@@ -590,6 +590,12 @@ class SqliteArtifactRegistry:
         self._retention_policy = retention_policy
         self._state_log = state_log
         self._agent_names = agent_names
+        # Conflict-outcome observers (guarantee-ladder U5 / R-4). Fired after a
+        # typed deny's counter upsert COMMITs; each call is exception-guarded so
+        # an observer raise can never alter the decided outcome. Present on the
+        # read-only handle too (the list simply never fires there — read-only
+        # never reaches a commit path).
+        self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
 
         if read_only:
             self._open_read_only(instance_id)
@@ -650,6 +656,13 @@ class SqliteArtifactRegistry:
         self._chmod_if_exists(self._shm_path())
 
         self._initialize_schema(instance_id)
+        # Conflict-counter table (guarantee-ladder U5 / KTD-9): an idempotent
+        # writer-open ensure, deliberately OUTSIDE the versioned migration
+        # chain — the counters are observability exhaust, not coordination
+        # state, so they must not force a schema-version bump (and must not
+        # break the v7 write-free read-only open, which never runs this and
+        # whose readers tolerate the table's absence).
+        self._ensure_conflict_counters_table()
         # Persist the retention policy on writer open (incl. the explicit
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
@@ -3367,6 +3380,72 @@ class SqliteArtifactRegistry:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def _ensure_conflict_counters_table(self) -> None:
+        """Create the conflict-counter table if absent (writer open only).
+
+        Idempotent and outside the versioned migration chain by design (see
+        the ``__init__`` call site): observability exhaust, not coordination
+        state. Single DDL statement under autocommit; no explicit txn."""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conflict_counters (
+                artifact_id  TEXT NOT NULL,
+                agent_id     TEXT NOT NULL,
+                reason       TEXT NOT NULL,
+                count        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (artifact_id, agent_id, reason)
+            )
+            """
+        )
+
+    def _count_conflict_in_txn(
+        self, artifact_id: UUID, agent_id: UUID, reason: str
+    ) -> None:
+        """Upsert one typed-deny count INSIDE the caller's open transaction.
+
+        Must be issued before the branch's ``COMMIT`` so the increment commits
+        atomically with the deny decision — a crash between deny and count can
+        never leave the two disagreeing. (Guarantee-ladder U5 / R-4; durable so
+        counts survive coordinator idle-shutdown respawns, KTD-9.)"""
+        self._conn.execute(
+            """
+            INSERT INTO conflict_counters (artifact_id, agent_id, reason, count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT (artifact_id, agent_id, reason)
+            DO UPDATE SET count = count + 1
+            """,
+            (artifact_id.hex, agent_id.hex, reason),
+        )
+
+    def _fire_conflict_callbacks(
+        self, artifact_id: UUID, agent_id: UUID, reason: str
+    ) -> None:
+        """Notify observers AFTER the counter upsert committed. Each call is
+        exception-guarded: an observer crash never alters the typed outcome
+        (and never triggers the outer rollback handler — the txn is closed)."""
+        for callback in self.conflict_callbacks:
+            try:
+                callback(artifact_id, agent_id, reason)
+            except Exception:  # noqa: BLE001 — observer isolation by design
+                logger.exception("conflict callback raised; deny outcome unaffected")
+
+    def conflict_outcome_totals(self) -> dict[tuple[UUID, UUID, str], int]:
+        """Return the per-(artifact, agent, reason) typed-deny counts.
+
+        Zero conflicts → an empty dict (zero is a reportable result). Tolerates
+        a missing table — a read-only open of a pre-U5 db never created it —
+        by reporting empty rather than raising."""
+        try:
+            rows = self._conn.execute(
+                "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {
+            (UUID(hex=art_hex), UUID(hex=agent_hex), reason): count
+            for art_hex, agent_hex, reason, count in rows
+        }
+
     def commit_cas(
         self,
         artifact_id: UUID,
@@ -3450,14 +3529,18 @@ class SqliteArtifactRegistry:
                 current = version_row[0]
                 current_size_tokens = version_row[1]
 
-                # 3-outcome discrimination. Each non-win branch COMMITs the
-                # (read-only) transaction and returns a typed result; nothing
-                # was mutated, so the COMMIT just releases the lock cleanly.
+                # 3-outcome discrimination. Each ConflictDetail branch upserts
+                # its counter row (U5 instrumentation) then COMMITs, so the
+                # count lands atomically with the deny; corruption COMMITs a
+                # genuinely read-only txn (corruption is not one of the three
+                # counted reasons).
                 if expected_version > current:
                     self._conn.execute("COMMIT")
                     return CasCorruption(current_version=current)
                 if expected_version < current:
+                    self._count_conflict_in_txn(artifact_id, agent_id, "version_mismatch")
                     self._conn.execute("COMMIT")
+                    self._fire_conflict_callbacks(artifact_id, agent_id, "version_mismatch")
                     return ConflictDetail("version_mismatch", current)
                 # Version matches. Holder check is the OCC-vs-pessimistic guard;
                 # exclude the committer itself (it is S/I, but be defensive).
@@ -3475,7 +3558,9 @@ class SqliteArtifactRegistry:
                     ),
                 ).fetchone()
                 if other_holder is not None:
+                    self._count_conflict_in_txn(artifact_id, agent_id, "other_holder")
                     self._conn.execute("COMMIT")
+                    self._fire_conflict_callbacks(artifact_id, agent_id, "other_holder")
                     return ConflictDetail("other_holder", current)
 
                 # Read-generation fence: reject a committer whose CAPTURED
@@ -3499,7 +3584,13 @@ class SqliteArtifactRegistry:
                     if og_row is None:
                         raise KeyError(f"artifact {artifact_id} not in registry")
                     if rg_row[0] < og_row[0]:
+                        self._count_conflict_in_txn(
+                            artifact_id, agent_id, "stale_read_generation"
+                        )
                         self._conn.execute("COMMIT")
+                        self._fire_conflict_callbacks(
+                            artifact_id, agent_id, "stale_read_generation"
+                        )
                         return ConflictDetail("stale_read_generation", current)
 
                 # ---- WIN: mutate atomically ----
@@ -3736,7 +3827,13 @@ class SqliteArtifactRegistry:
                             continue
 
                 if conflicts:
-                    self._conn.execute("COMMIT")  # read-only txn, nothing mutated
+                    # Count each failing member atomically with the aggregate
+                    # deny (U5); this is the txn's only mutation.
+                    for art_id, detail in conflicts.items():
+                        self._count_conflict_in_txn(art_id, agent_id, detail.reason)
+                    self._conn.execute("COMMIT")
+                    for art_id, detail in conflicts.items():
+                        self._fire_conflict_callbacks(art_id, agent_id, detail.reason)
                     return MultiCommitConflict(per_artifact=dict(conflicts))
 
                 # ---- WIN: apply every member atomically in this one txn ----

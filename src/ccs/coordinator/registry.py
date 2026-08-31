@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -53,6 +54,8 @@ from .registry_protocol import (
 from .retention import RetentionPolicy, collectible_versions
 
 CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
+
+logger = logging.getLogger(__name__)
 
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
@@ -189,6 +192,18 @@ class ArtifactRegistry:
         # critical section as the session-pin capture).
         self._checkpoints: dict[str, CheckpointRecord] = {}
         self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
+        # Conflict-outcome instrumentation (guarantee-ladder U5 / R-4): counts
+        # keyed by (artifact_id, agent_id, reason) for the three typed deny
+        # reasons, incremented at the SAME branch that constructs the returned
+        # ConflictDetail — never at the service layer, so wire and library
+        # callers are counted identically. Observability only: NOT part of the
+        # RegistryBase coordination contract (the protocol-parity guard pins
+        # the Protocol surface, and this deliberately stays off it). Process-
+        # scoped here; durable in the sqlite registry (KTD-9). Callbacks fire
+        # after the deny is decided, each guarded — an observer raise must
+        # never turn a typed deny into an exception.
+        self._conflict_counts: dict[tuple[UUID, UUID, str], int] = {}
+        self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
         # Cross-artifact capture lock (Unit 2). This registry is otherwise
         # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
         # docstrings). GIL atomicity is per single dict ACCESS, which is
@@ -566,6 +581,30 @@ class ArtifactRegistry:
                 self._seq -= 1
                 raise
 
+    def _note_conflict(self, artifact_id: UUID, agent_id: UUID, reason: str) -> None:
+        """Count one typed deny at its construction site and notify observers.
+
+        Called ONLY where a ``ConflictDetail`` is actually returned to the
+        caller (never for :class:`CasCorruption`, never mid-``commit_all``
+        before the aggregate is decided). The increment is a GIL-atomic dict
+        op; each callback is exception-guarded so an observer crash cannot
+        alter the typed outcome already decided."""
+        key = (artifact_id, agent_id, reason)
+        self._conflict_counts[key] = self._conflict_counts.get(key, 0) + 1
+        for callback in self.conflict_callbacks:
+            try:
+                callback(artifact_id, agent_id, reason)
+            except Exception:  # noqa: BLE001 — observer isolation by design
+                logger.exception("conflict callback raised; deny outcome unaffected")
+
+    def conflict_outcome_totals(self) -> dict[tuple[UUID, UUID, str], int]:
+        """Return the per-(artifact, agent, reason) typed-deny counts.
+
+        Zero conflicts → an empty dict — zero is a reportable result, not an
+        error. Process-scoped for this registry (parity divergence asserted,
+        not masked: durability is the sqlite registry's job)."""
+        return dict(self._conflict_counts)
+
     def commit_cas(
         self,
         artifact_id: UUID,
@@ -622,12 +661,14 @@ class ArtifactRegistry:
         if expected_version > current:
             return CasCorruption(current_version=current)
         if expected_version < current:
+            self._note_conflict(artifact_id, agent_id, "version_mismatch")
             return ConflictDetail("version_mismatch", current)
         other_holder = any(
             peer_id != agent_id and state in _M_OR_E_STATES
             for peer_id, state in record.state_by_agent.items()
         )
         if other_holder:
+            self._note_conflict(artifact_id, agent_id, "other_holder")
             return ConflictDetail("other_holder", current)
 
         # Read-generation fence: reject a committer whose CAPTURED read-claim
@@ -640,6 +681,7 @@ class ArtifactRegistry:
         # equality admits. Server-side; no commit_cas signature change.
         read_gen = record.read_generation_by_agent.get(agent_id)
         if read_gen is not None and read_gen < record.owner_generation:
+            self._note_conflict(artifact_id, agent_id, "stale_read_generation")
             return ConflictDetail("stale_read_generation", current)
 
         # ---- WIN ----
@@ -803,6 +845,10 @@ class ArtifactRegistry:
                 continue
 
         if conflicts:
+            # Count each failing member only now that the aggregate deny is
+            # decided — a mid-CHECK KeyError raise counts nothing.
+            for art_id, detail in conflicts.items():
+                self._note_conflict(art_id, agent_id, detail.reason)
             return MultiCommitConflict(per_artifact=dict(conflicts))
 
         # ---- STAGE: compute all mutations (nothing applied yet) ----
