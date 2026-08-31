@@ -38,6 +38,9 @@ import this module; production modules gain no test-only branches.
 from __future__ import annotations
 
 import multiprocessing
+import os
+import signal
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -52,7 +55,9 @@ __all__ = [
     "HarnessFailure",
     "ProcessRaceHarness",
     "RaceResult",
+    "park_forever",
     "run_in_subprocess",
+    "run_kill_after_ack",
 ]
 
 
@@ -119,11 +124,18 @@ class DeclaredExemption:
 
 
 class ContenderContext:
-    """What the harness hands each child: the rendezvous and its delay."""
+    """What the harness hands each child: the rendezvous and its delay.
 
-    def __init__(self, barrier: Any, delay_seconds: float) -> None:
+    Under :func:`run_kill_after_ack` the context additionally carries the ack
+    channel; ``ack()`` on a plain race context is a loud error, never a no-op.
+    """
+
+    def __init__(
+        self, barrier: Any, delay_seconds: float, ack_channel: Any = None
+    ) -> None:
         self._barrier = barrier
         self.delay_seconds = delay_seconds
+        self._ack_channel = ack_channel
 
     def barrier_wait(self, timeout: float | None = None) -> None:
         """Rendezvous with every other contender before the racing section."""
@@ -133,6 +145,36 @@ class ContenderContext:
         """Apply this contender's injected delay (a no-op at 0.0)."""
         if self.delay_seconds > 0:
             time.sleep(self.delay_seconds)
+
+    def ack(self, value: Any) -> None:
+        """Acknowledge the durable-claimed write, then PARK — never returns.
+
+        The ack IS the synchronization: the parent SIGKILLs this process the
+        moment it arrives — no sleeps order the kill. Parking is built into
+        the call so the violation is impossible by construction: a contender
+        cannot run past its ack, so a clean interpreter exit can never flush
+        the user-space buffers whose loss the case exists to catch. The
+        contender's frame stays alive through the park, keeping its open
+        handles and buffered state exactly as they were at the ack.
+        """
+        if self._ack_channel is None:
+            raise RuntimeError(
+                "ack() is only available under run_kill_after_ack; a plain "
+                "race contender has no ack channel"
+            )
+        self._ack_channel.put(("ack", value))
+        park_forever()
+
+
+def park_forever() -> None:  # pragma: no cover - only ever exits via SIGKILL
+    """Block the calling process until it is killed from outside.
+
+    Not a sleep-as-synchronization: nothing is ordered by this wait — the
+    ordering event is the ack the parent already received. The park only
+    keeps user-space state (open handles, unflushed buffers) alive so the
+    SIGKILL destroys it rather than a clean exit flushing it.
+    """
+    threading.Event().wait()
 
 
 def _child_main(
@@ -218,6 +260,27 @@ class ProcessRaceHarness:
 
     # -- the declared-exemption seam (R-8) --------------------------------
 
+    def declare_exemption(
+        self, *, subject: str, clause: str, reason: str
+    ) -> DeclaredExemption:
+        """Record a declared exemption directly (R-8's generic entry point).
+
+        For exemptions that are not a refused *race* — a verification grade no
+        local case can reach (fsync-grade durability), a run deferred to a
+        release procedure (the managed kill-the-primary run, KTD-5), a
+        platform without the kill primitive. The reason is mandatory: an
+        empty reason is a :class:`HarnessFailure`, same teeth as
+        :meth:`refuse_to_race`.
+        """
+        if not reason:
+            raise HarnessFailure(
+                f"exemption for {subject!r} ({clause}) declared without a "
+                "reason; R-8 exempts nothing silently"
+            )
+        exemption = DeclaredExemption(subject=subject, clause=clause, reason=reason)
+        self._exemptions.append(exemption)
+        return exemption
+
     def refuse_to_race(self, binding: Any, clause: str) -> DeclaredExemption:
         """Refuse a race for an ``in_process_only`` binding, recording why.
 
@@ -287,3 +350,89 @@ def run_in_subprocess(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any:
     if kind == "error":
         raise ContenderError(index, exc_repr, tb_text)
     return value
+
+
+def _ack_child_main(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    queue: Any,
+) -> None:  # pragma: no cover - runs in the spawned child
+    ctx = ContenderContext(
+        multiprocessing.get_context("spawn").Barrier(1), 0.0, ack_channel=queue
+    )
+    try:
+        fn(ctx, *args)
+        # Reaching here means fn returned WITHOUT acking (ctx.ack parks and
+        # never returns) — a contract violation reported deterministically:
+        # no ack was sent, so the parent's first message is this one.
+        queue.put(("returned", None))
+    except BaseException as exc:  # noqa: BLE001 - the channel carries everything
+        queue.put(("error", repr(exc), traceback.format_exc()))
+
+
+def run_kill_after_ack(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any:
+    """Run ONE contender until it ACKS its durable-claimed write, then SIGKILL
+    it mid-life and return the acked value (guarantee-ladder U6 / KTD-5).
+
+    Protocol: the contender performs its write and calls ``ctx.ack(value)``
+    exactly once — the ack parks the process and never returns, so a
+    contender cannot outlive its own acknowledgement. The parent kills the
+    child THE MOMENT the ack arrives (the ack is the synchronization; no
+    sleeps order anything) and asserts the child died by SIGKILL, so the
+    caller can then verify the acknowledged write against the substrate with
+    the writer genuinely destroyed:
+
+    - a contender that RETURNS (necessarily without acking — the ack parks)
+      is a :class:`HarnessFailure`, reported deterministically;
+    - a raise re-raises as :class:`ContenderError`; a hang is killed and is a
+      :class:`HarnessFailure` — never a pass.
+
+    SIGKILL destroys USER-SPACE state only: bytes already handed to the OS
+    survive in the page cache, which is exactly the process-crash grade this
+    primitive can honestly verify (fsync-grade discrimination is a declared
+    exemption, see the conformance kit).
+    """
+    if not hasattr(signal, "SIGKILL"):  # pragma: no cover - non-POSIX
+        raise HarnessFailure(
+            f"kill primitive unavailable on this platform; declare an R-8 "
+            f"exemption instead of running the case (os.name={os.name!r})"
+        )
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.SimpleQueue()
+    proc = ctx.Process(target=_ack_child_main, args=(spec.fn, spec.args, queue), daemon=True)
+    proc.start()
+    deadline = time.monotonic() + timeout_sec
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessFailure(
+                    f"kill-after-ack timed out after {timeout_sec}s awaiting the "
+                    "ack (child killed)"
+                )
+            if queue._reader.poll(min(remaining, 0.1)):  # noqa: SLF001
+                message = queue.get()
+                break
+        if message[0] == "error":
+            raise ContenderError(0, message[1], message[2])
+        if message[0] == "returned":
+            raise HarnessFailure(
+                "contender returned without acking; the case needs an "
+                "acknowledged write to kill against — call ctx.ack(facts), "
+                "which parks the process for the kill"
+            )
+        assert message[0] == "ack"
+        os.kill(proc.pid, signal.SIGKILL)  # type: ignore[arg-type]
+        proc.join(timeout=10.0)
+        if proc.is_alive():  # pragma: no cover - stubborn child
+            raise HarnessFailure("child survived SIGKILL; cannot certify the case")
+        if proc.exitcode != -signal.SIGKILL:
+            raise HarnessFailure(
+                f"child exited with {proc.exitcode}, not -SIGKILL: the death "
+                "was not the injected kill, so the case proves nothing"
+            )
+        return message[1]
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5.0)

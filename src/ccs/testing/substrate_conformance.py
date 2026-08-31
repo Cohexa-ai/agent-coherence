@@ -74,7 +74,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from multiprocessing.managers import BaseManager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Iterator, NoReturn, Protocol, Sequence, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Final,
+    Iterator,
+    NoReturn,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 from uuid import UUID, uuid4
 
 # pytest backs SKIP reporting ONLY — the corpus itself must import and run
@@ -113,11 +123,17 @@ from ccs.core.exceptions import (
 )
 from ccs.core.substrate import (
     CapabilityDescriptor,
+    DurabilityRegime,
     RestoreTier,
     Tier,
     retention_is_empty_for,
+    sha256_hex,
 )
-from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness
+from ccs.testing.process_harness import (
+    ContenderSpec,
+    ProcessRaceHarness,
+    run_kill_after_ack,
+)
 from ccs.testing.s3_local import LocalS3Client
 
 if TYPE_CHECKING:
@@ -143,6 +159,14 @@ __all__ = [
     "WorkspaceMemberFacts",
     "WorkspaceRestoreFacts",
     "assert_abort_after_partial_visibility",
+    "AcknowledgedWriteLost",
+    "FSYNC_GRADE_EXEMPTION_REASON",
+    "MANAGED_KILL_RUN_EXEMPTION_REASON",
+    "UndeclaredDurabilityRegime",
+    "assert_durability_regime_is_declared",
+    "assert_process_crash_durability",
+    "assert_sqlite_acknowledged_commit_survives_kill",
+    "declare_deferred_durability_exemptions",
     "assert_coordinator_retention_empty",
     "assert_cross_process_one_winner_native_cas",
     "assert_cross_process_rejects_read_then_write",
@@ -234,6 +258,8 @@ def _fake_descriptor(arm: str) -> CapabilityDescriptor:
         version_source="fake row-version" if arm == "row" else "fake object ETag",
         least_privilege="in-memory conformance fake",
         consistency_note="fake single-primary",
+        durability_regime=DurabilityRegime.IN_PROCESS,
+        durability_facts="process memory only (dict store); dies with the process",
     )
 
 
@@ -373,6 +399,8 @@ class LwwSubstrate:
             version_source=None,
             least_privilege="in-memory detect-only fake",
             consistency_note="last-write-wins; no atomic CAS",
+            durability_regime=DurabilityRegime.IN_PROCESS,
+            durability_facts="process memory only (dict store); dies with the process",
         )
 
     @property
@@ -888,6 +916,185 @@ def assert_forward_only_honest() -> None:
     # mints no token to compare.
     with _expect_raises(ValueError, match="version_source"):
         CapabilityDescriptor(tier=Tier.FORWARD_ONLY, version_source="etag")
+
+
+# ===========================================================================
+# Durability regime — declaration + the kill-the-primary case (U6, R-5/KTD-5).
+#
+# The honest local claim is PROCESS-CRASH grade: SIGKILL destroys user-space
+# state only (bytes handed to the OS survive in the page cache and are flushed
+# by the kernel), so the local case proves an acknowledged commit's bytes had
+# at least reached the OS — and can NEVER discriminate fsync-grade regimes.
+# Both deeper grades are DECLARED exemptions (R-8), never silent skips.
+#
+# RUNBOOK — the per-binding-release managed kill-the-primary run (KTD-5).
+# This is the release-procedure template the deferred exemption points at; it
+# is prose here because the repo ships no managed binding yet:
+#   1. Provision the managed substrate (e.g. RDS Postgres, DynamoDB) at the
+#      binding's declared configuration — record the descriptor's
+#      durability_facts verbatim in the run log.
+#   2. Drive the binding through a committed, ACKNOWLEDGED write (the same
+#      ack-then-park protocol as run_kill_after_ack; ack only after the
+#      substrate confirmed the commit).
+#   3. Kill the PRIMARY node through the provider's own failure lever
+#      (reboot-with-failover, AZ kill), not a client disconnect.
+#   4. After failover, read back through a fresh connection: the acknowledged
+#      write is present → the declared regime holds; absent → record a
+#      refutation against the descriptor's claim, and the binding's regime
+#      must be downgraded before release.
+#   5. File the run (date, substrate version, facts, outcome) with the
+#      release notes; the exemption stays declared until a run replaces it.
+# ===========================================================================
+
+
+class UndeclaredDurabilityRegime(AssertionError):
+    """A binding offered no durability regime (or an unverifiable one).
+
+    Typed refusal: the kit never assumes a grade for a silent descriptor —
+    an undeclared axis is NOT process-crash by default."""
+
+
+class AcknowledgedWriteLost(AssertionError):
+    """An ACKNOWLEDGED write was missing after the writer was SIGKILLed.
+
+    The binding acked before its bytes reached the OS — the process-crash
+    grade is violated (the loss a kill case genuinely can catch)."""
+
+
+def assert_durability_regime_is_declared(descriptor: CapabilityDescriptor) -> None:
+    """The descriptor speaks the durability axis: a regime AND its facts.
+
+    A regime without configuration facts is refused too — a claim nothing
+    qualifies cannot be checked against the substrate's actual settings."""
+    if descriptor.durability_regime is None:
+        raise UndeclaredDurabilityRegime(
+            "binding declares no durability_regime; refusing to assume a "
+            "grade (an undeclared axis is not process-crash by default)"
+        )
+    if not descriptor.durability_facts:
+        raise UndeclaredDurabilityRegime(
+            f"durability_regime {descriptor.durability_regime.value!r} is "
+            "declared without configuration facts; an unverifiable claim is "
+            "refused (state e.g. the journal/synchronous settings it rides on)"
+        )
+
+
+def assert_process_crash_durability(
+    spec: ContenderSpec,
+    verify_durable: "Callable[[Any], bool]",
+    *,
+    timeout_sec: float = 60.0,
+) -> None:
+    """The generic kill-the-primary case at PROCESS-CRASH grade.
+
+    ``spec.fn`` performs the write, ``ctx.ack(facts)``s it, then parks (see
+    :func:`ccs.testing.process_harness.run_kill_after_ack` for the protocol);
+    the harness SIGKILLs it on the ack. ``verify_durable(facts)`` then reads
+    the substrate with the writer destroyed and returns whether the
+    acknowledged write is present — False raises the typed
+    :class:`AcknowledgedWriteLost`. Deterministic: the ack is the only
+    synchronization, and the assertion holds at any interleaving after it."""
+    facts = run_kill_after_ack(spec, timeout_sec=timeout_sec)
+    if not verify_durable(facts):
+        raise AcknowledgedWriteLost(
+            f"acknowledged write missing after SIGKILL: {facts!r} — the "
+            "binding acked before its bytes reached the OS"
+        )
+
+
+def _durability_sqlite_child(ctx: Any, db_path_str: str, artifact_hex: str, agent_hex: str) -> None:
+    """Child: open the sqlite registry, commit a WIN, ack it, park for the kill."""
+    from ccs.core.states import MESIState
+    from ccs.core.types import Artifact
+
+    registry = SqliteArtifactRegistry(Path(db_path_str))
+    artifact = Artifact(
+        id=UUID(hex=artifact_hex), name="durability.md", version=1, content_hash="seed"
+    )
+    registry.register_artifact(artifact, "seed-content")
+    agent = UUID(hex=agent_hex)
+    registry.set_agent_state(artifact.id, agent, MESIState.SHARED, trigger="fetch", tick=0)
+    committed_hash = sha256_hex(b"the acknowledged bytes")
+    result = registry.commit_cas(
+        artifact.id, agent, expected_version=1, content_hash=committed_hash
+    )
+    updated = result[0]  # WIN returns (updated_artifact, invalidated_agent_ids)
+    # The ack goes out only AFTER the registry's COMMIT returned — exactly the
+    # acknowledgement whose durability the case certifies. The registry handle
+    # stays open (never .close()d) so SIGKILL destroys a LIVE writer; ack()
+    # parks and never returns.
+    ctx.ack(
+        {
+            "artifact": artifact_hex,
+            "version": updated.version,
+            "content_hash": committed_hash,
+        }
+    )
+
+
+def assert_sqlite_acknowledged_commit_survives_kill(db_path: "Path | str") -> None:
+    """The kill-the-primary case on the existing store (KTD-5's local leg).
+
+    A spawned child opens :class:`SqliteArtifactRegistry` at ``db_path``,
+    commits a WIN, acknowledges, parks, and is SIGKILLed; the reopened store
+    (writer open — it runs WAL recovery over the dead writer's hot journal)
+    must serve the acknowledged version with the acknowledged content hash."""
+    db = Path(db_path)
+    artifact_hex, agent_hex = uuid4().hex, uuid4().hex
+
+    def _verify(facts: Any) -> bool:
+        reopened = SqliteArtifactRegistry(db)
+        try:
+            artifact = reopened.get_artifact(UUID(hex=facts["artifact"]))
+            return (
+                artifact is not None
+                and artifact.version == facts["version"]
+                and artifact.content_hash == facts["content_hash"]
+            )
+        finally:
+            reopened.close()
+
+    assert_process_crash_durability(
+        ContenderSpec(
+            fn=_durability_sqlite_child, args=(str(db), artifact_hex, agent_hex)
+        ),
+        _verify,
+    )
+
+
+#: Why no local case can certify fsync-grade (OS-crash) durability (R-8).
+FSYNC_GRADE_EXEMPTION_REASON = (
+    "SIGKILL destroys user-space state only — bytes in the OS page cache "
+    "survive and are flushed by the kernel — so no local kill can "
+    "discriminate fsync-grade regimes (sqlite synchronous NORMAL vs FULL "
+    "differ only under OS crash/power loss); a crash-simulating VFS is the "
+    "named future closer"
+)
+
+#: Why the managed kill-the-primary run is deferred to release time (KTD-5).
+MANAGED_KILL_RUN_EXEMPTION_REASON = (
+    "kill-the-primary against a managed cluster is a per-binding-release "
+    "run (see this section's runbook template), not a CI case; deferred "
+    "with this declaration, never silently skipped"
+)
+
+
+def declare_deferred_durability_exemptions(
+    harness: ProcessRaceHarness,
+) -> "tuple[Any, Any]":
+    """Record the two deferred durability grades as DECLARED exemptions (R-8)
+    so the kit report names them; returns ``(fsync_grade, managed_run)``."""
+    fsync = harness.declare_exemption(
+        subject="durability",
+        clause="R-5 fsync-grade discrimination",
+        reason=FSYNC_GRADE_EXEMPTION_REASON,
+    )
+    managed = harness.declare_exemption(
+        subject="durability",
+        clause="R-5 managed kill-the-primary (KTD-5)",
+        reason=MANAGED_KILL_RUN_EXEMPTION_REASON,
+    )
+    return fsync, managed
 
 
 # ===========================================================================
