@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import queue as queue_module
 import signal
 import threading
 import time
@@ -177,6 +178,32 @@ def park_forever() -> None:  # pragma: no cover - only ever exits via SIGKILL
     threading.Event().wait()
 
 
+def _next_message(q: Any, deadline: float) -> Any:
+    """Next queue message before ``deadline``, or ``None`` on timeout.
+
+    ``multiprocessing.Queue.get(timeout=...)`` is the stdlib's own bounded
+    wait — one shared implementation for every harness entry point."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        return q.get(timeout=remaining)
+    except queue_module.Empty:
+        return None
+
+
+def _terminate_and_join(procs: "list[Any]") -> None:
+    """Terminate-then-join every live child; escalate to kill on a holdout."""
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in procs:
+        proc.join(timeout=5.0)
+        if proc.is_alive():  # pragma: no cover - stubborn child
+            proc.kill()
+            proc.join(timeout=5.0)
+
+
 def _child_main(
     index: int,
     fn: Callable[..., Any],
@@ -212,7 +239,7 @@ class ProcessRaceHarness:
         if len(contenders) < 2:
             raise HarnessFailure("a race needs at least two contenders")
         barrier = self._ctx.Barrier(len(contenders))
-        queue = self._ctx.SimpleQueue()
+        queue = self._ctx.Queue()
         procs = [
             self._ctx.Process(
                 target=_child_main,
@@ -227,26 +254,16 @@ class ProcessRaceHarness:
         raw: dict[int, tuple[Any, ...]] = {}
         try:
             while len(raw) < len(procs):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                item = _next_message(queue, deadline)
+                if item is None:
                     missing = sorted(set(range(len(procs))) - set(raw))
                     raise HarnessFailure(
                         f"race timed out after {self._timeout_sec}s; "
                         f"contender(s) {missing} never reported (killed)"
                     )
-                # SimpleQueue has no timeout; poll the underlying reader.
-                if queue._reader.poll(min(remaining, 0.1)):  # noqa: SLF001
-                    item = queue.get()
-                    raw[item[0]] = item
+                raw[item[0]] = item
         finally:
-            for proc in procs:
-                if proc.is_alive():
-                    proc.terminate()
-            for proc in procs:
-                proc.join(timeout=5.0)
-                if proc.is_alive():  # pragma: no cover - stubborn child
-                    proc.kill()
-                    proc.join(timeout=5.0)
+            _terminate_and_join(procs)
         outcomes = []
         for i in range(len(procs)):
             index, kind, value, exc_repr, tb_text = raw[i]
@@ -324,7 +341,7 @@ def run_in_subprocess(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any:
     """
     ctx = multiprocessing.get_context("spawn")
     barrier = ctx.Barrier(1)
-    queue = ctx.SimpleQueue()
+    queue = ctx.Queue()
     proc = ctx.Process(
         target=_child_main,
         args=(0, spec.fn, spec.args, spec.delay_seconds, barrier, queue),
@@ -333,20 +350,12 @@ def run_in_subprocess(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any:
     proc.start()
     deadline = time.monotonic() + timeout_sec
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HarnessFailure(f"subprocess step timed out after {timeout_sec}s (killed)")
-            if queue._reader.poll(min(remaining, 0.1)):  # noqa: SLF001
-                index, kind, value, exc_repr, tb_text = queue.get()
-                break
+        message = _next_message(queue, deadline)
+        if message is None:
+            raise HarnessFailure(f"subprocess step timed out after {timeout_sec}s (killed)")
+        index, kind, value, exc_repr, tb_text = message
     finally:
-        if proc.is_alive():
-            proc.terminate()
-        proc.join(timeout=5.0)
-        if proc.is_alive():  # pragma: no cover - stubborn child
-            proc.kill()
-            proc.join(timeout=5.0)
+        _terminate_and_join([proc])
     if kind == "error":
         raise ContenderError(index, exc_repr, tb_text)
     return value
@@ -398,21 +407,17 @@ def run_kill_after_ack(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any
             f"exemption instead of running the case (os.name={os.name!r})"
         )
     ctx = multiprocessing.get_context("spawn")
-    queue = ctx.SimpleQueue()
+    queue = ctx.Queue()
     proc = ctx.Process(target=_ack_child_main, args=(spec.fn, spec.args, queue), daemon=True)
     proc.start()
     deadline = time.monotonic() + timeout_sec
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HarnessFailure(
-                    f"kill-after-ack timed out after {timeout_sec}s awaiting the "
-                    "ack (child killed)"
-                )
-            if queue._reader.poll(min(remaining, 0.1)):  # noqa: SLF001
-                message = queue.get()
-                break
+        message = _next_message(queue, deadline)
+        if message is None:
+            raise HarnessFailure(
+                f"kill-after-ack timed out after {timeout_sec}s awaiting the "
+                "ack (child killed)"
+            )
         if message[0] == "error":
             raise ContenderError(0, message[1], message[2])
         if message[0] == "returned":

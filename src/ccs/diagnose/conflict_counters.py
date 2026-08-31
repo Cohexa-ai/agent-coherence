@@ -34,11 +34,16 @@ def read_conflict_totals(db_path: str | Path) -> dict[tuple[str, str, str], int]
     error, not zero); a missing table returns ``{}``.
     """
     path = Path(db_path)
-    if not path.exists():
-        raise FileNotFoundError(f"no coordinator database at {path}")
     # mode=ro + uri=True: without the explicit uri flag sqlite3 treats the
     # string as a literal filename and can silently fall back to read-write.
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # No pre-check stat: connect directly and translate the failure, so a
+    # missing file cannot slip through a check-to-open race window.
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        if not path.exists():
+            raise FileNotFoundError(f"no coordinator database at {path}") from exc
+        raise
     try:
         try:
             rows = conn.execute(

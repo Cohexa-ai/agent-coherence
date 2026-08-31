@@ -3538,10 +3538,11 @@ class SqliteArtifactRegistry:
                     self._conn.execute("COMMIT")
                     return CasCorruption(current_version=current)
                 if expected_version < current:
-                    self._count_conflict_in_txn(artifact_id, agent_id, "version_mismatch")
+                    detail = ConflictDetail("version_mismatch", current)
+                    self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
                     self._conn.execute("COMMIT")
-                    self._fire_conflict_callbacks(artifact_id, agent_id, "version_mismatch")
-                    return ConflictDetail("version_mismatch", current)
+                    self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
+                    return detail
                 # Version matches. Holder check is the OCC-vs-pessimistic guard;
                 # exclude the committer itself (it is S/I, but be defensive).
                 other_holder = self._conn.execute(
@@ -3558,10 +3559,11 @@ class SqliteArtifactRegistry:
                     ),
                 ).fetchone()
                 if other_holder is not None:
-                    self._count_conflict_in_txn(artifact_id, agent_id, "other_holder")
+                    detail = ConflictDetail("other_holder", current)
+                    self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
                     self._conn.execute("COMMIT")
-                    self._fire_conflict_callbacks(artifact_id, agent_id, "other_holder")
-                    return ConflictDetail("other_holder", current)
+                    self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
+                    return detail
 
                 # Read-generation fence: reject a committer whose CAPTURED
                 # read-claim was superseded by a sweep reclamation (a reclaimed
@@ -3584,14 +3586,11 @@ class SqliteArtifactRegistry:
                     if og_row is None:
                         raise KeyError(f"artifact {artifact_id} not in registry")
                     if rg_row[0] < og_row[0]:
-                        self._count_conflict_in_txn(
-                            artifact_id, agent_id, "stale_read_generation"
-                        )
+                        detail = ConflictDetail("stale_read_generation", current)
+                        self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
                         self._conn.execute("COMMIT")
-                        self._fire_conflict_callbacks(
-                            artifact_id, agent_id, "stale_read_generation"
-                        )
-                        return ConflictDetail("stale_read_generation", current)
+                        self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
+                        return detail
 
                 # ---- WIN: mutate atomically ----
                 next_version = current + 1

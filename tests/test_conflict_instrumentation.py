@@ -191,6 +191,12 @@ def test_offline_reader_reads_a_closed_db(tmp_path: Path) -> None:
     assert read_conflict_totals(db) == {(art.id.hex, agent.hex, "version_mismatch"): 3}
 
 
+def test_offline_reader_missing_file_raises_not_zero(tmp_path: Path) -> None:
+    """A report against a nonexistent store is a caller error, never zero."""
+    with pytest.raises(FileNotFoundError):
+        read_conflict_totals(tmp_path / "nope.db")
+
+
 def test_offline_reader_reports_zero_for_a_conflict_free_db(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()

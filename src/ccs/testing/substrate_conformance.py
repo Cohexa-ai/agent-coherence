@@ -169,6 +169,7 @@ __all__ = [
     "declare_deferred_durability_exemptions",
     "assert_coordinator_retention_empty",
     "assert_cross_process_one_winner_native_cas",
+    "assert_cross_process_lost_update_is_detected",
     "assert_cross_process_rejects_read_then_write",
     "CrossProcessLostUpdate",
     "assert_detect_only_silent_lost_update",
@@ -894,6 +895,14 @@ def assert_cross_process_rejects_read_then_write() -> None:
         f"the read-then-write control was NOT caught (verdicts: {verdicts}); "
         "the cross-process race has lost its teeth"
     )
+
+
+def assert_cross_process_lost_update_is_detected() -> None:
+    """The same read-then-write control, surfaced as the TYPED failure: runs
+    the broken binding and raises :class:`CrossProcessLostUpdate` on the
+    detected loss (the loss is expected — callers assert the raise). Public
+    wrapper so runners never import the module-private helper."""
+    _run_broken_read_then_write_race(raise_on_loss=True)
 
 
 def assert_forward_only_honest() -> None:

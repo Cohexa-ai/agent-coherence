@@ -661,15 +661,17 @@ class ArtifactRegistry:
         if expected_version > current:
             return CasCorruption(current_version=current)
         if expected_version < current:
-            self._note_conflict(artifact_id, agent_id, "version_mismatch")
-            return ConflictDetail("version_mismatch", current)
+            detail = ConflictDetail("version_mismatch", current)
+            self._note_conflict(artifact_id, agent_id, detail.reason)
+            return detail
         other_holder = any(
             peer_id != agent_id and state in _M_OR_E_STATES
             for peer_id, state in record.state_by_agent.items()
         )
         if other_holder:
-            self._note_conflict(artifact_id, agent_id, "other_holder")
-            return ConflictDetail("other_holder", current)
+            detail = ConflictDetail("other_holder", current)
+            self._note_conflict(artifact_id, agent_id, detail.reason)
+            return detail
 
         # Read-generation fence: reject a committer whose CAPTURED read-claim
         # was superseded by a sweep reclamation. A reclaimed M/E holder kept its
@@ -681,8 +683,9 @@ class ArtifactRegistry:
         # equality admits. Server-side; no commit_cas signature change.
         read_gen = record.read_generation_by_agent.get(agent_id)
         if read_gen is not None and read_gen < record.owner_generation:
-            self._note_conflict(artifact_id, agent_id, "stale_read_generation")
-            return ConflictDetail("stale_read_generation", current)
+            detail = ConflictDetail("stale_read_generation", current)
+            self._note_conflict(artifact_id, agent_id, detail.reason)
+            return detail
 
         # ---- WIN ----
         next_version = current + 1

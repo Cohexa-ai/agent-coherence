@@ -46,7 +46,9 @@ def test_read_then_write_binding_is_caught() -> None:
 def test_read_then_write_detection_is_a_typed_failure() -> None:
     import pytest
 
-    from ccs.testing.substrate_conformance import _run_broken_read_then_write_race
+    from ccs.testing.substrate_conformance import (
+        assert_cross_process_lost_update_is_detected,
+    )
 
     with pytest.raises(CrossProcessLostUpdate, match="lost update"):
-        _run_broken_read_then_write_race(raise_on_loss=True)
+        assert_cross_process_lost_update_is_detected()

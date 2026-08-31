@@ -20,7 +20,6 @@ which is the fence's whole job. Both variants are asserted.
 
 from __future__ import annotations
 
-import hashlib
 import time
 import uuid
 from pathlib import Path
@@ -32,13 +31,10 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
+from ccs.core.substrate import sha256_hex
 from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness, run_in_subprocess
 
 _PATH = "CLAUDE.md"  # in DEFAULT_TRACKED_PATTERNS — coordinated without extra policy files
-
-
-def _hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +83,7 @@ def _child_commit_cas(
         {
             "session_id": session_id,
             "path": _PATH,
-            "content_hash": _hash(payload.encode()),
+            "content_hash": sha256_hex(payload.encode()),
             "expected_version": expected_version,
         },
     )
@@ -109,7 +105,7 @@ def _child_read_then_race_commit(ctx, workspace_str: str, session_id: str, paylo
         {
             "session_id": session_id,
             "path": _PATH,
-            "content_hash": _hash(payload.encode()),
+            "content_hash": sha256_hex(payload.encode()),
             "expected_version": version,
         },
     )
@@ -129,7 +125,7 @@ def _child_commit_expect_unavailable(ctx, workspace_str: str, session_id: str) -
             {
                 "session_id": session_id,
                 "path": _PATH,
-                "content_hash": _hash(b"x"),
+                "content_hash": sha256_hex(b"x"),
                 "expected_version": 1,
             },
         )

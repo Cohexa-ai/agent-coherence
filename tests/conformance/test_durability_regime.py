@@ -15,14 +15,13 @@ teeth.
 
 from __future__ import annotations
 
-import hashlib
 import signal
 import sys
 from pathlib import Path
 
 import pytest
 
-from ccs.core.substrate import CapabilityDescriptor, DurabilityRegime, Tier
+from ccs.core.substrate import CapabilityDescriptor, DurabilityRegime, Tier, sha256_hex
 from ccs.testing.process_harness import (
     ContenderSpec,
     HarnessFailure,
@@ -78,7 +77,7 @@ def _buffered_ack_child(ctx, path_str: str) -> None:
     ctx.ack(
         {
             "path": path_str,
-            "fingerprint": hashlib.sha256(_PAYLOAD).hexdigest(),
+            "fingerprint": sha256_hex(_PAYLOAD),
         }
     )
 
@@ -87,7 +86,7 @@ def _verify_buffered_payload_on_disk(ack: dict) -> bool:
     target = Path(ack["path"])
     if not target.exists():
         return False
-    return hashlib.sha256(target.read_bytes()).hexdigest() == ack["fingerprint"]
+    return sha256_hex(target.read_bytes()) == ack["fingerprint"]
 
 
 def test_buffered_in_process_ack_fails_the_case(tmp_path: Path) -> None:
