@@ -19,6 +19,13 @@ Current members:
   outcomes, and the declared-exemption seam (R-8) for bindings that are
   in-process-only by construction. In-process serialization satisfies no clause
   of the conformance contract; this harness is what makes a kit race probative.
+- :mod:`ccs.testing.claim_ladder` — the machine-checked claim ladder
+  (guarantee-ladder plan U7): frozen rungs pairing each claimed guarantee with
+  its README claim-pins and the pytest node-ids that would fail without it.
+  Foreign consumers see rungs and guarantee text only; node-id resolution and
+  the two-way README drift guard live in the repo test tree
+  (``tests/conformance/test_claim_ladder.py``). No cross-host rung exists to
+  claim.
 - :mod:`ccs.testing.substrate_conformance` — the conformance corpus: the
   tier-honesty kit (``ConformanceBinding``, the in-memory fake, the
   split-comparand teeth) plus the Workspace-Versioning family
