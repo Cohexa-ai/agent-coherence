@@ -1248,6 +1248,22 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.handler_concurrency_overflows_total: int = 0
         self._overflow_counter_lock = threading.Lock()
 
+    def server_bind(self) -> None:
+        """Bind without the stdlib's reverse-DNS lookup.
+
+        Regression note: http.server.HTTPServer.server_bind calls
+        socket.getfqdn() to populate self.server_name, which blocks on
+        the host resolver — measured at 35 s on a macOS workstation
+        with a stalled resolver, blowing the coordinator spawn's 10 s
+        reachability window (_spawn_detached in cli/coherence_coordinator.py).
+        We bind 127.0.0.1 only, so the FQDN is purely cosmetic: bind at
+        the TCPServer layer and fill server_name/server_port from the
+        bound address ourselves. Never call socket.getfqdn here.
+        """
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0] or "localhost"
+        self.server_port = self.server_address[1]
+
     def process_request(self, request: Any, client_address: Any) -> None:
         """Override ThreadingMixIn.process_request to gate handler spawn
         on the concurrency semaphore. If at limit, send 503 directly
