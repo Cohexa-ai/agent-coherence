@@ -53,6 +53,16 @@ teeth stub. The family's fixture-disclosure rule is binding: scenario prose and
 assertions describe failure scenarios and required FINAL OBSERVABLE OUTCOMES
 only — a foreign implementation passes by satisfying outcomes, never by
 mimicking any particular internal mechanism.
+
+
+**In-process serialization does not satisfy any clause of this contract.**
+The hand-sequenced scenarios below are TYPED-OUTCOME contract tests — they pin
+what a binding returns at each interleaving, and a single process can sequence
+any interleaving it likes. Only the cross-process races (the
+``assert_cross_process_*`` family, riding :mod:`ccs.testing.process_harness`)
+prove a binding's conditional write is atomic rather than read-then-write; a
+binding that cannot be raced cross-process carries a DECLARED exemption with a
+stated reason (R-8), never a silent skip.
 """
 
 from __future__ import annotations
@@ -139,6 +149,7 @@ __all__ = [
     "CrossProcessLostUpdate",
     "assert_detect_only_silent_lost_update",
     "assert_forward_only_honest",
+    "assert_in_process_binding_exemption_is_declared",
     "assert_invalidation_before_act",
     "assert_native_cas_descriptor",
     "assert_never_ship_a_store_wire",
@@ -403,7 +414,20 @@ class ConformanceBinding(Protocol):
 
 
 class InMemoryBinding:
-    """A :class:`ConformanceBinding` backed by the in-memory fake substrate."""
+    """A :class:`ConformanceBinding` backed by the in-memory fake substrate.
+
+    Declared ``in_process_only`` (KTD-4): the store is GIL-serialized process
+    memory by construction and cannot be shared across OS processes — a
+    spawn-context child would receive a pickled private copy and the race
+    would be vacuous. The cross-process arm runs against the manager-served
+    stand-in instead; this binding's exclusion is a DECLARED R-8 exemption,
+    never a silent skip."""
+
+    in_process_only = True
+    in_process_only_reason = (
+        "GIL-serialized process memory by construction; the cross-process race "
+        "runs against the manager-served substrate instead (KTD-4)"
+    )
 
     def __init__(self, arm: str = "object") -> None:
         self._store = InMemoryStore()
@@ -456,9 +480,13 @@ def assert_native_cas_descriptor(descriptor: CapabilityDescriptor) -> None:
 def assert_racing_writers_one_winner(
     binding: ConformanceBinding, make_session: "SessionFactory"
 ) -> None:
-    """(i) The SUBSTRATE CAS arbitrates: a non-coordinated writer moves the
-    substrate; the loser gets the uniform typed retryable conflict. This is the
-    guarantee a bare CAS already gives (it is NOT the coordinator's add)."""
+    """(i) TYPED-OUTCOME contract test (hand-sequenced, single-process): the
+    SUBSTRATE CAS arbitrates — a non-coordinated writer moves the substrate;
+    the loser gets the uniform typed retryable conflict. This is the guarantee
+    a bare CAS already gives (it is NOT the coordinator's add). It pins the
+    OUTCOME VOCABULARY only; atomicity under real contention is proved by
+    ``assert_cross_process_one_winner_native_cas`` — in-process sequencing
+    satisfies no atomicity clause."""
     ref = _fresh_ref()
     binding.seed(ref, b"v1")
     agent = CoordinatedSubstrate(binding.make_view(), make_session())
@@ -812,6 +840,19 @@ def _run_broken_read_then_write_race(*, raise_on_loss: bool = False) -> list[str
         return verdicts
     finally:
         manager.shutdown()
+
+
+def assert_in_process_binding_exemption_is_declared(binding: object | None = None) -> list[str]:
+    """R-8 / KTD-4: an in-process-only binding is REFUSED a cross-process race
+    with its declared reason recorded in the run report — nothing is silently
+    skipped. Returns the report lines so a runner can print them. The default
+    subject is the in-memory binding, the contract's first declared exemption."""
+    subject = binding if binding is not None else InMemoryBinding()
+    harness = ProcessRaceHarness()
+    harness.refuse_to_race(subject, clause="R-1 cross-process race")
+    report = harness.report()
+    assert report and any("R-1 cross-process race" in line for line in report), report
+    return report
 
 
 def assert_cross_process_rejects_read_then_write() -> None:
