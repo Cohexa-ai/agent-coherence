@@ -207,6 +207,98 @@ def test_coordinator_second_invocation_reuses_existing(
                 pass
 
 
+def _capture_probe(seen: dict, *, reachable: bool):
+    """Stub for coherence_coordinator._tcp_probe that records bind_host."""
+    def probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
+        seen["bind_host"] = bind_host
+        return reachable
+    return probe
+
+
+def _write_port_file(workspace: Path, port: int) -> Path:
+    pid_file = workspace / ".coherence" / "server.pid"
+    pid_file.parent.mkdir(exist_ok=True)
+    pid_file.write_text(f"999\n{port}\n", encoding="utf-8")
+    return pid_file
+
+
+def test_coordinator_reuse_probe_targets_routed_bind_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routed-bind regression: the existing-coordinator probe in main()
+    must poll the --bind-host address, not loopback. Before the fix it
+    dropped the kwarg, so a coordinator bound to 10.0.0.5 looked dead
+    from 127.0.0.1 and every non-loopback invocation re-forked."""
+    _write_port_file(git_workspace, 54321)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
+    )
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--bind-host", "10.0.0.5", "--quiet",
+    ])
+
+    assert rc == 0
+    assert seen["bind_host"] == "10.0.0.5"
+
+
+def test_spawn_detached_probe_targets_routed_bind_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routed-bind regression: _spawn_detached's port-file poll must probe
+    the child's bind host. Before the fix it polled 127.0.0.1, collected
+    ECONNREFUSED for the full 10s window, exited 2 — and left the live
+    daemon orphaned behind the port file."""
+    _write_port_file(git_workspace, 54321)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
+    )
+    monkeypatch.setattr(
+        coherence_coordinator.subprocess, "Popen",
+        lambda *a, **kw: None,  # the pre-written port file stands in for the child
+    )
+
+    rc = coherence_coordinator._spawn_detached(
+        git_workspace, quiet=True, bind_host="10.0.0.5",
+    )
+
+    assert rc == 0
+    assert seen["bind_host"] == "10.0.0.5"
+
+
+def test_prepare_for_migration_probe_targets_endpoint_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Routed-bind regression: the shutdown poll in --prepare-for-migration
+    must probe the resolved endpoint's host. Probing loopback for a
+    remote-bound coordinator reports "gone" instantly while the server is
+    still draining (false success here, unlike the false failure above)."""
+    import ccs.cli._coherence_client as client_mod
+    from ccs.cli._coherence_client import CoordinatorEndpoint
+
+    _write_port_file(git_workspace, 54321)
+    endpoint = CoordinatorEndpoint(port=54321, bearer="token", host="10.0.0.5")
+    monkeypatch.setattr(client_mod, "resolve_endpoint", lambda root: endpoint)
+    monkeypatch.setattr(
+        client_mod, "post",
+        lambda *a, **kw: {"ok": True, "released": 1, "errors": []},
+    )
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=False)
+    )
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+    ])
+
+    assert rc == 0, capsys.readouterr()
+    assert seen["bind_host"] == "10.0.0.5"
+
+
 # ----------------------------------------------------------------------
 # coherence_status
 # ----------------------------------------------------------------------

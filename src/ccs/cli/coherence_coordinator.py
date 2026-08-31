@@ -156,7 +156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     pid_file = root / ".coherence" / "server.pid"
     existing_port = _read_port_from_file(pid_file)
     cfg = LifecycleConfig()
-    if existing_port is not None and _tcp_probe(existing_port, cfg):
+    if existing_port is not None and _tcp_probe(
+        existing_port, cfg, bind_host=args.bind_host
+    ):
         if not args.quiet:
             print(f"port={existing_port}", flush=True)
         return 0
@@ -229,7 +231,7 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
     poll_deadline = time.monotonic() + 5.0
     while time.monotonic() < poll_deadline:
         port = _read_port_from_file(pid_file)
-        if port is None or not _tcp_probe(port, cfg):
+        if port is None or not _tcp_probe(port, cfg, bind_host=endpoint.host):
             break
         time.sleep(0.1)
     else:
@@ -302,7 +304,7 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
     cfg = LifecycleConfig()
     for _ in range(_DETACH_PORT_WAIT_ATTEMPTS):
         port = _read_port_from_file(pid_file)
-        if port is not None and _tcp_probe(port, cfg):
+        if port is not None and _tcp_probe(port, cfg, bind_host=bind_host):
             if not quiet:
                 print(f"port={port}", flush=True)
             return 0
