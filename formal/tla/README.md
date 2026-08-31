@@ -207,20 +207,28 @@ Target: **5 minutes** total across the specs run in CI (the original five measur
 | CrashRecovery (local) | `CrashRecovery.cfg` | 3 | 2 | 12 | — | ~30+ min |
 | OCC (CI) | `OCC_CI.cfg` | 2 | 1 | 4 | 1,372,720 | ~47s |
 | OCC (local) | `OCC.cfg` | 3 | 1 | 6 | — | minutes |
-| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 2,594,040 | ~66s |
+| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~111s |
 | Fencing (local) | `Fencing.cfg` | 3 | 1 | 6 | — | minutes |
-| ZombieRevoke (CI) | `ZombieRevoke_CI.cfg` | 2 | 1 | 3 | 1,555,216 | ~49s |
+| ZombieRevoke (CI) | `ZombieRevoke_CI.cfg` | 2 | 1 | 3 | 3,902,098 | ~93s |
 | ZombieRevoke (local) | `ZombieRevoke.cfg` | 3 | 1 | 6 | — | minutes |
-| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 2,594,040 | ~115s |
+| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~176s |
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
-| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 695,500 | ~27s |
+| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 1,735,500 | ~46s |
 | Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
 | WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~5s |
 | WorkspaceVersion (local) | `WorkspaceVersion.cfg` | — | 2 members | MaxVersion=4 | 204,216 | ~6s |
 
-Fencing, ZombieRevoke, EffectGate, Retention and Snapshot were remeasured 2026-08-30
-(8 cores): the epoch bump on a voluntary release makes a new generation value reachable
-in each of them. The full `make tla-check` sweep is ~7min20s, up from ~5min.
+Fencing, ZombieRevoke, EffectGate, Retention and Snapshot were remeasured 2026-08-31
+(8 cores). Two changes compound here: the epoch bump on a voluntary release makes a new
+generation value reachable in each of them, and `MaxGen` had to be raised from `MaxTicks`
+to `MaxTicks + NumAgents`. That second one is not cosmetic. A release bump is not
+tick-bounded, so acquire/release cycles reach the old ceiling at clock 0 -- and because a
+failed bump guard DISABLES its action rather than violating an invariant, TLC quietly
+stopped exploring revoke transitions there while still reporting success. Raising the
+ceiling roughly doubles each affected space (EffectGate 3.9M -> 10.5M distinct states is
+the largest). The full `make tla-check` sweep is ~11min40s, up from ~7min20s and ~5min
+before the amendment. If that stops fitting the CI budget, cut the tick horizon rather
+than `MaxGen` -- a low `MaxGen` buys its speed by silently not checking things.
 
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)

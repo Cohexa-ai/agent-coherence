@@ -117,13 +117,18 @@
 
 EXTENDS CrashRecovery
 
-(* Generation space bound for finite model checking. Each sweep bumps a
-   reclaimed artifact's generation by 1 and sweeps are bounded by the tick
-   horizon; FencingInvalidateAction also bumps and is NOT tick-bounded, so both
-   bump sites carry an explicit `< MaxGen` guard rather than relying on the
-   horizon. Safety-only checking, so a guard that disables the action at the
-   ceiling is sound (it truncates the space, it does not admit anything). *)
-MaxGen == MaxTicks
+(* Generation space bound for finite model checking.
+
+   MaxTicks alone is NOT enough. A sweep bump is tick-bounded, but
+   FencingInvalidateAction's release bump is not: acquire/release cycles bump
+   the epoch without advancing the clock, so the ceiling is reachable at
+   clock 0. Both bump sites carry a `< MaxGen` guard, and a guard that fails
+   DISABLES its action rather than violating anything -- so too low a ceiling
+   silently stops TLC exploring revoke transitions while the run still reports
+   success. Sized as MaxTicks + NumAgents, mirroring MESI.tla's MaxVersion,
+   which solves the same problem (a counter advanced by agent actions rather
+   than by the clock) the same way. *)
+MaxGen == MaxTicks + NumAgents
 
 VARIABLES ownerGeneration, readGeneration, staleApply, silentRevoke
 

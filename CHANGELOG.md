@@ -49,6 +49,20 @@ Alpha — APIs may change before `v1.0`.
   `stale_read_generation` rejections where a release previously left the fence
   unarmed — that is the fix, not a regression.
 
+  Two callers had to follow the new "decline" outcome, because `invalidate`
+  could previously never be a no-op. `AgentRuntime.handle_invalidation` now asks
+  the coordinator first and clamps the local cache only on a signal it actually
+  applied — clamping first would drop the agent's view for a grant the
+  coordinator then keeps, a split the pre-pin code could not produce.
+  `AgentRuntime.handle_update` now clears the transient for the agents it grants
+  SHARED, the way `fetch` already does: once an eager push has moved a peer back
+  to SHARED the pin can legitimately decline the late invalidation that used to
+  clear it, and a stranded transient stalls both the stable-grant sweep and that
+  peer's next `commit_cas`.
+
+  The backend conformance kit gains a MUST-MATCH release-bump scenario, so the
+  epoch rule R9 now states is one a third-party backend can actually fail.
+
   Both defects were in the formal model too: `Fencing.tla` inherited the
   unguarded `CRInvalidateAction`, which *is* F2 encoded. `Fencing.tla` now bumps
   the epoch on a release and carries `NoSilentRevoke`; the pin and
@@ -59,7 +73,7 @@ Alpha — APIs may change before `v1.0`.
   defined relative to the very counter that fails to move — which is why the
   second invariant exists; confirmed by mutation. Both new invariants carry
   documented mutants (`formal/tla/README.md` recipes 16 and 17). `make
-  tla-check` now sweeps nine specs, ~7min20s.
+  tla-check` now sweeps nine specs. `MaxGen` is sized `MaxTicks + NumAgents` (mirroring `MaxVersion`): the release bump is not tick-bounded, so the old `MaxTicks` ceiling was reachable at clock 0, and a bump guard that fails DISABLES its action rather than violating anything — TLC silently stopped exploring revoke transitions while still reporting success.
 
 ## [0.14.0] - 2026-08-25
 

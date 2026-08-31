@@ -88,6 +88,10 @@ def test_fence_rejects_superseded_read_generation(factory: RegistryFactory) -> N
     kit.assert_fence_rejects_superseded_read_generation(factory)
 
 
+def test_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
+    kit.assert_epoch_moves_on_voluntary_release(factory)
+
+
 def test_version_and_generation_pair_is_untearable(factory: RegistryFactory) -> None:
     kit.assert_version_and_generation_pair_is_untearable(factory)
 

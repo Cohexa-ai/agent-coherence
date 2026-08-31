@@ -297,17 +297,35 @@ class AgentRuntime:
         )
 
     def handle_invalidation(self, signal: InvalidationSignal) -> None:
-        """Apply invalidation event from coordinator/event bus."""
+        """Apply invalidation event from coordinator/event bus.
+
+        The coordinator decides FIRST, and the local cache follows its verdict.
+        Order is load-bearing: ``invalidate`` can decline a signal the
+        NoZombieRevoke pin finds obsolete (``service._revoke_is_superseded``),
+        and clamping the cache before asking would drop this agent's view for a
+        grant the coordinator then keeps -- a split the pre-pin code could not
+        produce, because the coordinator always applied.
+
+        A ``None`` return from an artifact the registry does not know is the one
+        case that still clears the cache: the artifact is gone, so there is
+        nothing for the local copy to be coherent WITH. Only a live artifact
+        whose revoke was declined leaves the cache alone.
+        """
+        declined = (
+            self.coordinator.invalidate(
+                agent_id=self.agent_id,
+                artifact_id=signal.artifact_id,
+                new_version=signal.new_version,
+                issuer_agent_id=signal.issuer_agent_id,
+                issued_at_tick=signal.issued_at_tick,
+            )
+            is None
+        )
+        if declined and self.coordinator.registry.has_artifact(signal.artifact_id):
+            return
         self.cache.invalidate(
             signal.artifact_id,
             invalidated_version=max(signal.new_version - 1, 0),
-            issued_at_tick=signal.issued_at_tick,
-        )
-        self.coordinator.invalidate(
-            agent_id=self.agent_id,
-            artifact_id=signal.artifact_id,
-            new_version=signal.new_version,
-            issuer_agent_id=signal.issuer_agent_id,
             issued_at_tick=signal.issued_at_tick,
         )
 
@@ -337,13 +355,24 @@ class AgentRuntime:
             source="broadcast",
             now_tick=now_tick,
         )
+        # An eager push IS an observation, so it completes the grant transition
+        # the same way ``service.fetch`` does -- state, then clear the transient.
+        # ``_write_impl`` / ``_commit_impl`` set a peer's SIA/EIA transient
+        # alongside the INVALID transition and leave the bus-delivered
+        # invalidation to clear it; once an update has moved that peer back to
+        # SHARED, the NoZombieRevoke pin can legitimately decline the late
+        # signal, and without this the transient would strand -- stalling the
+        # stable-grant sweep (which skips a pair mid-transient) and the peer's
+        # next commit_cas until the transient-timeout fail-safe fires.
         self.coordinator.registry.set_agent_state(
             artifact_id, self.agent_id, MESIState.SHARED, trigger="update", tick=now_tick
         )
+        self.coordinator.registry.clear_agent_transient(artifact_id, self.agent_id)
         if writer_agent_id is not None:
             self.coordinator.registry.set_agent_state(
                 artifact_id, writer_agent_id, MESIState.SHARED, trigger="update", tick=now_tick
             )
+            self.coordinator.registry.clear_agent_transient(artifact_id, writer_agent_id)
 
     def content(self, artifact_id: UUID) -> str | None:
         """Return locally cached content body for artifact if present."""
