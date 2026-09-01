@@ -122,20 +122,32 @@ class ArtifactRegistry:
 
     @contextmanager
     def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
-        """In-memory mirror of :meth:`SqliteArtifactRegistry.abort_guard`
-        (finding A6) so :class:`CoordinatorService` can call it uniformly
-        regardless of which registry backs it.
+        """Hold ``self._lock`` across the caller's whole mutation, failing
+        closed if the handler watchdog already timed out (finding A6). The
+        same guarantee, word for word, as
+        :meth:`SqliteArtifactRegistry.abort_guard`, so
+        :class:`CoordinatorService` composes check-then-act sequences
+        identically over either registry.
 
-        The abort check: if the handler watchdog already timed out and SET
-        ``abort``, fail closed before the caller mutates; otherwise run the
-        mutation. ``abort=None`` (every non-watchdog caller) checks nothing.
+        The lock is what makes the guard mean something across MULTIPLE
+        registry calls: each public method serializes itself, but a service
+        sequence that reads, decides, then writes needs the decision and the
+        write inside one hold. The RLock is reentrant, so the nested registry
+        calls under the guard acquire freely.
+
+        The abort check runs the instant the lock is won: by then the watchdog
+        may have fired, returned ``degraded: true``, and SET ``abort`` -- the
+        late "phantom grant" aborts before it lands. ``abort=None`` (every
+        non-watchdog caller) is a plain lock acquire with no behavioural
+        change.
         """
-        if abort is not None and abort.is_set():
-            raise WatchdogAbandoned(
-                "handler watchdog timed out before this mutation ran; aborting "
-                "before it lands (A6)."
-            )
-        yield
+        with self._lock:
+            if abort is not None and abort.is_set():
+                raise WatchdogAbandoned(
+                    "handler watchdog timed out before this mutation ran; "
+                    "aborting before it lands (A6)."
+                )
+            yield
 
     def __init__(
         self,
