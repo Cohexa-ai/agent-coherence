@@ -19,9 +19,10 @@ from uuid import uuid4
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.states import MESIState
-from ccs.core.types import Artifact, ConflictDetail
+from ccs.core.types import Artifact, ConflictDetail, FetchRequest
 
 _WRITERS = 4
 _CALLS_PER_WRITER = 400
@@ -157,5 +158,77 @@ def test_concurrent_cas_writers_produce_one_winner_and_typed_conflicts(registry)
             (updated, _invalidated) = wins[0]
             assert updated.version == expected + 1
             assert registry.get_artifact(artifact.id).version == expected + 1
+    finally:
+        sys.setswitchinterval(default_switch_interval)
+
+
+_FETCH_ROUNDS = 20
+_FETCH_ITERS = 30
+_M_OR_E = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
+
+
+def test_concurrent_fetch_and_write_never_leave_two_write_holders(registry) -> None:
+    """U5's fetch guard: the grant decision and the grant land in one hold.
+
+    ``fetch`` decides EXCLUSIVE-vs-SHARED from a state-map snapshot; without
+    the guard a peer ``write`` landing between that read and the grant write
+    leaves TWO M/E holders — the single-writer invariant the whole protocol
+    exists to keep. Reverting the guard fails this 38-in-40 rounds at a 1 us
+    switch interval, surfacing as ``single_writer_violated`` raises from
+    whichever path validates first.
+    """
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    writer, reader = uuid4(), uuid4()
+
+    default_switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for round_no in range(_FETCH_ROUNDS):
+            barrier = threading.Barrier(2, timeout=5)
+            failures: list[BaseException] = []
+
+            def _writes() -> None:
+                try:
+                    barrier.wait()
+                    for t in range(_FETCH_ITERS):
+                        svc.write(agent_id=writer, artifact_id=art.id, issued_at_tick=t)
+                        svc.invalidate(
+                            agent_id=writer, artifact_id=art.id, new_version=1,
+                            issuer_agent_id=writer, issued_at_tick=t,
+                        )
+                except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                    failures.append(exc)
+
+            def _fetches() -> None:
+                try:
+                    barrier.wait()
+                    for t in range(_FETCH_ITERS):
+                        svc.fetch(FetchRequest(
+                            artifact_id=art.id, requesting_agent_id=reader,
+                            requested_at_tick=t,
+                        ))
+                except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                    failures.append(exc)
+
+            threads = [
+                threading.Thread(target=_writes, daemon=True),
+                threading.Thread(target=_fetches, daemon=True),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+                assert not t.is_alive(), f"round {round_no}: a worker never finished"
+
+            assert not failures, f"round {round_no}: {failures[0]!r}"
+            write_holders = [
+                ag for ag, st in registry.get_state_map(art.id).items() if st in _M_OR_E
+            ]
+            assert len(write_holders) <= 1, (
+                f"round {round_no}: {len(write_holders)} write-state holders — "
+                "fetch granted from a snapshot a concurrent write had already "
+                "invalidated"
+            )
     finally:
         sys.setswitchinterval(default_switch_interval)

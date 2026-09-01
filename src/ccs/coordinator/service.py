@@ -471,7 +471,12 @@ class CoordinatorService:
         content_hash: str | None = None,
         depends_on: tuple[UUID, ...] = (),
     ) -> Artifact:
-        """Register a new artifact and optionally assign an initial owner."""
+        """Register a new artifact and optionally assign an initial owner.
+
+        The register and the initial EXCLUSIVE grant run under one
+        :meth:`registry.abort_guard` hold (U5): without it a concurrent sweep
+        or peer fetch can interleave between them and act on an artifact that
+        exists but whose owner grant has not landed yet."""
         artifact = Artifact(
             name=name,
             version=1,
@@ -479,44 +484,55 @@ class CoordinatorService:
             size_tokens=size_tokens,
             depends_on=depends_on,
         )
-        self.registry.register_artifact(artifact, content)
-        if initial_owner is not None:
-            self.registry.set_agent_state(artifact.id, initial_owner, MESIState.EXCLUSIVE, trigger="register", tick=0)
+        with self.registry.abort_guard():
+            self.registry.register_artifact(artifact, content)
+            if initial_owner is not None:
+                self.registry.set_agent_state(
+                    artifact.id, initial_owner, MESIState.EXCLUSIVE, trigger="register", tick=0
+                )
         return artifact
 
     def fetch(self, request: FetchRequest) -> FetchResponse:
-        """Fetch canonical artifact payload and grant requester state."""
-        artifact = self._require_artifact(request.artifact_id)
-        content = self.registry.get_content(request.artifact_id)
-        if content is None:
-            raise CoherenceError(f"artifact_content_missing artifact={request.artifact_id}")
+        """Fetch canonical artifact payload and grant requester state.
 
-        state_map = self.registry.get_state_map(request.artifact_id)
-        other_holders = [
-            agent_id
-            for agent_id, state in state_map.items()
-            if agent_id != request.requesting_agent_id and state != MESIState.INVALID
-        ]
+        The whole read-decide-grant sequence runs under one
+        :meth:`registry.abort_guard` hold (U5): the grant decision (EXCLUSIVE
+        vs SHARED) is made from the state-map snapshot, so a peer write
+        landing between that read and the grant write could otherwise leave
+        two holders in a write state — the check-then-act shape every other
+        mutation path already guards."""
+        with self.registry.abort_guard():
+            artifact = self._require_artifact(request.artifact_id)
+            content = self.registry.get_content(request.artifact_id)
+            if content is None:
+                raise CoherenceError(f"artifact_content_missing artifact={request.artifact_id}")
 
-        grant = MESIState.EXCLUSIVE if not other_holders else MESIState.SHARED
-        self.registry.set_agent_transient(
-            request.artifact_id,
-            request.requesting_agent_id,
-            TransientState.IED if grant == MESIState.EXCLUSIVE else TransientState.ISG,
-            entered_tick=request.requested_at_tick,
-        )
-        if other_holders:
-            # Multiple readers must stay coherent; downgrade any exclusive/modified holder.
-            for agent_id in other_holders:
-                self.registry.set_agent_state(
-                    request.artifact_id, agent_id, MESIState.SHARED, trigger="fetch", tick=request.requested_at_tick
-                )
+            state_map = self.registry.get_state_map(request.artifact_id)
+            other_holders = [
+                agent_id
+                for agent_id, state in state_map.items()
+                if agent_id != request.requesting_agent_id and state != MESIState.INVALID
+            ]
 
-        self.registry.set_agent_state(
-            request.artifact_id, request.requesting_agent_id, grant, trigger="fetch", tick=request.requested_at_tick
-        )
-        self.registry.clear_agent_transient(request.artifact_id, request.requesting_agent_id)
-        self._validate_single_writer(request.artifact_id)
+            grant = MESIState.EXCLUSIVE if not other_holders else MESIState.SHARED
+            self.registry.set_agent_transient(
+                request.artifact_id,
+                request.requesting_agent_id,
+                TransientState.IED if grant == MESIState.EXCLUSIVE else TransientState.ISG,
+                entered_tick=request.requested_at_tick,
+            )
+            if other_holders:
+                # Multiple readers must stay coherent; downgrade any exclusive/modified holder.
+                for agent_id in other_holders:
+                    self.registry.set_agent_state(
+                        request.artifact_id, agent_id, MESIState.SHARED, trigger="fetch", tick=request.requested_at_tick
+                    )
+
+            self.registry.set_agent_state(
+                request.artifact_id, request.requesting_agent_id, grant, trigger="fetch", tick=request.requested_at_tick
+            )
+            self.registry.clear_agent_transient(request.artifact_id, request.requesting_agent_id)
+            self._validate_single_writer(request.artifact_id)
 
         return FetchResponse(
             artifact_id=request.artifact_id,
@@ -2906,21 +2922,28 @@ class CoordinatorService:
 
         Does not require the caller to hold EXCLUSIVE or MODIFIED state first.
         Returns [] when the artifact is absent (silent no-op for the caller).
+
+        The existence check, the holder enumeration and the removal run under
+        one :meth:`registry.abort_guard` hold (U5), so the emitted signals
+        match the holders that actually existed at the instant of removal — a
+        grant established between the enumeration and the remove can neither
+        be missed nor phantom-signalled.
         """
-        if not self.registry.has_artifact(artifact_id):
-            return []
-        artifact = self._require_artifact(artifact_id)
-        signals = [
-            InvalidationSignal(
-                artifact_id=artifact_id,
-                new_version=artifact.version,
-                issued_at_tick=issued_at_tick,
-                issuer_agent_id=agent_id,
-            )
-            for holder_id, state in self.registry.get_state_map(artifact_id).items()
-            if state != MESIState.INVALID
-        ]
-        self.registry.remove_artifact(artifact_id)
+        with self.registry.abort_guard():
+            if not self.registry.has_artifact(artifact_id):
+                return []
+            artifact = self._require_artifact(artifact_id)
+            signals = [
+                InvalidationSignal(
+                    artifact_id=artifact_id,
+                    new_version=artifact.version,
+                    issued_at_tick=issued_at_tick,
+                    issuer_agent_id=agent_id,
+                )
+                for holder_id, state in self.registry.get_state_map(artifact_id).items()
+                if state != MESIState.INVALID
+            ]
+            self.registry.remove_artifact(artifact_id)
         return signals
 
     def record_heartbeat(self, *, agent_id: UUID, now_tick: int) -> None:
@@ -2936,19 +2959,29 @@ class CoordinatorService:
 
         expired = 0
         for artifact_id in self.registry.artifact_ids():
-            for agent_id, transient in self.registry.get_transient_map(artifact_id).items():
-                entered = self.registry.get_transient_tick(artifact_id, agent_id)
-                if entered is None:
-                    continue
-                if (current_tick - entered) < timeout_ticks:
-                    continue
+            for agent_id in list(self.registry.get_transient_map(artifact_id)):
+                # Per-pair hold (U5 / KTD2): the walk's snapshot is stale by
+                # the time a pair is visited, so the decision re-reads INSIDE
+                # the hold and the write lands in the same hold. Held per pair,
+                # not across the walk — a long scan must not block unrelated
+                # reads for its whole duration.
+                with self.registry.abort_guard():
+                    if self.registry.get_agent_transient(artifact_id, agent_id) is None:
+                        # Cleared since the snapshot (the grant completed);
+                        # evicting now would destroy a settled entry.
+                        continue
+                    entered = self.registry.get_transient_tick(artifact_id, agent_id)
+                    if entered is None:
+                        continue
+                    if (current_tick - entered) < timeout_ticks:
+                        continue
 
-                # Conservative fail-safe: transient timeout always forces local invalidation.
-                self.registry.set_agent_state(
-                    artifact_id, agent_id, MESIState.INVALID, trigger="timeout", tick=current_tick
-                )
-                self.registry.clear_agent_transient(artifact_id, agent_id)
-                expired += 1
+                    # Conservative fail-safe: transient timeout always forces local invalidation.
+                    self.registry.set_agent_state(
+                        artifact_id, agent_id, MESIState.INVALID, trigger="timeout", tick=current_tick
+                    )
+                    self.registry.clear_agent_transient(artifact_id, agent_id)
+                    expired += 1
 
         return expired
 
@@ -2979,6 +3012,11 @@ class CoordinatorService:
         Library code remains preemption-notice-agnostic; the registry
         method is adapter-only (SqliteArtifactRegistry).
 
+        KTD7 — ``on_reclaim`` runs while the per-pair registry hold is HELD:
+        it must never block on other threads and may reach only into this
+        registry's own (reentrant) methods. Both shipped callbacks qualify (a
+        list append; ``record_preemption_notice``).
+
         Returns the number of grants reclaimed.
         """
         if heartbeat_timeout_ticks < 1:
@@ -2996,58 +3034,72 @@ class CoordinatorService:
 
         reclaimed = 0
         for artifact_id, agent_id, _mesi in snapshot:
-            # Live read — agents that entered transient since the snapshot are owned by
-            # the transient sweep, not this one (R4).
-            if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
-                continue
-
-            last_hb = self.registry.last_heartbeat_tick(agent_id)
-            # Heartbeat uses `>=` to match max-hold's `>=` (review fix ADV-02).
-            # An effective timeout of exactly heartbeat_timeout_ticks means a
-            # grant is reclaimed when (current_tick - last_hb) reaches the
-            # threshold, not the tick after. Matches the 'at least this many
-            # ticks since last heartbeat' framing in CrashRecoveryConfig docs.
-            heartbeat_stale = last_hb is None or (current_tick - last_hb) >= heartbeat_timeout_ticks
-
-            if heartbeat_stale:
-                trigger = "reclaim_heartbeat"
-            else:
-                granted_at = self.registry.granted_at_tick(agent_id, artifact_id)
-                if granted_at is None:
-                    # M∪E holder without granted_at — should not exist; skip to avoid
-                    # blocking the sweep but log so operators can investigate.
-                    logger.warning(
-                        "sweep: M/E holder has no granted_at slot; skipping max-hold check "
-                        "agent=%s artifact=%s",
-                        agent_id, artifact_id,
-                    )
+            # Per-pair hold (U5 / KTD2): everything from the state re-read to
+            # the reclaiming write happens inside ONE registry hold, so the
+            # decision cannot outlive the state it was made from -- the window
+            # that let a reclaim land on a grant renewed after the reads, and
+            # let the walk observe the mid-renewal "M/E holder with no
+            # granted_at slot" state this method used to log as impossible.
+            # Held per pair, not across the walk: a long sweep must not block
+            # an unrelated artifact's reads for the whole scan.
+            with self.registry.abort_guard():
+                # The snapshot is stale by now; re-read the pair's state and
+                # skip anything that is no longer a stable-state grant.
+                if self.registry.get_agent_state(artifact_id, agent_id) not in m_or_e:
                     continue
-                if (current_tick - granted_at) >= max_hold_ticks:
-                    trigger = "reclaim_max_hold"
+                # Agents that entered transient since the snapshot are owned by
+                # the transient sweep, not this one (R4).
+                if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
+                    continue
+
+                last_hb = self.registry.last_heartbeat_tick(agent_id)
+                # Heartbeat uses `>=` to match max-hold's `>=` (review fix ADV-02).
+                # An effective timeout of exactly heartbeat_timeout_ticks means a
+                # grant is reclaimed when (current_tick - last_hb) reaches the
+                # threshold, not the tick after. Matches the 'at least this many
+                # ticks since last heartbeat' framing in CrashRecoveryConfig docs.
+                heartbeat_stale = last_hb is None or (current_tick - last_hb) >= heartbeat_timeout_ticks
+
+                if heartbeat_stale:
+                    trigger = "reclaim_heartbeat"
                 else:
-                    continue
+                    granted_at = self.registry.granted_at_tick(agent_id, artifact_id)
+                    if granted_at is None:
+                        # M∪E holder without granted_at inside the hold — a real
+                        # inconsistency now, not a mid-renewal read: skip and log
+                        # so operators can investigate.
+                        logger.warning(
+                            "sweep: M/E holder has no granted_at slot; skipping max-hold check "
+                            "agent=%s artifact=%s",
+                            agent_id, artifact_id,
+                        )
+                        continue
+                    if (current_tick - granted_at) >= max_hold_ticks:
+                        trigger = "reclaim_max_hold"
+                    else:
+                        continue
 
-            self.registry.set_agent_state(
-                artifact_id,
-                agent_id,
-                MESIState.INVALID,
-                trigger=trigger,
-                tick=current_tick,
-                content_hash=None,
-            )
-            self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
-            self._validate_single_writer(artifact_id)
-            if on_reclaim is not None:
-                # Best-effort: a notice-recording failure must not stop the sweep
-                # (the reclamation itself already landed in the registry).
-                try:
-                    on_reclaim(artifact_id, agent_id, trigger)
-                except Exception:  # noqa: BLE001 — telemetry surface, best-effort
-                    logger.exception(
-                        "on_reclaim callback raised for agent=%s artifact=%s trigger=%s",
-                        agent_id, artifact_id, trigger,
-                    )
-            reclaimed += 1
+                self.registry.set_agent_state(
+                    artifact_id,
+                    agent_id,
+                    MESIState.INVALID,
+                    trigger=trigger,
+                    tick=current_tick,
+                    content_hash=None,
+                )
+                self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
+                self._validate_single_writer(artifact_id)
+                if on_reclaim is not None:
+                    # Best-effort: a notice-recording failure must not stop the sweep
+                    # (the reclamation itself already landed in the registry).
+                    try:
+                        on_reclaim(artifact_id, agent_id, trigger)
+                    except Exception:  # noqa: BLE001 — telemetry surface, best-effort
+                        logger.exception(
+                            "on_reclaim callback raised for agent=%s artifact=%s trigger=%s",
+                            agent_id, artifact_id, trigger,
+                        )
+                reclaimed += 1
 
         return reclaimed
 
