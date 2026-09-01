@@ -8,6 +8,34 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The in-memory registry now carries the same concurrency contract as the
+  durable one: thread-safe, one lock, held across every check-then-act
+  sequence.** The old contract — "single-threaded, lock-free by contract, GIL
+  per-access atomicity" — only ever covered a single dict access, while the
+  paths above it compose multi-access sequences the GIL does not hold
+  together. Racing the stable-grant sweep against a holder renewing its claim
+  put the walk into the state the sweep's own comment called impossible
+  ("M/E holder has no granted_at slot") and silently skipped max-hold
+  enforcement; racing `fetch` against a peer `write` left two agents in a
+  write state (`single_writer_violated`, 38 of 40 rounds); racing two
+  optimistic committers double-applied one `expected_version`. All three
+  reproduced on the SQLite arm too wherever the sequence lived in the service
+  layer — per-call backend serialization cannot fix a multi-call decision.
+
+  The capture-only `_capture_lock` is widened into `self._lock`, held by every
+  public method except three named construction-time-immutable accessors;
+  `abort_guard` now holds it across the caller's whole mutation exactly like
+  the SQLite guard; `commit_cas` / `commit_all` decide and apply in one hold
+  (the in-memory stand-in for `BEGIN IMMEDIATE`); and the service's five
+  check-then-act sequences — `fetch`, `delete`, `register_artifact`, both
+  sweeps — run under the guard, the sweeps holding per `(agent, artifact)`
+  pair with the pair's state re-read inside the hold, never across the walk.
+  Callbacks the registry accepts (`state_log`, `on_reclaim`) now run under the
+  lock and carry that stated obligation. A structural test drives every
+  public member of both registries against a tracking lock, with the surface
+  frozen by name, so a new unlocked member fails CI by name. Uncontended
+  overhead: ~168 ns per acquire, ~2.7 µs per commit cycle.
+
 - **The read-generation fence is now an operation-class property, not a
   commit-path one — `invalidate` could both bypass it and suppress it.** The
   fence (`owner_generation` vs a committer's captured `read_generation`) was

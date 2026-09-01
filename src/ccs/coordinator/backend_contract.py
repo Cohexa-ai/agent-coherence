@@ -140,7 +140,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "THE N-artifact atomic boundary (SB-18). commit_all runs CHECK-all "
         "(version-CAS + other_holder + fence per member) then applies EVERY member "
         "or NONE, in one serialized step (sqlite: one BEGIN IMMEDIATE; in-memory: "
-        "one _capture_lock hold with snapshot-restore). All-or-nothing -- a partial "
+        "one _lock hold with snapshot-restore). All-or-nothing -- a partial "
         "batch is never observable (NoPartialPublish). Returns a MultiCasResult; "
         "the aggregated invalidation broadcasts only after the commit. A genuinely "
         "new atomic op, never a loop of commit_cas.",
@@ -267,7 +267,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "base",
         "Persists a workspace-checkpoint manifest (WV Unit 2): the header row + "
         "owner metadata + every member row in ONE registry transaction (sqlite: "
-        "one BEGIN IMMEDIATE; in-memory: one _capture_lock hold with validate-"
+        "one BEGIN IMMEDIATE; in-memory: one _lock hold with validate-"
         "before-first-insert) — individually atomic, all rows or none. NOT part "
         "of the R9 single-writer RMW: the manifest records capture facts, it "
         "arbitrates no writer (the capture engine's version reads ride the "
