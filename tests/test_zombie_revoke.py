@@ -31,6 +31,8 @@ dropping an invalidation is far more dangerous than applying one.
 
 from __future__ import annotations
 
+import logging
+import sys
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -512,3 +514,201 @@ def test_peer_invalidation_still_clears_a_stranded_transient(registry) -> None:
     assert svc.registry.get_agent_transient(art.id, b) is None, (
         "the pin stranded a peer's invalidation transient"
     )
+
+
+# ---------------------------------------------------------------------------
+# R9 / AE1 — the sweep's own read-to-write window
+# ---------------------------------------------------------------------------
+#
+# The two defects above are about a signal that outlived its authority. This
+# one is about a DECISION that outlived the state it was made from, inside a
+# single caller: ``enforce_stable_grant_timeouts`` reads the state map, the
+# transient slot, the heartbeat and ``granted_at_tick`` in four separate
+# registry calls, then writes INVALID in a fifth. Nothing holds those five
+# together on EITHER backend: sqlite serializes each call on its RLock, but
+# the sequence lives in the service layer, above any per-call lock. Both arms
+# fail here today, and both must pass once the sweep decides and writes in
+# one hold (the plan's U5).
+#
+# The GIL switch interval is forced down for the racing test: at the 5 ms
+# default a ~100-bytecode window between two registry calls is practically
+# never split, and the failure this test exists to show goes quiet. At 1 us
+# it reproduces in well over half the rounds on both arms (measured: 92-137
+# warnings per run in-memory, 9-19 on sqlite), which over 40 rounds puts a
+# spurious full pass below 1e-4.
+
+_RACE_SWITCH_INTERVAL = 1e-6
+
+_SWEEP_ROUNDS = 40
+_RENEWALS_PER_ROUND = 60
+_SWEEPS_PER_ROUND = 60
+
+_STALE_GRANT_TICK = 0          # over-held by construction at _SWEEP_TICK
+_SWEEP_TICK = 1_000
+_MAX_HOLD_TICKS = 100          # a grant renewed at _SWEEP_TICK is 0 ticks old
+_HEARTBEAT_TIMEOUT_TICKS = 10_000  # never the deciding leg in these rounds
+
+_NO_GRANTED_AT = "has no granted_at slot"
+
+
+def _renew_grant(reg, artifact_id: object, agent_id: object, tick: int) -> None:
+    """One renewal: hand the write claim back, take it again at a fresh tick.
+
+    ``set_agent_state`` writes ``granted_at_tick`` on an M∪E ACQUIRE only --
+    M<->E transitions deliberately preserve the original grant tick, because the
+    agent has continuously held *some* write claim. So a holder refreshes its
+    max-hold budget the only way the API allows, and the only way a real one
+    does: it releases and re-acquires. The (state, trigger) pairs are exactly
+    the ones ``CoordinatorService`` uses -- ``invalidate`` to release
+    (service.py, the ``_invalidate_impl`` write) and ``write`` to acquire
+    EXCLUSIVE (service.py, the ``write`` grant).
+    """
+    reg.set_agent_state(
+        artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=tick
+    )
+    reg.set_agent_state(
+        artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=tick
+    )
+
+
+def test_sweep_does_not_reclaim_a_renewed_grant(registry, caplog) -> None:
+    """A grant renewed at a fresh tick is not reclaimed by a concurrent sweep.
+
+    R9 / AE1. Two windows open inside ``enforce_stable_grant_timeouts``, both
+    between a read and the write that acts on it, with no lock holding the
+    pair together:
+
+      W1  the sweep reads ``granted_at_tick`` (or the heartbeat) while the
+          grant is still the original over-held one, decides reclaim, and by
+          the time it writes INVALID the holder has renewed. A grant that was
+          fresh at write time is destroyed on a budget it no longer had.
+          Proven reachable by a forced interleave (park the sweep inside
+          ``last_heartbeat_tick``, heartbeat, release: the reclaim lands on a
+          holder that just proved it was alive); a few-bytecode window, so
+          racing alone never hit it in 160 measured rounds. The final-state
+          assertion below is its regression net.
+
+      W2  the sweep's snapshot sees M/E, then the renewal's release pops the
+          ``granted_at_tick`` slot before the sweep reads it. The sweep finds
+          an M/E holder with no grant tick -- a state the registry's own
+          comment says "should not exist" -- logs it, and SKIPS the max-hold
+          check for that holder: enforcement quietly not happening. This is
+          the wide window; it is what reliably fails this test today, on both
+          arms. The warning assertion below is its discriminator.
+
+    The discriminator for W1 needs no timing heuristic. The renewer's LAST act
+    in every round is an acquire, so if the holder is INVALID once both threads
+    have joined, the sweep's write necessarily landed after that acquire. A
+    sweep that reclaims the original stale grant BEFORE the first renewal is
+    correct, and leaves the holder M/E via the renewal that follows -- so it is
+    not counted, and the assertion cannot fire on a legitimate reclaim.
+
+    Runs many rounds because both windows are genuine races, not gated ones: a
+    gate inside the sweep's read-to-write window would deadlock against the
+    very lock this test exists to justify -- and after the fix the gated
+    interleave is exactly the schedule the lock makes unreachable.
+    """
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    registry.record_heartbeat(agent, _SWEEP_TICK)
+
+    zombie_rounds: list[int] = []
+    failures: list[BaseException] = []
+
+    default_switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(_RACE_SWITCH_INTERVAL)
+    try:
+        with caplog.at_level(logging.WARNING, logger="ccs.coordinator.service"):
+            for round_no in range(_SWEEP_ROUNDS):
+                # Reset to the over-held grant W1 needs: a live claim whose budget
+                # ran out long before _SWEEP_TICK.
+                registry.set_agent_state(
+                    art.id, agent, MESIState.INVALID, trigger="invalidate", tick=_STALE_GRANT_TICK
+                )
+                registry.set_agent_state(
+                    art.id, agent, MESIState.EXCLUSIVE, trigger="write", tick=_STALE_GRANT_TICK
+                )
+
+                start = threading.Barrier(2, timeout=5)
+
+                def _renews() -> None:
+                    try:
+                        start.wait()
+                        for _ in range(_RENEWALS_PER_ROUND):
+                            _renew_grant(registry, art.id, agent, _SWEEP_TICK)
+                    except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                        failures.append(exc)
+
+                def _sweeps() -> None:
+                    try:
+                        start.wait()
+                        for _ in range(_SWEEPS_PER_ROUND):
+                            svc.enforce_stable_grant_timeouts(
+                                current_tick=_SWEEP_TICK,
+                                heartbeat_timeout_ticks=_HEARTBEAT_TIMEOUT_TICKS,
+                                max_hold_ticks=_MAX_HOLD_TICKS,
+                            )
+                    except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                        failures.append(exc)
+
+                renewer = threading.Thread(target=_renews, daemon=True)
+                sweeper = threading.Thread(target=_sweeps, daemon=True)
+                renewer.start()
+                sweeper.start()
+                renewer.join(timeout=5)
+                sweeper.join(timeout=5)
+                assert not renewer.is_alive() and not sweeper.is_alive(), (
+                    f"round {round_no}: a worker never finished — the sweep and the "
+                    "renewer are deadlocked against each other"
+                )
+                if failures:
+                    break
+
+                if registry.get_agent_state(art.id, agent) not in _M_OR_E:
+                    zombie_rounds.append(round_no)
+
+    finally:
+        sys.setswitchinterval(default_switch_interval)
+
+    assert not failures, f"a worker raised: {failures[0]!r}"
+
+    assert not zombie_rounds, (
+        f"the sweep reclaimed a renewed grant in {len(zombie_rounds)} of "
+        f"{_SWEEP_ROUNDS} rounds (first: {zombie_rounds[0]}). The holder's last "
+        "act was an acquire at a fresh tick, so the reclamation was decided on a "
+        "granted_at_tick that had already been replaced when the write landed."
+    )
+
+    stranded = [r for r in caplog.records if _NO_GRANTED_AT in r.getMessage()]
+    assert not stranded, (
+        f"the sweep saw an M/E holder with no granted_at slot {len(stranded)} "
+        "times — it read the state map and the grant tick either side of a "
+        f"concurrent renewal (first: {stranded[0].getMessage()})"
+    )
+
+
+def test_sweep_still_reclaims_a_genuinely_over_held_grant(registry) -> None:
+    """Teeth for the test above: the sweep must still do its job.
+
+    Without this, ``test_sweep_does_not_reclaim_a_renewed_grant`` would pass
+    against a sweep that reclaims nothing at all — including one broken by the
+    serialization it exists to motivate.
+    """
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    registry.record_heartbeat(agent, _SWEEP_TICK)
+    registry.set_agent_state(
+        art.id, agent, MESIState.EXCLUSIVE, trigger="write", tick=_STALE_GRANT_TICK
+    )
+
+    reclaimed = svc.enforce_stable_grant_timeouts(
+        current_tick=_SWEEP_TICK,
+        heartbeat_timeout_ticks=_HEARTBEAT_TIMEOUT_TICKS,
+        max_hold_ticks=_MAX_HOLD_TICKS,
+    )
+
+    assert reclaimed == 1
+    assert registry.get_agent_state(art.id, agent) == MESIState.INVALID
+    assert registry.get_last_reclamation(agent, art.id) is not None
