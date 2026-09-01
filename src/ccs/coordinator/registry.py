@@ -638,8 +638,9 @@ class ArtifactRegistry:
         """In-memory optimistic-concurrency compare-and-swap (plan Unit 2,
         parity with :meth:`SqliteArtifactRegistry.commit_cas`). Written fresh
         from the contract — there is no ``resolve_or_register`` precedent here
-        and the two registries share no base class. Plain GIL-atomic dict
-        mutation; no ``BEGIN IMMEDIATE`` (single-process library callers).
+        and the two registries share no base class. One method-wide ``_lock``
+        hold stands in for the sqlite ``BEGIN IMMEDIATE``: the arbitration
+        legs and the apply are a single serialized step (U4).
 
         Same 3-outcome discrimination, version check BEFORE the holder check:
 
@@ -671,92 +672,92 @@ class ArtifactRegistry:
         previously the None path retained the stale OLD body under the new
         version, a latent history-poisoning bug now fixed.
         """
-        record = self._records.get(artifact_id)
-        if record is None:
-            raise KeyError(f"artifact {artifact_id} not in registry")
-        current = record.artifact.version
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                raise KeyError(f"artifact {artifact_id} not in registry")
+            current = record.artifact.version
 
-        if expected_version > current:
-            return CasCorruption(current_version=current)
-        if expected_version < current:
-            return ConflictDetail("version_mismatch", current)
-        other_holder = any(
-            peer_id != agent_id and state in _M_OR_E_STATES
-            for peer_id, state in record.state_by_agent.items()
-        )
-        if other_holder:
-            return ConflictDetail("other_holder", current)
+            if expected_version > current:
+                return CasCorruption(current_version=current)
+            if expected_version < current:
+                return ConflictDetail("version_mismatch", current)
+            other_holder = any(
+                peer_id != agent_id and state in _M_OR_E_STATES
+                for peer_id, state in record.state_by_agent.items()
+            )
+            if other_holder:
+                return ConflictDetail("other_holder", current)
 
-        # Read-generation fence: reject a committer whose CAPTURED read-claim
-        # was superseded by a sweep reclamation. A reclaimed M/E holder kept its
-        # stale read_generation (captured at acquire), so it is caught here even
-        # though the version is unchanged and no peer holds M/E -- exactly what
-        # version-CAS cannot catch. An ABSENT read_generation means the committer
-        # never established a fence claim: a plain OCC writer whose lost-update
-        # protection is version-CAS (checked above), so it is admitted. Strict->;
-        # equality admits. Server-side; no commit_cas signature change.
-        read_gen = record.read_generation_by_agent.get(agent_id)
-        if read_gen is not None and read_gen < record.owner_generation:
-            return ConflictDetail("stale_read_generation", current)
+            # Read-generation fence: reject a committer whose CAPTURED read-claim
+            # was superseded by a sweep reclamation. A reclaimed M/E holder kept its
+            # stale read_generation (captured at acquire), so it is caught here even
+            # though the version is unchanged and no peer holds M/E -- exactly what
+            # version-CAS cannot catch. An ABSENT read_generation means the committer
+            # never established a fence claim: a plain OCC writer whose lost-update
+            # protection is version-CAS (checked above), so it is admitted. Strict->;
+            # equality admits. Server-side; no commit_cas signature change.
+            read_gen = record.read_generation_by_agent.get(agent_id)
+            if read_gen is not None and read_gen < record.owner_generation:
+                return ConflictDetail("stale_read_generation", current)
 
-        # ---- WIN ----
-        next_version = current + 1
-        committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
-        peers = [
-            (peer_id, state)
-            for peer_id, state in record.state_by_agent.items()
-            if peer_id != agent_id and state != MESIState.INVALID
-        ]
+            # ---- WIN ----
+            next_version = current + 1
+            committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
+            peers = [
+                (peer_id, state)
+                for peer_id, state in record.state_by_agent.items()
+                if peer_id != agent_id and state != MESIState.INVALID
+            ]
 
-        # Emit all state_log entries FIRST (peers then committer), reserving
-        # _seq per emission. If any raises, _emit_state_log has already
-        # decremented its own reservation; we decrement the ones that already
-        # succeeded in this call and re-raise — nothing has mutated yet, so the
-        # registry stays consistent (mutation-then-log parity).
-        emitted_here = 0
-        try:
-            for peer_id, peer_from in peers:
+            # Emit all state_log entries FIRST (peers then committer), reserving
+            # _seq per emission. If any raises, _emit_state_log has already
+            # decremented its own reservation; we decrement the ones that already
+            # succeeded in this call and re-raise — nothing has mutated yet, so the
+            # registry stays consistent (mutation-then-log parity).
+            emitted_here = 0
+            try:
+                for peer_id, peer_from in peers:
+                    emitted_here += self._emit_state_log(
+                        artifact_id=artifact_id,
+                        agent_id=peer_id,
+                        from_state=peer_from,
+                        to_state=MESIState.INVALID,
+                        trigger=trigger,
+                        tick=tick,
+                        version=next_version,
+                        content_hash=None,
+                    )
                 emitted_here += self._emit_state_log(
                     artifact_id=artifact_id,
-                    agent_id=peer_id,
-                    from_state=peer_from,
-                    to_state=MESIState.INVALID,
+                    agent_id=agent_id,
+                    from_state=committer_from,
+                    to_state=MESIState.SHARED,
                     trigger=trigger,
                     tick=tick,
                     version=next_version,
-                    content_hash=None,
+                    content_hash=content_hash,
                 )
-            emitted_here += self._emit_state_log(
-                artifact_id=artifact_id,
-                agent_id=agent_id,
-                from_state=committer_from,
-                to_state=MESIState.SHARED,
-                trigger=trigger,
-                tick=tick,
+            except Exception:
+                self._seq -= emitted_here
+                raise
+
+            # All logs emitted — now apply the mutations (cannot fail).
+            updated = Artifact(
+                id=artifact_id,
+                name=record.artifact.name,
                 version=next_version,
                 content_hash=content_hash,
+                size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
+                depends_on=record.artifact.depends_on,
             )
-        except Exception:
-            self._seq -= emitted_here
-            raise
-
-        # All logs emitted — now apply the mutations (cannot fail).
-        updated = Artifact(
-            id=artifact_id,
-            name=record.artifact.name,
-            version=next_version,
-            content_hash=content_hash,
-            size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
-            depends_on=record.artifact.depends_on,
-        )
-        # The version-move apply runs under _lock (Unit 2): the WIN
-        # advances record.artifact.version, and a concurrent multi-artifact
-        # capture reads N versions under that same lock — so this commit cannot
-        # tear a cut (read skew) by moving one read-set member while the capture
-        # has already read its peers. The lock is an RLock, so the nested
-        # _capture_version re-enters freely. The non-WIN branches above mutate
-        # nothing, so they need no lock; only this apply does.
-        with self._lock:
+            # The whole method runs under ONE _lock hold (Unit 2 -> U4): the
+            # arbitration legs above (version, holder, fence) and the apply
+            # below are a single check-then-act -- deciding on a version read
+            # outside the hold and applying inside it was the same class of gap
+            # as the sweep race. A concurrent multi-artifact capture reads N
+            # versions under this same lock, so the WIN cannot tear a cut
+            # (read skew) either. The RLock re-enters for _capture_version.
             # Content coherence: when the caller threaded the winning body,
             # advance record.content to it so a peer re-fetch reads the NEW
             # content at the new version (without this, version + content_hash
@@ -777,27 +778,27 @@ class ArtifactRegistry:
             record.artifact = updated
             record.last_writer = agent_id
 
-        invalidated: list[UUID] = []
-        for peer_id, peer_from in peers:
-            record.state_by_agent[peer_id] = MESIState.INVALID
-            if peer_from in _M_OR_E_STATES:
-                record.granted_at_tick_by_agent.pop(peer_id, None)
-            invalidated.append(peer_id)
+            invalidated: list[UUID] = []
+            for peer_id, peer_from in peers:
+                record.state_by_agent[peer_id] = MESIState.INVALID
+                if peer_from in _M_OR_E_STATES:
+                    record.granted_at_tick_by_agent.pop(peer_id, None)
+                invalidated.append(peer_id)
 
-        # Committer S/I → SHARED, NOT MODIFIED: an OCC writer is optimistic and
-        # holds no grant, so SHARED is the honest end-state and keeps the same
-        # agent's next commit_cas repeatable (a sticky MODIFIED would trip the
-        # service D4 "M/E callers use commit()" precondition). SHARED is not in
-        # M∪E, so this is not an acquire — do NOT set granted_at_tick and do NOT
-        # clear the reclaim slot (mirror set_agent_state's non-M/E-from-non-M/E
-        # path, which leaves both untouched).
-        record.state_by_agent[agent_id] = MESIState.SHARED
-        # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
-        # last_observed_version to the version it just produced; the
-        # invalidated peers above keep their prior values.
-        record.last_observed_version_by_agent[agent_id] = next_version
+            # Committer S/I → SHARED, NOT MODIFIED: an OCC writer is optimistic and
+            # holds no grant, so SHARED is the honest end-state and keeps the same
+            # agent's next commit_cas repeatable (a sticky MODIFIED would trip the
+            # service D4 "M/E callers use commit()" precondition). SHARED is not in
+            # M∪E, so this is not an acquire — do NOT set granted_at_tick and do NOT
+            # clear the reclaim slot (mirror set_agent_state's non-M/E-from-non-M/E
+            # path, which leaves both untouched).
+            record.state_by_agent[agent_id] = MESIState.SHARED
+            # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
+            # last_observed_version to the version it just produced; the
+            # invalidated peers above keep their prior values.
+            record.last_observed_version_by_agent[agent_id] = next_version
 
-        return updated, invalidated
+            return updated, invalidated
 
     def commit_all(
         self,
@@ -831,98 +832,101 @@ class ArtifactRegistry:
         the APPLY both roll back in full on any raise (snapshot-then-restore), so a
         mid-apply exception can never leave a torn batch.
         """
-        if not writes:
-            raise ValueError("commit_all requires a non-empty write-set")
+        with self._lock:
+            if not writes:
+                raise ValueError("commit_all requires a non-empty write-set")
 
-        # ---- CHECK: every member, pure reads, no mutation (all-or-nothing) ----
-        conflicts: dict[UUID, ConflictDetail] = {}
-        for art_id, entry in writes.items():
-            record = self._records.get(art_id)
-            if record is None:
-                raise KeyError(f"artifact {art_id} not in registry")
-            current = record.artifact.version
-            if entry.expected_version > current:
-                # Corruption aborts the whole batch (all-or-nothing); non-retryable.
-                return CasCorruption(current_version=current)
-            if entry.expected_version < current:
-                conflicts[art_id] = ConflictDetail("version_mismatch", current)
-                continue
-            other_holder = any(
-                peer_id != agent_id and state in _M_OR_E_STATES
-                for peer_id, state in record.state_by_agent.items()
-            )
-            if other_holder:
-                conflicts[art_id] = ConflictDetail("other_holder", current)
-                continue
-            read_gen = record.read_generation_by_agent.get(agent_id)
-            if read_gen is not None and read_gen < record.owner_generation:
-                conflicts[art_id] = ConflictDetail("stale_read_generation", current)
-                continue
+            # ---- CHECK: every member, pure reads, no mutation (all-or-nothing) ----
+            conflicts: dict[UUID, ConflictDetail] = {}
+            for art_id, entry in writes.items():
+                record = self._records.get(art_id)
+                if record is None:
+                    raise KeyError(f"artifact {art_id} not in registry")
+                current = record.artifact.version
+                if entry.expected_version > current:
+                    # Corruption aborts the whole batch (all-or-nothing); non-retryable.
+                    return CasCorruption(current_version=current)
+                if entry.expected_version < current:
+                    conflicts[art_id] = ConflictDetail("version_mismatch", current)
+                    continue
+                other_holder = any(
+                    peer_id != agent_id and state in _M_OR_E_STATES
+                    for peer_id, state in record.state_by_agent.items()
+                )
+                if other_holder:
+                    conflicts[art_id] = ConflictDetail("other_holder", current)
+                    continue
+                read_gen = record.read_generation_by_agent.get(agent_id)
+                if read_gen is not None and read_gen < record.owner_generation:
+                    conflicts[art_id] = ConflictDetail("stale_read_generation", current)
+                    continue
 
-        if conflicts:
-            return MultiCommitConflict(per_artifact=dict(conflicts))
+            if conflicts:
+                return MultiCommitConflict(per_artifact=dict(conflicts))
 
-        # ---- STAGE: compute all mutations (nothing applied yet) ----
-        staged = []
-        for art_id, entry in writes.items():
-            record = self._records[art_id]
-            next_version = record.artifact.version + 1
-            committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
-            peers = [
-                (peer_id, state)
-                for peer_id, state in record.state_by_agent.items()
-                if peer_id != agent_id and state != MESIState.INVALID
-            ]
-            updated = Artifact(
-                id=art_id,
-                name=record.artifact.name,
-                version=next_version,
-                content_hash=entry.content_hash,
-                size_tokens=(
-                    entry.size_tokens
-                    if entry.size_tokens is not None
-                    else record.artifact.size_tokens
-                ),
-                depends_on=record.artifact.depends_on,
-            )
-            staged.append((art_id, record, entry, next_version, committer_from, peers, updated))
+            # ---- STAGE: compute all mutations (nothing applied yet) ----
+            staged = []
+            for art_id, entry in writes.items():
+                record = self._records[art_id]
+                next_version = record.artifact.version + 1
+                committer_from = record.state_by_agent.get(agent_id, MESIState.INVALID)
+                peers = [
+                    (peer_id, state)
+                    for peer_id, state in record.state_by_agent.items()
+                    if peer_id != agent_id and state != MESIState.INVALID
+                ]
+                updated = Artifact(
+                    id=art_id,
+                    name=record.artifact.name,
+                    version=next_version,
+                    content_hash=entry.content_hash,
+                    size_tokens=(
+                        entry.size_tokens
+                        if entry.size_tokens is not None
+                        else record.artifact.size_tokens
+                    ),
+                    depends_on=record.artifact.depends_on,
+                )
+                staged.append((art_id, record, entry, next_version, committer_from, peers, updated))
 
-        # ---- EMIT all state_log entries FIRST, across the whole batch, with a
-        # running _seq rollback total so a raise leaves the registry unmutated. ----
-        emitted_here = 0
-        try:
-            for art_id, record, entry, next_version, committer_from, peers, updated in staged:
-                for peer_id, peer_from in peers:
+            # ---- EMIT all state_log entries FIRST, across the whole batch, with a
+            # running _seq rollback total so a raise leaves the registry unmutated. ----
+            emitted_here = 0
+            try:
+                for art_id, record, entry, next_version, committer_from, peers, updated in staged:
+                    for peer_id, peer_from in peers:
+                        emitted_here += self._emit_state_log(
+                            artifact_id=art_id,
+                            agent_id=peer_id,
+                            from_state=peer_from,
+                            to_state=MESIState.INVALID,
+                            trigger=trigger,
+                            tick=tick,
+                            version=next_version,
+                            content_hash=None,
+                        )
                     emitted_here += self._emit_state_log(
                         artifact_id=art_id,
-                        agent_id=peer_id,
-                        from_state=peer_from,
-                        to_state=MESIState.INVALID,
+                        agent_id=agent_id,
+                        from_state=committer_from,
+                        to_state=MESIState.SHARED,
                         trigger=trigger,
                         tick=tick,
                         version=next_version,
-                        content_hash=None,
+                        content_hash=entry.content_hash,
                     )
-                emitted_here += self._emit_state_log(
-                    artifact_id=art_id,
-                    agent_id=agent_id,
-                    from_state=committer_from,
-                    to_state=MESIState.SHARED,
-                    trigger=trigger,
-                    tick=tick,
-                    version=next_version,
-                    content_hash=entry.content_hash,
-                )
-        except Exception:
-            self._seq -= emitted_here
-            raise
+            except Exception:
+                self._seq -= emitted_here
+                raise
 
-        # ---- APPLY (total): snapshot every affected record, apply all N under one
-        # _lock hold, and RESTORE ALL on any raise — a mid-apply exception
-        # can never leave a partial batch (the plan's total-apply hardening). ----
-        invalidated: dict[UUID, list[UUID]] = {}
-        versions: dict[UUID, int] = {}
-        with self._lock:
+            # ---- APPLY (total): snapshot every affected record, apply all N, and
+            # RESTORE ALL on any raise — a mid-apply exception can never leave a
+            # partial batch (the plan's total-apply hardening). The method-wide
+            # _lock hold (U4) already covers this block AND the CHECK legs above:
+            # check-all and apply-total are one serialized step, as the contract
+            # says of the sqlite BEGIN IMMEDIATE. ----
+            invalidated: dict[UUID, list[UUID]] = {}
+            versions: dict[UUID, int] = {}
             snapshots = [
                 (
                     record,
@@ -981,12 +985,12 @@ class ArtifactRegistry:
                 self._seq -= emitted_here
                 raise
 
-        # BROADCAST is the caller's (service) responsibility, AFTER this returns —
-        # the per-artifact invalidations are published to the event bus only post-commit.
-        return MultiCommitResult(
-            versions=versions,
-            invalidated={art: tuple(peers) for art, peers in invalidated.items()},
-        )
+            # BROADCAST is the caller's (service) responsibility, AFTER this returns —
+            # the per-artifact invalidations are published to the event bus only post-commit.
+            return MultiCommitResult(
+                versions=versions,
+                invalidated={art: tuple(peers) for art, peers in invalidated.items()},
+            )
 
     def capture_version_vector(
         self,

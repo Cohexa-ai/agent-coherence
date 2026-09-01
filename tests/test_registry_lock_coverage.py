@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import sys
 import threading
+from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.states import MESIState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, ConflictDetail
 
 _WRITERS = 4
 _CALLS_PER_WRITER = 400
@@ -73,3 +77,85 @@ def test_state_log_sequence_is_gapless_under_concurrent_writers() -> None:
         f"{len(emitted)} emitted, {len(set(emitted))} distinct, "
         f"min={min(emitted)}, max={max(emitted)}"
     )
+
+
+@pytest.fixture(params=["in_memory", "sqlite"])
+def registry(request, tmp_path: Path):
+    """Both registries: the arbitration contract is now identical (KD1)."""
+    if request.param == "in_memory":
+        yield ArtifactRegistry()
+    else:
+        with SqliteArtifactRegistry(tmp_path / "state.db") as reg:
+            yield reg
+
+
+_CAS_ROUNDS = 20
+_CAS_WRITERS = 4
+
+
+def test_concurrent_cas_writers_produce_one_winner_and_typed_conflicts(registry) -> None:
+    """N optimistic writers racing one version: exactly one WIN per round.
+
+    The U4 property: ``commit_cas``'s version check, holder check, fence check
+    and apply are ONE serialized step. Split them (the pre-U4 shape: legs
+    outside the hold, apply inside) and two writers can both pass the version
+    check before either applies -- two WINs from one expected_version, a
+    version that advances twice, and a lost update. Reverting U4 fails this
+    within a few rounds at a 1 us switch interval.
+
+    Losers must get a typed ``ConflictDetail`` back, never an exception, and
+    a conflict must leave the version exactly where the winner put it.
+    """
+    artifact = Artifact(id=uuid4(), name="plan.md", version=1)
+    registry.register_artifact(artifact, "v1")
+    writers = [uuid4() for _ in range(_CAS_WRITERS)]
+
+    default_switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for round_no in range(_CAS_ROUNDS):
+            expected = registry.get_artifact(artifact.id).version
+            results: dict[int, object] = {}
+            failures: list[BaseException] = []
+            start = threading.Barrier(_CAS_WRITERS, timeout=5)
+
+            def _commits(slot: int, agent_id) -> None:
+                try:
+                    start.wait()
+                    results[slot] = registry.commit_cas(
+                        artifact.id,
+                        agent_id,
+                        expected_version=expected,
+                        content_hash=f"h{slot}",
+                        content=f"round{round_no}-writer{slot}",
+                        tick=round_no,
+                    )
+                except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                    failures.append(exc)
+
+            threads = [
+                threading.Thread(target=_commits, args=(slot, agent), daemon=True)
+                for slot, agent in enumerate(writers)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+                assert not t.is_alive(), f"round {round_no}: a writer never finished"
+
+            assert not failures, f"round {round_no}: a writer raised: {failures[0]!r}"
+            wins = [r for r in results.values() if isinstance(r, tuple)]
+            conflicts = [r for r in results.values() if isinstance(r, ConflictDetail)]
+            assert len(wins) == 1, (
+                f"round {round_no}: {len(wins)} writers won the same "
+                f"expected_version={expected} — the arbitration legs and the "
+                f"apply are not one serialized step"
+            )
+            assert len(conflicts) == _CAS_WRITERS - 1
+            assert all(c.reason == "version_mismatch" for c in conflicts)
+            # The version moved exactly once: to the winner's next_version.
+            (updated, _invalidated) = wins[0]
+            assert updated.version == expected + 1
+            assert registry.get_artifact(artifact.id).version == expected + 1
+    finally:
+        sys.setswitchinterval(default_switch_interval)
