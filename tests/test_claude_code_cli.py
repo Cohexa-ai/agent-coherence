@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -205,6 +206,259 @@ def test_coordinator_second_invocation_reuses_existing(
                 os.kill(pid, 15)
             except (ValueError, ProcessLookupError, IndexError):
                 pass
+
+
+def _capture_probe(seen: dict, *, reachable: bool):
+    """Stub for coherence_coordinator._tcp_probe that records bind_host."""
+    def probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
+        seen["bind_host"] = bind_host
+        return reachable
+    return probe
+
+
+def _write_port_file(workspace: Path, port: int) -> Path:
+    pid_file = workspace / ".coherence" / "server.pid"
+    pid_file.parent.mkdir(exist_ok=True)
+    pid_file.write_text(f"999\n{port}\n", encoding="utf-8")
+    return pid_file
+
+
+def _write_coherence_files(workspace: Path, port: int) -> Path:
+    """pid file + hook.secret, enough for the real resolve_endpoint to succeed."""
+    pid_file = _write_port_file(workspace, port)
+    (workspace / ".coherence" / "hook.secret").write_text("test-token\n", encoding="utf-8")
+    return pid_file
+
+
+def test_coordinator_reuse_probe_targets_routed_bind_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routed-bind regression: the existing-coordinator probe in main()
+    must poll the --bind-host address, not loopback. Before the fix it
+    dropped the kwarg, so a coordinator bound to 10.0.0.5 looked dead
+    from 127.0.0.1 and every non-loopback invocation re-forked."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    _write_port_file(git_workspace, 54321)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
+    )
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--bind-host", "10.0.0.5", "--quiet",
+    ])
+
+    assert rc == 0
+    assert seen["bind_host"] == "10.0.0.5"
+
+
+def test_spawn_detached_probe_targets_routed_bind_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routed-bind regression: _spawn_detached's port-file poll must probe
+    the child's bind host. Before the fix it polled 127.0.0.1, collected
+    ECONNREFUSED for the full 10s window, exited 2 — and left the live
+    daemon orphaned behind the port file."""
+    _write_port_file(git_workspace, 54321)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
+    )
+    monkeypatch.setattr(
+        coherence_coordinator.subprocess, "Popen",
+        lambda *a, **kw: None,  # the pre-written port file stands in for the child
+    )
+
+    rc = coherence_coordinator._spawn_detached(
+        git_workspace, quiet=True, bind_host="10.0.0.5",
+    )
+
+    assert rc == 0
+    assert seen["bind_host"] == "10.0.0.5"
+
+
+def test_spawn_detached_routed_bind_reports_loopback_conflict(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When a loopback-bound coordinator already holds the workspace, a
+    routed spawn can never converge: the child joins the existing
+    coordinator via the flock loser path and no routed listener appears.
+    The detach wait must detect the mismatch and exit 2 immediately with
+    a message naming it — not stall through the whole window with a
+    generic 'did not become reachable'."""
+    _write_port_file(git_workspace, 54321)
+
+    def split_probe(port, cfg, *, bind_host="127.0.0.1"):
+        return bind_host == "127.0.0.1"  # loopback answers, routed host doesn't
+
+    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", split_probe)
+    monkeypatch.setattr(
+        coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
+    )
+
+    start = time.monotonic()
+    rc = coherence_coordinator._spawn_detached(
+        git_workspace, quiet=True, bind_host="10.0.0.5",
+    )
+    elapsed = time.monotonic() - start
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "already running" in captured.err
+    assert "127.0.0.1" in captured.err
+    assert elapsed < 2.0, f"conflict detection took {elapsed:.1f}s — stalled through the window"
+
+
+def test_spawn_detached_wait_is_wall_clock_bounded(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The detach wait must be a wall-clock deadline, not an attempt count.
+    Attempt counting multiplies with the probe's internal retry budget: a
+    SYN-dropping routed host makes each probe slow, inflating the '10s'
+    window to minutes inside a SessionStart hook. A slow probe here must
+    still hit the deadline on schedule."""
+    _write_port_file(git_workspace, 54321)
+    monkeypatch.setattr(coherence_coordinator, "_DETACH_PORT_WAIT_TIMEOUT_SEC", 0.5)
+
+    def slow_dead_probe(port, cfg, *, bind_host="127.0.0.1"):
+        time.sleep(0.2)  # stand-in for the probe's own retry budget
+        return False
+
+    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", slow_dead_probe)
+    monkeypatch.setattr(
+        coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
+    )
+
+    start = time.monotonic()
+    rc = coherence_coordinator._spawn_detached(
+        git_workspace, quiet=True, bind_host="127.0.0.1",
+    )
+    elapsed = time.monotonic() - start
+
+    assert rc == 2
+    assert "did not become reachable" in capsys.readouterr().err
+    assert elapsed < 2.0, (
+        f"wait ran {elapsed:.1f}s — attempt-counting, not the 0.5s wall-clock deadline"
+    )
+
+
+def test_wildcard_bind_host_rejected_before_any_dial(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--bind-host 0.0.0.0 is documented as rejected, but validation used
+    to run only inside the forked child: the parent dialed the raw string,
+    where 0.0.0.0 aliases to localhost and laundered to exit 0. The CLI
+    entry must reject it before any probe dials."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    _write_port_file(git_workspace, 54321)
+
+    def must_not_dial(port, cfg, *, bind_host="127.0.0.1"):
+        pytest.fail(f"probe dialed {bind_host!r} before bind-host validation")
+
+    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", must_not_dial)
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--bind-host", "0.0.0.0",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "wildcard" in captured.err
+
+
+def test_prepare_for_migration_targets_routed_bind_host(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Routed-bind regression: --prepare-for-migration must aim BOTH its
+    release POST and its shutdown poll at the --bind-host address. The
+    local resolver only reads port + secret files and always reports
+    loopback, so the CLI has to rebuild the endpoint from the flag —
+    exercised here through the real resolve_endpoint, not a fabricated
+    CoordinatorEndpoint."""
+    import ccs.cli._coherence_client as client_mod
+
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    _write_coherence_files(git_workspace, 54321)
+    posted: dict = {}
+
+    def fake_post(endpoint, path, payload, **kw):
+        posted["host"] = endpoint.host
+        return {"ok": True, "released": 1, "errors": []}
+
+    monkeypatch.setattr(client_mod, "post", fake_post)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=False)
+    )
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+        "--bind-host", "10.0.0.5",
+    ])
+
+    assert rc == 0, capsys.readouterr()
+    assert posted["host"] == "10.0.0.5"
+    assert seen["bind_host"] == "10.0.0.5"
+
+
+def test_prepare_for_migration_default_stays_loopback(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without --bind-host the migration path must be byte-unchanged:
+    POST and poll both target the resolver's loopback endpoint."""
+    import ccs.cli._coherence_client as client_mod
+
+    _write_coherence_files(git_workspace, 54321)
+    posted: dict = {}
+
+    def fake_post(endpoint, path, payload, **kw):
+        posted["host"] = endpoint.host
+        return {"ok": True, "released": 0, "errors": []}
+
+    monkeypatch.setattr(client_mod, "post", fake_post)
+    seen: dict = {}
+    monkeypatch.setattr(
+        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=False)
+    )
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+    ])
+
+    assert rc == 0, capsys.readouterr()
+    assert posted["host"] == "127.0.0.1"
+    assert seen["bind_host"] == "127.0.0.1"
+
+
+def test_prepare_for_migration_unreachable_post_exits_2_cleanly(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A connection failure at the release POST must map to the documented
+    exit 2 with an operator message — not escape as a CoordinatorUnavailable
+    traceback (interpreter exit 1, grants silently left live)."""
+    import ccs.cli._coherence_client as client_mod
+    from ccs.cli._coherence_client import CoordinatorUnavailable
+
+    _write_coherence_files(git_workspace, 54321)
+
+    def refused_post(endpoint, path, payload, **kw):
+        raise CoordinatorUnavailable("could not reach coordinator at http://127.0.0.1:54321")
+
+    monkeypatch.setattr(client_mod, "post", refused_post)
+
+    rc = coherence_coordinator.main([
+        "--root", str(git_workspace), "--prepare-for-migration",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "could not reach coordinator" in captured.err
 
 
 # ----------------------------------------------------------------------
