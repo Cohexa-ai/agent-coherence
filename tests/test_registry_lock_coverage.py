@@ -232,3 +232,219 @@ def test_concurrent_fetch_and_write_never_leave_two_write_holders(registry) -> N
             )
     finally:
         sys.setswitchinterval(default_switch_interval)
+
+
+# ---------------------------------------------------------------------------
+# U6 — structural lock coverage: adding an unlocked public member fails CI
+# ---------------------------------------------------------------------------
+#
+# The behavioral tests above prove specific sequences serialize; this section
+# proves the CONTRACT structurally, member by member: every public method and
+# property of both registries acquires the registry lock, except the named
+# construction-time-immutable accessors. A new public member that forgets the
+# lock fails here by name, instead of shipping a race.
+
+import inspect
+from types import SimpleNamespace
+
+from ccs.coordinator.registry_protocol import CheckpointRecord
+from ccs.core.states import TransientState
+
+# The ONLY members allowed to skip the lock: accessors of fields assigned once
+# in __init__ (or cached at construction, on sqlite) and never mutated.
+# Anything else added here must argue immutability at its declaration site.
+EXEMPT_MEMBERS = frozenset({
+    "coordinator_epoch",  # _coordinator_epoch: minted/loaded at construction
+    "instance_id",        # _instance_id: minted/loaded at construction
+    "retention_meta",     # _retain_versions/_retention_policy: constructor-final
+})
+
+# The full public surface, frozen (KTD4): discovery below compares against
+# these, so a NEW public member cannot appear without being enrolled — and
+# enrolling it runs it through the lock check.
+INMEM_SURFACE = frozenset({
+    "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
+    "artifact_ids", "capture_version_vector", "clear_agent_transient",
+    "commit_all", "commit_cas", "coordinator_epoch", "create_checkpoint",
+    "get_agent_state", "get_agent_transient", "get_artifact",
+    "get_artifact_and_generation", "get_checkpoint", "get_checkpoint_members",
+    "get_content", "get_content_at_version", "get_last_reclamation",
+    "get_owner_generation", "get_read_generation", "get_session_cut",
+    "get_session_meta", "get_state_map", "get_transient_map",
+    "get_transient_tick", "get_version_record", "granted_at_tick",
+    "has_artifact", "instance_id", "last_heartbeat_tick",
+    "last_observed_version_for", "list_checkpoints", "record_heartbeat",
+    "record_last_reclamation", "register_artifact", "release_session",
+    "remove_artifact", "retention_meta", "session_count", "set_agent_state",
+    "set_agent_transient", "set_artifact_and_content",
+    "set_checkpoint_member_pin", "set_checkpoint_member_restore",
+    "set_checkpoint_restore_status", "valid_holders",
+})
+SQLITE_SURFACE = INMEM_SURFACE | frozenset({
+    "artifact_names_under_prefix", "artifacts_held_by_agent", "close",
+    "evict_stale_notices", "get_artifact_updated_at", "last_writer_for",
+    "lookup_artifact_id_by_name", "peek_preemption_notice",
+    "pop_pending_notices", "pop_preemption_notice", "record_preemption_notice",
+    "resolve_or_register", "status_snapshot",
+})
+
+
+class _TrackingRLock:
+    """Proxy over ``threading.RLock`` recording acquire/release events.
+
+    Pattern from ``tests/test_diagnose_callback.py``: installed as the
+    registry's ``_lock`` so a member body that holds the lock is observed
+    doing so.
+    """
+
+    def __init__(self) -> None:
+        self._inner = threading.RLock()
+        self.events: list[str] = []
+
+    def acquire(self, *args, **kwargs):
+        self.events.append("acquire")
+        return self._inner.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self.events.append("release")
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def _public_members(cls) -> dict[str, str]:
+    """Discover the public surface: {name: "method" | "property"}."""
+    surface: dict[str, str] = {}
+    for name in dir(cls):
+        if name.startswith("_"):
+            continue
+        attr = inspect.getattr_static(cls, name)
+        surface[name] = "property" if isinstance(attr, property) else "method"
+    return surface
+
+
+def _synth_value(param: inspect.Parameter):
+    """One plausible argument per required parameter, by name then annotation.
+
+    The value only needs to get the call INTO the method body — a KeyError on
+    an unknown artifact is fine, because the lock acquire is the body's first
+    act and the check swallows the exception.
+    """
+    name, ann = param.name, str(param.annotation)
+    if name == "artifact":
+        return Artifact(id=uuid4(), name="synth.md", version=1)
+    if name == "state":
+        return MESIState.SHARED
+    if name == "states":
+        return [MESIState.SHARED]
+    if name == "transient_state":
+        return TransientState.ISG
+    if name == "checkpoint":
+        # Real header: create_checkpoint fail-closed-validates owner and
+        # duplicates BEFORE its lock, so a bogus value never reaches the hold.
+        return CheckpointRecord(
+            checkpoint_id="synth", name="synth", owner=uuid4(),
+            created_at=1.0, created_at_tick=1, window_min=1.0, window_max=1.0,
+        )
+    if name == "members":
+        return []
+    if name == "writes":
+        return {uuid4(): SimpleNamespace(
+            expected_version=1, content_hash="h", size_tokens=None, content=None
+        )}
+    if name == "read_set":
+        return [uuid4()]
+    if name == "abort":
+        return None
+    if "UUID" in ann or name.endswith("agent_id") or name.endswith("artifact_id") or name == "owner":
+        return uuid4()
+    if "float" in ann:
+        return 1.0
+    if "int" in ann:
+        return 1
+    if "bool" in ann:
+        return False
+    return "x"
+
+
+def _assert_member_holds_lock(reg, name: str, kind: str) -> None:
+    """Install the tracker, drive the member, and require an observed hold."""
+    tracker = _TrackingRLock()
+    reg._lock = tracker  # noqa: SLF001 — the seam under test
+
+    if kind == "property":
+        getattr(type(reg), name).fget(reg)
+    elif name == "abort_guard":
+        # A context manager: a plain call returns the manager without running
+        # the body, observing no acquire — enter it properly.
+        with reg.abort_guard():
+            pass
+    else:
+        method = getattr(reg, name)
+        kwargs = {
+            p.name: _synth_value(p)
+            for p in inspect.signature(method).parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+        try:
+            method(**kwargs)
+        except Exception:  # noqa: BLE001 — only the acquire is under test
+            pass
+
+    assert tracker.events.count("acquire") >= 1, (
+        f"{type(reg).__name__}.{name} ran without acquiring the registry lock "
+        "— either serialize it or argue construction-time immutability in "
+        "EXEMPT_MEMBERS"
+    )
+    assert tracker.events.count("acquire") == tracker.events.count("release"), (
+        f"{type(reg).__name__}.{name} left the lock held: "
+        f"{tracker.events.count('acquire')} acquires vs "
+        f"{tracker.events.count('release')} releases"
+    )
+
+
+def test_inmem_surface_is_enrolled() -> None:
+    """A new public member must be added to the frozen list — and thereby
+    run through the lock check."""
+    assert set(_public_members(ArtifactRegistry)) == set(INMEM_SURFACE)
+
+
+def test_sqlite_surface_is_enrolled() -> None:
+    assert set(_public_members(SqliteArtifactRegistry)) == set(SQLITE_SURFACE)
+
+
+def test_exemptions_are_only_the_immutable_accessors() -> None:
+    assert EXEMPT_MEMBERS == {"coordinator_epoch", "instance_id", "retention_meta"}
+
+
+@pytest.mark.parametrize("member", sorted(INMEM_SURFACE - EXEMPT_MEMBERS))
+def test_inmem_member_holds_the_lock(member: str) -> None:
+    reg = ArtifactRegistry()
+    _assert_member_holds_lock(reg, member, _public_members(ArtifactRegistry)[member])
+
+
+@pytest.mark.parametrize("member", sorted(SQLITE_SURFACE - EXEMPT_MEMBERS))
+def test_sqlite_member_holds_the_lock(member: str, tmp_path: Path) -> None:
+    with SqliteArtifactRegistry(tmp_path / "cov.db") as reg:
+        _assert_member_holds_lock(reg, member, _public_members(SqliteArtifactRegistry)[member])
+
+
+def test_teeth_an_unlocked_member_fails_by_name() -> None:
+    """The check must actually bite: a stub with one unlocked public method
+    fails, and the failure names that method."""
+
+    class _Unlocked:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+        def rogue_method(self) -> int:
+            return 1  # touches no lock
+
+    with pytest.raises(AssertionError, match="rogue_method"):
+        _assert_member_holds_lock(_Unlocked(), "rogue_method", "method")
