@@ -108,7 +108,17 @@ class ArtifactRecord:
 
 
 class ArtifactRegistry:
-    """Canonical in-memory artifact directory and payload store."""
+    """Canonical in-memory artifact directory and payload store.
+
+    Concurrency contract: thread-safe, same as :class:`SqliteArtifactRegistry`.
+    Every public method that touches mutable registry state serializes on one
+    reentrant ``self._lock`` (the widened successor of the old capture-only
+    lock). The only exemptions are accessors of fields immutable since
+    construction, each named at its declaration site. Callers composing
+    MULTI-call sequences (check-then-act across method boundaries) still need
+    :meth:`abort_guard` to hold the lock across the whole sequence -- per-call
+    serialization alone cannot make a decision and its write atomic.
+    """
 
     @contextmanager
     def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
@@ -116,10 +126,9 @@ class ArtifactRegistry:
         (finding A6) so :class:`CoordinatorService` can call it uniformly
         regardless of which registry backs it.
 
-        This registry is single-threaded (no process-level lock), so the guard
-        is a lock-free abort check: if the handler watchdog already timed out
-        and SET ``abort``, fail closed before the caller mutates; otherwise run
-        the mutation. ``abort=None`` (every non-watchdog caller) is a no-op.
+        The abort check: if the handler watchdog already timed out and SET
+        ``abort``, fail closed before the caller mutates; otherwise run the
+        mutation. ``abort=None`` (every non-watchdog caller) checks nothing.
         """
         if abort is not None and abort.is_set():
             raise WatchdogAbandoned(
@@ -137,6 +146,11 @@ class ArtifactRegistry:
         retain_versions: bool = False,
         retention_policy: RetentionPolicy | None = None,
     ) -> None:
+        # KTD7 -- ``state_log`` (and every callback this registry accepts) now
+        # runs while ``self._lock`` is HELD: it must never block on other
+        # threads and may call back only into this registry's own (reentrant)
+        # methods. The sqlite registry has always fired it inside its lock;
+        # this makes the obligation symmetric.
         if state_log is not None and instance_id is None:
             raise ValueError(
                 "instance_id must be provided when state_log is set; "
@@ -185,24 +199,24 @@ class ArtifactRegistry:
         # ``workspace_checkpoint_members`` tables for API parity. PROCESS-SCOPED
         # like the session pins — an in-memory manifest does NOT survive a
         # restart (restart-durability is sqlite-only; the parity harness asserts
-        # the divergence rather than masking it). Guarded by ``_capture_lock``
+        # the divergence rather than masking it). Guarded by ``_lock``
         # (the manifest create is a multi-row atomic insert, same class of
         # critical section as the session-pin capture).
         self._checkpoints: dict[str, CheckpointRecord] = {}
         self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
-        # Cross-artifact capture lock (Unit 2). This registry is otherwise
-        # LOCK-FREE by contract (GIL per-access atomicity — see the module/class
-        # docstrings). GIL atomicity is per single dict ACCESS, which is
-        # INSUFFICIENT across N artifacts: a multi-artifact capture reads N
-        # versions then inserts the pin set, and a peer commit interleaving those
-        # reads would yield a torn (read-skewed) cut. This dedicated RLock makes
-        # ONLY the capture/release multi-artifact critical sections atomic; the
-        # existing per-access paths stay lock-free. It also guards the pin-store
-        # dict against an inline-GC exemption read racing a release (both take
-        # this lock), so there is no deadlock: capture/release never call back
-        # into a path that re-takes a DIFFERENT lock, and the GC exemption read
-        # is a short, self-contained critical section.
-        self._capture_lock = threading.RLock()
+        # THE registry lock. Started life as a capture-only lock (the
+        # multi-artifact session-pin critical sections); widened to serialize
+        # EVERY public method that touches mutable registry state, because the
+        # old "lock-free by contract, GIL per-access atomicity" policy only
+        # ever covered a single dict access -- and the service layer composes
+        # multi-access sequences (the fence check-then-persist, the sweep's
+        # read-then-reclaim) that the GIL does not hold together. Reentrant so
+        # a caller holding it via abort_guard can compose registry calls into
+        # one atomic sequence, and so the internal cross-method calls
+        # (commit paths -> set_agent_state) re-enter freely. Uncontended
+        # RLock acquire measured ~168 ns; the widest method makes ~16 internal
+        # acquires ~= 2.7 us per commit cycle -- noise against the sqlite arm.
+        self._lock = threading.RLock()
 
     def _capture_version(
         self, record: ArtifactRecord, version: int, content: bytes | str
@@ -219,9 +233,9 @@ class ArtifactRegistry:
         Lock-free posture (registry contract): the version-history dict ops are
         plain GIL-atomic; a concurrent reader of ``get_content_at_version`` sees
         a consistent value at any single dict access, no ``BEGIN IMMEDIATE``.
-        Caveat (Unit 2): the exemptions read below re-enters ``_capture_lock``
+        Caveat (Unit 2): the exemptions read below re-enters ``_lock``
         via ``_live_pins_for_artifact``. This method is ALWAYS invoked from
-        within an already-held ``_capture_lock`` (the version-move apply in
+        within an already-held ``_lock`` (the version-move apply in
         ``commit_cas`` / ``set_artifact_and_content`` / ``register_artifact``),
         so the RLock re-entry is harmless and the dict ops stay GIL-atomic.
         """
@@ -255,7 +269,7 @@ class ArtifactRegistry:
         loop consumes after the lock is released. A session pins at most one
         version per artifact (the cut is a map), so the union is naturally
         deduplicated by the set."""
-        with self._capture_lock:
+        with self._lock:
             return {
                 pins[artifact_id]
                 for pins in self._session_pins.values()
@@ -265,34 +279,38 @@ class ArtifactRegistry:
     def register_artifact(self, artifact: Artifact, content: str) -> None:
         """Insert artifact record into registry.
 
-        The version-establishing mutation is performed under ``_capture_lock``
+        The version-establishing mutation is performed under ``_lock``
         (Unit 2): a concurrent ``capture_version_vector`` reads N artifact
         versions + inserts the pin set under that same lock, so registering /
         moving a version cannot interleave a multi-artifact capture and tear its
-        cut (read skew). The lock-free READ accessors are untouched."""
-        record = ArtifactRecord(artifact=artifact, content=content)
-        with self._capture_lock:
+        cut (read skew)."""
+        with self._lock:
+            record = ArtifactRecord(artifact=artifact, content=content)
             if self._retain_versions:
                 self._capture_version(record, artifact.version, content)
             self._records[artifact.id] = record
 
     def has_artifact(self, artifact_id: UUID) -> bool:
         """Return whether an artifact exists in registry."""
-        return artifact_id in self._records
+        with self._lock:
+            return artifact_id in self._records
 
     def artifact_ids(self) -> list[UUID]:
         """Return all known artifact ids."""
-        return list(self._records.keys())
+        with self._lock:
+            return list(self._records.keys())
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
         """Return artifact metadata if present."""
-        record = self._records.get(artifact_id)
-        return record.artifact if record else None
+        with self._lock:
+            record = self._records.get(artifact_id)
+            return record.artifact if record else None
 
     def get_content(self, artifact_id: UUID) -> Optional[str]:
         """Return artifact content if present."""
-        record = self._records.get(artifact_id)
-        return record.content if record else None
+        with self._lock:
+            record = self._records.get(artifact_id)
+            return record.content if record else None
 
     @property
     def coordinator_epoch(self) -> str:
@@ -305,7 +323,10 @@ class ArtifactRegistry:
         **per-construction** (minted fresh in ``__init__``, NOT persisted) — a
         new ``ArtifactRegistry`` gets a new epoch, so it cannot mismatch across a
         restart the way the durable sqlite epoch can; it exists for surface
-        parity and for the same-process ``expected_epoch`` guard."""
+        parity and for the same-process ``expected_epoch`` guard.
+
+        Lock exemption: reads ``_coordinator_epoch``, assigned once in
+        ``__init__`` and never mutated."""
         return self._coordinator_epoch
 
     @property
@@ -316,7 +337,10 @@ class ArtifactRegistry:
         Public read-only accessor mirroring
         :attr:`SqliteArtifactRegistry.instance_id` so the two registries share
         one identity duck-type and consumers never reach into the private
-        field."""
+        field.
+
+        Lock exemption: reads ``_instance_id``, assigned once in ``__init__``
+        and never mutated."""
         return self._instance_id
 
     def retention_meta(self) -> tuple[bool, RetentionPolicy | None]:
@@ -327,20 +351,25 @@ class ArtifactRegistry:
         registries. In-memory there is no persisted meta — the answer is the
         live constructor state: ``_retain_versions`` is the enabled marker and
         ``_retention_policy`` the bound (``None`` ⇒ unbounded when enabled).
-        ``retain_versions=False`` ⇒ ``(False, None)`` (retention never on)."""
+        ``retain_versions=False`` ⇒ ``(False, None)`` (retention never on).
+
+        Lock exemption: reads ``_retain_versions`` and ``_retention_policy``,
+        both assigned once in ``__init__`` and never mutated."""
         if not self._retain_versions:
             return False, None
         return True, self._retention_policy
 
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
-        return self._records[artifact_id].owner_generation
+        with self._lock:
+            return self._records[artifact_id].owner_generation
 
     def get_read_generation(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the generation an agent captured at its last claim, or None if
         it never established a fence claim (a plain OCC writer that version-CAS,
         not the fence, arbitrates)."""
-        return self._records[artifact_id].read_generation_by_agent.get(agent_id)
+        with self._lock:
+            return self._records[artifact_id].read_generation_by_agent.get(agent_id)
 
     def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the artifact version whose bytes this agent last observed
@@ -348,7 +377,8 @@ class ArtifactRegistry:
         transition), or None when the pair was never observed — absence is an
         absent key, never a 0-sentinel, and a transition to INVALID preserved
         the prior recorded value. The post-compaction staleness comparand."""
-        return self._records[artifact_id].last_observed_version_by_agent.get(agent_id)
+        with self._lock:
+            return self._records[artifact_id].last_observed_version_by_agent.get(agent_id)
 
     def get_artifact_and_generation(
         self, artifact_id: UUID
@@ -356,8 +386,11 @@ class ArtifactRegistry:
         """Return ``(artifact, owner_generation)`` as one pair-consistent
         snapshot, or None when the artifact is absent.
 
-        This registry is lock-free by contract (GIL per-access atomicity), so
-        the pair is stitched with a seqlock on ``owner_generation``: within the
+        Under the widened registry lock this method is serialized like every
+        other, so the seqlock below is redundant -- kept deliberately, because
+        its no-ABA argument is the only written record of WHY the pair read is
+        safe, and it costs one extra field read. The pair is stitched with a
+        seqlock on ``owner_generation``: within the
         life of one record the generation only ever increments (reclaims bump
         it; nothing decrements or resets it), so if it reads equal on both sides
         of the artifact read, the returned pair coexisted at the instant the
@@ -377,14 +410,15 @@ class ArtifactRegistry:
         wires ``CoordinatorService.delete``, so none of the surfaces the gate
         runs over can drive it — but the in-process ``CCSStore.delete()`` can,
         so it is a reachable boundary, not an impossible one."""
-        record = self._records.get(artifact_id)
-        if record is None:
-            return None
-        while True:
-            generation = record.owner_generation
-            artifact = record.artifact
-            if record.owner_generation == generation:
-                return artifact, generation
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return None
+            while True:
+                generation = record.owner_generation
+                artifact = record.artifact
+                if record.owner_generation == generation:
+                    return artifact, generation
 
     def set_artifact_and_content(
         self,
@@ -403,19 +437,22 @@ class ArtifactRegistry:
         sweep reclamation (the race the service's earlier get_agent_state check
         misses). A ``None`` fence_agent_id (source-churn) is unguarded.
         """
-        record = self._records[artifact_id]
-        if fence_agent_id is not None:
-            read_gen = record.read_generation_by_agent.get(fence_agent_id)
-            if read_gen is not None and read_gen < record.owner_generation:
-                raise StaleReadGeneration(
-                    f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
-                    f"artifact={artifact_id} read_gen={read_gen} "
-                    f"owner_gen={record.owner_generation}"
-                )
-        # Version-moving mutation under _capture_lock (Unit 2): serializes with
-        # a concurrent multi-artifact capture so the cut cannot observe this
-        # artifact moved while a peer in the same read-set is not (read skew).
-        with self._capture_lock:
+        # One hold covers the fence check AND the persist: deciding on
+        # read_generation outside the lock and writing inside it would be the
+        # same check-then-act gap this widening exists to close. Also
+        # serializes with a concurrent multi-artifact capture so the cut
+        # cannot observe this artifact moved while a peer in the same
+        # read-set is not (read skew).
+        with self._lock:
+            record = self._records[artifact_id]
+            if fence_agent_id is not None:
+                read_gen = record.read_generation_by_agent.get(fence_agent_id)
+                if read_gen is not None and read_gen < record.owner_generation:
+                    raise StaleReadGeneration(
+                        f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
+                        f"artifact={artifact_id} read_gen={read_gen} "
+                        f"owner_gen={record.owner_generation}"
+                    )
             if self._retain_versions:
                 self._capture_version(record, artifact.version, content)
             record.artifact = artifact
@@ -429,10 +466,11 @@ class ArtifactRegistry:
         ``commit_cas`` WIN threaded bytes — matching the corrected
         ``version_history`` annotation); ``None`` when not retained. Mirrors
         :meth:`SqliteArtifactRegistry.get_content_at_version`'s widened type."""
-        record = self._records.get(artifact_id)
-        if record is None:
-            return None
-        return record.version_history.get(version)
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return None
+            return record.version_history.get(version)
 
     def get_version_record(
         self, artifact_id: UUID, version: int
@@ -454,30 +492,33 @@ class ArtifactRegistry:
         reported as absent — the row was collected mid-read. ``None`` when the
         artifact or the version is absent (never captured, K-evicted, or
         T-expired-then-swept)."""
-        record = self._records.get(artifact_id)
-        if record is None:
-            return None
-        content = record.version_history.get(version)
-        if content is None:
-            return None
-        # One .get() per dict, no bare getitem: the GIL makes each dict access
-        # atomic but NOT the pair — a concurrent inline GC (a peer thread's
-        # capture under a bounded policy) can drop THIS version between the two
-        # reads, and a getitem here would KeyError out of read_at_version's
-        # never-raise contract. An absent stamp after a present body simply
-        # means the row was GC'd mid-read ⇒ report it as not retained.
-        captured_at = record.version_captured_at.get(version)
-        if captured_at is None:
-            return None
-        return content, captured_at
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return None
+            content = record.version_history.get(version)
+            if content is None:
+                return None
+            # One .get() per dict, no bare getitem: the GIL makes each dict access
+            # atomic but NOT the pair — a concurrent inline GC (a peer thread's
+            # capture under a bounded policy) can drop THIS version between the two
+            # reads, and a getitem here would KeyError out of read_at_version's
+            # never-raise contract. An absent stamp after a present body simply
+            # means the row was GC'd mid-read ⇒ report it as not retained.
+            captured_at = record.version_captured_at.get(version)
+            if captured_at is None:
+                return None
+            return content, captured_at
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
         """Return copy of per-agent MESI states for an artifact."""
-        return dict(self._records[artifact_id].state_by_agent)
+        with self._lock:
+            return dict(self._records[artifact_id].state_by_agent)
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
-        return self._records[artifact_id].state_by_agent.get(agent_id)
+        with self._lock:
+            return self._records[artifact_id].state_by_agent.get(agent_id)
 
     def set_agent_state(
         self,
@@ -490,84 +531,85 @@ class ArtifactRegistry:
         content_hash: str | None = None,
     ) -> None:
         """Set MESI state for one agent/artifact pair."""
-        record = self._records[artifact_id]
-        from_state = record.state_by_agent.get(agent_id, MESIState.INVALID)
-        record.state_by_agent[agent_id] = state
+        with self._lock:
+            record = self._records[artifact_id]
+            from_state = record.state_by_agent.get(agent_id, MESIState.INVALID)
+            record.state_by_agent[agent_id] = state
 
-        # Crash-recovery bookkeeping (no log emit, no serialization). Runs
-        # unconditionally and BEFORE the log emit so a state_log raise cannot
-        # leave state_by_agent and granted_at_tick_by_agent inconsistent
-        # (review fix COR-01 / REL-01: previously, a failed log emit left an
-        # M∪E entry without a granted_at_tick slot, defeating max-hold reclaim).
-        # Keeping the hot path branch-free preserves R5 byte-identity (these
-        # are dict mutations only, never serialized) and avoids subtle
-        # flag-on/flag-off divergence.
-        new_in_me = state in _M_OR_E_STATES
-        prev_in_me = from_state in _M_OR_E_STATES
-        if new_in_me:
-            if not prev_in_me:
-                # Set granted_at_tick on M∪E acquire only; M↔E transitions preserve the
-                # original grant tick (the agent has continuously held some M∪E grant).
-                record.granted_at_tick_by_agent[agent_id] = tick
-                # Slot clears on M∪E acquire ONLY (not on SHARED) — preserves the
-                # checkpoint-restore diagnostic across SHARED re-fetches.
-                record.last_reclamation_by_agent.pop(agent_id, None)
-        elif prev_in_me:
-            record.granted_at_tick_by_agent.pop(agent_id, None)
-            # Read-generation fence: revoking this M/E grant WITHOUT moving the
-            # version bumps the artifact's ownership epoch, atomically (GIL)
-            # with the INVALID transition, so a commit by the ex-holder (or any
-            # pre-revocation holder) fails the generation check. Both the sweep
-            # reclaims and the voluntary release ("invalidate") qualify — see
-            # EPOCH_BUMP_TRIGGERS. The version-moving peer invalidations do not.
-            if trigger in EPOCH_BUMP_TRIGGERS:
-                record.owner_generation += 1
+            # Crash-recovery bookkeeping (no log emit, no serialization). Runs
+            # unconditionally and BEFORE the log emit so a state_log raise cannot
+            # leave state_by_agent and granted_at_tick_by_agent inconsistent
+            # (review fix COR-01 / REL-01: previously, a failed log emit left an
+            # M∪E entry without a granted_at_tick slot, defeating max-hold reclaim).
+            # Keeping the hot path branch-free preserves R5 byte-identity (these
+            # are dict mutations only, never serialized) and avoids subtle
+            # flag-on/flag-off divergence.
+            new_in_me = state in _M_OR_E_STATES
+            prev_in_me = from_state in _M_OR_E_STATES
+            if new_in_me:
+                if not prev_in_me:
+                    # Set granted_at_tick on M∪E acquire only; M↔E transitions preserve the
+                    # original grant tick (the agent has continuously held some M∪E grant).
+                    record.granted_at_tick_by_agent[agent_id] = tick
+                    # Slot clears on M∪E acquire ONLY (not on SHARED) — preserves the
+                    # checkpoint-restore diagnostic across SHARED re-fetches.
+                    record.last_reclamation_by_agent.pop(agent_id, None)
+            elif prev_in_me:
+                record.granted_at_tick_by_agent.pop(agent_id, None)
+                # Read-generation fence: revoking this M/E grant WITHOUT moving the
+                # version bumps the artifact's ownership epoch, atomically (GIL)
+                # with the INVALID transition, so a commit by the ex-holder (or any
+                # pre-revocation holder) fails the generation check. Both the sweep
+                # reclaims and the voluntary release ("invalidate") qualify — see
+                # EPOCH_BUMP_TRIGGERS. The version-moving peer invalidations do not.
+                if trigger in EPOCH_BUMP_TRIGGERS:
+                    record.owner_generation += 1
 
-        # Read-generation fence: capture the current ownership epoch into the
-        # agent's read_generation when it establishes/refreshes a write-claim --
-        # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
-        # content read) or a genuine fetch read. Atomic (GIL) with the grant.
-        # The INVALID guard hardens the fetch leg: no current fetch path grants
-        # INVALID, but a future cache-miss-INVALID fetch must not mint a fresh
-        # claim for an unfenced zombie.
-        if (new_in_me and not prev_in_me) or (
-            trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
-        ):
-            record.read_generation_by_agent[agent_id] = record.owner_generation
+            # Read-generation fence: capture the current ownership epoch into the
+            # agent's read_generation when it establishes/refreshes a write-claim --
+            # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
+            # content read) or a genuine fetch read. Atomic (GIL) with the grant.
+            # The INVALID guard hardens the fetch leg: no current fetch path grants
+            # INVALID, but a future cache-miss-INVALID fetch must not mint a fresh
+            # claim for an unfenced zombie.
+            if (new_in_me and not prev_in_me) or (
+                trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+            ):
+                record.read_generation_by_agent[agent_id] = record.owner_generation
 
-        # SB-10 R6/R7: record the version whose bytes this agent now holds,
-        # GIL-atomic with the state write above (parity: the sqlite side writes
-        # it inside the same BEGIN IMMEDIATE as the upsert). Non-INVALID
-        # targets only -- a transition TO INVALID preserves the prior recorded
-        # value (the last version actually observed, the post-compaction
-        # staleness comparand) and a never-observed agent keeps no key (absent
-        # == None, never a 0-sentinel).
-        if state != MESIState.INVALID:
-            record.last_observed_version_by_agent[agent_id] = record.artifact.version
+            # SB-10 R6/R7: record the version whose bytes this agent now holds,
+            # GIL-atomic with the state write above (parity: the sqlite side writes
+            # it inside the same BEGIN IMMEDIATE as the upsert). Non-INVALID
+            # targets only -- a transition TO INVALID preserves the prior recorded
+            # value (the last version actually observed, the post-compaction
+            # staleness comparand) and a never-observed agent keeps no key (absent
+            # == None, never a 0-sentinel).
+            if state != MESIState.INVALID:
+                record.last_observed_version_by_agent[agent_id] = record.artifact.version
 
-        if self._state_log is not None:
-            self._seq += 1
-            entry = {
-                "tick": tick,
-                "artifact_id": str(artifact_id),
-                "agent_id": str(agent_id),
-                "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
-                "from_state": from_state.name,
-                "to_state": state.name,
-                "trigger": trigger,
-                "version": record.artifact.version,
-                "content_hash": content_hash,
-                "sequence_number": self._seq,
-                "instance_id": self._instance_id,
-                "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
-            }
-            try:
-                self._state_log(entry)
-            except Exception:
-                # Sequence number is reserved on success, not on attempt.
-                # Roll back so the next successful emission does not create a phantom gap.
-                self._seq -= 1
-                raise
+            if self._state_log is not None:
+                self._seq += 1
+                entry = {
+                    "tick": tick,
+                    "artifact_id": str(artifact_id),
+                    "agent_id": str(agent_id),
+                    "agent_name": self._agent_names.get(agent_id) if self._agent_names is not None else None,
+                    "from_state": from_state.name,
+                    "to_state": state.name,
+                    "trigger": trigger,
+                    "version": record.artifact.version,
+                    "content_hash": content_hash,
+                    "sequence_number": self._seq,
+                    "instance_id": self._instance_id,
+                    "schema_version": CCS_STATE_LOG_SCHEMA_VERSION,
+                }
+                try:
+                    self._state_log(entry)
+                except Exception:
+                    # Sequence number is reserved on success, not on attempt.
+                    # Roll back so the next successful emission does not create a phantom gap.
+                    self._seq -= 1
+                    raise
 
     def commit_cas(
         self,
@@ -695,14 +737,14 @@ class ArtifactRegistry:
             size_tokens=size_tokens if size_tokens is not None else record.artifact.size_tokens,
             depends_on=record.artifact.depends_on,
         )
-        # The version-move apply runs under _capture_lock (Unit 2): the WIN
+        # The version-move apply runs under _lock (Unit 2): the WIN
         # advances record.artifact.version, and a concurrent multi-artifact
         # capture reads N versions under that same lock — so this commit cannot
         # tear a cut (read skew) by moving one read-set member while the capture
         # has already read its peers. The lock is an RLock, so the nested
         # _capture_version re-enters freely. The non-WIN branches above mutate
         # nothing, so they need no lock; only this apply does.
-        with self._capture_lock:
+        with self._lock:
             # Content coherence: when the caller threaded the winning body,
             # advance record.content to it so a peer re-fetch reads the NEW
             # content at the new version (without this, version + content_hash
@@ -864,11 +906,11 @@ class ArtifactRegistry:
             raise
 
         # ---- APPLY (total): snapshot every affected record, apply all N under one
-        # _capture_lock hold, and RESTORE ALL on any raise — a mid-apply exception
+        # _lock hold, and RESTORE ALL on any raise — a mid-apply exception
         # can never leave a partial batch (the plan's total-apply hardening). ----
         invalidated: dict[UUID, list[UUID]] = {}
         versions: dict[UUID, int] = {}
-        with self._capture_lock:
+        with self._lock:
             snapshots = [
                 (
                     record,
@@ -954,12 +996,11 @@ class ArtifactRegistry:
         mints NO MESI grant and captures NO ``read_generation`` (it never calls
         ``set_agent_state`` / the fence-capture path) — a reader is not an owner.
 
-        Atomicity (the cross-artifact lock, Unit 2): GIL per-access atomicity is
-        per single dict access, which is insufficient across N artifacts. The
-        multi-artifact version read AND the pin insert run under
-        ``_capture_lock`` so a peer ``commit_cas`` cannot interleave the reads
-        and yield a torn (read-skewed) cut. The existing per-access paths stay
-        lock-free.
+        Atomicity (Unit 2): GIL per-access atomicity is per single dict
+        access, which is insufficient across N artifacts. The multi-artifact
+        version read AND the pin insert run under ``_lock`` so a peer
+        ``commit_cas`` cannot interleave the reads and yield a torn
+        (read-skewed) cut.
 
         Unknown-id validation (security, F7): the captured row-count must equal
         ``len(read_set)``. Any missing id → a typed
@@ -981,11 +1022,11 @@ class ArtifactRegistry:
             inserted.
         """
         ids = list(read_set)
-        with self._capture_lock:
+        with self._lock:
             # ONE linearization point: read every current version while holding
             # the capture lock. Every version-moving write — commit_cas WIN,
             # set_artifact_and_content, register_artifact — ALSO takes
-            # _capture_lock around its apply, so a peer write is serialized
+            # _lock around its apply, so a peer write is serialized
             # entirely before or after this whole capture, never partially
             # visible within the cut. The atomicity depends on BOTH sides taking
             # the lock; do NOT remove it from either side.
@@ -1024,7 +1065,7 @@ class ArtifactRegistry:
         versions become collectible again (Unit 2 / R4). Idempotent — releasing
         an unknown/already-released token is a no-op (no raise), mirroring the
         sqlite ``DELETE`` semantics."""
-        with self._capture_lock:
+        with self._lock:
             self._session_pins.pop(session_token, None)
             self._session_meta.pop(session_token, None)
 
@@ -1034,7 +1075,7 @@ class ArtifactRegistry:
         :meth:`SqliteArtifactRegistry.get_session_meta`; process-scoped here, so a
         fresh in-memory instance always returns ``None`` (in-memory sessions do
         not survive a restart — the asserted divergence)."""
-        with self._capture_lock:
+        with self._lock:
             return self._session_meta.get(session_token)
 
     def all_session_meta(self) -> "dict[str, tuple[UUID, int]]":
@@ -1043,14 +1084,14 @@ class ArtifactRegistry:
         :meth:`SqliteArtifactRegistry.all_session_meta`; the sweep enumerates this
         UNION'd with its in-memory token set (identical here, since both are
         process-scoped)."""
-        with self._capture_lock:
+        with self._lock:
             return dict(self._session_meta)
 
     def session_count(self) -> int:
         """Return the number of live sessions (SB-17 / TX-1, R14). Parity with
         :meth:`SqliteArtifactRegistry.session_count`; process-scoped, so a fresh
         instance is 0 (no durable survivors)."""
-        with self._capture_lock:
+        with self._lock:
             return len(self._session_meta)
 
     def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
@@ -1064,9 +1105,9 @@ class ArtifactRegistry:
         :meth:`SqliteArtifactRegistry.get_session_cut` (the two registries share
         no base class); divergent only on restart-survival (in-memory pins are
         process-scoped — a restart drops them and a post-restart token reads as
-        ``None``, the Unit-5 fail-closed concern). Taken under ``_capture_lock``
+        ``None``, the Unit-5 fail-closed concern). Taken under ``_lock``
         so a concurrent capture/release sees a consistent pin store."""
-        with self._capture_lock:
+        with self._lock:
             pins = self._session_pins.get(session_token)
             return dict(pins) if pins is not None else None
 
@@ -1079,7 +1120,7 @@ class ArtifactRegistry:
         checkpoint: CheckpointRecord,
         members: Sequence[CheckpointMember],
     ) -> None:
-        """Persist a checkpoint manifest atomically under ``_capture_lock`` —
+        """Persist a checkpoint manifest atomically under ``_lock`` —
         the header (owner metadata included, same critical section: the
         in-memory mirror of the sqlite same-transaction rule) plus every member,
         or nothing. Parity with
@@ -1096,7 +1137,7 @@ class ArtifactRegistry:
                 "without owner metadata is unrepresentable (fail-closed; the "
                 "restore path owner-validates against it)"
             )
-        with self._capture_lock:
+        with self._lock:
             if checkpoint.checkpoint_id in self._checkpoints:
                 raise ValueError(
                     f"create_checkpoint: duplicate checkpoint_id "
@@ -1119,13 +1160,13 @@ class ArtifactRegistry:
 
     def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
         """Return the checkpoint header, or ``None`` when unknown."""
-        with self._capture_lock:
+        with self._lock:
             return self._checkpoints.get(checkpoint_id)
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,
         checkpoint_id)`` (deterministic for the CLI ``list`` verb)."""
-        with self._capture_lock:
+        with self._lock:
             return sorted(
                 self._checkpoints.values(),
                 key=lambda c: (c.created_at, c.checkpoint_id),
@@ -1135,7 +1176,7 @@ class ArtifactRegistry:
         """Return the manifest's member rows ordered by ``member_path`` (empty
         list for an unknown checkpoint — :meth:`get_checkpoint` tells known from
         unknown)."""
-        with self._capture_lock:
+        with self._lock:
             member_by_path = self._checkpoint_members.get(checkpoint_id, {})
             return [member_by_path[path] for path in sorted(member_by_path)]
 
@@ -1145,7 +1186,7 @@ class ArtifactRegistry:
         """Update the checkpoint-level restore status + its ``updated_at`` stamp.
         Raises ``KeyError`` for an unknown checkpoint (fail fast, no silent
         no-op). Frozen records are replaced, never mutated in place."""
-        with self._capture_lock:
+        with self._lock:
             record = self._checkpoints.get(checkpoint_id)
             if record is None:
                 raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
@@ -1165,7 +1206,7 @@ class ArtifactRegistry:
         given values (a full member-restore-state write — a new restore run's
         first write for a member resets any prior run's delete record). Raises
         ``KeyError`` for an unknown (checkpoint, member) pair."""
-        with self._capture_lock:
+        with self._lock:
             member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
             if member is None:
                 raise KeyError(
@@ -1190,7 +1231,7 @@ class ArtifactRegistry:
         the member's restore tier in the same step — the Unit-6 loud tier
         downgrade. ``restore_tier=None`` leaves the tier untouched. Raises
         ``KeyError`` for an unknown (checkpoint, member) pair."""
-        with self._capture_lock:
+        with self._lock:
             member = self._checkpoint_members.get(checkpoint_id, {}).get(member_path)
             if member is None:
                 raise KeyError(
@@ -1211,7 +1252,7 @@ class ArtifactRegistry:
         adjustments cannot lose an update). Raises ``KeyError`` for an unknown
         checkpoint and ``ValueError`` if the result would go negative (a release
         without a matching pin is a bookkeeping bug, fail-closed)."""
-        with self._capture_lock:
+        with self._lock:
             record = self._checkpoints.get(checkpoint_id)
             if record is None:
                 raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
@@ -1269,39 +1310,45 @@ class ArtifactRegistry:
 
     def record_heartbeat(self, agent_id: UUID, now_tick: int) -> None:
         """Record an agent's heartbeat tick using max(prev, incoming) (R12 monotonicity)."""
-        prev = self._heartbeat_by_agent.get(agent_id)
-        if prev is None or now_tick > prev:
-            self._heartbeat_by_agent[agent_id] = now_tick
+        with self._lock:
+            prev = self._heartbeat_by_agent.get(agent_id)
+            if prev is None or now_tick > prev:
+                self._heartbeat_by_agent[agent_id] = now_tick
 
     def last_heartbeat_tick(self, agent_id: UUID) -> int | None:
         """Return the last recorded heartbeat tick for an agent, if any."""
-        return self._heartbeat_by_agent.get(agent_id)
+        with self._lock:
+            return self._heartbeat_by_agent.get(agent_id)
 
     def record_last_reclamation(
         self, agent_id: UUID, artifact_id: UUID, trigger: str, tick: int
     ) -> None:
         """Record the most recent reclamation slot for an (agent, artifact) pair."""
-        self._records[artifact_id].last_reclamation_by_agent[agent_id] = (trigger, tick)
+        with self._lock:
+            self._records[artifact_id].last_reclamation_by_agent[agent_id] = (trigger, tick)
 
     def get_last_reclamation(
         self, agent_id: UUID, artifact_id: UUID
     ) -> ReclamationSlot | None:
         """Return the most recent reclamation slot for an (agent, artifact) pair, if any."""
-        record = self._records.get(artifact_id)
-        if record is None:
-            return None
-        return record.last_reclamation_by_agent.get(agent_id)
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return None
+            return record.last_reclamation_by_agent.get(agent_id)
 
     def granted_at_tick(self, agent_id: UUID, artifact_id: UUID) -> int | None:
         """Return the tick at which agent acquired its current M/E grant on artifact, if any."""
-        record = self._records.get(artifact_id)
-        if record is None:
-            return None
-        return record.granted_at_tick_by_agent.get(agent_id)
+        with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return None
+            return record.granted_at_tick_by_agent.get(agent_id)
 
     def get_agent_transient(self, artifact_id: UUID, agent_id: UUID) -> TransientState | None:
         """Return transient state for one agent/artifact pair if present."""
-        return self._records[artifact_id].transient_by_agent.get(agent_id)
+        with self._lock:
+            return self._records[artifact_id].transient_by_agent.get(agent_id)
 
     def set_agent_transient(
         self,
@@ -1312,33 +1359,39 @@ class ArtifactRegistry:
         entered_tick: int,
     ) -> None:
         """Set transient state and entry tick for one agent/artifact pair."""
-        self._records[artifact_id].transient_by_agent[agent_id] = transient_state
-        self._records[artifact_id].transient_tick_by_agent[agent_id] = entered_tick
+        with self._lock:
+            self._records[artifact_id].transient_by_agent[agent_id] = transient_state
+            self._records[artifact_id].transient_tick_by_agent[agent_id] = entered_tick
 
     def clear_agent_transient(self, artifact_id: UUID, agent_id: UUID) -> None:
         """Clear transient state and timestamp for one agent/artifact pair."""
-        self._records[artifact_id].transient_by_agent.pop(agent_id, None)
-        self._records[artifact_id].transient_tick_by_agent.pop(agent_id, None)
+        with self._lock:
+            self._records[artifact_id].transient_by_agent.pop(agent_id, None)
+            self._records[artifact_id].transient_tick_by_agent.pop(agent_id, None)
 
     def get_transient_map(self, artifact_id: UUID) -> dict[UUID, TransientState]:
         """Return copy of per-agent transient states for an artifact."""
-        return dict(self._records[artifact_id].transient_by_agent)
+        with self._lock:
+            return dict(self._records[artifact_id].transient_by_agent)
 
     def get_transient_tick(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return tick when agent entered transient state if present."""
-        return self._records[artifact_id].transient_tick_by_agent.get(agent_id)
+        with self._lock:
+            return self._records[artifact_id].transient_tick_by_agent.get(agent_id)
 
     def remove_artifact(self, artifact_id: UUID) -> None:
         """Remove artifact record and all associated state from registry."""
-        self._records.pop(artifact_id, None)
+        with self._lock:
+            self._records.pop(artifact_id, None)
 
     def valid_holders(self, artifact_id: UUID) -> list[UUID]:
         """Return agents that currently hold non-invalid entries."""
-        return [
-            agent_id
-            for agent_id, state in self._records[artifact_id].state_by_agent.items()
-            if state != MESIState.INVALID
-        ]
+        with self._lock:
+            return [
+                agent_id
+                for agent_id, state in self._records[artifact_id].state_by_agent.items()
+                if state != MESIState.INVALID
+            ]
 
 
 if TYPE_CHECKING:
