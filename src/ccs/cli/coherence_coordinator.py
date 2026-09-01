@@ -40,6 +40,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import subprocess
 import sys
@@ -47,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from ccs.adapters.claude_code.auth import is_loopback_host, validate_bind_host
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
@@ -65,9 +67,11 @@ logger = logging.getLogger(__name__)
 
 #: How long the parent polls for the detached child to write the port
 #: file. Generous: cold Python interpreter + SQLite WAL setup + bind
-#: can take several seconds on slow disks. Matches the lifecycle module's
-#: spawn_self_probe budget × 1.5 for the inter-process round trip.
-_DETACH_PORT_WAIT_ATTEMPTS = 100  # × 0.1s = 10s
+#: can take several seconds on slow disks. A wall-clock deadline, not an
+#: attempt count — each probe carries its own internal retry budget, and
+#: multiplying the two silently inflated the window several-fold against
+#: an unreachable routed host (past Claude Code's default hook timeout).
+_DETACH_PORT_WAIT_TIMEOUT_SEC = 10.0
 _DETACH_PORT_WAIT_INTERVAL_SEC = 0.1
 
 
@@ -128,6 +132,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     root = Path(root_arg).resolve()
 
+    # Validate here, not only in the forked child's server construction:
+    # the parent dials this host directly for the reuse/spawn probes, and
+    # 0.0.0.0 aliases to localhost at connect time — an unvalidated
+    # wildcard would "pass" against a loopback coordinator instead of
+    # being rejected as documented. Loopback returns without reading env.
+    try:
+        validate_bind_host(args.bind_host)
+    except ValueError as exc:
+        err(f"agent-coherence-coordinator: {exc}")
+        return 2
+
     # Daemonized worker mode: bind + serve, then block forever so the
     # daemon HTTP/sweep/idle threads stay alive.
     if args._daemonized:
@@ -139,7 +154,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # SQLite registry (the operator's CLI invocation may not be that
     # process when the coordinator was detached on a prior session).
     if args.prepare_for_migration:
-        return _run_prepare_for_migration(root, quiet=args.quiet)
+        return _run_prepare_for_migration(
+            root, quiet=args.quiet, bind_host=args.bind_host
+        )
 
     # Test mode: keep the legacy in-process behavior so test_claude_code_cli
     # can spawn + assert in the same Python process. Not for users.
@@ -167,7 +184,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
 
 
-def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
+def _run_prepare_for_migration(
+    root: Path, *, quiet: bool, bind_host: str = "127.0.0.1"
+) -> int:
     """Unit 8: backend-switch safety entry point.
 
     Connects to the running coordinator, posts /admin/prepare-for-migration
@@ -186,6 +205,7 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
     from ccs.cli._coherence_client import (
         post as _post,
     )
+    from ccs.core.exceptions import InsecureTransportRefused
 
     pid_file = root / ".coherence" / "server.pid"
     if not pid_file.exists():
@@ -207,6 +227,13 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
             )
         return 0
 
+    # The local resolver only reads the port + secret files, so it always
+    # reports loopback. A routed coordinator listens ONLY on its bind
+    # address — both the release POST and the shutdown poll below must
+    # target that host or the whole path silently talks to nothing.
+    if not is_loopback_host(bind_host):
+        endpoint = dataclasses.replace(endpoint, host=bind_host)
+
     try:
         # M-04 / finding #28: use the shared _coherence_client.post() with
         # extra_headers instead of the now-deleted _post_with_operator_header().
@@ -215,6 +242,12 @@ def _run_prepare_for_migration(root: Path, *, quiet: bool) -> int:
                      extra_headers={"Coherence-Local-Operator": "true"})
     except _urlerr.HTTPError as exc:
         err(f"agent-coherence-coordinator: prepare-for-migration HTTP {exc.code}")
+        return 2
+    except (CoordinatorUnavailable, InsecureTransportRefused) as exc:
+        # Documented contract: 2 on any error reaching the coordinator.
+        # Without this, a refused connection escapes as a traceback (exit 1,
+        # colliding with the not-a-git-repo code) and grants stay live.
+        err(f"agent-coherence-coordinator: prepare-for-migration: {exc}")
         return 2
 
     if not resp.get("ok"):
@@ -302,17 +335,32 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
         return 2
 
     cfg = LifecycleConfig()
-    for _ in range(_DETACH_PORT_WAIT_ATTEMPTS):
+    deadline = time.monotonic() + _DETACH_PORT_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
         port = _read_port_from_file(pid_file)
-        if port is not None and _tcp_probe(port, cfg, bind_host=bind_host):
-            if not quiet:
-                print(f"port={port}", flush=True)
-            return 0
+        if port is not None:
+            if _tcp_probe(port, cfg, bind_host=bind_host):
+                if not quiet:
+                    print(f"port={port}", flush=True)
+                return 0
+            # A routed bind can never converge while a loopback-bound
+            # coordinator holds the workspace flock: the child joins it via
+            # the loser path and exits without binding the routed host.
+            # Name the mismatch now instead of stalling out the window.
+            if not is_loopback_host(bind_host) and _tcp_probe(
+                port, cfg, bind_host="127.0.0.1"
+            ):
+                err(
+                    "agent-coherence-coordinator: a coordinator for this "
+                    f"workspace is already running on 127.0.0.1:{port}; stop "
+                    f"it before re-binding to {bind_host}"
+                )
+                return 2
         time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
 
     err(
         "agent-coherence-coordinator: detached worker did not become reachable "
-        f"within {_DETACH_PORT_WAIT_ATTEMPTS * _DETACH_PORT_WAIT_INTERVAL_SEC:.0f}s"
+        f"within {_DETACH_PORT_WAIT_TIMEOUT_SEC:.0f}s"
     )
     return 2
 
