@@ -78,19 +78,30 @@ def _connect(
 ):
     """A bounded-wait connection: connect + per-statement timeouts ALWAYS set
     (KTD5). Arbitration calls use ``autocommit=True`` so the single SELECT is
-    one self-contained transaction (KTD2); provisioning uses explicit commit."""
+    one self-contained transaction (KTD2); provisioning uses explicit commit.
+
+    A connect failure surfaces the exception TYPE only: the DSN carries the
+    password, driver connect errors may echo conninfo, and the harness
+    transports child tracebacks — so the scrub lives at the ONE connect site.
+    """
     import psycopg  # noqa: PLC0415 - lazy so collection never needs the extra
 
     kwargs: dict[str, object] = {}
     if application_name is not None:
         kwargs["application_name"] = application_name
-    return psycopg.connect(
-        dsn,
-        autocommit=autocommit,
-        connect_timeout=_CONNECT_TIMEOUT_SEC,
-        options=f"-c statement_timeout={statement_timeout_ms}",
-        **kwargs,
-    )
+    try:
+        return psycopg.connect(
+            dsn,
+            autocommit=autocommit,
+            connect_timeout=_CONNECT_TIMEOUT_SEC,
+            options=f"-c statement_timeout={statement_timeout_ms}",
+            **kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised scrubbed
+        raise RuntimeError(
+            f"spike connect failed with {type(exc).__name__}; "
+            "details suppressed to avoid leaking DSN credentials"
+        ) from None
 
 
 @pytest.fixture(scope="module")
@@ -222,9 +233,12 @@ def test_expected_behind_yields_version_mismatch_without_mutation(conn) -> None:
     assert _anchor_count(conn) == anchor_before + 1, "the denied call still commits its anchor bump"
 
 
-def test_peer_exclusive_yields_other_holder_without_mutation(conn) -> None:
+@pytest.mark.parametrize("holder_state", ["EXCLUSIVE", "MODIFIED"])
+def test_peer_holder_yields_other_holder_without_mutation(conn, holder_state) -> None:
+    # BOTH halves of the M/E holder predicate must deny — a suite that only
+    # ever seeds EXCLUSIVE would stay green if MODIFIED fell out of the tuple.
     _seed(conn, version=1)
-    _grant(conn, _AGENT_B, "EXCLUSIVE", 0)
+    _grant(conn, _AGENT_B, holder_state, 0)
     before = _snapshot(conn)
 
     outcome, current = _arbitrate(conn, agent=_AGENT_A, expected_version=1)
@@ -348,19 +362,6 @@ _BLOCK_POLL_TIMEOUT_SEC = 10.0
 _FORCED_INTERLEAVING_ATTEMPTS = 3
 
 
-def _contender_connect(dsn: str, *, autocommit: bool, application_name: str | None = None):
-    """Contender-side connect with the DSN-scrubbing discipline: a failure
-    surfaces the exception TYPE only, because the harness transports child
-    tracebacks and a driver connect error may echo conninfo details."""
-    try:
-        return _connect(dsn, autocommit=autocommit, application_name=application_name)
-    except Exception as exc:  # noqa: BLE001 - re-raised scrubbed
-        raise RuntimeError(
-            f"spike contender connect failed with {type(exc).__name__}; "
-            "details suppressed to avoid leaking DSN credentials"
-        ) from None
-
-
 def _raise_contender_errors(result) -> None:
     """Surface the first child failure; a contender error is never a pass."""
     if result.errors:
@@ -392,8 +393,12 @@ def _await_backend_blocked(monitor_conn, application_name: str, timeout_sec: flo
 def _u2_locker_contender(ctx, dsn: str) -> dict:
     """Contender A: hold the artifact row lock, observe B blocked, then commit
     an EXCLUSIVE grant through the anchor lock chain while B waits."""
-    conn = _contender_connect(dsn, autocommit=False)
-    monitor = _contender_connect(dsn, autocommit=True)
+    conn = _connect(dsn, autocommit=False)
+    try:
+        monitor = _connect(dsn, autocommit=True)
+    except Exception:
+        conn.close()
+        raise
     try:
         ctx.barrier_wait()  # phase 1: both contenders are running
         with conn.cursor() as cur:
@@ -412,7 +417,7 @@ def _u2_locker_contender(ctx, dsn: str) -> dict:
 def _u2_naive_contender(ctx, dsn: str) -> dict:
     """Contender B: fire the naive single-statement CAS+grant-check and report
     whether it admitted (rowcount 1) or denied (rowcount 0)."""
-    conn = _contender_connect(dsn, autocommit=True, application_name=_NAIVE_APP_NAME)
+    conn = _connect(dsn, autocommit=True, application_name=_NAIVE_APP_NAME)
     try:
         ctx.barrier_wait()  # phase 1
         ctx.barrier_wait()  # phase 2: A holds the artifact row lock
@@ -492,7 +497,9 @@ def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
 
 # --- U3: cross-process affirmative demonstration ----------------------------
 #
-# Two-phase contenders per the shipped pattern: barrier 1 (everyone running),
+# Two-phase contenders per the shipped pattern (the harness Barrier is
+# reusable, and every contender in a race performs the same TWO waits, so the
+# rendezvous counts always match): barrier 1 (everyone running),
 # each contender pair-reads its comparands, barrier 2 (everyone holds the same
 # pre-race version), optional delay, then ONE arbitration call on its own
 # autocommit connection. Concurrent calls serialize on the anchor row lock;
@@ -551,7 +558,7 @@ def _u3_arbitrate_contender(ctx, dsn: str, agent: str, payload: str, app_name: s
     one arbitration SELECT on an autocommit connection (KTD2)."""
     import psycopg  # noqa: PLC0415
 
-    conn = _contender_connect(dsn, autocommit=True, application_name=app_name)
+    conn = _connect(dsn, autocommit=True, application_name=app_name)
     try:
         ctx.barrier_wait()  # phase 1: everyone is running
         with conn.cursor() as cur:
@@ -583,7 +590,7 @@ def _u3_arbitrate_contender(ctx, dsn: str, agent: str, payload: str, app_name: s
 def _u3_grant_transition_contender(ctx, dsn: str, agent: str, state: str, read_generation: int | None) -> dict:
     """Mid-race grant transition through the sanctioned anchor lock chain —
     INSERTs a NEW agent_states row, the phantom no row lock can see."""
-    conn = _contender_connect(dsn, autocommit=True, application_name=f"{_U3_APP_PREFIX}-grant")
+    conn = _connect(dsn, autocommit=True, application_name=f"{_U3_APP_PREFIX}-grant")
     try:
         ctx.barrier_wait()  # phase 1
         ctx.barrier_wait()  # phase 2
@@ -599,8 +606,12 @@ def _u3_grant_locker_contender(ctx, dsn: str) -> dict:
     lock + EXCLUSIVE upsert), observe the function-arm contender blocked on the
     anchor, then commit mid-flight — the same commit-across-a-blocked-peer
     shape as U2, at the construction's OWN serialization point."""
-    conn = _contender_connect(dsn, autocommit=False)
-    monitor = _contender_connect(dsn, autocommit=True)
+    conn = _connect(dsn, autocommit=False)
+    try:
+        monitor = _connect(dsn, autocommit=True)
+    except Exception:
+        conn.close()
+        raise
     try:
         ctx.barrier_wait()  # phase 1
         with conn.cursor() as cur:
@@ -619,7 +630,7 @@ def _u3_function_contender(ctx, dsn: str) -> dict:
     locker holds the anchor; blocks at the function's FIRST statement."""
     import psycopg  # noqa: PLC0415
 
-    conn = _contender_connect(dsn, autocommit=True, application_name=f"{_U3_APP_PREFIX}-fn")
+    conn = _connect(dsn, autocommit=True, application_name=f"{_U3_APP_PREFIX}-fn")
     try:
         ctx.barrier_wait()  # phase 1
         ctx.barrier_wait()  # phase 2: the locker holds the anchor lock
@@ -632,19 +643,6 @@ def _u3_function_contender(ctx, dsn: str) -> dict:
         return {"outcome": outcome, "current_version": current}
     finally:
         conn.close()
-
-
-def _uncontended_baseline_sec(dsn: str) -> float:
-    """Median of a few solo arbitration calls on freshly seeded rows — the
-    comparison floor for the loser-elapsed fallback signal (KTD6)."""
-    samples = []
-    with _connect(dsn, autocommit=True) as conn:
-        for i in range(3):
-            _reset_rows(dsn)
-            started = time.monotonic()
-            _arbitrate(conn, agent=f"baseline-{i}", expected_version=1)
-            samples.append(time.monotonic() - started)
-    return sorted(samples)[1]
 
 
 def _signal_lock_wait_or_warn(observed: bool, results: list[dict], baseline_sec: float) -> None:
@@ -697,7 +695,12 @@ def _assert_exactly_one_winner(dsn: str, results: list[dict], *, pre_version: in
     unknowns = [r for r in results if r["outcome"] == _OUTCOME_UNKNOWN]
     losers = [r for r in results if r["outcome"] not in (OUTCOME_WIN, _OUTCOME_UNKNOWN)]
 
-    assert version == pre_version + 1, f"exactly one write must land, got version {version}"
+    if version == pre_version and results and all(r["outcome"] == _OUTCOME_UNKNOWN for r in results):
+        pytest.fail(
+            "INCONCLUSIVE: every contender hit a driver error and no write landed "
+            f"({[r['error_type'] for r in results]}); rerun the spike — not a lost-update verdict"
+        )
+    assert version == pre_version + 1, f"exactly one write must land, got version {version}: {results}"
     assert len(wins) <= 1, f"two winners is a lost update: {results}"
     # Peer-committed ⇒ the version leg fires first (the shipped precedence
     # pin): every typed loser must see version_mismatch, never other_holder
@@ -713,34 +716,28 @@ def _assert_exactly_one_winner(dsn: str, results: list[dict], *, pre_version: in
         assert content_hash in {u["payload"] for u in unknowns}, results
 
 
-def test_race_two_contenders_exactly_one_winner(spike_pg) -> None:
-    _reset_rows(spike_pg)
-    baseline = _uncontended_baseline_sec(spike_pg)
+def test_race_two_contenders_exactly_one_winner(spike_pg, baseline_sec) -> None:
     _reset_rows(spike_pg)
     results, observed = _race_committers(spike_pg, agents=["r2-a", "r2-b"], delays=(0.0, 0.05))
     _assert_exactly_one_winner(spike_pg, results)
-    _signal_lock_wait_or_warn(observed, results, baseline)
+    _signal_lock_wait_or_warn(observed, results, baseline_sec)
 
 
-def test_race_four_contenders_exactly_one_winner(spike_pg) -> None:
-    _reset_rows(spike_pg)
-    baseline = _uncontended_baseline_sec(spike_pg)
+def test_race_four_contenders_exactly_one_winner(spike_pg, baseline_sec) -> None:
     _reset_rows(spike_pg)
     results, observed = _race_committers(
         spike_pg, agents=["r4-a", "r4-b", "r4-c", "r4-d"], delays=(0.0, 0.02, 0.04, 0.06)
     )
     _assert_exactly_one_winner(spike_pg, results)
-    _signal_lock_wait_or_warn(observed, results, baseline)
+    _signal_lock_wait_or_warn(observed, results, baseline_sec)
 
 
-def test_race_zero_delay_exactly_one_winner(spike_pg) -> None:
+def test_race_zero_delay_exactly_one_winner(spike_pg, baseline_sec) -> None:
     """Delays are never load-bearing: every assertion holds at all-zero."""
-    _reset_rows(spike_pg)
-    baseline = _uncontended_baseline_sec(spike_pg)
     _reset_rows(spike_pg)
     results, observed = _race_committers(spike_pg, agents=["z-a", "z-b"], delays=(0.0, 0.0))
     _assert_exactly_one_winner(spike_pg, results)
-    _signal_lock_wait_or_warn(observed, results, baseline)
+    _signal_lock_wait_or_warn(observed, results, baseline_sec)
 
 
 def test_race_fence_zombie_vs_fresh_peer(spike_pg) -> None:

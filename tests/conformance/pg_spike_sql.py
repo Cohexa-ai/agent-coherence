@@ -64,7 +64,7 @@ _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 def _validate_identifier(name: str) -> str:
     """Refuse any identifier that could smuggle SQL into the emitted DDL."""
-    if not _IDENTIFIER_RE.match(name):
+    if not _IDENTIFIER_RE.fullmatch(name):
         raise ValueError(f"unsafe SQL identifier for the spike schema: {name!r}")
     return name
 
