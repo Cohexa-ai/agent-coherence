@@ -448,3 +448,154 @@ def test_teeth_an_unlocked_member_fails_by_name() -> None:
 
     with pytest.raises(AssertionError, match="rogue_method"):
         _assert_member_holds_lock(_Unlocked(), "rogue_method", "method")
+
+
+# ---------------------------------------------------------------------------
+# Absent-artifact tolerance: the read accessors must match sqlite's
+# SELECT-no-row behavior, because the thread-safety contract makes
+# delete-vs-anything interleavings supported states, not caller errors.
+# ---------------------------------------------------------------------------
+
+_ABSENT_ACCESSOR_CASES = [
+    ("get_agent_state", lambda reg, art, ag: reg.get_agent_state(art, ag), None),
+    ("get_state_map", lambda reg, art, ag: reg.get_state_map(art), {}),
+    ("get_agent_transient", lambda reg, art, ag: reg.get_agent_transient(art, ag), None),
+    ("get_transient_map", lambda reg, art, ag: reg.get_transient_map(art), {}),
+    ("get_transient_tick", lambda reg, art, ag: reg.get_transient_tick(art, ag), None),
+    ("valid_holders", lambda reg, art, ag: reg.valid_holders(art), []),
+    ("get_read_generation", lambda reg, art, ag: reg.get_read_generation(art, ag), None),
+    (
+        "last_observed_version_for",
+        lambda reg, art, ag: reg.last_observed_version_for(art, ag),
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "accessor_name,call,expected",
+    _ABSENT_ACCESSOR_CASES,
+    ids=[c[0] for c in _ABSENT_ACCESSOR_CASES],
+)
+def test_read_accessors_tolerate_an_absent_artifact(registry, accessor_name, call, expected) -> None:
+    """An absent artifact answers like sqlite's empty SELECT, never KeyError.
+
+    The sweeps' per-pair holds re-read state for pairs snapshotted BEFORE a
+    concurrent delete landed; on sqlite those reads return None/{}/[] and the
+    pair is skipped, while the in-memory registry used to raise KeyError and
+    crash the whole sweep. get_owner_generation stays KeyError-raising by
+    documented contract on BOTH backends and is deliberately absent here.
+    """
+    assert call(registry, uuid4(), uuid4()) == expected
+
+
+class _StaleSnapshotRegistry(ArtifactRegistry):
+    """Serve the sweeps a pre-delete view of which pairs exist.
+
+    Reproduces deterministically the interleaving the thread-safety contract
+    permits: a sweep builds its walk list, a peer deletes the artifact, and
+    only then does the sweep's per-pair hold re-read live state. Overrides the
+    SNAPSHOT sources only -- every in-hold read stays live.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stale_ids: list = []
+        self.stale_state_maps: dict = {}
+        self.stale_transient_maps: dict = {}
+
+    def capture_stale_snapshot(self) -> None:
+        self.stale_ids = super().artifact_ids()
+        self.stale_state_maps = {a: super(type(self), self).get_state_map(a) for a in self.stale_ids}
+        self.stale_transient_maps = {
+            a: super(type(self), self).get_transient_map(a) for a in self.stale_ids
+        }
+
+    def artifact_ids(self):
+        return list(self.stale_ids) if self.stale_ids else super().artifact_ids()
+
+    def get_state_map(self, artifact_id):
+        if artifact_id in self.stale_state_maps:
+            return dict(self.stale_state_maps[artifact_id])
+        return super().get_state_map(artifact_id)
+
+    def get_transient_map(self, artifact_id):
+        if artifact_id in self.stale_transient_maps:
+            return dict(self.stale_transient_maps[artifact_id])
+        return super().get_transient_map(artifact_id)
+
+
+def test_stable_sweep_survives_a_delete_between_snapshot_and_hold() -> None:
+    """The grant sweep skips a vanished pair instead of crashing the walk."""
+    reg = _StaleSnapshotRegistry()
+    svc = CoordinatorService(reg)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    reg.set_agent_state(art.id, agent, MESIState.EXCLUSIVE, trigger="write", tick=0)
+
+    reg.capture_stale_snapshot()
+    svc.delete(agent_id=agent, artifact_id=art.id)
+
+    reclaimed = svc.enforce_stable_grant_timeouts(
+        current_tick=1_000, heartbeat_timeout_ticks=10, max_hold_ticks=10
+    )
+    assert reclaimed == 0
+
+
+def test_transient_sweep_survives_a_delete_between_snapshot_and_hold() -> None:
+    """The transient sweep skips a vanished pair instead of crashing the walk."""
+    from ccs.core.states import TransientState
+
+    reg = _StaleSnapshotRegistry()
+    svc = CoordinatorService(reg)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    reg.set_agent_transient(art.id, agent, TransientState.ISG, entered_tick=0)
+
+    reg.capture_stale_snapshot()
+    svc.delete(agent_id=agent, artifact_id=art.id)
+
+    expired = svc.enforce_transient_timeouts(current_tick=1_000, timeout_ticks=10)
+    assert expired == 0
+
+
+def test_transient_sweep_skips_a_pair_cleared_during_the_walk(registry) -> None:
+    """The in-hold re-read owns the eviction decision, not the stale snapshot.
+
+    A pair whose transient CLEARED after the walk list was built (the grant
+    completed) must not be force-invalidated on the stale snapshot's say-so.
+    Exercises the `get_agent_transient(...) is None: continue` guard the
+    per-pair hold added; `get_transient_tick is None` is the second net
+    behind it.
+    """
+    from ccs.core.states import TransientState
+
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    registry.set_agent_transient(art.id, agent, TransientState.ISG, entered_tick=0)
+    registry.set_agent_state(art.id, agent, MESIState.SHARED, trigger="fetch", tick=1_000)
+
+    if isinstance(registry, ArtifactRegistry):
+        stale = _StaleSnapshotRegistry()
+        # Rebuild the settled state on the wrapper so the stale snapshot can
+        # carry the pre-clear transient while live state has none.
+        svc = CoordinatorService(stale)
+        art = svc.register_artifact(name="plan.md", content="v1")
+        stale.set_agent_transient(art.id, agent, TransientState.ISG, entered_tick=0)
+        stale.capture_stale_snapshot()
+        stale.clear_agent_transient(art.id, agent)
+        stale.set_agent_state(art.id, agent, MESIState.SHARED, trigger="fetch", tick=1_000)
+        expired = svc.enforce_transient_timeouts(current_tick=1_000, timeout_ticks=10)
+        assert expired == 0
+        assert stale.get_agent_state(art.id, agent) == MESIState.SHARED, (
+            "the sweep evicted a pair whose transient had already cleared -- "
+            "the settled grant was destroyed on stale snapshot data"
+        )
+    else:
+        # sqlite arm: the live-read path (no stale-snapshot seam on this
+        # backend); the cleared pair is simply absent from the walk.
+        registry.clear_agent_transient(art.id, agent)
+        expired = svc.enforce_transient_timeouts(current_tick=1_000, timeout_ticks=10)
+        assert expired == 0
+        assert registry.get_agent_state(art.id, agent) == MESIState.SHARED

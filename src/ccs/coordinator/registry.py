@@ -381,7 +381,8 @@ class ArtifactRegistry:
         it never established a fence claim (a plain OCC writer that version-CAS,
         not the fence, arbitrates)."""
         with self._lock:
-            return self._records[artifact_id].read_generation_by_agent.get(agent_id)
+            record = self._records.get(artifact_id)
+            return record.read_generation_by_agent.get(agent_id) if record else None
 
     def last_observed_version_for(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return the artifact version whose bytes this agent last observed
@@ -390,7 +391,8 @@ class ArtifactRegistry:
         absent key, never a 0-sentinel, and a transition to INVALID preserved
         the prior recorded value. The post-compaction staleness comparand."""
         with self._lock:
-            return self._records[artifact_id].last_observed_version_by_agent.get(agent_id)
+            record = self._records.get(artifact_id)
+            return record.last_observed_version_by_agent.get(agent_id) if record else None
 
     def get_artifact_and_generation(
         self, artifact_id: UUID
@@ -525,12 +527,21 @@ class ArtifactRegistry:
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
         """Return copy of per-agent MESI states for an artifact."""
         with self._lock:
-            return dict(self._records[artifact_id].state_by_agent)
+            record = self._records.get(artifact_id)
+            return dict(record.state_by_agent) if record else {}
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
-        """Return MESI state for one agent/artifact pair if present."""
+        """Return MESI state for one agent/artifact pair if present.
+
+        Absent-artifact tolerance (this and every read accessor except the
+        deliberately KeyError-raising ``get_owner_generation``): answers match
+        sqlite's empty SELECT -- None/{}/[] -- because under the thread-safety
+        contract a delete may land between a sweep's snapshot and its per-pair
+        hold, and the hold's re-read must skip the vanished pair, not crash
+        the walk."""
         with self._lock:
-            return self._records[artifact_id].state_by_agent.get(agent_id)
+            record = self._records.get(artifact_id)
+            return record.state_by_agent.get(agent_id) if record else None
 
     def set_agent_state(
         self,
@@ -1364,7 +1375,8 @@ class ArtifactRegistry:
     def get_agent_transient(self, artifact_id: UUID, agent_id: UUID) -> TransientState | None:
         """Return transient state for one agent/artifact pair if present."""
         with self._lock:
-            return self._records[artifact_id].transient_by_agent.get(agent_id)
+            record = self._records.get(artifact_id)
+            return record.transient_by_agent.get(agent_id) if record else None
 
     def set_agent_transient(
         self,
@@ -1388,12 +1400,14 @@ class ArtifactRegistry:
     def get_transient_map(self, artifact_id: UUID) -> dict[UUID, TransientState]:
         """Return copy of per-agent transient states for an artifact."""
         with self._lock:
-            return dict(self._records[artifact_id].transient_by_agent)
+            record = self._records.get(artifact_id)
+            return dict(record.transient_by_agent) if record else {}
 
     def get_transient_tick(self, artifact_id: UUID, agent_id: UUID) -> int | None:
         """Return tick when agent entered transient state if present."""
         with self._lock:
-            return self._records[artifact_id].transient_tick_by_agent.get(agent_id)
+            record = self._records.get(artifact_id)
+            return record.transient_tick_by_agent.get(agent_id) if record else None
 
     def remove_artifact(self, artifact_id: UUID) -> None:
         """Remove artifact record and all associated state from registry."""
@@ -1403,9 +1417,12 @@ class ArtifactRegistry:
     def valid_holders(self, artifact_id: UUID) -> list[UUID]:
         """Return agents that currently hold non-invalid entries."""
         with self._lock:
+            record = self._records.get(artifact_id)
+            if record is None:
+                return []
             return [
                 agent_id
-                for agent_id, state in self._records[artifact_id].state_by_agent.items()
+                for agent_id, state in record.state_by_agent.items()
                 if state != MESIState.INVALID
             ]
 
