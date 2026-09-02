@@ -250,3 +250,49 @@ def real_s3():
 def test_real_s3_native_cas_conformance(real_s3, harness: CoordinatorHarness) -> None:
     bucket, region = real_s3
     run_native_cas_conformance(_S3ConformanceBinding(bucket, region), harness)
+
+
+# ---------------------------------------------------------------------------
+# U4 — contract prose, relabelling, exemption wiring (guarantee-ladder plan).
+# ---------------------------------------------------------------------------
+
+
+def test_contract_prose_carries_the_in_process_clause() -> None:
+    """R-3, string-pinned (the repo's byte-stable-prose discipline)."""
+    import ccs.testing.substrate_conformance as corpus
+
+    assert "In-process serialization does not satisfy any clause of this contract." in (
+        corpus.__doc__ or ""
+    )
+
+
+def test_shim_still_resolves_old_and_new_names() -> None:
+    """A-P3: the in-repo import path stays stable across the relabelling."""
+    from tests.conformance import substrate_conformance as shim
+
+    assert shim.assert_racing_writers_one_winner is not None  # old name survives
+    assert shim.assert_cross_process_one_winner_native_cas is not None
+    assert shim.assert_in_process_binding_exemption_is_declared is not None
+
+
+def test_shim_all_mirrors_the_packaged_corpus() -> None:
+    """Every packaged __all__ name is re-exported by the in-repo shim — the
+    spot-check above cannot catch a newly added name the shim missed."""
+    import ccs.testing.substrate_conformance as corpus
+    from tests.conformance import substrate_conformance as shim
+
+    missing = set(corpus.__all__) - set(shim.__all__)
+    assert not missing, f"shim __all__ is missing: {sorted(missing)}"
+
+
+def test_in_memory_binding_exemption_is_declared_and_reported() -> None:
+    """KTD-4 / R-8 — Covers AE5: the in-memory binding is refused the
+    cross-process race with its declared reason in the run report."""
+    from ccs.testing.substrate_conformance import (
+        InMemoryBinding,
+        assert_in_process_binding_exemption_is_declared,
+    )
+
+    report = assert_in_process_binding_exemption_is_declared()
+    assert any("InMemoryBinding" in line and "GIL-serialized" in line for line in report)
+    assert InMemoryBinding.in_process_only is True

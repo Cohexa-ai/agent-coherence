@@ -271,3 +271,42 @@ def test_coordinator_routed_bind_constructs_with_insecure_ack(tmp_path, monkeypa
     except OSError:
         return  # address not assignable on this host — guard already passed
     server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Regression: degraded-DNS bind stall.
+#
+# stdlib http.server.HTTPServer.server_bind calls socket.getfqdn(), which
+# blocks on the host resolver — measured at 35 s on a macOS workstation with
+# a stalled resolver, blowing the coordinator spawn's 10 s reachability window
+# (_spawn_detached). The server binds loopback only, so the FQDN is cosmetic;
+# _ThreadingHTTPServer.server_bind must never touch socket.getfqdn.
+# ---------------------------------------------------------------------------
+
+
+def test_server_bind_never_calls_getfqdn(monkeypatch):
+    """Binding the coordinator's HTTP server must not perform reverse DNS."""
+    import http.server as _http_server
+    import socket as _socket
+
+    from ccs.adapters.claude_code.coordinator_server import _ThreadingHTTPServer
+
+    def _stalled_resolver(name: str = "") -> str:  # pragma: no cover - fail path
+        raise AssertionError(
+            "server_bind reached socket.getfqdn — this stalls coordinator "
+            "startup past the 10 s spawn window when host DNS is degraded"
+        )
+
+    monkeypatch.setattr(_socket, "getfqdn", _stalled_resolver)
+    monkeypatch.setattr(_http_server.socket, "getfqdn", _stalled_resolver)
+
+    server = _ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        _http_server.BaseHTTPRequestHandler,
+        concurrency_limit=4,
+    )
+    try:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port == server.server_address[1] > 0
+    finally:
+        server.server_close()
