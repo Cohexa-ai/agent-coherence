@@ -70,8 +70,10 @@
    pessimistic write-acquire preempts the caller while moving NEITHER
    comparand (no commit, and trigger="write" is outside EPOCH_BUMP_TRIGGERS),
    so check_fence additionally HOLDs when the re-validate read itself comes
-   back without a standing grant (a warn-mode stale re-grant). Both are
-   client-side checks pinned by tests/adapters/test_effect_gate_wrapper.py. The multi-artifact
+   back stale (the caller had no standing grant at that read; the coordinator
+   declines to re-grant a verify_only fence read, so the HOLD is
+   level-triggered). Both are client-side checks pinned by
+   tests/adapters/test_effect_gate_wrapper.py. The multi-artifact
    coordinator-side effect gate (a coherent cut) is Snapshot.tla's
    NoReadSkewWithinCut, not this single-artifact wrapper. *)
 

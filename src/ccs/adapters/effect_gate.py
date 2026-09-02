@@ -17,8 +17,11 @@ revocation moves neither comparand: a peer's pessimistic write-acquire ends
 the caller's grant with no commit (version unmoved) and no epoch bump
 (``trigger="write"`` is deliberately outside ``EPOCH_BUMP_TRIGGERS``), so the
 re-validate additionally requires the read that answers it to be served under
-a STANDING grant -- a warn-mode stale re-grant HOLDs, it never re-arms a
-preempted decision.
+a STANDING grant -- a stale-status re-read HOLDs. That re-read travels
+``verify_only`` so the coordinator does NOT re-grant the preempted holder on
+it; the HOLD is level-triggered, so a bare re-check re-HOLDs until
+``reacquire()`` re-mints a live grant rather than silently re-arming the
+preempted decision on retry.
 It reuses the shipped ``CoherentVolume`` optimistic-concurrency primitives and
 never reimplements the coordinator gate.
 
@@ -154,9 +157,10 @@ def _held(
 ) -> StaleView:
     """Build the HOLD exception, carrying the drift, for a moved / vanished /
     unconfirmed / reclaimed / preempted input. ``lapsed`` says the re-validate
-    read itself reported the caller WITHOUT a standing grant (a warn-mode
-    stale re-grant) — the only signal left when a peer's write-claim acquire
-    preempted the grant while moving neither comparand."""
+    read itself came back stale — the caller had no standing grant at that read
+    (the coordinator declines to re-grant a ``verify_only`` fence read) — the
+    only signal left when a peer's write-claim acquire preempted the grant
+    while moving neither comparand."""
     generation_unconfirmed = expected_generation is None or current_generation is None
     if current_version is None:
         cause = HOLD_INPUT_VANISHED
@@ -190,18 +194,34 @@ def _held(
             f"had its grant reclaimed (ownership generation "
             f"g{expected_generation} -> g{current_generation}, version unchanged)"
         )
-    else:
+    elif lapsed:
         cause = HOLD_GRANT_PREEMPTED
         # Both comparands unchanged AND confirmed, yet the re-validate read was
-        # served WITHOUT a standing grant (``lapsed``): a peer write-claim
-        # acquire preempted the caller between capture and fire. No commit has
-        # landed (version unmoved) and trigger="write" deliberately does not
-        # bump the ownership epoch, so the pair is structurally blind here --
-        # only the grant-state answer on the re-read itself can see it.
+        # served WITHOUT a standing grant (``lapsed``): the caller's grant did
+        # not stand at the re-validate. The usual cause is a peer write-claim
+        # acquire that preempted the caller between capture and fire -- no
+        # commit has landed (version unmoved) and trigger="write" deliberately
+        # does not bump the ownership epoch, so the pair is structurally blind
+        # here; only the grant-state answer on the re-read itself sees it. A
+        # grantless re-read with NO peer lands here too (a re-minted identity
+        # gating with an earlier read's comparands), so the detail says
+        # "typically" rather than asserting a peer the fence never observed.
         detail = (
-            f"lost the grant it was read under (version and ownership "
-            f"generation g{expected_generation} unchanged -- a peer "
-            f"write-claim preempted it)"
+            f"was not under a standing grant at re-validate (version and "
+            f"ownership generation g{expected_generation} unchanged -- "
+            f"typically a peer write-claim preemption)"
+        )
+    else:
+        # Unreachable by construction: check_fence calls _held only when a
+        # comparand is unconfirmed, moved, or ``lapsed``, and every such
+        # condition is handled above. A future disjunct in check_fence, or a
+        # new _held caller, that reaches here would otherwise silently mislabel
+        # its HOLD as grant_preempted -- fail loud so the drift is caught.
+        raise AssertionError(
+            "internal: _held() reached its residual branch with an unchanged, "
+            f"confirmed, standing pair (v{expected_version}, "
+            f"g{expected_generation}) -- no HOLD condition holds; check_fence "
+            "and _held have drifted"
         )
     # A real CoherentVolume rejects a non-PathLike path before gate() runs, but
     # volume is duck-typed at runtime -- never let fspath() mask the HOLD.

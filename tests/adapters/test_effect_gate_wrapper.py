@@ -25,11 +25,12 @@ import pytest
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.adapters.effect_gate import gate
+from ccs.adapters.effect_gate import check_fence, gate
 from ccs.cli._coherence_client import post as _cc_post
 from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import (
     HOLD_GRANT_PREEMPTED,
+    HOLD_GRANT_RECLAIMED,
     HOLD_READ_DENIED,
     CoherenceDegradedWarning,
     CoherenceError,
@@ -309,7 +310,77 @@ def test_escaping_effect_held_when_grant_preempted_at_unchanged_pair(
         assert exc.current_generation == exc.expected_generation
         # — so the HOLD keys on the grant not standing at the re-validate.
         assert exc.hold_cause == HOLD_GRANT_PREEMPTED
-        assert "lost the grant" in str(exc)
+        assert "was not under a standing grant" in str(exc)
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_grant_preempted_hold_is_level_triggered_across_bare_regates(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write-preemption HOLD must be LEVEL-triggered, not edge-triggered:
+    a preempted holder that pulls the fence verdict twice with the SAME
+    comparands — no ``reacquire()`` between — must HOLD BOTH times. This is the
+    ``swg_gate`` retry shape (an agent that reads once, holds the pair, and
+    asks again before dispatch), and the H4 reality that models retry a deny
+    2-5 times.
+
+    The hazard the fence's own re-read used to create: a warn-leg re-validate
+    re-granted the caller SHARED (``post_stale_read``), healing the very grant
+    loss it was checking, so the SECOND bare check took the fresh branch and
+    ADMITTED — the peer still holds EXCLUSIVE. The verification read now travels
+    ``verify_only`` so the coordinator does NOT re-grant on it; the caller stays
+    INVALID and every bare re-check re-HOLDs until a real ``reacquire()``. This
+    mirrors the strict leg (KTD-T: a strict deny never re-grants), so warn and
+    strict converge. PRE-FIX the second check returned ``None`` (proceed)."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+        vol = CoherentVolume(
+            root_w,
+            on_error="strict",
+            on_stale_write="allow",
+            remote_endpoint=resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer),
+        )
+        (root_w / "task.txt").write_bytes(b"task-v1")
+        vol.write("task.txt", b"task-v1")  # M grant at v1
+        # Capture the pair the agent would carry from its swg_read.
+        _data, ev, eg = vol.read_with_version_generation("task.txt")
+        # A peer write-acquires, silently revoking this holder's grant.
+        resp = _cc_post(
+            ep, "/hooks/pre-edit", {"session_id": str(uuid4()), "path": "task.txt"}
+        )
+        assert resp.get("ok") is True, f"peer write-acquire failed: {resp}"
+
+        # Pull the fence verdict repeatedly with the SAME comparands, no
+        # reacquire between — every pull must HOLD grant_preempted.
+        for attempt in range(3):
+            with pytest.raises(StaleView) as exc_info:
+                check_fence(
+                    vol,
+                    "task.txt",
+                    expected_version=ev,
+                    expected_generation=eg,
+                )
+            assert exc_info.value.hold_cause == HOLD_GRANT_PREEMPTED, (
+                f"attempt {attempt}: a bare re-check must re-HOLD, not admit — "
+                "the fence read must not re-grant the preempted holder"
+            )
+            # The comparands never move: only the standing-grant leg sees it.
+            assert exc_info.value.current_version == ev
+            assert exc_info.value.current_generation == eg
+
+        # Recovery is via reacquire(), which DOES re-mint a live grant — after
+        # it the same path re-gates clean (the deny is recoverable, not sticky).
+        vol.reacquire("task.txt")
+        _d2, v2, g2 = vol.read_with_version_generation("task.txt")
+        check_fence(vol, "task.txt", expected_version=v2, expected_generation=g2)
     finally:
         stop_coordinator(coord_root)
 
@@ -769,6 +840,36 @@ def test_gate_holds_on_lapsed_grant_with_pair_unchanged() -> None:
     assert exc.value.current_version == 5
     assert exc.value.expected_generation == 7
     assert exc.value.current_generation == 7
+
+
+def test_grant_reclaimed_wins_when_lapsed_and_generation_both_moved() -> None:
+    """Branch-priority pin for _held(): when the re-read is BOTH lapsed AND the
+    ownership generation moved (a sweep reclaim that also left the caller
+    without a standing grant), the more-specific ``grant_reclaimed`` cause must
+    win over ``grant_preempted`` — the generation check sits before the lapsed
+    check, so the g->g+1 drift is named rather than hidden behind the residual
+    preemption label."""
+
+    class _LapsedStub(_StubVolume):
+        _last_read_stale = False
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            out = super().read_with_version_generation(path, observe=observe)
+            self._last_read_stale = not observe
+            return out
+
+    with pytest.raises(StaleView) as exc:
+        gate(
+            # capture (v5,g7); re-validate (v5,g8) AND lapsed.
+            _LapsedStub([(b"c", 5, 7), (b"c", 5, 8)]),
+            "p",
+            decide=lambda d: "go",
+            effect=lambda x: x,
+        )
+    assert exc.value.hold_cause == HOLD_GRANT_RECLAIMED
+    assert exc.value.current_generation == exc.value.expected_generation + 1
 
 
 def test_gate_holds_on_unconfirmed_capture_generation() -> None:

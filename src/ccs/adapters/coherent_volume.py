@@ -90,7 +90,7 @@ __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 
 class _ReadResult(NamedTuple):
     """What one coordinator-mediated read yields. Named rather than a bare
-    tuple because two of the four fields are int-shaped and adjacent
+    tuple because two of the five fields are int-shaped and adjacent
     (``version`` and ``owner_generation``), so a positional transposition would
     type-check in one direction while silently swapping a value comparand for
     an authority one."""
@@ -1676,7 +1676,11 @@ class CoherentVolume:
 
     def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
         """OCC helper: register a SHARED view and return
-        ``(bytes, version, stale_denied, owner_generation)``.
+        ``(bytes, version, stale_denied, owner_generation, stale_status)``
+        (a :class:`_ReadResult`); ``stale_status`` is True when the coordinator
+        classified this read as stale (a warn re-grant or a deny), the
+        standing-grant signal the effect fence keys the ``grant_preempted``
+        HOLD on.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
         handling) but also surfaces the coordinator's authoritative ``version``
@@ -1727,6 +1731,18 @@ class CoherentVolume:
                     # owner_generation). Older coordinators ignore the flag and
                     # answer without the key (generation stays None).
                     "want_owner_generation": True,
+                    # A verification read (``observe=False`` -- the effect
+                    # fence re-reading only to compare comparands) must not
+                    # MUTATE coordinator grant state: re-granting SHARED here
+                    # would heal the very grant loss the fence is checking, so
+                    # the caller stays whatever it was (INVALID after a
+                    # preemption), and a bare re-check re-HOLDs instead of
+                    # admitting. The client-side ``observe`` already keeps the
+                    # foreign-edit baseline still; this carries the same
+                    # "verification is not observation" rule to the server.
+                    # Older coordinators ignore it (edge-triggered fallback,
+                    # still fail-closed on the first check).
+                    "verify_only": not observe,
                 },
             )
             if isinstance(resp, dict):
