@@ -91,6 +91,20 @@ Alpha — APIs may change before `v1.0`.
   The backend conformance kit gains a MUST-MATCH release-bump scenario, so the
   epoch rule R9 now states is one a third-party backend can actually fail.
 
+  The review of this branch then found the pin's un-fenced sibling: the eager
+  UPDATE broadcast travels the same publish-after-lock boundary, and
+  `handle_update` applied it unconditionally — a stale update could regress a
+  recipient's view to older bytes marked valid, drop a fresher M/E claim with
+  no epoch bump, and stamp `last_observed_version` with the registry's current
+  version while the cache held the older body, poisoning the very comparand
+  the revoke pin trusts. `handle_update` now drops a broadcast whose bytes are
+  behind the world or whose recipient holds a live write claim (an update
+  completes an INVALID/SHARED revalidation, never revokes M/E); only the
+  transient clears survive a drop. In the same round, the in-memory read
+  accessors became absent-artifact tolerant (None/{}/[] like sqlite's empty
+  SELECT) so a delete landing between a sweep's snapshot and its per-pair
+  hold skips the vanished pair instead of crashing the walk.
+
   Both defects were in the formal model too: `Fencing.tla` inherited the
   unguarded `CRInvalidateAction`, which *is* F2 encoded. `Fencing.tla` now bumps
   the epoch on a release and carries `NoSilentRevoke`; the pin and
