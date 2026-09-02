@@ -47,6 +47,7 @@ __all__ = [
     "READ_AGENT_STATES_SQL",
     "READ_ANCHOR_SQL",
     "READ_ARTIFACT_SQL",
+    "RESET_ROWS_SQL",
     "SPIKE_SCHEMA",
     "SpikeSql",
     "build_spike_sql",
@@ -334,3 +335,6 @@ READ_AGENT_STATES_SQL = (
 
 # (artifact)
 READ_ANCHOR_SQL = f"SELECT forced_writes FROM {SPIKE_SCHEMA}.anchor WHERE artifact = %s"
+
+# Per-attempt reset for the cross-process cases: rows only, schema untouched.
+RESET_ROWS_SQL = f"TRUNCATE {SPIKE_SCHEMA}.artifacts, {SPIKE_SCHEMA}.agent_states, {SPIKE_SCHEMA}.anchor"

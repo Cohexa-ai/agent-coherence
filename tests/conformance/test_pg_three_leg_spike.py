@@ -23,15 +23,19 @@ never the driver message, which may embed the DSN password (the shipped
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
+from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness
 from tests.conformance.pg_spike_sql import (
     ARBITRATE_SQL,
     BUMP_OWNER_GENERATION_SQL,
     GRANT_TRANSITION_SQL,
     INSERT_ANCHOR_SQL,
     INSERT_ARTIFACT_SQL,
+    LOCK_ARTIFACT_ROW_SQL,
+    NAIVE_COMMIT_CAS_SQL,
     OUTCOME_CORRUPTION,
     OUTCOME_OTHER_HOLDER,
     OUTCOME_STALE_READ_GENERATION,
@@ -41,6 +45,7 @@ from tests.conformance.pg_spike_sql import (
     READ_AGENT_STATES_SQL,
     READ_ANCHOR_SQL,
     READ_ARTIFACT_SQL,
+    RESET_ROWS_SQL,
     SPIKE_SCHEMA,
     build_spike_sql,
 )
@@ -275,3 +280,177 @@ def test_function_hardening_search_path_pinned_and_no_public_execute(conn) -> No
         # revoke it must be non-NULL with no PUBLIC entry (grantee '' in acl text).
         assert acl is not None, f"{fn} has default ACLs — the R6 revoke did not land"
         assert not any(entry.startswith("=") for entry in acl), f"{fn} still grants PUBLIC: {acl}"
+
+
+# --- U2: negative control — the naive construction loses the grant leg ------
+#
+# The decisive interleaving is FORCED, never hoped for (delay-free by design):
+#   1. Contender A takes the artifact's row lock with a non-version-bumping
+#      UPDATE inside an open transaction.
+#   2. Contender B fires the naive single statement and BLOCKS on that lock —
+#      observed directly in pg_stat_activity, so B is provably in-flight
+#      across A's commit (no scheduling coin-flip).
+#   3. A writes an EXCLUSIVE grant via the sanctioned transition helper (the
+#      anchor lock chain) and commits.
+#   4. B's row re-check re-evaluates the version qual against A's committed
+#      tuple, while the grant subquery keeps its pre-grant statement snapshot —
+#      §9.2 predicts the admit lands.
+#
+# Refutation predicate: a DENY under exactly this interleaving is a genuine
+# refutation of the origin's §9.2 mechanism claim (reported loudly, flags the
+# C-3 pause). A run where the forcing did not hold is INCONCLUSIVE — rerun,
+# never escalate. Never silently green either way.
+
+_NAIVE_APP_NAME = "ccs-spike-naive"
+_BLOCK_POLL_TIMEOUT_SEC = 10.0
+_U2_ATTEMPTS = 3
+
+
+def _contender_connect(dsn: str, *, autocommit: bool, application_name: str | None = None):
+    """Contender-side connect with the DSN-scrubbing discipline: a failure
+    surfaces the exception TYPE only, because the harness transports child
+    tracebacks and a driver connect error may echo conninfo details."""
+    import psycopg  # noqa: PLC0415
+
+    kwargs: dict[str, object] = {}
+    if application_name is not None:
+        kwargs["application_name"] = application_name
+    try:
+        return psycopg.connect(
+            dsn,
+            autocommit=autocommit,
+            connect_timeout=_CONNECT_TIMEOUT_SEC,
+            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+            **kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised scrubbed
+        raise RuntimeError(
+            f"spike contender connect failed with {type(exc).__name__}; "
+            "details suppressed to avoid leaking DSN credentials"
+        ) from None
+
+
+def _await_backend_blocked(monitor_conn, application_name: str, timeout_sec: float = _BLOCK_POLL_TIMEOUT_SEC) -> bool:
+    """True once a backend with ``application_name`` is observed in a Lock wait.
+
+    Must run on an AUTOCOMMIT connection: backend-status views are frozen at
+    first access within a transaction, so polling inside one would never see
+    the state change.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        with monitor_conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE application_name = %s AND wait_event_type = 'Lock'",
+                (application_name,),
+            )
+            (count,) = cur.fetchone()
+        if count:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _u2_locker_contender(ctx, dsn: str) -> dict:
+    """Contender A: hold the artifact row lock, observe B blocked, then commit
+    an EXCLUSIVE grant through the anchor lock chain while B waits."""
+    conn = _contender_connect(dsn, autocommit=False)
+    monitor = _contender_connect(dsn, autocommit=True)
+    try:
+        ctx.barrier_wait()  # phase 1: both contenders are running
+        with conn.cursor() as cur:
+            cur.execute(LOCK_ARTIFACT_ROW_SQL, (_ARTIFACT,))  # row lock held; version untouched
+        ctx.barrier_wait()  # phase 2: the lock is provably held before B fires
+        observed_blocked = _await_backend_blocked(monitor, _NAIVE_APP_NAME)
+        with conn.cursor() as cur:
+            cur.execute(GRANT_TRANSITION_SQL, (_ARTIFACT, _AGENT_A, "EXCLUSIVE", 0))
+        conn.commit()  # B unblocks HERE, mid-flight across this grant commit
+        return {"observed_blocked": observed_blocked}
+    finally:
+        monitor.close()
+        conn.close()
+
+
+def _u2_naive_contender(ctx, dsn: str) -> dict:
+    """Contender B: fire the naive single-statement CAS+grant-check and report
+    whether it admitted (rowcount 1) or denied (rowcount 0)."""
+    conn = _contender_connect(dsn, autocommit=True, application_name=_NAIVE_APP_NAME)
+    try:
+        ctx.barrier_wait()  # phase 1
+        ctx.barrier_wait()  # phase 2: A holds the artifact row lock
+        started = time.monotonic()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(NAIVE_COMMIT_CAS_SQL, ("naive-c", "naive-t", _ARTIFACT, 1, _AGENT_B))
+                rowcount = cur.rowcount
+        except Exception as exc:  # noqa: BLE001 - classified, scrubbed (KTD5)
+            return {"outcome": "unknown", "error_type": type(exc).__name__}
+        return {"rowcount": rowcount, "elapsed": time.monotonic() - started}
+    finally:
+        conn.close()
+
+
+def _reset_rows(dsn: str, *, version: int = 1, owner_generation: int = 0) -> None:
+    with _connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(RESET_ROWS_SQL)
+        _seed(conn, version=version, owner_generation=owner_generation)
+
+
+def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
+    """R8 — and the origin §10 second-pass caveat this control discharges: the
+    naive arm must admit a write while a peer's committed EXCLUSIVE grant
+    should have denied it. This test PASSING means the naive construction
+    FAILED in the predicted shape."""
+    inconclusive: list[str] = []
+    for _attempt in range(_U2_ATTEMPTS):
+        _reset_rows(spike_pg)
+        harness = ProcessRaceHarness(timeout_sec=60.0)
+        result = harness.race(
+            [
+                ContenderSpec(_u2_locker_contender, args=(spike_pg,)),
+                ContenderSpec(_u2_naive_contender, args=(spike_pg,)),
+            ]
+        )
+        for outcome in result.outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+        locker = result.outcomes[0].value
+        naive = result.outcomes[1].value
+
+        if naive.get("outcome") == "unknown":
+            inconclusive.append(f"driver error {naive['error_type']} (unknown outcome)")
+            continue
+        if not locker["observed_blocked"]:
+            inconclusive.append("naive backend never observed in a Lock wait")
+            continue
+
+        # The forcing held: B was provably blocked across A's grant commit.
+        with _connect(spike_pg, autocommit=True) as check:
+            with check.cursor() as cur:
+                cur.execute(READ_ARTIFACT_SQL, (_ARTIFACT,))
+                version, _gen, content_hash, _token = cur.fetchone()
+                cur.execute(READ_AGENT_STATES_SQL, (_ARTIFACT,))
+                states = dict((agent, state) for agent, state, _g in cur.fetchall())
+        assert states.get(_AGENT_A) == "EXCLUSIVE", "scaffold broke: A's grant transition did not commit"
+
+        if naive["rowcount"] == 0:
+            pytest.fail(
+                "SPIKE FINDING — §9.2 REFUTED: the naive single statement DENIED under the "
+                "forced interleaving (blocked across a committed EXCLUSIVE grant, then rejected). "
+                "The origin BRD's mechanism argument does not hold as stated; flag the C-3 pause "
+                "and record this in the findings report before any backend scoping."
+            )
+        # The predicted lost arbitration: the naive statement admitted a write
+        # while a peer held a committed EXCLUSIVE grant.
+        assert naive["rowcount"] == 1
+        assert version == 2 and content_hash == "naive-c", (
+            "the admitted write should be the naive contender's payload"
+        )
+        return
+    pytest.fail(
+        "INCONCLUSIVE (not a §9.2 refutation): the forced interleaving could not be "
+        f"established in {_U2_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike; "
+        "do not escalate an unforced run to the C-3 pause."
+    )
