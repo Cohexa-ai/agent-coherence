@@ -78,18 +78,30 @@ CLAIM_LADDER: tuple[ClaimRung, ...] = (
             "sweep-reclaimed zombie's commit is rejected by the "
             "read-generation fence even with the version unmoved; the same "
             "zombie's escaping effect is HELD at the gate() boundary on the "
-            "(version, ownership-generation) pair."
+            "(version, ownership-generation) pair; and the REVOKE direction "
+            "is pinned too — a peer-issued invalidation minted before a grant "
+            "existed is dropped as obsolete against the target's last "
+            "observed version, and every revocation of a write claim moves "
+            "the ownership epoch, so a voluntary release cannot disarm the "
+            "fence."
         ),
         readme_pins=(
             "Concurrent lost update",
             "Reclaim-zombie write",
             "Reclaim-zombie effect",
+            "Zombie revoke",
         ),
         proving_tests=(
             "tests/test_registry.py::test_commit_cas_version_mismatch_no_mutation",
             "tests/test_fencing.py::test_parity_commit_cas_fence_rejects_superseded_reader",
             "tests/adapters/test_effect_gate_wrapper.py::"
             "test_escaping_effect_held_when_grant_reclaimed_version_unchanged",
+            "tests/test_zombie_revoke.py::"
+            "test_invalidate_rejects_issuer_from_a_superseded_generation",
+            "tests/test_zombie_revoke.py::"
+            "test_release_by_invalidate_arms_the_fence_like_a_sweep_reclaim",
+            "tests/test_zombie_revoke.py::"
+            "test_adapter_concurrent_publish_does_not_revoke_a_fresher_grant",
         ),
     ),
     ClaimRung(

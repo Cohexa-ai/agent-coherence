@@ -53,6 +53,9 @@ formal/tla/
 ├── Fencing.tla             # amendment: EXTENDS CrashRecovery, adds the read-generation fence
 ├── Fencing.cfg             # TLC config: 3 agents (local deep runs)
 ├── Fencing_CI.cfg          # TLC config: 2 agents (CI, fits 5-min budget)
+├── ZombieRevoke.tla        # amendment: EXTENDS Fencing, pins the REVOKE (NoZombieRevoke)
+├── ZombieRevoke.cfg        # TLC config: 3 agents (local deep runs)
+├── ZombieRevoke_CI.cfg     # TLC config: 2 agents, MaxTicks=3 (CI, ~35s)
 ├── EffectGate.tla          # amendment: EXTENDS Fencing, adds the effect-ordering gate machine
 ├── EffectGate.cfg          # TLC config: 3 agents (local deep runs)
 ├── EffectGate_CI.cfg       # TLC config: 2 agents, MaxTicks=3, HeartbeatTimeout=1 (CI; see budget notes)
@@ -93,6 +96,9 @@ java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/Fencing_CI.cfg formal/tla/Fencing.tla -workers auto
 
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
+  -config formal/tla/ZombieRevoke_CI.cfg formal/tla/ZombieRevoke.tla -workers auto
+
+java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/Retention_CI.cfg formal/tla/Retention.tla -workers auto
 
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
@@ -118,6 +124,8 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `NoLostUpdate` | OCC | No successful `commit_cas` ever landed on a stale observed version — the concurrent lost-update is prevented |
 | — | `ReadGenBounded` | Fencing, EffectGate, Retention, Snapshot | A captured read-generation never exceeds the artifact's current ownership epoch |
 | — | `NoStaleApply` | Fencing, EffectGate, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
+| — | `NoZombieRevoke` | ZombieRevoke | No invalidation ever revoked a write claim it was not authority over — a signal minted at one epoch and applied to a claim established later. The dual of `NoStaleApply`: that one says a superseded claim cannot WRITE, this one says a superseded signal cannot REVOKE. Neither subsumes the other (recipe 16 gives it teeth) |
+| — | `NoSilentRevoke` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot | A write claim is never revoked without the ownership epoch moving — by the sweep OR by a voluntary release, the two operations that end a claim at an unchanged version. `NoStaleApply` structurally cannot see this failure (it is defined *relative* to the epoch that fails to move), which is why it is stated separately (recipe 17 gives it teeth) |
 | — | `NoStaleAdmit` | EffectGate | The effect gate never ADMITS an escaping effect whose captured `(version, ownerGeneration)` pair had moved as of the re-validate read — the reclaim-zombie *effect* (generation moved, version unchanged) is held. Scoped to the re-validate point; the admit→fire residual window is deliberately unguarded and model-visible (recipe 15 gives it teeth) |
 | — | `PairMovedScoped` | EffectGate | Canonicalization sanity: the moved-since-capture flag is FALSE outside the decided window, so the abstraction adds no spurious state |
 | — | `NoCollectedRead` | Retention, Snapshot | No versioned read ever observed a hole inside the promised K-window strictly below the current version — the GC never collects what the bounded-retention contract promises (current version included, by construction) |
@@ -153,7 +161,10 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `ObserveGenAction` | `read_generation` capture in `set_agent_state` (fetch / E∪M acquire) |
 | `FencingSweepAction` | the `owner_generation` bump on reclaim triggers in `set_agent_state` |
 | `FencingCommitAction` | the generation guard in `commit_cas` + `set_artifact_and_content(fence_agent_id=…)` |
+| `FencingInvalidateAction` | `service.invalidate` — the NoZombieRevoke pin (`_revoke_is_superseded`) plus the `owner_generation` bump the shared `EPOCH_BUMP_TRIGGERS` predicate now covers |
+| `observedCurrent` | `agent_states.last_observed_version` (SB-10 R6/R7), abstracted to one bit per pair — see the spec header for why |
 | `NoStaleApply` | dual-registry parity + regression suite (`tests/test_fencing.py`) |
+| `NoZombieRevoke` / `NoSilentRevoke` | `tests/test_zombie_revoke.py` (both defects, plus the guards that keep the pin from over-reaching) |
 | `EffectDecideAction` | `gate()`'s decision read — `CoherentVolume.read_with_version_generation()` → registry `get_artifact_and_generation()` (one pair-atomic snapshot on both registry arms) |
 | `EffectAdmitAction` / `EffectHoldAction` | `gate()`'s effect-boundary re-read + pair comparison; the HOLD is the raised `StaleView` carrying the version and generation drift |
 | `EffectFireAction` | `effect(decision)` after the admit — the disclaimed residual re-validate→fire window (unguarded in the model on purpose) |
@@ -196,19 +207,33 @@ Target: **5 minutes** total across the specs run in CI (the original five measur
 | CrashRecovery (local) | `CrashRecovery.cfg` | 3 | 2 | 12 | — | ~30+ min |
 | OCC (CI) | `OCC_CI.cfg` | 2 | 1 | 4 | 1,372,720 | ~47s |
 | OCC (local) | `OCC.cfg` | 3 | 1 | 6 | — | minutes |
-| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 2,832,014 | ~67s |
+| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~111s |
 | Fencing (local) | `Fencing.cfg` | 3 | 1 | 6 | — | minutes |
-| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 2,832,014 | ~115s |
+| ZombieRevoke (CI) | `ZombieRevoke_CI.cfg` | 2 | 1 | 3 | 3,902,098 | ~93s |
+| ZombieRevoke (local) | `ZombieRevoke.cfg` | 3 | 1 | 6 | — | minutes |
+| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~176s |
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
-| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 375,180 | ~18s |
+| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 1,735,500 | ~46s |
 | Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
 | WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~5s |
 | WorkspaceVersion (local) | `WorkspaceVersion.cfg` | — | 2 members | MaxVersion=4 | 204,216 | ~6s |
 
+Fencing, ZombieRevoke, EffectGate, Retention and Snapshot were remeasured 2026-08-31
+(8 cores). Two changes compound here: the epoch bump on a voluntary release makes a new
+generation value reachable in each of them, and `MaxGen` had to be raised from `MaxTicks`
+to `MaxTicks + NumAgents`. That second one is not cosmetic. A release bump is not
+tick-bounded, so acquire/release cycles reach the old ceiling at clock 0 -- and because a
+failed bump guard DISABLES its action rather than violating an invariant, TLC quietly
+stopped exploring revoke transitions there while still reporting success. Raising the
+ceiling roughly doubles each affected space (EffectGate 3.9M -> 10.5M distinct states is
+the largest). The full `make tla-check` sweep is ~11min40s, up from ~7min20s and ~5min
+before the amendment. If that stops fitting the CI budget, cut the tick horizon rather
+than `MaxGen` -- a low `MaxGen` buys its speed by silently not checking things.
+
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)
 and the read action is a stutter in the correct spec, so retention adds transitions and
-per-transition checks (~1.7× Fencing's wall time; 30,483,363 generated vs 28,142,923)
+per-transition checks (~1.7× Fencing's wall time; 28,270,477 generated vs 26,108,777)
 but zero state-space dimensions. The local 3-agent config is overnight-class, not a
 quick check: measured ≥95M distinct states (703M generated, queue still growing) at the
 40-minute mark on 8 cores — and since the distinct space equals Fencing's, that is also
@@ -216,7 +241,7 @@ the true size of `Fencing.cfg`'s local space.
 
 Snapshot **inverts** the usual CI shape — **1 agent × 2 artifacts** (the other CI specs are 2 agents × 1 artifact). Read skew is a cross-artifact phenomenon, so ≥ 2 artifacts is mandatory; the agent-contention re-check of the inherited fence invariants is already discharged by the other specs and by the local `Snapshot.cfg` (2 agents). The CI config also disables the sweep (`HeartbeatTimeout` > `MaxTicks`) — the session machinery is fence-uniform and adds no sweep interaction, so suppressing it keeps the run to ~18s without losing Snapshot-specific coverage. The local `Snapshot.cfg` (2 agents, `MaxTicks=4`, sweeps on) is the deep composition check and the home for the mutant recipes.
 
-EffectGate multiplies Fencing's space by the gate machine (5 phases × the moved-flag), so its CI config **tightens the tick horizon instead of dropping coverage**: `MaxTicks=3, HeartbeatTimeout=1, MaxHoldTicks=2` keeps every hazard reachable — the mutant (recipe 15) still finds the reclaim-between-capture-and-admit trace in ~1s, which is the reachability proof — while the correct spec converges at 40,015,043 generated / 3,724,900 distinct states in ~1min40s on 8 cores (measured 2026-08-20). The naive encoding with concrete captured comparands diverges (>80M distinct, queue still growing); the moved-since-capture abstraction in the spec header is what makes the spec checkable at all. The local `EffectGate.cfg` (3 agents, `MaxTicks=6`) is overnight-class.
+EffectGate multiplies Fencing's space by the gate machine (5 phases × the moved-flag), so its CI config **tightens the tick horizon instead of dropping coverage**: `MaxTicks=3, HeartbeatTimeout=1, MaxHoldTicks=2` keeps every hazard reachable — the mutant (recipe 15) still finds the reclaim-between-capture-and-admit trace in ~1s, which is the reachability proof — while the correct spec converges at 40,015,043 generated / 3,724,900 distinct states in ~1min40s on 8 cores (3,913,780 distinct / ~1min57s remeasured 2026-08-30 after the epoch-bump amendment). The naive encoding with concrete captured comparands diverges (>80M distinct, queue still growing); the moved-since-capture abstraction in the spec header is what makes the spec checkable at all. The local `EffectGate.cfg` (3 agents, `MaxTicks=6`) is overnight-class.
 
 CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=6) to fit the budget.
 The full 3-agent config (`CrashRecovery.cfg`) is for local deep runs:
@@ -372,6 +397,26 @@ and confirm TLC finds a counterexample:
     violation, showing a trace where a sweep reclamation (or a peer commit)
     lands between the decide capture and the admit and the effect is admitted
     anyway. (Verified 2026-08-20: violation found in ~1s, 879 distinct states.)
+
+16. **NoZombieRevoke mutation (apply a superseded signal)**: In
+    `ZombieRevoke.tla`, replace the `\/ ~observedCurrent[ag][art]` disjunct of
+    `ZRInvalidateAction`'s pin with `\/ TRUE` (so a peer-issued invalidation can
+    land on a target that has already observed a version at least as new as the
+    one it announces). Run TLC on `ZombieRevoke_CI.cfg`. TLC should fail with a
+    `NoZombieRevoke` violation, showing a trace where a signal minted at one
+    epoch revokes a claim established later — the shipped defect this amendment
+    closes. (Verified 2026-08-30.)
+
+17. **NoSilentRevoke mutation (revoke without moving the epoch)**: In
+    `Fencing.tla`, replace `FencingInvalidateAction`'s `ownerGeneration' = …`
+    conjunct with `/\ UNCHANGED ownerGeneration` — the shipped behaviour before
+    `EPOCH_BUMP_TRIGGERS`. Run TLC on `Fencing_CI.cfg`. TLC should
+    fail with a `NoSilentRevoke` violation. Note that `NoStaleApply`,
+    `ReadGenBounded` and `SingleWriter` all stay GREEN on that trace: the flag
+    is defined relative to the very counter that fails to move, which is exactly
+    why the property is stated separately rather than folded into the fence's.
+    The same mutation applied to `FencingSweepAction`'s bump is caught by the
+    same invariant. (Verified 2026-08-30: both variants found.)
 
 These mutations are run manually during development to validate TLC's
 bug-detection capability. The mutated files are not committed. Recipes 5–10

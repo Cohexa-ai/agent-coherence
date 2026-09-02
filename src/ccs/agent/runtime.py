@@ -297,17 +297,35 @@ class AgentRuntime:
         )
 
     def handle_invalidation(self, signal: InvalidationSignal) -> None:
-        """Apply invalidation event from coordinator/event bus."""
+        """Apply invalidation event from coordinator/event bus.
+
+        The coordinator decides FIRST, and the local cache follows its verdict.
+        Order is load-bearing: ``invalidate`` can decline a signal the
+        NoZombieRevoke pin finds obsolete (``service._revoke_is_superseded``),
+        and clamping the cache before asking would drop this agent's view for a
+        grant the coordinator then keeps -- a split the pre-pin code could not
+        produce, because the coordinator always applied.
+
+        A ``None`` return from an artifact the registry does not know is the one
+        case that still clears the cache: the artifact is gone, so there is
+        nothing for the local copy to be coherent WITH. Only a live artifact
+        whose revoke was declined leaves the cache alone.
+        """
+        declined = (
+            self.coordinator.invalidate(
+                agent_id=self.agent_id,
+                artifact_id=signal.artifact_id,
+                new_version=signal.new_version,
+                issuer_agent_id=signal.issuer_agent_id,
+                issued_at_tick=signal.issued_at_tick,
+            )
+            is None
+        )
+        if declined and self.coordinator.registry.has_artifact(signal.artifact_id):
+            return
         self.cache.invalidate(
             signal.artifact_id,
             invalidated_version=max(signal.new_version - 1, 0),
-            issued_at_tick=signal.issued_at_tick,
-        )
-        self.coordinator.invalidate(
-            agent_id=self.agent_id,
-            artifact_id=signal.artifact_id,
-            new_version=signal.new_version,
-            issuer_agent_id=signal.issuer_agent_id,
             issued_at_tick=signal.issued_at_tick,
         )
 
@@ -320,30 +338,77 @@ class AgentRuntime:
         now_tick: int,
         writer_agent_id: UUID | None = None,
     ) -> None:
-        """Apply eager-broadcast content update from peer/coordinator."""
-        self.cache.put(
-            artifact_id,
-            self.strategy.on_fetch(
+        """Apply eager-broadcast content update from peer/coordinator.
+
+        Pinned like the invalidation path: a broadcast is minted inside the
+        registry lock and delivered after it is released, so by delivery time
+        the artifact may have moved past it -- the recipient may even hold a
+        FRESH write claim established after the mint. Applying a stale update
+        would revoke that claim M -> SHARED with no epoch bump, regress the
+        cache to older bytes marked valid, and let ``set_agent_state`` stamp
+        ``last_observed_version`` with the registry's CURRENT version while
+        the cache holds the OLDER body -- poisoning the comparand
+        ``_revoke_is_superseded`` trusts. One version comparison under one
+        guard hold drops the whole apply; only the transient clears survive
+        the drop (a stranded slot stalls the stable-grant sweep, while an
+        early clear is harmless).
+        """
+        with self.coordinator.registry.abort_guard():
+            artifact = self.coordinator.registry.get_artifact(artifact_id)
+            if artifact is None:
+                # Deleted since the mint; the delete's own invalidation path
+                # owns the cache teardown.
+                return
+            state = self.coordinator.registry.get_agent_state(artifact_id, self.agent_id)
+            # Two stale shapes. The broadcast's bytes are behind the WORLD
+            # (the version moved past the mint), or the recipient holds a
+            # LIVE write claim: an update can complete an INVALID/SHARED
+            # revalidation, never revoke M/E -- a same-version broadcast
+            # against an M/E holder necessarily predates the acquire, because
+            # the commit that minted it would have invalidated this agent
+            # first. (The writer-relinquish leg below is different: it
+            # downgrades the WRITER, and only ever on the fresh path.)
+            if version < artifact.version or state in (MESIState.MODIFIED, MESIState.EXCLUSIVE):
+                self.coordinator.registry.clear_agent_transient(artifact_id, self.agent_id)
+                if writer_agent_id is not None:
+                    self.coordinator.registry.clear_agent_transient(artifact_id, writer_agent_id)
+                return
+            self.cache.put(
+                artifact_id,
+                self.strategy.on_fetch(
+                    artifact_id=artifact_id,
+                    version=version,
+                    state=MESIState.SHARED,
+                    now_tick=now_tick,
+                ),
+            )
+            self._record_content_view(
                 artifact_id=artifact_id,
                 version=version,
-                state=MESIState.SHARED,
+                content=content,
+                source="broadcast",
                 now_tick=now_tick,
-            ),
-        )
-        self._record_content_view(
-            artifact_id=artifact_id,
-            version=version,
-            content=content,
-            source="broadcast",
-            now_tick=now_tick,
-        )
-        self.coordinator.registry.set_agent_state(
-            artifact_id, self.agent_id, MESIState.SHARED, trigger="update", tick=now_tick
-        )
-        if writer_agent_id is not None:
-            self.coordinator.registry.set_agent_state(
-                artifact_id, writer_agent_id, MESIState.SHARED, trigger="update", tick=now_tick
             )
+            # An eager push IS an observation, so it completes the grant transition
+            # the same way ``service.fetch`` does -- state, then clear the transient.
+            # ``_write_impl`` / ``_commit_impl`` set a peer's SIA/EIA transient
+            # alongside the INVALID transition and leave the bus-delivered
+            # invalidation to clear it; once an update has moved that peer back to
+            # SHARED, the NoZombieRevoke pin can legitimately decline the late
+            # signal, and without this the transient would strand -- stalling the
+            # stable-grant sweep (which skips a pair mid-transient) and the peer's
+            # next commit_cas until the transient-timeout fail-safe fires. The
+            # in-hold version check above is what makes this stamp truthful: it
+            # only ever lands when the broadcast's bytes ARE the current version.
+            self.coordinator.registry.set_agent_state(
+                artifact_id, self.agent_id, MESIState.SHARED, trigger="update", tick=now_tick
+            )
+            self.coordinator.registry.clear_agent_transient(artifact_id, self.agent_id)
+            if writer_agent_id is not None:
+                self.coordinator.registry.set_agent_state(
+                    artifact_id, writer_agent_id, MESIState.SHARED, trigger="update", tick=now_tick
+                )
+                self.coordinator.registry.clear_agent_transient(artifact_id, writer_agent_id)
 
     def content(self, artifact_id: UUID) -> str | None:
         """Return locally cached content body for artifact if present."""

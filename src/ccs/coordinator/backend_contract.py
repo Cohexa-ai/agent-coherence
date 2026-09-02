@@ -140,7 +140,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "THE N-artifact atomic boundary (SB-18). commit_all runs CHECK-all "
         "(version-CAS + other_holder + fence per member) then applies EVERY member "
         "or NONE, in one serialized step (sqlite: one BEGIN IMMEDIATE; in-memory: "
-        "one _capture_lock hold with snapshot-restore). All-or-nothing -- a partial "
+        "one _lock hold with snapshot-restore). All-or-nothing -- a partial "
         "batch is never observable (NoPartialPublish). Returns a MultiCasResult; "
         "the aggregated invalidation broadcasts only after the commit. A genuinely "
         "new atomic op, never a loop of commit_cas.",
@@ -161,9 +161,12 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "base",
         "The MESI grant transition — the grant-arbitration leg of the boundary. "
         "Called inside every atomic mutation path (write/commit peer-invalidation "
-        "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim, "
-        "which bumps owner_generation for the fence). Single-writer is checked "
-        "after each such transition.",
+        "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim). "
+        "An M/E->INVALID transition that revokes the write claim WITHOUT moving "
+        "the version bumps owner_generation for the fence — the sweep reclaims "
+        "AND the voluntary invalidate release (EPOCH_BUMP_TRIGGERS); the "
+        "version-moving peer invalidations do not, because version-CAS already "
+        "arbitrates those. Single-writer is checked after each such transition.",
     ),
     MemberContract(
         "set_agent_transient",
@@ -264,7 +267,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "base",
         "Persists a workspace-checkpoint manifest (WV Unit 2): the header row + "
         "owner metadata + every member row in ONE registry transaction (sqlite: "
-        "one BEGIN IMMEDIATE; in-memory: one _capture_lock hold with validate-"
+        "one BEGIN IMMEDIATE; in-memory: one _lock hold with validate-"
         "before-first-insert) — individually atomic, all rows or none. NOT part "
         "of the R9 single-writer RMW: the manifest records capture facts, it "
         "arbitrates no writer (the capture engine's version reads ride the "
@@ -648,8 +651,9 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "may hold MODIFIED/EXCLUSIVE when an OCC writer commits; the MESI grant "
         "transition is part of the same step)",
         "read-generation fence (owner_generation vs the committer's captured "
-        "read_generation: reject a writer whose M/E grant was reclaimed by the "
-        "sweep — version never moved, so version-CAS alone cannot see it)",
+        "read_generation: reject a writer whose M/E grant was revoked without "
+        "the version moving — by the sweep OR by a voluntary invalidate release "
+        "— since version-CAS alone cannot see that)",
     ),
     # Reproduced verbatim from the shipped guard semantics + the fence-parity
     # lesson (docs/solutions/.../fence-admit-on-absent-...). Do NOT paraphrase:
@@ -680,7 +684,9 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "Liveness EVICTION is a SEPARATE same-lock sweep "
         "(enforce_stable_grant_timeouts), NOT read inside commit_cas's "
         "transaction. It reclaims stale M/E grants (heartbeat / max-hold) and "
-        "bumps owner_generation atomically with the M/E->INVALID transition, "
+        "bumps owner_generation atomically with the M/E->INVALID transition — as "
+        "does the voluntary invalidate release, so a release can never SUPPRESS "
+        "the epoch move by getting there before the sweep — both "
         "serialized under the SAME registry lock as the atomic mutations. Per "
         "tier, a backend states whether liveness folds into the atomic RMW "
         "(Tier-1 may) or preserves the separate-sweep semantics WITH an equivalent "

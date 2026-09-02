@@ -70,6 +70,12 @@ from ccs.core.types import (
 # wire-stable constant, matched by identity, never by substring.
 _RECLAIM_TRIGGER = "reclaim_heartbeat"
 
+# The voluntary-release trigger. It is NOT a reclaim, but it ends a write claim
+# at an UNCHANGED version exactly as a reclaim does, so R9 requires it to move
+# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this). Named
+# here as the wire-stable constant, matched by identity, never by substring.
+_RELEASE_TRIGGER = "invalidate"
+
 # The single-writer conflict reason the arbitration leg emits when a version-
 # matching OCC writer meets a pessimistic M/E peer. The registries return it as a
 # bare ``ConflictDetail`` literal (there is no exported OTHER_HOLDER_REASON
@@ -359,6 +365,68 @@ def assert_fence_rejects_superseded_read_generation(factory: RegistryFactory) ->
     assert result.reason == STALE_READ_GENERATION_REASON, result.reason
     # No mutation — the version stayed put.
     assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+
+def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
+    """Read-generation fence — RELEASE-BUMP leg (MUST-MATCH). The epoch rule is
+    not "the sweep did it" but "a write claim was revoked WITHOUT the version
+    moving", which is the one condition version-CAS is structurally blind to. A
+    voluntary release ends a claim at an unchanged version exactly as a reclaim
+    does, so it MUST move ``owner_generation`` too.
+
+    Without this leg a backend can revoke a grant through the release path,
+    leave the epoch behind, and then ADMIT the very commit the reject leg above
+    exists to catch — while still passing conformance. The failure is silent on
+    both sides: the version never moves, so version-CAS sees nothing, and the
+    epoch never moves, so the fence has nothing to compare.
+
+    Contrast with :func:`assert_fence_rejects_superseded_read_generation`: that
+    leg pins the fence's VERDICT, this one pins the operand the verdict needs."""
+    reg = factory()
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+    agent, peer = uuid4(), uuid4()
+
+    # Acquire EXCLUSIVE → captures read_generation at the current epoch.
+    reg.set_agent_state(artifact_id, agent, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    before = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, agent)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+
+    # Voluntary release — NOT a reclaim, and the version does not move.
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, agent, MESIState.INVALID, trigger=_RELEASE_TRIGGER, tick=2
+    )
+    assert reg.get_artifact(artifact_id).version == 1, (  # type: ignore[attr-defined]
+        "the release leg must not move the version — that is the whole point"
+    )
+    assert reg.get_owner_generation(artifact_id) > before, (  # type: ignore[attr-defined]
+        "a voluntary release revoked a write claim without moving "
+        "owner_generation: the fence can never arm for this holder afterwards, "
+        "because no sweep has an M/E grant left to reclaim"
+    )
+
+    # And the epoch move is load-bearing: the released holder's commit at the
+    # unchanged version is now rejected, exactly as a reclaimed holder's is.
+    reg.set_agent_state(artifact_id, agent, MESIState.SHARED, trigger="peer_regrant", tick=3)  # type: ignore[attr-defined]
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, agent, expected_version=1, content_hash=_hash("zombie"), tick=4
+    )
+    assert isinstance(result, ConflictDetail), (
+        "the released holder's commit was ADMITTED at an unchanged version; the "
+        f"release-path epoch move is not load-bearing, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+    # A peer-invalidation (the version-MOVING revoke class) must NOT bump: that
+    # path is arbitrated by version-CAS, and bumping there would over-fence.
+    reg.set_agent_state(artifact_id, peer, MESIState.EXCLUSIVE, tick=5)  # type: ignore[attr-defined]
+    steady = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    reg.set_agent_state(artifact_id, peer, MESIState.INVALID, trigger="commit", tick=6)  # type: ignore[attr-defined]
+    assert reg.get_owner_generation(artifact_id) == steady, (  # type: ignore[attr-defined]
+        "a version-moving peer invalidation must NOT move the epoch"
+    )
 
 
 def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:

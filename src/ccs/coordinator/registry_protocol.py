@@ -152,14 +152,31 @@ class CheckpointMember:
 #
 # RECLAIM_TRIGGERS: the coordinator-side EVICTION triggers (the stable-grant
 # sweep's reclaim_heartbeat / reclaim_max_hold + the transient-timeout fail-safe
-# "timeout"). An M/E -> INVALID transition carrying one of these bumps the
-# artifact's owner_generation (the read-generation fence): the claim was revoked
-# WITHOUT a version move, which version-CAS cannot see. Any other
-# (peer-invalidation) INVALID does NOT bump — that path moves the version, so
-# version-CAS already catches a stale write.
+# "timeout"). A SUBSET of the bump-gating set: an M/E -> INVALID transition
+# carrying one of these bumps the artifact's owner_generation (the
+# read-generation fence), because the claim was revoked WITHOUT a version move,
+# which version-CAS cannot see. EPOCH_BUMP_TRIGGERS immediately below is the
+# full bump set -- it adds the voluntary "invalidate" release, which ends a
+# claim at an unchanged version the same way. Only the version-moving
+# peer-invalidation triggers ("write" / "commit") never bump: that path moves
+# the version, so version-CAS already catches a stale write.
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
+# EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
+# ownership epoch. The rule is not "the sweep did it" but "a write-claim was
+# revoked WITHOUT the version moving" -- the one condition version-CAS is
+# structurally blind to. That is every RECLAIM_TRIGGER plus "invalidate", the
+# voluntary release (service.invalidate: a post-edit failure, a session-stop
+# release, an operator drain), which likewise ends a claim at an unchanged
+# version. Leaving it out let a release SUPPRESS the fence: the holder is
+# already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
+# never moves at all -- the identical end-state a sweep reclaim fences was
+# silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+#
+# The peer-invalidation triggers ("write" / "commit") stay OUT, unchanged: that
+# path moves the version, so version-CAS already arbitrates a stale write.
+EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"})
 # CLAIM_CAPTURE_TRIGGERS: triggers marking a GENUINE content read for
 # read-generation capture (the E/M-acquire capture is keyed on the state
 # transition, not the trigger). Service.fetch() emits "fetch"; renaming it
