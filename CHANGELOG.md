@@ -8,6 +8,25 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The effect gate now holds a write-preempted holder's escaping effect —
+  the one revocation that moves neither comparand.** A peer's pessimistic
+  write-acquire takes a holder's grant with no commit behind it yet (version
+  unmoved) and no ownership-epoch bump (`trigger="write"` is deliberately
+  outside `EPOCH_BUMP_TRIGGERS`), so the `(version, owner_generation)` pair
+  `gate()` / `swg_gate` re-validates compared equal and the preempted
+  holder's irreversible effect (a webhook, a deploy, an opened PR) fired on
+  authority it no longer had. The commit path never had this hole — a
+  preempted committer is refused by the M/E state check and version-CAS —
+  but an escaping effect has no commit to arbitrate. The fence now also
+  requires the re-validate read itself to be served under a standing grant:
+  a stale-status re-read (the warn-mode re-grant a preempted holder gets)
+  HOLDs with the new typed `grant_preempted` cause even though both
+  comparands are unchanged and confirmed. The strict-mode leg already held
+  (the re-read is a deny); this closes the tracked-but-not-strict leg, and
+  the epoch's `"write"` exclusion is unchanged — the per-artifact epoch
+  cannot see a SHARED holder's preemption and would needlessly fence
+  bystanders' CAS reads, so the gate asks the grant-state question directly.
+
 - **The in-memory registry now carries the same concurrency contract as the
   durable one: thread-safe, one lock, held across every check-then-act
   sequence.** The old contract — "single-threaded, lock-free by contract, GIL
