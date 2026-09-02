@@ -712,3 +712,183 @@ def test_sweep_still_reclaims_a_genuinely_over_held_grant(registry) -> None:
     assert reclaimed == 1
     assert registry.get_agent_state(art.id, agent) == MESIState.INVALID
     assert registry.get_last_reclamation(agent, art.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# F3 — the update broadcast is the pin's un-fenced sibling
+# ---------------------------------------------------------------------------
+#
+# ``handle_update`` used to apply a broadcast unconditionally: cache put,
+# SHARED transitions, observation stamp, transient clears. The same
+# publish-after-lock window the F1 test proves for invalidations exists for
+# updates, and a stale update did three wrong things at once — regressed the
+# recipient's view to older bytes marked valid (under the zero-staleness
+# eager strategy), dropped a fresher M/E claim to SHARED with no epoch bump,
+# and let ``set_agent_state`` stamp ``last_observed_version`` with the
+# registry's CURRENT version while the cache held the OLDER body, poisoning
+# the exact comparand ``_revoke_is_superseded`` trusts. The guard compares
+# the broadcast's version against the registry's current version under one
+# hold and skips the whole apply when it is behind — keeping only the
+# transient clear, because a stranded transient stalls the sweep while an
+# early clear is harmless. The fresh path is pinned by
+# ``test_eager_update_then_declined_invalidation_leaves_no_transient``.
+
+
+def test_stale_update_broadcast_does_not_regress_the_recipients_view() -> None:
+    """End-to-end reachability: a held UPDATE must not overwrite newer bytes.
+
+    Under the eager strategy a commit publishes full content AFTER the
+    registry lock is released (``adapters/base.py``), so a peer can complete
+    its own write inside that window. Before the fix the late v2 broadcast
+    then landed on B — who wrote v3 itself — and B's cache and content view
+    regressed to v2 marked SHARED-valid, while ``last_observed_version``
+    stayed at 3: stale bytes served as fresh under ``staleness_bound() == 0``,
+    and any v3-announcing heal signal would be declined by the pin.
+    """
+
+    class _GatedUpdateBus(InMemoryEventBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reached = threading.Event()
+            self.release = threading.Event()
+            self._armed = True
+
+        def publish_update(self, event, *, recipients):  # type: ignore[override]
+            if self._armed:
+                self._armed = False
+                self.reached.set()
+                self.release.wait(timeout=5)
+            return super().publish_update(event, recipients=recipients)
+
+    bus = _GatedUpdateBus()
+    core = CoherenceAdapterCore(strategy_name="eager", event_bus=bus)
+    core.register_agent("A", now_tick=0)
+    agent_b = core.register_agent("B", now_tick=0)
+    art = core.register_artifact(name="plan.md", content="v1")
+
+    core.read(agent_name="A", artifact_id=art.id, now_tick=1)
+    core.read(agent_name="B", artifact_id=art.id, now_tick=1)
+
+    failures: list[BaseException] = []
+
+    def _a_writes() -> None:
+        try:
+            core.write(agent_name="A", artifact_id=art.id, content="a-v2", now_tick=2)
+        except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+            failures.append(exc)
+
+    thread = threading.Thread(target=_a_writes, daemon=True)
+    thread.start()
+    try:
+        assert bus.reached.wait(timeout=5), "A never reached the update-publish boundary"
+        assert core.registry.get_artifact(art.id).version == 2
+
+        # B's own full cycle, entirely inside A's publish window.
+        core.write(agent_name="B", artifact_id=art.id, content="b-v3", now_tick=3)
+        assert core.registry.get_artifact(art.id).version == 3
+    finally:
+        bus.release.set()
+        thread.join(timeout=5)
+
+    assert not failures, f"A's write raised: {failures[0]!r}"
+    entry = core._agents_by_name["B"].runtime.cache.get(art.id)
+    assert entry is not None and entry.local_version == 3, (
+        f"B's cached view regressed to the stale broadcast (version "
+        f"{entry and entry.local_version}): older bytes marked valid while "
+        "last_observed_version still claims version 3 was observed — the "
+        "split that makes the pin decline the healing invalidation"
+    )
+    assert core.content(agent_name="B", artifact_id=art.id) == "b-v3", (
+        "B's content view regressed to the stale broadcast under a "
+        "zero-staleness strategy"
+    )
+    assert core.registry.last_observed_version_for(art.id, agent_b) == 3
+
+
+def test_stale_update_does_not_downgrade_a_fresher_write_claim(registry) -> None:
+    """Deterministic replay: a stale update on an M/E holder is dropped whole.
+
+    The update-side twin of ``test_invalidate_rejects_signal_older_than_the_
+    current_version``: B re-acquired EXCLUSIVE after the broadcast was minted,
+    so the late event has no authority over B's claim — applying it would
+    revoke the grant M -> SHARED with no epoch bump and regress B's cache.
+    Only the transient clear survives the drop (a stranded slot stalls the
+    stable-grant sweep; clearing early is harmless).
+    """
+    from ccs.agent.runtime import AgentRuntime
+    from ccs.core.states import TransientState
+    from ccs.strategies import build_strategy
+
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    a, b = uuid4(), uuid4()
+
+    # A commits v2; imagine its update broadcast held at the publish boundary.
+    svc.registry.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=1)
+    svc.write(agent_id=a, artifact_id=art.id, issued_at_tick=1)
+    updated, _signals = svc.commit(agent_id=a, artifact_id=art.id, content="v2", issued_at_tick=2)
+    assert updated.version == 2
+
+    # B re-acquires a FRESH write claim after the broadcast was minted, with
+    # the SIA/EIA-style transient a real invalidation would have left behind.
+    svc.write(agent_id=b, artifact_id=art.id, issued_at_tick=3)
+    assert svc.registry.get_agent_state(art.id, b) in _M_OR_E
+    svc.registry.set_agent_transient(
+        art.id, b, TransientState.SIA, entered_tick=3
+    )
+
+    runtime_b = AgentRuntime(
+        agent_id=b, coordinator=svc, strategy=build_strategy("eager")
+    )
+    # The held v2 broadcast is finally delivered.
+    runtime_b.handle_update(
+        artifact_id=art.id, version=2, content="v2", now_tick=4, writer_agent_id=a
+    )
+
+    assert svc.registry.get_agent_state(art.id, b) in _M_OR_E, (
+        "a stale update revoked B's write claim, established after the "
+        "broadcast was minted — M -> SHARED with no epoch bump"
+    )
+    assert runtime_b.cache.get(art.id) is None, (
+        "a stale update installed the broadcast's older bytes as a valid "
+        "cache entry"
+    )
+    assert runtime_b.content(art.id) is None, (
+        "a stale update recorded the broadcast's older content as B's view"
+    )
+    assert svc.registry.get_agent_transient(art.id, b) is None, (
+        "the drop must still clear the transient — a stranded slot stalls "
+        "the stable-grant sweep"
+    )
+
+
+def test_invalidation_for_a_deleted_artifact_still_clears_the_cache() -> None:
+    """The decline fast-path must not shield a deleted artifact's stale cache.
+
+    ``handle_invalidation`` returns early only when the coordinator DECLINED
+    the signal for an artifact that still exists; a signal naming a deleted
+    artifact falls through to the local clamp, because the deletion is itself
+    the strongest reason the cached view is dead. Pins the
+    ``has_artifact=False`` leg of the ``declined and has_artifact`` gate.
+    """
+    core = CoherenceAdapterCore(event_bus=InMemoryEventBus())
+    core.register_agent("A", now_tick=0)
+    agent_b = core.register_agent("B", now_tick=0)
+    art = core.register_artifact(name="plan.md", content="v1")
+    runtime_b = core._agents_by_name["B"].runtime
+
+    core.read(agent_name="B", artifact_id=art.id, now_tick=1)
+    assert runtime_b.cache.get(art.id) is not None
+
+    (signal,) = core.coordinator.delete(
+        agent_id=core._agents_by_name["A"].agent_id, artifact_id=art.id, issued_at_tick=2
+    )
+    runtime_b.handle_invalidation(signal)
+
+    entry = runtime_b.cache.get(art.id)
+    assert entry is None or entry.state == MESIState.INVALID, (
+        "a signal naming a deleted artifact was declined-and-dropped, leaving "
+        f"B's cached view alive (state {entry and entry.state}) for an "
+        "artifact that no longer exists"
+    )
+    assert core.registry.get_agent_state(art.id, agent_b) is None
