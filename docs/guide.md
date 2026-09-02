@@ -297,6 +297,17 @@ store = CCSStore(strategy="lazy", state_log=safe_log)
 
 `state_log=None` (default) adds no overhead — the guard is a single `is not None` check.
 
+### Callbacks run under the registry lock
+
+`state_log` (and the crash-recovery sweep's `on_reclaim` callback) execute while the
+coordinator's registry lock is **held**, on both backends. A callback that blocks —
+waiting on another thread, a network sink with no timeout, a queue that can fill —
+stalls every registry operation in the process for as long as it blocks, not just the
+one being logged. Keep callbacks fast and non-blocking: append to an in-memory buffer
+and drain it elsewhere, rather than doing I/O inline. Calling back into the store from
+inside a callback is safe only for registry methods (the lock is reentrant); never
+wait on other threads from inside one.
+
 ### Log validation
 
 Verify a materialized JSONL log for gaps and schema drift:

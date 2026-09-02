@@ -152,11 +152,14 @@ class CheckpointMember:
 #
 # RECLAIM_TRIGGERS: the coordinator-side EVICTION triggers (the stable-grant
 # sweep's reclaim_heartbeat / reclaim_max_hold + the transient-timeout fail-safe
-# "timeout"). An M/E -> INVALID transition carrying one of these bumps the
-# artifact's owner_generation (the read-generation fence): the claim was revoked
-# WITHOUT a version move, which version-CAS cannot see. Any other
-# (peer-invalidation) INVALID does NOT bump — that path moves the version, so
-# version-CAS already catches a stale write.
+# "timeout"). A SUBSET of the bump-gating set: an M/E -> INVALID transition
+# carrying one of these bumps the artifact's owner_generation (the
+# read-generation fence), because the claim was revoked WITHOUT a version move,
+# which version-CAS cannot see. EPOCH_BUMP_TRIGGERS immediately below is the
+# full bump set -- it adds the voluntary "invalidate" release, which ends a
+# claim at an unchanged version the same way. Only the version-moving
+# peer-invalidation triggers ("write" / "commit") never bump: that path moves
+# the version, so version-CAS already catches a stale write.
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
