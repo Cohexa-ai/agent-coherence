@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -28,6 +29,7 @@ from ccs.adapters.effect_gate import gate
 from ccs.cli._coherence_client import post as _cc_post
 from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import (
+    HOLD_GRANT_PREEMPTED,
     HOLD_READ_DENIED,
     CoherenceDegradedWarning,
     CoherenceError,
@@ -239,6 +241,75 @@ def test_escaping_effect_held_when_grant_reclaimed_version_unchanged(
         assert exc.expected_generation is not None
         assert exc.current_generation == exc.expected_generation + 1
         assert "grant reclaimed" in str(exc)
+    finally:
+        stop_coordinator(coord_root)
+
+
+def test_escaping_effect_held_when_grant_preempted_at_unchanged_pair(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Write-preemption sibling of the sweep-reclaim regression above: a PEER's
+    pessimistic write-acquire (the ``/hooks/pre-edit`` leg of an edit) silently
+    takes this holder's grant between capture and fire. Unlike a sweep reclaim
+    or a voluntary release, the acquire moves NOTHING the pair can see — no
+    commit yet, so the version stays put, and ``trigger="write"`` is outside
+    EPOCH_BUMP_TRIGGERS, so the ownership epoch stays put too. The
+    ``(version, owner_generation)`` comparands are structurally blind here; the
+    gate must instead notice that the caller's grant did not STAND at the
+    re-validate read (the warn-leg re-read is a stale re-grant, not a fresh
+    confirm). PRE-FIX the pair compared equal and the preempted holder's
+    effect FIRED; POST-FIX it HOLDs with the typed ``grant_preempted`` cause."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        # Tracked but NOT strict: the preempted holder's re-read is a warn-mode
+        # stale re-grant carrying the SAME confirmed (version, generation).
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+        vol = CoherentVolume(
+            root_w,
+            on_error="strict",
+            on_stale_write="allow",
+            remote_endpoint=resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer),
+        )
+        (root_w / "task.txt").write_bytes(b"task-v1")
+        vol.write("task.txt", b"task-v1")  # M grant at v1
+        fired: list[str] = []
+
+        def decide(data: bytes) -> str:
+            # FIXED-STALE BUFFER: the peer write-ACQUIRES between capture and
+            # re-validate — a real wire-level pre-edit with no commit behind
+            # it, driven deterministically inside decide(), never a sleep.
+            resp = _cc_post(
+                ep,
+                "/hooks/pre-edit",
+                {"session_id": str(uuid4()), "path": "task.txt"},
+            )
+            assert resp.get("ok") is True, f"peer write-acquire failed: {resp}"
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(StaleView) as exc_info:
+            gate(vol, "task.txt", decide=decide, effect=effect)
+
+        assert fired == []  # the preempted holder's effect never fired
+        exc = exc_info.value
+        # THE distinguishing shape vs the sweep sibling: the version never
+        # moved AND the ownership epoch never moved — both comparands equal
+        # and confirmed —
+        assert exc.current_version == exc.expected_version
+        assert exc.expected_generation is not None
+        assert exc.current_generation == exc.expected_generation
+        # — so the HOLD keys on the grant not standing at the re-validate.
+        assert exc.hold_cause == HOLD_GRANT_PREEMPTED
+        assert "lost the grant" in str(exc)
     finally:
         stop_coordinator(coord_root)
 
@@ -666,6 +737,38 @@ def test_gate_holds_on_generation_moved_version_unchanged() -> None:
     assert exc.value.expected_generation == 7
     assert exc.value.current_generation == 8
     assert "grant reclaimed" in str(exc.value)
+
+
+def test_gate_holds_on_lapsed_grant_with_pair_unchanged() -> None:
+    """Pure-logic pin of the standing-grant leg: the re-validate read reports a
+    LAPSED grant (a warn-mode stale re-grant) while BOTH comparands are
+    unchanged and confirmed — the write-preemption shape. The pair alone would
+    admit; the standing-grant check HOLDs with the typed cause."""
+
+    class _LapsedStub(_StubVolume):
+        _last_read_stale = False
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            out = super().read_with_version_generation(path, observe=observe)
+            # The observe=False read is the fence's re-validate: the
+            # coordinator answered it with a stale re-grant, not a confirm.
+            self._last_read_stale = not observe
+            return out
+
+    with pytest.raises(StaleView) as exc:
+        gate(
+            _LapsedStub([(b"c", 5, 7), (b"c", 5, 7)]),
+            "p",
+            decide=lambda d: "go",
+            effect=lambda x: x,
+        )
+    assert exc.value.hold_cause == HOLD_GRANT_PREEMPTED
+    assert exc.value.expected_version == 5
+    assert exc.value.current_version == 5
+    assert exc.value.expected_generation == 7
+    assert exc.value.current_generation == 7
 
 
 def test_gate_holds_on_unconfirmed_capture_generation() -> None:

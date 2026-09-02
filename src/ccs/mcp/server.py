@@ -63,7 +63,10 @@ Three guarantees, all single-host and fail-closed:
      the pair that read returned. It DENIES (reason=stale_view) if the value
      moved OR the grant you read under was reclaimed while you were thinking —
      a reclaim leaves the version untouched, so the version alone cannot see
-     it. On a deny, do not take the action: swg_reacquire, re-read, re-decide.
+     it — OR a peer's write-claim preempted your grant, which leaves BOTH
+     comparands untouched: the gate also re-checks that your grant still
+     stands. On a deny, do not take the action: swg_reacquire, re-read,
+     re-decide.
      The verdict is true as of that call; the dispatch after it is still yours.
 
 OUT OF GUARANTEE (do not rely on this server for): writers on DIFFERENT hosts or
@@ -107,7 +110,9 @@ _GATE_DESC = (
     "read (sending a webhook, opening a PR, running a deploy, posting a "
     "message). Returns decision=proceed, or DENIES with reason=stale_view if the "
     "file moved OR the grant you read it under was reclaimed (the version alone "
-    "cannot see a reclaim) OR either comparand is unconfirmed. On a deny: do NOT "
+    "cannot see a reclaim) OR a peer write-claim preempted your grant (which "
+    "moves neither comparand — the gate re-checks that the grant still stands) "
+    "OR either comparand is unconfirmed. On a deny: do NOT "
     "take the action — swg_reacquire, re-read, re-decide." + _SCOPE_CLAUSE
 )
 _WRITE_DESC = (

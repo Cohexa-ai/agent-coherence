@@ -26,8 +26,8 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 # an agent or operator can branch.
 #
 # Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
-# INPUT_VANISHED and READ_DENIED are recoverable — reacquire, re-decide,
-# re-gate. GENERATION_UNCONFIRMED is the residual bucket and is NOT a clean
+# GRANT_PREEMPTED, INPUT_VANISHED and READ_DENIED are recoverable — reacquire,
+# re-decide, re-gate. GENERATION_UNCONFIRMED is the residual bucket and is NOT a clean
 # permanent/transient signal: a degraded read, an unconfirmable foreign edit,
 # and a coordinator that predates generation reporting all land there. Treat it
 # as "reacquire and re-gate first"; a HOLD that survives a SUCCESSFUL reacquire
@@ -36,6 +36,11 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 # the client as a deny, not as a missing field — from hiding in that bucket.
 HOLD_VERSION_MOVED = "version_moved"
 HOLD_GRANT_RECLAIMED = "grant_reclaimed"
+# The grant the decision was read under did not STAND at the re-validate read
+# while BOTH comparands stayed put — a peer's write-claim acquire preempts a
+# holder without moving the version (no commit yet) or the ownership epoch
+# (trigger="write" is outside EPOCH_BUMP_TRIGGERS; see registry_protocol).
+HOLD_GRANT_PREEMPTED = "grant_preempted"
 HOLD_INPUT_VANISHED = "input_vanished"
 HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
 HOLD_READ_DENIED = "read_denied"
