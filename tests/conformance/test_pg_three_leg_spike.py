@@ -37,6 +37,7 @@ from tests.conformance.pg_spike_sql import (
     GRANT_TRANSITION_SQL,
     INSERT_ANCHOR_SQL,
     INSERT_ARTIFACT_SQL,
+    LOCK_AGENT_STATE_ROW_SQL,
     LOCK_ARTIFACT_ROW_SQL,
     MUTANT_ARBITRATE_SQL,
     NAIVE_COMMIT_CAS_SQL,
@@ -51,6 +52,7 @@ from tests.conformance.pg_spike_sql import (
     READ_ARTIFACT_SQL,
     RESET_ROWS_SQL,
     SPIKE_SCHEMA,
+    build_bump_transition_ddl,
     build_mutant_arbitration_ddl,
     build_spike_sql,
 )
@@ -125,6 +127,7 @@ def spike_pg():
             cur.execute(f"DROP SCHEMA IF EXISTS {SPIKE_SCHEMA} CASCADE")
             cur.execute(sql.schema_ddl)
             cur.execute(sql.functions_ddl)
+            cur.execute(build_bump_transition_ddl())
         conn.commit()
         with conn.cursor() as cur:
             cur.execute("SHOW transaction_isolation")
@@ -320,7 +323,7 @@ def test_missing_artifact_is_a_loud_error_not_a_typed_outcome(conn) -> None:
 
 
 def test_function_hardening_search_path_pinned_and_no_public_execute(conn) -> None:
-    for fn in ("spike_commit_cas", "spike_grant_transition"):
+    for fn in ("spike_commit_cas", "spike_grant_transition", "spike_bump_owner_generation"):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT prosecdef, proconfig, proacl::text[] FROM pg_proc "
@@ -561,9 +564,16 @@ def _u3_arbitrate_contender(ctx, dsn: str, agent: str, payload: str, app_name: s
     conn = _connect(dsn, autocommit=True, application_name=app_name)
     try:
         ctx.barrier_wait()  # phase 1: everyone is running
-        with conn.cursor() as cur:
-            cur.execute(PAIR_READ_SQL, (_ARTIFACT,))
-            read_version, _generation = cur.fetchone()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(PAIR_READ_SQL, (_ARTIFACT,))
+                read_version, _generation = cur.fetchone()
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            # KTD5 covers the pre-race read too — but the phase-2 rendezvous
+            # must STILL happen before returning, or the sibling contenders
+            # strand at the barrier until the harness timeout.
+            ctx.barrier_wait()
+            return {"agent": agent, "payload": payload, "outcome": _OUTCOME_UNKNOWN, "error_type": type(exc).__name__}
         ctx.barrier_wait()  # phase 2: everyone holds the same pre-race state
         ctx.delay()
         started = time.monotonic()
@@ -601,11 +611,14 @@ def _u3_grant_transition_contender(ctx, dsn: str, agent: str, state: str, read_g
         conn.close()
 
 
-def _u3_grant_locker_contender(ctx, dsn: str) -> dict:
-    """Paired-contrast forcer: hold an UNCOMMITTED grant transition (anchor
-    lock + EXCLUSIVE upsert), observe the function-arm contender blocked on the
-    anchor, then commit mid-flight — the same commit-across-a-blocked-peer
-    shape as U2, at the construction's OWN serialization point."""
+def _u3_grant_locker_contender(ctx, dsn: str, agent: str, state: str, read_generation) -> dict:
+    """Forced-interleaving locker: hold an UNCOMMITTED grant transition (anchor
+    lock + the given upsert), observe the function-arm contender blocked on the
+    anchor, then commit mid-flight — the commit-across-a-blocked-peer shape at
+    the construction's OWN serialization point. The granted state decides which
+    leg the unblocked function lands on: an M/E grant forces other_holder; a
+    non-holder SHARED transition leaves the ladder to fall through to the
+    fence."""
     conn = _connect(dsn, autocommit=False)
     try:
         monitor = _connect(dsn, autocommit=True)
@@ -615,7 +628,7 @@ def _u3_grant_locker_contender(ctx, dsn: str) -> dict:
     try:
         ctx.barrier_wait()  # phase 1
         with conn.cursor() as cur:
-            cur.execute(GRANT_TRANSITION_SQL, (_ARTIFACT, _AGENT_A, "EXCLUSIVE", 0))  # uncommitted
+            cur.execute(GRANT_TRANSITION_SQL, (_ARTIFACT, agent, state, read_generation))  # uncommitted
         ctx.barrier_wait()  # phase 2: the anchor lock is provably held before B fires
         observed_blocked = _await_backend_blocked(monitor, f"{_U3_APP_PREFIX}-fn")
         conn.commit()  # B unblocks HERE, mid-flight across this grant commit
@@ -625,9 +638,10 @@ def _u3_grant_locker_contender(ctx, dsn: str) -> dict:
         conn.close()
 
 
-def _u3_function_contender(ctx, dsn: str) -> dict:
-    """Paired-contrast function arm: fires the arbitration function while the
-    locker holds the anchor; blocks at the function's FIRST statement."""
+def _u3_function_contender(ctx, dsn: str, agent: str) -> dict:
+    """Forced-interleaving function arm: fires the arbitration function as the
+    given agent while the locker holds the anchor; blocks at the function's
+    FIRST statement."""
     import psycopg  # noqa: PLC0415
 
     conn = _connect(dsn, autocommit=True, application_name=f"{_U3_APP_PREFIX}-fn")
@@ -636,13 +650,25 @@ def _u3_function_contender(ctx, dsn: str) -> dict:
         ctx.barrier_wait()  # phase 2: the locker holds the anchor lock
         try:
             with conn.cursor() as cur:
-                cur.execute(ARBITRATE_SQL, (_ARTIFACT, _AGENT_B, 1, "fn-c", "fn-t"))
+                cur.execute(ARBITRATE_SQL, (_ARTIFACT, agent, 1, "fn-c", "fn-t"))
                 outcome, current = cur.fetchone()
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             return {"outcome": _OUTCOME_UNKNOWN, "error_type": type(exc).__name__}
         return {"outcome": outcome, "current_version": current}
     finally:
         conn.close()
+
+
+def _fail_inconclusive_on_unknown(results) -> None:
+    """KTD5: an unknown driver outcome is never a semantic verdict. The
+    direct-assert races classify it INCONCLUSIVE — mirroring the forced
+    interleavings' rerun discipline — instead of failing a typed assertion."""
+    unknown = [r for r in results if r.get("outcome") == _OUTCOME_UNKNOWN]
+    if unknown:
+        pytest.fail(
+            "INCONCLUSIVE (not a semantic verdict): a contender hit a driver error "
+            f"({[r.get('error_type') for r in unknown]}); rerun the spike."
+        )
 
 
 def _signal_lock_wait_or_warn(observed: bool, results: list[dict], baseline_sec: float) -> None:
@@ -751,6 +777,7 @@ def test_race_fence_zombie_vs_fresh_peer(spike_pg) -> None:
             cur.execute(BUMP_OWNER_GENERATION_SQL, (_ARTIFACT,))  # the reclaim supersedes it
 
     results, _observed = _race_committers(spike_pg, agents=["zombie", "fresh"], delays=(0.0, 0.0))
+    _fail_inconclusive_on_unknown(results)
     zombie, fresh = results[0], results[1]
 
     # The fresh peer has NO read_generation — admit-on-absent, cross-process:
@@ -779,6 +806,7 @@ def test_race_pessimistic_holder_denies_optimistic_committers(spike_pg) -> None:
         _grant(conn, "holder", "EXCLUSIVE", 0)
 
     results, _observed = _race_committers(spike_pg, agents=["opt-a", "opt-b"], delays=(0.0, 0.0))
+    _fail_inconclusive_on_unknown(results)
     assert [r["outcome"] for r in results] == [OUTCOME_OTHER_HOLDER, OUTCOME_OTHER_HOLDER], results
 
     with _connect(spike_pg, autocommit=True) as conn:
@@ -805,6 +833,7 @@ def test_race_phantom_grant_insert_vs_committer(spike_pg) -> None:
     )
     _raise_contender_errors(result)
     committer = result.outcomes[1].value
+    _fail_inconclusive_on_unknown([committer])
 
     with _connect(spike_pg, autocommit=True) as conn:
         with conn.cursor() as cur:
@@ -851,6 +880,41 @@ def test_statement_timeout_mid_function_is_a_safe_no_effect(spike_pg) -> None:
     assert anchor == 0, "the whole statement must roll back — anchor bump included"
 
 
+def test_statement_timeout_after_anchor_bump_rolls_back_whole_statement(spike_pg) -> None:
+    """Round-2 review finding: the sibling test above blocks the victim at its
+    FIRST statement (the anchor), so its anchor-rollback claim is vacuously
+    true. Here the blocker holds a raw row lock on a seeded EXCLUSIVE peer's
+    agent_states row WITHOUT touching the anchor, so the victim EXECUTES its
+    anchor bump, passes the CAS, and blocks at the grant leg's FOR UPDATE —
+    the cancel then has a real intra-function write to roll back."""
+    import psycopg  # noqa: PLC0415
+
+    _reset_rows(spike_pg)
+    with _connect(spike_pg, autocommit=True) as seed_conn:
+        _grant(seed_conn, "holder", "EXCLUSIVE", 0)
+        anchor_before = _anchor_count(seed_conn)
+        before = _snapshot(seed_conn)
+
+    blocker = _connect(spike_pg, autocommit=False)
+    try:
+        with blocker.cursor() as cur:
+            # Deliberately OUTSIDE the anchor chain: the lock must not stop
+            # the victim's anchor bump, only its grant-leg FOR UPDATE.
+            cur.execute(LOCK_AGENT_STATE_ROW_SQL, (_ARTIFACT, "holder"))
+        with _connect(spike_pg, autocommit=True, statement_timeout_ms=300) as victim:
+            with pytest.raises(psycopg.errors.QueryCanceled):
+                _arbitrate(victim, agent="victim", expected_version=1)
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    with _connect(spike_pg, autocommit=True) as conn:
+        assert _snapshot(conn) == before, "a cancelled arbitration mutated the decided rows"
+        assert _anchor_count(conn) == anchor_before, (
+            "the whole statement must roll back — the EXECUTED anchor bump included"
+        )
+
+
 def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> None:
     """U2's core contrast: the SAME commit-across-a-blocked-peer shape that the
     naive statement ADMITTED is DENIED by the function. Each arm blocks at its
@@ -865,8 +929,8 @@ def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> 
         harness = ProcessRaceHarness(timeout_sec=60.0)
         result = harness.race(
             [
-                ContenderSpec(_u3_grant_locker_contender, args=(spike_pg,)),
-                ContenderSpec(_u3_function_contender, args=(spike_pg,)),
+                ContenderSpec(_u3_grant_locker_contender, args=(spike_pg, _AGENT_A, "EXCLUSIVE", 0)),
+                ContenderSpec(_u3_function_contender, args=(spike_pg, _AGENT_B)),
             ]
         )
         _raise_contender_errors(result)
@@ -891,6 +955,53 @@ def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> 
         return
     pytest.fail(
         "INCONCLUSIVE: the forced interleaving could not be established in "
+        f"{_FORCED_INTERLEAVING_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike."
+    )
+
+
+def test_forced_fence_zombie_deterministically_sees_stale_read_generation(spike_pg) -> None:
+    """Round-2 review finding: the free zombie-vs-fresh race certifies the
+    fence leg cross-process only when the zombie happens to arbitrate first.
+    This variant FORCES it: a non-holder SHARED transition holds the anchor
+    lock (creating no M/E holder and moving no version), the zombie provably
+    blocks at its anchor bump, the locker commits, and the zombie's post-wait
+    ladder must land on the fence leg — stale_read_generation,
+    deterministically."""
+    inconclusive: list[str] = []
+    for _attempt in range(_FORCED_INTERLEAVING_ATTEMPTS):
+        _reset_rows(spike_pg)
+        with _connect(spike_pg, autocommit=True) as conn:
+            _grant(conn, "zombie", "INVALID", 0)  # captured generation 0 at its acquire
+            with conn.cursor() as cur:
+                cur.execute(BUMP_OWNER_GENERATION_SQL, (_ARTIFACT,))  # the reclaim supersedes it
+        harness = ProcessRaceHarness(timeout_sec=60.0)
+        result = harness.race(
+            [
+                ContenderSpec(_u3_grant_locker_contender, args=(spike_pg, "bystander", "SHARED", None)),
+                ContenderSpec(_u3_function_contender, args=(spike_pg, "zombie")),
+            ]
+        )
+        _raise_contender_errors(result)
+        locker = result.outcomes[0].value
+        fn_arm = result.outcomes[1].value
+
+        if fn_arm.get("outcome") == _OUTCOME_UNKNOWN:
+            inconclusive.append(f"driver error {fn_arm['error_type']} (unknown outcome)")
+            continue
+        if not locker["observed_blocked"]:
+            inconclusive.append("zombie backend never observed in a Lock wait")
+            continue
+
+        # The forcing held: the zombie was blocked across the SHARED commit,
+        # its fresh post-wait reads saw version unmoved and no M/E peer, so
+        # only the fence can (and must) deny it.
+        assert fn_arm["outcome"] == OUTCOME_STALE_READ_GENERATION, fn_arm
+        with _connect(spike_pg, autocommit=True) as conn:
+            artifact, _states = _snapshot(conn)
+        assert artifact == (1, 1, None, None), "the fenced zombie left a trace"
+        return
+    pytest.fail(
+        "INCONCLUSIVE: the forced fence interleaving could not be established in "
         f"{_FORCED_INTERLEAVING_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike."
     )
 

@@ -38,6 +38,7 @@ __all__ = [
     "GRANT_TRANSITION_SQL",
     "INSERT_ANCHOR_SQL",
     "INSERT_ARTIFACT_SQL",
+    "LOCK_AGENT_STATE_ROW_SQL",
     "LOCK_ARTIFACT_ROW_SQL",
     "MUTANT_ARBITRATE_SQL",
     "MUTANT_FN_NAME",
@@ -54,6 +55,7 @@ __all__ = [
     "RESET_ROWS_SQL",
     "SPIKE_SCHEMA",
     "SpikeSql",
+    "build_bump_transition_ddl",
     "build_mutant_arbitration_ddl",
     "build_spike_sql",
 ]
@@ -363,11 +365,13 @@ INSERT_ANCHOR_SQL = f"INSERT INTO {SPIKE_SCHEMA}.anchor (artifact) VALUES (%s)"
 
 # Fence-precondition scaffold: supersede outstanding read_generations by
 # bumping the artifact's owner_generation, as the shipped sweep/invalidate
-# would. Not a grant change, so it does not use the transition helper.
+# would. Routed through the SAME anchor lock chain as every other conflicting
+# transition (see build_bump_transition_ddl below): the shipped contract
+# serializes the generation-bumping sweep with the atomic mutations, and the
+# scaffold models that discipline so no test can accidentally rely on an
+# unserialized bump.
 # (artifact)
-BUMP_OWNER_GENERATION_SQL = (
-    f"UPDATE {SPIKE_SCHEMA}.artifacts SET owner_generation = owner_generation + 1 WHERE id = %s"
-)
+BUMP_OWNER_GENERATION_SQL = f"SELECT {SPIKE_SCHEMA}.spike_bump_owner_generation(%s)"
 
 # (artifact)
 READ_ARTIFACT_SQL = (
@@ -386,3 +390,46 @@ READ_ANCHOR_SQL = f"SELECT forced_writes FROM {SPIKE_SCHEMA}.anchor WHERE artifa
 
 # Per-attempt reset for the cross-process cases: rows only, schema untouched.
 RESET_ROWS_SQL = f"TRUNCATE {SPIKE_SCHEMA}.artifacts, {SPIKE_SCHEMA}.agent_states, {SPIKE_SCHEMA}.anchor"
+
+# Timeout-forcing scaffold: a raw row lock on one agent_states row that stays
+# deliberately OUTSIDE the anchor chain, so a victim arbitration call EXECUTES
+# its anchor bump and blocks only at the grant leg's FOR UPDATE — giving the
+# statement_timeout cancel a real intra-function write to roll back.
+# (artifact, agent)
+LOCK_AGENT_STATE_ROW_SQL = (
+    f"SELECT 1 FROM {SPIKE_SCHEMA}.agent_states WHERE artifact = %s AND agent = %s FOR UPDATE"
+)
+
+
+def build_bump_transition_ddl(schema: str = SPIKE_SCHEMA) -> str:
+    """The generation-bump scaffold as a function in the anchor lock chain.
+
+    Scaffolding, not the construction under test — but the shipped contract
+    requires the generation-bumping sweep serialized under the SAME lock as
+    the atomic mutations, so even seeding models the discipline a build must
+    honor. Applied by the fixture in the same provisioning transaction as the
+    other functions (R6's revoke/grant pairing included).
+    """
+    sch = _validate_identifier(schema)
+    sig = f"{sch}.spike_bump_owner_generation(text)"
+    return f"""\
+CREATE FUNCTION {sch}.spike_bump_owner_generation(p_artifact text)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = {sch}, pg_temp
+AS $spike$
+BEGIN
+    UPDATE anchor SET forced_writes = forced_writes + 1
+        WHERE artifact = p_artifact;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'spike: no anchor row for artifact %', p_artifact;
+    END IF;
+    UPDATE artifacts SET owner_generation = owner_generation + 1
+        WHERE id = p_artifact;
+END;
+$spike$;
+
+REVOKE ALL ON FUNCTION {sig} FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION {sig} TO CURRENT_USER;"""
