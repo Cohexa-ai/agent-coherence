@@ -30,6 +30,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, VERSION_MISMATCH_REASON
+
 __all__ = [
     "ARBITRATE_SQL",
     "BUMP_OWNER_GENERATION_SQL",
@@ -71,12 +73,21 @@ SPIKE_SCHEMA = _validate_identifier("ccs_spike")
 
 
 # Typed positional outcomes of the arbitration step (R3) — the shipped reason
-# vocabulary from the conformance kit / ConflictDetail, matched verbatim.
+# vocabulary. version_mismatch / stale_read_generation ALIAS the shipped
+# constants so "matched verbatim" holds by construction. "other_holder" is
+# pinned by tests/backend_conformance/kit.py:OTHER_HOLDER_REASON — importing
+# the kit would drag the coordinator stack into this module's import graph, so
+# it is mirrored here. win/corruption have no shipped reason constant
+# (corruption ships as a raised error, not a ConflictDetail reason).
 OUTCOME_WIN = "win"
-OUTCOME_VERSION_MISMATCH = "version_mismatch"
+OUTCOME_VERSION_MISMATCH = VERSION_MISMATCH_REASON
 OUTCOME_OTHER_HOLDER = "other_holder"
-OUTCOME_STALE_READ_GENERATION = "stale_read_generation"
+OUTCOME_STALE_READ_GENERATION = STALE_READ_GENERATION_REASON
 OUTCOME_CORRUPTION = "corruption"
+
+# The M/E holder predicate — ONE shared fragment for the real grant leg and
+# the naive control, so the two race arms always compare the same predicate.
+_HOLDER_STATES_SQL = "('MODIFIED', 'EXCLUSIVE')"
 
 
 @dataclass(frozen=True)
@@ -87,13 +98,12 @@ class SpikeSql:
     both functions AND performs the privilege REVOKE/GRANT in the SAME emitted
     block — the fixture must apply it inside one transaction (R6, the origin's
     RD-79 defensive floor: no window where the function exists PUBLIC-executable).
+    Deliberately no joined-script accessor: a single flattened script invites
+    applying the function DDL outside one transaction, reopening that window.
     """
 
     schema_ddl: str
     functions_ddl: str
-
-    def as_script(self) -> str:
-        return "\n\n".join([self.schema_ddl, self.functions_ddl])
 
 
 def build_spike_sql(schema: str = SPIKE_SCHEMA) -> SpikeSql:
@@ -201,7 +211,7 @@ def build_mutant_arbitration_ddl(schema: str = SPIKE_SCHEMA) -> str:
     )
 
 
-_GRANT_LEG_SQL = """\
+_GRANT_LEG_SQL = f"""\
 -- Leg 2: grant arbitration. This statement takes a FRESH snapshot: if the
     -- anchor UPDATE above waited out a peer's grant-transition commit, the
     -- rows read here are the peer's COMMITTED rows — the mechanism the naive
@@ -209,10 +219,10 @@ _GRANT_LEG_SQL = """\
     PERFORM 1 FROM agent_states s
         WHERE s.artifact = p_artifact
           AND s.agent <> p_agent
-          AND s.state IN ('MODIFIED', 'EXCLUSIVE')
+          AND s.state IN {_HOLDER_STATES_SQL}
         FOR UPDATE;
     IF FOUND THEN
-        outcome := 'other_holder'; current_version := v_version; RETURN;
+        outcome := '{OUTCOME_OTHER_HOLDER}'; current_version := v_version; RETURN;
     END IF;"""
 
 
@@ -261,10 +271,10 @@ BEGIN
     -- everything; behind is the ordinary conflict. Checked before the grant
     -- read, so corruption structurally outranks other_holder (KTD8).
     IF p_expected_version > v_version THEN
-        outcome := 'corruption'; current_version := v_version; RETURN;
+        outcome := '{OUTCOME_CORRUPTION}'; current_version := v_version; RETURN;
     END IF;
     IF p_expected_version < v_version THEN
-        outcome := 'version_mismatch'; current_version := v_version; RETURN;
+        outcome := '{OUTCOME_VERSION_MISMATCH}'; current_version := v_version; RETURN;
     END IF;
 
     {grant_leg}
@@ -278,7 +288,7 @@ BEGIN
         WHERE s.artifact = p_artifact AND s.agent = p_agent
         FOR UPDATE;
     IF v_read_generation IS NOT NULL AND v_read_generation < v_owner_generation THEN
-        outcome := 'stale_read_generation'; current_version := v_version; RETURN;
+        outcome := '{OUTCOME_STALE_READ_GENERATION}'; current_version := v_version; RETURN;
     END IF;
 
     -- WIN: payload, commit token, and the committer's grant land in the SAME
@@ -292,7 +302,7 @@ BEGIN
         VALUES (p_artifact, p_agent, 'MODIFIED', v_owner_generation)
         ON CONFLICT (artifact, agent) DO UPDATE
             SET state = excluded.state, read_generation = excluded.read_generation;
-    outcome := 'win'; current_version := v_version + 1;
+    outcome := '{OUTCOME_WIN}'; current_version := v_version + 1;
 END;
 $spike$;"""
 
@@ -331,7 +341,7 @@ UPDATE {SPIKE_SCHEMA}.artifacts a
        SELECT 1 FROM {SPIKE_SCHEMA}.agent_states s
         WHERE s.artifact = a.id
           AND s.agent <> %s
-          AND s.state IN ('MODIFIED', 'EXCLUSIVE'))"""
+          AND s.state IN {_HOLDER_STATES_SQL})"""
 
 # U2's forcing scaffold: take the artifact's row lock WITHOUT bumping the
 # version (no trigger mints versions in the spike schema), so a blocked naive

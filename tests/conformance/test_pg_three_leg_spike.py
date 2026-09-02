@@ -23,6 +23,7 @@ never the driver message, which may embed the DSN password (the shipped
 from __future__ import annotations
 
 import os
+import statistics
 import threading
 import time
 import warnings
@@ -60,27 +61,43 @@ _ARTIFACT = "artifact-1"
 _AGENT_A = "agent-a"
 _AGENT_B = "agent-b"
 
+# Client-side classification of a driver error whose server outcome is
+# unresolved (KTD5) — a harness verdict, not a server outcome string.
+_OUTCOME_UNKNOWN = "unknown"
+
 _CONNECT_TIMEOUT_SEC = 10
 _STATEMENT_TIMEOUT_MS = 15_000
 
 
-def _connect(dsn: str, *, autocommit: bool, statement_timeout_ms: int = _STATEMENT_TIMEOUT_MS):
+def _connect(
+    dsn: str,
+    *,
+    autocommit: bool,
+    statement_timeout_ms: int = _STATEMENT_TIMEOUT_MS,
+    application_name: str | None = None,
+):
     """A bounded-wait connection: connect + per-statement timeouts ALWAYS set
     (KTD5). Arbitration calls use ``autocommit=True`` so the single SELECT is
     one self-contained transaction (KTD2); provisioning uses explicit commit."""
     import psycopg  # noqa: PLC0415 - lazy so collection never needs the extra
 
+    kwargs: dict[str, object] = {}
+    if application_name is not None:
+        kwargs["application_name"] = application_name
     return psycopg.connect(
         dsn,
         autocommit=autocommit,
         connect_timeout=_CONNECT_TIMEOUT_SEC,
         options=f"-c statement_timeout={statement_timeout_ms}",
+        **kwargs,
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def spike_pg():
-    """Provision the spike schema + functions on the operator's Postgres.
+    """Provision the spike schema + functions ONCE for the module (the schema
+    is immutable; per-test isolation is the row truncate below — the module is
+    declared serial, so module scope adds no parallelism hazard).
 
     Functions DDL (CREATE + REVOKE/GRANT) applies in ONE transaction (R6).
     Fails loudly when the server's default isolation is not READ COMMITTED —
@@ -113,11 +130,34 @@ def spike_pg():
             cur.execute(f"DROP SCHEMA IF EXISTS {SPIKE_SCHEMA} CASCADE")
 
 
+@pytest.fixture(autouse=True)
+def _clean_rows(spike_pg):
+    """Per-test isolation over the module-scoped schema: rows start empty."""
+    with _connect(spike_pg, autocommit=True) as c, c.cursor() as cur:
+        cur.execute(RESET_ROWS_SQL)
+
+
 @pytest.fixture
 def conn(spike_pg):
     """An autocommit connection for direct-call tests (KTD2's client shape)."""
     with _connect(spike_pg, autocommit=True) as c:
         yield c
+
+
+@pytest.fixture(scope="module")
+def baseline_sec(spike_pg) -> float:
+    """The uncontended arbitration-call floor for the loser-elapsed fallback
+    signal (KTD6) — a property of the server/DSN, measured once per module."""
+    samples = []
+    with _connect(spike_pg, autocommit=True) as c:
+        for i in range(3):
+            with c.cursor() as cur:
+                cur.execute(RESET_ROWS_SQL)
+            _seed(c)
+            started = time.monotonic()
+            _arbitrate(c, agent=f"baseline-{i}", expected_version=1)
+            samples.append(time.monotonic() - started)
+    return statistics.median(samples)
 
 
 def _seed(conn, *, version: int = 1, owner_generation: int = 0) -> None:
@@ -255,16 +295,14 @@ def test_missing_artifact_is_a_loud_error_not_a_typed_outcome(conn) -> None:
     import psycopg  # noqa: PLC0415
 
     # No anchor row: the lock-chain entry itself refuses, loudly.
-    with pytest.raises(psycopg.Error) as excinfo:
+    with pytest.raises(psycopg.errors.RaiseException):
         _arbitrate(conn, agent=_AGENT_A, expected_version=1)
-    assert excinfo.value.sqlstate == "P0001"  # RAISE EXCEPTION
 
     # Anchor present but artifact row missing: the STRICT pair-read refuses.
     with conn.cursor() as cur:
         cur.execute(INSERT_ANCHOR_SQL, (_ARTIFACT,))
-    with pytest.raises(psycopg.Error) as excinfo:
+    with pytest.raises(psycopg.errors.NoDataFound):  # SELECT ... INTO STRICT
         _arbitrate(conn, agent=_AGENT_A, expected_version=1)
-    assert excinfo.value.sqlstate == "P0002"  # NO_DATA_FOUND from SELECT ... INTO STRICT
 
 
 def test_function_hardening_search_path_pinned_and_no_public_execute(conn) -> None:
@@ -307,31 +345,26 @@ def test_function_hardening_search_path_pinned_and_no_public_execute(conn) -> No
 
 _NAIVE_APP_NAME = "ccs-spike-naive"
 _BLOCK_POLL_TIMEOUT_SEC = 10.0
-_U2_ATTEMPTS = 3
+_FORCED_INTERLEAVING_ATTEMPTS = 3
 
 
 def _contender_connect(dsn: str, *, autocommit: bool, application_name: str | None = None):
     """Contender-side connect with the DSN-scrubbing discipline: a failure
     surfaces the exception TYPE only, because the harness transports child
     tracebacks and a driver connect error may echo conninfo details."""
-    import psycopg  # noqa: PLC0415
-
-    kwargs: dict[str, object] = {}
-    if application_name is not None:
-        kwargs["application_name"] = application_name
     try:
-        return psycopg.connect(
-            dsn,
-            autocommit=autocommit,
-            connect_timeout=_CONNECT_TIMEOUT_SEC,
-            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
-            **kwargs,
-        )
+        return _connect(dsn, autocommit=autocommit, application_name=application_name)
     except Exception as exc:  # noqa: BLE001 - re-raised scrubbed
         raise RuntimeError(
             f"spike contender connect failed with {type(exc).__name__}; "
             "details suppressed to avoid leaking DSN credentials"
         ) from None
+
+
+def _raise_contender_errors(result) -> None:
+    """Surface the first child failure; a contender error is never a pass."""
+    if result.errors:
+        raise result.errors[0].error
 
 
 def _await_backend_blocked(monitor_conn, application_name: str, timeout_sec: float = _BLOCK_POLL_TIMEOUT_SEC) -> bool:
@@ -383,23 +416,22 @@ def _u2_naive_contender(ctx, dsn: str) -> dict:
     try:
         ctx.barrier_wait()  # phase 1
         ctx.barrier_wait()  # phase 2: A holds the artifact row lock
-        started = time.monotonic()
         try:
             with conn.cursor() as cur:
                 cur.execute(NAIVE_COMMIT_CAS_SQL, ("naive-c", "naive-t", _ARTIFACT, 1, _AGENT_B))
                 rowcount = cur.rowcount
         except Exception as exc:  # noqa: BLE001 - classified, scrubbed (KTD5)
-            return {"outcome": "unknown", "error_type": type(exc).__name__}
-        return {"rowcount": rowcount, "elapsed": time.monotonic() - started}
+            return {"outcome": _OUTCOME_UNKNOWN, "error_type": type(exc).__name__}
+        return {"rowcount": rowcount}
     finally:
         conn.close()
 
 
-def _reset_rows(dsn: str, *, version: int = 1, owner_generation: int = 0) -> None:
+def _reset_rows(dsn: str) -> None:
     with _connect(dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(RESET_ROWS_SQL)
-        _seed(conn, version=version, owner_generation=owner_generation)
+        _seed(conn)
 
 
 def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
@@ -408,7 +440,7 @@ def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
     should have denied it. This test PASSING means the naive construction
     FAILED in the predicted shape."""
     inconclusive: list[str] = []
-    for _attempt in range(_U2_ATTEMPTS):
+    for _attempt in range(_FORCED_INTERLEAVING_ATTEMPTS):
         _reset_rows(spike_pg)
         harness = ProcessRaceHarness(timeout_sec=60.0)
         result = harness.race(
@@ -417,13 +449,11 @@ def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
                 ContenderSpec(_u2_naive_contender, args=(spike_pg,)),
             ]
         )
-        for outcome in result.outcomes:
-            if outcome.error is not None:
-                raise outcome.error
+        _raise_contender_errors(result)
         locker = result.outcomes[0].value
         naive = result.outcomes[1].value
 
-        if naive.get("outcome") == "unknown":
+        if naive.get("outcome") == _OUTCOME_UNKNOWN:
             inconclusive.append(f"driver error {naive['error_type']} (unknown outcome)")
             continue
         if not locker["observed_blocked"]:
@@ -436,7 +466,7 @@ def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
                 cur.execute(READ_ARTIFACT_SQL, (_ARTIFACT,))
                 version, _gen, content_hash, _token = cur.fetchone()
                 cur.execute(READ_AGENT_STATES_SQL, (_ARTIFACT,))
-                states = dict((agent, state) for agent, state, _g in cur.fetchall())
+                states = {agent: state for agent, state, _g in cur.fetchall()}
         assert states.get(_AGENT_A) == "EXCLUSIVE", "scaffold broke: A's grant transition did not commit"
 
         if naive["rowcount"] == 0:
@@ -455,7 +485,7 @@ def test_naive_single_statement_loses_the_grant_leg(spike_pg) -> None:
         return
     pytest.fail(
         "INCONCLUSIVE (not a §9.2 refutation): the forced interleaving could not be "
-        f"established in {_U2_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike; "
+        f"established in {_FORCED_INTERLEAVING_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike; "
         "do not escalate an unforced run to the C-3 pause."
     )
 
@@ -537,7 +567,7 @@ def _u3_arbitrate_contender(ctx, dsn: str, agent: str, payload: str, app_name: s
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             # KTD5: the write MAY have landed server-side — classify, discard
             # the connection, and let the parent's authoritative read settle it.
-            return {"agent": agent, "payload": payload, "outcome": "unknown", "error_type": type(exc).__name__}
+            return {"agent": agent, "payload": payload, "outcome": _OUTCOME_UNKNOWN, "error_type": type(exc).__name__}
         return {
             "agent": agent,
             "payload": payload,
@@ -598,7 +628,7 @@ def _u3_function_contender(ctx, dsn: str) -> dict:
                 cur.execute(ARBITRATE_SQL, (_ARTIFACT, _AGENT_B, 1, "fn-c", "fn-t"))
                 outcome, current = cur.fetchone()
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-            return {"outcome": "unknown", "error_type": type(exc).__name__}
+            return {"outcome": _OUTCOME_UNKNOWN, "error_type": type(exc).__name__}
         return {"outcome": outcome, "current_version": current}
     finally:
         conn.close()
@@ -651,9 +681,7 @@ def _race_committers(dsn: str, *, agents: list[str], delays: tuple[float, ...]) 
                 for i, agent in enumerate(agents)
             ]
         )
-    for outcome in result.outcomes:
-        if outcome.error is not None:
-            raise outcome.error
+    _raise_contender_errors(result)
     return [o.value for o in result.outcomes], monitor.observed
 
 
@@ -666,8 +694,8 @@ def _assert_exactly_one_winner(dsn: str, results: list[dict], *, pre_version: in
             cur.execute(READ_ARTIFACT_SQL, (_ARTIFACT,))
             version, _generation, content_hash, _token = cur.fetchone()
     wins = [r for r in results if r["outcome"] == OUTCOME_WIN]
-    unknowns = [r for r in results if r["outcome"] == "unknown"]
-    losers = [r for r in results if r["outcome"] not in (OUTCOME_WIN, "unknown")]
+    unknowns = [r for r in results if r["outcome"] == _OUTCOME_UNKNOWN]
+    losers = [r for r in results if r["outcome"] not in (OUTCOME_WIN, _OUTCOME_UNKNOWN)]
 
     assert version == pre_version + 1, f"exactly one write must land, got version {version}"
     assert len(wins) <= 1, f"two winners is a lost update: {results}"
@@ -778,9 +806,7 @@ def test_race_phantom_grant_insert_vs_committer(spike_pg) -> None:
             ),
         ]
     )
-    for outcome in result.outcomes:
-        if outcome.error is not None:
-            raise outcome.error
+    _raise_contender_errors(result)
     committer = result.outcomes[1].value
 
     with _connect(spike_pg, autocommit=True) as conn:
@@ -837,7 +863,7 @@ def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> 
     in-flight across the peer's EXCLUSIVE grant commit. This test also carries
     R9's deterministic lock-wait observation for the suite."""
     inconclusive: list[str] = []
-    for _attempt in range(_U2_ATTEMPTS):
+    for _attempt in range(_FORCED_INTERLEAVING_ATTEMPTS):
         _reset_rows(spike_pg)
         harness = ProcessRaceHarness(timeout_sec=60.0)
         result = harness.race(
@@ -846,13 +872,11 @@ def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> 
                 ContenderSpec(_u3_function_contender, args=(spike_pg,)),
             ]
         )
-        for outcome in result.outcomes:
-            if outcome.error is not None:
-                raise outcome.error
+        _raise_contender_errors(result)
         locker = result.outcomes[0].value
         fn_arm = result.outcomes[1].value
 
-        if fn_arm.get("outcome") == "unknown":
+        if fn_arm.get("outcome") == _OUTCOME_UNKNOWN:
             inconclusive.append(f"driver error {fn_arm['error_type']} (unknown outcome)")
             continue
         if not locker["observed_blocked"]:
@@ -870,7 +894,7 @@ def test_paired_contrast_function_denies_under_forced_interleaving(spike_pg) -> 
         return
     pytest.fail(
         "INCONCLUSIVE: the forced interleaving could not be established in "
-        f"{_U2_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike."
+        f"{_FORCED_INTERLEAVING_ATTEMPTS} attempts ({'; '.join(inconclusive)}). Rerun the spike."
     )
 
 
