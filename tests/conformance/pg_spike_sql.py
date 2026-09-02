@@ -37,6 +37,8 @@ __all__ = [
     "INSERT_ANCHOR_SQL",
     "INSERT_ARTIFACT_SQL",
     "LOCK_ARTIFACT_ROW_SQL",
+    "MUTANT_ARBITRATE_SQL",
+    "MUTANT_FN_NAME",
     "NAIVE_COMMIT_CAS_SQL",
     "OUTCOME_CORRUPTION",
     "OUTCOME_OTHER_HOLDER",
@@ -50,6 +52,7 @@ __all__ = [
     "RESET_ROWS_SQL",
     "SPIKE_SCHEMA",
     "SpikeSql",
+    "build_mutant_arbitration_ddl",
     "build_spike_sql",
 ]
 
@@ -138,7 +141,86 @@ CREATE TABLE {sch}.anchor (
 -- function owning all three legs, invoked as one SELECT. It runs INSIDE the
 -- invoking statement's transaction (plpgsql cannot commit); with an autocommit
 -- client the whole ladder is one self-contained transaction.
-CREATE FUNCTION {sch}.spike_commit_cas(
+{_arbitration_fn_ddl(sch, "spike_commit_cas", _GRANT_LEG_SQL)}
+
+-- The ONLY sanctioned way any test code changes a grant: the anchor
+-- forced-write and the agent_states upsert in ONE transaction, SAME lock
+-- order as the arbitration function (anchor first). KTD3's lock-chain
+-- discipline applies to scaffolding too — a grant written outside this chain
+-- would be invisible to a concurrently-arbitrating call and prove nothing.
+CREATE FUNCTION {sch}.spike_grant_transition(
+    p_artifact text,
+    p_agent text,
+    p_state text,
+    p_read_generation bigint
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = {sch}, pg_temp
+AS $spike$
+BEGIN
+    UPDATE anchor SET forced_writes = forced_writes + 1
+        WHERE artifact = p_artifact;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'spike: no anchor row for artifact %', p_artifact;
+    END IF;
+    INSERT INTO agent_states (artifact, agent, state, read_generation)
+        VALUES (p_artifact, p_agent, p_state, p_read_generation)
+        ON CONFLICT (artifact, agent) DO UPDATE
+            SET state = excluded.state, read_generation = excluded.read_generation;
+END;
+$spike$;
+
+-- R6 (RD-79 defensive floor): revoke and re-grant in the SAME transaction as
+-- creation, throwaway schema or not. PUBLIC gets no EXECUTE window, ever.
+REVOKE ALL ON FUNCTION {arbitrate_sig} FROM PUBLIC;
+REVOKE ALL ON FUNCTION {transition_sig} FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION {arbitrate_sig} TO CURRENT_USER;
+GRANT EXECUTE ON FUNCTION {transition_sig} TO CURRENT_USER;"""
+
+    return SpikeSql(schema_ddl=schema_ddl, functions_ddl=functions_ddl)
+
+
+MUTANT_FN_NAME = "spike_commit_cas_mutant"
+
+
+def build_mutant_arbitration_ddl(schema: str = SPIKE_SCHEMA) -> str:
+    """The SAME arbitration function with the grant leg STRIPPED — the
+    Verification Contract's teeth check: the other_holder scenarios must flip
+    red under this mutant, or the spike cannot fail and proves nothing. Emitted
+    from the same template as the real function so the two can never drift."""
+    sch = _validate_identifier(schema)
+    mutant_leg = "-- MUTANT: the grant-arbitration leg is deliberately removed."
+    sig = f"{sch}.{MUTANT_FN_NAME}(text, text, bigint, text, text)"
+    return (
+        f"{_arbitration_fn_ddl(sch, MUTANT_FN_NAME, mutant_leg)}\n\n"
+        f"REVOKE ALL ON FUNCTION {sig} FROM PUBLIC;\n"
+        f"GRANT EXECUTE ON FUNCTION {sig} TO CURRENT_USER;"
+    )
+
+
+_GRANT_LEG_SQL = """\
+-- Leg 2: grant arbitration. This statement takes a FRESH snapshot: if the
+    -- anchor UPDATE above waited out a peer's grant-transition commit, the
+    -- rows read here are the peer's COMMITTED rows — the mechanism the naive
+    -- single-statement construction structurally lacks.
+    PERFORM 1 FROM agent_states s
+        WHERE s.artifact = p_artifact
+          AND s.agent <> p_agent
+          AND s.state IN ('MODIFIED', 'EXCLUSIVE')
+        FOR UPDATE;
+    IF FOUND THEN
+        outcome := 'other_holder'; current_version := v_version; RETURN;
+    END IF;"""
+
+
+def _arbitration_fn_ddl(sch: str, fn_name: str, grant_leg: str) -> str:
+    """One template for the real arbitration function and its teeth-check mutant."""
+    _validate_identifier(fn_name)
+    return f"""\
+CREATE FUNCTION {sch}.{fn_name}(
     p_artifact text,
     p_agent text,
     p_expected_version bigint,
@@ -185,18 +267,7 @@ BEGIN
         outcome := 'version_mismatch'; current_version := v_version; RETURN;
     END IF;
 
-    -- Leg 2: grant arbitration. This statement takes a FRESH snapshot: if the
-    -- anchor UPDATE above waited out a peer's grant-transition commit, the
-    -- rows read here are the peer's COMMITTED rows — the mechanism the naive
-    -- single-statement construction structurally lacks.
-    PERFORM 1 FROM agent_states s
-        WHERE s.artifact = p_artifact
-          AND s.agent <> p_agent
-          AND s.state IN ('MODIFIED', 'EXCLUSIVE')
-        FOR UPDATE;
-    IF FOUND THEN
-        outcome := 'other_holder'; current_version := v_version; RETURN;
-    END IF;
+    {grant_leg}
 
     -- Leg 3: read-generation fence. Contract verbatim: an ABSENT
     -- read_generation (no row, or NULL) is ADMITTED — version-CAS arbitrates;
@@ -223,46 +294,7 @@ BEGIN
             SET state = excluded.state, read_generation = excluded.read_generation;
     outcome := 'win'; current_version := v_version + 1;
 END;
-$spike$;
-
--- The ONLY sanctioned way any test code changes a grant: the anchor
--- forced-write and the agent_states upsert in ONE transaction, SAME lock
--- order as the arbitration function (anchor first). KTD3's lock-chain
--- discipline applies to scaffolding too — a grant written outside this chain
--- would be invisible to a concurrently-arbitrating call and prove nothing.
-CREATE FUNCTION {sch}.spike_grant_transition(
-    p_artifact text,
-    p_agent text,
-    p_state text,
-    p_read_generation bigint
-)
-RETURNS void
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
-SET search_path = {sch}, pg_temp
-AS $spike$
-BEGIN
-    UPDATE anchor SET forced_writes = forced_writes + 1
-        WHERE artifact = p_artifact;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'spike: no anchor row for artifact %', p_artifact;
-    END IF;
-    INSERT INTO agent_states (artifact, agent, state, read_generation)
-        VALUES (p_artifact, p_agent, p_state, p_read_generation)
-        ON CONFLICT (artifact, agent) DO UPDATE
-            SET state = excluded.state, read_generation = excluded.read_generation;
-END;
-$spike$;
-
--- R6 (RD-79 defensive floor): revoke and re-grant in the SAME transaction as
--- creation, throwaway schema or not. PUBLIC gets no EXECUTE window, ever.
-REVOKE ALL ON FUNCTION {arbitrate_sig} FROM PUBLIC;
-REVOKE ALL ON FUNCTION {transition_sig} FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION {arbitrate_sig} TO CURRENT_USER;
-GRANT EXECUTE ON FUNCTION {transition_sig} TO CURRENT_USER;"""
-
-    return SpikeSql(schema_ddl=schema_ddl, functions_ddl=functions_ddl)
+$spike$;"""
 
 
 # --- client-side statements (positional %s params, order in the comment) -----
@@ -270,6 +302,12 @@ GRANT EXECUTE ON FUNCTION {transition_sig} TO CURRENT_USER;"""
 # (artifact, agent, expected_version, content_hash, commit_token)
 ARBITRATE_SQL = (
     f"SELECT outcome, current_version FROM {SPIKE_SCHEMA}.spike_commit_cas(%s, %s, %s, %s, %s)"
+)
+
+# Same signature against the teeth-check mutant (grant leg removed).
+# (artifact, agent, expected_version, content_hash, commit_token)
+MUTANT_ARBITRATE_SQL = (
+    f"SELECT outcome, current_version FROM {SPIKE_SCHEMA}.{MUTANT_FN_NAME}(%s, %s, %s, %s, %s)"
 )
 
 # (artifact, agent, state, read_generation)
