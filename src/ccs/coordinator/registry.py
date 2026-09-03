@@ -602,7 +602,11 @@ class ArtifactRegistry:
                 # with the INVALID transition, so a commit by the ex-holder (or any
                 # pre-revocation holder) fails the generation check. Both the sweep
                 # reclaims and the voluntary release ("invalidate") qualify — see
-                # EPOCH_BUMP_TRIGGERS. The version-moving peer invalidations do not.
+                # EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
+                # "commit") do not -- a "commit" moves the version and a
+                # "write" preemption is fenced by grant-state at the effect
+                # gate and by the M/E state check at commit, never by the
+                # epoch (see registry_protocol.EPOCH_BUMP_TRIGGERS).
                 if trigger in EPOCH_BUMP_TRIGGERS:
                     record.owner_generation += 1
 
