@@ -12,7 +12,7 @@ TLC model checking for the MESI coherence protocol, its crash-recovery extension
 - **Heartbeat liveness** — monotonic heartbeat recording per agent.
 - **Reclamation slot lifecycle** — slot preserved through I→S, cleared on I→M∪E re-acquire.
 - **Optimistic commit-CAS (OCC)** — a version-checked commit (`commit_cas`) that bypasses the pessimistic acquire: an S/I writer reads the version (`ObserveAction`), then commits only if its observed version still matches and no other agent holds M∪E. Closes the concurrent lost-update. Corresponds to `commit_cas` in `src/ccs/coordinator/`.
-- **Read-generation fence (Fencing)** — a per-artifact ownership epoch (`ownerGeneration`) bumped atomically on every sweep reclamation, captured into `readGeneration` when an agent establishes its write-claim (`ObserveGenAction` — deliberately decoupled so the sweep can interleave between capture and commit), and enforced by a generation-guarded commit (`FencingCommitAction`): a writer whose captured generation was superseded by a reclamation is rejected even when the version is unchanged — the reclaim-zombie write the version CAS cannot see. Corresponds to `owner_generation` / `read_generation` in `src/ccs/coordinator/`.
+- **Read-generation fence (Fencing)** — a per-artifact ownership epoch (`ownerGeneration`) bumped atomically on every sweep reclamation, captured into `readGeneration` when an agent establishes its write-claim (`ObserveGenAction` — deliberately decoupled so the sweep can interleave between capture and commit), and enforced by a generation-guarded commit (`FencingCommitAction`): a writer whose captured generation was superseded by a reclamation is rejected even when the version is unchanged — the reclaim-zombie write the version CAS cannot see. The capture rule itself is pinned as an action property (`NoUnearnedCapture`): a captured generation is written only by its owner's own read or acquire, never by a peer's fetch, so a refusal stays sticky until the refused agent re-reads. Corresponds to `owner_generation` / `read_generation` in `src/ccs/coordinator/`.
 - **Effect-ordering gate (EffectGate)** — the builder-facing `gate()` wrapper modeled over the fence world: a per-artifact gate machine captures the `(version, ownerGeneration)` pair at decision time (`EffectDecideAction` — one atomic read, matching the registry's pair-atomic `get_artifact_and_generation`), re-validates it at the effect boundary (`EffectAdmitAction`, guarded on BOTH comparands), HOLDs on a moved pair (`EffectHoldAction`), and fires from an unguarded separate action (`EffectFireAction`) — the admit/fire split keeps the disclaimed re-validate→fire residual window model-visible instead of proving it away. Proves `NoStaleAdmit`: the gate never admits an effect whose captured pair had moved as of the re-validate read — in particular the reclaim case, where a sweep bumps the generation while the version never moves. Two exact abstractions keep it CI-convergent: moved-since-capture (a boolean; both comparands are monotonic, so equality-with-captured IS unchanged-since-capture — no ABA) instead of concrete captured values, and one gate machine per artifact (the admit consults only per-artifact registry state; the caller's identity never enters the check). Corresponds to `gate()` in `src/ccs/adapters/effect_gate.py`.
 - **Bounded version retention + read-at-version (Retention)** — a per-artifact K-bounded history of committed versions (`history`, content abstracted as the version number), extended and garbage-collected atomically inside the fence-guarded commit (`RetentionCommitAction` — commit + retain + K-GC are one action, mirroring the same-transaction capture discipline), plus an off-protocol read-at-version request (`VersionedReadAction`) proven to be a protocol no-op. Every inherited invariant is re-checked with retention composed in — safety **preservation**, not behavioral equivalence (no refinement mapping). Corresponds to the retention capture points and `CoordinatorService.read_at_version`.
 - **Consistent multi-artifact snapshot sessions (Snapshot)** — a session captures a per-artifact version-vector at ONE atomic linearization point (`BeginSessionAction`), reads a coherent cut with no cross-artifact read skew (`NoReadSkewWithinCut`), and holds its pinned versions against the K-bounded GC for its lifetime via the exemptions seam (`PinAlwaysRetained` — `SnapRetainAndCollect` keeps the newest-K window ∪ live-session pins, with session liveness the state the GC reads). Single-artifact commits only — atomic multi-artifact *publish* is modeled separately in `AtomicPublish.tla` (below). The read-skew detector lives in the commit and is vacuous under atomic capture; the split mutant gives it teeth (the `staleApply`/`collectedRead` idiom). Corresponds to `begin_session` / the read-side transaction layer.
@@ -55,7 +55,7 @@ formal/tla/
 ├── Fencing_CI.cfg          # TLC config: 2 agents (CI, fits 5-min budget)
 ├── ZombieRevoke.tla        # amendment: EXTENDS Fencing, pins the REVOKE (NoZombieRevoke)
 ├── ZombieRevoke.cfg        # TLC config: 3 agents (local deep runs)
-├── ZombieRevoke_CI.cfg     # TLC config: 2 agents, MaxTicks=3 (CI, ~35s)
+├── ZombieRevoke_CI.cfg     # TLC config: 2 agents, MaxTicks=3 (CI, ~80s)
 ├── EffectGate.tla          # amendment: EXTENDS Fencing, adds the effect-ordering gate machine
 ├── EffectGate.cfg          # TLC config: 3 agents (local deep runs)
 ├── EffectGate_CI.cfg       # TLC config: 2 agents, MaxTicks=3, HeartbeatTimeout=1 (CI; see budget notes)
@@ -126,6 +126,7 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `NoStaleApply` | Fencing, EffectGate, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
 | — | `NoZombieRevoke` | ZombieRevoke | No invalidation ever revoked a write claim it was not authority over — a signal minted at one epoch and applied to a claim established later. The dual of `NoStaleApply`: that one says a superseded claim cannot WRITE, this one says a superseded signal cannot REVOKE. Neither subsumes the other (recipe 16 gives it teeth) |
 | — | `NoSilentRevoke` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot | A write claim is never revoked without the ownership epoch moving — by the sweep OR by a voluntary release, the two operations that end a claim at an unchanged version. `NoStaleApply` structurally cannot see this failure (it is defined *relative* to the epoch that fails to move), which is why it is stated separately (recipe 17 gives it teeth) |
+| — | `NoUnearnedCapture` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot (action property, cfg `PROPERTY`) | `[][∀ ag, art : readGeneration'[ag][art] ≠ readGeneration[ag][art] ⇒ ClaimEstablishedOrRefreshed(ag, art)]_fenceVars` — an agent's captured read-generation changes only in that agent's own claim-establishing step: its read from INVALID, its non-M∪E→M∪E acquire, or its own `ObserveGenAction`. Nothing a peer does — the fetch that downgrades it M∪E→S or re-lists it S→S, a heartbeat, a tick — may refresh it, which is what makes a `stale_read_generation` refusal sticky. A state invariant cannot see an unearned capture (the refreshed slot is extensionally identical to a legitimate `ObserveGenAction`'s result and `NoStaleApply` then stays green), so it is an action property, like `ReadAtVersionIsProtocolNoOp` (recipe 18 gives it teeth) |
 | — | `NoStaleAdmit` | EffectGate | The effect gate never ADMITS an escaping effect whose captured `(version, ownerGeneration)` pair had moved as of the re-validate read — the reclaim-zombie *effect* (generation moved, version unchanged) is held. Scoped to the re-validate point; the admit→fire residual window is deliberately unguarded and model-visible (recipe 15 gives it teeth) |
 | — | `PairMovedScoped` | EffectGate | Canonicalization sanity: the moved-since-capture flag is FALSE outside the decided window, so the abstraction adds no spurious state |
 | — | `NoCollectedRead` | Retention, Snapshot | No versioned read ever observed a hole inside the promised K-window strictly below the current version — the GC never collects what the bounded-retention contract promises (current version included, by construction) |
@@ -146,7 +147,7 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 
 | TLA+ | Implementation |
 |------|---------------|
-| `FetchAction` | `CoordinatorService.fetch()` in `src/ccs/coordinator/service.py` |
+| `FetchAction` | `CoordinatorService.fetch()` in `src/ccs/coordinator/service.py` — the requester leg (I→S/E) plus the peer loop that downgrades M∪E holders to S. The peer loop is the leg `NoUnearnedCapture` forbids from capturing: the model's fetch leaves `readGeneration` unchanged for every agent it touches, and the service's loop now downgrades only M∪E peers, never re-listing (or re-capturing) a SHARED bystander |
 | `WriteAction` | `CoordinatorService.write()` / `upgrade()` |
 | `CommitAction` | `CoordinatorService.commit()` |
 | `InvalidateAction` | `CoordinatorService.invalidate()` |
@@ -158,7 +159,8 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `SingleWriter` | `check_single_writer()` in `src/ccs/core/invariants.py` |
 | `MonotonicVersion` | `check_monotonic_version()` in `src/ccs/core/invariants.py` |
 | `NoLostUpdate` | concurrent-writer test (`tests/test_occ_commit_cas.py`) |
-| `ObserveGenAction` | `read_generation` capture in `set_agent_state` (fetch / E∪M acquire) |
+| `ObserveGenAction` | a non-INVALID holder's genuine re-read — the `read_generation` capture in `set_agent_state` on the requester's own `"fetch"` transition, behind the registries' INVALID guard (an INVALID agent's read is the fetch grant itself, modeled by `FetchAction`). The E∪M-acquire capture arm is `FencingWriteAction` |
+| `NoUnearnedCapture` | the sticky-refusal regressions in `tests/test_zombie_revoke.py` (a peer's fetch — downgrade or SHARED→SHARED — never re-arms a refused reclaim-zombie on either registry; the requester's own re-read still captures) and the service-driven conformance-kit scenario a re-capturing backend fails |
 | `FencingSweepAction` | the `owner_generation` bump on reclaim triggers in `set_agent_state` |
 | `FencingCommitAction` | the generation guard in `commit_cas` + `set_artifact_and_content(fence_agent_id=…)` |
 | `FencingInvalidateAction` | `service.invalidate` — the NoZombieRevoke pin (`_revoke_is_superseded`) plus the `owner_generation` bump the shared `EPOCH_BUMP_TRIGGERS` predicate now covers |
@@ -202,20 +204,22 @@ Target: **5 minutes** total across the specs run in CI (the original five measur
 
 | Model | Config | Agents | Artifacts | MaxTicks | Distinct States | Wall Time |
 |-------|--------|--------|-----------|----------|----------------|-----------|
-| MESI_Standalone | `MESI_Standalone.cfg` | 3 | 2 | 12 | 557,037 | ~18s |
-| CrashRecovery (CI) | `CrashRecovery_CI.cfg` | 2 | 1 | 6 | 258,854 | ~18s |
+| MESI_Standalone | `MESI_Standalone.cfg` | 3 | 2 | 12 | 557,037 | ~9s |
+| CrashRecovery (CI) | `CrashRecovery_CI.cfg` | 2 | 1 | 6 | 258,854 | ~7s |
 | CrashRecovery (local) | `CrashRecovery.cfg` | 3 | 2 | 12 | — | ~30+ min |
-| OCC (CI) | `OCC_CI.cfg` | 2 | 1 | 4 | 1,372,720 | ~47s |
+| OCC (CI) | `OCC_CI.cfg` | 2 | 1 | 4 | 1,678,120 | ~30s |
 | OCC (local) | `OCC.cfg` | 3 | 1 | 6 | — | minutes |
-| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~111s |
+| Fencing (CI) | `Fencing_CI.cfg` | 2 | 1 | 4 | 5,723,640 | ~118s |
 | Fencing (local) | `Fencing.cfg` | 3 | 1 | 6 | — | minutes |
-| ZombieRevoke (CI) | `ZombieRevoke_CI.cfg` | 2 | 1 | 3 | 3,902,098 | ~93s |
+| ZombieRevoke (CI) | `ZombieRevoke_CI.cfg` | 2 | 1 | 3 | 3,648,666 | ~81s |
 | ZombieRevoke (local) | `ZombieRevoke.cfg` | 3 | 1 | 6 | — | minutes |
-| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 5,954,640 | ~176s |
+| EffectGate (CI) | `EffectGate_CI.cfg` | 2 | 1 | 3 | 10,036,000 | ~221s |
+| EffectGate (local) | `EffectGate.cfg` | 3 | 1 | 6 | — | overnight |
+| Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 5,723,640 | ~161s |
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
-| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 1,735,500 | ~46s |
+| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 1,363,115 | ~39s |
 | Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
-| WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~5s |
+| WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~4s |
 | WorkspaceVersion (local) | `WorkspaceVersion.cfg` | — | 2 members | MaxVersion=4 | 204,216 | ~6s |
 
 Fencing, ZombieRevoke, EffectGate, Retention and Snapshot were remeasured 2026-08-31
@@ -230,10 +234,21 @@ the largest). The full `make tla-check` sweep is ~11min40s, up from ~7min20s and
 before the amendment. If that stops fitting the CI budget, cut the tick horizon rather
 than `MaxGen` -- a low `MaxGen` buys its speed by silently not checking things.
 
+Every row above was remeasured 2026-09-03 (8 cores, sequential, Makefile order) after
+`ObserveGenAction` gained its `/= "I"` guard and `NoUnearnedCapture` joined the Fencing
+configs and the four downstream CI configs. The guard is what moves the counts: an
+INVALID agent can no longer capture without fetching, so Fencing loses ~4% of its
+distinct states (5,954,640 → 5,723,640), ZombieRevoke ~6% (3,902,098 → 3,648,666),
+EffectGate ~4% (10.5M → 10,036,000) and Snapshot ~21% (1,735,500 → 1,363,115). The
+action property adds a per-transition check and no state dimension. The full
+`make tla-check` sweep measured **~11min09s** (669s) on that run; the 5-minute target
+above is historical and the workflow sets no job timeout, so this table is the only
+operational meaning "the CI budget" has.
+
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)
 and the read action is a stutter in the correct spec, so retention adds transitions and
-per-transition checks (~1.7× Fencing's wall time; 28,270,477 generated vs 26,108,777)
+per-transition checks (~1.4× Fencing's wall time; 56,450,797 generated vs 51,681,097)
 but zero state-space dimensions. The local 3-agent config is overnight-class, not a
 quick check: measured ≥95M distinct states (703M generated, queue still growing) at the
 40-minute mark on 8 cores — and since the distinct space equals Fencing's, that is also
@@ -241,7 +256,7 @@ the true size of `Fencing.cfg`'s local space.
 
 Snapshot **inverts** the usual CI shape — **1 agent × 2 artifacts** (the other CI specs are 2 agents × 1 artifact). Read skew is a cross-artifact phenomenon, so ≥ 2 artifacts is mandatory; the agent-contention re-check of the inherited fence invariants is already discharged by the other specs and by the local `Snapshot.cfg` (2 agents). The CI config also disables the sweep (`HeartbeatTimeout` > `MaxTicks`) — the session machinery is fence-uniform and adds no sweep interaction, so suppressing it keeps the run to ~18s without losing Snapshot-specific coverage. The local `Snapshot.cfg` (2 agents, `MaxTicks=4`, sweeps on) is the deep composition check and the home for the mutant recipes.
 
-EffectGate multiplies Fencing's space by the gate machine (5 phases × the moved-flag), so its CI config **tightens the tick horizon instead of dropping coverage**: `MaxTicks=3, HeartbeatTimeout=1, MaxHoldTicks=2` keeps every hazard reachable — the mutant (recipe 15) still finds the reclaim-between-capture-and-admit trace in ~1s, which is the reachability proof — while the correct spec converges at 40,015,043 generated / 3,724,900 distinct states in ~1min40s on 8 cores (3,913,780 distinct / ~1min57s remeasured 2026-08-30 after the epoch-bump amendment). The naive encoding with concrete captured comparands diverges (>80M distinct, queue still growing); the moved-since-capture abstraction in the spec header is what makes the spec checkable at all. The local `EffectGate.cfg` (3 agents, `MaxTicks=6`) is overnight-class.
+EffectGate multiplies Fencing's space by the gate machine (5 phases × the moved-flag), so its CI config **tightens the tick horizon instead of dropping coverage**: `MaxTicks=3, HeartbeatTimeout=1, MaxHoldTicks=2` keeps every hazard reachable — the mutant (recipe 15) still finds the reclaim-between-capture-and-admit trace in ~1s, which is the reachability proof — while the correct spec converges at 96,139,653 generated / 10,036,000 distinct states in ~3min41s on 8 cores (remeasured 2026-09-03; it was 3,724,900 distinct / ~1min40s before the epoch-bump amendment, and the `MaxGen` raise described above is what roughly tripled it). The naive encoding with concrete captured comparands diverges (>80M distinct, queue still growing); the moved-since-capture abstraction in the spec header is what makes the spec checkable at all. The local `EffectGate.cfg` (3 agents, `MaxTicks=6`) is overnight-class.
 
 CI uses `CrashRecovery_CI.cfg` (2 agents, MaxTicks=6) to fit the budget.
 The full 3-agent config (`CrashRecovery.cfg`) is for local deep runs:
@@ -276,7 +291,9 @@ and confirm TLC finds a counterexample:
    from `FencingCommitAction`'s WIN branch (so a superseded writer can win). Run
    `make tla-check`. TLC should fail with a `NoStaleApply` violation, showing a
    trace where a sweep-reclaimed writer's commit lands on a bumped ownership
-   epoch. (Verified 2026-06-09: violation found in <1s, 570 distinct states.)
+   epoch. (Verified 2026-06-09: violation found in <1s, 570 distinct states;
+   re-verified 2026-09-03 on the `ObserveGenAction`-guarded spec: <1s, 210
+   distinct states.)
 
 5. **Retention atomicity mutation (crash window)**: In `Retention.tla`, split
    `RetentionCommitAction`'s retain from its version bump into two separately-
@@ -301,8 +318,14 @@ and confirm TLC finds a counterexample:
    every state INVARIANT — `NoStaleApply` included — stays green on the
    violating trace: the refreshed claim is extensionally identical to a
    legitimate `ObserveGenAction`, which is exactly why the read-no-op claim is
-   checked as an action property. (Verified 2026-06-11: violation found in
-   <1s, 1,370 states generated.)
+   checked as an action property. `NoUnearnedCapture` (recipe 18) fails on
+   this mutant too (through an INVALID reader's refresh, which
+   `ObserveGenAction`'s guard excludes — with `ReadAtVersionIsProtocolNoOp`
+   dropped from the config it reports the violation in <1s, 225 distinct
+   states), but TLC prints the first property violated. (Verified 2026-06-11:
+   violation found in <1s, 1,370 states generated; re-verified 2026-09-03
+   on the `ObserveGenAction`-guarded spec: <1s, 531 states generated, 216
+   distinct.)
 
 7. **Retention GC-eats-current mutation**: In `Retention.tla`, flip the GC's
    oldest-row selection in `RetainAndCollect` from
@@ -396,7 +419,9 @@ and confirm TLC finds a counterexample:
     Run TLC on `EffectGate_CI.cfg`. TLC should fail with a `NoStaleAdmit`
     violation, showing a trace where a sweep reclamation (or a peer commit)
     lands between the decide capture and the admit and the effect is admitted
-    anyway. (Verified 2026-08-20: violation found in ~1s, 879 distinct states.)
+    anyway. (Verified 2026-08-20: violation found in ~1s, 879 distinct states;
+    re-verified 2026-09-03 on the `ObserveGenAction`-guarded spec: ~1s, 915
+    distinct states.)
 
 16. **NoZombieRevoke mutation (apply a superseded signal)**: In
     `ZombieRevoke.tla`, replace the `\/ ~observedCurrent[ag][art]` disjunct of
@@ -405,7 +430,8 @@ and confirm TLC finds a counterexample:
     one it announces). Run TLC on `ZombieRevoke_CI.cfg`. TLC should fail with a
     `NoZombieRevoke` violation, showing a trace where a signal minted at one
     epoch revokes a claim established later — the shipped defect this amendment
-    closes. (Verified 2026-08-30.)
+    closes. (Verified 2026-08-30; re-verified 2026-09-03 on the
+    `ObserveGenAction`-guarded spec: <1s, 54 distinct states.)
 
 17. **NoSilentRevoke mutation (revoke without moving the epoch)**: In
     `Fencing.tla`, replace `FencingInvalidateAction`'s `ownerGeneration' = …`
@@ -416,12 +442,64 @@ and confirm TLC finds a counterexample:
     is defined relative to the very counter that fails to move, which is exactly
     why the property is stated separately rather than folded into the fence's.
     The same mutation applied to `FencingSweepAction`'s bump is caught by the
-    same invariant. (Verified 2026-08-30: both variants found.)
+    same invariant. (Verified 2026-08-30: both variants found; re-verified
+    2026-09-03 on the `ObserveGenAction`-guarded spec: <1s each, 72 distinct
+    states for the release variant, 175 for the sweep variant.)
+
+18. **NoUnearnedCapture mutation (the fetch's peer leg captures)**: In
+    `Fencing.tla`, in `FencingNext`, replace the `CRFetchAction` disjunct's
+    `UNCHANGED readGeneration` so that every peer that is non-INVALID both
+    before and after the step captures the current epoch — the shipped
+    registry's peer loop, which re-listed every non-INVALID peer under the
+    `"fetch"` trigger and re-captured on each re-listing:
+
+    ```tla
+    \/ (CRFetchAction
+        /\ readGeneration' = [ag \in Agents |-> [art \in Artifacts |->
+             IF mesiState[art][ag] /= "I" /\ mesiState'[art][ag] /= "I"
+             THEN ownerGeneration[art] ELSE readGeneration[ag][art]]]
+        /\ UNCHANGED <<ownerGeneration, staleApply, silentRevoke>>)
+    ```
+
+    Run TLC on `Fencing_CI.cfg`. TLC should fail with an
+    `Action property NoUnearnedCapture is violated` error. Note that every
+    state INVARIANT — `NoStaleApply`, `ReadGenBounded`, `SingleWriter`, all of
+    them — stays GREEN on this mutant: with the `PROPERTY` line removed from
+    the config the same mutant runs to completion with no error (verified
+    2026-09-03: 3,608,760 distinct states, ~59s), because a re-armed slot is
+    extensionally identical to one a legitimate `ObserveGenAction` refreshed
+    and the re-armed commit is, by the fence's own comparison, current. The
+    failure lives in the transition, which is why the rule has to be an action
+    property. On this spec shape the first counterexample TLC prints is a
+    fetch-granted EXCLUSIVE holder (whose `readGeneration` is still `None`
+    — the fetch grants E without capturing; see the known divergence below)
+    being downgraded E→S by a peer's fetch and captured; the SHARED→SHARED
+    re-listing the shipped loop performed is caught deeper in the same
+    mutant (restricting the mutant to `= "S"` before and after — a SHARED
+    bystander re-captured by a peer's re-fetch — is caught on its own: <1s,
+    172 distinct states). A downgrade-only mutant (capture only on M∪E→S) is NOT a valid
+    recipe: on this shape it fails through that same `None`-holder gap, and
+    on a code-faithful model where every M∪E holder carries the current
+    generation it would be vacuous. The named third disjunct of
+    `ClaimEstablishedOrRefreshed` — `ObserveGenAction` itself rather than "no
+    grant moved" — is what also catches a heartbeat-that-captures mutant
+    (`HeartbeatAction` refreshing every non-INVALID slot: violation in <1s,
+    77 distinct states). (Verified 2026-09-03: violation found in ~1s, 60
+    distinct states.)
+
+    Known divergence this recipe leans on: in `Fencing.tla` a fetch that
+    grants EXCLUSIVE carries no operand (`readGeneration` stays `None`),
+    while the registries capture at every M∪E entry. Reshaping the spec to
+    match (a capturing fetch action plus a non-capturing adapter re-grant
+    action) must add that non-capturing re-grant in the same edit and
+    re-verify this recipe, which otherwise turns vacuous.
 
 These mutations are run manually during development to validate TLC's
 bug-detection capability. The mutated files are not committed. Recipes 5–10
 run TLC directly on their amendment's CI config (`Retention_CI.cfg` /
 `Snapshot_CI.cfg`); recipe 11 runs on `AtomicPublish.cfg`; recipes 12–14 run
-on `WorkspaceVersion_CI.cfg`; recipe 15 runs on `EffectGate_CI.cfg`. Mutating
-one amendment cannot affect the other specs, so the full `make tla-check` adds
-nothing.
+on `WorkspaceVersion_CI.cfg`; recipe 15 runs on `EffectGate_CI.cfg`; recipe 16
+runs on `ZombieRevoke_CI.cfg`; recipes 4, 17 and 18 run on `Fencing_CI.cfg`.
+Mutating one amendment cannot affect the specs upstream of it, so the full
+`make tla-check` adds nothing (a `Fencing.tla` mutant does propagate to every
+downstream config, which is why `NoUnearnedCapture` is listed in each of them).

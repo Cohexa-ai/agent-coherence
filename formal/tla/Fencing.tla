@@ -21,6 +21,10 @@
                          path). None until captured -- the absent operand the
                          commit ADMITS (a writer with no fence claim;
                          version-CAS arbitrates it -- see the commit bullet).
+                         Written ONLY by the agent's own claim-establishing
+                         step: nothing a PEER does (a fetch that downgrades
+                         or re-lists this agent, a heartbeat, a tick) may
+                         refresh it -- NoUnearnedCapture pins this.
      - staleApply      : a sticky history flag -- TRUE iff any commit ever
                          applied a write from a CAPTURED read-generation older
                          than the artifact's current ownerGeneration (a stale
@@ -155,15 +159,21 @@ FencingInit ==
     /\ silentRevoke = FALSE
 
 --------------------------------------------------------------------
-(* ObserveGenAction: the genuine-read capture leg -- an agent captures the
-   current ownerGeneration into its slot on a read (the OCC read-set capture).
-   Decoupled from the read action so the sweep can fire between capture and
-   commit (the non-atomic-capture hazard). The E/M-acquire capture is the OTHER
-   leg, atomic with the acquire (FencingWriteAction). *)
+(* ObserveGenAction: the genuine-read capture leg -- a NON-INVALID holder
+   captures the current ownerGeneration into its slot on a read (the OCC
+   read-set capture). Guarded on `/= "I"` because the registries capture only
+   for an agent that already holds the artifact: an INVALID agent's read is the
+   fetch itself (CRFetchAction, which models the I -> S/E grant and leaves
+   readGeneration alone, see FencingNext). OCC.tla's sibling ObserveAction is
+   guarded to S/I the same way. Decoupled from the read action so the sweep
+   can fire between capture and commit (the non-atomic-capture hazard). The
+   E/M-acquire capture is the OTHER leg, atomic with the acquire
+   (FencingWriteAction). *)
 --------------------------------------------------------------------
 
 ObserveGenAction ==
     \E ag \in Agents, art \in Artifacts :
+        /\ mesiState[art][ag] /= "I"
         /\ readGeneration' = [readGeneration EXCEPT ![ag][art] = ownerGeneration[art]]
         /\ UNCHANGED <<baseVars, crVars, ownerGeneration, staleApply,
                       silentRevoke>>
@@ -306,7 +316,18 @@ FencingInvalidateAction ==
    FencingCommitAction, FencingWriteAction (which captures the read-generation
    at the E/M acquire), FencingSweepAction (the crux modeling decision above)
    and FencingInvalidateAction (which bumps the generation on the OTHER
-   grant-revoking operation). *)
+   grant-revoking operation).
+
+   The fetch leaves readGeneration UNCHANGED on purpose, for EVERY agent the
+   step touches -- the requester AND the peers it downgrades M/E -> S. A fetch
+   is one agent's read; the peer leg is a grant change forced on a bystander,
+   not that bystander's read, so it may not refresh the bystander's operand.
+   The shipped registry once did exactly that: its peer loop re-listed every
+   non-INVALID peer under the "fetch" trigger (a downgrade, or an S -> S
+   re-listing), and each re-listing re-captured the peer's slot -- so a
+   reclaim-zombie whose commit had been refused was re-armed by ANYONE ELSE's
+   read and its stale write then landed. NoUnearnedCapture below is the pin;
+   README recipe 18 is the mutant that models the shipped loop. *)
 FencingNext ==
     \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration,
                                         staleApply, silentRevoke>>)
@@ -349,7 +370,11 @@ ReadGenBounded ==
    never read) carries no read-generation to be superseded, so it is outside
    this property and is admitted (version-CAS, OCC.tla, is its lost-update
    guard). A reclaim-zombie is NEVER absent -- FencingWriteAction captures at
-   the acquire -- so admit-on-absent removes no fence coverage. SingleWriter,
+   the acquire -- so admit-on-absent removes no fence coverage, and
+   NoUnearnedCapture keeps that stale value from being refreshed by any step
+   that is not the zombie's own claim (a peer's fetch, a heartbeat, a tick), so
+   the refusal is sticky until the zombie itself re-reads or re-acquires.
+   SingleWriter,
    MonotonicVersion, and the CR invariants (I3-I6) are inherited and re-checked
    to validate composition. *)
 NoStaleApply == staleApply = FALSE
@@ -368,5 +393,47 @@ NoStaleApply == staleApply = FALSE
    commits (the version moves, version-CAS arbitrates), it is reclaimed (bump),
    or it releases (bump, since this amendment). There is no fourth exit. *)
 NoSilentRevoke == silentRevoke = FALSE
+
+(* The steps in which ag's fence claim on art is legitimately established or
+   refreshed -- the ONLY steps allowed to write readGeneration[ag][art]:
+     - ag's own read from INVALID (the I -> S/E grant), computed from mesiState
+       vs mesiState' (the UpdatedGrantedAtTick discipline -- never reaching into
+       CRFetchAction's existential binding);
+     - ag's own acquire (the non-M/E -> M/E transition FencingWriteAction
+       captures on), computed the same way;
+     - ag's own decoupled read: ObserveGenAction ITSELF. Naming the action, and
+       not a weaker "no grant moved in this step" approximation, is deliberate:
+       the approximation is also satisfied by a heartbeat or a tick that
+       captures (neither moves a grant), so a heartbeat-that-captures mutant
+       would slip past it. Since ObserveGenAction is the only disjunct that
+       fits a step with no MESI change, this pins it exactly. *)
+ClaimEstablishedOrRefreshed(ag, art) ==
+    \/ mesiState[art][ag] = "I"       /\ mesiState'[art][ag] /= "I"      \* own read from I
+    \/ mesiState[art][ag] \notin MorE /\ mesiState'[art][ag] \in MorE    \* acquire
+    \/ ObserveGenAction                                                 \* own decoupled read
+
+(* The capture-rule ACTION PROPERTY (cfg: PROPERTY, not INVARIANT): a change
+   to ANY agent's captured read-generation happens only in that agent's own
+   claim-establishing or claim-refreshing step. Nothing a peer does -- the
+   fetch that downgrades this agent M/E -> S or re-lists it S -> S, a
+   heartbeat, a tick -- may refresh it. This is what makes a
+   stale-read-generation refusal STICKY: a reclaim-zombie stays refused across
+   any number of peer reads until it re-reads or re-acquires itself.
+
+   A state invariant cannot see an unearned capture. After the offending step
+   the zombie's slot simply equals ownerGeneration, which is extensionally
+   identical to the state a legitimate ObserveGenAction produces; NoStaleApply
+   then stays green because the re-armed commit is, by the fence's own
+   comparison, current. The failure is in the TRANSITION, not the state -- the
+   same reason Retention.tla checks ReadAtVersionIsProtocolNoOp as an action
+   property. Confirmed by mutation (README recipe 18): the peer-loop mutant
+   passes every state invariant in every config and fails only this property.
+   Read only unprimed/primed state functions, so it composes unchanged into
+   every downstream amendment (ZombieRevoke, EffectGate, Retention, Snapshot),
+   each of which lists it in its CI config. *)
+NoUnearnedCapture ==
+    [][\A ag \in Agents, art \in Artifacts :
+         readGeneration'[ag][art] /= readGeneration[ag][art]
+             => ClaimEstablishedOrRefreshed(ag, art)]_fenceVars
 
 ==========================================================================
