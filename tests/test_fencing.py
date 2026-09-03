@@ -49,6 +49,20 @@ def _pair(reg, artifact_id) -> tuple[int, int]:
     return artifact.version, generation
 
 
+def _poke_owner_generation(reg, artifact_id) -> None:
+    """Advance owner_generation behind set_agent_state's back so a live grant
+    carries a superseded claim -- a shape the service cannot reach, built the
+    way the MWB-transient regression below builds it (raw SQL on sqlite, the
+    record map in memory)."""
+    if isinstance(reg, SqliteArtifactRegistry):
+        reg._conn.execute(
+            "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
+            (artifact_id.hex,),
+        )
+    else:
+        reg._records[artifact_id].owner_generation += 1
+
+
 def test_parity_owner_generation_bumps_on_reclaim_only(registry) -> None:
     reg = registry
     art = _register(reg)
@@ -235,3 +249,71 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
     assert _pair(reg, art.id) == (2, 1)
     assert reg.get_artifact_and_generation(uuid4()) is None
+
+
+def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -> None:
+    """Leaving M/E is a loss of authority, never a claim. service.fetch tags
+    its peer downgrade "fetch" too, so the capture predicate must not treat
+    that leg as the agent's own read and refresh a superseded value. The
+    stale-under-live-grant shape is poked directly; after the downgrade the
+    value is still PRESENT (not cleared to absent, which admit-on-absent
+    would wave through) and the ex-holder's commit is still refused."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)  # claim g0
+    _poke_owner_generation(reg, art.id)
+    assert _pair(reg, art.id) == (1, 1)
+
+    # A peer's fetch downgrades the holder: E -> S under trigger "fetch".
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=2)
+
+    assert reg.get_read_generation(art.id, a) == 0  # preserved, and present
+    res = reg.commit_cas(art.id, a, expected_version=1, content_hash="late")
+    assert isinstance(res, ConflictDetail)
+    assert res.reason == "stale_read_generation"
+    assert _pair(reg, art.id) == (1, 1)  # version unmoved
+
+
+def test_parity_own_fetch_read_captures_current_epoch(registry) -> None:
+    """The requester leg of fetch IS the agent's own claim: an I -> S read
+    captures the current epoch (not merely epoch 0), and a S -> S re-read after
+    a later bump re-captures -- the recovery path for a reclaimed SHARED
+    agent. Guards against tightening the trigger arm to from_state == INVALID,
+    which would strand that re-read."""
+    reg = registry
+    art = _register(reg)
+    a, b = uuid4(), uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+    assert reg.get_owner_generation(art.id) == 1
+    # I -> S: b's first read captures the CURRENT epoch.
+    reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=11)
+    assert reg.get_read_generation(art.id, b) == 1
+    # A further reclaim supersedes b's claim ...
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=12)
+    reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=20)
+    assert reg.get_owner_generation(art.id) == 2
+    # ... and b's own S -> S re-read re-captures, so its commit wins.
+    reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=21)
+    assert reg.get_read_generation(art.id, b) == 2
+    res = reg.commit_cas(art.id, b, expected_version=1, content_hash="fresh")
+    assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
+    assert reg.get_artifact(art.id).version == 2
+
+
+def test_parity_fetch_regrant_within_me_leaves_read_generation_unchanged(registry) -> None:
+    """An E -> E re-grant tagged "fetch" is neither an acquire nor a read, so
+    it does not capture. Under the service an M/E holder's captured value
+    already equals the epoch; the poke makes the two differ so the no-capture
+    is observable rather than vacuous."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)  # claim g0
+    _poke_owner_generation(reg, art.id)
+
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="fetch", tick=2)
+
+    assert reg.get_read_generation(art.id, a) == 0
+    assert reg.get_owner_generation(art.id) == 1

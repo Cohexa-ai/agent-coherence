@@ -3041,14 +3041,24 @@ class SqliteArtifactRegistry:
                         )
 
                 # Read-generation fence: capture the current ownership epoch into
-                # the agent's read_generation when it establishes/refreshes a
-                # write-claim (E/M acquire -- P0 fix, incl. acquire-without-read
-                # -- or a fetch read), atomic with the grant in this BEGIN
-                # IMMEDIATE. The agent_states row exists after the upsert above.
-                # INVALID guard on the fetch leg: a future cache-miss-INVALID
-                # fetch must not mint a fresh claim for an unfenced zombie.
+                # the agent's read_generation ONLY on the agent's own claim -- an
+                # E/M acquire (including an acquire with no prior content read)
+                # or a genuine fetch read into S/E -- atomic with the grant in
+                # this BEGIN IMMEDIATE. The agent_states row exists after the
+                # upsert above. Two guards on the fetch leg. INVALID: a
+                # cache-miss-INVALID fetch must not mint a fresh claim for an
+                # unfenced zombie. Not-leaving-M/E: service.fetch tags its peer
+                # downgrade (M/E -> S) "fetch" too, and leaving M/E is a loss of
+                # authority, never a claim -- refreshing here would re-arm a
+                # superseded value and un-stick a stale_read_generation
+                # rejection. service.fetch no longer rewrites an already-SHARED
+                # peer, so an S -> S "fetch" reaching this predicate is always
+                # the agent's own re-read, which must keep capturing (the
+                # reclaimed-reader recovery path).
                 if (new_in_me and not prev_in_me) or (
-                    trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+                    trigger in CLAIM_CAPTURE_TRIGGERS
+                    and state != MESIState.INVALID
+                    and not prev_in_me
                 ):
                     self._conn.execute(
                         "UPDATE agent_states SET read_generation = "

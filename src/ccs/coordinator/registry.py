@@ -611,14 +611,23 @@ class ArtifactRegistry:
                     record.owner_generation += 1
 
             # Read-generation fence: capture the current ownership epoch into the
-            # agent's read_generation when it establishes/refreshes a write-claim --
-            # an E/M acquire (P0 fix: includes a pessimistic acquire with no prior
-            # content read) or a genuine fetch read. Atomic (GIL) with the grant.
-            # The INVALID guard hardens the fetch leg: no current fetch path grants
-            # INVALID, but a future cache-miss-INVALID fetch must not mint a fresh
-            # claim for an unfenced zombie.
+            # agent's read_generation ONLY on the agent's own claim -- an E/M
+            # acquire (including a pessimistic acquire with no prior content
+            # read) or a genuine fetch read into S/E. Atomic (GIL) with the grant.
+            # Two guards on the fetch leg. INVALID: no current fetch path grants
+            # INVALID, but a cache-miss-INVALID fetch must not mint a fresh claim
+            # for an unfenced zombie. Not-leaving-M/E: service.fetch tags its
+            # peer downgrade (M/E -> S) "fetch" too, and leaving M/E is a loss of
+            # authority, never a claim -- refreshing here would re-arm a
+            # superseded value and un-stick a stale_read_generation rejection.
+            # service.fetch no longer rewrites an already-SHARED peer, so an
+            # S -> S "fetch" reaching this predicate is always the agent's own
+            # re-read, which must keep capturing (the reclaimed-reader recovery
+            # path).
             if (new_in_me and not prev_in_me) or (
-                trigger in CLAIM_CAPTURE_TRIGGERS and state != MESIState.INVALID
+                trigger in CLAIM_CAPTURE_TRIGGERS
+                and state != MESIState.INVALID
+                and not prev_in_me
             ):
                 record.read_generation_by_agent[agent_id] = record.owner_generation
 
