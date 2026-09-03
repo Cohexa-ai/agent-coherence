@@ -44,8 +44,9 @@ from ccs.bus.event_bus import InMemoryEventBus
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON
 from ccs.core.states import MESIState
-from ccs.core.types import Artifact, ConflictDetail
+from ccs.core.types import Artifact, CommitAllEntry, ConflictDetail, FetchRequest, MultiCommitConflict
 
 _M_OR_E = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
 
@@ -80,6 +81,20 @@ def registry(request, tmp_path: Path):
     else:
         with SqliteArtifactRegistry(tmp_path / "state.db") as reg:
             yield reg
+
+
+@pytest.fixture(params=["in_memory", "sqlite"])
+def logged_registry(request, tmp_path: Path):
+    """Both registries with a state log attached, so a test can pin exactly
+    which rows a service call emits — and which it does not."""
+    log: list[dict] = []
+    if request.param == "in_memory":
+        yield ArtifactRegistry(state_log=log.append, instance_id="test"), log
+    else:
+        with SqliteArtifactRegistry(
+            tmp_path / "state.db", state_log=log.append, instance_id="test"
+        ) as reg:
+            yield reg, log
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +261,190 @@ def test_adapter_concurrent_publish_does_not_revoke_a_fresher_grant() -> None:
         "the coordinator kept B's grant but B's own cached view was invalidated "
         f"by the same stale signal (cache state {entry and entry.state})"
     )
+
+
+# ---------------------------------------------------------------------------
+# F4 — a peer's fetch must not re-arm a reclaimed holder's fence
+# ---------------------------------------------------------------------------
+#
+# ``read_generation`` is captured on a GENUINE read: the requester leg of
+# ``fetch``, or an I/S -> M/E acquire. ``CoordinatorService.fetch`` used to
+# rewrite EVERY non-INVALID peer to SHARED with ``trigger="fetch"``, and the
+# registries capture on that trigger — so a peer already in SHARED was
+# re-captured on a read it never made, and re-stamped an observation it never
+# had. A holder the sweep reclaimed and a late same-version update re-granted
+# SHARED then sat one peer fetch away from a fresh claim: refused
+# ``stale_read_generation`` once, admitted the next time, the version unmoved
+# in between. The loop now leaves SHARED peers alone and downgrades only M/E
+# holders, which is what ``FetchAction`` in ``formal/tla/MESI.tla`` always
+# said it did.
+
+
+def _seed_reclaimed_shared_holder(svc: CoordinatorService, art_id, writer, holder) -> None:
+    """Build the reclaimed-then-re-granted holder THROUGH the service.
+
+      t1    W acquires and commits                  -> version 2, epoch 0
+      t3    A acquires EXCLUSIVE                    -> A.rg 0
+      t100  the sweep reclaims A (never heartbeated) -> A INVALID, epoch 1, version 2
+      t101  a late same-version update re-grants A SHARED
+            (``AgentRuntime.handle_update``'s ``"update"`` shape: no capture)
+
+    A now holds a SHARED grant whose captured generation (0) is behind the
+    epoch (1) while the version is exactly the one it read — the reclaim the
+    version CAS cannot see, which the fence exists to refuse.
+    """
+    svc.write(agent_id=writer, artifact_id=art_id, issued_at_tick=1)
+    updated, _signals = svc.commit(agent_id=writer, artifact_id=art_id, content="v2", issued_at_tick=2)
+    assert updated.version == 2
+
+    svc.write(agent_id=holder, artifact_id=art_id, issued_at_tick=3)
+    assert svc.registry.get_agent_state(art_id, holder) == MESIState.EXCLUSIVE
+    assert svc.registry.get_read_generation(art_id, holder) == 0
+
+    reclaimed = svc.enforce_stable_grant_timeouts(
+        current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=1000
+    )
+    assert reclaimed == 1
+    assert svc.registry.get_agent_state(art_id, holder) == MESIState.INVALID
+    assert svc.registry.get_owner_generation(art_id) == 1
+    assert svc.registry.get_artifact(art_id).version == 2
+
+    svc.registry.set_agent_state(art_id, holder, MESIState.SHARED, trigger="update", tick=101)
+    assert svc.registry.get_read_generation(art_id, holder) == 0, '"update" is not a capture trigger'
+
+
+def _fenced_commit_reason(reg, art_id, agent, *, path: str, tick: int) -> str | None:
+    """The holder's commit at version 2 on ``path``: its refusal reason, or None on a win."""
+    if path == "commit_cas":
+        result = reg.commit_cas(art_id, agent, expected_version=2, content_hash="zombie", tick=tick)
+        return result.reason if isinstance(result, ConflictDetail) else None
+    result = reg.commit_all(
+        agent,
+        {art_id: CommitAllEntry(expected_version=2, content_hash="zombie", content="zombie")},
+        tick=tick,
+    )
+    return result.per_artifact[art_id].reason if isinstance(result, MultiCommitConflict) else None
+
+
+@pytest.mark.parametrize("commit_path", ["commit_cas", "commit_all"])
+def test_peer_fetch_does_not_rearm_a_reclaimed_holders_fence(registry, commit_path) -> None:
+    """A ``stale_read_generation`` refusal is sticky across a peer's fetch.
+
+      t102  A's commit at version 2          -> REFUSED stale_read_generation
+      t103  peer P fetches                    -> A is already SHARED: left alone
+      t104  A's commit at version 2, again    -> REFUSED again; version still 2
+
+    Before the fix t103 rewrote A to SHARED with ``trigger="fetch"``, the
+    registry captured epoch 1 into A's ``read_generation``, and t104 landed
+    (version 3) — a commit the fence had just refused, admitted because
+    someone ELSE read the artifact. Both commit paths, both registries.
+    """
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    w, a, p = uuid4(), uuid4(), uuid4()
+    _seed_reclaimed_shared_holder(svc, art.id, w, a)
+
+    assert _fenced_commit_reason(registry, art.id, a, path=commit_path, tick=102) == STALE_READ_GENERATION_REASON
+    assert registry.get_artifact(art.id).version == 2
+
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=p, requested_at_tick=103))
+
+    reason = _fenced_commit_reason(registry, art.id, a, path=commit_path, tick=104)
+    assert reason == STALE_READ_GENERATION_REASON, (
+        f"the reclaimed holder's {commit_path} was refused stale_read_generation, a peer fetched, "
+        f"and the identical commit was then {'ADMITTED' if reason is None else 'refused ' + reason} "
+        f"(version now {registry.get_artifact(art.id).version})"
+    )
+    assert registry.get_artifact(art.id).version == 2, "phantom version bump"
+    assert registry.get_read_generation(art.id, a) == 0, (
+        "a peer's fetch re-captured the reclaimed holder's read_generation on a read it never made"
+    )
+
+
+def test_own_reread_after_a_peer_fetch_recaptures_and_wins(registry) -> None:
+    """Only the holder's OWN read clears the refusal: the requester leg of
+    ``fetch`` still captures, SHARED -> SHARED included, so a reclaimed SHARED
+    agent recovers through its re-read and the ``write_cas`` retry loop keeps
+    converging. The fence is sticky, not permanent."""
+    svc = CoordinatorService(registry)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    w, a, p = uuid4(), uuid4(), uuid4()
+    _seed_reclaimed_shared_holder(svc, art.id, w, a)
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=p, requested_at_tick=103))
+    assert registry.get_agent_state(art.id, a) == MESIState.SHARED
+
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=a, requested_at_tick=104))
+
+    assert registry.get_agent_state(art.id, a) == MESIState.SHARED
+    assert registry.get_read_generation(art.id, a) == 1, (
+        "the holder's own SHARED -> SHARED re-read did not capture the current epoch"
+    )
+    result = registry.commit_cas(art.id, a, expected_version=2, content_hash="fresh", tick=105)
+    assert not isinstance(result, ConflictDetail), f"a re-read holder's commit was refused: {result.reason}"
+    assert registry.get_artifact(art.id).version == 3
+
+
+def test_peer_fetch_still_downgrades_an_exclusive_holder(logged_registry) -> None:
+    """Teeth for the guard: the skip is for SHARED peers only. An EXCLUSIVE
+    holder is still downgraded by a peer's fetch, with its E -> S ``"fetch"``
+    row in the state log — the MESI downgrade the loop exists for."""
+    reg, log = logged_registry
+    svc = CoordinatorService(reg)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    a, p = uuid4(), uuid4()
+
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=a, requested_at_tick=1))
+    assert reg.get_agent_state(art.id, a) == MESIState.EXCLUSIVE
+    log.clear()
+
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=p, requested_at_tick=2))
+
+    assert reg.get_agent_state(art.id, a) == MESIState.SHARED, "an EXCLUSIVE holder survived a peer's fetch"
+    rows = {(e["agent_id"], e["from_state"], e["to_state"]) for e in log if e["trigger"] == "fetch"}
+    assert rows == {(str(a), "EXCLUSIVE", "SHARED"), (str(p), "INVALID", "SHARED")}
+
+
+def test_peer_fetch_leaves_shared_bystanders_untouched(logged_registry) -> None:
+    """One EXCLUSIVE holder, two SHARED bystanders, one peer fetch: only the
+    holder is downgraded. The bystanders keep their captured generation and
+    their recorded observation, and get no state-log row.
+
+    Seeded directly — EXCLUSIVE cannot coexist with SHARED holders through the
+    service — with the epoch and the version both moved past what the
+    bystanders captured, so a rewrite would show on every axis.
+    """
+    reg, log = logged_registry
+    svc = CoordinatorService(reg)
+    art = svc.register_artifact(name="plan.md", content="v1")
+    holder, b1, b2, p = uuid4(), uuid4(), uuid4(), uuid4()
+
+    for bystander in (b1, b2):
+        reg.set_agent_state(art.id, bystander, MESIState.SHARED, trigger="fetch", tick=1)
+    bumped = Artifact(id=art.id, name="plan.md", version=2, content_hash="h2")
+    reg.set_artifact_and_content(art.id, bumped, "v2")
+    reg.set_agent_state(art.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=2)
+    reg.set_agent_state(art.id, holder, MESIState.INVALID, trigger="invalidate", tick=3)
+    reg.set_agent_state(art.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=4)
+    assert reg.get_owner_generation(art.id) == 1
+    for bystander in (b1, b2):
+        assert reg.get_read_generation(art.id, bystander) == 0
+        assert reg.last_observed_version_for(art.id, bystander) == 1
+    log.clear()
+
+    svc.fetch(FetchRequest(artifact_id=art.id, requesting_agent_id=p, requested_at_tick=5))
+
+    assert reg.get_agent_state(art.id, holder) == MESIState.SHARED
+    assert reg.get_agent_state(art.id, p) == MESIState.SHARED
+    for bystander in (b1, b2):
+        assert reg.get_read_generation(art.id, bystander) == 0, (
+            "a bystander's read_generation was re-captured by a peer's fetch"
+        )
+        assert reg.last_observed_version_for(art.id, bystander) == 1, (
+            "a bystander's observation was re-stamped by a peer's fetch"
+        )
+    expected = {str(holder), str(p)}
+    touched = {e["agent_id"] for e in log}
+    assert touched == expected, f"a peer's fetch wrote state for bystanders: {touched - expected}"
 
 
 # ---------------------------------------------------------------------------
