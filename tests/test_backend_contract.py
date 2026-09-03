@@ -300,3 +300,24 @@ def test_module_imports_no_networked_code() -> None:
         text = fh.read()
     for forbidden in ("import socket", "import ssl", "import urllib", "import http", "requests"):
         assert forbidden not in text, forbidden
+
+
+def test_r9_fence_capture_survives_every_peer_fetch() -> None:
+    """The captured generation is the zombie's side of the fence check, and it
+    is written only by the zombie's OWN claim: a peer's fetch that downgrades
+    it to SHARED captures nothing, and a peer's fetch never rewrites an
+    already-SHARED holder — so a superseded value survives, and the refusal
+    stays sticky, until the zombie's own re-read or re-acquire. Two pins keep
+    the clause from drifting back to the trigger-only rule."""
+    text = R9_ATOMIC_BOUNDARY.fence_admit_on_absent
+    assert "captures nothing" in text
+    assert "never rewrites an already-SHARED holder" in text
+
+
+def test_set_agent_state_member_contract_states_the_capture_rule() -> None:
+    """The ``set_agent_state`` member contract carries the capture rule the
+    registries implement: capture rides the agent's OWN claim-establishing
+    transition, and a transition OUT of M/E captures nothing."""
+    rationale = MEMBER_CLASSIFICATION["set_agent_state"].rationale
+    assert "OWN claim" in rationale
+    assert "captures nothing" in rationale

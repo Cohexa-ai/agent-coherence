@@ -6,7 +6,41 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Changed
+
+- A peer's `fetch` no longer emits `SHARED`→`SHARED` `"fetch"` state-log
+  rows for SHARED bystanders and no longer re-stamps their
+  `last_observed_version`; under that trigger only a MODIFIED/EXCLUSIVE
+  holder is downgraded, and logged. Recorded logs from before this change
+  still replay — the trigger set is unchanged.
+
 ### Fixed
+
+- **A `stale_read_generation` refusal is now sticky — a peer's read no
+  longer re-arms a reclaimed holder's fence.** `CoordinatorService.fetch`
+  emits `trigger="fetch"` on two legs: the requester's own read, and the
+  loop that moved every other non-INVALID peer to SHARED — including peers
+  already SHARED. The registries' read-generation capture was keyed on the
+  trigger alone, so a bystander's `read_generation` was refreshed to the
+  current epoch by someone else's read. For an ex-holder the stable-grant
+  sweep had reclaimed — whose `commit_cas` at the unchanged version had been
+  correctly refused `stale_read_generation` — the next peer fetch rewrote
+  its superseded value, and its next commit at that same version was
+  admitted. The reject was correct but not sticky. Reachable in state
+  through the library adapters (a deferred or asynchronous event bus, where
+  a held broadcast re-grants the reclaimed writer SHARED) and the simulation
+  engine; the admitted commit always carries the current bytes, so this is a
+  revoked-authority violation, not a lost update. The Claude Code adapter
+  never calls `fetch` and is unaffected. `fetch` now leaves already-SHARED
+  peers untouched, and on both registries the trigger-armed capture also
+  requires that the agent is not leaving MODIFIED/EXCLUSIVE — an agent's
+  `read_generation` is written only by its own acquire or its own genuine
+  read, so only the zombie's own re-read or re-acquire clears the refusal.
+  Expect `stale_read_generation` to persist across peers' reads where it
+  previously vanished. The backend conformance kit gains a service-driven
+  fetch scenario that a re-capturing backend fails, and `Fencing.tla` pins
+  the rule as the `NoUnearnedCapture` action property with a documented
+  mutant (`formal/tla/README.md` recipe 18).
 
 - **The effect gate now holds a write-preempted holder's escaping effect —
   the one revocation that moves neither comparand.** A peer's pessimistic
