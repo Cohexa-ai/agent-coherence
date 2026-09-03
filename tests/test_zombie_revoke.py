@@ -34,7 +34,10 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections import Counter
+from functools import partial
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 import pytest
@@ -445,6 +448,128 @@ def test_peer_fetch_leaves_shared_bystanders_untouched(logged_registry) -> None:
     expected = {str(holder), str(p)}
     touched = {e["agent_id"] for e in log}
     assert touched == expected, f"a peer's fetch wrote state for bystanders: {touched - expected}"
+
+
+class _DeferredBus(InMemoryEventBus):
+    """Holds every publish until ``release`` — the late-delivery shape.
+
+    A broadcast is minted inside the registry lock and delivered after it is
+    released (``adapters/base.py``); this bus stretches that window so the
+    test can run a sweep reclaim inside it, in one thread, with no gating.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held: list[Callable[[], int]] = []
+
+    def publish_invalidation(self, signal, *, recipients):  # type: ignore[override]
+        self.held.append(partial(InMemoryEventBus.publish_invalidation, self, signal, recipients=list(recipients)))
+        return 0
+
+    def publish_update(self, event, *, recipients):  # type: ignore[override]
+        self.held.append(partial(InMemoryEventBus.publish_update, self, event, recipients=list(recipients)))
+        return 0
+
+    def release(self) -> None:
+        held, self.held = self.held, []
+        for deliver in held:
+            deliver()
+
+
+def test_adapter_fence_forces_a_reclaimed_writer_to_reread_before_write_cas(monkeypatch) -> None:
+    """Reachability through the public adapter seam: the reclaimed writer
+    cannot win ``write_cas`` on its stale claim; the fence forces a re-read.
+
+      t1    W writes v2 through the adapter        -> W MODIFIED; the eager
+            broadcast to P is HELD on the bus
+      t2    Q registers (joined after the mint: not a recipient, cache cold)
+      t200  the sweep reclaims W (no heartbeat)    -> W INVALID, epoch 1, v2
+      rel   the held broadcast lands on P; P's ``handle_update`` writer leg
+            re-grants W SHARED with ``"update"``   -> W.rg 0 < epoch 1
+      t201  Q reads                                -> cache cold, reaches
+            ``service.fetch``: the peer leg the fix guards
+      t202  W calls ``write_cas``                  -> refused once, re-reads,
+            wins at v3 with ITS bytes
+
+    Before the fix t201 rewrote W SHARED -> SHARED with ``"fetch"``, the
+    registry captured epoch 1 for W, and t202 landed with ZERO fetches — a
+    claim the fence had refused, cleared because someone else read.
+
+    Why a deferred bus: with the default synchronous ``InMemoryEventBus`` the
+    broadcast is delivered inside W's own ``write`` call, so W is downgraded
+    M -> SHARED before it ever returns, and there is no M/E grant left for a
+    sweep to reclaim — the state cannot be reached. Why Q, not P, is the
+    fetcher: the released broadcast leaves P holding a SHARED cache entry at
+    v2, and under the eager strategy a SHARED entry is a cache hit
+    (``requires_refresh`` only on INVALID), so P's read never reaches the
+    coordinator. Neither is a second assertion path; both are why the
+    choreography is shaped as it is.
+    """
+    bus = _DeferredBus()
+    core = CoherenceAdapterCore(strategy_name="eager", event_bus=bus)
+    w = core.register_agent("W", now_tick=0)
+    p = core.register_agent("P", now_tick=0)
+    art = core.register_artifact(name="plan.md", content="v1")
+
+    fetches: Counter = Counter()
+    real_fetch = core.coordinator.fetch
+
+    def _counted_fetch(request):
+        fetches[request.requesting_agent_id] += 1
+        return real_fetch(request)
+
+    monkeypatch.setattr(core.coordinator, "fetch", _counted_fetch)
+
+    updated = core.write(agent_name="W", artifact_id=art.id, content="w-v2", now_tick=1)
+    assert updated.version == 2
+    assert core.registry.get_agent_state(art.id, w) == MESIState.MODIFIED
+    assert bus.held, "the eager broadcast was not held"
+    q = core.register_agent("Q", now_tick=2)
+
+    # The adapter's own sweep fires only from read()/write(), and either would
+    # fetch first — a read by W would take a spurious grant. Drive the
+    # coordinator's sweep directly, as a scheduler would.
+    reclaimed = core.coordinator.enforce_stable_grant_timeouts(
+        current_tick=200, heartbeat_timeout_ticks=10, max_hold_ticks=1000
+    )
+    assert reclaimed == 1
+    assert core.registry.get_agent_state(art.id, w) == MESIState.INVALID
+    assert core.registry.get_owner_generation(art.id) == 1
+    assert core.registry.get_artifact(art.id).version == 2
+
+    bus.release()
+
+    assert core.registry.get_agent_state(art.id, p) == MESIState.SHARED
+    assert core.registry.get_agent_state(art.id, w) == MESIState.SHARED, (
+        "the recipient's update handling did not re-grant the writer SHARED"
+    )
+    assert core.registry.get_read_generation(art.id, w) == 0, '"update" is not a capture trigger'
+
+    core.read(agent_name="Q", artifact_id=art.id, now_tick=201)
+    assert fetches[q] == 1, "Q's read was not the cache-cold fetch the scenario needs"
+    assert core.registry.get_agent_state(art.id, q) == MESIState.SHARED
+    w_generation_after_peer_fetch = core.registry.get_read_generation(art.id, w)
+    # W's cache-cold fetch inside its t1 write is already on the counter; only
+    # the fetches write_cas itself performs are the forced re-read.
+    w_fetches_before = fetches[w]
+
+    won = core.write_cas(
+        agent_name="W",
+        artifact_id=art.id,
+        make_content=lambda _entry: ("w-v3", None),
+        now_tick=202,
+    )
+
+    rereads = fetches[w] - w_fetches_before
+    assert rereads >= 1, (
+        f"the reclaimed writer's write_cas won with {rereads} coordinator fetches: a peer's "
+        "read cleared a refusal only the writer's own re-read may clear"
+    )
+    assert won.version == 3
+    assert core.registry.get_content(art.id) == "w-v3", "the committed bytes are not the writer's"
+    assert w_generation_after_peer_fetch == 0, (
+        "a peer's fetch re-captured the reclaimed writer's read_generation on a read it never made"
+    )
 
 
 # ---------------------------------------------------------------------------
