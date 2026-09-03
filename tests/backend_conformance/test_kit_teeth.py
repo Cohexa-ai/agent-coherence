@@ -23,9 +23,15 @@ this leg (the OCC writer commits at the CORRECT version, so only the grant check
 can stop it).
 
 The MUST-MATCH scenarios that do NOT depend on the grant leg (pure version-CAS
-arbitration, admit-on-absent) still PASS the stub — proving the teeth test fails
-the stub for the RIGHT reason (the dropped grant leg), not because the stub is
-broken everywhere.
+arbitration, admit-on-absent, the fence staying sticky across a peer's fetch)
+still PASS the stub — proving the teeth test fails the stub for the RIGHT reason
+(the dropped grant leg), not because the stub is broken everywhere.
+
+A third stub (:class:`_RearmingRegistry`) gives the peer-fetch scenario its
+teeth: it delegates everything, but a requester's ``"fetch"`` set re-lists every
+OTHER non-INVALID holder under the capture trigger — the effect the service's
+fetch loop used to have when it rewrote peers that were already SHARED, moved
+inside the backend. The kit's peer-fetch scenario MUST FAIL it.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from uuid import UUID
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import CasResult
+from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult
 from ccs.core.states import MESIState
 from ccs.core.types import CasCorruption, ConflictDetail
 from tests.backend_conformance import kit
@@ -171,6 +177,96 @@ class _TornPairFactory:
         return None
 
 
+class _RearmingRegistry:
+    """A degraded backend that RE-ARMS the read-generation fence on a peer's
+    read. Delegates everything to a wrapped real in-memory registry via
+    ``__getattr__`` EXCEPT ``set_agent_state``: after delegating the call, any
+    set carrying the capture trigger toward a non-INVALID state re-lists EVERY
+    other non-INVALID holder of that artifact under the same trigger. That is
+    the effect the service's fetch loop used to have when it rewrote peers that
+    were already SHARED, reproduced inside the backend. The registry exposes no
+    setter for ``read_generation``, so the refresh IS a re-issued
+    ``set_agent_state`` at the holder's current state — which the real
+    predicate cannot tell from that holder's own read, so it re-captures the
+    current ``owner_generation`` on a read the holder never made.
+
+    A per-target re-capture alone would have no teeth: the fixed service never
+    routes a ``"fetch"`` set to a peer that is already SHARED, so only a wrapper
+    that refreshes the OTHER holders can reach the zombie."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        # Every member except set_agent_state comes straight from the real registry.
+        return getattr(self._inner, name)
+
+    def set_agent_state(  # noqa: D401 - degraded on purpose
+        self,
+        artifact_id: UUID,
+        agent_id: UUID,
+        state: MESIState,
+        *,
+        trigger: str = "unknown",
+        tick: int = 0,
+        content_hash: str | None = None,
+    ) -> None:
+        self._inner.set_agent_state(
+            artifact_id, agent_id, state, trigger=trigger, tick=tick, content_hash=content_hash
+        )
+        if trigger not in CLAIM_CAPTURE_TRIGGERS or state == MESIState.INVALID:
+            return
+        # THE INJECTED BUG: one agent's read re-lists every other non-INVALID
+        # holder under the capture trigger. To the inner registry each re-set is
+        # that holder's own read, so its read_generation is refreshed.
+        for holder, holder_state in self._inner.get_state_map(artifact_id).items():
+            if holder == agent_id or holder_state == MESIState.INVALID:
+                continue
+            self._inner.set_agent_state(
+                artifact_id, holder, holder_state, trigger=trigger, tick=tick
+            )
+
+
+class _RearmingFactory:
+    """A :class:`RegistryFactory` minting one process-scoped
+    :class:`_RearmingRegistry` (same shape as :class:`_DegradedFactory`)."""
+
+    def __init__(self) -> None:
+        self._reg: _RearmingRegistry | None = None
+
+    def __call__(self) -> _RearmingRegistry:
+        if self._reg is None:
+            self._reg = _RearmingRegistry()
+        return self._reg
+
+    def close_all(self) -> None:
+        return None
+
+    @property
+    def db_path(self) -> Path | None:
+        return None
+
+
+def test_rearming_stub_fails_peer_fetch_scenario() -> None:
+    """THE TEETH for the peer-fetch scenario. A backend that refreshes every
+    non-INVALID holder's ``read_generation`` whenever a requester's ``"fetch"``
+    set lands MUST FAIL the kit — otherwise the scenario would bless the very
+    re-arm that let a refused commit land because someone else read. The failure
+    message names the peer-fetch leg and the obligation a backend author skipped."""
+    factory: RegistryFactory = _RearmingFactory()
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_peer_fetch_does_not_rearm_superseded_read_generation(factory)
+    message = str(excinfo.value)
+    assert "PEER's fetch RE-ARMED" in message
+    # The wrapper refreshed the operand to the CURRENT epoch (0 → 1), which is
+    # exactly the re-arm — not some unrelated corruption of the value.
+    assert "moved from 0 to 1" in message
+    assert "OWN acquire or OWN read" in message, (
+        "the teeth failure must name the obligation a backend author skipped; "
+        f"got: {message}"
+    )
+
+
 def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
     """THE TEETH for the pair-atomicity scenario. A backend serving
     ``get_artifact_and_generation`` as two independent reads MUST FAIL the kit —
@@ -217,6 +313,10 @@ def test_degraded_stub_still_passes_grant_independent_scenarios() -> None:
     # Admit-on-absent: a plain OCC writer with no fence claim wins — again grant-
     # independent (a fresh factory so no cross-scenario state bleed).
     kit.assert_fence_admits_absent_read_generation(factory)
+    # Peer-fetch stickiness: the stub delegates set_agent_state, so a peer's
+    # fetch reaches the real capture predicate and the zombie stays refused —
+    # grant-independent, still correct (a fresh factory again).
+    kit.assert_peer_fetch_does_not_rearm_superseded_read_generation(_DegradedFactory())
 
 
 def test_degraded_stub_fence_reject_leg_still_holds() -> None:
