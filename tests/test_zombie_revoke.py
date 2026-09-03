@@ -267,7 +267,7 @@ def test_adapter_concurrent_publish_does_not_revoke_a_fresher_grant() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F4 — a peer's fetch must not re-arm a reclaimed holder's fence
+# F4 — a peer's fetch must not re-arm a reclaim-zombie's fence
 # ---------------------------------------------------------------------------
 #
 # ``read_generation`` is captured on a GENUINE read: the requester leg of
@@ -354,13 +354,13 @@ def test_peer_fetch_does_not_rearm_a_reclaimed_holders_fence(registry, commit_pa
 
     reason = _fenced_commit_reason(registry, art.id, a, path=commit_path, tick=104)
     assert reason == STALE_READ_GENERATION_REASON, (
-        f"the reclaimed holder's {commit_path} was refused stale_read_generation, a peer fetched, "
+        f"the reclaim-zombie's {commit_path} was refused stale_read_generation, a peer fetched, "
         f"and the identical commit was then {'ADMITTED' if reason is None else 'refused ' + reason} "
         f"(version now {registry.get_artifact(art.id).version})"
     )
     assert registry.get_artifact(art.id).version == 2, "phantom version bump"
     assert registry.get_read_generation(art.id, a) == 0, (
-        "a peer's fetch re-captured the reclaimed holder's read_generation on a read it never made"
+        "a peer's fetch re-captured the reclaim-zombie's read_generation on a read it never made"
     )
 
 

@@ -19,7 +19,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
-from ccs.core.exceptions import StaleReadGeneration
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, ConflictDetail
 
@@ -202,7 +202,6 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     (owner_generation advanced between commit()'s state check and the
     version persist)."""
     from ccs.coordinator.service import CoordinatorService
-    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry as _Sqlite
 
     reg = registry
     art = _register(reg)
@@ -211,13 +210,7 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     # Pessimistic acquire WITHOUT a prior fetch (P0-fix path): captures gen 0.
     service.write(agent_id=a, artifact_id=art.id, issued_at_tick=1)
     # Manufacture the race: generation advances while the state stays E.
-    if isinstance(reg, _Sqlite):
-        reg._conn.execute(
-            "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
-            (art.id.hex,),
-        )
-    else:
-        reg._records[art.id].owner_generation += 1
+    _poke_owner_generation(reg, art.id)
 
     with pytest.raises(StaleReadGeneration):
         service.commit(agent_id=a, artifact_id=art.id, content="late", issued_at_tick=2)
@@ -271,7 +264,7 @@ def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -
     assert reg.get_read_generation(art.id, a) == 0  # preserved, and present
     res = reg.commit_cas(art.id, a, expected_version=1, content_hash="late")
     assert isinstance(res, ConflictDetail)
-    assert res.reason == "stale_read_generation"
+    assert res.reason == STALE_READ_GENERATION_REASON
     assert _pair(reg, art.id) == (1, 1)  # version unmoved
 
 
