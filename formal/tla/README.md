@@ -160,7 +160,7 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `MonotonicVersion` | `check_monotonic_version()` in `src/ccs/core/invariants.py` |
 | `NoLostUpdate` | concurrent-writer test (`tests/test_occ_commit_cas.py`) |
 | `ObserveGenAction` | a non-INVALID holder's genuine re-read — the `read_generation` capture in `set_agent_state` on the requester's own `"fetch"` transition, behind the registries' INVALID guard (an INVALID agent's read is the fetch grant itself, modeled by `FetchAction`). The E∪M-acquire capture arm is `FencingWriteAction` |
-| `NoUnearnedCapture` | the sticky-refusal regressions in `tests/test_zombie_revoke.py` (a peer's fetch — downgrade or SHARED→SHARED — never re-arms a refused reclaim-zombie on either registry; the requester's own re-read still captures) and the service-driven conformance-kit scenario a re-capturing backend fails |
+| `NoUnearnedCapture` | the sticky-refusal regressions in `tests/test_fetch_peer_leg_fence.py` (a peer's fetch — downgrade or SHARED→SHARED — never re-arms a refused reclaim-zombie on either registry; the requester's own re-read still captures) and the service-driven conformance-kit scenario a re-capturing backend fails |
 | `FencingSweepAction` | the `owner_generation` bump on reclaim triggers in `set_agent_state` |
 | `FencingCommitAction` | the generation guard in `commit_cas` + `set_artifact_and_content(fence_agent_id=…)` |
 | `FencingInvalidateAction` | `service.invalidate` — the NoZombieRevoke pin (`_revoke_is_superseded`) plus the `owner_generation` bump the shared `EPOCH_BUMP_TRIGGERS` predicate now covers |
