@@ -166,7 +166,13 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "the version bumps owner_generation for the fence — the sweep reclaims "
         "AND the voluntary invalidate release (EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
-        "arbitrates those. Single-writer is checked after each such transition.",
+        "arbitrates those. Single-writer is checked after each such transition. "
+        "The read_generation capture rides the same transition and is keyed on "
+        "the agent's OWN claim: an I/S->M/E acquire, or a genuine read the agent "
+        "requested (CLAIM_CAPTURE_TRIGGERS plus the not-previously-in-M/E "
+        "guard); a transition that takes the agent OUT of M/E captures nothing, "
+        "so a peer's fetch that downgrades a holder never refreshes its "
+        "captured generation.",
     ),
     MemberContract(
         "set_agent_transient",
@@ -653,7 +659,9 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "read-generation fence (owner_generation vs the committer's captured "
         "read_generation: reject a writer whose M/E grant was revoked without "
         "the version moving — by the sweep OR by a voluntary invalidate release "
-        "— since version-CAS alone cannot see that)",
+        "— since version-CAS alone cannot see that; the captured operand is "
+        "written only at the committer's own claim-establishing transitions, "
+        "never by a peer's fetch)",
     ),
     # Reproduced verbatim from the shipped guard semantics + the fence-parity
     # lesson (docs/solutions/.../fence-admit-on-absent-...). Do NOT paraphrase:
@@ -666,8 +674,14 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "owner_generation WINS (the version bumps). ONLY a PRESENT read_generation "
         "that is superseded (< owner_generation) is REJECTED as "
         "stale_read_generation. A reclaim-zombie is NEVER absent — it captured its "
-        "read_generation atomically at the I/S->M/E acquire and the sweep "
-        "preserved that value while bumping owner_generation — so admit-on-absent "
+        "read_generation atomically at the I/S->M/E acquire, the sweep preserved "
+        "that value while bumping owner_generation, and no later transition that "
+        "leaves its authority unchanged or reduces it refreshes the value: a "
+        "voluntary release preserves it, a peer's fetch that downgrades it to "
+        "SHARED captures nothing, and a peer's fetch never rewrites an "
+        "already-SHARED holder, which is why the superseded value SURVIVES until "
+        "the zombie's OWN re-acquire (I/S->M/E) or its OWN genuine read "
+        "re-captures it — so admit-on-absent "
         "removes no fence coverage. The `is not None` predicate is load-bearing, "
         "not defensive: it separates the plain OCC writer (admit) from the "
         "reclaim-zombie (reject)."

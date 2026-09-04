@@ -258,7 +258,7 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `trigger` | Fires when |
 |-----------|-----------|
 | `"register"` | Initial artifact registration; registering agent receives EXCLUSIVE |
-| `"fetch"` | Fetch grant; agent transitions to SHARED or EXCLUSIVE |
+| `"fetch"` | Fetch grant; the requester transitions to SHARED or EXCLUSIVE, and a peer holding EXCLUSIVE/MODIFIED is downgraded to SHARED under the same trigger (a peer already in SHARED is not touched) |
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
 | `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
@@ -271,7 +271,11 @@ holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
 *without the version moving* — the one case a version check cannot see. A later
 commit from that ex-holder is then rejected with `stale_read_generation` rather
 than silently applied. `"write"` and `"commit"` do not move the epoch: those
-paths move the version, so the version check already arbitrates them.
+paths move the version, so the version check already arbitrates them. An
+agent's side of the check — the generation it captured — is written only by
+its own acquire or its own read; being downgraded by another agent's fetch
+never refreshes it, so an ex-holder rejected with `stale_read_generation`
+stays rejected until it re-reads or re-acquires itself.
 
 An explicit invalidation is also **pinned**: one issued by a peer is dropped as
 obsolete if the agent it names has since observed a version at least as new as

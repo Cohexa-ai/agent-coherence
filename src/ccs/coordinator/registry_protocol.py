@@ -191,10 +191,15 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
 # even with the (version, generation) pair unchanged).
 EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"})
-# CLAIM_CAPTURE_TRIGGERS: triggers marking a GENUINE content read for
-# read-generation capture (the E/M-acquire capture is keyed on the state
-# transition, not the trigger). Service.fetch() emits "fetch"; renaming it
-# without updating this would silently disable capture on reads.
+# CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
+# content read for read-generation capture (the E/M-acquire capture is keyed
+# on the state transition, not the trigger). Membership is necessary, not
+# sufficient: service.fetch() emits "fetch" on two legs -- the requester's own
+# read (I/S -> S/E) and the downgrade of an M/E peer to SHARED -- and only the
+# first is a claim. The capture site therefore also requires that the agent is
+# not leaving M/E (and is not being granted INVALID); a peer's downgrade never
+# refreshes the ex-holder's captured generation. Renaming the trigger without
+# updating this would silently disable capture on reads.
 CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 

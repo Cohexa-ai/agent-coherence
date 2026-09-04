@@ -108,6 +108,8 @@ CLAIM_LADDER: tuple[ClaimRung, ...] = (
             "test_release_by_invalidate_arms_the_fence_like_a_sweep_reclaim",
             "tests/test_zombie_revoke.py::"
             "test_adapter_concurrent_publish_does_not_revoke_a_fresher_grant",
+            "tests/test_fetch_peer_leg_fence.py::"
+            "test_peer_fetch_does_not_rearm_a_reclaimed_holders_fence",
         ),
     ),
     ClaimRung(

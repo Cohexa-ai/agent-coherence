@@ -76,6 +76,9 @@ from .registry_protocol import (
     SqliteExtended,
 )
 
+# The write-claim states, as one membership set (mirrors the registries' _M_OR_E_STATES).
+_M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
+
 logger = logging.getLogger(__name__)
 
 
@@ -522,8 +525,16 @@ class CoordinatorService:
                 entered_tick=request.requested_at_tick,
             )
             if other_holders:
-                # Multiple readers must stay coherent; downgrade any exclusive/modified holder.
+                # Multiple readers must stay coherent: downgrade the M/E holder, if
+                # any. A peer already in SHARED is left alone — rewriting it would
+                # re-capture its read_generation on a read it never made and
+                # re-stamp an observation it never had ("fetch" is the capture
+                # trigger, and set_agent_state records both on every non-INVALID
+                # write). other_holders itself stays wide: the EXCLUSIVE-vs-SHARED
+                # grant above must still see every non-INVALID peer.
                 for agent_id in other_holders:
+                    if state_map[agent_id] not in _M_OR_E_STATES:
+                        continue
                     self.registry.set_agent_state(
                         request.artifact_id, agent_id, MESIState.SHARED, trigger="fetch", tick=request.requested_at_tick
                     )
