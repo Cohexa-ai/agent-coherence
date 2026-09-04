@@ -1553,6 +1553,36 @@ def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> Non
 # ----------------------------------------------------------------------
 
 
+def _await_in_flight_drain(
+    coordinator: CoordinatorHTTPServer, timeout_sec: float = 1.0,
+) -> None:
+    """Wait for the in-flight counter to reach zero, failing on timeout.
+
+    ``client.post`` returns as soon as the response body is read, but
+    ``release_handler_slot`` runs in the dispatcher's ``finally`` block
+    AFTER the response has been written. Between those two points the
+    counter still reads 1 from the client's point of view — a window of
+    microseconds on an idle machine, milliseconds on a loaded CI runner
+    (REL-03's lock around the watchdog counters widens it further).
+
+    Any test that samples the counter straight after a client call is
+    therefore racing the server thread. The contract under test is that
+    the finally block releases the slot — *eventually* zero, not zero by
+    the next bytecode op — so wait for the drain rather than sampling
+    it. Do NOT relax the assertion to ``<= 1`` instead: that stops
+    pinning the release, which is the whole property.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if coordinator._in_flight == 0:
+            return
+        time.sleep(0.010)
+    pytest.fail(
+        f"in-flight counter never drained: expected 0 within "
+        f"{timeout_sec}s, still at {coordinator._in_flight}"
+    )
+
+
 def test_i1_acquire_release_pair_balances_counter(tmp_path: Path) -> None:
     """Unit-level: acquire/release balance the in-flight counter; the
     drain condition is signalled on the zero transition."""
@@ -1652,36 +1682,27 @@ def test_i5_dispatch_pairs_acquire_with_release(client: _Client, coordinator) ->
     """Integration: a normal pre-read request increments and decrements
     the in-flight counter exactly once, leaving it at zero on return.
 
-    Polling rationale: client.post returns once the response body is read,
-    but ``release_handler_slot`` runs in the dispatcher's finally block
-    AFTER the response is sent. There's a microseconds-to-milliseconds
-    window where the counter is still 1 from the client's POV. Poll
-    briefly (up to 1s) instead of asserting immediately — the contract
-    is "eventually zero", not "zero by the next bytecode op". REL-03's
-    lock around watchdog counters widens this window slightly on slow
-    CI, surfacing the pre-existing race."""
+    The zero check waits for the drain — see :func:`_await_in_flight_drain`
+    for why sampling it straight after the response races the server
+    thread."""
     assert coordinator._in_flight == 0
     status, _ = client.post(
         "/hooks/pre-read",
         {"session_id": _sid("i5"), "path": "CLAUDE.md"},
     )
     assert status == 200
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        if coordinator._in_flight == 0:
-            return
-        time.sleep(0.010)
-    pytest.fail(
-        f"in-flight counter never drained: expected 0 within 1s, "
-        f"still at {coordinator._in_flight}"
-    )
+    _await_in_flight_drain(coordinator)
 
 
 def test_i6_dispatch_decrements_even_when_handler_raises(
     client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defensive: if a handler raises mid-dispatch (becoming a 500), the
-    finally block must still release the slot."""
+    finally block must still release the slot.
+
+    Same drain wait as i5: the 500 is written by the ``except`` arm and
+    the release happens in the ``finally`` that follows it, so the
+    client can observe the response before the decrement lands."""
     import ccs.adapters.claude_code.coordinator_server as mod
     original = mod._ROUTES[("POST", "/hooks/pre-read")]
 
@@ -1690,13 +1711,14 @@ def test_i6_dispatch_decrements_even_when_handler_raises(
 
     monkeypatch.setitem(mod._ROUTES, ("POST", "/hooks/pre-read"), raising_handler)
     try:
+        assert coordinator._in_flight == 0
         status, _ = client.post(
             "/hooks/pre-read",
             {"session_id": _sid("i6"), "path": "CLAUDE.md"},
         )
         assert status == 500
         # Counter must have been decremented despite the exception.
-        assert coordinator._in_flight == 0
+        _await_in_flight_drain(coordinator)
     finally:
         mod._ROUTES[("POST", "/hooks/pre-read")] = original
 
