@@ -597,6 +597,14 @@ per-file MESI state, a content hash, and a version. Point a second volume in
 another process at the same workspace and it attaches to the same coordinator, so
 every process on the host shares one coherent view.
 
+**Every volume coordinating a workspace must declare the same `managed` globs.**
+This is a hard requirement in v1, and it fails quietly if you break it: the
+coordinator checks only how *many* strict patterns a volume declared, not which
+ones, so a sibling whose globs differ from the spawner's constructs successfully
+and reports itself healthy — while its own paths are not guarded and its stale
+writes land with no signal. Until a per-glob check exists, a fleet with mixed
+globs is unsupported.
+
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume
 
@@ -953,7 +961,7 @@ The corpus's race scenarios run across real OS **process** boundaries: contender
 - Restore is over **artifacts, never effects** — files and objects come back; a sent message does not.
 - File members are detection-only (`no-arbiter`); only backends with a native conditional write arbitrate. And restore is a **forward** commit carrying old bytes — versions strictly increase, history is never rewritten.
 - Restoring file members while a live coordinator session is running bypasses that session's grants — the session learns of the change on its next read, not before. The CLI warns when it detects a live coordinator; it does not refuse.
-- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores of the same checkpoint assume a single controller — run one restore at a time.
+- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores assume a single controller — run one restore at a time. Two restores of the *same* checkpoint are the obvious case; the sharper one is two restores of **different** checkpoints that overlap on a member. Those are not cross-serialized: each leg compares against the state it read, so both can honestly report the member `restored` while only the last write survives on disk. The engine serializes its own runs; ordering across controllers is the operator's contract in v1.
 
 ## Multi-artifact snapshot sessions
 
