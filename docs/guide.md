@@ -39,12 +39,13 @@ full command-line toolset, and the API reference.
 19. [Real-workload benchmarks](#real-workload-benchmarks)
 20. [Benchmarking your own workload](#benchmarking-your-own-workload)
 21. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-22. [Replay (v0.8.2+)](#replay-v082)
-23. [Command-line tools](#command-line-tools)
-24. [API reference](#api-reference)
-25. [Low-level adapter API](#low-level-adapter-api)
-26. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-27. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+22. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+23. [Replay (v0.8.2+)](#replay-v082)
+24. [Command-line tools](#command-line-tools)
+25. [API reference](#api-reference)
+26. [Low-level adapter API](#low-level-adapter-api)
+27. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+28. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -258,13 +259,30 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `trigger` | Fires when |
 |-----------|-----------|
 | `"register"` | Initial artifact registration; registering agent receives EXCLUSIVE |
-| `"fetch"` | Fetch grant; agent transitions to SHARED or EXCLUSIVE |
+| `"fetch"` | Fetch grant; the requester transitions to SHARED or EXCLUSIVE, and a peer holding EXCLUSIVE/MODIFIED is downgraded to SHARED under the same trigger (a peer already in SHARED is not touched) |
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
 | `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
+
+The last four triggers move the artifact's **ownership epoch** when they take a
+holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
+*without the version moving* — the one case a version check cannot see. A later
+commit from that ex-holder is then rejected with `stale_read_generation` rather
+than silently applied. `"write"` and `"commit"` do not move the epoch: those
+paths move the version, so the version check already arbitrates them. An
+agent's side of the check — the generation it captured — is written only by
+its own acquire or its own read; being downgraded by another agent's fetch
+never refreshes it, so an ex-holder rejected with `stale_read_generation`
+stays rejected until it re-reads or re-acquires itself.
+
+An explicit invalidation is also **pinned**: one issued by a peer is dropped as
+obsolete if the agent it names has since observed a version at least as new as
+the one the signal announces. Without that, an invalidation minted before a peer
+was reclaimed and re-acquired would revoke the fresh grant it knows nothing
+about. An agent releasing its *own* claim is never pinned.
 
 ### Error handling
 
@@ -283,6 +301,17 @@ store = CCSStore(strategy="lazy", state_log=safe_log)
 ```
 
 `state_log=None` (default) adds no overhead — the guard is a single `is not None` check.
+
+### Callbacks run under the registry lock
+
+`state_log` (and the crash-recovery sweep's `on_reclaim` callback) execute while the
+coordinator's registry lock is **held**, on both backends. A callback that blocks —
+waiting on another thread, a network sink with no timeout, a queue that can fill —
+stalls every registry operation in the process for as long as it blocks, not just the
+one being logged. Keep callbacks fast and non-blocking: append to an in-memory buffer
+and drain it elsewhere, rather than doing I/O inline. Calling back into the store from
+inside a callback is safe only for registry methods (the lock is reentrant); never
+wait on other threads from inside one.
 
 ### Log validation
 
@@ -916,6 +945,8 @@ Offline, deterministic, no API keys. `--baseline` first demonstrates the loss (n
 
 The workspace family ships in the packaged conformance corpus (`ccs.testing.substrate_conformance`), so a foreign implementation of workspace checkpoint/restore can be tested against the same scenarios ours is. Implement the `WorkspaceConformanceBinding` protocol and **declare your capabilities honestly** (`declares_versioned` / `declares_pinnable` / `declares_restart_survival`); the suite splits into **MUST-MATCH** scenarios every implementation must reproduce (one-winner restore arbitration, torn-cut detection, bounded termination under contention, restore-as-forward-commit, ABSENT-is-a-fact) and **DECLARED** scenarios pinned to your own declarations (versioned vs unversioned history, pinnable vs `restorable-unpinned`, restart survival) — a binding passes by satisfying observable outcomes, never by mimicking our internals. The corpus imports and runs without pytest; `pip install 'agent-coherence[conformance]'` adds it so skipped scenarios report as skips under your test runner. The restore-registration design is model-checked (`formal/tla/WorkspaceVersion.tla`, run in CI).
 
+The corpus's race scenarios run across real OS **process** boundaries: contenders are spawned processes rendezvoused at a barrier before their racing section, so a binding whose "compare-and-swap" is a read-then-write under an in-process lock is caught rather than false-greened — in-process serialization satisfies no clause of the contract. A binding that genuinely cannot be raced across processes (an in-memory fake) is not silently skipped; it declares the reason and the run report prints the exemption. Two further axes ship with the corpus. **Durability**: a binding's `CapabilityDescriptor` can declare the regime an acknowledged write survives (`in-process`, `process-crash`, or `os-crash`) together with the configuration facts the claim rides on; the corpus verifies the process-crash grade locally by SIGKILLing a writer after its acknowledged commit and reading the store back, while fsync-grade discrimination and managed-cluster failover runs are recorded as declared exemptions with their reasons rather than skipped. **The claim ladder** (`ccs.testing.claim_ladder`): every guarantee this project claims is a rung pairing its guarantee text with the exact README claim-phrases it backs and the tests that would fail without it — the repo's own suite resolves every named test at collection time and drift-guards the README in both directions, so a claim cannot outlive its proof, and no cross-host rung exists to claim.
+
 **Scope, honestly.**
 
 - Single-host coordinator: checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims.
@@ -1017,7 +1048,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
-| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed |
+| `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
 
 Denials are machine-readable: an agent parses the typed payload (for example
@@ -1369,6 +1400,50 @@ See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags
 
 ---
 
+## Conflict-outcome counters — how often did it actually fire?
+
+*New in v0.14.1.*
+
+Every guarantee in this library ends in a typed refusal: `version_mismatch`,
+`other_holder`, `stale_read_generation`. The counters answer the question that
+follows — **how often does that actually happen in my fleet?** — with a number
+instead of an argument.
+
+The coordinator keeps a durable tally per `(artifact, agent, reason)` that
+survives restarts. Read it back offline, against a coordinator that is no
+longer running:
+
+```python
+from ccs.diagnose.conflict_counters import read_conflict_totals
+
+totals = read_conflict_totals(".coherence/state.db")
+# {(artifact_id_hex, agent_id_hex, "stale_read_generation"): 3, ...}
+
+for (artifact, agent, reason), count in sorted(totals.items()):
+    print(f"{reason:24} {count:>5}   artifact={artifact[:8]} agent={agent[:8]}")
+```
+
+The reader opens the database **read-only and raw** — it imports no coordinator
+and needs no daemon — so you can point it at a `state.db` copied off a machine
+after the fact.
+
+**The honesty rules matter more than the numbers, so they are worth stating
+plainly:**
+
+- A database written **before** this release has no `conflict_counters` table.
+  That reads as **zero recorded conflicts** — a real, reportable result.
+- Every **other** read failure — a locked database, a hot-WAL recovery failure,
+  disk I/O — is raised, never mapped to zero. A broken read can never
+  masquerade as a quiet month.
+- A missing file raises `FileNotFoundError`: a report against a store that does
+  not exist is a caller error, not evidence of zero conflicts.
+- **Attribution is by agent identity only.** No host identifier reaches the
+  commit path today, so a report built from these totals says "agent", not
+  "host" — the reader will not invent a dimension the data does not carry.
+
+Zero is a result. *No table at all* is a different result, and the distinction
+is exactly what makes a thirty-day observation window worth running.
+
 ## Replay (v0.8.2+)
 
 `agent-coherence-replay` is an invariant-replay tool that walks a captured
@@ -1603,7 +1678,7 @@ from ccs.adapters import OpenAIAgentsAdapter, CoherenceSession
 
 ### `gate(volume, path, *, decide, effect)`
 
-Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input state it was decided from. `gate()` captures the input's `(version, ownership generation)` pair (one atomic coordinator snapshot, via `volume.read_with_version_generation`), runs `decide`, re-reads the pair at the effect boundary, and fires `effect` only if **both** are unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs. The two comparands answer different questions: the version answers "is the value still the one `decide` saw"; the generation answers "is the grant it was read under still standing". A coordinator sweep that reclaims a stalled holder's grant advances the generation **without** a version move, so a version-only check would fire a reclaimed (zombie) holder's effect — the generation leg holds it.
+Order an escaping side effect (a deploy, an opened PR, a notification) against a shared input so it fires only on the input state it was decided from. `gate()` captures the input's `(version, ownership generation)` pair (one atomic coordinator snapshot, via `volume.read_with_version_generation`), runs `decide`, re-reads the pair at the effect boundary, and fires `effect` only if **both** are unchanged and confirmed — otherwise it raises `StaleView` (a HOLD) before the effect runs. The two comparands answer different questions: the version answers "is the value still the one `decide` saw"; the generation answers "is the grant it was read under still standing". A coordinator sweep that reclaims a stalled holder's grant advances the generation **without** a version move, so a version-only check would fire a reclaimed (zombie) holder's effect — the generation leg holds it. One revocation moves **neither** comparand: a peer's pessimistic write-acquire takes the holder's grant with no commit behind it yet (version unmoved) and no epoch bump (that trigger is deliberately outside the bump set). The gate closes that leg too — the re-read at the effect boundary must itself be served under a *standing* grant; a preempted holder's re-read comes back stale, and the effect holds with the typed `grant_preempted` cause. That re-read is a verification read the coordinator does not re-grant, so the hold is level-triggered: a bare re-gate holds again, and only `reacquire()` clears it.
 
 ```python
 from ccs.adapters import CoherentVolume, gate
@@ -1630,12 +1705,13 @@ Branch on `hold_cause` rather than the message:
 |---|---|---|
 | `version_moved` | a peer committed a newer version | `reacquire()`, re-decide, re-gate |
 | `grant_reclaimed` | the grant the decision was read under was reclaimed; the version never moved | `reacquire()`, re-decide, re-gate |
+| `grant_preempted` | a peer's write-claim acquire took the grant the decision was read under; **neither** the version nor the ownership generation moved (no commit yet, no epoch bump) — the gate saw the re-read itself come back without a standing grant | `reacquire()`, re-decide, re-gate |
 | `read_denied` | the coordinator refused the re-read (strict mode; this view is INVALID) — **on a strict-mode volume this is how a reclaim usually surfaces** | `reacquire()`, re-decide, re-gate |
 | `input_vanished` | the artifact is gone at the effect boundary | re-establish the input, then re-gate |
 | `version_unconfirmed` | a degraded read returned no confirmed version | restore coordinator health, then re-gate |
 | `generation_unconfirmed` | the residual bucket: no confirmed ownership generation, from a degraded read, an out-of-band edit the coordinator could not confirm, **or** a coordinator that does not report generations at all | `reacquire()` and re-gate **first** — that clears the first two. A HOLD that survives a *successful* reacquire is the third: check the daemon's version and restart it |
 
-**What the causes do and don't tell you.** The first five are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
+**What the causes do and don't tell you.** All but the last are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
 
 **Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 

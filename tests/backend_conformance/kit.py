@@ -10,8 +10,9 @@ demands be MECHANICAL, not a naming convention:
 
 **MUST-MATCH** (``assert_*`` functions taking only a :class:`RegistryFactory`):
 contract behaviors that MUST be identical on every conforming arm — CAS
-arbitration, the read-generation fence (including admit-on-absent), single-writer
-under barrier-forced contention, and session fail-closed refusals. Each
+arbitration, the read-generation fence (including admit-on-absent and the
+verdict staying sticky across a peer's fetch), single-writer under
+barrier-forced contention, and session fail-closed refusals. Each
 hard-asserts the SAME correctness property regardless of arm. There is no arm
 parameter and no expected-outcome parameter — the property is universal, so a
 must-match function CANNOT express "arm X may differ".
@@ -60,6 +61,7 @@ from ccs.core.states import MESIState
 from ccs.core.types import (
     Artifact,
     ConflictDetail,
+    FetchRequest,
     SessionReadRejection,
     SnapshotSession,
     VersionedContent,
@@ -69,6 +71,12 @@ from ccs.core.types import (
 # WITHOUT a version move — exactly what version-CAS cannot see). Named here as the
 # wire-stable constant, matched by identity, never by substring.
 _RECLAIM_TRIGGER = "reclaim_heartbeat"
+
+# The voluntary-release trigger. It is NOT a reclaim, but it ends a write claim
+# at an UNCHANGED version exactly as a reclaim does, so R9 requires it to move
+# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this). Named
+# here as the wire-stable constant, matched by identity, never by substring.
+_RELEASE_TRIGGER = "invalidate"
 
 # The single-writer conflict reason the arbitration leg emits when a version-
 # matching OCC writer meets a pessimistic M/E peer. The registries return it as a
@@ -345,8 +353,9 @@ def assert_fence_rejects_superseded_read_generation(factory: RegistryFactory) ->
         "read_generation, else the fence has nothing to reject"
     )
 
-    # Re-grant SHARED (a re-read would land it back in S) WITHOUT a fresh capture,
-    # so the stale read_generation survives (SHARED does not re-capture).
+    # Re-grant SHARED (a re-read would land it back in S) WITHOUT a fresh capture:
+    # a SHARED re-grant under any trigger but the agent's OWN "fetch" read does
+    # not re-capture, so the stale read_generation survives.
     reg.set_agent_state(artifact_id, agent, MESIState.SHARED, trigger="peer_regrant", tick=3)  # type: ignore[attr-defined]
 
     result = reg.commit_cas(  # type: ignore[attr-defined]
@@ -359,6 +368,150 @@ def assert_fence_rejects_superseded_read_generation(factory: RegistryFactory) ->
     assert result.reason == STALE_READ_GENERATION_REASON, result.reason
     # No mutation — the version stayed put.
     assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+
+def assert_peer_fetch_does_not_rearm_superseded_read_generation(factory: RegistryFactory) -> None:
+    """Read-generation fence — PEER-FETCH leg (MUST-MATCH). The fence's verdict
+    is STICKY: once a reclaimed holder's commit is refused
+    ``stale_read_generation``, nothing ANOTHER agent does can make that same
+    commit land — only the holder's OWN re-read or re-acquire re-captures. The
+    reclaim-zombie is seeded exactly as in
+    :func:`assert_fence_rejects_superseded_read_generation` (acquire, sweep-class
+    reclaim, non-capturing SHARED re-grant); then a DIFFERENT agent reads the
+    artifact through ``CoordinatorService.fetch`` — the producer of every
+    ``"fetch"`` set. Afterwards the zombie's ``read_generation`` MUST be
+    unchanged, its ``commit_cas`` at the unchanged version MUST still be refused,
+    and the version MUST NOT move.
+
+    The leg this pins: a peer's read is not the zombie's read. A backend whose
+    ``"fetch"`` handling re-lists every non-INVALID holder under the capture
+    trigger refreshes the zombie's operand on a read it never made, and the
+    commit the fence just refused then LANDS at the very version it was refused
+    at — a revoked write claim honored because someone ELSE read. Both shipped
+    arms pass because ``fetch`` downgrades only an M/E holder and leaves a peer
+    that is already SHARED alone, so no ``"fetch"`` set ever reaches the zombie;
+    the re-arming wrapper in ``test_kit_teeth.py`` reproduces the re-listing
+    inside the backend and FAILS here."""
+    reg = factory()
+    svc = CoordinatorService(reg)
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+    zombie, peer = uuid4(), uuid4()
+
+    # Acquire EXCLUSIVE → captures read_generation = owner_generation (0).
+    reg.set_agent_state(artifact_id, zombie, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, zombie)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+
+    # Sweep-class reclaim → INVALID with a RECLAIM_TRIGGER bumps owner_generation.
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, zombie, MESIState.INVALID, trigger=_RECLAIM_TRIGGER, tick=2
+    )
+    epoch = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    assert epoch > captured, (
+        "a sweep-class reclaim must bump owner_generation past the captured "
+        "read_generation, else the fence has nothing to reject"
+    )
+
+    # Re-grant SHARED WITHOUT a fresh capture (not the zombie's own "fetch" read),
+    # so the superseded read_generation survives into the peer's read below.
+    reg.set_agent_state(artifact_id, zombie, MESIState.SHARED, trigger="peer_regrant", tick=3)  # type: ignore[attr-defined]
+    assert reg.get_read_generation(artifact_id, zombie) == captured, (  # type: ignore[attr-defined]
+        "scenario precondition: a SHARED re-grant under a non-capture trigger must "
+        "preserve the superseded read_generation"
+    )
+
+    # A DIFFERENT agent's genuine read, through the service. The zombie is a
+    # non-INVALID peer, so the requester is granted SHARED and captures for
+    # ITSELF — the one capture a fetch is allowed to make.
+    response = svc.fetch(
+        FetchRequest(artifact_id=artifact_id, requesting_agent_id=peer, requested_at_tick=4)
+    )
+    assert response.state_grant == MESIState.SHARED
+    assert reg.get_read_generation(artifact_id, peer) == epoch, (  # type: ignore[attr-defined]
+        "the requester's OWN read must capture the current owner_generation"
+    )
+
+    # The zombie's operand is untouched: nobody read on its behalf.
+    rearmed = reg.get_read_generation(artifact_id, zombie)  # type: ignore[attr-defined]
+    assert rearmed == captured, (
+        "a PEER's fetch RE-ARMED the fence: the reclaimed holder's read_generation "
+        f"moved from {captured} to {rearmed} on a read it never made. A backend must "
+        "write an agent's read_generation only on that agent's OWN acquire or OWN "
+        "read — never because another agent read the artifact"
+    )
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, zombie, expected_version=1, content_hash=_hash("zombie"), tick=5
+    )
+    assert isinstance(result, ConflictDetail), (
+        "a PEER's fetch RE-ARMED the fence: the reclaim-zombie's commit at the "
+        f"unchanged version was ADMITTED after another agent read, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
+    # No mutation — the version stayed put.
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+
+def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
+    """Read-generation fence — RELEASE-BUMP leg (MUST-MATCH). The epoch rule is
+    not "the sweep did it" but "a write claim was revoked WITHOUT the version
+    moving", which is the one condition version-CAS is structurally blind to. A
+    voluntary release ends a claim at an unchanged version exactly as a reclaim
+    does, so it MUST move ``owner_generation`` too.
+
+    Without this leg a backend can revoke a grant through the release path,
+    leave the epoch behind, and then ADMIT the very commit the reject leg above
+    exists to catch — while still passing conformance. The failure is silent on
+    both sides: the version never moves, so version-CAS sees nothing, and the
+    epoch never moves, so the fence has nothing to compare.
+
+    Contrast with :func:`assert_fence_rejects_superseded_read_generation`: that
+    leg pins the fence's VERDICT, this one pins the operand the verdict needs."""
+    reg = factory()
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+    agent, peer = uuid4(), uuid4()
+
+    # Acquire EXCLUSIVE → captures read_generation at the current epoch.
+    reg.set_agent_state(artifact_id, agent, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    before = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, agent)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+
+    # Voluntary release — NOT a reclaim, and the version does not move.
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, agent, MESIState.INVALID, trigger=_RELEASE_TRIGGER, tick=2
+    )
+    assert reg.get_artifact(artifact_id).version == 1, (  # type: ignore[attr-defined]
+        "the release leg must not move the version — that is the whole point"
+    )
+    assert reg.get_owner_generation(artifact_id) > before, (  # type: ignore[attr-defined]
+        "a voluntary release revoked a write claim without moving "
+        "owner_generation: the fence can never arm for this holder afterwards, "
+        "because no sweep has an M/E grant left to reclaim"
+    )
+
+    # And the epoch move is load-bearing: the released holder's commit at the
+    # unchanged version is now rejected, exactly as a reclaimed holder's is.
+    reg.set_agent_state(artifact_id, agent, MESIState.SHARED, trigger="peer_regrant", tick=3)  # type: ignore[attr-defined]
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, agent, expected_version=1, content_hash=_hash("zombie"), tick=4
+    )
+    assert isinstance(result, ConflictDetail), (
+        "the released holder's commit was ADMITTED at an unchanged version; the "
+        f"release-path epoch move is not load-bearing, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+    # A peer-invalidation (the version-MOVING revoke class) must NOT bump: that
+    # path is arbitrated by version-CAS, and bumping there would over-fence.
+    reg.set_agent_state(artifact_id, peer, MESIState.EXCLUSIVE, tick=5)  # type: ignore[attr-defined]
+    steady = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    reg.set_agent_state(artifact_id, peer, MESIState.INVALID, trigger="commit", tick=6)  # type: ignore[attr-defined]
+    assert reg.get_owner_generation(artifact_id) == steady, (  # type: ignore[attr-defined]
+        "a version-moving peer invalidation must NOT move the epoch"
+    )
 
 
 def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:

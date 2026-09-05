@@ -19,7 +19,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
-from ccs.core.exceptions import StaleReadGeneration
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, ConflictDetail
 
@@ -47,6 +47,20 @@ def _pair(reg, artifact_id) -> tuple[int, int]:
     assert got is not None
     artifact, generation = got
     return artifact.version, generation
+
+
+def _poke_owner_generation(reg, artifact_id) -> None:
+    """Advance owner_generation behind set_agent_state's back so a live grant
+    carries a superseded claim -- a shape the service cannot reach, built the
+    way the MWB-transient regression below builds it (raw SQL on sqlite, the
+    record map in memory)."""
+    if isinstance(reg, SqliteArtifactRegistry):
+        reg._conn.execute(
+            "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
+            (artifact_id.hex,),
+        )
+    else:
+        reg._records[artifact_id].owner_generation += 1
 
 
 def test_parity_owner_generation_bumps_on_reclaim_only(registry) -> None:
@@ -135,19 +149,26 @@ def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None
 
 
 def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
-    """The RECLAIM_TRIGGERS / CLAIM_CAPTURE_TRIGGERS constants are duplicated
-    (the registries share no base class); this pins the copies equal so the
-    bump and the capture can never silently diverge. The capture pin also
+    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS
+    constants are duplicated (the registries share no base class); this pins the
+    copies equal so the bump and the capture can never silently diverge. The capture pin also
     guards the service.fetch() trigger string: a rename there without updating
     the constants would silently disable read-generation capture on fetches."""
     from ccs.coordinator.registry import CLAIM_CAPTURE_TRIGGERS as MEM_CAPTURE
+    from ccs.coordinator.registry import EPOCH_BUMP_TRIGGERS as MEM_BUMP
     from ccs.coordinator.registry import RECLAIM_TRIGGERS as IN_MEMORY
     from ccs.coordinator.sqlite_registry import CLAIM_CAPTURE_TRIGGERS as SQL_CAPTURE
+    from ccs.coordinator.sqlite_registry import EPOCH_BUMP_TRIGGERS as SQL_BUMP
     from ccs.coordinator.sqlite_registry import RECLAIM_TRIGGERS as SQLITE
 
     assert IN_MEMORY == SQLITE == frozenset(
         {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
     )
+    # EPOCH_BUMP_TRIGGERS is what the bump sites actually key on: every reclaim
+    # trigger PLUS the voluntary "invalidate" release, which also ends a write
+    # claim without moving the version. The version-moving peer
+    # invalidations ("write"/"commit") stay out.
+    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate"})
     assert MEM_CAPTURE == SQL_CAPTURE == frozenset({"fetch"})
 
 
@@ -181,7 +202,6 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     (owner_generation advanced between commit()'s state check and the
     version persist)."""
     from ccs.coordinator.service import CoordinatorService
-    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry as _Sqlite
 
     reg = registry
     art = _register(reg)
@@ -190,13 +210,7 @@ def test_commit_fence_raise_clears_mwb_transient(registry) -> None:
     # Pessimistic acquire WITHOUT a prior fetch (P0-fix path): captures gen 0.
     service.write(agent_id=a, artifact_id=art.id, issued_at_tick=1)
     # Manufacture the race: generation advances while the state stays E.
-    if isinstance(reg, _Sqlite):
-        reg._conn.execute(
-            "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
-            (art.id.hex,),
-        )
-    else:
-        reg._records[art.id].owner_generation += 1
+    _poke_owner_generation(reg, art.id)
 
     with pytest.raises(StaleReadGeneration):
         service.commit(agent_id=a, artifact_id=art.id, content="late", issued_at_tick=2)
@@ -228,3 +242,71 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
     assert _pair(reg, art.id) == (2, 1)
     assert reg.get_artifact_and_generation(uuid4()) is None
+
+
+def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -> None:
+    """Leaving M/E is a loss of authority, never a claim. service.fetch tags
+    its peer downgrade "fetch" too, so the capture predicate must not treat
+    that leg as the agent's own read and refresh a superseded value. The
+    stale-under-live-grant shape is poked directly; after the downgrade the
+    value is still PRESENT (not cleared to absent, which admit-on-absent
+    would wave through) and the ex-holder's commit is still refused."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)  # claim g0
+    _poke_owner_generation(reg, art.id)
+    assert _pair(reg, art.id) == (1, 1)
+
+    # A peer's fetch downgrades the holder: E -> S under trigger "fetch".
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=2)
+
+    assert reg.get_read_generation(art.id, a) == 0  # preserved, and present
+    res = reg.commit_cas(art.id, a, expected_version=1, content_hash="late")
+    assert isinstance(res, ConflictDetail)
+    assert res.reason == STALE_READ_GENERATION_REASON
+    assert _pair(reg, art.id) == (1, 1)  # version unmoved
+
+
+def test_parity_own_fetch_read_captures_current_epoch(registry) -> None:
+    """The requester leg of fetch IS the agent's own claim: an I -> S read
+    captures the current epoch (not merely epoch 0), and a S -> S re-read after
+    a later bump re-captures -- the recovery path for a reclaimed SHARED
+    agent. Guards against tightening the trigger arm to from_state == INVALID,
+    which would strand that re-read."""
+    reg = registry
+    art = _register(reg)
+    a, b = uuid4(), uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)
+    reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=10)
+    assert reg.get_owner_generation(art.id) == 1
+    # I -> S: b's first read captures the CURRENT epoch.
+    reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=11)
+    assert reg.get_read_generation(art.id, b) == 1
+    # A further reclaim supersedes b's claim ...
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=12)
+    reg.set_agent_state(art.id, a, MESIState.INVALID, trigger="reclaim_heartbeat", tick=20)
+    assert reg.get_owner_generation(art.id) == 2
+    # ... and b's own S -> S re-read re-captures, so its commit wins.
+    reg.set_agent_state(art.id, b, MESIState.SHARED, trigger="fetch", tick=21)
+    assert reg.get_read_generation(art.id, b) == 2
+    res = reg.commit_cas(art.id, b, expected_version=1, content_hash="fresh")
+    assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
+    assert reg.get_artifact(art.id).version == 2
+
+
+def test_parity_fetch_regrant_within_me_leaves_read_generation_unchanged(registry) -> None:
+    """An E -> E re-grant tagged "fetch" is neither an acquire nor a read, so
+    it does not capture. Under the service an M/E holder's captured value
+    already equals the epoch; the poke makes the two differ so the no-capture
+    is observable rather than vacuous."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="write", tick=1)  # claim g0
+    _poke_owner_generation(reg, art.id)
+
+    reg.set_agent_state(art.id, a, MESIState.EXCLUSIVE, trigger="fetch", tick=2)
+
+    assert reg.get_read_generation(art.id, a) == 0
+    assert reg.get_owner_generation(art.id) == 1

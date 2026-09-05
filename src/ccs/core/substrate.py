@@ -59,6 +59,33 @@ class Tier(Enum):
     FORWARD_ONLY = "forward_only"
 
 
+class DurabilityRegime(Enum):
+    """Honest durability grade a substrate binding declares (guarantee-ladder
+    U6 / R-5). A third ADDITIVE axis on the :class:`CapabilityDescriptor` —
+    Tier speaks to write arbitration, RestoreTier to bringing state back;
+    this axis speaks to what an ACKNOWLEDGED write survives. Values are
+    wire-stable constants matched by identity; add, never rename.
+
+    - ``IN_PROCESS`` — acknowledged state lives in process memory only and
+      dies with the process (the kit's in-memory fakes; an honest floor,
+      never a defect — the declaration is what makes it honest).
+    - ``PROCESS_CRASH`` — an acknowledged write's bytes have at least reached
+      the OS before the ack, so SIGKILL (user-space destruction) cannot lose
+      it; an OS crash or power loss still can. This is the grade the local
+      kill-the-primary case can actually verify.
+    - ``OS_CRASH`` — fsync-grade: the acknowledged write survives kernel
+      panic/power loss. NO local case can discriminate this from
+      ``PROCESS_CRASH`` (a SIGKILL leaves the page cache intact), so a
+      binding claiming it must point at the configuration facts that carry
+      the claim; verification is a declared exemption until a
+      crash-simulating VFS closes it.
+    """
+
+    IN_PROCESS = "in-process"
+    PROCESS_CRASH = "process-crash"
+    OS_CRASH = "os-crash"
+
+
 class RestoreTier(Enum):
     """Honest per-member RESTORE capability a Workspace-Versioning member declares.
 
@@ -175,6 +202,14 @@ class CapabilityDescriptor:
     versioned_pinnable: bool = False
     restore_tier: RestoreTier | None = None
     arbitration_tier: ArbitrationTier | None = None
+    # Durability axis (guarantee-ladder U6 / R-5, ADDITIVE — the defaults
+    # claim nothing): the regime an acknowledged write honestly survives,
+    # plus the configuration facts the claim rides on (e.g. "sqlite
+    # journal_mode=WAL synchronous=NORMAL"). ``None`` means the binding is
+    # not (yet) speaking the axis — the kit's declaration assertion refuses
+    # such a descriptor with a typed reason rather than assuming a grade.
+    durability_regime: DurabilityRegime | None = None
+    durability_facts: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, Tier):
@@ -208,6 +243,19 @@ class CapabilityDescriptor:
                 "restore_tier 'restorable' requires versioned_pinnable=True: a "
                 "descriptor may under-claim but never over-claim (fail-closed) — "
                 "an unpinned member is 'restorable-unpinned' at best"
+            )
+        if self.durability_regime is not None and not isinstance(
+            self.durability_regime, DurabilityRegime
+        ):
+            valid = ", ".join(t.value for t in DurabilityRegime)
+            raise ValueError(
+                f"unknown durability_regime: {self.durability_regime!r} "
+                f"(expected one of: {valid})"
+            )
+        if self.durability_facts and self.durability_regime is None:
+            raise ValueError(
+                "durability_facts requires a declared durability_regime: facts "
+                "qualifying no regime are an over-claim vector (fail-closed)"
             )
 
     @property

@@ -152,18 +152,54 @@ class CheckpointMember:
 #
 # RECLAIM_TRIGGERS: the coordinator-side EVICTION triggers (the stable-grant
 # sweep's reclaim_heartbeat / reclaim_max_hold + the transient-timeout fail-safe
-# "timeout"). An M/E -> INVALID transition carrying one of these bumps the
-# artifact's owner_generation (the read-generation fence): the claim was revoked
-# WITHOUT a version move, which version-CAS cannot see. Any other
-# (peer-invalidation) INVALID does NOT bump — that path moves the version, so
-# version-CAS already catches a stale write.
+# "timeout"). A SUBSET of the bump-gating set: an M/E -> INVALID transition
+# carrying one of these bumps the artifact's owner_generation (the
+# read-generation fence), because the claim was revoked WITHOUT a version move,
+# which version-CAS cannot see. EPOCH_BUMP_TRIGGERS immediately below is the
+# full bump set -- it adds the voluntary "invalidate" release, which ends a
+# claim at an unchanged version the same way. The peer-invalidation triggers
+# never bump, for different reasons each: "commit" moves the version, so
+# version-CAS already catches a stale write; "write" (a peer's pessimistic
+# acquire) moves NOTHING, and is kept out anyway -- see the note under
+# EPOCH_BUMP_TRIGGERS for where that revocation IS fenced.
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
-# CLAIM_CAPTURE_TRIGGERS: triggers marking a GENUINE content read for
-# read-generation capture (the E/M-acquire capture is keyed on the state
-# transition, not the trigger). Service.fetch() emits "fetch"; renaming it
-# without updating this would silently disable capture on reads.
+# EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
+# ownership epoch. The rule is not "the sweep did it" but "a write-claim was
+# revoked WITHOUT the version moving" -- the one condition version-CAS is
+# structurally blind to. That is every RECLAIM_TRIGGER plus "invalidate", the
+# voluntary release (service.invalidate: a post-edit failure, a session-stop
+# release, an operator drain), which likewise ends a claim at an unchanged
+# version. Leaving it out let a release SUPPRESS the fence: the holder is
+# already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
+# never moves at all -- the identical end-state a sweep reclaim fences was
+# silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+#
+# The peer-invalidation triggers ("write" / "commit") stay OUT, unchanged.
+# "commit" moves the version, so version-CAS already arbitrates a stale write.
+# "write" -- a peer's pessimistic acquire -- revokes the holder's claim while
+# moving NEITHER the version (no commit yet) NOR, per this exclusion, the
+# epoch. It stays out because the per-ARTIFACT epoch is the wrong fence for
+# preemption: bumping here would fence every bystander's read-generation at
+# the next CAS for a revocation that version-CAS will arbitrate anyway once
+# the acquirer commits, and it still could not cover a SHARED holder's
+# preemption (bumps key on M/E revocations only). The preempted holder is
+# fenced elsewhere, per operation class: its commit is refused by the M/E
+# state check + version-CAS, and its ESCAPING EFFECT -- which has no commit to
+# arbitrate -- is HELD by the effect gate's standing-grant re-check
+# (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
+# even with the (version, generation) pair unchanged).
+EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"})
+# CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
+# content read for read-generation capture (the E/M-acquire capture is keyed
+# on the state transition, not the trigger). Membership is necessary, not
+# sufficient: service.fetch() emits "fetch" on two legs -- the requester's own
+# read (I/S -> S/E) and the downgrade of an M/E peer to SHARED -- and only the
+# first is a claim. The capture site therefore also requires that the agent is
+# not leaving M/E (and is not being granted INVALID); a peer's downgrade never
+# refreshes the ex-holder's captured generation. Renaming the trigger without
+# updating this would silently disable capture on reads.
 CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 

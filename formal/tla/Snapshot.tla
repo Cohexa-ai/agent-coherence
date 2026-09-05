@@ -221,7 +221,7 @@ SnapshotCommitAction ==
         /\ readSkew' = (readSkew \/ (\E s \in Sessions : PartiallyCaptured(s)))
         /\ UNCHANGED <<clock, mesiState, lastHeartbeat, grantedAtTick,
                        lastReclamation, ownerGeneration, readGeneration,
-                       collectedRead, snapshot, sessionLive>>
+                       silentRevoke, collectedRead, snapshot, sessionLive>>
 
 --------------------------------------------------------------------
 (* Specification *)
@@ -231,11 +231,11 @@ SnapshotCommitAction ==
    wrapping mirrors Retention's own Next; RetentionCommitAction is DELIBERATELY
    replaced by SnapshotCommitAction (the crux). *)
 SnapshotNext ==
-    \/ (CRFetchAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead, snapshot, sessionLive, readSkew>>)
+    \/ (CRFetchAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (FencingWriteAction  /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
-    \/ (CRInvalidateAction  /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead, snapshot, sessionLive, readSkew>>)
-    \/ (CRTickAction        /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead, snapshot, sessionLive, readSkew>>)
-    \/ (HeartbeatAction     /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, history, collectedRead, snapshot, sessionLive, readSkew>>)
+    \/ (FencingInvalidateAction /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
+    \/ (CRTickAction        /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
+    \/ (HeartbeatAction     /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (FencingSweepAction  /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (ObserveGenAction    /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (VersionedReadAction /\ UNCHANGED <<snapshot, sessionLive, readSkew>>)

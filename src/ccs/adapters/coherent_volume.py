@@ -90,7 +90,7 @@ __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 
 class _ReadResult(NamedTuple):
     """What one coordinator-mediated read yields. Named rather than a bare
-    tuple because two of the four fields are int-shaped and adjacent
+    tuple because two of the five fields are int-shaped and adjacent
     (``version`` and ``owner_generation``), so a positional transposition would
     type-check in one direction while silently swapping a value comparand for
     an authority one."""
@@ -99,6 +99,13 @@ class _ReadResult(NamedTuple):
     version: int
     stale_denied: bool
     owner_generation: int | None
+    #: The pre-read classified this instance as WITHOUT a standing grant on the
+    #: current version (the ``status == "stale"`` shape — a warn-mode re-grant
+    #: or a strict deny). The effect fence reads this: a caller whose grant did
+    #: not stand at re-validate must HOLD even when the ``(version,
+    #: owner_generation)`` pair is unchanged, because a peer's write-claim
+    #: acquire preempts a holder while moving NEITHER comparand.
+    stale_status: bool
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -951,7 +958,7 @@ class CoherentVolume:
             # SHARED and route the next comparand read through the coordinator's
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
-            current_bytes, expected_version, stale_denied, _gen = (
+            current_bytes, expected_version, stale_denied, _gen, _stale = (
                 self._read_with_version(rel)
             )
             if stale_denied:
@@ -1108,8 +1115,8 @@ class CoherentVolume:
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU).
         self._remint()
-        _current_bytes, current_version, stale_denied, _gen = self._read_with_version(
-            rel
+        _current_bytes, current_version, stale_denied, _gen, _stale = (
+            self._read_with_version(rel)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1607,13 +1614,24 @@ class CoherentVolume:
         :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
         """
         with self._single_op_guard():
-            data, version, _stale_denied, _generation = self._read_with_version(path)
+            data, version, _stale_denied, _generation, _stale = (
+                self._read_with_version(path)
+            )
             return data, version
 
     #: Whether the most recent :meth:`read_with_version_generation` was refused
     #: by the coordinator (strict-mode deny). Read by the effect fence to name
     #: the HOLD cause precisely; per-instance and overwritten each call.
     _last_read_denied: bool = False
+
+    #: Whether the most recent :meth:`read_with_version_generation` came back
+    #: with the STALE status shape — this instance had no standing grant on the
+    #: current version at that read (a warn-mode stale re-grant, or a deny).
+    #: Read by the effect fence: a grant that did not stand at re-validate
+    #: HOLDs even when the ``(version, owner_generation)`` pair is unchanged,
+    #: the drift a peer's write-claim preemption leaves behind (no commit, no
+    #: epoch bump). Per-instance and overwritten each call, like its sibling.
+    _last_read_stale: bool = False
 
     def read_with_version_generation(
         self, path: str | os.PathLike[str], *, observe: bool = True
@@ -1639,8 +1657,8 @@ class CoherentVolume:
         absolve an out-of-band edit the caller never actually saw.
         """
         with self._single_op_guard():
-            data, version, stale_denied, generation = self._read_with_version(
-                path, observe=observe
+            data, version, stale_denied, generation, stale_status = (
+                self._read_with_version(path, observe=observe)
             )
             # A strict-mode deny is reported as a REFUSED read, not merely as a
             # missing generation: they need different answers (a deny clears
@@ -1648,11 +1666,21 @@ class CoherentVolume:
             # all does not), and on the strict path a sweep reclaim reaches the
             # client precisely AS a deny.
             self._last_read_denied = stale_denied
+            # A stale-status read (warn re-grant OR deny) means the grant this
+            # instance was previously read under did NOT stand at this read —
+            # the re-grant, if any, is a NEW grant. The effect fence keys the
+            # write-preemption HOLD on this: a peer's write-claim acquire ends
+            # the caller's grant while moving neither comparand.
+            self._last_read_stale = stale_status
             return data, version, generation
 
     def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
         """OCC helper: register a SHARED view and return
-        ``(bytes, version, stale_denied, owner_generation)``.
+        ``(bytes, version, stale_denied, owner_generation, stale_status)``
+        (a :class:`_ReadResult`); ``stale_status`` is True when the coordinator
+        classified this read as stale (a warn re-grant or a deny), the
+        standing-grant signal the effect fence keys the ``grant_preempted``
+        HOLD on.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
         handling) but also surfaces the coordinator's authoritative ``version``
@@ -1690,6 +1718,7 @@ class CoherentVolume:
             self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
+        stale_status = False
         owner_generation: int | None = None
         if self._endpoint is not None:
             resp = self._post(
@@ -1702,6 +1731,18 @@ class CoherentVolume:
                     # owner_generation). Older coordinators ignore the flag and
                     # answer without the key (generation stays None).
                     "want_owner_generation": True,
+                    # A verification read (``observe=False`` -- the effect
+                    # fence re-reading only to compare comparands) must not
+                    # MUTATE coordinator grant state: re-granting SHARED here
+                    # would heal the very grant loss the fence is checking, so
+                    # the caller stays whatever it was (INVALID after a
+                    # preemption), and a bare re-check re-HOLDs instead of
+                    # admitting. The client-side ``observe`` already keeps the
+                    # foreign-edit baseline still; this carries the same
+                    # "verification is not observation" rule to the server.
+                    # Older coordinators ignore it (edge-triggered fallback,
+                    # still fail-closed on the first check).
+                    "verify_only": not observe,
                 },
             )
             if isinstance(resp, dict):
@@ -1721,7 +1762,10 @@ class CoherentVolume:
                 hook_output = resp.get("hookSpecificOutput")
                 if isinstance(hook_output, dict):
                     stale_denied = hook_output.get("permissionDecision") == "deny"
-        return _ReadResult(data, version, stale_denied, owner_generation)
+                # Any stale-status response — warn re-grant or deny alike —
+                # means this instance's prior grant did not stand at this read.
+                stale_status = resp.get("status") == "stale"
+        return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
 
     @staticmethod
     def _pre_read_version(resp: dict) -> int:

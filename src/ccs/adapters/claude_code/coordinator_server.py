@@ -1248,6 +1248,22 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.handler_concurrency_overflows_total: int = 0
         self._overflow_counter_lock = threading.Lock()
 
+    def server_bind(self) -> None:
+        """Bind without the stdlib's reverse-DNS lookup.
+
+        Regression note: http.server.HTTPServer.server_bind calls
+        socket.getfqdn() to populate self.server_name, which blocks on
+        the host resolver — measured at 35 s on a macOS workstation
+        with a stalled resolver, blowing the coordinator spawn's 10 s
+        reachability window (_spawn_detached in cli/coherence_coordinator.py).
+        We bind 127.0.0.1 only, so the FQDN is purely cosmetic: bind at
+        the TCPServer layer and fill server_name/server_port from the
+        bound address ourselves. Never call socket.getfqdn here.
+        """
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0] or "localhost"
+        self.server_port = self.server_address[1]
+
     def process_request(self, request: Any, client_address: Any) -> None:
         """Override ThreadingMixIn.process_request to gate handler spawn
         on the concurrency semaphore. If at limit, send 503 directly
@@ -1511,6 +1527,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # ``(version, owner_generation)``. Absent (every shipped client), the
     # response shapes below are byte-unchanged.
     want_generation = bool(body.get("want_owner_generation"))
+    # Effect-gate verification read: the fence re-reads only to COMPARE
+    # comparands and discards the body. Such a read must not mutate coordinator
+    # state -- above all it must not re-grant SHARED to a preempted holder,
+    # which would heal the grant loss the fence exists to detect and let a bare
+    # re-check ADMIT (the write-preemption blind spot). It also must not consume
+    # the victim's preemption notices or bump stale-warning telemetry the fence
+    # throws away. Absent (every non-fence client), behavior is byte-unchanged.
+    verify_only = bool(body.get("verify_only"))
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -1578,8 +1602,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the
         # re-read. Increment whether the re-read returns fresh or stale —
-        # the agent attempted the read either way.
-        if coordinator.consume_stale_marker(agent_id, artifact_id):
+        # the agent attempted the read either way. A verify_only fence read is
+        # NOT a genuine agent re-read: skip it so the marker survives for the
+        # agent's next real read and the counter is not skewed.
+        if not verify_only and coordinator.consume_stale_marker(agent_id, artifact_id):
             coordinator.increment_stale_warning_reread()
 
         # ONE pair-atomic read backs BOTH the branch classification (version,
@@ -1768,10 +1794,18 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
 
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
-        coordinator.registry.set_agent_state(
-            artifact_id, agent_id, MESIState.SHARED,
-            trigger="post_stale_read", tick=now, content_hash=content_hash,
-        )
+        # A verify_only fence read SKIPS the re-grant: healing the caller's
+        # grant here would let its next bare re-check take the fresh branch and
+        # ADMIT an effect whose grant a peer already revoked (the write-
+        # preemption blind spot). Leaving it INVALID makes the HOLD
+        # level-triggered — every bare re-check re-HOLDs until a real
+        # reacquire() re-mints a live grant — matching the strict leg (KTD-T
+        # never re-grants on a deny). The client discards this read's bytes.
+        if not verify_only:
+            coordinator.registry.set_agent_state(
+                artifact_id, agent_id, MESIState.SHARED,
+                trigger="post_stale_read", tick=now, content_hash=content_hash,
+            )
         resp = _payloads.build_stale_response(summary)
         if want_generation and owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
@@ -1780,19 +1814,24 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # moved even though the version did not. It shares the snapshot that
             # produced summary.current_version, so the pair cannot disagree.
             resp["owner_generation"] = owner_generation
-        # KTD-J (Unit 8): bump the stale-warning emission counter +
-        # mark the pair so a follow-up pre-read counts as a re-read.
-        coordinator.increment_stale_warning_emitted()
-        coordinator.mark_stale_warned(agent_id, artifact_id)
-        # A1: if THIS session has pending preemption notices, prepend them
-        # to the additionalContext so X learns about Y's revocation alongside
-        # the stale-read warning.
-        notices = coordinator.registry.pop_pending_notices(agent_id)
-        if notices:
-            notice_text = _build_preemption_text(coordinator, notices)
-            resp["hookSpecificOutput"]["additionalContext"] = (
-                notice_text + "\n\n" + resp["hookSpecificOutput"]["additionalContext"]
-            )
+        if not verify_only:
+            # KTD-J (Unit 8): bump the stale-warning emission counter +
+            # mark the pair so a follow-up pre-read counts as a re-read. A
+            # fence verification read is not an agent-visible stale warning, so
+            # skip both — the fence discards this response body.
+            coordinator.increment_stale_warning_emitted()
+            coordinator.mark_stale_warned(agent_id, artifact_id)
+            # A1: if THIS session has pending preemption notices, prepend them
+            # to the additionalContext so X learns about Y's revocation
+            # alongside the stale-read warning. A verify_only read must NOT pop
+            # them — the fence discards the body, so a destructive pop here
+            # would drop the notice the agent needs on its next real read.
+            notices = coordinator.registry.pop_pending_notices(agent_id)
+            if notices:
+                notice_text = _build_preemption_text(coordinator, notices)
+                resp["hookSpecificOutput"]["additionalContext"] = (
+                    notice_text + "\n\n" + resp["hookSpecificOutput"]["additionalContext"]
+                )
         return resp
 
     # Wrap _run_or_degrade so we can also pop notices for the FRESH-response
@@ -1807,7 +1846,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # does not lose — the notice surface.
     def work_with_notice_surfacing() -> dict:
         result = work()
-        if result.get("status") == "fresh" and "hookSpecificOutput" not in result:
+        # A verify_only fence read discards this body, so a destructive notice
+        # pop here would silently drop the preemption notice the agent needs on
+        # its next real read — skip the drain for it (the stale branch skips its
+        # own pop for the same reason).
+        if (
+            not verify_only
+            and result.get("status") == "fresh"
+            and "hookSpecificOutput" not in result
+        ):
             notices = coordinator.registry.pop_pending_notices(agent_id)
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)

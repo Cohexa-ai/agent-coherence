@@ -304,11 +304,12 @@ class TestGcHold:
 
 
 class TestInMemoryConcurrentAtomicity:
-    """The in-memory registry is lock-free per-access; the NEW capture lock makes
-    the multi-artifact read + pin insert atomic across N artifacts AND serializes
-    with the version-moving writes (register/commit), so a captured cut is always
-    a SINGLE-linearization-point snapshot — never a read-skewed pair stitched
-    across two writer commits.
+    """The registry lock makes the multi-artifact read + pin insert atomic
+    across N artifacts AND serializes with the version-moving writes
+    (register/commit), so a captured cut is always a
+    SINGLE-linearization-point snapshot — never a read-skewed pair stitched
+    across two writer commits. (Once the capture-only lock; now the one
+    registry-wide lock every public method holds.)
 
     The probe enforces a real cross-artifact invariant: a writer always advances
     A *before* B to the same version, so at EVERY real instant

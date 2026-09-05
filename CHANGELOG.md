@@ -4,6 +4,219 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [0.14.1] - 2026-09-05
+
+**Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.
+
+### Added
+
+- **Conflict-outcome counters — a typed deny is now countable, across
+  restarts.** The coordinator persists a durable per-`(artifact, agent,
+  reason)` tally of the three typed refusals (`version_mismatch`,
+  `other_holder`, `stale_read_generation`), so "how often does this
+  actually fire in my fleet?" stops being a question answered by argument.
+  `ccs.diagnose.conflict_counters.read_conflict_totals(db_path)` reads them
+  back **offline** — raw read-only sqlite against a closed `state.db`, no
+  coordinator import, no running daemon — so a report can be built after
+  the fact from a database that has since been shut down. The honesty rules
+  are load-bearing: a database predating the instrumentation has no
+  `conflict_counters` table and reads as **zero recorded conflicts**, which
+  is a reportable result; every *other* read failure (a locked database, a
+  hot-WAL recovery failure, disk I/O) propagates rather than being mapped
+  to zero, so a broken read can never masquerade as a quiet month.
+  Attribution is by agent identity only — no host identifier reaches the
+  commit path today, and the reader says so rather than inventing one.
+
+- **The claim ladder — every guarantee this project claims is pinned to the
+  test that would fail without it.** `ccs.testing.claim_ladder` pairs each
+  guarantee's text with the exact README claim-phrases it backs and the
+  tests that prove it; the suite resolves every named test at collection
+  time and drift-guards the README **in both directions**, so a claim
+  cannot outlive its proof and a rung cannot appear without one. This is
+  the machine-checked answer to "which of these sentences is still true?"
+
+- **Cross-process conformance + a declared durability regime.** The
+  packaged substrate-conformance corpus now runs its race scenarios across
+  real OS **process** boundaries — contenders are spawned processes
+  rendezvoused at a barrier before the racing section, so a binding whose
+  "compare-and-swap" is really a read-then-write under an in-process lock
+  is caught rather than false-greened. A binding declares the durability
+  regime an acknowledged write survives (`in-process` / `process-crash` /
+  `os-crash`); the corpus verifies the process-crash grade locally by
+  SIGKILLing a writer after its acknowledged commit and reading the store
+  back. What cannot be verified locally is recorded as a **declared
+  exemption with its reason**, never silently skipped.
+
+### Changed
+
+- A peer's `fetch` no longer emits `SHARED`→`SHARED` `"fetch"` state-log
+  rows for SHARED bystanders and no longer re-stamps their
+  `last_observed_version`; under that trigger only a MODIFIED/EXCLUSIVE
+  holder is downgraded, and logged. Recorded logs from before this change
+  still replay — the trigger set is unchanged.
+
+### Fixed
+
+- **A `stale_read_generation` refusal is now sticky — a peer's read no
+  longer re-arms a reclaimed holder's fence.** `CoordinatorService.fetch`
+  emits `trigger="fetch"` on two legs: the requester's own read, and the
+  loop that moved every other non-INVALID peer to SHARED — including peers
+  already SHARED. The registries' read-generation capture was keyed on the
+  trigger alone, so a bystander's `read_generation` was refreshed to the
+  current epoch by someone else's read. For an ex-holder the stable-grant
+  sweep had reclaimed — whose `commit_cas` at the unchanged version had been
+  correctly refused `stale_read_generation` — the next peer fetch rewrote
+  its superseded value, and its next commit at that same version was
+  admitted. The reject was correct but not sticky. Reachable in state
+  through the library adapters (a deferred or asynchronous event bus, where
+  a held broadcast re-grants the reclaimed writer SHARED) and the simulation
+  engine; the admitted commit always carries the current bytes, so this is a
+  revoked-authority violation, not a lost update. The Claude Code adapter
+  never calls `fetch` and is unaffected. `fetch` now leaves already-SHARED
+  peers untouched, and on both registries the trigger-armed capture also
+  requires that the agent is not leaving MODIFIED/EXCLUSIVE — an agent's
+  `read_generation` is written only by its own acquire or its own genuine
+  read, so only the zombie's own re-read or re-acquire clears the refusal.
+  Expect `stale_read_generation` to persist across peers' reads where it
+  previously vanished. The backend conformance kit gains a service-driven
+  fetch scenario that a re-capturing backend fails, and `Fencing.tla` pins
+  the rule as the `NoUnearnedCapture` action property with a documented
+  mutant (`formal/tla/README.md` recipe 18).
+
+- **The effect gate now holds a write-preempted holder's escaping effect —
+  the one revocation that moves neither comparand.** A peer's pessimistic
+  write-acquire takes a holder's grant with no commit behind it yet (version
+  unmoved) and no ownership-epoch bump (`trigger="write"` is deliberately
+  outside `EPOCH_BUMP_TRIGGERS`), so the `(version, owner_generation)` pair
+  `gate()` / `swg_gate` re-validates compared equal and the preempted
+  holder's irreversible effect (a webhook, a deploy, an opened PR) fired on
+  authority it no longer had. The commit path never had this hole — a
+  preempted committer is refused by the M/E state check and version-CAS —
+  but an escaping effect has no commit to arbitrate. The fence now also
+  requires the re-validate read itself to be served under a standing grant:
+  a stale-status re-read HOLDs with the new typed `grant_preempted` cause
+  even though both comparands are unchanged and confirmed. The strict-mode
+  leg already held (the re-read is a deny); this closes the tracked-but-not-
+  strict leg, and the epoch's `"write"` exclusion is unchanged — the
+  per-artifact epoch cannot see a SHARED holder's preemption and would
+  needlessly fence bystanders' CAS reads, so the gate asks the grant-state
+  question directly. The HOLD is **level-triggered**: the fence's re-validate
+  is a verification read (`verify_only`) the coordinator does not re-grant, so
+  a preempted holder stays revoked and every bare re-gate re-HOLDs until
+  `reacquire()` re-mints a live grant — matching the strict leg, and matching
+  the retryable-deny recovery contract. As a side effect, that verification
+  read no longer consumes the victim's preemption notices or skews the
+  stale-warning telemetry, which the fence discards.
+
+- **The in-memory registry now carries the same concurrency contract as the
+  durable one: thread-safe, one lock, held across every check-then-act
+  sequence.** The old contract — "single-threaded, lock-free by contract, GIL
+  per-access atomicity" — only ever covered a single dict access, while the
+  paths above it compose multi-access sequences the GIL does not hold
+  together. Racing the stable-grant sweep against a holder renewing its claim
+  put the walk into the state the sweep's own comment called impossible
+  ("M/E holder has no granted_at slot") and silently skipped max-hold
+  enforcement; racing `fetch` against a peer `write` left two agents in a
+  write state (`single_writer_violated`, 38 of 40 rounds); racing two
+  optimistic committers double-applied one `expected_version`. All three
+  reproduced on the SQLite arm too wherever the sequence lived in the service
+  layer — per-call backend serialization cannot fix a multi-call decision.
+
+  The capture-only `_capture_lock` is widened into `self._lock`, held by every
+  public method except three named construction-time-immutable accessors;
+  `abort_guard` now holds it across the caller's whole mutation exactly like
+  the SQLite guard; `commit_cas` / `commit_all` decide and apply in one hold
+  (the in-memory stand-in for `BEGIN IMMEDIATE`); and the service's five
+  check-then-act sequences — `fetch`, `delete`, `register_artifact`, both
+  sweeps — run under the guard, the sweeps holding per `(agent, artifact)`
+  pair with the pair's state re-read inside the hold, never across the walk.
+  Callbacks the registry accepts (`state_log`, `on_reclaim`) now run under the
+  lock and carry that stated obligation. A structural test drives every
+  public member of both registries against a tracking lock, with the surface
+  frozen by name, so a new unlocked member fails CI by name. Uncontended
+  overhead: ~168 ns per acquire, ~2.7 µs per commit cycle.
+
+- **The read-generation fence is now an operation-class property, not a
+  commit-path one — `invalidate` could both bypass it and suppress it.** The
+  fence (`owner_generation` vs a committer's captured `read_generation`) was
+  checked on the three commit paths and nowhere else. The other grant-revoking
+  operation, `CoordinatorService.invalidate`, neither consulted it nor
+  maintained it, and both halves were reachable on a single host in one process
+  — the registry `RLock` serializes each mutation but not the decision to revoke
+  against the revoke itself.
+
+  *A revoke minted at one epoch could destroy a grant issued at a later one.*
+  Invalidation signals are minted inside the registry lock and delivered after
+  it is released, so a peer could be reclaimed, re-acquire and re-read in
+  between; the stale signal then revoked the fresh grant. Reachable through
+  `CoherenceAdapterCore` (the CCSStore/LangGraph base) with the concurrent
+  callers it already documents, where nothing threads the A6 abort Event and
+  `abort_guard` is therefore a plain lock acquire. A peer-issued invalidation is
+  now pinned to the target's `last_observed_version`: a target that has already
+  observed a version at least as new as the one announced is not behind the
+  signal, so the signal is dropped as obsolete. The pin is deliberately narrow,
+  because wrongly dropping an invalidation is far worse than wrongly applying
+  one — a self-issued release (post-edit failure, session-stop, operator drain)
+  is never pinned, an already-INVALID target is never pinned (its stranded
+  SIA/EIA transient still needs clearing), and an absent observation is admitted
+  rather than dropped, matching the commit-path fence's admit-on-absent rule.
+
+  *A voluntary release could disarm the fence entirely.* `invalidate` moved an
+  M/E holder to INVALID under a trigger outside `RECLAIM_TRIGGERS`, so the
+  epoch never moved — and the sweep could not arm it later either, there being
+  no M/E grant left to reclaim. Identical end-state, opposite verdict: a
+  sweep-reclaimed holder's later commit at an unchanged version was rejected
+  `stale_read_generation`, while an `invalidate`-released one was silently
+  admitted. Epoch movement now keys on `EPOCH_BUMP_TRIGGERS` — every reclaim
+  trigger plus `invalidate` — the rule being "a write claim was revoked without
+  the version moving", which is the one condition version-CAS is structurally
+  blind to. The version-moving peer invalidations (`write` / `commit`) are
+  unchanged and still do not bump.
+
+  Both registries; `backend_contract.py` R9 restated to match. Expect more
+  `stale_read_generation` rejections where a release previously left the fence
+  unarmed — that is the fix, not a regression.
+
+  Two callers had to follow the new "decline" outcome, because `invalidate`
+  could previously never be a no-op. `AgentRuntime.handle_invalidation` now asks
+  the coordinator first and clamps the local cache only on a signal it actually
+  applied — clamping first would drop the agent's view for a grant the
+  coordinator then keeps, a split the pre-pin code could not produce.
+  `AgentRuntime.handle_update` now clears the transient for the agents it grants
+  SHARED, the way `fetch` already does: once an eager push has moved a peer back
+  to SHARED the pin can legitimately decline the late invalidation that used to
+  clear it, and a stranded transient stalls both the stable-grant sweep and that
+  peer's next `commit_cas`.
+
+  The backend conformance kit gains a MUST-MATCH release-bump scenario, so the
+  epoch rule R9 now states is one a third-party backend can actually fail.
+
+  The review of this branch then found the pin's un-fenced sibling: the eager
+  UPDATE broadcast travels the same publish-after-lock boundary, and
+  `handle_update` applied it unconditionally — a stale update could regress a
+  recipient's view to older bytes marked valid, drop a fresher M/E claim with
+  no epoch bump, and stamp `last_observed_version` with the registry's current
+  version while the cache held the older body, poisoning the very comparand
+  the revoke pin trusts. `handle_update` now drops a broadcast whose bytes are
+  behind the world or whose recipient holds a live write claim (an update
+  completes an INVALID/SHARED revalidation, never revokes M/E); only the
+  transient clears survive a drop. In the same round, the in-memory read
+  accessors became absent-artifact tolerant (None/{}/[] like sqlite's empty
+  SELECT) so a delete landing between a sweep's snapshot and its per-pair
+  hold skips the vanished pair instead of crashing the walk.
+
+  Both defects were in the formal model too: `Fencing.tla` inherited the
+  unguarded `CRInvalidateAction`, which *is* F2 encoded. `Fencing.tla` now bumps
+  the epoch on a release and carries `NoSilentRevoke`; the pin and
+  `NoZombieRevoke` live in a new sibling amendment, `ZombieRevoke.tla`, kept out
+  of `Fencing` because its per-agent observation variable would cost every
+  downstream spec (EffectGate, Retention, Snapshot) state space for a property
+  none of them is about. `NoStaleApply` structurally cannot see F2 — it is
+  defined relative to the very counter that fails to move — which is why the
+  second invariant exists; confirmed by mutation. Both new invariants carry
+  documented mutants (`formal/tla/README.md` recipes 16 and 17). `make
+  tla-check` now sweeps nine specs. `MaxGen` is sized `MaxTicks + NumAgents` (mirroring `MaxVersion`): the release bump is not tick-bounded, so the old `MaxTicks` ceiling was reachable at clock 0, and a bump guard that fails DISABLES its action rather than violating anything — TLC silently stopped exploring revoke transitions while still reporting success.
+
 ## [0.14.0] - 2026-08-25
 
 ### Added

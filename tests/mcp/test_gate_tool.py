@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli._coherence_client import post as _cc_post
+from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
 from ccs.mcp.server import _do_gate, _do_read
 from ccs.mcp.session import SessionConfig
 
@@ -238,3 +241,58 @@ def test_gate_on_a_vanished_input_answers_check_path_not_reacquire(
         assert res.structuredContent["retryable"] is False
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_gate_surfaces_grant_preempted_and_re_denies_on_bare_retry(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wire contract for the write-preemption leg. A peer's pessimistic
+    write-acquire preempts the holder while the ``(version, owner_generation)``
+    pair stays put, so ``swg_gate`` must DENY with ``reason=stale_view`` and the
+    typed ``hold_cause=grant_preempted`` -- distinct from the strict leg's
+    ``read_denied``. And the deny is LEVEL-triggered at the wire: a bare second
+    call with the same comparands (the H4 retry shape) re-denies rather than
+    admitting, because the fence's verification read no longer re-grants the
+    preempted holder. Uses the tracked-but-NOT-strict topology, where the
+    preempted re-read is a warn re-grant rather than a strict deny."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    coord_root = tmp_path / "coord"
+    coord_root.mkdir()
+    root_w = tmp_path / "w"
+    root_w.mkdir()
+    lifecycle.ensure_coordinator(coord_root, config=fast_cfg)
+    try:
+        ep = resolve_endpoint(coord_root)
+        _cc_post(ep, "/policy/track", {"paths": ["task.txt"]})
+        vol = CoherentVolume(
+            root_w,
+            on_error="strict",
+            on_stale_write="allow",
+            remote_endpoint=resolve_remote_endpoint("127.0.0.1", ep.port, ep.bearer),
+        )
+        cfg = SessionConfig(root=root_w.resolve(), managed=("*",))
+        (root_w / "task.txt").write_bytes(b"task-v1")
+        vol.write("task.txt", b"task-v1")  # M grant at v1
+        version, generation = _comparand(_do_read(vol, cfg, "task.txt"))
+        # A peer write-acquires, silently revoking this holder's grant.
+        resp = _cc_post(
+            ep, "/hooks/pre-edit", {"session_id": str(uuid4()), "path": "task.txt"}
+        )
+        assert resp.get("ok") is True, f"peer write-acquire failed: {resp}"
+
+        res = _do_gate(vol, cfg, "task.txt", version, generation)
+        assert res.isError is True, "a preempted grant must DENY, not proceed"
+        assert res.structuredContent["reason"] == "stale_view"
+        # grant_preempted (not version_moved) already proves the version never
+        # moved -- the peer acquired but did not commit. Do NOT read through the
+        # volume here to re-check it: an ordinary observe=True read re-grants
+        # SHARED and would launder the preempted state (finding #1's own
+        # mechanism), defeating the level-triggered check below.
+        assert res.structuredContent["hold_cause"] == "grant_preempted"
+
+        # Level-triggered: a bare retry (no reacquire) must re-DENY, not admit.
+        res2 = _do_gate(vol, cfg, "task.txt", version, generation)
+        assert res2.isError is True, "a bare retry must re-deny, not admit"
+        assert res2.structuredContent["hold_cause"] == "grant_preempted"
+    finally:
+        stop_coordinator(coord_root)

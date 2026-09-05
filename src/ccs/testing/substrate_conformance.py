@@ -53,6 +53,16 @@ teeth stub. The family's fixture-disclosure rule is binding: scenario prose and
 assertions describe failure scenarios and required FINAL OBSERVABLE OUTCOMES
 only — a foreign implementation passes by satisfying outcomes, never by
 mimicking any particular internal mechanism.
+
+
+**In-process serialization does not satisfy any clause of this contract.**
+The hand-sequenced scenarios below are TYPED-OUTCOME contract tests — they pin
+what a binding returns at each interleaving, and a single process can sequence
+any interleaving it likes. Only the cross-process races (the
+``assert_cross_process_*`` family, riding :mod:`ccs.testing.process_harness`)
+prove a binding's conditional write is atomic rather than read-then-write; a
+binding that cannot be raced cross-process carries a DECLARED exemption with a
+stated reason (R-8), never a silent skip.
 """
 
 from __future__ import annotations
@@ -60,10 +70,22 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from multiprocessing.managers import BaseManager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Iterator, NoReturn, Protocol, Sequence, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Final,
+    Iterator,
+    NoReturn,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 from uuid import UUID, uuid4
 
 # pytest backs SKIP reporting ONLY — the corpus itself must import and run
@@ -102,9 +124,16 @@ from ccs.core.exceptions import (
 )
 from ccs.core.substrate import (
     CapabilityDescriptor,
+    DurabilityRegime,
     RestoreTier,
     Tier,
     retention_is_empty_for,
+    sha256_hex,
+)
+from ccs.testing.process_harness import (
+    ContenderSpec,
+    ProcessRaceHarness,
+    run_kill_after_ack,
 )
 from ccs.testing.s3_local import LocalS3Client
 
@@ -131,9 +160,22 @@ __all__ = [
     "WorkspaceMemberFacts",
     "WorkspaceRestoreFacts",
     "assert_abort_after_partial_visibility",
+    "AcknowledgedWriteLost",
+    "FSYNC_GRADE_EXEMPTION_REASON",
+    "MANAGED_KILL_RUN_EXEMPTION_REASON",
+    "UndeclaredDurabilityRegime",
+    "assert_durability_regime_is_declared",
+    "assert_process_crash_durability",
+    "assert_sqlite_acknowledged_commit_survives_kill",
+    "declare_deferred_durability_exemptions",
     "assert_coordinator_retention_empty",
+    "assert_cross_process_one_winner_native_cas",
+    "assert_cross_process_lost_update_is_detected",
+    "assert_cross_process_rejects_read_then_write",
+    "CrossProcessLostUpdate",
     "assert_detect_only_silent_lost_update",
     "assert_forward_only_honest",
+    "assert_in_process_binding_exemption_is_declared",
     "assert_invalidation_before_act",
     "assert_native_cas_descriptor",
     "assert_never_ship_a_store_wire",
@@ -218,6 +260,8 @@ def _fake_descriptor(arm: str) -> CapabilityDescriptor:
         version_source="fake row-version" if arm == "row" else "fake object ETag",
         least_privilege="in-memory conformance fake",
         consistency_note="fake single-primary",
+        durability_regime=DurabilityRegime.IN_PROCESS,
+        durability_facts="process memory only (dict store); dies with the process",
     )
 
 
@@ -357,6 +401,8 @@ class LwwSubstrate:
             version_source=None,
             least_privilege="in-memory detect-only fake",
             consistency_note="last-write-wins; no atomic CAS",
+            durability_regime=DurabilityRegime.IN_PROCESS,
+            durability_facts="process memory only (dict store); dies with the process",
         )
 
     @property
@@ -398,7 +444,20 @@ class ConformanceBinding(Protocol):
 
 
 class InMemoryBinding:
-    """A :class:`ConformanceBinding` backed by the in-memory fake substrate."""
+    """A :class:`ConformanceBinding` backed by the in-memory fake substrate.
+
+    Declared ``in_process_only`` (KTD-4): the store is GIL-serialized process
+    memory by construction and cannot be shared across OS processes — a
+    spawn-context child would receive a pickled private copy and the race
+    would be vacuous. The cross-process arm runs against the manager-served
+    stand-in instead; this binding's exclusion is a DECLARED R-8 exemption,
+    never a silent skip."""
+
+    in_process_only = True
+    in_process_only_reason = (
+        "GIL-serialized process memory by construction; the cross-process race "
+        "runs against the manager-served substrate instead (KTD-4)"
+    )
 
     def __init__(self, arm: str = "object") -> None:
         self._store = InMemoryStore()
@@ -451,9 +510,13 @@ def assert_native_cas_descriptor(descriptor: CapabilityDescriptor) -> None:
 def assert_racing_writers_one_winner(
     binding: ConformanceBinding, make_session: "SessionFactory"
 ) -> None:
-    """(i) The SUBSTRATE CAS arbitrates: a non-coordinated writer moves the
-    substrate; the loser gets the uniform typed retryable conflict. This is the
-    guarantee a bare CAS already gives (it is NOT the coordinator's add)."""
+    """(i) TYPED-OUTCOME contract test (hand-sequenced, single-process): the
+    SUBSTRATE CAS arbitrates — a non-coordinated writer moves the substrate;
+    the loser gets the uniform typed retryable conflict. This is the guarantee
+    a bare CAS already gives (it is NOT the coordinator's add). It pins the
+    OUTCOME VOCABULARY only; atomicity under real contention is proved by
+    ``assert_cross_process_one_winner_native_cas`` — in-process sequencing
+    satisfies no atomicity clause."""
     ref = _fresh_ref()
     binding.seed(ref, b"v1")
     agent = CoordinatedSubstrate(binding.make_view(), make_session())
@@ -666,6 +729,233 @@ def assert_detect_only_silent_lost_update() -> None:
         assert word not in text, f"detect-only text must not contain {word!r}"
 
 
+
+# ===========================================================================
+# Cross-process substrate-CAS races (guarantee-ladder plan U2; R-1/R-2).
+#
+# In-process serialization does not satisfy any clause of this contract: the
+# original race assertions above are hand-sequenced interleavings and remain
+# valuable as TYPED-OUTCOME contract tests, but only a race between separate
+# OS processes proves a binding's conditional write is atomic rather than
+# read-then-write. The packaged S3 stand-in is an in-process fake, so the
+# harness owns the sharing vehicle: a substrate-owner process serves ONE
+# locked stand-in instance and contenders reach it through a manager proxy.
+# The manager Server dispatches each client CONNECTION on its own thread with
+# no dispatch lock, and the packaged fake is single-threaded by design -- so
+# call-atomicity is NOT free. The served stand-ins below run every public
+# call under one per-call lock, making a NATIVE conditional put (check+write
+# inside one call) atomic by construction rather than by GIL scheduling
+# accident. The raced boundary stays BETWEEN proxied calls: a client-side
+# check-then-write (two calls with a real gap) races and is caught. A real
+# PG/S3 endpoint, when configured, replaces the proxy with the true network
+# boundary (the `real_substrate` arm).
+# ===========================================================================
+
+
+class CrossProcessLostUpdate(AssertionError):
+    """A cross-process race produced a lost update (more than one apparent
+    winner, or a winner whose bytes did not survive). For a conforming binding
+    this is a conformance FAILURE; for the read-then-write teeth control it is
+    the expected, asserted detection."""
+
+
+class _SubstrateManager(BaseManager):
+    """The substrate-owner process: serves ONE locked stand-in instance to all
+    contenders. The stand-in's per-call lock makes each proxied method call
+    atomic inside the owner process (the manager Server would otherwise
+    interleave them, one dispatch thread per client connection); the gap
+    BETWEEN calls is the raced boundary."""
+
+
+class _CallAtomicS3Client(LocalS3Client):
+    """Manager-served stand-in whose every public call runs under one lock.
+
+    The manager Server dispatches each client CONNECTION on its own thread,
+    and the packaged fake is single-threaded by design — so without this
+    lock the conditional put's check-then-append would be atomic only by
+    GIL scheduling accident. The lock makes call-atomicity a property of
+    the substrate-owner process by construction; the raced boundary stays
+    BETWEEN proxied calls, exactly what the contenders race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._call_lock = threading.Lock()
+
+    def create_bucket(self, name: str, **kwargs: Any) -> None:
+        with self._call_lock:
+            return super().create_bucket(name, **kwargs)
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        with self._call_lock:
+            return super().put_object(**kwargs)
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        with self._call_lock:
+            return super().get_object(**kwargs)
+
+
+class _CallAtomicInMemoryStore(InMemoryStore):
+    """Same construction for the read-then-write control's store."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._call_lock = threading.Lock()
+
+    def set(self, ref: str, data: bytes) -> str:
+        with self._call_lock:
+            return super().set(ref, data)
+
+    def get(self, ref: str) -> tuple[bytes, str] | None:
+        with self._call_lock:
+            return super().get(ref)
+
+
+# The registered NAMES stay the packaged classes' names so every call site is
+# unchanged; the SERVED classes are the locked stand-ins above.
+_SubstrateManager.register("LocalS3Client", _CallAtomicS3Client)
+_SubstrateManager.register("InMemoryStore", _CallAtomicInMemoryStore)
+
+_XP_BUCKET = "xp-race"
+_XP_KEY = "artifact"
+
+
+def _xp_native_cas_contender(ctx, client_proxy, etag: str, payload: bytes) -> str:
+    """Conforming contender: both phases barrier-aligned, then ONE proxied
+    conditional put -- the check and the write execute atomically inside the
+    substrate-owner process (native CAS, the S3 If-Match shape)."""
+    ctx.barrier_wait()  # phase 1: everyone is running
+    ctx.barrier_wait()  # phase 2: everyone holds the same pre-read token
+    ctx.delay()
+    try:
+        client_proxy.put_object(Bucket=_XP_BUCKET, Key=_XP_KEY, Body=payload, IfMatch=etag)
+    except Exception as exc:  # noqa: BLE001 - manager transports remote errors opaquely
+        if "PreconditionFailed" in repr(exc):
+            return "conflict"
+        raise
+    return "won"
+
+
+def _xp_read_then_write_contender(ctx, store_proxy, expected_token: str, payload: bytes) -> str:
+    """The qm defect class: the conditional is assembled CLIENT-side from two
+    proxied calls (read+compare, then unconditional write) with a real gap."""
+    ctx.barrier_wait()  # phase 1: everyone is running
+    entry = store_proxy.get(_XP_KEY)
+    ctx.barrier_wait()  # phase 2: everyone has read the SAME token
+    ctx.delay()
+    if entry is None or entry[1] != expected_token:
+        return "conflict"
+    store_proxy.set(_XP_KEY, payload)  # unconditional -- the gap is the bug
+    return "won"
+
+
+def assert_cross_process_one_winner_native_cas(
+    *, contenders: int = 2, delays: tuple[float, ...] = (0.0, 0.05), timeout_sec: float = 60.0
+) -> None:
+    """R-1 + R-2, positive arm: N contender OS processes race one native
+    conditional write; exactly one wins, every loser gets the typed conflict,
+    and a final authoritative read shows the winner's bytes (the loser's write
+    left no trace). Must hold at EVERY delay vector including all-zero."""
+    assert len(delays) == contenders, "one delay per contender"
+    manager = _SubstrateManager()
+    manager.start()
+    try:
+        client = manager.LocalS3Client()
+        client.create_bucket(_XP_BUCKET, versioned=True)
+        seeded = client.put_object(Bucket=_XP_BUCKET, Key=_XP_KEY, Body=b"seed")
+        etag = seeded["ETag"]
+        payloads = [f"contender-{i}".encode() for i in range(contenders)]
+        harness = ProcessRaceHarness(timeout_sec=timeout_sec)
+        result = harness.race(
+            [
+                ContenderSpec(
+                    _xp_native_cas_contender,
+                    args=(client, etag, payloads[i]),
+                    delay_seconds=delays[i],
+                )
+                for i in range(contenders)
+            ]
+        )
+        for outcome in result.outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+        verdicts = [o.value for o in result.outcomes]
+        winners = [i for i, v in enumerate(verdicts) if v == "won"]
+        if len(winners) != 1:
+            raise CrossProcessLostUpdate(
+                f"expected exactly one winner, got {len(winners)}: {verdicts} (lost update)"
+            )
+        assert verdicts.count("conflict") == contenders - 1, verdicts
+        final = client.get_object(Bucket=_XP_BUCKET, Key=_XP_KEY)["Body"].read()
+        assert final == payloads[winners[0]], (
+            "the winner's bytes did not survive -- a loser's write left a trace (R-2)"
+        )
+    finally:
+        manager.shutdown()
+
+
+def _run_broken_read_then_write_race(*, raise_on_loss: bool = False) -> list[str]:
+    """Race the read-then-write control; return verdicts. With
+    ``raise_on_loss`` the detected lost update raises CrossProcessLostUpdate,
+    mirroring the conforming assertion's failure shape."""
+    manager = _SubstrateManager()
+    manager.start()
+    try:
+        store = manager.InMemoryStore()
+        token = store.set(_XP_KEY, b"seed")
+        harness = ProcessRaceHarness(timeout_sec=60.0)
+        result = harness.race(
+            [
+                ContenderSpec(_xp_read_then_write_contender, args=(store, token, b"A"), delay_seconds=0.0),
+                ContenderSpec(_xp_read_then_write_contender, args=(store, token, b"B"), delay_seconds=0.1),
+            ]
+        )
+        for outcome in result.outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+        verdicts = [o.value for o in result.outcomes]
+        if raise_on_loss and verdicts.count("won") != 1:
+            raise CrossProcessLostUpdate(
+                f"read-then-write binding produced a lost update: {verdicts}"
+            )
+        return verdicts
+    finally:
+        manager.shutdown()
+
+
+def assert_in_process_binding_exemption_is_declared(binding: object | None = None) -> list[str]:
+    """R-8 / KTD-4: an in-process-only binding is REFUSED a cross-process race
+    with its declared reason recorded in the run report — nothing is silently
+    skipped. Returns the report lines so a runner can print them. The default
+    subject is the in-memory binding, the contract's first declared exemption."""
+    subject = binding if binding is not None else InMemoryBinding()
+    harness = ProcessRaceHarness()
+    harness.refuse_to_race(subject, clause="R-1 cross-process race")
+    report = harness.report()
+    assert report and any("R-1 cross-process race" in line for line in report), report
+    return report
+
+
+def assert_cross_process_rejects_read_then_write() -> None:
+    """R-1 teeth certification (the suite would be vacuous without it): a
+    binding whose conditional is assembled client-side from separate calls
+    MUST be caught -- both contenders report "won" and one update is silently
+    lost. The two-phase barrier makes the catch deterministic: both contenders
+    hold the same pre-read token before either writes."""
+    verdicts = _run_broken_read_then_write_race()
+    assert verdicts.count("won") == 2, (
+        f"the read-then-write control was NOT caught (verdicts: {verdicts}); "
+        "the cross-process race has lost its teeth"
+    )
+
+
+def assert_cross_process_lost_update_is_detected() -> None:
+    """The same read-then-write control, surfaced as the TYPED failure: runs
+    the broken binding and raises :class:`CrossProcessLostUpdate` on the
+    detected loss (the loss is expected — callers assert the raise). Public
+    wrapper so runners never import the module-private helper."""
+    _run_broken_read_then_write_race(raise_on_loss=True)
+
+
 def assert_forward_only_honest() -> None:
     """The forward-only arm (descriptor-level, pre-network): effect-ordering-only
     text with NO enforcement/CAS/rollback/dedup wording, and the no-version_source
@@ -686,6 +976,185 @@ def assert_forward_only_honest() -> None:
     # mints no token to compare.
     with _expect_raises(ValueError, match="version_source"):
         CapabilityDescriptor(tier=Tier.FORWARD_ONLY, version_source="etag")
+
+
+# ===========================================================================
+# Durability regime — declaration + the kill-the-primary case (U6, R-5/KTD-5).
+#
+# The honest local claim is PROCESS-CRASH grade: SIGKILL destroys user-space
+# state only (bytes handed to the OS survive in the page cache and are flushed
+# by the kernel), so the local case proves an acknowledged commit's bytes had
+# at least reached the OS — and can NEVER discriminate fsync-grade regimes.
+# Both deeper grades are DECLARED exemptions (R-8), never silent skips.
+#
+# RUNBOOK — the per-binding-release managed kill-the-primary run (KTD-5).
+# This is the release-procedure template the deferred exemption points at; it
+# is prose here because the repo ships no managed binding yet:
+#   1. Provision the managed substrate (e.g. RDS Postgres, DynamoDB) at the
+#      binding's declared configuration — record the descriptor's
+#      durability_facts verbatim in the run log.
+#   2. Drive the binding through a committed, ACKNOWLEDGED write (the same
+#      ack-then-park protocol as run_kill_after_ack; ack only after the
+#      substrate confirmed the commit).
+#   3. Kill the PRIMARY node through the provider's own failure lever
+#      (reboot-with-failover, AZ kill), not a client disconnect.
+#   4. After failover, read back through a fresh connection: the acknowledged
+#      write is present → the declared regime holds; absent → record a
+#      refutation against the descriptor's claim, and the binding's regime
+#      must be downgraded before release.
+#   5. File the run (date, substrate version, facts, outcome) with the
+#      release notes; the exemption stays declared until a run replaces it.
+# ===========================================================================
+
+
+class UndeclaredDurabilityRegime(AssertionError):
+    """A binding offered no durability regime (or an unverifiable one).
+
+    Typed refusal: the kit never assumes a grade for a silent descriptor —
+    an undeclared axis is NOT process-crash by default."""
+
+
+class AcknowledgedWriteLost(AssertionError):
+    """An ACKNOWLEDGED write was missing after the writer was SIGKILLed.
+
+    The binding acked before its bytes reached the OS — the process-crash
+    grade is violated (the loss a kill case genuinely can catch)."""
+
+
+def assert_durability_regime_is_declared(descriptor: CapabilityDescriptor) -> None:
+    """The descriptor speaks the durability axis: a regime AND its facts.
+
+    A regime without configuration facts is refused too — a claim nothing
+    qualifies cannot be checked against the substrate's actual settings."""
+    if descriptor.durability_regime is None:
+        raise UndeclaredDurabilityRegime(
+            "binding declares no durability_regime; refusing to assume a "
+            "grade (an undeclared axis is not process-crash by default)"
+        )
+    if not descriptor.durability_facts:
+        raise UndeclaredDurabilityRegime(
+            f"durability_regime {descriptor.durability_regime.value!r} is "
+            "declared without configuration facts; an unverifiable claim is "
+            "refused (state e.g. the journal/synchronous settings it rides on)"
+        )
+
+
+def assert_process_crash_durability(
+    spec: ContenderSpec,
+    verify_durable: "Callable[[Any], bool]",
+    *,
+    timeout_sec: float = 60.0,
+) -> None:
+    """The generic kill-the-primary case at PROCESS-CRASH grade.
+
+    ``spec.fn`` performs the write, ``ctx.ack(facts)``s it, then parks (see
+    :func:`ccs.testing.process_harness.run_kill_after_ack` for the protocol);
+    the harness SIGKILLs it on the ack. ``verify_durable(facts)`` then reads
+    the substrate with the writer destroyed and returns whether the
+    acknowledged write is present — False raises the typed
+    :class:`AcknowledgedWriteLost`. Deterministic: the ack is the only
+    synchronization, and the assertion holds at any interleaving after it."""
+    facts = run_kill_after_ack(spec, timeout_sec=timeout_sec)
+    if not verify_durable(facts):
+        raise AcknowledgedWriteLost(
+            f"acknowledged write missing after SIGKILL: {facts!r} — the "
+            "binding acked before its bytes reached the OS"
+        )
+
+
+def _durability_sqlite_child(ctx: Any, db_path_str: str, artifact_hex: str, agent_hex: str) -> None:
+    """Child: open the sqlite registry, commit a WIN, ack it, park for the kill."""
+    from ccs.core.states import MESIState
+    from ccs.core.types import Artifact
+
+    registry = SqliteArtifactRegistry(Path(db_path_str))
+    artifact = Artifact(
+        id=UUID(hex=artifact_hex), name="durability.md", version=1, content_hash="seed"
+    )
+    registry.register_artifact(artifact, "seed-content")
+    agent = UUID(hex=agent_hex)
+    registry.set_agent_state(artifact.id, agent, MESIState.SHARED, trigger="fetch", tick=0)
+    committed_hash = sha256_hex(b"the acknowledged bytes")
+    result = registry.commit_cas(
+        artifact.id, agent, expected_version=1, content_hash=committed_hash
+    )
+    updated = result[0]  # WIN returns (updated_artifact, invalidated_agent_ids)
+    # The ack goes out only AFTER the registry's COMMIT returned — exactly the
+    # acknowledgement whose durability the case certifies. The registry handle
+    # stays open (never .close()d) so SIGKILL destroys a LIVE writer; ack()
+    # parks and never returns.
+    ctx.ack(
+        {
+            "artifact": artifact_hex,
+            "version": updated.version,
+            "content_hash": committed_hash,
+        }
+    )
+
+
+def assert_sqlite_acknowledged_commit_survives_kill(db_path: "Path | str") -> None:
+    """The kill-the-primary case on the existing store (KTD-5's local leg).
+
+    A spawned child opens :class:`SqliteArtifactRegistry` at ``db_path``,
+    commits a WIN, acknowledges, parks, and is SIGKILLed; the reopened store
+    (writer open — it runs WAL recovery over the dead writer's hot journal)
+    must serve the acknowledged version with the acknowledged content hash."""
+    db = Path(db_path)
+    artifact_hex, agent_hex = uuid4().hex, uuid4().hex
+
+    def _verify(facts: Any) -> bool:
+        reopened = SqliteArtifactRegistry(db)
+        try:
+            artifact = reopened.get_artifact(UUID(hex=facts["artifact"]))
+            return (
+                artifact is not None
+                and artifact.version == facts["version"]
+                and artifact.content_hash == facts["content_hash"]
+            )
+        finally:
+            reopened.close()
+
+    assert_process_crash_durability(
+        ContenderSpec(
+            fn=_durability_sqlite_child, args=(str(db), artifact_hex, agent_hex)
+        ),
+        _verify,
+    )
+
+
+#: Why no local case can certify fsync-grade (OS-crash) durability (R-8).
+FSYNC_GRADE_EXEMPTION_REASON = (
+    "SIGKILL destroys user-space state only — bytes in the OS page cache "
+    "survive and are flushed by the kernel — so no local kill can "
+    "discriminate fsync-grade regimes (sqlite synchronous NORMAL vs FULL "
+    "differ only under OS crash/power loss); a crash-simulating VFS is the "
+    "named future closer"
+)
+
+#: Why the managed kill-the-primary run is deferred to release time (KTD-5).
+MANAGED_KILL_RUN_EXEMPTION_REASON = (
+    "kill-the-primary against a managed cluster is a per-binding-release "
+    "run (see this section's runbook template), not a CI case; deferred "
+    "with this declaration, never silently skipped"
+)
+
+
+def declare_deferred_durability_exemptions(
+    harness: ProcessRaceHarness,
+) -> "tuple[Any, Any]":
+    """Record the two deferred durability grades as DECLARED exemptions (R-8)
+    so the kit report names them; returns ``(fsync_grade, managed_run)``."""
+    fsync = harness.declare_exemption(
+        subject="durability",
+        clause="R-5 fsync-grade discrimination",
+        reason=FSYNC_GRADE_EXEMPTION_REASON,
+    )
+    managed = harness.declare_exemption(
+        subject="durability",
+        clause="R-5 managed kill-the-primary (KTD-5)",
+        reason=MANAGED_KILL_RUN_EXEMPTION_REASON,
+    )
+    return fsync, managed
 
 
 # ===========================================================================
