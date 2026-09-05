@@ -4,7 +4,48 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.14.1] - 2026-09-05
+
+**Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.
+
+### Added
+
+- **Conflict-outcome counters — a typed deny is now countable, across
+  restarts.** The coordinator persists a durable per-`(artifact, agent,
+  reason)` tally of the three typed refusals (`version_mismatch`,
+  `other_holder`, `stale_read_generation`), so "how often does this
+  actually fire in my fleet?" stops being a question answered by argument.
+  `ccs.diagnose.conflict_counters.read_conflict_totals(db_path)` reads them
+  back **offline** — raw read-only sqlite against a closed `state.db`, no
+  coordinator import, no running daemon — so a report can be built after
+  the fact from a database that has since been shut down. The honesty rules
+  are load-bearing: a database predating the instrumentation has no
+  `conflict_counters` table and reads as **zero recorded conflicts**, which
+  is a reportable result; every *other* read failure (a locked database, a
+  hot-WAL recovery failure, disk I/O) propagates rather than being mapped
+  to zero, so a broken read can never masquerade as a quiet month.
+  Attribution is by agent identity only — no host identifier reaches the
+  commit path today, and the reader says so rather than inventing one.
+
+- **The claim ladder — every guarantee this project claims is pinned to the
+  test that would fail without it.** `ccs.testing.claim_ladder` pairs each
+  guarantee's text with the exact README claim-phrases it backs and the
+  tests that prove it; the suite resolves every named test at collection
+  time and drift-guards the README **in both directions**, so a claim
+  cannot outlive its proof and a rung cannot appear without one. This is
+  the machine-checked answer to "which of these sentences is still true?"
+
+- **Cross-process conformance + a declared durability regime.** The
+  packaged substrate-conformance corpus now runs its race scenarios across
+  real OS **process** boundaries — contenders are spawned processes
+  rendezvoused at a barrier before the racing section, so a binding whose
+  "compare-and-swap" is really a read-then-write under an in-process lock
+  is caught rather than false-greened. A binding declares the durability
+  regime an acknowledged write survives (`in-process` / `process-crash` /
+  `os-crash`); the corpus verifies the process-crash grade locally by
+  SIGKILLing a writer after its acknowledged commit and reading the store
+  back. What cannot be verified locally is recorded as a **declared
+  exemption with its reason**, never silently skipped.
 
 ### Changed
 

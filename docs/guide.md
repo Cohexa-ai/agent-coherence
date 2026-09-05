@@ -39,12 +39,13 @@ full command-line toolset, and the API reference.
 19. [Real-workload benchmarks](#real-workload-benchmarks)
 20. [Benchmarking your own workload](#benchmarking-your-own-workload)
 21. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-22. [Replay (v0.8.2+)](#replay-v082)
-23. [Command-line tools](#command-line-tools)
-24. [API reference](#api-reference)
-25. [Low-level adapter API](#low-level-adapter-api)
-26. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-27. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+22. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+23. [Replay (v0.8.2+)](#replay-v082)
+24. [Command-line tools](#command-line-tools)
+25. [API reference](#api-reference)
+26. [Low-level adapter API](#low-level-adapter-api)
+27. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+28. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -1398,6 +1399,50 @@ A standalone CLI for detecting divergent reads in an existing LangGraph graph wi
 See [docs/ccs-diagnose.md](ccs-diagnose.md) for the full reference: usage, flags, exit codes, trust posture, calibration corpus, and the `langgraph-v0-preview` → `v1` promotion gate.
 
 ---
+
+## Conflict-outcome counters — how often did it actually fire?
+
+*New in v0.14.1.*
+
+Every guarantee in this library ends in a typed refusal: `version_mismatch`,
+`other_holder`, `stale_read_generation`. The counters answer the question that
+follows — **how often does that actually happen in my fleet?** — with a number
+instead of an argument.
+
+The coordinator keeps a durable tally per `(artifact, agent, reason)` that
+survives restarts. Read it back offline, against a coordinator that is no
+longer running:
+
+```python
+from ccs.diagnose.conflict_counters import read_conflict_totals
+
+totals = read_conflict_totals(".coherence/state.db")
+# {(artifact_id_hex, agent_id_hex, "stale_read_generation"): 3, ...}
+
+for (artifact, agent, reason), count in sorted(totals.items()):
+    print(f"{reason:24} {count:>5}   artifact={artifact[:8]} agent={agent[:8]}")
+```
+
+The reader opens the database **read-only and raw** — it imports no coordinator
+and needs no daemon — so you can point it at a `state.db` copied off a machine
+after the fact.
+
+**The honesty rules matter more than the numbers, so they are worth stating
+plainly:**
+
+- A database written **before** this release has no `conflict_counters` table.
+  That reads as **zero recorded conflicts** — a real, reportable result.
+- Every **other** read failure — a locked database, a hot-WAL recovery failure,
+  disk I/O — is raised, never mapped to zero. A broken read can never
+  masquerade as a quiet month.
+- A missing file raises `FileNotFoundError`: a report against a store that does
+  not exist is a caller error, not evidence of zero conflicts.
+- **Attribution is by agent identity only.** No host identifier reaches the
+  commit path today, so a report built from these totals says "agent", not
+  "host" — the reader will not invent a dimension the data does not carry.
+
+Zero is a result. *No table at all* is a different result, and the distinction
+is exactly what makes a thirty-day observation window worth running.
 
 ## Replay (v0.8.2+)
 
