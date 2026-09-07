@@ -35,10 +35,6 @@ def new_workspace(act: str) -> Path:
     """Fresh temp workspace for one act, with the notes directory in place."""
     workspace = Path(tempfile.mkdtemp(prefix=f"session_handoff_{act}_"))
     (workspace / NOTES).parent.mkdir(parents=True, exist_ok=True)
-    # The coordinator requires ``.coherence/`` at 0700; the pre-spawn config write
-    # would otherwise create it at 0755, and the coordinator would tighten it and
-    # warn on stderr every act.
-    (workspace / ".coherence").mkdir(mode=0o700)
     return workspace
 
 
