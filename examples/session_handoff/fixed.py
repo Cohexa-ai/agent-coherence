@@ -22,9 +22,20 @@ from __future__ import annotations
 
 import shutil
 
+from ccs.adapters.claude_code.hook_payloads import STRICT_MODE_DENY_REASON_TEMPLATE
 from examples.session_handoff import A_STATUS_1, A_STATUS_2, B_PICKUP, GUARDED, NOTES, UNGUARDED
 from examples.session_handoff.broken import EXPECTED, new_workspace, render_notes, verdict_line
 from examples.session_handoff.sessions import Session, SessionDenied
+
+#: The coordinator renders every strict-mode deny from one public template; its
+#: fixed lead-in is how a trace can tell a coordinator deny from the file's own
+#: version check (which raises the same ``StaleView`` with a different reason).
+COORDINATOR_DENY_PREFIX = STRICT_MODE_DENY_REASON_TEMPLATE.split("{", 1)[0]
+
+
+def denied_by_coordinator(message: str | None) -> bool:
+    """True when a deny reason came from the coordinator, not from the file's own version check."""
+    return bool(message) and message.startswith(COORDINATOR_DENY_PREFIX)
 
 
 def run_guarded() -> dict[str, object]:

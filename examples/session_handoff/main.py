@@ -6,11 +6,13 @@
 Runs five acts, each with two REAL OS processes, and exits 0 only if ALL hold:
   - RED       — plain file I/O → A's second write erases B's pickup line; nothing raised.
   - GREEN     — the same sequence through ``CoherentVolume`` → A's stale write is
-                DENIED (``StaleView``); A reacquires and both lines survive EXACTLY.
+                DENIED by the coordinator (``StaleView``); A reacquires and both
+                lines survive EXACTLY.
   - CONTROL   — the green code with the guard pointed elsewhere → the loss returns,
                 proving green depends on the deny, not on the re-read.
   - HANDOFF a — A checkpoints, writes once more, stops; B restores → the disk rewinds
-                in one attempt and A learns on its NEXT write (denied, then reacquire).
+                in one attempt and A learns on its NEXT write (denied by the file's
+                own version check, then reacquire).
   - HANDOFF b — A is STILL WORKING while B restores → the restore concludes a bounded
                 ``conflict``; A's latest edit survives; nothing was clobbered.
 
@@ -37,7 +39,7 @@ _ACTS: tuple[tuple[str, Callable[[], dict], str], ...] = (
     ("red", broken.run_broken, "RED — plain file I/O, no coordination"),
     ("green", fixed.run_guarded, "GREEN — the same sequence through CoherentVolume (handoff/** guarded)"),
     ("control", fixed.run_control, "CONTROL — the same code with the guard pointed elsewhere (other/**)"),
-    ("stopped", handoff.run_handoff_stopped, "HANDOFF — A hands off through a checkpoint, then stops"),
+    ("stopped", handoff.run_handoff_stopped, "HANDOFF — A hands off through a checkpoint, then stops writing"),
     ("racing", handoff.run_handoff_racing, "HANDOFF — A hands off through a checkpoint, and is still working"),
 )
 
@@ -72,8 +74,10 @@ def _red_checks(red: dict) -> dict[str, bool]:
 
 def _green_checks(green: dict) -> dict[str, bool]:
     return {
-        "GREEN    A's stale write is denied (StaleView)": (
-            bool(green["denied"]) and green["denial_exc"] == "StaleView"
+        "GREEN    A's stale write is denied by the coordinator (StaleView)": (
+            bool(green["denied"])
+            and green["denial_exc"] == "StaleView"
+            and fixed.denied_by_coordinator(green["denial_message"])
         ),
         "GREEN    A reacquires and rebuilds; both lines survive (exact)": (
             bool(green["recovered"]) and green["final"] == EXPECTED and not green["lost"]
@@ -94,14 +98,16 @@ def _control_checks(control: dict) -> dict[str, bool]:
 
 def _stopped_checks(stopped: dict) -> dict[str, bool]:
     return {
-        "HANDOFF  A stopped: B's restore lands in one attempt; the disk is rewound": (
+        "HANDOFF  A stopped writing: B's restore lands in one attempt; the disk is rewound": (
             stopped["outcome"] == RESTORE_OUTCOME_RESTORED
             and stopped["attempts"] == 1
             and stopped["disk_after_restore"] == A_STATUS_1
         ),
-        "HANDOFF  A stopped: A's next write is denied (StaleView); reacquire shows the handoff bytes": (
+        "HANDOFF  A stopped writing: A's next write is denied by the file's own version check (StaleView); "
+        "reacquire shows the handoff bytes": (
             bool(stopped["a_denied"])
             and stopped["a_denial_exc"] == "StaleView"
+            and not fixed.denied_by_coordinator(stopped["a_denial_message"])
             and stopped["a_reacquired"] == A_STATUS_1
         ),
     }

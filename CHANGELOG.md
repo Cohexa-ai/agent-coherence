@@ -17,7 +17,7 @@ Alpha — APIs may change before `v1.0`.
   `CoherentVolume` the stale write is denied and both lines survive; a control arm
   with the guard pointed elsewhere shows the loss return. The handoff act shows
   both honest outcomes of a rewind — clean when the handing-off session has
-  stopped, a bounded `conflict` (never a clobber) when it is still writing.
+  stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
 ## [0.14.1] - 2026-09-05

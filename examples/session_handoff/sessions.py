@@ -9,10 +9,11 @@ sessions are therefore two processes, exactly as two agent sessions on one
 host would be; the first child to construct its volume spawns the coordinator
 (an in-process serving thread) and every later child attaches to it.
 
-Commands cross a spawn-context queue pair and come back typed: a coordinator
-deny (any ``CoherenceError``, e.g. ``StaleView``) surfaces in the parent as
-:class:`SessionDenied`; anything else the child raises surfaces as
-:class:`SessionError` carrying the child's traceback. Checkpoint and restore
+Commands cross a spawn-context queue pair and come back typed: a typed
+coordinator deny — ``StaleView`` or ``CommitPreempted`` — surfaces in the parent
+as :class:`SessionDenied`; anything else the child raises, including any other
+``CoherenceError`` (an unreachable coordinator, an unknown checkpoint), surfaces
+as :class:`SessionError` carrying the child's traceback. Checkpoint and restore
 run in the child too, over a per-command ``WorkspaceVersioner`` — the ledger
 is opened, used, and closed inside each command, never held across commands.
 
@@ -42,6 +43,7 @@ _REPLY_TIMEOUT_SEC = 60.0
 _STOP_TIMEOUT_SEC = 30.0
 _JOIN_TIMEOUT_SEC = 10.0
 _POLL_SEC = 0.05
+_PARENT_WATCH_SEC = 1.0
 
 _KIND_OK = "ok"
 _KIND_DENIED = "denied"
@@ -49,7 +51,8 @@ _KIND_ERROR = "error"
 
 
 class SessionDenied(Exception):
-    """The child's coordinator denied the operation (a ``CoherenceError``)."""
+    """The child's coordinator denied the operation: a typed deny, ``StaleView``
+    or ``CommitPreempted``. Every other child-side failure is a :class:`SessionError`."""
 
     def __init__(self, exc_name: str, message: str) -> None:
         super().__init__(f"{exc_name}: {message}")
@@ -338,17 +341,37 @@ def _dispatch(op: str, args: tuple[Any, ...], state: dict[str, Any]) -> Any:
     raise ValueError(f"unknown session command {op!r}")
 
 
+def _next_command(cmd_q: Any) -> tuple[Any, ...] | None:  # pragma: no cover - runs in the spawned child
+    """Wait for the next command; ``None`` once the parent process is gone.
+
+    A waiting ``get`` still returns the moment a command lands; the timeout only
+    bounds how long the child goes without checking that its parent is alive.
+    """
+    while True:
+        with suppress(queue.Empty):
+            return tuple(cmd_q.get(timeout=_PARENT_WATCH_SEC))
+        parent = multiprocessing.parent_process()
+        if parent is None or not parent.is_alive():
+            return None
+
+
 def _session_main(
     cmd_q: Any, reply_q: Any, workspace_str: str, role: str, managed: tuple[str, ...]
 ) -> None:  # pragma: no cover - runs in the spawned child
     # Imported here so the child pays for the volume runtime only once alive.
     from ccs.adapters.claude_code.lifecycle import stop_coordinator
     from ccs.adapters.coherent_volume import CoherentVolume
-    from ccs.core.exceptions import CoherenceError
+    from ccs.core.exceptions import CommitPreempted, StaleView
 
     state: dict[str, Any] = {"workspace": Path(workspace_str), "role": role, "volume": None}
     while True:
-        command = cmd_q.get()
+        command = _next_command(cmd_q)
+        if command is None:
+            # ``daemon=True`` reaps this child only through the parent's atexit
+            # hook, which a hard kill (SIGKILL, OOM, CI timeout) never runs; an
+            # unbounded ``get`` would then block forever holding the coordinator.
+            stop_coordinator(state["workspace"])
+            return
         op, args = command[0], tuple(command[1:])
         try:
             if op == "stop":
@@ -362,7 +385,10 @@ def _session_main(
             else:
                 value = _dispatch(op, args, state)
             reply_q.put((_KIND_OK, value, None, None, None))
-        except CoherenceError as exc:
+        except (StaleView, CommitPreempted) as exc:
+            # Only the volume's typed denies are denies; any other CoherenceError
+            # (unreachable coordinator, CheckpointUnknown, ...) is a failure and
+            # keeps its traceback via the branch below.
             # A deny carries no traceback: the parent raises SessionDenied from the
             # name and message alone, so formatting one here would only be discarded.
             reply_q.put((_KIND_DENIED, None, type(exc).__name__, str(exc), None))

@@ -9,7 +9,8 @@ status write. B picks the checkpoint up and restores it, rewinding the notes to
 the handoff point. What happens next depends on one thing — whether A has
 stopped.
 
-HANDOFF-a (``run_handoff_stopped``): A stopped after that last write. B's
+HANDOFF-a (``run_handoff_stopped``): A has stopped writing after that last
+write (its process stays open — it hosts the coordinator B is attached to). B's
 restore lands cleanly (``restored``, one attempt) and the disk holds the handoff
 bytes again. A finds out only when it next writes: the restore went through the
 versioner's own ledger, never through A's live coordinator view, so A's next
@@ -54,7 +55,7 @@ _Story = Callable[[Path, Session, Session], dict[str, object]]
 
 
 def run_handoff_stopped() -> dict[str, object]:
-    """HANDOFF-a: A stops after the handoff; B's restore rewinds, A learns on its next write."""
+    """HANDOFF-a: A stops writing after the handoff; B's restore rewinds, A learns on its next write."""
     return _with_two_sessions("handoff_stopped", _stopped_story)
 
 
@@ -86,7 +87,7 @@ def _stopped_story(workspace: Path, a: Session, b: Session) -> dict[str, object]
     checkpoint = _post_and_checkpoint(a, "handoff-1", trace)
     checkpoint_id = str(checkpoint["checkpoint_id"])
     a.write(A_STATUS_2)
-    trace.append(f"A write     {render_notes(A_STATUS_2)}   (one more status, then A stops)")
+    trace.append(f"A write     {render_notes(A_STATUS_2)}   (one more status, then A stops writing)")
     members = _pick_up(b, checkpoint_id, trace)
     leg = _single_leg(b.restore(checkpoint_id), trace)
     disk_after_restore = _notes_on_disk(workspace, trace)
