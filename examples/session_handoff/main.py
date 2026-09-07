@@ -24,18 +24,13 @@ under the ``__main__`` guard at the bottom.
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
+from ccs.core.exceptions import RESTORE_OUTCOME_CONFLICT, RESTORE_OUTCOME_RESTORED
 from examples.session_handoff import A_STATUS_1, A_STATUS_2, broken, fixed, handoff
 from examples.session_handoff.broken import EXPECTED
-from examples.session_handoff.handoff import RACING_ATTEMPTS, still_working_bytes
+from examples.session_handoff.handoff import RACING_ATTEMPTS
+from examples.session_handoff.sessions import still_working_bytes
 
 #: (result key, act runner, title line) — in the order the story is told: loss first.
 _ACTS: tuple[tuple[str, Callable[[], dict], str], ...] = (
@@ -100,7 +95,7 @@ def _control_checks(control: dict) -> dict[str, bool]:
 def _stopped_checks(stopped: dict) -> dict[str, bool]:
     return {
         "HANDOFF  A stopped: B's restore lands in one attempt; the disk is rewound": (
-            stopped["outcome"] == "restored"
+            stopped["outcome"] == RESTORE_OUTCOME_RESTORED
             and stopped["attempts"] == 1
             and stopped["disk_after_restore"] == A_STATUS_1
         ),
@@ -115,7 +110,7 @@ def _stopped_checks(stopped: dict) -> dict[str, bool]:
 def _racing_checks(racing: dict) -> dict[str, bool]:
     return {
         f"HANDOFF  A still working: restore concludes conflict after {RACING_ATTEMPTS} attempts; A's edit survives": (
-            racing["outcome"] == "conflict"
+            racing["outcome"] == RESTORE_OUTCOME_CONFLICT
             and racing["attempts"] == RACING_ATTEMPTS
             and racing["disk_after_restore"] == still_working_bytes(RACING_ATTEMPTS)
             and not racing["restore_landed"]

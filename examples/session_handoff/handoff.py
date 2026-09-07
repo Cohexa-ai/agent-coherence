@@ -63,23 +63,21 @@ def run_handoff_racing() -> dict[str, object]:
     return _with_two_sessions("handoff_racing", _racing_story)
 
 
-def still_working_bytes(edit: int) -> bytes:
-    """The notes bytes after the racing source's ``edit``-th edit (mirrors ``_StillWorkingSource``)."""
-    return f"status: still working, edit {edit}\n".encode()
-
-
 def _with_two_sessions(act: str, story: _Story) -> dict[str, object]:
     """Fresh workspace, A then B, the story, then B then A closed (reverse creation order)."""
     workspace = new_workspace(act)
-    a = Session(workspace, "A", GUARDED)  # first session: spawns the coordinator
+    a: Session | None = None
     try:
+        a = Session(workspace, "A", GUARDED)  # first session: spawns the coordinator
         b = Session(workspace, "B", GUARDED)  # attaches to A's coordinator
         try:
             return story(workspace, a, b)
         finally:
             b.close()
     finally:
-        a.close()
+        # The workspace is removed even when spawning A itself failed.
+        if a is not None:
+            a.close()
         shutil.rmtree(workspace, ignore_errors=True)
 
 

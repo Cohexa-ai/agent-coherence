@@ -215,6 +215,11 @@ class Session:
 # --- child side ---------------------------------------------------------------
 
 
+def still_working_bytes(edit: int) -> bytes:
+    """The notes bytes after the racing source's ``edit``-th edit — the one place this format lives."""
+    return f"status: still working, edit {edit}\n".encode()
+
+
 class _StillWorkingSource:
     """Wrap a ``WorkingTreeSource``: every read of ``NOTES`` is followed by a
     fresh edit to the disk file — the handing-off session is still typing. The
@@ -231,7 +236,7 @@ class _StillWorkingSource:
         observed = self._inner.read_with_version(path)
         if path == NOTES:
             self._edits += 1
-            (self._workspace / NOTES).write_bytes(f"status: still working, edit {self._edits}\n".encode())
+            (self._workspace / NOTES).write_bytes(still_working_bytes(self._edits))
         return observed
 
     def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
@@ -358,7 +363,9 @@ def _session_main(
                 value = _dispatch(op, args, state)
             reply_q.put((_KIND_OK, value, None, None, None))
         except CoherenceError as exc:
-            reply_q.put((_KIND_DENIED, None, type(exc).__name__, str(exc), traceback.format_exc()))
+            # A deny carries no traceback: the parent raises SessionDenied from the
+            # name and message alone, so formatting one here would only be discarded.
+            reply_q.put((_KIND_DENIED, None, type(exc).__name__, str(exc), None))
         except BaseException as exc:  # noqa: BLE001 - the channel carries everything
             reply_q.put((_KIND_ERROR, None, type(exc).__name__, str(exc), traceback.format_exc()))
             if op == "stop":

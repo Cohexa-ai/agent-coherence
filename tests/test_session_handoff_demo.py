@@ -15,19 +15,19 @@ from __future__ import annotations
 
 import os
 import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
 
+from ccs.core.exceptions import RESTORE_OUTCOME_CONFLICT, RESTORE_OUTCOME_RESTORED
 from examples.session_handoff import A_STATUS_1, A_STATUS_2, B_PICKUP, GUARDED, NOTES
+from examples.session_handoff.broken import new_workspace
 from examples.session_handoff.sessions import Session, SessionDenied
 
 
 @pytest.fixture
 def workspace() -> Path:
-    root = Path(tempfile.mkdtemp(prefix="session_handoff_test_"))
-    (root / NOTES).parent.mkdir(parents=True, exist_ok=True)
+    root = new_workspace("test")
     try:
         yield root
     finally:
@@ -146,7 +146,7 @@ def test_handoff_stopped_rewinds_and_a_learns_on_next_write() -> None:
     assert result["members"][0]["member_path"] == NOTES
     assert result["members"][0]["restore_tier"] == "restorable-unpinned"
     assert result["members"][0]["pin_state"] == "held"
-    assert result["outcome"] == "restored"
+    assert result["outcome"] == RESTORE_OUTCOME_RESTORED
     assert result["attempts"] == 1
     assert result["detail"]
     assert result["disk_after_restore"] == A_STATUS_1  # rewound to the handoff point
@@ -160,7 +160,8 @@ def test_handoff_stopped_rewinds_and_a_learns_on_next_write() -> None:
 
 def test_handoff_racing_concludes_conflict_not_clobber() -> None:
     from ccs.adapters.workspace import MAX_RESTORE_LEG_REDRIVES
-    from examples.session_handoff.handoff import RACING_ATTEMPTS, run_handoff_racing, still_working_bytes
+    from examples.session_handoff.handoff import RACING_ATTEMPTS, run_handoff_racing
+    from examples.session_handoff.sessions import still_working_bytes
 
     result = run_handoff_racing()
 
@@ -169,7 +170,7 @@ def test_handoff_racing_concludes_conflict_not_clobber() -> None:
     assert result["act"] == "handoff_racing"
     assert isinstance(result["checkpoint_id"], str) and result["checkpoint_id"]
     assert len(result["members"]) == 1 and result["members"][0]["member_path"] == NOTES
-    assert result["outcome"] == "conflict"
+    assert result["outcome"] == RESTORE_OUTCOME_CONFLICT
     assert result["attempts"] == RACING_ATTEMPTS
     assert "re-drive budget exhausted" in result["detail"]
     # One racing edit per admitted attempt, so the last edit index equals the attempt count.

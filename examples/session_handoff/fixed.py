@@ -44,8 +44,9 @@ def _run_handoff(act: str, managed: tuple[str, ...]) -> dict[str, object]:
     """
     workspace = new_workspace(act)
     trace: list[str] = []
-    a = Session(workspace, "A", managed)  # first session: spawns the coordinator
+    a: Session | None = None
     try:
+        a = Session(workspace, "A", managed)  # first session: spawns the coordinator
         b = Session(workspace, "B", managed)  # attaches to A's coordinator
         try:
             _post_status_and_pick_up(a, b, trace)
@@ -56,7 +57,9 @@ def _run_handoff(act: str, managed: tuple[str, ...]) -> dict[str, object]:
         finally:
             b.close()
     finally:
-        a.close()
+        # The workspace is removed even when spawning A itself failed.
+        if a is not None:
+            a.close()
         shutil.rmtree(workspace, ignore_errors=True)
     return {
         "act": act,

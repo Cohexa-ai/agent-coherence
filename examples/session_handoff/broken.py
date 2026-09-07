@@ -66,10 +66,11 @@ def run_broken() -> dict[str, object]:
     """
     workspace = new_workspace("red")
     trace: list[str] = []
-    # A Session always carries a volume; this act never touches it. Leaving NOTES
-    # outside the strict glob keeps the arm honest: nothing is coordinating it.
-    a = Session(workspace, "A", UNGUARDED)
+    a: Session | None = None
     try:
+        # A Session always carries a volume; this act never touches it. Leaving NOTES
+        # outside the strict glob keeps the arm honest: nothing is coordinating it.
+        a = Session(workspace, "A", UNGUARDED)
         b = Session(workspace, "B", UNGUARDED)
         try:
             a.raw_write(A_STATUS_1)
@@ -87,7 +88,9 @@ def run_broken() -> dict[str, object]:
         finally:
             b.close()
     finally:
-        a.close()
+        # The workspace is removed even when spawning A itself failed.
+        if a is not None:
+            a.close()
         shutil.rmtree(workspace, ignore_errors=True)
     return {
         "act": "red",
