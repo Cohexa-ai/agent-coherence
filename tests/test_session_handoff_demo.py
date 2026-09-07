@@ -80,3 +80,53 @@ def test_two_sessions_are_distinct_processes(workspace: Path) -> None:
     with Session(workspace, "A", GUARDED) as a, Session(workspace, "B", GUARDED) as b:
         assert a.pid != b.pid
         assert os.getpid() not in {a.pid, b.pid}
+
+
+# --- the three acts: RED, GREEN, CONTROL -------------------------------------------------
+
+
+def test_red_loses_the_pickup_line() -> None:
+    from examples.session_handoff.broken import run_broken
+
+    result = run_broken()
+
+    assert result["act"] == "red"
+    assert result["raised"] is None  # plain file I/O: nothing complained
+    assert result["final"] == A_STATUS_2  # B's pickup line is gone
+    assert result["expected"] == A_STATUS_2 + B_PICKUP
+    assert result["b_line_present"] is False
+    assert result["lost"] is True
+    assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
+
+
+def test_green_denies_then_both_lines_survive() -> None:
+    from examples.session_handoff.fixed import run_guarded
+
+    result = run_guarded()
+
+    assert result["act"] == "green"
+    assert result["denied"] is True
+    assert result["denial_exc"] == "StaleView"
+    assert result["denial_message"]  # the coordinator's reason travels verbatim
+    assert result["recovered"] is True
+    assert result["final"] == A_STATUS_2 + B_PICKUP  # EXACT bytes: both lines survive
+    assert result["expected"] == A_STATUS_2 + B_PICKUP
+    assert result["b_line_present"] is True
+    assert result["lost"] is False
+    assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
+
+
+def test_control_with_guard_off_loses_again() -> None:
+    from examples.session_handoff.fixed import run_control
+
+    result = run_control()
+
+    assert result["act"] == "control"
+    assert result["denied"] is False  # NOTES sits outside the strict glob: no deny
+    assert result["denial_exc"] is None
+    assert result["denial_message"] is None
+    assert result["recovered"] is False
+    assert result["final"] == A_STATUS_2  # the loss returns
+    assert result["b_line_present"] is False
+    assert result["lost"] is True
+    assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
