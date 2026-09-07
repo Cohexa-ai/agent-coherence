@@ -1291,6 +1291,7 @@ Correctness demos lead; the token-savings / hit-rate demos follow.
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
 | Workspace versioning & restore | `python -m examples.workspace_versioning.main` | Checkpoint a mixed file + S3 workspace, then restore it with per-member honesty (`restored` / `conflict` / delete leg / forward-only skip); `--baseline` shows the unrecoverable loss first (offline, no keys) |
+| Session handoff | `python -m examples.session_handoff.main` | Two sessions, each a real OS process, share a scratch file and hand off through a checkpoint: plain file I/O loses the second session's line with nothing raised; `CoherentVolume` denies the stale write and both lines survive; a rewind lands cleanly when the handing-off session stopped and concludes `conflict` when it is still writing (offline, no keys) |
 | Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
 | Cross-host (experimental) | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
 | LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |

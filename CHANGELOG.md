@@ -4,6 +4,22 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Added
+
+- **Session-handoff demo** (`examples/session_handoff`): two sessions on one
+  host — each a real OS process — share a scratch file and hand work off through
+  a checkpoint. It runs the workaround described in
+  [anthropics/claude-code#60082](https://github.com/anthropics/claude-code/issues/60082)
+  the way people actually run it and pins what the file does under it: plain file
+  I/O loses the second session's line with nothing raised; through
+  `CoherentVolume` the stale write is denied and both lines survive; a control arm
+  with the guard pointed elsewhere shows the loss return. The handoff act shows
+  both honest outcomes of a rewind — clean when the handing-off session has
+  stopped, a bounded `conflict` (never a clobber) when it is still writing.
+  Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
+
 ## [0.14.1] - 2026-09-05
 
 **Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.
