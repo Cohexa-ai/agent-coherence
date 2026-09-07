@@ -19,6 +19,8 @@ token-identity logic both real bindings use.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -197,6 +199,33 @@ def _agent(
 
 def _session(tmp_path: Path, fast_cfg: LifecycleConfig) -> SubstrateCoordinatorSession:
     return SubstrateCoordinatorSession(tmp_path, managed=("**",), config=fast_cfg)
+
+
+# --- spawn: the pre-spawn policy write creates .coherence/ at 0700 ----------
+
+
+def test_spawn_creates_coherence_dir_at_0700_without_tighten_warning(
+    tmp_path: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The strict-policy write creates ``.coherence/`` ahead of the lifecycle
+    and must do so at the 0700 the lifecycle requires; otherwise every fresh
+    workspace spawns with a "tightened existing .coherence directory" warning
+    about a directory the session itself created a moment earlier. umask is
+    pinned to 022 so a permissive default ``mkdir`` is observable."""
+    prior_umask = os.umask(0o022)
+    try:
+        caplog.set_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle")
+        _session(tmp_path, fast_cfg)
+        assert ((tmp_path / ".coherence").stat().st_mode & 0o777) == 0o700
+        tightened = [
+            r.getMessage()
+            for r in caplog.records
+            if "tightened existing .coherence directory" in r.getMessage()
+        ]
+        assert tightened == []
+    finally:
+        os.umask(prior_umask)
+        stop_coordinator(tmp_path)
 
 
 # --- happy: pull invalidation before act (LOAD-BEARING) ---------------------

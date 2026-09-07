@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import logging
 import os
 import subprocess
 import threading
@@ -75,6 +76,32 @@ def test_unmanaged_paths_get_no_strict(tmp_path: Path, fast_cfg: LifecycleConfig
         assert vol.is_attached
         assert vol.strict_mode_active() is False
     finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fresh_workspace_coherence_dir_is_0700_without_tighten_warning(
+    tmp_path: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pre-spawn policy write creates ``.coherence/`` itself, ahead of the
+    lifecycle. It must create it at the 0700 the lifecycle requires; otherwise
+    every brand-new workspace spawns with a "tightened existing .coherence
+    directory" warning that blames the operator for a directory the volume
+    created a moment earlier. umask is pinned to 022 so a permissive default
+    ``mkdir`` is observable regardless of the host's setting."""
+    prior_umask = os.umask(0o022)
+    try:
+        caplog.set_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle")
+        vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        assert vol.is_attached
+        assert ((tmp_path / ".coherence").stat().st_mode & 0o777) == 0o700
+        tightened = [
+            r.getMessage()
+            for r in caplog.records
+            if "tightened existing .coherence directory" in r.getMessage()
+        ]
+        assert tightened == []
+    finally:
+        os.umask(prior_umask)
         stop_coordinator(tmp_path)
 
 

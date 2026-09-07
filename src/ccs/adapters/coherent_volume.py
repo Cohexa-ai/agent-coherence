@@ -519,7 +519,14 @@ class CoherentVolume:
         if not self._managed:
             return
         coherence_dir = self._root / ".coherence"
-        coherence_dir.mkdir(parents=True, exist_ok=True)
+        # This write runs BEFORE the lifecycle creates the directory, so on a
+        # fresh workspace it is the creator. The lifecycle requires 0700 here
+        # (state.db, hook.secret and the pidfile live inside) and re-tightens
+        # anything looser with a warning — a default-mode mkdir would earn every
+        # brand-new workspace that warning for a directory we made a moment
+        # earlier. An existing directory is left as-is (mkdir never chmods);
+        # re-tightening stays the lifecycle's job.
+        coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._merge_yaml_list(coherence_dir / "tracked.yaml", self._managed)
         self._merge_yaml_list(coherence_dir / "strict_mode.yaml", self._managed)
 
