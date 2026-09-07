@@ -130,3 +130,51 @@ def test_control_with_guard_off_loses_again() -> None:
     assert result["b_line_present"] is False
     assert result["lost"] is True
     assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
+
+
+# --- the fourth act: HANDOFF (A stopped / A still working) -------------------------------
+
+
+def test_handoff_stopped_rewinds_and_a_learns_on_next_write() -> None:
+    from examples.session_handoff.handoff import run_handoff_stopped
+
+    result = run_handoff_stopped()
+
+    assert result["act"] == "handoff_stopped"
+    assert isinstance(result["checkpoint_id"], str) and result["checkpoint_id"]
+    assert len(result["members"]) == 1
+    assert result["members"][0]["member_path"] == NOTES
+    assert result["members"][0]["restore_tier"] == "restorable-unpinned"
+    assert result["members"][0]["pin_state"] == "held"
+    assert result["outcome"] == "restored"
+    assert result["attempts"] == 1
+    assert result["detail"]
+    assert result["disk_after_restore"] == A_STATUS_1  # rewound to the handoff point
+    assert result["a_denied"] is True  # A learns on its NEXT write, not at restore time
+    assert result["a_denial_exc"] == "StaleView"
+    assert result["a_denial_message"]
+    assert result["a_reacquired"] == A_STATUS_1
+    assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
+    assert result["checkpoint_id"] not in "\n".join(result["trace"])  # the uuid never enters the trace
+
+
+def test_handoff_racing_concludes_conflict_not_clobber() -> None:
+    from ccs.adapters.workspace import MAX_RESTORE_LEG_REDRIVES
+    from examples.session_handoff.handoff import RACING_ATTEMPTS, run_handoff_racing, still_working_bytes
+
+    result = run_handoff_racing()
+
+    # The leg budget admits the initial attempt plus every re-drive, then concludes.
+    assert RACING_ATTEMPTS == MAX_RESTORE_LEG_REDRIVES + 1
+    assert result["act"] == "handoff_racing"
+    assert isinstance(result["checkpoint_id"], str) and result["checkpoint_id"]
+    assert len(result["members"]) == 1 and result["members"][0]["member_path"] == NOTES
+    assert result["outcome"] == "conflict"
+    assert result["attempts"] == RACING_ATTEMPTS
+    assert "re-drive budget exhausted" in result["detail"]
+    # One racing edit per admitted attempt, so the last edit index equals the attempt count.
+    assert still_working_bytes(RACING_ATTEMPTS) == f"status: still working, edit {RACING_ATTEMPTS}\n".encode()
+    assert result["disk_after_restore"] == still_working_bytes(RACING_ATTEMPTS)
+    assert result["restore_landed"] is False  # A's work survives; nothing was clobbered
+    assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
+    assert result["checkpoint_id"] not in "\n".join(result["trace"])
