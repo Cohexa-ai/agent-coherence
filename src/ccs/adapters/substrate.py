@@ -395,7 +395,12 @@ def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     for a peer commit to invalidate this reader's cached view."""
     if not managed:
         return
-    coherence_dir.mkdir(parents=True, exist_ok=True)
+    # Runs BEFORE the lifecycle creates the directory, so on a fresh workspace
+    # this is the creator: match the 0700 the lifecycle requires, or every new
+    # workspace spawns with a "tightened existing .coherence directory" warning
+    # about a directory this call made a moment earlier. An existing directory
+    # is left as-is (mkdir never chmods); re-tightening is the lifecycle's job.
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     for name in ("tracked.yaml", "strict_mode.yaml"):
         _merge_yaml_list(coherence_dir / name, managed)
 
