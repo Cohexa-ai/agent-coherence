@@ -178,3 +178,12 @@ def test_handoff_racing_concludes_conflict_not_clobber() -> None:
     assert result["restore_landed"] is False  # A's work survives; nothing was clobbered
     assert result["trace"] and all(isinstance(line, str) for line in result["trace"])
     assert result["checkpoint_id"] not in "\n".join(result["trace"])
+
+
+# --- the runner: all five acts under one exit code -----------------------------------------
+
+
+def test_session_handoff_demo_exits_zero() -> None:
+    from examples.session_handoff.main import main
+
+    assert main([]) == 0
