@@ -17,6 +17,7 @@ matrix that exercises bare-install paths.
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -87,3 +88,28 @@ def _neutralize_v090_first_use_warning():
 
     _service._V090_FIRST_USE_WARNED = True
     yield
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def registry(request, tmp_path: Path):
+    """Both registry implementations, identically — the parametrization IS the
+    parity harness for registry-level surfaces.
+
+    Shared here rather than per-module because the instrumentation suites
+    (conflict counters, foreign-write counters) assert the same contract across
+    both arms and had drifted into byte-identical local copies. Modules that
+    define their own ``registry`` still shadow this one, so the pre-existing
+    per-module fixtures keep their own param ids and teardown idiom.
+    """
+    # Imported in-body, matching this file's existing idiom: a module-level
+    # `ccs` import would fail conftest import outright, before the
+    # `collect_ignore_glob` guards above ever get a chance to skip gracefully.
+    from ccs.coordinator.registry import ArtifactRegistry
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    if request.param == "memory":
+        yield ArtifactRegistry()
+    else:
+        reg = SqliteArtifactRegistry(tmp_path / "state.db")
+        yield reg
+        reg.close()
