@@ -81,7 +81,12 @@ stale-write-guard-fs = "ccs.mcp.server:main"
 # `python tools/check_release_readiness.py`. Maintainers run the same path.
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.4"]
+# ``setuptools`` is already the build backend; naming it here as well puts it
+# in the *test* environment, where tests/test_packaging_data_files.py pins its
+# package-data replay against the real thing. Neither a modern venv nor
+# GitHub's setup-python leaves it importable on 3.12, so without this the
+# cross-check silently skips everywhere and the pin never actually holds.
+dev = ["pytest>=7.0", "ruff>=0.4", "setuptools>=68.0"]
 # The packaged conformance corpus (ccs.testing.substrate_conformance) imports
 # and runs WITHOUT pytest; this extra adds it so scenario skips report as
 # skips when a foreign implementation runs the corpus under its test suite.
@@ -145,6 +150,21 @@ version = { attr = "ccs.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The HTML report templates are read off the filesystem at runtime
+# (``Path(__file__).with_name("templates")`` in ccs/output/report.py and
+# ccs/diagnose/render.py), so they MUST ride the wheel — without them an
+# installed-from-PyPI ``ccs-diagnose``/``ccs-compare`` raises FileNotFoundError
+# the moment it renders. Discovery alone does not carry them: ``templates/`` is
+# found as a namespace package, but a package with no matching data pattern
+# ships nothing. Nor would a bare ``"*"`` under the catch-all key reach the
+# files — setuptools globs every pattern against the owning package's directory
+# with ``glob(recursive=True)``, where ``*`` stops at a path separator, so the
+# subdirectory has to be named. tests/test_packaging_data_files.py fails if any
+# future non-.py asset under src/ccs/ is left undeclared here.
+[tool.setuptools.package-data]
+"ccs.diagnose" = ["templates/*.html"]
+"ccs.output" = ["templates/*.html"]
 
 [project.urls]
 Homepage = "https://github.com/Cohexa-ai/agent-coherence"
