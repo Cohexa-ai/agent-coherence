@@ -125,11 +125,13 @@ from ccs.core.types import (
 from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
     EPOCH_BUMP_TRIGGERS,
+    FOREIGN_WRITE_OUTCOMES,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     CaptureResult,
     CasResult,
     CheckpointMember,
     CheckpointRecord,
+    DetectionRun,
     ReclamationSlot,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -597,6 +599,11 @@ class SqliteArtifactRegistry:
         # read-only handle too (the list simply never fires there — read-only
         # never reaches a commit path).
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
+        # This handle's foreign-write detection run identity. Minted per open,
+        # never persisted until the first tick, so a coordinator that opened the
+        # store but never ran the detector leaves no observation row at all —
+        # which is exactly the not-instrumented signal ``detection_runs`` reads.
+        self._detection_run_id: str = uuid4().hex
 
         if read_only:
             self._open_read_only(instance_id)
@@ -664,6 +671,16 @@ class SqliteArtifactRegistry:
         # break the v7 write-free read-only open, which never runs this and
         # whose readers tolerate the table's absence).
         self._ensure_conflict_counters_table()
+        # Foreign-write detection tables (detection-substrate plan U2 / KTD6,
+        # KTD14). Same posture and the same reason as the conflict counters
+        # above: observability exhaust, idempotent writer-open ensure, outside
+        # the versioned migration chain, never run on the write-free read-only
+        # open. One difference is load-bearing — because BOTH tables exist after
+        # any writer open, whether or not the sweep thread was ever created
+        # (``sweep_interval_sec <= 0`` skips it), the table's PRESENCE cannot
+        # mean "the detector ran". Only an observation ROW can, which is what
+        # ``detection_runs`` reads.
+        self._ensure_foreign_write_tables()
         # Persist the retention policy on writer open (incl. the explicit
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
@@ -3410,6 +3427,186 @@ class SqliteArtifactRegistry:
             )
             """
         )
+
+    def _ensure_foreign_write_tables(self) -> None:
+        """Create the foreign-write detection tables if absent (writer open only).
+
+        Two tables, matching the detector's two facts and R9's bound on what it
+        may mutate.
+
+        ``foreign_write_counters`` is ONE ROW PER ARTIFACT rather than one per
+        (artifact, outcome). KTD10 drops the agent dimension the conflict
+        counters carry, and KTD14 requires the last-counted disk hash to live in
+        this table; a composite (artifact, outcome) key would replicate that
+        single per-artifact fact across three rows and invite them to drift, so
+        the outcome moves into a column each and the hash stays unique.
+
+        ``foreign_write_observations`` is one row per coordinator run, not a
+        single upserted marker: R12 asks whether the detector observed a
+        particular SPAN, which a cumulative count cannot answer across a
+        restart. Idempotent, single DDL statements under autocommit."""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_counters (
+                artifact_id           TEXT NOT NULL PRIMARY KEY,
+                foreign_count         INTEGER NOT NULL DEFAULT 0,
+                mediated_count        INTEGER NOT NULL DEFAULT 0,
+                lag_suppressed_count  INTEGER NOT NULL DEFAULT 0,
+                last_counted_hash     TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_observations (
+                run_id           TEXT NOT NULL PRIMARY KEY,
+                first_tick_unix  REAL NOT NULL,
+                last_tick_unix   REAL NOT NULL,
+                tick_count       INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+    def record_detection_tick(self, now_unix: float) -> None:
+        """Record that the detector observed one tick in THIS coordinator run.
+
+        Written on every tick the poll completed, including a tick that found
+        nothing — that is precisely what makes a later zero readable as zero
+        (R8). A tick whose poll RAISED must not reach here: an advancing count
+        over a broken poll is the false-clean outcome the whole liveness row
+        exists to prevent, so the caller records the tick only after the poll
+        succeeded."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO foreign_write_observations
+                        (run_id, first_tick_unix, last_tick_unix, tick_count)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        last_tick_unix = excluded.last_tick_unix,
+                        tick_count     = tick_count + 1
+                    """,
+                    (self._detection_run_id, now_unix, now_unix),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
+    def record_foreign_write(
+        self, artifact_id: UUID, outcome: str, disk_hash: str
+    ) -> bool:
+        """Count one newly observed on-disk content for ``artifact_id``.
+
+        Returns ``True`` when the observation was counted and ``False`` when it
+        was suppressed as already-counted. The gate is KTD14's edge trigger:
+        git reports a path dirty against the index on EVERY invocation until it
+        is staged and committed, and the canonical hash only advances on a
+        mediated commit, so a level-triggered count would record one foreign
+        edit on every tick for as long as it persists. The gate keys on content,
+        not on outcome — an artifact that diverges, is re-mediated, then
+        diverges back to a previously seen content is three real observations.
+
+        The suppressing value lives HERE, in the detector's own table, never on
+        ``artifacts.content_hash``: healing the comparand a safety check reads
+        is the repeated defect this repo has already shipped three times."""
+        if outcome not in FOREIGN_WRITE_OUTCOMES:
+            raise ValueError(
+                f"unknown foreign-write outcome {outcome!r}; "
+                f"expected one of {FOREIGN_WRITE_OUTCOMES}"
+            )
+        column = f"{outcome}_count"
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT last_counted_hash FROM foreign_write_counters "
+                    "WHERE artifact_id = ?",
+                    (artifact_id.hex,),
+                ).fetchone()
+                if row is not None and row[0] == disk_hash:
+                    self._conn.execute("COMMIT")
+                    return False
+                # Column name is not caller data: `outcome` was validated
+                # against the fixed vocabulary above, so this interpolation
+                # cannot carry a caller-controlled fragment.
+                self._conn.execute(
+                    f"""
+                    INSERT INTO foreign_write_counters
+                        (artifact_id, {column}, last_counted_hash)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT (artifact_id) DO UPDATE SET
+                        {column}          = {column} + 1,
+                        last_counted_hash = excluded.last_counted_hash
+                    """,
+                    (artifact_id.hex, disk_hash),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        """Return per-artifact detection counts, omitting zero buckets.
+
+        Zero detections is an empty mapping — a reportable result, not an error.
+        Tolerates a missing table ONLY on a read-only open of a store that
+        predates the instrument; on a writer handle the ensure guarantees it, so
+        an ``OperationalError`` there is a real failure and is re-raised."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT artifact_id, foreign_count, mediated_count, "
+                    "lag_suppressed_count FROM foreign_write_counters"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return {}
+                raise
+        totals: dict[UUID, dict[str, int]] = {}
+        for art_hex, foreign, mediated, suppressed in rows:
+            counts = {
+                name: value
+                for name, value in zip(
+                    FOREIGN_WRITE_OUTCOMES, (foreign, mediated, suppressed)
+                )
+                if value
+            }
+            if counts:
+                totals[UUID(hex=art_hex)] = counts
+        return totals
+
+    def detection_runs(self) -> list[DetectionRun]:
+        """Return every recorded run interval, oldest first.
+
+        An EMPTY list is the not-instrumented signal. It cannot be inferred from
+        the table's absence: both tables exist after any writer open, including
+        one where ``sweep_interval_sec <= 0`` meant the sweep thread was never
+        created and the detector never ran."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT run_id, first_tick_unix, last_tick_unix, tick_count "
+                    "FROM foreign_write_observations ORDER BY first_tick_unix"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return []
+                raise
+        return [
+            DetectionRun(
+                run_id=run_id,
+                first_tick_unix=float(first),
+                last_tick_unix=float(last),
+                tick_count=int(count),
+            )
+            for run_id, first, last, count in rows
+        ]
 
     def _count_conflict_in_txn(
         self, artifact_id: UUID, agent_id: UUID, reason: str

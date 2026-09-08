@@ -81,6 +81,38 @@ MultiCasResult: TypeAlias = "MultiCommitResult | MultiCommitConflict | CasCorrup
 CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
+# Foreign-write detection outcomes (detection-substrate plan R5). Exactly three
+# classifications and nothing finer: a disk content the coordinator holds
+# (``mediated``), one it does not and cannot explain (``foreign``), and one it
+# declines to call foreign because a recent mediated commit to that artifact is
+# witnessed inside the benign commit-to-disk lag window (``lag_suppressed``, R13
+# — its own reported outcome so an operator can size the window's admitted
+# false-negative, never folded into ``mediated``).
+FOREIGN_WRITE_OUTCOMES: tuple[str, str, str] = ("foreign", "mediated", "lag_suppressed")
+
+
+@dataclass(frozen=True)
+class DetectionRun:
+    """One coordinator run's observed detection interval (plan R8, R12 / KTD6).
+
+    A cumulative tick count cannot tell a reader whether the detector observed a
+    PARTICULAR span — a coordinator down for the middle of a session still
+    presents a large count and a recent last tick. So each run records its own
+    interval, and a coverage question is answered by intersecting the session's
+    span with these intervals rather than by trusting a total.
+
+    ``run_id`` is opaque and per-writer-open. An empty run list is the
+    not-instrumented signal: the tables exist on every writer open whether or
+    not the sweep thread was created, so the TABLE cannot carry that meaning and
+    the ROW must.
+    """
+
+    run_id: str
+    first_tick_unix: float
+    last_tick_unix: float
+    tick_count: int
+
+
 @dataclass(frozen=True)
 class CheckpointRecord:
     """One workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9).
@@ -503,6 +535,20 @@ class SqliteExtended(RegistryBase, Protocol):
     """
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
+        ...
+
+    def detection_runs(self) -> list[DetectionRun]:
+        ...
+
+    def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        ...
+
+    def record_detection_tick(self, now_unix: float) -> None:
+        ...
+
+    def record_foreign_write(
+        self, artifact_id: UUID, outcome: str, disk_hash: str
+    ) -> bool:
         ...
 
     def artifacts_held_by_agent(

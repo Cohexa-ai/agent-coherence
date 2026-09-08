@@ -98,13 +98,23 @@ EXTENDED_ONLY_METHODS = frozenset(
         "artifact_names_under_prefix",
         "artifacts_held_by_agent",
         "close",
+        # Foreign-write detection instrumentation. Declared on the extended
+        # surface because the sweep-side detector reaches the registry through
+        # the SQLite handle the coordinator server always constructs; the
+        # in-memory registry implements the same four for behavioural parity
+        # (asserted in tests/test_foreign_write_instrumentation.py) exactly as
+        # it does for the conflict counters.
+        "detection_runs",
         "evict_stale_notices",
+        "foreign_write_totals",
         "get_artifact_updated_at",
         "last_writer_for",
         "lookup_artifact_id_by_name",
         "peek_preemption_notice",
         "pop_pending_notices",
         "pop_preemption_notice",
+        "record_detection_tick",
+        "record_foreign_write",
         "record_preemption_notice",
         "resolve_or_register",
         "status_snapshot",
