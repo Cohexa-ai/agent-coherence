@@ -4,6 +4,32 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Fixed
+
+- **The HTML report templates now ship in the distribution.** `ccs-compare`
+  and `ccs-diagnose` read their templates off the filesystem beside the
+  module (`Path(__file__).with_name("templates")`), but `pyproject.toml`
+  declared no `package-data`, so neither `comparison_report.html` nor
+  `diagnose_report.html` was written into the wheel or the sdist. A source
+  checkout always has the files, which is why the test suite never saw it;
+  anyone installing from PyPI hit a bare `FileNotFoundError` the moment a
+  report rendered. Both templates are now declared and verified present in
+  both artifacts.
+
+  The declaration has to name the subdirectory (`"ccs.output" =
+  ["templates/*.html"]`) — setuptools globs each pattern against the owning
+  package's directory with `glob(recursive=True)`, so a bare `"*"` stops at
+  the path separator and never reaches inside `templates/`. A new guard,
+  `tests/test_packaging_data_files.py`, enumerates every non-`.py` file
+  under `src/ccs/` and fails if any of them is left undeclared, so the next
+  asset added anywhere in the tree fails in CI rather than in a user's
+  install. It replays setuptools' own `find_data_files` algorithm from
+  `pyproject.toml` — no wheel build, no setuptools import — and a companion
+  test pins that replay against the real build backend wherever setuptools
+  is importable.
+
 ## [0.14.1] - 2026-09-05
 
 **Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.
