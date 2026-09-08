@@ -1452,6 +1452,70 @@ plainly:**
 Zero is a result. *No table at all* is a different result, and the distinction
 is exactly what makes a thirty-day observation window worth running.
 
+---
+
+## Foreign-write detection — who wrote this behind my back?
+
+The coordinator sees writes that go through it. It does not see an editor, a
+script, or a second tool that writes a shared file directly — and that is the
+window where a stale value quietly spreads into everything derived from it. The
+existing guards catch such an edit at the next read and at the next write. They
+say nothing about the time in between.
+
+Detection watches that window. While a coordinator is running, once per sweep it
+asks git which of the files it coordinates have changed on disk, re-hashes just
+those, and records what it found. It never denies anything. A detection is a
+number in a report, not a refusal.
+
+Read it back offline, against a coordinator that is no longer running:
+
+```python
+from ccs.diagnose.foreign_writes import read_foreign_write_report
+
+report = read_foreign_write_report(".coherence/state.db")
+
+print(report.state)        # 'not-instrumented' | 'instrumented-zero' | 'counts'
+for artifact, counts in sorted(report.totals.items()):
+    print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
+```
+
+Each file lands in one of three buckets:
+
+- **foreign** — the bytes on disk are not the bytes the coordinator has, and
+  nothing it knows explains that.
+- **mediated** — the file changed, and the coordinator holds exactly those
+  bytes. It was a write that went through it.
+- **lag_suppressed** — the mismatch looked like a write that was still landing
+  when the check ran. Counted separately, never as a foreign write and never as
+  a clean result, so you can see how often the benefit of the doubt was given.
+
+**The honesty rules matter more than the numbers, so they are worth stating
+plainly:**
+
+- **Zero is only zero when the detector actually ran.** A store it never ran
+  against reports `not-instrumented`, which is a different answer from
+  `instrumented-zero`. Turning the sweep off, or reading a store from a
+  coordinator that never started one, gives you the first — never a clean bill
+  of health you did not earn.
+- **A count is one per version of the content, not one per check.** An edit
+  nobody has reconciled is still there on the next check, and the one after
+  that. It is counted once. Change the file again and that is a second count.
+- **Detection covers files the coordinator already knows and git tracks.** A
+  file that matches your patterns but has never been touched through the
+  coordinator, one you have since stopped tracking, and one git ignores are all
+  outside it. They are not reported as clean; they are not reported at all.
+- **A broken check is never a quiet month.** If git cannot run, the check is not
+  recorded as having happened, so the gap is visible in the report rather than
+  reading as no news.
+- **`covers(start, end)` answers coverage, not the totals.** A coordinator that
+  was down for the middle of a period still shows a healthy count of checks. Ask
+  `covers` whether the period you care about was actually watched end to end.
+- **Attribution is by file only.** A change on disk carries no author, so the
+  report names what changed and never who changed it.
+
+Reading the report never writes to the store, so you can point it at a database
+copied off a machine after the fact.
+
 ## Replay (v0.8.2+)
 
 `agent-coherence-replay` is an invariant-replay tool that walks a captured
