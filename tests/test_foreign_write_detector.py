@@ -412,3 +412,54 @@ def test_classify_is_a_pure_function_of_its_inputs() -> None:
         disk_hash="a", canonical_hash="b", updated_at=1.0,
         has_mediated_writer=False, now_unix=2.0, window_sec=5.0,
     ) == "foreign"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: detection through to the offline report
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_write_reaches_the_offline_report(coordinator, repo: Path) -> None:
+    """The whole path in one test: an editor that never called the coordinator
+    writes a tracked artifact, one tick observes it, and a reader pointed at the
+    CLOSED store returns it."""
+    from ccs.diagnose.foreign_writes import COUNTS, read_foreign_write_report
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    (repo / "notes.md").write_text("edited out of band\n")
+
+    run_detection_pass(coordinator, now_unix=1000.0, window_sec=WINDOW)
+    db = Path(coordinator.registry._db_path)  # noqa: SLF001 — the store under test
+    coordinator.registry.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == COUNTS
+    assert report.totals == {art.hex: {"foreign": 1}}
+    assert report.covers(1000.0, 1000.0) is True
+
+
+def test_only_the_dirty_artifact_is_re_hashed(coordinator, repo: Path, monkeypatch) -> None:
+    """R3's cost claim. Many covered artifacts, one dirty against the index —
+    git decides the re-hash set, so the clean ones cost a stat in git and no
+    hash here."""
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    names = [f"note_{n:03d}.md" for n in range(50)]
+    for name in names:
+        (repo / name).write_text("v1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "many")
+    coordinator.policy = _policy(repo, "note_*.md")
+    for name in names:
+        _register(coordinator, name, "v1\n")
+    (repo / names[7]).write_text("only this one moved\n")
+
+    hashed: list[str] = []
+    real = detector._disk_hash
+    monkeypatch.setattr(
+        detector, "_disk_hash", lambda p: (hashed.append(p.name), real(p))[1]
+    )
+
+    run_detection_pass(coordinator, now_unix=1000.0, window_sec=WINDOW)
+
+    assert hashed == [names[7]]
