@@ -779,9 +779,11 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     # Lazy import — coordinator_server imports lifecycle's
     # CoordinatorHTTPServer; importing back at module load would cycle.
     from ccs.adapters.claude_code.coordinator_server import (
+        _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
         SWEEP_RECLAMATION_PREEMPTER_ID,
         monotonic_seconds,
     )
+    from ccs.adapters.claude_code.foreign_write_detector import run_detection_pass
 
     coordinator = entry.coordinator
 
@@ -852,6 +854,23 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
         except Exception as exc:
             # Sweep is best-effort — never crash the coordinator.
             logger.exception("sweep tick failed: %s", exc)
+        # Foreign-write detection: a fifth pass, deliberately OUTSIDE the try
+        # above rather than appended inside it. The four passes share one
+        # best-effort guard, so a detection failure inside it would cost the
+        # tick's reclamation work; and running detection only when all four
+        # succeeded would make the instrument's own liveness depend on theirs.
+        # Two separate guards keep the failure domains apart in both
+        # directions. ``run_detection_pass`` raises nothing by contract.
+        #
+        # The window is the shipped benign commit-to-disk lag plus one tick.
+        # They are otherwise both 5.0s and the comparison is inclusive, so a
+        # mediated commit first observed on the next tick would sit exactly on
+        # the boundary and jitter would decide whether it read as foreign.
+        run_detection_pass(
+            coordinator,
+            now_unix=now_tick,
+            window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + cfg.sweep_interval_sec,
+        )
 
 
 def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
