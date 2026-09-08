@@ -44,11 +44,13 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Iterable
 from uuid import UUID
 
+from ccs.adapters.claude_code.coordinator_server import _F_SENTINEL_CONTENT_HASH
 from ccs.core.substrate import sha256_hex
 
 logger = logging.getLogger(__name__)
@@ -65,11 +67,9 @@ _MAX_PATHSPEC_BYTES = 24_000
 # recording it as an outcome would inflate a number an operator reads as writes.
 _MAX_HASH_BYTES = 64 * 1024 * 1024
 
-# Content hashes that carry no claim, so a mismatch against them means nothing.
-# The empty value is the first-observation seed; the all-`f` value is the
-# explicit no-claim sentinel. The shipped strict-mode comparison excludes both,
-# and so must this one.
-_SENTINEL_CONTENT_HASH = "f" * 64
+# The no-claim sentinel is IMPORTED, not re-typed: this comparison and the
+# shipped strict-mode one must exclude the same value, and a second literal is
+# exactly how they would drift apart.
 
 
 class GitPollError(RuntimeError):
@@ -179,11 +179,22 @@ def _disk_hash(path: Path) -> str | None:
     None covers every way an artifact can stop being a readable regular file —
     deleted, renamed away, replaced by a directory, permission-revoked — and
     also an oversized one. All of those are coverage gaps, not detections.
+
+    The regular-file check stays even though it looks like a TOCTOU pre-check to
+    be replaced by open-and-handle-the-error. It is load-bearing rather than
+    defensive: opening a FIFO blocks until a writer connects, which would hang
+    this thread indefinitely if a coordinated path were ever replaced by a named
+    pipe. One stat answers both that question and the size cap.
+
+    The whole file is read before hashing rather than streamed. That is bounded
+    by the cap above and only happens for a file git already reported dirty, so
+    it buys less than routing every hash through the one canonical helper does.
     """
     try:
-        if not path.is_file():
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
             return None
-        if path.stat().st_size > _MAX_HASH_BYTES:
+        if info.st_size > _MAX_HASH_BYTES:
             logger.debug("detection: %s exceeds the per-tick hash cap; skipped", path)
             return None
         with open(path, "rb") as handle:
@@ -192,32 +203,31 @@ def _disk_hash(path: Path) -> str | None:
         return None
 
 
-def _classify(
+def _classify_mismatch(
     *,
-    disk_hash: str,
-    canonical_hash: str,
     updated_at: float | None,
     has_mediated_writer: bool,
     now_unix: float,
     window_sec: float,
 ) -> str:
-    """Name this observation: mediated, lag_suppressed, or foreign.
+    """Name an observation whose disk bytes differ from the canonical hash.
 
-    Disk agreeing with the canonical hash means the coordinator holds these
-    bytes — a write it mediated. Otherwise the store may still explain the
-    mismatch: in both shipped write paths the bytes reach disk BEFORE the
-    registry commit lands, so a commit observed mid-flight looks like a
-    divergence. That excuse is only available when the store actually witnesses
-    a mediated commit for the artifact, which is what ``has_mediated_writer``
-    asks — the timestamp alone is also stamped by first-observation
-    registration, with no writer behind it, and would suppress a genuine foreign
-    write on a freshly registered artifact.
+    The caller has already established the mismatch — disk agreeing with the
+    canonical hash means the coordinator holds these bytes and the write was one
+    it mediated, which needs no store lookups at all. This is the other branch,
+    and it is the only one that costs two extra reads.
+
+    The store may still explain the mismatch: in both shipped write paths the
+    bytes reach disk BEFORE the registry commit lands, so a commit observed
+    mid-flight looks like a divergence. That excuse is only available when the
+    store actually witnesses a mediated commit for the artifact, which is what
+    ``has_mediated_writer`` asks — the timestamp alone is also stamped by
+    first-observation registration, with no writer behind it, and would suppress
+    a genuine foreign write on a freshly registered artifact.
 
     The window's admitted false-negative is not hidden: a suppression is its own
     counted outcome, so an operator can size the exposure rather than trust it.
     """
-    if disk_hash == canonical_hash:
-        return "mediated"
     if (
         has_mediated_writer
         and updated_at is not None
@@ -299,18 +309,24 @@ def _observe(
     if artifact is None:
         return 0
     canonical = artifact.content_hash
-    if not canonical or canonical == _SENTINEL_CONTENT_HASH:
+    if not canonical or canonical == _F_SENTINEL_CONTENT_HASH:
         return 0  # a no-claim hash; a mismatch against it means nothing
     disk_hash = _disk_hash(root / name)
     if disk_hash is None:
         return 0  # not an observable regular file this tick
 
-    outcome = _classify(
-        disk_hash=disk_hash,
-        canonical_hash=canonical,
-        updated_at=registry.get_artifact_updated_at(artifact_id),
-        has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
-        now_unix=now_unix,
-        window_sec=window_sec,
-    )
+    # Settle the cheap branch first. Disk agreeing with the canonical hash is
+    # the common case on a tick that sees anything at all, and it needs no
+    # further reads — asking the store for the timestamp and last writer before
+    # comparing would spend two queries and two lock acquisitions per artifact
+    # to answer a question the comparison already closed.
+    if disk_hash == canonical:
+        outcome = "mediated"
+    else:
+        outcome = _classify_mismatch(
+            updated_at=registry.get_artifact_updated_at(artifact_id),
+            has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
+            now_unix=now_unix,
+            window_sec=window_sec,
+        )
     return 1 if registry.record_foreign_write(artifact_id, outcome, disk_hash) else 0

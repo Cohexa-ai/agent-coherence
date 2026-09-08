@@ -540,6 +540,36 @@ def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
     return STORE_SIGNAL_UNREADABLE
 
 
+# The one place the outcome vocabulary is bound to the columns that store it.
+# Both the write and the read side name their columns through this map, so a
+# reorder of either FOREIGN_WRITE_OUTCOMES or the SELECT list cannot silently
+# transpose two counts — an f-string convention on one side and a positional
+# zip on the other could, and no equal-count test would catch it.
+FOREIGN_WRITE_COLUMNS: dict[str, str] = {
+    "foreign": "foreign_count",
+    "mediated": "mediated_count",
+    "lag_suppressed": "lag_suppressed_count",
+}
+assert tuple(FOREIGN_WRITE_COLUMNS) == FOREIGN_WRITE_OUTCOMES, (
+    "the outcome vocabulary and its column map must stay in step"
+)
+
+
+def _foreign_write_column(outcome: str) -> str:
+    """Resolve an outcome to its counter column, refusing anything else.
+
+    The result is interpolated into SQL, so this is the trust boundary: only a
+    value present in the fixed map above can reach the statement, which is what
+    makes that interpolation safe from caller data."""
+    try:
+        return FOREIGN_WRITE_COLUMNS[outcome]
+    except KeyError:
+        raise ValueError(
+            f"unknown foreign-write outcome {outcome!r}; "
+            f"expected one of {FOREIGN_WRITE_OUTCOMES}"
+        ) from None
+
+
 @dataclass(frozen=True)
 class _ArtifactRow:
     """Internal row decoded from the artifacts table."""
@@ -3475,26 +3505,25 @@ class SqliteArtifactRegistry:
         (R8). A tick whose poll RAISED must not reach here: an advancing count
         over a broken poll is the false-clean outcome the whole liveness row
         exists to prevent, so the caller records the tick only after the poll
-        succeeded."""
+        succeeded.
+
+        One statement, so no explicit transaction: the connection is opened
+        autocommit, and this runs on every tick against the same lock and
+        busy-timeout budget the request handlers share. Wrapping a lone
+        statement would cost three sqlite round-trips per tick for no added
+        atomicity."""
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                self._conn.execute(
-                    """
-                    INSERT INTO foreign_write_observations
-                        (run_id, first_tick_unix, last_tick_unix, tick_count)
-                    VALUES (?, ?, ?, 1)
-                    ON CONFLICT (run_id) DO UPDATE SET
-                        last_tick_unix = excluded.last_tick_unix,
-                        tick_count     = tick_count + 1
-                    """,
-                    (self._detection_run_id, now_unix, now_unix),
-                )
-                self._conn.execute("COMMIT")
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
-                raise
+            self._conn.execute(
+                """
+                INSERT INTO foreign_write_observations
+                    (run_id, first_tick_unix, last_tick_unix, tick_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    last_tick_unix = excluded.last_tick_unix,
+                    tick_count     = tick_count + 1
+                """,
+                (self._detection_run_id, now_unix, now_unix),
+            )
 
     def record_foreign_write(
         self, artifact_id: UUID, outcome: str, disk_hash: str
@@ -3513,43 +3542,28 @@ class SqliteArtifactRegistry:
         The suppressing value lives HERE, in the detector's own table, never on
         ``artifacts.content_hash``: healing the comparand a safety check reads
         is the repeated defect this repo has already shipped three times."""
-        if outcome not in FOREIGN_WRITE_OUTCOMES:
-            raise ValueError(
-                f"unknown foreign-write outcome {outcome!r}; "
-                f"expected one of {FOREIGN_WRITE_OUTCOMES}"
-            )
-        column = f"{outcome}_count"
+        column = _foreign_write_column(outcome)
+        # One guarded upsert, no read-then-write: the WHERE clause on the
+        # DO UPDATE arm turns a repeat of the same content into a no-op, so
+        # ``rowcount`` reports whether this observation was new. Same shape as
+        # ``record_preemption_notice``'s guarded upsert. Single statement under
+        # autocommit, so no explicit transaction and no read-modify-write
+        # window for a concurrent tick to interleave into.
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._conn.execute(
-                    "SELECT last_counted_hash FROM foreign_write_counters "
-                    "WHERE artifact_id = ?",
-                    (artifact_id.hex,),
-                ).fetchone()
-                if row is not None and row[0] == disk_hash:
-                    self._conn.execute("COMMIT")
-                    return False
-                # Column name is not caller data: `outcome` was validated
-                # against the fixed vocabulary above, so this interpolation
-                # cannot carry a caller-controlled fragment.
-                self._conn.execute(
-                    f"""
-                    INSERT INTO foreign_write_counters
-                        (artifact_id, {column}, last_counted_hash)
-                    VALUES (?, 1, ?)
-                    ON CONFLICT (artifact_id) DO UPDATE SET
-                        {column}          = {column} + 1,
-                        last_counted_hash = excluded.last_counted_hash
-                    """,
-                    (artifact_id.hex, disk_hash),
-                )
-                self._conn.execute("COMMIT")
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
-                raise
-        return True
+            cursor = self._conn.execute(
+                f"""
+                INSERT INTO foreign_write_counters
+                    (artifact_id, {column}, last_counted_hash)
+                VALUES (?, 1, ?)
+                ON CONFLICT (artifact_id) DO UPDATE SET
+                    {column}          = {column} + 1,
+                    last_counted_hash = excluded.last_counted_hash
+                WHERE foreign_write_counters.last_counted_hash
+                      != excluded.last_counted_hash
+                """,
+                (artifact_id.hex, disk_hash),
+            )
+        return cursor.rowcount > 0
 
     def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
         """Return per-artifact detection counts, omitting zero buckets.
@@ -3558,24 +3572,24 @@ class SqliteArtifactRegistry:
         Tolerates a missing table ONLY on a read-only open of a store that
         predates the instrument; on a writer handle the ensure guarantees it, so
         an ``OperationalError`` there is a real failure and is re-raised."""
+        # Name every column through the same mapping the write side uses, so a
+        # reordering of either the outcome vocabulary or this SELECT cannot
+        # silently transpose two labels — a positional zip would.
+        outcomes = tuple(FOREIGN_WRITE_COLUMNS)
+        selected = ", ".join(FOREIGN_WRITE_COLUMNS[name] for name in outcomes)
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT artifact_id, foreign_count, mediated_count, "
-                    "lag_suppressed_count FROM foreign_write_counters"
+                    f"SELECT artifact_id, {selected} FROM foreign_write_counters"
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 if self._read_only and "no such table" in str(exc):
                     return {}
                 raise
         totals: dict[UUID, dict[str, int]] = {}
-        for art_hex, foreign, mediated, suppressed in rows:
+        for art_hex, *values in rows:
             counts = {
-                name: value
-                for name, value in zip(
-                    FOREIGN_WRITE_OUTCOMES, (foreign, mediated, suppressed)
-                )
-                if value
+                name: value for name, value in zip(outcomes, values) if value
             }
             if counts:
                 totals[UUID(hex=art_hex)] = counts

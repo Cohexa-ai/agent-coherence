@@ -200,22 +200,48 @@ def test_reopening_does_not_recount_an_unchanged_divergence(tmp_path: Path) -> N
     reopened.close()
 
 
+def _table_names(db: Path) -> set[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+
+def test_a_writer_open_creates_both_tables(tmp_path: Path) -> None:
+    """Which is why their PRESENCE can never mean the detector ran."""
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    assert {"foreign_write_counters", "foreign_write_observations"} <= _table_names(db)
+
+
 def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     """Mirrors the conflict-counter contract: the write-free read-only open
     never runs the ensure, and its readers tolerate the absence."""
     import sqlite3
 
     db = tmp_path / "state.db"
+    # A store at the current schema that predates the instrument: created by a
+    # writer, then stripped, so the read-only open has a schema to accept but
+    # no detection tables to find.
     SqliteArtifactRegistry(db).close()
-
     conn = sqlite3.connect(db)
-    tables = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
+    conn.execute("DROP TABLE foreign_write_counters")
+    conn.execute("DROP TABLE foreign_write_observations")
+    conn.commit()
     conn.close()
-    assert "foreign_write_counters" in tables
-    assert "foreign_write_observations" in tables
+
+    reg = SqliteArtifactRegistry(db, read_only=True)
+    reg.close()
+
+    tables = _table_names(db)
+    assert "foreign_write_counters" not in tables
+    assert "foreign_write_observations" not in tables
 
 
 def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) -> None:
@@ -270,3 +296,24 @@ def test_detection_writes_touch_no_artifact_row(tmp_path: Path) -> None:
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
     conn.close()
+
+
+def test_distinct_counts_are_not_transposed_between_outcomes(registry) -> None:
+    """Three different values, so a mislabelling is observable at all.
+
+    Every other count test here uses equal values across the buckets, which
+    means a read side that drifted from the outcome-to-column map — hardcoding
+    a column order, say — would still satisfy them. It does not satisfy this
+    one. Swapping two entries in the map itself is deliberately NOT caught,
+    and cannot be: both sides derive from that one map, so a swap is a
+    consistent relabelling rather than a transposition."""
+    art = uuid4()
+    for index in range(1):
+        registry.record_foreign_write(art, "foreign", f"{index:064d}")
+    for index in range(1, 3):
+        registry.record_foreign_write(art, "mediated", f"{index:064d}")
+    for index in range(3, 6):
+        registry.record_foreign_write(art, "lag_suppressed", f"{index:064d}")
+    assert registry.foreign_write_totals() == {
+        art: {"foreign": 1, "mediated": 2, "lag_suppressed": 3}
+    }

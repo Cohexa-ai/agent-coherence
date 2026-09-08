@@ -745,6 +745,9 @@ class ArtifactRegistry:
                 f"unknown foreign-write outcome {outcome!r}; "
                 f"expected one of {FOREIGN_WRITE_OUTCOMES}"
             )
+        # Keyed by the outcome name directly — this backend stores a dict, so
+        # it has no column names to bind and needs no equivalent of the sqlite
+        # registry's outcome-to-column map.
         with self._lock:
             if self._detection_last_hash.get(artifact_id) == disk_hash:
                 return False
