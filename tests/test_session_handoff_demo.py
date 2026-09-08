@@ -10,8 +10,10 @@ on: a deny crosses the process boundary as a typed ``SessionDenied`` — and eac
 act's deny is pinned to the mechanism that produced it (the coordinator, or the
 file's own version check after an out-of-band rewind); any other child failure,
 including a non-deny ``CoherenceError``, crosses as a typed ``SessionError``
-carrying the child's traceback; raw file I/O bypasses the guard entirely (the
-negative control); and the two sessions really are distinct processes.
+carrying the child's traceback; a dead or hung child is bounded rather than a
+stall, and teardown swallows whatever reply it finds; raw file I/O bypasses the
+guard entirely (the negative control); and the two sessions really are distinct
+processes.
 """
 
 from __future__ import annotations
@@ -26,7 +28,13 @@ from ccs.core.exceptions import RESTORE_OUTCOME_CONFLICT, RESTORE_OUTCOME_RESTOR
 from examples.session_handoff import A_STATUS_1, A_STATUS_2, B_PICKUP, GUARDED, NOTES
 from examples.session_handoff.broken import new_workspace
 from examples.session_handoff.fixed import denied_by_coordinator
-from examples.session_handoff.sessions import Session, SessionDenied, SessionError
+from examples.session_handoff.sessions import (
+    _JOIN_TIMEOUT_SEC,
+    _KIND_DENIED,
+    Session,
+    SessionDenied,
+    SessionError,
+)
 
 
 @pytest.fixture
@@ -125,6 +133,87 @@ def test_session_non_deny_coherence_error_surfaces_as_session_error(workspace: P
         assert err.value.traceback and "CheckpointUnknown" in err.value.traceback
     finally:
         a.close()
+
+
+def test_close_tolerates_an_abandoned_reply(workspace: Path) -> None:
+    """Teardown must not re-raise a reply left over from an abandoned command.
+
+    An interrupt inside ``_await_reply`` abandons that command's reply in the
+    queue; ``close()``'s own wait then collects it instead of the ``stop``
+    reply. Nothing may escape teardown: every act calls ``close()`` and
+    ``shutil.rmtree`` from the SAME ``finally``, so a raise here would skip the
+    workspace cleanup. A deny is the reply that used to escape -- it is not a
+    ``SessionError``, so the guard did not cover it.
+    """
+    a = Session(workspace, "A", GUARDED)
+    # The exact tuple the child puts for a typed deny (sessions.py `_session_main`).
+    a._reply_q.put((_KIND_DENIED, None, "StaleView", "stale read denied: handoff/notes.md", None))
+
+    a.close()  # must not raise
+
+    assert not a._proc.is_alive()  # the child is still reaped
+
+
+def test_dead_child_surfaces_as_child_exited(workspace: Path) -> None:
+    """A child that died surfaces as a typed ``SessionError``, never a stall."""
+    a = Session(workspace, "A", GUARDED)
+    try:
+        a._proc.kill()
+        a._proc.join(timeout=_JOIN_TIMEOUT_SEC)
+
+        with pytest.raises(SessionError) as err:
+            a.read()
+        assert err.value.exc_name == "ChildExited"
+        assert "before answering 'read'" in err.value.message
+    finally:
+        a.close()
+
+
+def test_unanswered_command_times_out_and_terminates_the_child(workspace: Path) -> None:
+    """A hung child hits the bounded deadline, is terminated, and raises."""
+    a = Session(workspace, "A", GUARDED)
+    try:
+        # No command was sent, so no reply is coming -- the parent's view of a
+        # child wedged mid-command. The wait must be bounded, not a stall.
+        with pytest.raises(SessionError) as err:
+            a._await_reply("probe", 0.5)
+        assert err.value.exc_name == "TimeoutError"
+        assert not a._proc.is_alive()  # the deadline branch terminates the child
+    finally:
+        a.close()
+
+
+def test_act_removes_its_workspace_when_close_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An act's temp workspace is removed even when teardown itself raises.
+
+    ``close()`` swallows both channel types, but an interrupt landing in
+    teardown is a ``BaseException`` and must keep propagating. Cleanup may not
+    depend on that: it runs from its own ``finally``, so the caller loses the
+    interrupt's meaning but never its temp directory.
+    """
+    from examples.session_handoff import broken, sessions
+
+    created: list[Path] = []
+    real_new_workspace = broken.new_workspace
+    real_close = sessions.Session.close
+
+    def recording_new_workspace(act: str) -> Path:
+        made = real_new_workspace(act)
+        created.append(made)
+        return made
+
+    def close_then_interrupt(self: sessions.Session) -> None:
+        real_close(self)  # the child is still reaped
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(broken, "new_workspace", recording_new_workspace)
+    monkeypatch.setattr(sessions.Session, "close", close_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        broken.run_broken()
+
+    assert created, "the act never created a workspace"
+    assert not created[0].exists()  # removed despite teardown raising
 
 
 # --- the three acts: RED, GREEN, CONTROL -------------------------------------------------

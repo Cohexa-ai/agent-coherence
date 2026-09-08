@@ -76,10 +76,14 @@ def _with_two_sessions(act: str, story: _Story) -> dict[str, object]:
         finally:
             b.close()
     finally:
-        # The workspace is removed even when spawning A itself failed.
-        if a is not None:
-            a.close()
-        shutil.rmtree(workspace, ignore_errors=True)
+        # The workspace is removed even when spawning A itself failed, and even
+        # when close() itself escapes -- an interrupt landing in teardown must
+        # not cost the caller its temp directory.
+        try:
+            if a is not None:
+                a.close()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _stopped_story(workspace: Path, a: Session, b: Session) -> dict[str, object]:

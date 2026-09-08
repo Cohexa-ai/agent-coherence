@@ -9,9 +9,10 @@ sessions are therefore two processes, exactly as two agent sessions on one
 host would be; the first child to construct its volume spawns the coordinator
 (an in-process serving thread) and every later child attaches to it.
 
-Commands cross a spawn-context queue pair and come back typed: a typed
-coordinator deny — ``StaleView`` or ``CommitPreempted`` — surfaces in the parent
-as :class:`SessionDenied`; anything else the child raises, including any other
+Commands cross a spawn-context queue pair and come back typed: one of the
+volume's typed denies — ``StaleView`` or ``CommitPreempted``, from the
+coordinator or from the file's own version check — surfaces in the parent as
+:class:`SessionDenied`; anything else the child raises, including any other
 ``CoherenceError`` (an unreachable coordinator, an unknown checkpoint), surfaces
 as :class:`SessionError` carrying the child's traceback. Checkpoint and restore
 run in the child too, over a per-command ``WorkspaceVersioner`` — the ledger
@@ -51,8 +52,9 @@ _KIND_ERROR = "error"
 
 
 class SessionDenied(Exception):
-    """The child's coordinator denied the operation: a typed deny, ``StaleView``
-    or ``CommitPreempted``. Every other child-side failure is a :class:`SessionError`."""
+    """One of the volume's typed denies — ``StaleView`` or ``CommitPreempted`` —
+    raised by the coordinator or by the file's own version check. Every other
+    child-side failure is a :class:`SessionError`."""
 
     def __init__(self, exc_name: str, message: str) -> None:
         super().__init__(f"{exc_name}: {message}")
@@ -146,7 +148,12 @@ class Session:
         try:
             if self._proc.is_alive():
                 self._cmd_q.put(("stop",))
-                with suppress(SessionError):
+                # Both channel types, because the wait is not correlated to the
+                # command: an interrupt that abandoned an earlier reply leaves it
+                # in the queue, and this wait collects THAT instead of the stop
+                # reply. Teardown must swallow it either way -- callers run
+                # close() and their workspace cleanup from one ``finally``.
+                with suppress(SessionError, SessionDenied):
                     self._await_reply("stop", _STOP_TIMEOUT_SEC)
             self._proc.join(timeout=_JOIN_TIMEOUT_SEC)
         finally:

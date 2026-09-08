@@ -68,10 +68,14 @@ def _run_handoff(act: str, managed: tuple[str, ...]) -> dict[str, object]:
         finally:
             b.close()
     finally:
-        # The workspace is removed even when spawning A itself failed.
-        if a is not None:
-            a.close()
-        shutil.rmtree(workspace, ignore_errors=True)
+        # The workspace is removed even when spawning A itself failed, and even
+        # when close() itself escapes -- an interrupt landing in teardown must
+        # not cost the caller its temp directory.
+        try:
+            if a is not None:
+                a.close()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
     return {
         "act": act,
         "final": final,
