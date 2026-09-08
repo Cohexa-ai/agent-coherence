@@ -33,6 +33,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._state_db import open_readonly_state_db
+
 __all__ = [
     "COUNTS",
     "INSTRUMENTED_ZERO",
@@ -142,21 +144,8 @@ def read_foreign_write_report(db_path: str | Path) -> ForeignWriteReport:
     ``FileNotFoundError``: a report against a store that does not exist is a
     caller error, not evidence of zero foreign writes.
     """
-    path = Path(db_path)
-    # mode=ro + uri=True: without the explicit uri flag sqlite3 treats the
-    # string as a literal filename and can silently fall back to read-write.
-    # No pre-check stat: connect directly and translate the failure, so a
-    # missing file cannot slip through a check-to-open race window.
+    conn = open_readonly_state_db(Path(db_path))
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.OperationalError as exc:
-        if not path.exists():
-            raise FileNotFoundError(f"no coordinator database at {path}") from exc
-        raise
-    try:
-        # A transient writer lock must wait, never masquerade as not-instrumented;
-        # 1500 matches the registry's own budget-derived value.
-        conn.execute("PRAGMA busy_timeout=1500")
         run_rows = _read_table(
             conn,
             "SELECT run_id, first_tick_unix, last_tick_unix, tick_count, "
