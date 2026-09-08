@@ -1477,6 +1477,11 @@ report = read_foreign_write_report(".coherence/state.db")
 print(report.state)        # 'not-instrumented' | 'instrumented-zero' | 'counts'
 for artifact, counts in sorted(report.totals.items()):
     print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
+
+for run in report.runs:                  # what each coordinator run watched
+    print(run.tick_count, "checks over", run.covered_count, "files")
+
+report.covers(started_at, ended_at)      # was that period watched end to end?
 ```
 
 Each file lands in one of three buckets:
@@ -1494,9 +1499,14 @@ plainly:**
 
 - **Zero is only zero when the detector actually ran.** A store it never ran
   against reports `not-instrumented`, which is a different answer from
-  `instrumented-zero`. Turning the sweep off, or reading a store from a
-  coordinator that never started one, gives you the first — never a clean bill
-  of health you did not earn.
+  `instrumented-zero`. Turning the sweep off, reading a store from a coordinator
+  that never started one, or running where nothing is in scope all give you the
+  first — never a clean bill of health you did not earn. Each run also records
+  how many files were in scope, because watching five hundred and finding
+  nothing is a different result from watching none.
+- **A suppression expires.** A mismatch excused as a write still landing is
+  re-examined once the window passes. If no write ever landed, it becomes a
+  foreign write and is counted as one. The benefit of the doubt is temporary.
 - **A count is one per version of the content, not one per check.** An edit
   nobody has reconciled is still there on the next check, and the one after
   that. It is counted once. Change the file again and that is a second count.

@@ -267,7 +267,9 @@ INMEM_SURFACE = frozenset({
     "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
     "artifact_ids", "capture_version_vector", "clear_agent_transient",
     "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
-    "create_checkpoint", "detection_runs", "foreign_write_totals",
+    "artifacts_with_detection_edge", "clear_detection_edges",
+    "close_detection_run", "create_checkpoint", "detection_runs",
+    "foreign_write_totals",
     "get_agent_state", "get_agent_transient", "get_artifact",
     "get_artifact_and_generation", "get_checkpoint", "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
@@ -354,6 +356,8 @@ def _synth_value(param: inspect.Parameter):
             checkpoint_id="synth", name="synth", owner=uuid4(),
             created_at=1.0, created_at_tick=1, window_min=1.0, window_max=1.0,
         )
+    if name == "artifact_ids":
+        return [uuid4()]
     if name == "outcome":
         # record_foreign_write fail-closed-validates the outcome against the
         # fixed three-value vocabulary BEFORE its lock, so a bogus string never

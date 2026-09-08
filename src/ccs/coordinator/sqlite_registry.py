@@ -3482,7 +3482,8 @@ class SqliteArtifactRegistry:
                 foreign_count         INTEGER NOT NULL DEFAULT 0,
                 mediated_count        INTEGER NOT NULL DEFAULT 0,
                 lag_suppressed_count  INTEGER NOT NULL DEFAULT 0,
-                last_counted_hash     TEXT NOT NULL
+                last_counted_hash     TEXT NOT NULL,
+                last_counted_outcome  TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -3492,20 +3493,26 @@ class SqliteArtifactRegistry:
                 run_id           TEXT NOT NULL PRIMARY KEY,
                 first_tick_unix  REAL NOT NULL,
                 last_tick_unix   REAL NOT NULL,
-                tick_count       INTEGER NOT NULL DEFAULT 0
+                tick_count       INTEGER NOT NULL DEFAULT 0,
+                covered_count    INTEGER NOT NULL DEFAULT 0
             )
             """
         )
 
-    def record_detection_tick(self, now_unix: float) -> None:
-        """Record that the detector observed one tick in THIS coordinator run.
+    def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:
+        """Record that the detector observed one tick in THIS observed interval.
 
         Written on every tick the poll completed, including a tick that found
-        nothing — that is precisely what makes a later zero readable as zero
-        (R8). A tick whose poll RAISED must not reach here: an advancing count
-        over a broken poll is the false-clean outcome the whole liveness row
-        exists to prevent, so the caller records the tick only after the poll
-        succeeded.
+        nothing — that is precisely what makes a later zero readable as zero. A
+        tick whose poll RAISED must not reach here: an advancing count over a
+        broken poll is the false-clean outcome the whole liveness row exists to
+        prevent, so the caller records the tick only after the poll succeeded,
+        and closes the interval when it did not.
+
+        ``covered_count`` is how many artifacts were actually in scope. Without
+        it a reader cannot tell a run that watched five hundred artifacts and
+        found nothing from one that watched none, and those are very different
+        answers to "was this period clean?".
 
         One statement, so no explicit transaction: the connection is opened
         autocommit, and this runs on every tick against the same lock and
@@ -3516,14 +3523,30 @@ class SqliteArtifactRegistry:
             self._conn.execute(
                 """
                 INSERT INTO foreign_write_observations
-                    (run_id, first_tick_unix, last_tick_unix, tick_count)
-                VALUES (?, ?, ?, 1)
+                    (run_id, first_tick_unix, last_tick_unix, tick_count,
+                     covered_count)
+                VALUES (?, ?, ?, 1, ?)
                 ON CONFLICT (run_id) DO UPDATE SET
                     last_tick_unix = excluded.last_tick_unix,
-                    tick_count     = tick_count + 1
+                    tick_count     = tick_count + 1,
+                    covered_count  = MAX(covered_count, excluded.covered_count)
                 """,
-                (self._detection_run_id, now_unix, now_unix),
+                (self._detection_run_id, now_unix, now_unix, covered_count),
             )
+
+    def close_detection_run(self) -> None:
+        """End the current observed interval and open a fresh one.
+
+        Called when a tick failed. The interval a run row describes is read as
+        continuously observed, so a run that ticked, went blind for a week, then
+        ticked again would otherwise answer a coverage question for that whole
+        week. Rotating the identity leaves the completed interval intact and
+        lets the next success start a new one, so the hole is visible.
+
+        Purely local: nothing is written until the next successful tick, so a
+        coordinator that fails forever leaves no misleading row behind."""
+        with self._lock:
+            self._detection_run_id = uuid4().hex
 
     def record_foreign_write(
         self, artifact_id: UUID, outcome: str, disk_hash: str
@@ -3531,20 +3554,26 @@ class SqliteArtifactRegistry:
         """Count one newly observed on-disk content for ``artifact_id``.
 
         Returns ``True`` when the observation was counted and ``False`` when it
-        was suppressed as already-counted. The gate is KTD14's edge trigger:
-        git reports a path dirty against the index on EVERY invocation until it
-        is staged and committed, and the canonical hash only advances on a
-        mediated commit, so a level-triggered count would record one foreign
-        edit on every tick for as long as it persists. The gate keys on content,
-        not on outcome — an artifact that diverges, is re-mediated, then
-        diverges back to a previously seen content is three real observations.
+        was suppressed as already-counted. The gate is the edge trigger: git
+        reports a path dirty against the index on EVERY invocation until it is
+        staged and committed, and the canonical hash only advances on a mediated
+        commit, so a level-triggered count would record one foreign edit on
+        every tick for as long as it persists.
 
-        The suppressing value lives HERE, in the detector's own table, never on
+        The gate keys on content AND outcome. Content alone would freeze a
+        classification that is allowed to change while the bytes do not: a
+        mismatch suppressed as a commit-still-landing is re-examined once the
+        window expires, and if no commit ever landed it becomes foreign. Keyed
+        on content alone, that first benefit of the doubt would be permanent —
+        the instrument would have recorded a real foreign write as benign and
+        never revisited it.
+
+        The suppressing values live HERE, in the detector's own table, never on
         ``artifacts.content_hash``: healing the comparand a safety check reads
         is the repeated defect this repo has already shipped three times."""
         column = _foreign_write_column(outcome)
         # One guarded upsert, no read-then-write: the WHERE clause on the
-        # DO UPDATE arm turns a repeat of the same content into a no-op, so
+        # DO UPDATE arm turns a repeat of the same observation into a no-op, so
         # ``rowcount`` reports whether this observation was new. Same shape as
         # ``record_preemption_notice``'s guarded upsert. Single statement under
         # autocommit, so no explicit transaction and no read-modify-write
@@ -3553,17 +3582,57 @@ class SqliteArtifactRegistry:
             cursor = self._conn.execute(
                 f"""
                 INSERT INTO foreign_write_counters
-                    (artifact_id, {column}, last_counted_hash)
-                VALUES (?, 1, ?)
+                    (artifact_id, {column}, last_counted_hash,
+                     last_counted_outcome)
+                VALUES (?, 1, ?, ?)
                 ON CONFLICT (artifact_id) DO UPDATE SET
-                    {column}          = {column} + 1,
-                    last_counted_hash = excluded.last_counted_hash
+                    {column}             = {column} + 1,
+                    last_counted_hash    = excluded.last_counted_hash,
+                    last_counted_outcome = excluded.last_counted_outcome
                 WHERE foreign_write_counters.last_counted_hash
-                      != excluded.last_counted_hash
+                          != excluded.last_counted_hash
+                   OR foreign_write_counters.last_counted_outcome
+                          != excluded.last_counted_outcome
                 """,
-                (artifact_id.hex, disk_hash),
+                (artifact_id.hex, disk_hash, outcome),
             )
         return cursor.rowcount > 0
+
+    def artifacts_with_detection_edge(self) -> set[UUID]:
+        """Artifacts currently holding an edge-gate value.
+
+        Small by construction — only artifacts the detector has ever counted —
+        so the caller can decide which clean artifacts need clearing without
+        issuing a statement per clean artifact per tick."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT artifact_id FROM foreign_write_counters "
+                    "WHERE last_counted_hash != ''"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return set()
+                raise
+        return {UUID(hex=row[0]) for row in rows}
+
+    def clear_detection_edges(self, artifact_ids: list[UUID]) -> None:
+        """Re-arm detection for artifacts that are no longer diverging.
+
+        Counts are untouched — this clears only the value that suppresses a
+        repeat. An artifact reconciled back to the index has no live divergence,
+        so holding its old content would make an identical later edit look
+        already-counted and go unrecorded."""
+        if not artifact_ids:
+            return
+        placeholders = ", ".join("?" for _ in artifact_ids)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE foreign_write_counters "
+                f"SET last_counted_hash = '', last_counted_outcome = '' "
+                f"WHERE artifact_id IN ({placeholders})",
+                [artifact_id.hex for artifact_id in artifact_ids],
+            )
 
     def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
         """Return per-artifact detection counts, omitting zero buckets.
@@ -3605,8 +3674,9 @@ class SqliteArtifactRegistry:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT run_id, first_tick_unix, last_tick_unix, tick_count "
-                    "FROM foreign_write_observations ORDER BY first_tick_unix"
+                    "SELECT run_id, first_tick_unix, last_tick_unix, tick_count, "
+                    "covered_count FROM foreign_write_observations "
+                    "ORDER BY first_tick_unix"
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 if self._read_only and "no such table" in str(exc):
@@ -3618,8 +3688,9 @@ class SqliteArtifactRegistry:
                 first_tick_unix=float(first),
                 last_tick_unix=float(last),
                 tick_count=int(count),
+                covered_count=int(covered),
             )
-            for run_id, first, last, count in rows
+            for run_id, first, last, count, covered in rows
         ]
 
     def _count_conflict_in_txn(

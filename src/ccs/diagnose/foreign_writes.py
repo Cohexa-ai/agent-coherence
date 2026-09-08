@@ -52,6 +52,16 @@ COUNTS = "counts"
 """The detector observed ticks and recorded detections."""
 
 
+# Outcome name to counter column, in one place. The write side binds the same
+# way; a positional SELECT here could drift from it and relabel counts silently,
+# and every equal-count test would still pass.
+_OUTCOME_COLUMNS: dict[str, str] = {
+    "foreign": "foreign_count",
+    "mediated": "mediated_count",
+    "lag_suppressed": "lag_suppressed_count",
+}
+
+
 @dataclass(frozen=True)
 class ObservedRun:
     """One coordinator run's observed detection interval."""
@@ -60,6 +70,9 @@ class ObservedRun:
     first_tick_unix: float
     last_tick_unix: float
     tick_count: int
+    covered_count: int = 0
+    """Artifacts in scope during this interval. A run that watched nothing is
+    not a clean run, and a tick count alone cannot say which this was."""
 
 
 @dataclass(frozen=True)
@@ -146,13 +159,15 @@ def read_foreign_write_report(db_path: str | Path) -> ForeignWriteReport:
         conn.execute("PRAGMA busy_timeout=1500")
         run_rows = _read_table(
             conn,
-            "SELECT run_id, first_tick_unix, last_tick_unix, tick_count "
-            "FROM foreign_write_observations ORDER BY first_tick_unix",
+            "SELECT run_id, first_tick_unix, last_tick_unix, tick_count, "
+            "covered_count FROM foreign_write_observations "
+            "ORDER BY first_tick_unix",
         )
+        outcomes = tuple(_OUTCOME_COLUMNS)
+        selected = ", ".join(_OUTCOME_COLUMNS[name] for name in outcomes)
         counter_rows = _read_table(
             conn,
-            "SELECT artifact_id, foreign_count, mediated_count, "
-            "lag_suppressed_count FROM foreign_write_counters",
+            f"SELECT artifact_id, {selected} FROM foreign_write_counters",
         )
     finally:
         conn.close()
@@ -163,20 +178,13 @@ def read_foreign_write_report(db_path: str | Path) -> ForeignWriteReport:
             first_tick_unix=float(first),
             last_tick_unix=float(last),
             tick_count=int(count),
+            covered_count=int(covered),
         )
-        for run_id, first, last, count in (run_rows or ())
+        for run_id, first, last, count, covered in (run_rows or ())
     )
     totals: dict[str, dict[str, int]] = {}
-    for art_hex, foreign, mediated, suppressed in counter_rows or ():
-        counts = {
-            name: value
-            for name, value in (
-                ("foreign", foreign),
-                ("mediated", mediated),
-                ("lag_suppressed", suppressed),
-            )
-            if value
-        }
+    for art_hex, *values in counter_rows or ():
+        counts = {name: value for name, value in zip(outcomes, values) if value}
         if counts:
             totals[art_hex] = counts
 

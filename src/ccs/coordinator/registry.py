@@ -239,9 +239,10 @@ class ArtifactRegistry:
         # KTD14's edge gate — the disk content last counted per artifact, held
         # here and never on the canonical hash a safety check reads.
         self._detection_counts: dict[UUID, dict[str, int]] = {}
-        self._detection_last_hash: dict[UUID, str] = {}
+        self._detection_last: dict[UUID, tuple[str, str]] = {}
         self._detection_run_id: str = uuid4().hex
         self._detection_run: DetectionRun | None = None
+        self._detection_runs_closed: list[DetectionRun] = []
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
         # THE registry lock. Started life as a capture-only lock (the
         # multi-artifact session-pin critical sections); widened to serialize
@@ -709,8 +710,8 @@ class ArtifactRegistry:
     # NOT claimed here, exactly as the conflict counters above declare.
     # ------------------------------------------------------------------
 
-    def record_detection_tick(self, now_unix: float) -> None:
-        """Record that the detector observed one tick in this run.
+    def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:
+        """Record that the detector observed one tick in this interval.
 
         See :meth:`SqliteArtifactRegistry.record_detection_tick`. Only a tick
         whose poll actually succeeded reaches here — an advancing count over a
@@ -723,6 +724,7 @@ class ArtifactRegistry:
                     first_tick_unix=now_unix,
                     last_tick_unix=now_unix,
                     tick_count=1,
+                    covered_count=covered_count,
                 )
             else:
                 self._detection_run = DetectionRun(
@@ -730,7 +732,19 @@ class ArtifactRegistry:
                     first_tick_unix=run.first_tick_unix,
                     last_tick_unix=now_unix,
                     tick_count=run.tick_count + 1,
+                    covered_count=max(run.covered_count, covered_count),
                 )
+
+    def close_detection_run(self) -> None:
+        """End the current observed interval and open a fresh one.
+
+        See :meth:`SqliteArtifactRegistry.close_detection_run` — a failed tick
+        must not let a later success extend an interval across the outage."""
+        with self._lock:
+            if self._detection_run is not None:
+                self._detection_runs_closed.append(self._detection_run)
+                self._detection_run = None
+            self._detection_run_id = uuid4().hex
 
     def record_foreign_write(
         self, artifact_id: UUID, outcome: str, disk_hash: str
@@ -749,12 +763,23 @@ class ArtifactRegistry:
         # it has no column names to bind and needs no equivalent of the sqlite
         # registry's outcome-to-column map.
         with self._lock:
-            if self._detection_last_hash.get(artifact_id) == disk_hash:
+            if self._detection_last.get(artifact_id) == (disk_hash, outcome):
                 return False
-            self._detection_last_hash[artifact_id] = disk_hash
+            self._detection_last[artifact_id] = (disk_hash, outcome)
             counts = self._detection_counts.setdefault(artifact_id, {})
             counts[outcome] = counts.get(outcome, 0) + 1
         return True
+
+    def artifacts_with_detection_edge(self) -> set[UUID]:
+        """Artifacts currently holding an edge-gate value."""
+        with self._lock:
+            return set(self._detection_last)
+
+    def clear_detection_edges(self, artifact_ids: list[UUID]) -> None:
+        """Re-arm detection for artifacts that are no longer diverging."""
+        with self._lock:
+            for artifact_id in artifact_ids:
+                self._detection_last.pop(artifact_id, None)
 
     def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
         """Return per-artifact detection counts; zero detections is an empty
@@ -766,7 +791,10 @@ class ArtifactRegistry:
         """Return this run's observed interval, or an empty list when the
         detector never ticked — the not-instrumented signal."""
         with self._lock:
-            return [] if self._detection_run is None else [self._detection_run]
+            runs = list(self._detection_runs_closed)
+            if self._detection_run is not None:
+                runs.append(self._detection_run)
+            return runs
 
     def commit_cas(
         self,

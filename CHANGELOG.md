@@ -13,7 +13,7 @@ Alpha — APIs may change before `v1.0`.
   second tool writing a shared file directly is invisible to it until the next
   read or the next write hits a guard. While a coordinator runs, each sweep now
   asks git which coordinated files changed on disk, re-hashes only those, and
-  records each one as `foreign`, `mediated`, or `suppressed` — the last being a
+  records each one as `foreign`, `mediated`, or `lag_suppressed` — the last being a
   mismatch that looked like a write still landing, counted separately so the
   benefit of the doubt is measurable rather than invisible. It never denies,
   never invalidates, and writes nothing outside its own two tables.
@@ -27,8 +27,13 @@ Alpha — APIs may change before `v1.0`.
   of the content, not one per check** — git keeps reporting an unreconciled edit
   on every pass, so a level-triggered counter would turn one edit into thousands.
   **Coverage is files the coordinator already knows and git tracks**; anything
-  else is reported as outside the instrument, never as clean. **A failed check is
-  not recorded as a check**, so a broken poll shows up as a gap. And `covers()`
+  else is reported as outside the instrument, never as clean, and each run also
+  records how many files were in scope so watching none is distinguishable from
+  watching many and finding nothing. **A failed check is not recorded as a
+  check**, and it ends that run's observed period, so a broken poll shows up as
+  a gap rather than being interpolated across. **A suppression expires**: a
+  mismatch excused as a write still landing is re-examined once the window
+  passes, and becomes a foreign write if none ever landed. And `covers()`
   answers whether a given period was watched end to end, which a total number of
   checks cannot: a coordinator down for the middle of a period still shows a
   healthy count. Attribution is by file only — a change on disk carries no author.

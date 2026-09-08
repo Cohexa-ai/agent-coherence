@@ -786,6 +786,11 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     from ccs.adapters.claude_code.foreign_write_detector import run_detection_pass
 
     coordinator = entry.coordinator
+    # Held across ticks for this coordinator: which files the detector has
+    # already read, by size and modification time. It carries no coordination
+    # state and no safety comparand — only a hint about what is worth
+    # re-reading, so a stale entry costs one extra read and never a wrong count.
+    detection_stat_cache: dict[str, tuple[tuple[int, int], str]] = {}
 
     def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
         """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
@@ -862,6 +867,11 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
         # Two separate guards keep the failure domains apart in both
         # directions. ``run_detection_pass`` raises nothing by contract.
         #
+        # The poll gets one sweep interval as its whole budget, not per batch:
+        # detection runs in this loop, so an instrument that overruns delays the
+        # next tick's grant reclamation. Exhausting it fails the poll honestly,
+        # which leaves the tick unrecorded and the gap visible.
+        #
         # The window is the shipped benign commit-to-disk lag plus one tick.
         # They are otherwise both 5.0s and the comparison is inclusive, so a
         # mediated commit first observed on the next tick would sit exactly on
@@ -870,6 +880,8 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             coordinator,
             now_unix=now_tick,
             window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + cfg.sweep_interval_sec,
+            poll_budget_sec=cfg.sweep_interval_sec,
+            stat_cache=detection_stat_cache,
         )
 
 

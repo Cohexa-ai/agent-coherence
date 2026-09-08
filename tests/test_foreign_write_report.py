@@ -190,3 +190,33 @@ def test_the_reader_does_not_modify_the_store(tmp_path: Path) -> None:
     assert report.state == INSTRUMENTED_ZERO
     assert db.read_bytes() == before_bytes
     assert db.stat().st_mtime_ns == before_mtime
+
+
+def test_distinct_counts_are_not_transposed_in_the_report(tmp_path: Path) -> None:
+    """The write side binds columns through one map; so must the reader. Every
+    other count case here uses equal values, which a positional drift survives."""
+    db = tmp_path / "state.db"
+    art = uuid4()
+    reg = SqliteArtifactRegistry(db)
+    reg.record_detection_tick(100.0, covered_count=1)
+    reg.record_foreign_write(art, "foreign", f"{0:064d}")
+    for index in (1, 2):
+        reg.record_foreign_write(art, "mediated", f"{index:064d}")
+    for index in (3, 4, 5):
+        reg.record_foreign_write(art, "lag_suppressed", f"{index:064d}")
+    reg.close()
+
+    report = read_foreign_write_report(db)
+    assert report.totals == {art.hex: {"foreign": 1, "mediated": 2, "lag_suppressed": 3}}
+
+
+def test_the_report_says_how_much_each_run_watched(tmp_path: Path) -> None:
+    """A run that watched nothing is not a clean run."""
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    reg.record_detection_tick(100.0, covered_count=7)
+    reg.record_detection_tick(105.0, covered_count=9)
+    reg.close()
+
+    runs = read_foreign_write_report(db).runs
+    assert len(runs) == 1 and runs[0].covered_count == 9

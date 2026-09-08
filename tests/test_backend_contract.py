@@ -8,7 +8,7 @@ frozen dataclasses, string constants) formalizing what a networked registry
 backend must provide to re-home the coordinator's atomic boundary. These tests
 are the DRIFT GUARDS the plan calls for:
 
-- the member-classification map covers EXACTLY the 63 ``RegistryBase`` +
+- the member-classification map covers EXACTLY the 66 ``RegistryBase`` +
   ``SqliteExtended`` members — no more, no fewer — so a Protocol member added or
   removed in ``registry_protocol.py`` without a matching contract update FAILS
   CI (bidirectional guard);
@@ -19,7 +19,7 @@ are the DRIFT GUARDS the plan calls for:
 - a classification value outside the enum is unrepresentable (typed);
 - the tier enum has exactly ``TIER_1`` and ``TIER_2``.
 
-The expected 63-member set is FROZEN here (imported from the parity test's own
+The expected 66-member set is FROZEN here (imported from the parity test's own
 frozen name-sets), NOT derived from the Protocol at runtime — so a silent
 Protocol edit cannot move the goalposts this test guards (the same discipline
 ``tests/test_registry_protocol_parity.py`` uses).
@@ -42,42 +42,45 @@ from ccs.coordinator.backend_contract import (
     Tier,
 )
 
-# The 63-member expected surface, imported from the parity test's FROZEN
-# name-sets (45 base methods + 17 extended methods + 1 base property). Reusing
+# The 66-member expected surface, imported from the parity test's FROZEN
+# name-sets (45 base + 13 extended + 7 detection methods + 1 base property). Reusing
 # those frozensets means this contract and the Protocol parity share ONE
 # source of truth for the surface: if either the parity test or the Protocol
 # changes the surface, the two drift guards fire together.
 from tests.test_registry_protocol_parity import (  # noqa: E402
     BASE_METHODS,
     BASE_PROPERTIES,
+    DETECTION_METHODS,
     EXTENDED_ONLY_METHODS,
 )
 
-EXPECTED_MEMBERS = BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES
+EXPECTED_MEMBERS = (
+    BASE_METHODS | EXTENDED_ONLY_METHODS | DETECTION_METHODS | BASE_PROPERTIES
+)
 
 
 # ---------------------------------------------------------------------------
-# Member classification — exactly the 63 Protocol members, no drift
+# Member classification — exactly the 66 Protocol members, no drift
 # ---------------------------------------------------------------------------
 
 
 def test_member_map_covers_exactly_the_protocol_surface() -> None:
-    """The classification map keys equal the 63-member Protocol surface EXACTLY
+    """The classification map keys equal the 66-member Protocol surface EXACTLY
     — no more, no fewer. A member added to (or removed from) ``registry_protocol.py``
     without a matching contract update fails HERE (bidirectional drift guard)."""
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_63_members() -> None:
+def test_member_map_has_exactly_66_members() -> None:
     """Pin the count explicitly: 45 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
     ``get_artifact_and_generation``, then the SB-10 comparand read
-    ``last_observed_version_for`` added) + 17 extended methods (the four
-    foreign-write detection members added) + 1
-    base property = 63. Guards against a same-size add+remove that would slip
+    ``last_observed_version_for`` added) + 13 extended methods + 7
+    foreign-write detection methods on their own Protocol + 1
+    base property = 66. Guards against a same-size add+remove that would slip
     past the set-equality check on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 63
-    assert len(EXPECTED_MEMBERS) == 63
+    assert len(MEMBER_CLASSIFICATION) == 66
+    assert len(EXPECTED_MEMBERS) == 66
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:
@@ -96,18 +99,22 @@ def test_every_member_has_a_typed_classification() -> None:
     for name, contract in MEMBER_CLASSIFICATION.items():
         assert isinstance(contract.member_class, MemberClass), name
         assert contract.name == name
-        assert contract.surface in {"base", "sqlite_extended"}
+        assert contract.surface in {"base", "sqlite_extended", "detection"}
         assert contract.rationale  # non-empty rationale authored from service.py
 
 
 def test_member_surface_matches_the_protocol_split() -> None:
     """Each member's declared ``surface`` matches which Protocol frozenset it
-    belongs to (base methods + the base property are "base"; extended-only
-    methods are "sqlite_extended")."""
+    belongs to: base methods plus the base property are "base", extended-only
+    methods are "sqlite_extended", and the detection instrument is its own
+    "detection" surface — a backend may implement that one independently, or
+    not at all, without losing the coordination surface."""
     base_surface = BASE_METHODS | BASE_PROPERTIES
     for name, contract in MEMBER_CLASSIFICATION.items():
         if name in base_surface:
             assert contract.surface == "base", name
+        elif name in DETECTION_METHODS:
+            assert contract.surface == "detection", name
         else:
             assert contract.surface == "sqlite_extended", name
 
