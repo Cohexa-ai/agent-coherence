@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 59-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
 Protocols), this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
@@ -105,12 +105,12 @@ class MemberContract:
 
     name: str
     member_class: MemberClass
-    surface: str  # "base" | "sqlite_extended"
+    surface: str  # "base" | "sqlite_extended" | "detection"
     rationale: str
 
 
-# The 59 members of RegistryBase (45 methods + 1 property) and SqliteExtended
-# (+13 methods), classified against the CoordinatorService call sites. The
+# The 66 members of RegistryBase (45 methods + 1 property), SqliteExtended
+# (+13 methods) and ForeignWriteDetection (+7 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
 # ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
@@ -606,13 +606,70 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Batch read of the artifact + state maps for the /status surface, "
         "optionally scoping the state half to named agents. Non-mutating.",
     ),
+    MemberContract(
+        "record_foreign_write",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Counts one newly observed on-disk content for an artifact, gated on the "
+        "disk hash last counted for it. A mutation, but observability exhaust "
+        "rather than coordination state: it decides nothing, and the boundary "
+        "never reads it. A backend makes the read-compare-upsert individually "
+        "atomic so two ticks cannot double-count one content; it must NOT fold "
+        "it into the single-writer RMW, where it would put a detector's write "
+        "on the arbitration path.",
+    ),
+    MemberContract(
+        "record_detection_tick",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Records that the detector observed one tick in this coordinator run. "
+        "Individually durable liveness exhaust, outside the boundary — the same "
+        "posture as the grant-holder heartbeat, and read only by the offline "
+        "report that distinguishes a true zero from an instrument that never ran.",
+    ),
+    MemberContract(
+        "foreign_write_totals",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads per-artifact detection counts. Non-mutating.",
+    ),
+    MemberContract(
+        "detection_runs",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads the observed per-run detection intervals a coverage claim is "
+        "checked against. Non-mutating.",
+    ),
+    MemberContract(
+        "close_detection_run",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Ends the current observed interval after a failed tick so a later "
+        "success cannot extend it across the outage. Process-local bookkeeping "
+        "outside the boundary; a backend need only ensure the next tick opens a "
+        "distinct interval.",
+    ),
+    MemberContract(
+        "clear_detection_edges",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Re-arms detection for artifacts no longer diverging, clearing only the "
+        "value that suppresses a repeat and never a count. Individually "
+        "durable, outside the boundary.",
+    ),
+    MemberContract(
+        "artifacts_with_detection_edge",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads which artifacts currently hold an edge-gate value. Non-mutating.",
+    ),
 )
 
 MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 59-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 66-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

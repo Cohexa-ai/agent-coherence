@@ -35,7 +35,11 @@ from uuid import uuid4
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import RegistryBase, SqliteExtended
+from ccs.coordinator.registry_protocol import (
+    ForeignWriteDetection,
+    RegistryBase,
+    SqliteExtended,
+)
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.types import Artifact, FetchRequest
@@ -111,6 +115,24 @@ EXTENDED_ONLY_METHODS = frozenset(
     }
 )
 
+DETECTION_METHODS = frozenset(
+    {
+        "artifacts_with_detection_edge",
+        "clear_detection_edges",
+        "close_detection_run",
+        "detection_runs",
+        "foreign_write_totals",
+        "record_detection_tick",
+        "record_foreign_write",
+    }
+)
+"""The foreign-write detection surface, deliberately its own Protocol.
+
+``SqliteExtended`` is runtime_checkable and the service layer isinstance-checks
+it to pick the durable resolve path, so a structural check passes only when
+every member is present. Folding instrumentation in would have silently demoted
+any backend that implements the coordination surface but not this one."""
+
 # Property members of the base contract. The method checks below filter by
 # callable(), so a ``@property`` is structurally invisible to them; pin
 # properties explicitly so a backend typed against RegistryBase cannot omit one,
@@ -166,6 +188,32 @@ def test_sqlite_registry_is_sqlite_extended(
     assert isinstance(sqlite_registry, SqliteExtended)
 
 
+def test_both_registries_implement_detection(
+    inmem_registry: ArtifactRegistry, sqlite_registry: SqliteArtifactRegistry
+) -> None:
+    assert isinstance(inmem_registry, ForeignWriteDetection)
+    assert isinstance(sqlite_registry, ForeignWriteDetection)
+
+
+def test_a_backend_without_detection_is_still_sqlite_extended() -> None:
+    """The regression this split exists to prevent.
+
+    The service layer isinstance-checks SqliteExtended to choose the durable
+    resolve path over a slower mint. A backend that implements the whole
+    coordination surface but no instrumentation must keep taking that path."""
+
+    class _CoordinationOnly:
+        pass
+
+    for name in BASE_METHODS | EXTENDED_ONLY_METHODS:
+        setattr(_CoordinationOnly, name, lambda self, *a, **k: None)
+    _CoordinationOnly.coordinator_epoch = property(lambda self: 0)
+
+    backend = _CoordinationOnly()
+    assert isinstance(backend, SqliteExtended)
+    assert not isinstance(backend, ForeignWriteDetection)
+
+
 # ---------------------------------------------------------------------------
 # Full expected surface — names present + callable
 # ---------------------------------------------------------------------------
@@ -204,8 +252,18 @@ def test_protocol_surface_matches_expected_names() -> None:
         for n in dir(SqliteExtended)
         if not n.startswith("_") and callable(getattr(SqliteExtended, n))
     }
+    detection_names = {
+        n
+        for n in dir(ForeignWriteDetection)
+        if not n.startswith("_") and callable(getattr(ForeignWriteDetection, n))
+    }
     assert base_names == BASE_METHODS
     assert extended_names == BASE_METHODS | EXTENDED_ONLY_METHODS
+    assert detection_names == DETECTION_METHODS
+    assert not (extended_names & DETECTION_METHODS), (
+        "detection members must stay off SqliteExtended: it is isinstance-checked "
+        "to choose the durable resolve path, and adding members narrows what passes"
+    )
     base_props = {
         n
         for n in dir(RegistryBase)

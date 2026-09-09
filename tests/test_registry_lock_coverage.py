@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.registry_protocol import FOREIGN_WRITE_OUTCOMES
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.states import MESIState
@@ -266,7 +267,9 @@ INMEM_SURFACE = frozenset({
     "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
     "artifact_ids", "capture_version_vector", "clear_agent_transient",
     "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
-    "create_checkpoint",
+    "artifacts_with_detection_edge", "clear_detection_edges",
+    "close_detection_run", "create_checkpoint", "detection_runs",
+    "foreign_write_totals",
     "get_agent_state", "get_agent_transient", "get_artifact",
     "get_artifact_and_generation", "get_checkpoint", "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
@@ -274,7 +277,8 @@ INMEM_SURFACE = frozenset({
     "get_session_meta", "get_state_map", "get_transient_map",
     "get_transient_tick", "get_version_record", "granted_at_tick",
     "has_artifact", "instance_id", "last_heartbeat_tick",
-    "last_observed_version_for", "list_checkpoints", "record_heartbeat",
+    "last_observed_version_for", "list_checkpoints",
+    "record_detection_tick", "record_foreign_write", "record_heartbeat",
     "record_last_reclamation", "register_artifact", "release_session",
     "remove_artifact", "retention_meta", "session_count", "set_agent_state",
     "set_agent_transient", "set_artifact_and_content",
@@ -352,6 +356,13 @@ def _synth_value(param: inspect.Parameter):
             checkpoint_id="synth", name="synth", owner=uuid4(),
             created_at=1.0, created_at_tick=1, window_min=1.0, window_max=1.0,
         )
+    if name == "artifact_ids":
+        return [uuid4()]
+    if name == "outcome":
+        # record_foreign_write fail-closed-validates the outcome against the
+        # fixed three-value vocabulary BEFORE its lock, so a bogus string never
+        # reaches the hold — same shape as `checkpoint` above.
+        return FOREIGN_WRITE_OUTCOMES[0]
     if name == "members":
         return []
     if name == "writes":
