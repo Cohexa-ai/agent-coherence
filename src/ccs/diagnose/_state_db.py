@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 __all__ = ["open_readonly_state_db"]
 
@@ -34,16 +35,36 @@ def open_readonly_state_db(path: Path) -> sqlite3.Connection:
 
     Raises ``FileNotFoundError`` when nothing is there — a report against a
     store that does not exist is a caller error, never evidence of a quiet
-    month. Every other failure to open propagates, so a broken read cannot be
-    mistaken for an empty one. The caller owns the returned connection and
-    must close it.
+    month — and ``ValueError`` for a path carrying a NUL, which no filesystem
+    call would accept either. Every other failure to open propagates, so a
+    broken read cannot be mistaken for an empty one. The caller owns the
+    returned connection and must close it.
     """
+    # A NUL cannot survive the round trip: quote() renders it %00 and SQLite
+    # decodes it back into a C string that truncates there, which is the same
+    # open-a-different-file bug the encoding below exists to prevent. Python
+    # raises ValueError for a NUL in any real filesystem call, so raise it here
+    # rather than let the URI layer turn it into a silent wrong-file read.
+    if "\x00" in str(path):
+        raise ValueError(f"NUL byte in coordinator database path: {path!r}")
     # mode=ro + uri=True: without the explicit uri flag sqlite3 treats the
     # string as a literal filename and can silently fall back to read-write.
+    # quote() so the path is read as filename bytes and never as URI syntax:
+    # a '#' would otherwise start a fragment that swallows the query, taking
+    # mode=ro with it — SQLite then opens the truncated path read-WRITE,
+    # creates it, and the reader reports a store it never read as empty.
+    # safe="" because '/' left unescaped lets a leading '//' read as a URI
+    # authority, which is the same wrong-file hazard; SQLite decodes %2F back
+    # into a separator, so escaping it costs nothing. absolute() so a bare
+    # ":memory:" cannot resolve to SQLite's in-memory store and answer with a
+    # zero no database ever backed. surrogateescape so an undecodable
+    # filesystem byte still reaches the open and fails as FileNotFoundError,
+    # rather than escaping as UnicodeEncodeError past every documented type.
     # No pre-check stat: connect directly and translate the failure, so a
     # missing file cannot slip through a check-to-open race window.
+    uri = quote(str(path.absolute()), safe="", errors="surrogateescape")
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{uri}?mode=ro", uri=True)
     except sqlite3.OperationalError as exc:
         if not path.exists():
             raise FileNotFoundError(f"no coordinator database at {path}") from exc
