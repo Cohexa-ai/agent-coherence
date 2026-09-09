@@ -17,6 +17,7 @@ matrix that exercises bare-install paths.
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -87,3 +88,33 @@ def _neutralize_v090_first_use_warning():
 
     _service._V090_FIRST_USE_WARNED = True
     yield
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def registry(request, tmp_path: Path):
+    """Both registry implementations, identically — the parametrization IS the
+    parity harness for registry-level surfaces.
+
+    Shared here rather than per-module because the conflict-counter suite and
+    the foreign-write-counter suite that follows it assert the same contract
+    across both arms, from what had become byte-identical local copies. Modules
+    that define their own ``registry`` shadow this one, so the pre-existing
+    per-module fixtures keep their own param ids and teardown idiom;
+    ``tests/test_registry_fixture_contract.py`` pins both halves of that split.
+
+    The sqlite arm's filename is deliberately its own: consumers put their own
+    sqlite files in the same ``tmp_path``, and the tree's default ``state.db``
+    is a name two coordinator suites already reserve for raw-sqlite probes.
+    """
+    # Deferred like the ``ccs`` imports in the hooks above, so importing this
+    # conftest stays free of the package under test. Nothing here needs `ccs`
+    # until a test actually requests the fixture.
+    from ccs.coordinator.registry import ArtifactRegistry
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    if request.param == "memory":
+        yield ArtifactRegistry()
+    else:
+        reg = SqliteArtifactRegistry(tmp_path / "shared-registry-arm.db")
+        yield reg
+        reg.close()
