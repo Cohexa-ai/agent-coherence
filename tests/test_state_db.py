@@ -17,6 +17,15 @@ filename bytes: SQLite opened a different file, ``mode=ro`` was displaced into
 the fragment and silently lost, and ``read_conflict_totals`` answered ``{}`` for
 a store that held real conflicts. A fabricated zero is the exact failure this
 subsystem exists to prevent, and the suite stayed green through all of it.
+
+The older tests were not weak — their input domain could not express the bug.
+``tmp_path`` yields only ``[A-Za-z0-9/_-]``, so no assertion added over that
+fixture could have failed. The rule this file exists to carry forward: when a
+fixture generates the input, the fixture silently decides which bugs are
+reachable, so a path-taking API has to be tested on paths the platform allows
+and the fixture never emits. ``URI_HOSTILE_NAMES`` below is that set for a
+directory component; the tests after it cover the shapes that are not
+directory names at all — a NUL, a ``//`` authority, and ``:memory:``.
 """
 
 from __future__ import annotations
