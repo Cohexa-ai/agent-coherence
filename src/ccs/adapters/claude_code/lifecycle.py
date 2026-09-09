@@ -791,6 +791,11 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     # state and no safety comparand — only a hint about what is worth
     # re-reading, so a stale entry costs one extra read and never a wrong count.
     detection_stat_cache: dict[str, tuple[tuple[int, int], str]] = {}
+    # Also held across ticks for this coordinator: which permanent poll faults
+    # have already been reported. A workspace that is not a git repository can
+    # never be polled, and logging that once per sweep interval for the life of
+    # the coordinator buries the failures an operator can act on.
+    detection_reported_faults: set[str] = set()
 
     def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
         """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
@@ -882,6 +887,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + cfg.sweep_interval_sec,
             poll_budget_sec=cfg.sweep_interval_sec,
             stat_cache=detection_stat_cache,
+            reported_faults=detection_reported_faults,
         )
 
 

@@ -23,6 +23,7 @@ import pytest
 
 from ccs.adapters.claude_code.foreign_write_detector import (
     GitPollError,
+    NotAGitRepositoryError,
     _classify_mismatch,
     _git_dirty_paths,
     _parse_porcelain_v2,
@@ -37,14 +38,24 @@ WINDOW = 10.0
 POLL_BUDGET = 30.0
 
 
-def _tick(coordinator, *, now_unix: float, window_sec: float = WINDOW, cache=None) -> int:
-    """One tick with the caller-owned stat cache the sweep loop holds."""
+def _tick(
+    coordinator,
+    *,
+    now_unix: float,
+    window_sec: float = WINDOW,
+    cache=None,
+    faults=None,
+) -> int:
+    """One tick with the two caller-owned pieces the sweep loop holds across
+    ticks: the stat cache, and the latch of already-reported permanent faults.
+    A test that cares about either passes its own and reuses it."""
     return run_detection_pass(
         coordinator,
         now_unix=now_unix,
         window_sec=window_sec,
         poll_budget_sec=POLL_BUDGET,
         stat_cache=cache if cache is not None else {},
+        reported_faults=faults if faults is not None else set(),
     )
 
 
@@ -382,6 +393,128 @@ def test_a_non_zero_git_exit_raises_rather_than_reading_clean(tmp_path: Path) ->
     not_a_repo.mkdir()
     with pytest.raises(GitPollError):
         _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=POLL_BUDGET)
+
+
+def test_a_missing_repository_is_typed_apart_from_a_genuine_failure(
+    tmp_path: Path, repo: Path
+) -> None:
+    """128 is git's generic fatal exit, so the code alone cannot separate a
+    workspace that can never be polled from a corrupt index, a bad object or a
+    dubious-ownership refusal. Only the first is permanent and non-actionable,
+    and only the first may ever be quieted."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    with pytest.raises(NotAGitRepositoryError):
+        _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=POLL_BUDGET)
+
+    # A real repository, a real fatal, the same exit code — and not the quiet
+    # one: git refuses a pathspec that resolves outside the work tree.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    with pytest.raises(GitPollError) as caught:
+        _git_dirty_paths(repo, [str(outside)], budget_sec=POLL_BUDGET)
+    assert not isinstance(caught.value, NotAGitRepositoryError)
+
+
+@pytest.mark.parametrize("gutted", [".git/HEAD", ".git/objects", ".git/refs"])
+def test_a_corrupt_repository_is_never_mistaken_for_an_absent_one(
+    repo: Path, gutted: str
+) -> None:
+    """The message cannot tell these apart, so the filesystem has to.
+
+    A repository whose ``.git`` survives but whose ``HEAD``, ``objects`` or
+    ``refs`` does not answers with the BYTE-IDENTICAL "fatal: not a git
+    repository (or any of the parent directories): .git" and the same exit 128
+    an absent one gives. That repository is broken and an operator can fix it;
+    quieting it would hand out the reassurance this instrument exists to earn.
+    """
+    import shutil
+
+    target = repo / gutted
+    shutil.rmtree(target) if target.is_dir() else target.unlink()
+
+    with pytest.raises(GitPollError) as caught:
+        _git_dirty_paths(repo, ["notes.md"], budget_sec=POLL_BUDGET)
+
+    # The sentence IS there. The classification still is not — which is the
+    # whole point: it is decided by `.git` existing, not by what git said.
+    assert "not a git repository" in str(caught.value).lower()
+    assert not isinstance(caught.value, NotAGitRepositoryError)
+
+
+def test_a_dangling_git_symlink_is_broken_rather_than_absent(
+    tmp_path: Path
+) -> None:
+    """``lexists``, not ``exists``: a ``.git`` pointing at nothing is a
+    repository someone has to repair, and the walk must not read it as a
+    workspace that never had one."""
+    workspace = tmp_path / "dangling"
+    workspace.mkdir()
+    (workspace / ".git").symlink_to(tmp_path / "gone")
+
+    with pytest.raises(GitPollError) as caught:
+        _git_dirty_paths(workspace, ["notes.md"], budget_sec=POLL_BUDGET)
+    assert not isinstance(caught.value, NotAGitRepositoryError)
+
+
+def test_a_repository_above_the_workspace_still_counts_as_present(
+    tmp_path: Path, repo: Path
+) -> None:
+    """The walk mirrors git's own discovery, which searches upward. A
+    coordinator rooted in a subdirectory is inside a repository even though its
+    own directory holds no ``.git``."""
+    from ccs.adapters.claude_code.foreign_write_detector import _repository_is_absent
+
+    nested = repo / "sub" / "deeper"
+    nested.mkdir(parents=True)
+    assert _repository_is_absent(nested) is False
+    assert _repository_is_absent(tmp_path / "nowhere-near-a-repo") is True
+
+
+@pytest.mark.parametrize("failure", [PermissionError, OSError])
+def test_a_walk_that_cannot_answer_says_present_rather_than_absent(
+    tmp_path: Path, monkeypatch, failure
+) -> None:
+    """Driven through the guard function itself, because the conditions that
+    reach these branches — an unsearchable parent, a root that will not resolve
+    — cannot be staged portably, and a branch no test can see reports green.
+
+    ``os.path.lexists`` is what this rules out: it folds a stat ERROR into the
+    same ``False`` it gives a missing file, so the walk would read an
+    unreadable directory as "no repository here" and quiet it.
+    """
+    import os as os_module
+
+    from ccs.adapters.claude_code.foreign_write_detector import _repository_is_absent
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    assert _repository_is_absent(workspace) is True  # control: really absent
+
+    def _refuse(*_args, **_kwargs):
+        raise failure(13, "refused")
+
+    monkeypatch.setattr(os_module, "lstat", _refuse)
+    assert _repository_is_absent(workspace) is False
+
+
+def test_a_root_that_will_not_resolve_says_present(tmp_path: Path, monkeypatch) -> None:
+    """Same asymmetry one step earlier."""
+    from ccs.adapters.claude_code.foreign_write_detector import _repository_is_absent
+
+    def _refuse(*_args, **_kwargs):
+        raise OSError(62, "too many levels of symbolic links")
+
+    monkeypatch.setattr(Path, "resolve", _refuse)
+    assert _repository_is_absent(tmp_path / "workspace") is False
+
+
+def test_the_poll_pins_the_language_of_the_diagnostics_it_reads() -> None:
+    """The missing-repository signature is a sentence git TRANSLATES: under
+    ``fr_FR.UTF-8`` it reads "ni ceci ni aucun de ses répertoires parents n'est
+    un dépôt git". Without ``LC_ALL=C`` an operator's locale would decide
+    whether a workspace reads as inert or as broken."""
+    assert _poll_env()["LC_ALL"] == "C"
 
 
 def test_the_poll_never_takes_the_index_lock(repo: Path) -> None:
@@ -726,3 +859,125 @@ def test_the_last_batch_is_queried_too(repo: Path) -> None:
         names[1],
         names[-1],
     }
+
+
+# ---------------------------------------------------------------------------
+# A workspace the pass can never poll — the shipped demos' temp directory
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_git_workspace_is_reported_once_and_without_a_traceback(
+    coordinator, repo: Path, caplog
+) -> None:
+    """``tempfile.mkdtemp()`` is not a repository, so every shipped demo runs
+    the pass against a workspace it can never poll — and before this, printed a
+    full traceback per sweep tick over the demo's own stdout and over CI.
+
+    The condition is permanent and no operator action clears it, so it is worth
+    exactly one line. Quieting the LOG must not quiet the REPORT: the ticks are
+    still not recorded, which is what makes the coverage hole visible offline.
+    """
+    import logging
+    import shutil
+
+    _register(coordinator, "notes.md", "v1\n")
+    shutil.rmtree(repo / ".git")
+    faults: set[str] = set()
+
+    with caplog.at_level(logging.DEBUG):
+        for tick in range(3):
+            _tick(coordinator, now_unix=1000.0 + tick, faults=faults)
+
+    logged = [r for r in caplog.records if r.name.endswith("foreign_write_detector")]
+    assert len(logged) == 1
+    assert logged[0].levelno == logging.DEBUG
+    assert logged[0].exc_info is None  # no traceback
+    assert "inert" in logged[0].getMessage()
+    assert coordinator.registry.detection_runs() == []
+
+
+def test_the_latch_re_arms_once_the_workspace_can_be_polled_again(
+    coordinator, repo: Path, caplog
+) -> None:
+    """The latch tracks the condition, not the coordinator's lifetime. A
+    workspace can become a repository (``git init``) and a repository can stop
+    being one, and the second outage is as worth one line as the first."""
+    import logging
+    import shutil
+
+    _register(coordinator, "notes.md", "v1\n")
+    git_dir = repo / ".git"
+    stashed = repo.parent / "git-stashed"
+    faults: set[str] = set()
+
+    with caplog.at_level(logging.DEBUG):
+        shutil.move(str(git_dir), str(stashed))
+        _tick(coordinator, now_unix=100.0, faults=faults)
+        shutil.move(str(stashed), str(git_dir))
+        _tick(coordinator, now_unix=200.0, faults=faults)  # a completed poll
+        shutil.move(str(git_dir), str(stashed))
+        _tick(coordinator, now_unix=300.0, faults=faults)
+        shutil.move(str(stashed), str(git_dir))
+
+    logged = [r for r in caplog.records if r.name.endswith("foreign_write_detector")]
+    assert len(logged) == 2
+    assert all(r.levelno == logging.DEBUG and r.exc_info is None for r in logged)
+
+
+def test_a_genuine_poll_failure_keeps_its_traceback_every_tick(
+    coordinator, repo: Path, caplog, monkeypatch
+) -> None:
+    """Only the one permanent condition is quieted. A corrupt index, a locked
+    repository or a dubious-ownership refusal is neither permanent nor
+    non-actionable, and stays exactly as loud as it was — every tick, with the
+    stack that says where it came from.
+
+    The raise deliberately carries the missing-repository SENTENCE while being
+    the base type: the quiet path keys on the type the git layer chose, never on
+    a substring re-sniffed at the top.
+    """
+    import logging
+
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    _register(coordinator, "notes.md", "v1\n")
+
+    def _boom(*_args, **_kwargs):
+        raise GitPollError("git status exited 128: fatal: not a git repository")
+
+    monkeypatch.setattr(detector, "_git_dirty_paths", _boom)
+    faults: set[str] = set()
+
+    with caplog.at_level(logging.DEBUG):
+        for tick in range(2):
+            _tick(coordinator, now_unix=1000.0 + tick, faults=faults)
+
+    logged = [r for r in caplog.records if r.name.endswith("foreign_write_detector")]
+    assert len(logged) == 2  # never latched
+    assert all(r.levelno == logging.ERROR for r in logged)
+    assert all(r.exc_info is not None for r in logged)  # traceback kept
+
+
+def test_a_corrupt_repository_stays_loud_on_every_tick(
+    coordinator, repo: Path, caplog
+) -> None:
+    """The end-to-end half of the same defect. A gutted ``.git`` reaches the
+    pass as an ordinary poll failure, so it keeps its traceback every tick and
+    never enters the latch — an operator who can fix this has to hear it."""
+    import logging
+    import shutil
+
+    _register(coordinator, "notes.md", "v1\n")
+    shutil.rmtree(repo / ".git" / "objects")
+    faults: set[str] = set()
+
+    with caplog.at_level(logging.DEBUG):
+        for tick in range(2):
+            _tick(coordinator, now_unix=1000.0 + tick, faults=faults)
+
+    logged = [r for r in caplog.records if r.name.endswith("foreign_write_detector")]
+    assert len(logged) == 2
+    assert all(r.levelno == logging.ERROR for r in logged)
+    assert all(r.exc_info is not None for r in logged)
+    assert faults == set()  # nothing latched
+    assert coordinator.registry.detection_runs() == []
