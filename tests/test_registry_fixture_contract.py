@@ -3,7 +3,7 @@
 
 """The `registry` fixture contract: who owns it, and under which param ids.
 
-``tests/conftest.py`` defines a tree-wide ``registry`` fixture. Nine modules
+``tests/conftest.py`` defines a tree-wide ``registry`` fixture. Ten modules
 define their own and shadow it. That shadowing is load-bearing and, until this
 module existed, entirely unasserted: pytest resolves the nearest fixture
 silently, so a module that loses its local definition does not fail — it binds
@@ -38,6 +38,7 @@ EXPECTED_LOCAL_FIXTURES: dict[str, tuple[str, ...] | None] = {
     "test_commit_all_registry.py": ("memory", "sqlite"),
     "test_fencing.py": ("in_memory", "sqlite"),
     "test_fetch_peer_leg_fence.py": ("in_memory", "sqlite"),
+    "test_foreign_write_instrumentation.py": ("memory", "sqlite"),
     "test_registry_lock_coverage.py": ("in_memory", "sqlite"),
     "test_zombie_revoke.py": ("in_memory", "sqlite"),
 }
