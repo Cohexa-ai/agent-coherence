@@ -12,8 +12,9 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
-Protocols), this module names the CONTRACT that surface must satisfy for a
+names the registry SURFACE (the 59-member ``RegistryBase`` + ``SqliteExtended``
+Protocols; the 7 detection members sit on their own ``ForeignWriteDetection``),
+this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
 IS (:data:`R9_ATOMIC_BOUNDARY`), the conformance tiers (:class:`Tier`), the
