@@ -41,6 +41,22 @@ exit and a clean tree to the same value; here a failed poll raises, the tick is
 NOT recorded, and the run's observed interval is closed so the offline report
 shows a hole rather than interpolating across it.
 
+**An inert workspace is not a broken poll.** A workspace with no repository at
+or above it cannot be polled at all: the condition is permanent, no operator
+action clears it, and every tick would otherwise log the same traceback until
+the coordinator stops. That one condition is reported once at debug and then
+latched; every other poll failure keeps its traceback, because it may be
+transient and it may be actionable. Both paths record no tick and close the
+observed interval, so the offline report shows the same honest hole either way
+— only the log volume differs.
+
+**And the quiet state is earned from the filesystem, never from the message.**
+Git answers a gutted repository — ``.git`` present, ``HEAD`` or ``objects`` or
+``refs`` gone — with the byte-identical "fatal: not a git repository (or any of
+the parent directories): .git" and the same exit 128 it gives an absent one.
+Classifying on that sentence alone would quiet a corrupt repository, which is
+both actionable and precisely the false reassurance this pass exists to refuse.
+
 **It asks git for literal paths.** A stored artifact name is data, and git reads
 pathspec magic in a path even after ``--``. A name beginning with a colon would
 otherwise re-scope or silently exclude the rest of the poll.
@@ -53,6 +69,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -91,6 +108,27 @@ _GIT_REDIRECT_VARS = (
     "GIT_NAMESPACE",
 )
 
+# The one poll fault reported once rather than per tick. A key rather than a
+# bare bool so the caller holds one latch whatever else later joins it.
+_FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
+
+# The CEILING on how long the repository walk may take. A handful of `lstat`
+# calls is microseconds whenever the filesystem answers at all; the bound is for
+# the case where it never does. It is a cap and not the operand — the caller
+# passes whatever is left of the poll's own budget, because that budget is
+# documented to bound the WHOLE poll, and a walk spent on top of it would
+# overrun the sweep interval this pass shares with grant reclamation.
+_WALK_BUDGET_SEC = 2.0
+
+# At most one walk may be outstanding per process. A walk that never returns
+# leaves an unkillable thread behind — `os.lstat` on a wedged mount cannot be
+# interrupted — so starting a fresh one per sweep tick would accumulate threads
+# until the process could create none at all. That is a worse failure than the
+# one the bound exists to prevent. While a walk is still out, the answer is
+# already "present", so a second one would buy nothing.
+_walk_lock = threading.Lock()
+_walk_in_flight: threading.Thread | None = None
+
 # An outstanding write grant is the registry's own evidence that a mediated
 # write is in flight, which the timestamp alone cannot supply — see _classify.
 _WRITE_GRANT_STATES = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
@@ -117,6 +155,29 @@ class GitPollError(RuntimeError):
     """
 
 
+class NotAGitRepositoryError(GitPollError):
+    """No repository exists at or above the workspace, so the poll never can.
+
+    A subclass rather than a flag: a caller that only cares that the tick
+    observed nothing keeps catching ``GitPollError`` and is unaffected, while a
+    caller that wants to say something different about a permanent,
+    non-actionable condition can name it.
+
+    It changes nothing about how the tick is accounted — no tick is recorded and
+    the observed interval is closed, exactly as for any other failed poll. What
+    it changes is the log: this one is reported once at debug rather than as a
+    traceback per sweep tick, because repeating it buries the failures an
+    operator can actually act on.
+
+    Which is why it is earned from the FILESYSTEM and not from what git said.
+    A repository whose ``.git`` survives but whose ``HEAD``, ``objects`` or
+    ``refs`` does not exits 128 with the byte-identical "fatal: not a git
+    repository (or any of the parent directories): .git" — verified across all
+    three. That repository is broken, an operator can fix it, and quieting it
+    would hand out exactly the reassurance this instrument exists to earn.
+    """
+
+
 def _poll_env() -> dict[str, str]:
     """The environment the poll runs under.
 
@@ -128,10 +189,21 @@ def _poll_env() -> dict[str, str]:
     parses pathspec magic inside a path even after ``--``, so without this a
     registered name beginning with a colon can exclude or re-scope the whole
     poll, blinding detection for every other artifact in the same batch.
+
+    ``LC_ALL=C`` pins the language of git's own diagnostics, which this module
+    READS: "not a git repository" is the signature that separates a permanently
+    inert workspace from a poll worth a traceback, and git translates that
+    sentence under a localized locale (verified: an ``fr_FR.UTF-8`` operator
+    gets "ni ceci ni aucun de ses répertoires parents n'est un dépôt git").
+    Pinned per-invocation for the same reason ``status.relativePaths`` is —
+    an output shape this code parses must not be inherited from the ambient
+    environment. It is a message-catalog setting only: ``-z`` already suppresses
+    path quoting, so the porcelain bytes are unchanged.
     """
     env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECT_VARS}
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["LC_ALL"] = "C"
     return env
 
 
@@ -181,12 +253,116 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
         except FileNotFoundError as exc:
             raise GitPollError("git is not on PATH") from exc
         if result.returncode != 0:
-            raise GitPollError(
-                f"git status exited {result.returncode} in {root}: "
-                f"{result.stderr.decode('utf-8', 'replace').strip()[:200]}"
-            )
+            stderr = result.stderr.decode("utf-8", "replace").strip()
+            message = f"git status exited {result.returncode} in {root}: {stderr[:200]}"
+            # Two halves, and NEITHER is sufficient alone. 128 is git's generic
+            # fatal exit — a bad object, a corrupt index and a dubious-ownership
+            # refusal all land on it — so the sentence is what says this was a
+            # repository-discovery failure (`_poll_env` pins the language so the
+            # match holds under any locale). And the sentence is what git also
+            # says about a repository whose `.git` is present but gutted, so the
+            # filesystem is what says the repository is absent rather than
+            # broken. Quiet requires both; anything else keeps its traceback.
+            # The walk's own bound is a ceiling; what it actually gets is
+            # whatever is left of the budget that bounds this WHOLE poll, so a
+            # failed classification cannot push the tick past the sweep
+            # interval it shares with the coordinator's grant and session work.
+            walk_budget = min(_WALK_BUDGET_SEC, max(0.0, deadline - time.monotonic()))
+            if (
+                result.returncode == 128
+                and "not a git repository" in stderr.lower()
+                and _repository_is_absent(root, budget_sec=walk_budget)
+            ):
+                raise NotAGitRepositoryError(message)
+            raise GitPollError(message)
         dirty.update(_parse_porcelain_v2(result.stdout.decode("utf-8", "replace")))
     return dirty
+
+
+def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -> bool:
+    """Whether NO ``.git`` exists at ``root`` or at any directory above it.
+
+    The walk runs on a bounded daemon thread because its own calls cannot be
+    interrupted: ``os.lstat`` on a wedged network or FUSE mount never returns,
+    and this runs on the sweep thread, whose other four passes reclaim grants
+    and reap dead sessions. ``_disk_hash`` states the same rule for the read
+    path — a path replaced by a named pipe "fails instead of blocking this
+    thread forever" — and this is that rule on the classification path. A walk
+    that has not answered within the budget says present, like every ambiguity
+    in the walk itself, so a wedged mount stays loud instead of going quiet.
+
+    One walk at a time per process, for the same reason the bound exists: the
+    thread left behind by a wedged mount cannot be killed, so a fresh one per
+    tick would accumulate. A walk still in flight means the last one did not
+    answer, which is already the present/loud reading.
+    """
+    global _walk_in_flight
+
+    answer: list[bool] = []
+
+    def _answer() -> None:
+        # Guarded here and not only in the pass: an exception raised on this
+        # thread never reaches ``run_detection_pass``, it reaches
+        # ``threading.excepthook`` — which prints the per-tick traceback this
+        # pass exists to stop printing. An unanswered walk is already the loud
+        # reading, so the guard costs nothing but the noise.
+        try:
+            answer.append(_walk_for_repository(root))
+        except Exception:  # noqa: BLE001 — a thread's raise escapes the pass
+            logger.exception("detection: the repository walk failed")
+
+    walker = threading.Thread(target=_answer, name="coord-fwd-walk", daemon=True)
+    with _walk_lock:
+        if _walk_in_flight is not None and _walk_in_flight.is_alive():
+            return False
+        try:
+            walker.start()
+        except RuntimeError:
+            # The process cannot create a thread. Saying present keeps this
+            # loud, where raising would reintroduce the per-tick traceback.
+            return False
+        _walk_in_flight = walker
+    walker.join(budget_sec)
+    return answer[0] if answer else False
+
+
+def _walk_for_repository(root: Path) -> bool:
+    """The walk itself. Separated so the bound above has something to bound.
+
+    The half of the missing-repository signature that git cannot supply. Git's
+    message is identical for an absent repository and for a corrupt one, so the
+    quiet state is earned here or not at all.
+
+    The walk mirrors git's own discovery: ``-C <root>`` and upward, with the
+    ``GIT_*`` overrides already scrubbed from the poll environment, so the two
+    cannot disagree about which repository was being looked for.
+
+    Every asymmetry runs toward the loud answer, because a wrong "absent" is the
+    expensive one — it is the reading that turns a broken repository into a
+    clean-looking silence:
+
+    * ``lstat``, not ``exists`` — a dangling ``.git`` symlink is a BROKEN
+      repository, not an absent one, and must keep its traceback.
+    * ``lstat``, not ``os.path.lexists`` — that helper folds a stat ERROR into
+      the same ``False`` it gives a missing file, so an unsearchable parent
+      directory would read as "no repository here" and be quieted. Only
+      ``FileNotFoundError`` keeps the walk going; anything else says present.
+    * a root that cannot even be resolved says present, for the same reason.
+    """
+    # Intentionally no I/O bound here — the caller owns it.
+    try:
+        resolved = root.resolve()
+    except OSError:
+        return False
+    for directory in (resolved, *resolved.parents):
+        try:
+            os.lstat(directory / ".git")
+        except FileNotFoundError:
+            continue  # this level has none; git looks higher, so do we
+        except OSError:
+            return False  # cannot tell — stay loud
+        return False  # something is there, even a dangling symlink
+    return True
 
 
 def _batched_pathspecs(names: list[str]) -> Iterable[list[str]]:
@@ -376,6 +552,7 @@ def run_detection_pass(
     window_sec: float,
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
+    reported_faults: set[str],
 ) -> int:
     """Run one detection tick. Returns the number of observations counted.
 
@@ -386,6 +563,13 @@ def run_detection_pass(
     ``stat_cache`` is the caller's, held across ticks for one coordinator. It
     holds no coordination state and no safety comparand — only which files are
     worth re-reading, and what each was last called.
+
+    ``reported_faults`` is the caller's too, and holds strictly less: which
+    permanent, non-actionable conditions have already been reported for this
+    coordinator, so a workspace that can never be polled says so once instead of
+    once per tick. Nothing reads it but the log, and a completed poll clears it
+    — the latch tracks the condition, so a workspace that later becomes a
+    repository and then is not one again reports the second time too.
     """
     try:
         return _detect(
@@ -394,18 +578,39 @@ def run_detection_pass(
             window_sec=window_sec,
             poll_budget_sec=poll_budget_sec,
             stat_cache=stat_cache,
+            reported_faults=reported_faults,
         )
+    except NotAGitRepositoryError as exc:
+        # Not an error to hand an operator every five seconds: the instrument is
+        # inert here and no reading of the log changes that. Reported without a
+        # traceback, because the stack says nothing the sentence does not, and
+        # a per-tick traceback buries the failures that ARE actionable — the
+        # demo whose temp workspace surfaced this printed one per tick over its
+        # own stdout. The accounting below is identical to any other failure.
+        if _FAULT_NOT_A_REPOSITORY not in reported_faults:
+            reported_faults.add(_FAULT_NOT_A_REPOSITORY)
+            logger.debug("foreign-write detection is inert: %s", exc)
+        _close_observed_interval(coordinator)
+        return 0
     except Exception as exc:  # noqa: BLE001 — an instrument may never break the sweep
         logger.exception("foreign-write detection tick failed: %s", exc)
-        # The run's observed interval ends here. Without this a later successful
-        # tick would extend the same interval across the outage, and a coverage
-        # question answered from that interval would claim a span nothing
-        # watched. The next success opens a new interval and the hole shows.
-        try:
-            coordinator.registry.close_detection_run()
-        except Exception:  # noqa: BLE001 — best effort; never mask the original
-            logger.exception("detection: could not close the observed run interval")
+        _close_observed_interval(coordinator)
         return 0
+
+
+def _close_observed_interval(coordinator: DetectionTarget) -> None:
+    """End the run's observed interval after a failed tick.
+
+    Without this a later successful tick would extend the same interval across
+    the outage, and a coverage question answered from that interval would claim
+    a span nothing watched. The next success opens a new interval and the hole
+    shows. Every failed tick closes it, including the inert-workspace one: what
+    that case quiets is the log, never the report.
+    """
+    try:
+        coordinator.registry.close_detection_run()
+    except Exception:  # noqa: BLE001 — best effort; never mask the original
+        logger.exception("detection: could not close the observed run interval")
 
 
 def _detect(
@@ -415,6 +620,7 @@ def _detect(
     window_sec: float,
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
+    reported_faults: set[str],
 ) -> int:
     # Bind both to locals for the whole tick. `/policy/track` swaps the policy
     # object atomically while the coordinator runs, and registration is
@@ -441,6 +647,11 @@ def _detect(
         return 0
 
     dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
+    # The poll completed, so whatever this workspace was when the latch was set,
+    # it is pollable now: re-arm, and a workspace that stops being a repository
+    # again is reported the second time too. Only a completed poll clears it —
+    # the early returns above observed nothing about the condition.
+    reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
     counted = 0
     for name in sorted(dirty & set(covered)):
         try:

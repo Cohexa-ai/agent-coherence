@@ -1501,10 +1501,11 @@ plainly:**
 - **Zero is only zero when the detector actually ran.** A store it never ran
   against reports `not-instrumented`, which is a different answer from
   `instrumented-zero`. Turning the sweep off, reading a store from a coordinator
-  that never started one, or running where nothing is in scope all give you the
-  first — never a clean bill of health you did not earn. Each run also records
-  how many files were in scope, because watching five hundred and finding
-  nothing is a different result from watching none.
+  that never started one, running where nothing is in scope, or running in a
+  workspace that is not a git repository all give you the first — never a clean
+  bill of health you did not earn. Each run also records how many files were in
+  scope, because watching five hundred and finding nothing is a different result
+  from watching none.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
@@ -1517,7 +1518,12 @@ plainly:**
   outside it. They are not reported as clean; they are not reported at all.
 - **A broken check is never a quiet month.** If git cannot run, the check is not
   recorded as having happened, so the gap is visible in the report rather than
-  reading as no news.
+  reading as no news. A workspace with no repository at all is the one such
+  condition nothing can fix, so it is logged once at debug level instead of once
+  per sweep; the report is unaffected and still shows the gap. A repository that
+  exists but is broken is not that case — git describes the two identically, so
+  this is decided by looking for the repository, not by reading the message —
+  and it stays loud.
 - **`covers(start, end)` answers coverage, not the totals.** A coordinator that
   was down for the middle of a period still shows a healthy count of checks. Ask
   `covers` whether the period you care about was actually watched end to end.
