@@ -158,8 +158,10 @@ re-drives pins idempotently (only ``unpinned`` members are attempted).
   skips file pin legs entirely (nothing above ``restorable-unpinned`` was
   ever claimed, so nothing needs backing).
 - **Forward-only / absent / unconfirmed members** — never pinned, untouched.
-- **Release is INTERNAL-ONLY** (``_release_checkpoint_pins``): there is no
-  public checkpoint-delete/release verb in v1. Refcount-aware across
+- **Release is PUBLIC at the checkpoint level** (:meth:`WorkspaceVersioner.
+  release_checkpoint`, over the ``_release_checkpoint_pins`` engine); there is
+  still no checkpoint-DELETE verb, and no CLI/HTTP route for either half.
+  Refcount-aware across
   checkpoints: before dropping an S3 legal hold the release scans every OTHER
   checkpoint's members for another ``held`` pin of the same ``(member_path,
   native_token)`` — a shared hold survives until the LAST holder releases.
@@ -1255,11 +1257,13 @@ class WorkspaceVersioner:
     def _release_checkpoint_pins(
         self, checkpoint_id: str
     ) -> "tuple[CheckpointMember, ...]":
-        """INTERNAL-ONLY: release every pin this checkpoint holds (idempotent).
+        """Release every pin this checkpoint holds (idempotent).
 
-        Deliberately underscore-private with NO public CLI/API verb (v1 scope:
-        the GC drop-half is v2 — this method exists so the pin lifecycle is
-        complete and testable, not as an operator surface).
+        The engine behind the public :meth:`release_checkpoint`, which adds
+        the blank/non-string id guard and the caller-facing docstring. Still
+        underscore-private and still with NO CLI or HTTP route (the bindings
+        carry credentials); checkpoint DELETION remains absent, and the GC
+        drop-half is v2.
 
         Per ``held`` member, in the fail-closed order: (1) record
         ``pin_state="released"`` — downgrading a ``restorable`` tier to

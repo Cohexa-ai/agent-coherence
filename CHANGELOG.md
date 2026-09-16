@@ -8,6 +8,20 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **Checkpoint pins can now be released through the Python API.**
+  A workspace checkpoint over S3 object members places a legal hold on each
+  captured version. Those holds outlive lifecycle expiry, version-targeted
+  delete and coordinator teardown, and until now no public verb dropped them,
+  so a bucket accumulated un-expirable versions.
+  `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins one
+  checkpoint holds, keeping a hold that another checkpoint in the same
+  registry still relies on — that cross-checkpoint scan is what it offers over
+  dropping holds by hand. The checkpoint manifest survives; this is not a
+  delete. Release is one-way, and S3 members must be re-declared on the
+  releasing versioner through the same binding and key that placed the hold.
+  Python only, with no HTTP route and no CLI verb, because the substrate
+  bindings carry your credentials.
+
 - **Foreign-write detection — the window between the guards is now observable.**
   The coordinator sees writes routed through it; an editor, a script, or a
   second tool writing a shared file directly is invisible to it until the next
