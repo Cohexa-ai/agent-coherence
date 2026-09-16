@@ -31,7 +31,12 @@ Alpha — APIs may change before `v1.0`.
   records how many files were in scope so watching none is distinguishable from
   watching many and finding nothing. **A failed check is not recorded as a
   check**, and it ends that run's observed period, so a broken poll shows up as
-  a gap rather than being interpolated across. **A suppression expires**: a
+  a gap rather than being interpolated across — and **a workspace that has no
+  repository to poll says so once** rather than printing a traceback every
+  sweep, while a repository that exists but is broken keeps its traceback,
+  because git describes the two identically and only looking for the repository
+  tells them apart. Both still record no check and still leave the gap visible:
+  what differs is the log, never the report. **A suppression expires**: a
   mismatch excused as a write still landing is re-examined once the window
   passes, and becomes a foreign write if none ever landed. And `covers()`
   answers whether a given period was watched end to end, which a total number of

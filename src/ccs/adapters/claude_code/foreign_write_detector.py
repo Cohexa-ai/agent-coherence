@@ -57,6 +57,21 @@ the parent directories): .git" and the same exit 128 it gives an absent one.
 Classifying on that sentence alone would quiet a corrupt repository, which is
 both actionable and precisely the false reassurance this pass exists to refuse.
 
+**What the quiet state cannot tell apart, and why no cheap memory fixes it.** A
+workspace whose filesystem drops back to an empty directory satisfies all three
+terms: git exits 128 with the sentence, and the walk genuinely finds no
+``.git``. That outage can be transient and actionable, and it is quieted as if
+permanent. The obvious discriminator — "this root completed a poll once, so a
+repository existed" — already exists in ``detection_runs`` and does NOT work
+here: the store IS ``<coordinator_root>/.coherence/state.db``, so the outage
+that hides the repository hides the memory with it. Measured on a real second
+filesystem: a forced unmount under a running coordinator kills the process at
+the registry read that PRECEDES the poll, a graceful one is refused while the
+store is open, and a coordinator that starts during the outage opens a fresh
+store whose ``detection_runs()`` is empty. What is lost is the log line only.
+Every branch here records no tick and closes the observed interval, so the
+offline report still shows the hole.
+
 **It asks git for literal paths.** A stored artifact name is data, and git reads
 pathspec magic in a path even after ``--``. A name beginning with a colon would
 otherwise re-scope or silently exclude the rest of the poll.
@@ -199,6 +214,12 @@ def _poll_env() -> dict[str, str]:
     an output shape this code parses must not be inherited from the ambient
     environment. It is a message-catalog setting only: ``-z`` already suppresses
     path quoting, so the porcelain bytes are unchanged.
+
+    The literal ``C`` is load-bearing. ``POSIX``, which reads as a synonym, does
+    NOT suppress ``LANGUAGE`` — gettext special-cases only ``C``/``C.UTF-8`` —
+    and on macOS an unset locale is not the C locale either, because libintl
+    falls back to CoreFoundation's preferred languages. Setting no locale is
+    therefore not equivalent to setting this one.
     """
     env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECT_VARS}
     env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -333,9 +354,23 @@ def _walk_for_repository(root: Path) -> bool:
     message is identical for an absent repository and for a corrupt one, so the
     quiet state is earned here or not at all.
 
-    The walk mirrors git's own discovery: ``-C <root>`` and upward, with the
-    ``GIT_*`` overrides already scrubbed from the poll environment, so the two
-    cannot disagree about which repository was being looked for.
+    It walks ``-C <root>`` and upward, like git — but it does NOT mirror git,
+    and the difference is deliberate. Git stops at a filesystem boundary unless
+    ``GIT_DISCOVERY_ACROSS_FILESYSTEM`` is set; this walk crosses. So a
+    workspace on its own mount under a repository keeps its per-tick traceback,
+    which is only noise.
+
+    Do not "fix" that by stopping when ``st_dev`` changes. Measured on a real
+    second filesystem: a GUTTED repository across a mount boundary produces the
+    byte-identical "fatal: not a git repository (or any of the parent
+    directories): .git", with no boundary line to tell it apart — so a walk
+    that stopped at the boundary would answer absent and quiet a BROKEN
+    repository, which is the one reading the third term exists to refuse.
+    Crossing is what keeps that case loud. Doing it safely would additionally
+    mean reimplementing git's boolean grammar for that variable and stat-ing a
+    second time per level, every failure of which would have to resolve loud —
+    new branches on the one path whose whole job is refusing a false quiet,
+    bought with log lines.
 
     Every asymmetry runs toward the loud answer, because a wrong "absent" is the
     expensive one — it is the reading that turns a broken repository into a
@@ -644,6 +679,17 @@ def _detect(
         # clean zero — that is the reading this instrument exists to prevent,
         # and it is reachable whenever the tracked patterns match no registered,
         # git-tracked artifact.
+        #
+        # And the interval closes, exactly as it does on a failed poll. Not
+        # recording the tick is only half of it: the run row this window sits
+        # inside is read as CONTINUOUSLY observed, so leaving it open lets the
+        # next successful tick extend the same interval across the window and
+        # `covers()` answer True for a span nothing was polled in. That is the
+        # false clean the whole three-state report exists to refuse, and it
+        # needs no corruption, no mount and no locale to reach — `/policy/track`
+        # swaps the tracked set while the coordinator runs, and the shipped
+        # untrack command is one way an operator empties it.
+        _close_observed_interval(coordinator)
         return 0
 
     dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
