@@ -64,6 +64,13 @@ PINS: tuple[Pin, ...] = (
         doc_phrase="must declare the same `managed` globs",
     ),
     Pin(
+        name="release: idempotence covers repeat calls, not concurrent ones",
+        source="src/ccs/adapters/workspace.py",
+        source_marker="Idempotent means REPEAT calls, not concurrent ones",
+        doc="docs/guide.md",
+        doc_phrase="two processes releasing one checkpoint both decrement its pin refcount",
+    ),
+    Pin(
         name="volume: the same requirement on the project's front page",
         source="src/ccs/adapters/coherent_volume.py",
         source_marker="Fleet requirement (hard, v1)",
