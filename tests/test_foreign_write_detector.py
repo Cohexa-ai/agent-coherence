@@ -442,6 +442,28 @@ def test_a_corrupt_repository_is_never_mistaken_for_an_absent_one(
     assert not isinstance(caught.value, NotAGitRepositoryError)
 
 
+def test_a_workspace_that_vanished_is_broken_rather_than_absent(
+    tmp_path: Path
+) -> None:
+    """The other half of the guard, forced by the case that reaches it.
+
+    A coordinator root deleted or unmounted under a running coordinator has no
+    ``.git`` anywhere above it, so the filesystem walk alone would call it
+    absent and quiet it forever. Git exits 128 there too, but says "cannot
+    change to" rather than "not a git repository" — and that sentence is the
+    only thing standing between a vanished workspace and a permanent silence.
+    """
+    from ccs.adapters.claude_code.foreign_write_detector import _repository_is_absent
+
+    gone = tmp_path / "gone"  # never created
+    assert _repository_is_absent(gone) is True  # the walk says absent ...
+
+    with pytest.raises(GitPollError) as caught:
+        _git_dirty_paths(gone, ["notes.md"], budget_sec=POLL_BUDGET)
+    assert not isinstance(caught.value, NotAGitRepositoryError)  # ... git does not
+    assert "not a git repository" not in str(caught.value).lower()
+
+
 def test_a_dangling_git_symlink_is_broken_rather_than_absent(
     tmp_path: Path
 ) -> None:
@@ -496,6 +518,134 @@ def test_a_walk_that_cannot_answer_says_present_rather_than_absent(
 
     monkeypatch.setattr(os_module, "lstat", _refuse)
     assert _repository_is_absent(workspace) is False
+
+
+def test_a_walk_that_never_answers_cannot_hold_the_sweep_thread(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The walk runs on the sweep thread, whose other four passes reclaim
+    grants and reap dead sessions. ``os.lstat`` on a wedged network or FUSE
+    mount never returns and cannot be interrupted, so an unbounded walk would
+    stall the coordinator's safety work for as long as the mount stays wedged.
+
+    ``_disk_hash`` states the same rule for the read path — a path replaced by
+    a named pipe "fails instead of blocking this thread forever" — and this is
+    that rule on the classification path. An unanswered walk says present, like
+    every other ambiguity here.
+    """
+    import threading
+    import time
+
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    # Released in the finally: only one walk may be in flight per process, so a
+    # test that left its own wedged walker running would hold that slot and
+    # quietly turn every later test's workspace loud.
+    release = threading.Event()
+
+    def _never_answers(_root):
+        release.wait(30)
+        return True  # would quiet the workspace, if it were ever reached
+
+    monkeypatch.setattr(detector, "_walk_for_repository", _never_answers)
+
+    started = time.monotonic()
+    try:
+        answer = detector._repository_is_absent(tmp_path, budget_sec=0.2)
+    finally:
+        release.set()
+    elapsed = time.monotonic() - started
+
+    assert answer is False  # unanswered means present, which stays loud
+    # Tight enough that the budget is the thing being honoured: a hard-coded
+    # wait substituted for `budget_sec` has to fail here, not sail through on
+    # a margin wide enough to hide it.
+    assert elapsed < 1.0
+
+
+def test_a_wedged_walk_is_never_started_twice_over(tmp_path: Path, monkeypatch) -> None:
+    """The thread a wedged mount leaves behind cannot be killed, so one per
+    sweep tick would accumulate until the process could create none at all —
+    a worse failure than the stall the bound exists to prevent.
+
+    While a walk is still out, its answer is already present/loud, so the
+    second caller needs no thread of its own.
+    """
+    import threading
+    import time
+
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    release = threading.Event()
+    monkeypatch.setattr(
+        detector, "_walk_for_repository", lambda _root: release.wait(30) or True
+    )
+
+    def _live_walkers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "coord-fwd-walk")
+
+    def _settle_walkers() -> None:
+        """Wait out any walker a neighbouring test released a moment ago, so
+        this test counts its own threads and not the previous one's."""
+        for _ in range(100):
+            if _live_walkers() == 0:
+                return
+            time.sleep(0.01)
+
+    _settle_walkers()
+    before = _live_walkers()
+    try:
+        for _ in range(5):  # five ticks against a filesystem that never answers
+            assert detector._repository_is_absent(tmp_path, budget_sec=0.05) is False
+        assert _live_walkers() - before == 1
+    finally:
+        release.set()
+        time.sleep(0.1)  # let the one walker retire so it leaks nothing
+
+
+def test_a_process_that_cannot_spawn_a_walker_says_present(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Thread exhaustion is exactly when this must not raise. A raise here
+    reaches the pass as an unexpected failure and prints the per-tick traceback
+    the change exists to stop printing, so the unstartable walk takes the same
+    loud-but-quiet-logged answer every other ambiguity takes."""
+    import threading
+
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    def _refuse(_self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", _refuse)
+
+    assert detector._repository_is_absent(tmp_path, budget_sec=0.2) is False
+
+
+def test_the_walk_is_bounded_by_what_is_left_of_the_poll_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``budget_sec`` is documented to bound the WHOLE poll. A walk spent on
+    top of it would push the tick past the sweep interval this pass shares with
+    grant reclamation and session liveness, so the walk gets the remainder —
+    never its own ceiling on top."""
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    seen: list[float] = []
+
+    def _capture(root, *, budget_sec):
+        seen.append(budget_sec)
+        return True
+
+    monkeypatch.setattr(detector, "_repository_is_absent", _capture)
+
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    with pytest.raises(NotAGitRepositoryError):
+        _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=0.5)
+
+    assert seen and seen[0] <= 0.5
+    assert seen[0] < detector._WALK_BUDGET_SEC  # the ceiling did not win
 
 
 def test_a_root_that_will_not_resolve_says_present(tmp_path: Path, monkeypatch) -> None:
@@ -699,7 +849,12 @@ def test_a_failed_tick_closes_the_observed_interval(coordinator, repo: Path) -> 
     """Coverage must not interpolate across an outage.
 
     Without closing the interval, a run that ticked, went blind, then ticked
-    again would answer a coverage question for the whole blind period."""
+    again would answer a coverage question for the whole blind period.
+
+    This one goes blind by losing its repository, so it rides the quiet branch;
+    its sibling below rides the loud one. Both branches close the interval, and
+    each needs its own test — typing one failure apart moved this test onto the
+    new branch and left the old one covered by nothing."""
     import shutil
 
     from ccs.diagnose.foreign_writes import read_foreign_write_report
@@ -722,6 +877,41 @@ def test_a_failed_tick_closes_the_observed_interval(coordinator, repo: Path) -> 
     assert len(report.runs) == 2
     assert report.covers(100.0, 100.0) is True
     assert report.covers(300.0, 300.0) is True
+    assert report.covers(100.0, 300.0) is False
+
+
+def test_an_ordinary_failed_tick_closes_the_observed_interval_too(
+    coordinator, repo: Path, monkeypatch
+) -> None:
+    """The same coverage guarantee on the branch that keeps its traceback.
+
+    A corrupt index or a dubious-ownership refusal blinds the instrument just
+    as completely as a missing repository, and interpolating a clean span
+    across THAT outage is the reading the three-state report exists to refuse.
+    Driven through the generic branch by a plain ``GitPollError``, because the
+    quiet branch is what a removed ``.git`` now reaches."""
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+    from ccs.diagnose.foreign_writes import read_foreign_write_report
+
+    _register(coordinator, "notes.md", "v1\n")
+    cache: dict = {}
+    _tick(coordinator, now_unix=100.0, cache=cache)
+
+    real = detector._git_dirty_paths  # noqa: SLF001 — the pass under test
+
+    def _boom(*_args, **_kwargs):
+        raise GitPollError("git status exited 128 in X: fatal: bad object HEAD")
+
+    monkeypatch.setattr(detector, "_git_dirty_paths", _boom)
+    _tick(coordinator, now_unix=200.0, cache=cache)  # poll fails, loudly
+    monkeypatch.setattr(detector, "_git_dirty_paths", real)
+    _tick(coordinator, now_unix=300.0, cache=cache)
+
+    db = Path(coordinator.registry._db_path)  # noqa: SLF001 — the store under test
+    coordinator.registry.close()
+    report = read_foreign_write_report(db)
+
+    assert len(report.runs) == 2
     assert report.covers(100.0, 300.0) is False
 
 

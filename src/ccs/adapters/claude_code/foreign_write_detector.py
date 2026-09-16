@@ -69,6 +69,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -110,6 +111,23 @@ _GIT_REDIRECT_VARS = (
 # The one poll fault reported once rather than per tick. A key rather than a
 # bare bool so the caller holds one latch whatever else later joins it.
 _FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
+
+# The CEILING on how long the repository walk may take. A handful of `lstat`
+# calls is microseconds whenever the filesystem answers at all; the bound is for
+# the case where it never does. It is a cap and not the operand — the caller
+# passes whatever is left of the poll's own budget, because that budget is
+# documented to bound the WHOLE poll, and a walk spent on top of it would
+# overrun the sweep interval this pass shares with grant reclamation.
+_WALK_BUDGET_SEC = 2.0
+
+# At most one walk may be outstanding per process. A walk that never returns
+# leaves an unkillable thread behind — `os.lstat` on a wedged mount cannot be
+# interrupted — so starting a fresh one per sweep tick would accumulate threads
+# until the process could create none at all. That is a worse failure than the
+# one the bound exists to prevent. While a walk is still out, the answer is
+# already "present", so a second one would buy nothing.
+_walk_lock = threading.Lock()
+_walk_in_flight: threading.Thread | None = None
 
 # An outstanding write grant is the registry's own evidence that a mediated
 # write is in flight, which the timestamp alone cannot supply — see _classify.
@@ -245,10 +263,15 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
             # says about a repository whose `.git` is present but gutted, so the
             # filesystem is what says the repository is absent rather than
             # broken. Quiet requires both; anything else keeps its traceback.
+            # The walk's own bound is a ceiling; what it actually gets is
+            # whatever is left of the budget that bounds this WHOLE poll, so a
+            # failed classification cannot push the tick past the sweep
+            # interval it shares with the coordinator's grant and session work.
+            walk_budget = min(_WALK_BUDGET_SEC, max(0.0, deadline - time.monotonic()))
             if (
                 result.returncode == 128
                 and "not a git repository" in stderr.lower()
-                and _repository_is_absent(root)
+                and _repository_is_absent(root, budget_sec=walk_budget)
             ):
                 raise NotAGitRepositoryError(message)
             raise GitPollError(message)
@@ -256,8 +279,55 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
     return dirty
 
 
-def _repository_is_absent(root: Path) -> bool:
+def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -> bool:
     """Whether NO ``.git`` exists at ``root`` or at any directory above it.
+
+    The walk runs on a bounded daemon thread because its own calls cannot be
+    interrupted: ``os.lstat`` on a wedged network or FUSE mount never returns,
+    and this runs on the sweep thread, whose other four passes reclaim grants
+    and reap dead sessions. ``_disk_hash`` states the same rule for the read
+    path — a path replaced by a named pipe "fails instead of blocking this
+    thread forever" — and this is that rule on the classification path. A walk
+    that has not answered within the budget says present, like every ambiguity
+    in the walk itself, so a wedged mount stays loud instead of going quiet.
+
+    One walk at a time per process, for the same reason the bound exists: the
+    thread left behind by a wedged mount cannot be killed, so a fresh one per
+    tick would accumulate. A walk still in flight means the last one did not
+    answer, which is already the present/loud reading.
+    """
+    global _walk_in_flight
+
+    answer: list[bool] = []
+
+    def _answer() -> None:
+        # Guarded here and not only in the pass: an exception raised on this
+        # thread never reaches ``run_detection_pass``, it reaches
+        # ``threading.excepthook`` — which prints the per-tick traceback this
+        # pass exists to stop printing. An unanswered walk is already the loud
+        # reading, so the guard costs nothing but the noise.
+        try:
+            answer.append(_walk_for_repository(root))
+        except Exception:  # noqa: BLE001 — a thread's raise escapes the pass
+            logger.exception("detection: the repository walk failed")
+
+    walker = threading.Thread(target=_answer, name="coord-fwd-walk", daemon=True)
+    with _walk_lock:
+        if _walk_in_flight is not None and _walk_in_flight.is_alive():
+            return False
+        try:
+            walker.start()
+        except RuntimeError:
+            # The process cannot create a thread. Saying present keeps this
+            # loud, where raising would reintroduce the per-tick traceback.
+            return False
+        _walk_in_flight = walker
+    walker.join(budget_sec)
+    return answer[0] if answer else False
+
+
+def _walk_for_repository(root: Path) -> bool:
+    """The walk itself. Separated so the bound above has something to bound.
 
     The half of the missing-repository signature that git cannot supply. Git's
     message is identical for an absent repository and for a corrupt one, so the
@@ -279,6 +349,7 @@ def _repository_is_absent(root: Path) -> bool:
       ``FileNotFoundError`` keeps the walk going; anything else says present.
     * a root that cannot even be resolved says present, for the same reason.
     """
+    # Intentionally no I/O bound here — the caller owns it.
     try:
         resolved = root.resolve()
     except OSError:
