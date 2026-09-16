@@ -27,6 +27,8 @@ Protocol edit cannot move the goalposts this test guards (the same discipline
 
 from __future__ import annotations
 
+import re
+
 from ccs.coordinator.backend_contract import (
     MEMBER_CLASSIFICATION,
     R9_ATOMIC_BOUNDARY,
@@ -295,6 +297,91 @@ def test_module_states_the_never_own_the_store_non_goal() -> None:
     assert mod.__doc__ is not None
     doc = mod.__doc__.lower()
     assert "never" in doc and "store we ship" in doc
+
+
+# A surface size written as prose. The hyphenated form is the idiom both files
+# use for "a surface of N members"; the spaced form also appears for a group
+# that is NOT the surface ("the WV Unit-2 checkpoint surface - 8 members"), so
+# the two are matched separately rather than with one looser pattern.
+_HYPHENATED_CLAIM = re.compile(r"(\d+)-member\b")
+_SPACED_CLAIM = re.compile(r"(\d+) members\b")
+# The breakdown that explains a total: "(45 methods + 1 property)", "(+13
+# methods)". These are what a reader consults to learn which Protocol owns what.
+_BREAKDOWN = re.compile(r"(\d+) (?:methods|method|properties|property)\b")
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_every_member_count_written_in_prose_matches_the_frozen_sets() -> None:
+    """Prose counts drift because nothing reads them. This reads all of them.
+
+    The surface size has one source of truth, the frozen name sets above, and
+    it is restated in prose in both files. Nothing checked any of those
+    restatements, so a wrong one was invisible to the suite and to the linter
+    -- which is how the surface sentence came to claim the all-three-Protocol
+    total for a two-Protocol surface until a human noticed (PR #204).
+
+    Deliberately a SWEEP rather than one assertion per known sentence. The
+    first draft of this guard was per-sentence, and it silently missed a third
+    restatement and all four breakdown figures; a restatement added tomorrow would
+    have been missed the same way. Matching every occurrence means a new one is
+    covered by construction, and the ordered comparison below means an added or
+    deleted restatement fails here rather than passing unnoticed.
+
+    Two counts are in play and they are not interchangeable, which is the trap
+    that turned a stale figure into a wrong one:
+
+    * the SURFACE is ``RegistryBase`` + ``SqliteExtended``, because the
+      detection members deliberately sit on their own ``ForeignWriteDetection``;
+    * the CLASSIFICATION covers all three.
+
+    Reword past these patterns and this fails rather than quietly ceasing to
+    guard -- an unexpected match list is the failure being prevented, so make
+    the update on purpose.
+    """
+    import ccs.coordinator.backend_contract as mod
+
+    surface = len(BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES)
+    everything = len(EXPECTED_MEMBERS)
+
+    assert mod.__file__ is not None
+    module_src = _read(mod.__file__)
+
+    # Ordered, exhaustive: an added or removed restatement changes the list.
+    assert [int(n) for n in _HYPHENATED_CLAIM.findall(module_src)] == [
+        surface,  # the module docstring's SURFACE sentence
+        everything,  # MEMBER_CLASSIFICATION's own docstring
+    ], "a hyphenated member count in backend_contract.py is wrong or unaccounted for"
+    assert [int(n) for n in _SPACED_CLAIM.findall(module_src)] == [
+        everything  # the classification comment's total
+    ], "a spaced member count in backend_contract.py is wrong or unaccounted for"
+
+    # The breakdown that must sum to that total. Guarding only the total lets a
+    # member move between Protocols without anything noticing: the sum is
+    # unchanged and the explanation is now wrong.
+    assert [int(n) for n in _BREAKDOWN.findall(module_src)] == [
+        len(BASE_METHODS),
+        len(BASE_PROPERTIES),
+        len(EXTENDED_ONLY_METHODS),
+        len(DETECTION_METHODS),
+    ], "the per-Protocol breakdown in backend_contract.py no longer sums as written"
+
+
+def test_this_suites_own_prose_states_the_real_member_count() -> None:
+    """The guard above reads the module; this file restates the count too.
+
+    Three times, in its header, above the frozen set, and in a test docstring --
+    and the file that pins the size is the last place a reader expects to find
+    a stale one. Unordered, because every hyphenated claim here means the same
+    whole surface, so a new correct mention is not a failure.
+    """
+    claims = {int(n) for n in _HYPHENATED_CLAIM.findall(_read(__file__))}
+    assert claims == {len(EXPECTED_MEMBERS)}, (
+        f"this file's own prose claims {sorted(claims)} members"
+    )
 
 
 def test_module_imports_no_networked_code() -> None:
