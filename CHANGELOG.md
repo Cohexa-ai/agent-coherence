@@ -52,6 +52,13 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
+  `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
+  warn-mode renderers sliced it to eight characters unconditionally, so a
+  post-restart collision reached the model as "another session (`<unknown`) has
+  been editing …". The guard is now one shared helper
+  (`hook_payloads.short_session_id`) used by all three renderers.
+
 - **The HTML report templates now ship in the distribution.** `ccs-compare`
   and `ccs-diagnose` read their templates off the filesystem beside the
   module (`Path(__file__).with_name("templates")`), but `pyproject.toml`

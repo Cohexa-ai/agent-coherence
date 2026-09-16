@@ -4545,3 +4545,82 @@ def test_deferred_reground_preset_abort_does_not_consume_flag(
     assert status == 200
     assert _reground_text_of(body) == armed_text
     assert coordinator.has_compact_pending(sid) is False
+
+
+# ======================================================================
+# Unknown-holder sentinel: the warn-mode renderers must not slice it
+# ======================================================================
+#
+# ``emit_strict_deny`` already preserves a ``<...>`` placeholder verbatim
+# (a bare ``[:8]`` yields the malformed ``<unknown``). The two warn-mode
+# renderers sliced unconditionally, so a post-restart collision — where
+# the adapter has no name for the surviving holder — reached the model as
+# "another session (<unknown) has been editing …".
+
+
+def test_warn_renderers_preserve_unknown_sentinel_verbatim() -> None:
+    """A ``<...>`` placeholder is prose, not an id: it renders whole in all
+    THREE renderers. Slicing it to 8 chars drops the closing bracket."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    collision = hp.edit_collision_warning(
+        holder_session_id="<unknown>",
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(<unknown>)" in collision
+    assert "(<unknown)" not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "session <unknown> at" in stale
+    assert "session <unknown at" not in stale
+
+    # The guarded renderer is the reference behavior, not a third variant.
+    deny = hp.emit_strict_deny(source="test", summary={
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "<unknown>" in deny["permissionDecisionReason"]
+
+
+def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
+    """The sentinel guard is keyed on the ``<...>`` shape, so a real UUID
+    session id keeps its short form in both warn renderers."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = "f2f7eab3-1111-4111-8111-111111111111"
+    collision = hp.edit_collision_warning(
+        holder_session_id=sid,
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(f2f7eab3)" in collision
+    assert sid not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": sid,
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "session f2f7eab3 at" in stale
+    assert sid not in stale

@@ -116,6 +116,22 @@ def emit_allow(
     return out
 
 
+def short_session_id(session_id: str) -> str:
+    """The 8-char short form of a session id, EXCEPT for a ``<...>`` sentinel.
+
+    A placeholder like ``"<unknown>"`` is prose, not an identifier: slicing it
+    to 8 chars drops the closing angle bracket and ships malformed text
+    ("<unknown"). Real session ids are 36-char UUIDs, so an 8-char prefix is
+    unambiguous whenever one is present. Every renderer that shortens a
+    session id for prose goes through here — the guard used to live in
+    :func:`emit_strict_deny` alone, and the two warn-mode renderers sliced
+    the sentinel.
+    """
+    if session_id.startswith("<") and session_id.endswith(">"):
+        return session_id
+    return session_id[:8]
+
+
 def emit_strict_deny(
     *,
     source: str,
@@ -130,14 +146,7 @@ def emit_strict_deny(
     (Unit 4 audit-log append) and parameter-list parity with :func:`emit_allow`.
     """
     last_writer_full = summary.get("last_writer_session_id") or "<unknown>"
-    # Preserve placeholder values like "<unknown>" verbatim — slicing to 8
-    # would lose the closing angle bracket and produce malformed prose
-    # ("<unknown" instead of "<unknown>"). Real UUIDv4 session ids are 36
-    # chars, so the 8-char short form is unambiguous when present.
-    if last_writer_full.startswith("<") and last_writer_full.endswith(">"):
-        last_writer_short = last_writer_full
-    else:
-        last_writer_short = last_writer_full[:8]
+    last_writer_short = short_session_id(last_writer_full)
     last_writer_ts_iso = datetime.fromtimestamp(
         summary["last_writer_at_unix_ts"], tz=timezone.utc
     ).isoformat()
@@ -337,7 +346,7 @@ def stale_read_warning(summary: StaleSummary) -> str:
 
     Constraint: no content bytes, no content hashes, no diff text.
     """
-    last_writer_short = summary["last_writer_session_id"][:8]
+    last_writer_short = short_session_id(summary["last_writer_session_id"])
     last_writer_ts = datetime.fromtimestamp(
         summary["last_writer_at_unix_ts"], tz=timezone.utc
     ).isoformat()
@@ -384,7 +393,7 @@ def edit_collision_warning(
     + the unique current time at message-build time all change between
     invocations. Future v0.2 strict mode can flip allow → deny safely.
     """
-    holder_short = holder_session_id[:8]
+    holder_short = short_session_id(holder_session_id)
     holder_ts = datetime.fromtimestamp(
         holder_acquired_at_unix_ts, tz=timezone.utc
     ).isoformat()
