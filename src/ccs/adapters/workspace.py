@@ -876,6 +876,57 @@ class WorkspaceVersioner:
             self._pin_members(store, checkpoint_id)
             return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
 
+    def release_checkpoint(self, checkpoint_id: str) -> "tuple[CheckpointMember, ...]":
+        """Release the pins this checkpoint holds — ONE-WAY (idempotent).
+
+        Every hold this checkpoint placed, and that no other checkpoint in
+        this registry still relies on, is DROPPED; every ``held`` row (an S3
+        legal hold and a file member's verification pin alike) becomes
+        ``pin_state="released"``, which is TERMINAL —
+        :meth:`pin_checkpoint` deliberately skips a released row, so nothing
+        re-establishes the hold, and from that instant the captured version is
+        eligible for lifecycle expiry AND for a version-targeted delete. The
+        MANIFEST survives: this releases pins, it does not delete the
+        checkpoint (there is no checkpoint-delete verb); the members stay
+        described, tiered honestly ``restorable-unpinned``.
+
+        PRECONDITION for S3 members: re-declare each object member on THIS
+        versioner with :meth:`add_object_member` first — through the SAME
+        binding and key that placed the hold. The pre-flight only checks that
+        an object member is declared at that member path, never that it is the
+        one that pinned the version, so a mismatched binding or key records
+        the row ``released`` WITHOUT dropping the hold, silently (the drop's
+        ``KeyError`` reads as "the version is gone, the hold is moot") —
+        leaving an un-expirable version no later call here will free.
+
+        A hold SHARED with another checkpoint survives until the LAST holder
+        releases: S3's hold is a flag, not a counter, and the cross-checkpoint
+        ``(member_path, native_token)`` scan is the counter. Two bounds on it:
+        the scan walks THIS versioner's registry only — a holder recorded
+        elsewhere is invisible to it — and it cannot close the engine's
+        disclosed under-retention window, where a pin landing after the
+        last-instant re-check can still lose its hold.
+
+        Idempotent is NOT self-healing: the release RECORDS ``released``
+        before it drops the substrate hold, so a crash or an untyped substrate
+        error between the two strands a live hold on an already-terminal row.
+        The recovery is
+        :meth:`~ccs.adapters.coherent_object.CoherentObject.release_legal_hold`
+        on the binding, by version. The remaining residuals (two processes
+        releasing concurrently and both over-retaining; the refcount's
+        separate registry write) are documented on
+        :meth:`_release_checkpoint_pins`, the engine this delegates to.
+
+        Raises ``ValueError`` for a blank/non-string id (BEFORE any store
+        access) and for a ``held`` S3 row with no declared binding (pre-flight,
+        before any write), the typed
+        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, and
+        ``TypeError`` for a service without the pin surface.
+        """
+        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+            raise ValueError("release_checkpoint needs a non-empty checkpoint id")
+        return self._release_checkpoint_pins(checkpoint_id)
+
     # --- capture pass ---------------------------------------------------------
 
     def _capture_all(self, name: str) -> list[CheckpointMember]:

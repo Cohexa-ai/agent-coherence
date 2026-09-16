@@ -2664,6 +2664,362 @@ def test_concurrent_pin_between_release_scan_and_drop_keeps_hold(
     assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
 
 
+# ---------------------------------------------------------------------------
+# WV Unit 6 — the PUBLIC release verb: release_checkpoint (issue #192)
+# ---------------------------------------------------------------------------
+
+
+class _StoreAccessProbe:
+    """Forwards the pin store surface to a real service, RECORDING each call.
+
+    The ordering witness for R3: a blank/non-string checkpoint id must raise
+    before ``release_checkpoint`` reaches the store at all, so ``touched``
+    stays empty. A guard placed after the store read records
+    ``get_workspace_checkpoint`` instead.
+
+    The CheckpointPinStore members are delegated EXPLICITLY (not via
+    ``__getattr__``): runtime-checkable Protocol isinstance uses static
+    attribute lookup on 3.12+, which a ``__getattr__`` fallthrough never
+    satisfies.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.touched: list[str] = []
+
+    def create_workspace_checkpoint(self, **kwargs: Any) -> Any:
+        self.touched.append("create_workspace_checkpoint")
+        return self._inner.create_workspace_checkpoint(**kwargs)
+
+    def get_workspace_checkpoint(self, checkpoint_id: str) -> Any:
+        self.touched.append("get_workspace_checkpoint")
+        return self._inner.get_workspace_checkpoint(checkpoint_id)
+
+    def get_workspace_checkpoint_members(self, checkpoint_id: str) -> Any:
+        self.touched.append("get_workspace_checkpoint_members")
+        return self._inner.get_workspace_checkpoint_members(checkpoint_id)
+
+    def list_workspace_checkpoints(self) -> Any:
+        self.touched.append("list_workspace_checkpoints")
+        return self._inner.list_workspace_checkpoints()
+
+    def set_workspace_checkpoint_member_pin(self, *args: Any, **kwargs: Any) -> Any:
+        self.touched.append("set_workspace_checkpoint_member_pin")
+        return self._inner.set_workspace_checkpoint_member_pin(*args, **kwargs)
+
+    def adjust_workspace_checkpoint_pin_refcount(self, *args: Any, **kwargs: Any) -> Any:
+        self.touched.append("adjust_workspace_checkpoint_pin_refcount")
+        return self._inner.adjust_workspace_checkpoint_pin_refcount(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _ReleaseRaisesUntyped(CoherentObject):
+    """A binding whose hold drop fails with an UNTYPED error — neither the
+    ``KeyError`` (version gone) nor the :class:`LegalHoldUnavailable` (no
+    Object Lock) the engine absorbs, so it propagates."""
+
+    def release_legal_hold(self, artifact_ref: str, *, version_id: str) -> None:
+        raise RuntimeError("substrate blew up mid-release")
+
+
+def test_release_checkpoint_shared_version_drops_only_on_last_holder(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """AE1 — the public verb carries the cross-checkpoint sharing scan: two
+    checkpoints pin the SAME (member_path, versionId); the FIRST release
+    leaves the substrate hold standing (the peer still depends on it), the
+    LAST one drops it. A delegation that lost the scan fails HERE."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp1 = versioner.checkpoint("first")
+    cp2 = versioner.checkpoint("second")  # no intervening write: same version
+    assert cp1.members[0].native_token == cp2.members[0].native_token
+
+    rows = versioner.release_checkpoint(cp1.record.checkpoint_id)
+
+    (released,) = rows
+    assert released.pin_state == PIN_STATE_RELEASED
+    (row2,) = registry.get_checkpoint_members(cp2.record.checkpoint_id)
+    assert row2.pin_state == PIN_STATE_HELD
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+
+    versioner.release_checkpoint(cp2.record.checkpoint_id)  # last out drops it
+
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+
+
+def test_release_checkpoint_drops_hold_and_downgrades_the_tier(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The happy path through the public verb: the substrate hold is dropped,
+    the row reads ``released``, and the ``restorable`` claim is un-backed in
+    the SAME write (no instant claims restorable without a pin behind it)."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+    assert cp.members[0].restore_tier == "restorable"
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+
+    rows = versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    (member,) = rows
+    assert member.pin_state == PIN_STATE_RELEASED
+    assert member.restore_tier == "restorable-unpinned"
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+    # The release is real: the lifecycle can now take the version.
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired == [put["VersionId"]] and held == []
+
+
+def test_release_checkpoint_twice_is_idempotent(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """AE2 — the second call returns the same durable rows, raises nothing,
+    and moves no refcount (a released row is not walked a second time)."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+    versioner.release_checkpoint(cp.record.checkpoint_id)
+    after_first = tuple(registry.get_checkpoint_members(cp.record.checkpoint_id))
+
+    rows = versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    assert rows == after_first  # byte-for-byte the same durable rows
+    assert rows[0].pin_state == PIN_STATE_RELEASED
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0  # no underflow
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+
+
+def test_release_checkpoint_bad_id_raises_before_any_store_access(
+    service: CoordinatorService,
+) -> None:
+    """AE3 / R3 — a blank or non-string id raises ``ValueError`` BEFORE the
+    store is reached. Asserting only that it raised would also pass for a
+    guard placed after the store read; the probe pins the ORDERING."""
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    probe = _StoreAccessProbe(service)
+    versioner = _versioner(probe)
+    versioner.add_object_member(obj, "cfg.json")
+    versioner.checkpoint("real")
+    assert probe.touched  # the probe DOES see real store work ...
+    probe.touched.clear()  # ... so an empty list below is a real signal
+
+    bad_ids: list[Any] = ["", "   ", None, 7]
+    for bad in bad_ids:
+        with pytest.raises(ValueError):
+            versioner.release_checkpoint(bad)
+
+    assert probe.touched == []
+
+
+def test_release_checkpoint_undeclared_member_preflight_changes_nothing(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """AE4 — a ``held`` S3 row whose object member is not declared on THIS
+    versioner refuses pre-flight, before any write: the row, its tier, the
+    refcount and the substrate hold are all exactly as they were."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+
+    fresh = _versioner(service)  # no declared members: cannot reach the bucket
+    with pytest.raises(ValueError):
+        fresh.release_checkpoint(cp.record.checkpoint_id)
+
+    (stored,) = registry.get_checkpoint_members(cp.record.checkpoint_id)
+    assert stored.pin_state == PIN_STATE_HELD
+    assert stored.restore_tier == "restorable"
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 1
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+
+
+def test_release_checkpoint_mismatched_key_records_released_but_keeps_hold(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """AE5 (CHARACTERIZATION of shipped engine behaviour) — the pre-flight
+    only asks that SOME object member is declared at the member path, never
+    that it is the one that placed the hold. Re-declaring through a binding
+    whose key does not carry the pinned version therefore records ``released``
+    while the hold SURVIVES, silently: the engine reads the resulting
+    ``KeyError`` as "the hold is moot". This is the silent failure the public
+    docstring's re-declaration precondition warns about."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    client.put_object(Bucket="demo", Key="other.json", Body=b"unrelated")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+
+    # The same member PATH, re-declared over the WRONG key.
+    mismatched = _versioner(service)
+    mismatched.add_object_member(obj, "other.json", member_path="s3://cfg.json")
+
+    rows = mismatched.release_checkpoint(cp.record.checkpoint_id)
+
+    assert rows[0].pin_state == PIN_STATE_RELEASED  # the record moved ...
+    assert rows[0].restore_tier == "restorable-unpinned"
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+    # ... and the hold did NOT. The version stays un-expirable.
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert held == [put["VersionId"]] and expired == []
+
+
+def test_release_checkpoint_without_pin_surface_raises_type_error(
+    service: CoordinatorService,
+) -> None:
+    """R5 — the typed refusal survives the delegation: a capture-only seam
+    cannot record a release outcome, so the PUBLIC verb fails fast."""
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+
+    capture_only = _versioner(_CaptureOnlyService(service))
+    capture_only.add_object_member(obj, "cfg.json")
+    with pytest.raises(TypeError):
+        capture_only.release_checkpoint(cp.record.checkpoint_id)
+
+
+def test_release_checkpoint_untyped_substrate_error_propagates_and_strands(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """CHARACTERIZATION of the stranding R5 names: an untyped substrate error
+    (neither ``KeyError`` nor ``LegalHoldUnavailable``) propagates, the rows
+    already processed keep their dropped holds, and the FAILING member is
+    left ``released`` with its hold still standing — record-before-drop, so
+    no later release or re-pin will drop it. ``CoherentObject.
+    release_legal_hold`` is the recovery."""
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    healthy = CoherentObject("demo", client=client)
+    broken = _ReleaseRaisesUntyped("demo", client=client)
+    put_ok = client.put_object(Bucket="demo", Key="a-ok.json", Body=b"a")
+    put_bad = client.put_object(Bucket="demo", Key="z-bad.json", Body=b"b")
+    versioner = _versioner(service)
+    versioner.add_object_member(broken, "z-bad.json")
+    versioner.add_object_member(healthy, "a-ok.json")
+    cp = versioner.checkpoint("two-members")
+    # Members are walked in durable row order (member_path), so the healthy
+    # member is processed BEFORE the one that blows up.
+    assert [row.member_path for row in cp.members] == ["s3://a-ok.json", "s3://z-bad.json"]
+
+    with pytest.raises(RuntimeError):
+        versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    rows = {row.member_path: row for row in registry.get_checkpoint_members(cp.record.checkpoint_id)}
+    assert rows["s3://a-ok.json"].pin_state == PIN_STATE_RELEASED
+    assert healthy.legal_hold_status("a-ok.json", version_id=put_ok["VersionId"]) is False
+    # The failing member: recorded released, hold STRANDED on the substrate.
+    assert rows["s3://z-bad.json"].pin_state == PIN_STATE_RELEASED
+    assert healthy.legal_hold_status("z-bad.json", version_id=put_bad["VersionId"]) is True
+
+
+def test_pin_checkpoint_after_release_checkpoint_is_one_way(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """``released`` is terminal: the re-drive must not resurrect a pin the
+    caller deliberately dropped, so the hold stays off."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+    versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    rows = versioner.pin_checkpoint(cp.record.checkpoint_id)
+
+    assert rows[0].pin_state == PIN_STATE_RELEASED
+    assert rows[0].restore_tier == "restorable-unpinned"
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+
+
+def test_release_checkpoint_unknown_id_raises_typed_refusal(
+    service: CoordinatorService,
+) -> None:
+    """R5 — an unknown id is the typed ``CheckpointUnknown``, not a bare
+    KeyError and not a silent no-op."""
+    versioner = _versioner(service)
+    with pytest.raises(CheckpointUnknown):
+        versioner.release_checkpoint("nope")
+
+
+def test_release_checkpoint_file_only_records_released_with_no_substrate_half(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """A file member's verification pin has no substrate half (``no-arbiter``:
+    no hold was ever placed, so none is dropped) — but the release DOES record
+    it ``released``, which ``pin_checkpoint`` will not re-drive."""
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "notes/plan.md")
+    cp = versioner.checkpoint("file-only")
+    (member,) = cp.members
+    assert member.pin_state == PIN_STATE_HELD
+    assert member.arbitration_tier == "no-arbiter"  # no substrate to hold
+
+    rows = versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    assert rows[0].pin_state == PIN_STATE_RELEASED
+    # The verification pin never upgraded the tier, so there is none to undo.
+    assert rows[0].restore_tier == "restorable-unpinned"
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+    assert versioner.pin_checkpoint(cp.record.checkpoint_id)[0].pin_state == (
+        PIN_STATE_RELEASED
+    )
+
+
+def test_release_checkpoint_leaves_non_held_rows_alone(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """Only ``held`` rows are released. A ``pin=False`` capture's ``unpinned``
+    row must survive untouched — walking it to the terminal ``released`` would
+    strand a checkpoint that was never pinned (``pin_checkpoint`` skips
+    ``released``) and would underflow the refcount."""
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("deferred", pin=False)
+
+    rows = versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    assert rows[0].pin_state == PIN_STATE_UNPINNED
+    assert rows[0].restore_tier == "restorable"
+    record = registry.get_checkpoint(cp.record.checkpoint_id)
+    assert record is not None and record.pin_refcount == 0
+    # Still pinnable: the deferred capture can be completed afterwards.
+    assert versioner.pin_checkpoint(cp.record.checkpoint_id)[0].pin_state == (
+        PIN_STATE_HELD
+    )
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+
+
 def test_pin_checkpoint_redrive_is_idempotent(
     registry: ArtifactRegistry, service: CoordinatorService
 ) -> None:
