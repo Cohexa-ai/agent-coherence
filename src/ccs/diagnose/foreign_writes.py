@@ -136,7 +136,14 @@ class ForeignWriteReport:
 
         A not-coverable store is NOT instrumented by this measure, and that is
         the intended reading: the detector ran, but it observed no tick, so
-        there is no span any claim can rest on."""
+        there is no span any claim can rest on.
+
+        Not a liveness signal. True means a span exists somewhere in this store
+        that a claim can rest on — not that the workspace is healthy NOW. Like
+        ``state``, it cannot fall once it has risen, because nothing deletes a
+        row. For "was THIS window watched", ask :meth:`covers`; for "did some
+        run find nothing to watch", read ``uncoverable`` — whatever ``state``
+        says."""
         return self.state in (INSTRUMENTED_ZERO, COUNTS)
 
     def covers(self, start_unix: float, end_unix: float) -> bool:
@@ -231,15 +238,26 @@ def read_foreign_write_report(db_path: str | Path) -> ForeignWriteReport:
         for run_id, reason, observed_at in (uncoverable_rows or ())
     )
 
-    # Ordered by how much each fact proves, strongest first. Counts decide
-    # before anything else: a store carrying detections demonstrably ran, so it
-    # is never reported as not-instrumented even if its observation rows were
-    # lost. An observed run then means a real zero. Only with NEITHER does the
-    # uncoverable note decide — it explains an absence of ticks, so a store that
-    # has ticks does not need it, and a workspace that later gained a repository
-    # must not be downgraded by the note its earlier run left behind. And no row
-    # of any kind is the not-instrumented signal, which is why the ROW and not
-    # the table carries this meaning.
+    # Ordered by how much each fact PROVES, strongest first — and symmetric by
+    # design, which is the half an earlier version of this comment left unsaid.
+    #
+    # Counts decide before anything else, and not merely because they are
+    # "stronger": ``foreign_write_counters`` carries no run id and no timestamp,
+    # so a detection is not a coverage claim and cannot be time-ordered at all.
+    # An observed run then means a real zero. Only with NEITHER does the
+    # uncoverable note decide — it explains an ABSENCE of ticks, so a store that
+    # has ticks does not need it. And no row of any kind is the not-instrumented
+    # signal, which is why the ROW and not the table carries this meaning.
+    #
+    # Deliberately NOT ranked by recency, in either direction. This store is an
+    # append-only log across every coordinator lifetime that ever opened it
+    # (``run_id`` is a fresh uuid per open, nothing is deleted), so an offline
+    # reader has no "now" and "the newest fact" is a liveness notion ``state``
+    # cannot carry. Ranking by recency would put ``state`` in direct
+    # contradiction with ``covers()``: a store with real ticks and a newer note
+    # would headline `not-coverable` while ``covers()`` still returned True over
+    # those very ticks. ``covers(start, end)`` is the instrument for a window,
+    # and it walks ``runs`` alone — untouched by any ranking here.
     if totals:
         state = COUNTS
     elif runs:

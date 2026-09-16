@@ -314,3 +314,52 @@ def test_a_store_predating_the_uncoverable_table_still_reads(tmp_path: Path) -> 
     report = read_foreign_write_report(db)
     assert report.state == NOT_INSTRUMENTED
     assert report.uncoverable == ()
+
+
+def test_an_uncoverable_note_newer_than_the_ticks_does_not_outrank_them(
+    tmp_path: Path,
+) -> None:
+    """The MIRROR of the ordering test above, and the one that makes this a
+    decision rather than an omission.
+
+    State ranks by how much each fact PROVES, symmetrically — not by recency.
+    Only one direction was pinned before, so a recency rewrite passed the whole
+    suite. This store's newest fact is "nothing here can be watched", and it
+    still reports a real zero, because the ticks it holds really happened.
+    """
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    reg.record_detection_tick(200.0, covered_count=4)
+    reg.close_detection_run()
+    reg.record_detection_uncoverable("no-git-work-tree", 300.0)
+    reg.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == INSTRUMENTED_ZERO
+    assert report.instrumented is True
+    assert len(report.uncoverable) == 1  # never hidden, whatever the state says
+    assert report.covers(200.0, 200.0) is True
+    assert report.covers(200.0, 300.0) is False  # the blind window still shows
+
+
+def test_report_state_never_contradicts_covers(tmp_path: Path) -> None:
+    """Why recency is not merely the other defensible option — it is wrong here.
+
+    Ranking by recency would report this store as ``not-coverable`` with
+    ``instrumented`` False, while ``covers()`` — which walks ``runs`` alone and
+    is the instrument for a window — still answers True over the very ticks
+    being denied. The invariant worth keeping is the one that holds in all four
+    states: a store that is not instrumented covers nothing.
+    """
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    for tick in (100.0, 500.0, 1000.0):
+        reg.record_detection_tick(tick, covered_count=500)
+    reg.close_detection_run()
+    reg.record_detection_uncoverable("no-git-work-tree", 1100.0)
+    reg.close()
+
+    report = read_foreign_write_report(db)
+    assert report.covers(100.0, 1000.0) is True
+    assert report.instrumented is True
+    assert report.state == INSTRUMENTED_ZERO
