@@ -52,6 +52,104 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`write_cas` now waits, rather than spins, while a peer's committed write
+  reaches disk.** The OCC comparand read fails closed when the coordinator
+  records a version whose bytes are not on disk yet — the transient window
+  between a peer's confirmed CAS and its `_atomic_write` landing. Consecutive
+  denied reads were bounded by count (`MAX_CAS_REACQUIRES`) with no delay
+  between them, which made that bound a proxy for CPU scheduling rather than
+  for a wedged view: measured, nine undelayed re-reads burn through in **37 ms**
+  of wall clock, all of it emergent from local HTTP round-trip latency and
+  chosen by nobody. Any peer descheduled inside that window for longer than
+  37 ms raised `ViewWedged` even though the view would have cleared moments
+  later. On a loaded CI runner that is unremarkable, and it reddened the
+  two-writer `examples/concurrent_writers` demo intermittently — on the same
+  commit that passed on a less contended job.
+
+  The count bound is unchanged; a capped-exponential wait now separates the
+  denied re-reads (`DENIED_READ_BACKOFF_BASE_SEC` 2 ms, doubling to
+  `DENIED_READ_BACKOFF_CAP_SEC` 50 ms). The waiting matters more than the extra
+  time it buys: an undelayed loser **competes for CPU with the very peer whose
+  disk write unblocks it**, so sleeping removes the cause rather than merely
+  outlasting it — with a 50 ms stall injected into the winner, the patched loop
+  converges in five polls where the undelayed one burned all nine and still
+  wedged. Tolerance for one streak moves from ~40 ms to ~280 ms; a genuinely
+  never-clearing view (a foreign edit, a wedged coordinator) still fails closed
+  with `ViewWedged`, and the fail-closed guarantee is untouched — no write lands,
+  so no update was ever at risk. A clean read resets the streak, so a single call
+  that alternates streaks with lost races stays bounded but by ~1.9 s in
+  aggregate rather than by one schedule.
+
+  This distinction is the general one: the sibling commit budget counts
+  *contention losses*, where an iteration count is exactly the right unit, while
+  a poll of a transient that clears on **another** writer's progress has to be
+  denominated in time. A new guard,
+  `test_write_cas_waits_between_denied_comparand_reads`, records the waits the
+  loop actually requests and pins the **sequence** against the schedule, plus a
+  non-degeneracy check on the two constants. Pinning only an elapsed floor was
+  not enough and is the interesting part: the floor is computed from the same
+  constants it guards, so zeroing the base makes the assertion `>= 0` and the
+  whole fix could be reverted with the test still green. The sequence form fails
+  on all of it — a removed wait, a zeroed or inverted constant, a schedule
+  flattened to the cap, and an off-by-one in the exponent.
+
+- **`GET /status` no longer reports an empty workspace while a grant is still
+  being enforced.** `sessions` was built by walking the adapter's in-memory
+  name map and looking each agent up in the registry snapshot. That map is
+  seeded empty on every process start and written only by `register_session`
+  on hook traffic, so a coordinator restart erased every holder from the
+  payload while the durable `agent_states` row kept arbitrating: a peer's
+  `pre-edit` still came back `collision: true` against a holder `/status` said
+  did not exist, and `agent-coherence-status` rendered the affirmative
+  `No active sessions.` The sweep did not bound it either — it reclaims only
+  MODIFIED and EXCLUSIVE, so a SHARED row survived indefinitely. The holder set
+  now comes from the registry and the name is a label applied afterwards. A
+  holder the adapter cannot name is listed on its raw agent id with
+  `agent_name: null` — the agent id is a one-way uuid5 of the session id, so
+  the name is honestly absent rather than guessed — and the CLI says so instead
+  of printing `None`. `StatusResponse` was documenting `last_writer` and
+  `session_id` keys the handler has never emitted; it now matches the wire.
+
+- **Preemption notices past the render cap are no longer destroyed.** One
+  `pre-read` on one path deleted *every* pending notice for the session while
+  rendering three of them, and the overflow line sent the caller to
+  `/agent-coherence status` / `GET /status`, neither of which has ever carried
+  notice data at any disclosure tier. Seven pending notices became three
+  rendered and four unrecoverable, so an agent reconciling after losing grants
+  learned who took three of its artifacts and got a bare count for the rest.
+  The drain is now bounded to what the response actually renders
+  (`pop_pending_notices(consume_limit=...)`); the rest stay queued and surface
+  on the session's next tracked-file operation, and the overflow line says that
+  instead. `POST /hooks/session-stop` still drains everything — it returns the
+  full structured array, so its drain was always matched by its render — and its
+  overflow line names that array rather than repeating the deferral promise,
+  which would be false twice over on a path that consumed the rows and has no
+  next operation to surface them on.
+
+- **`CasVersionConflict` no longer relabels every CAS refusal as
+  `version_mismatch`.** The coordinator distinguishes four refusals —
+  `version_mismatch`, `other_holder`, `stale_read_generation` and
+  `caller_in_transient_state` — and the client folded all four into one verdict
+  and discarded the reason, while the exception pinned `version_mismatch` as a
+  class attribute. Each needs different recovery, and the mislabel was
+  actively harmful for `other_holder`: the version has *not* moved, so the
+  message's own advice ("re-read at current and re-merge") produces a
+  byte-identical CAS that fails identically until the holder releases, and the
+  caller spins. The wire reason now travels onto the instance and into the
+  message, the MCP deny mapper routes a recover verb per reason
+  (`wait_and_retry` / `reacquire_and_reread` / `reacquire`), and a HELD batch
+  publish carries the first conflicting member's reason as
+  `StaleView.member_reason`. The class default and the `version_mismatch`
+  message are unchanged, so existing consumers and the byte-stability retry
+  contract are untouched.
+
+- **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
+  `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
+  warn-mode renderers sliced it to eight characters unconditionally, so a
+  post-restart collision reached the model as "another session (`<unknown`) has
+  been editing …". The guard is now one shared helper
+  (`hook_payloads.short_session_id`) used by all three renderers.
+
 - **The HTML report templates now ship in the distribution.** `ccs-compare`
   and `ccs-diagnose` read their templates off the filesystem beside the
   module (`Path(__file__).with_name("templates")`), but `pyproject.toml`

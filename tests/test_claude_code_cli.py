@@ -971,3 +971,32 @@ def test_resolve_endpoint_empty_secret(git_workspace: Path) -> None:
     with pytest.raises(CoordinatorUnavailable) as excinfo:
         resolve_endpoint(git_workspace)
     assert "empty" in str(excinfo.value)
+
+
+def test_render_table_marks_a_holder_with_no_known_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A holder whose grant outlived the coordinator that issued it arrives
+    with ``agent_name: null``. The renderer must say so, not print "None" —
+    and must not reuse the "no held grants" line, which means the opposite."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = {
+        "tracked_artifacts": [{"path": "docs/plan.md", "version": 2}],
+        "sessions": [
+            {
+                "agent_name": None,
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {"docs/plan.md": "EXCLUSIVE"},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    out = capsys.readouterr().out
+
+    assert "None" not in out
+    assert "name unknown" in out
+    assert "4c9625da" in out
+    assert "docs/plan.md" in out and "EXCLUSIVE" in out
+    assert "No active sessions." not in out

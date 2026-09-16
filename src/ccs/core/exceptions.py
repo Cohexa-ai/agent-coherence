@@ -473,6 +473,10 @@ class StaleView(CoherenceError):
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
     expected_version: int | None = None
     current_version: int | None = None
+    #: On a HELD batch publish, the first conflicting member's own refusal
+    #: reason (``version_mismatch`` / ``other_holder`` / ...). ``None``
+    #: everywhere else, so a generic handler reads it uniformly.
+    member_reason: str | None = None
     #: WHICH hold class fired, as a typed value (see the ``HOLD_*`` constants).
     #: ``None`` on coordinator-raised instances. Matched on this, never on the
     #: human message — and it is the difference between a HOLD ``reacquire()``
@@ -658,12 +662,46 @@ class InternalConcurrencyError(CoherenceError):
     reason = INTERNAL_CONCURRENCY_REASON
 
 
+#: Per-reason recovery advice for :class:`CasVersionConflict`'s message. The
+#: four reasons do not share a recovery: only a genuine lost race is fixed by
+#: re-reading and re-merging.
+_CAS_CONFLICT_ADVICE: dict[str, str] = {
+    VERSION_MISMATCH_REASON: (
+        "(no write landed; re-read at current and re-merge)"
+    ),
+    "other_holder": (
+        "(no write landed; a peer holds the grant and the version has NOT "
+        "moved — re-reading returns the same bytes, so back off and retry "
+        "rather than re-merging)"
+    ),
+    STALE_READ_GENERATION_REASON: (
+        "(no write landed; the claim this read was taken under was reclaimed "
+        "— reacquire and re-read, a merge alone does not help)"
+    ),
+    OCC_CALLER_TRANSIENT_REASON: (
+        "(no write landed; a peer invalidated this session between its read "
+        "and its CAS — recover with a fresh identity)"
+    ),
+}
+
+#: Used when the coordinator reports a reason this table does not know.
+_CAS_CONFLICT_ADVICE_FALLBACK = "(no write landed; re-read before retrying)"
+
+
 class CasVersionConflict(CoherenceError):
-    """Option-A CAS rejected (MCP-C Unit 5): the caller's ``expected_version`` no
-    longer matches the coordinator's current version — a peer committed in
-    between, OR the caller's comparand was stale. Typed-conflict, NOT auto-merge:
-    NO write landed; the agent re-reads at ``current_version``, re-merges, and
-    retries. Carries both versions so the client can re-CAS without another read.
+    """Option-A CAS rejected (MCP-C Unit 5). Typed-conflict, NOT auto-merge: NO
+    write landed, and both versions are carried so the client can recover
+    without another read.
+
+    WHY it was rejected is :attr:`reason`, and the four values do not share a
+    recovery. ``version_mismatch`` is the lost race the class is named for — a
+    peer committed in between, so re-read at ``current_version``, re-merge and
+    retry. ``other_holder`` means a pessimistic peer holds the grant with the
+    version UNCHANGED, so a re-read returns the same bytes and only backing off
+    makes progress. ``stale_read_generation`` means the claim this read was
+    taken under was reclaimed by the sweep: reacquire, then re-read.
+    ``caller_in_transient_state`` means a peer invalidated this session between
+    its read and its CAS: recover with a fresh identity.
 
     ``current_version`` is authoritative when the coordinator itself reported it
     (a bump-conflict). On a substrate-side CAS loss — where the coordinator was
@@ -672,12 +710,40 @@ class CasVersionConflict(CoherenceError):
     numeric.
     """
 
+    #: Class default, kept so ``except`` clauses and consumers that read the
+    #: class attribute keep working. An instance raised from a wire refusal
+    #: SHADOWS it with the coordinator's own reason.
     reason = VERSION_MISMATCH_REASON
 
-    def __init__(self, artifact_id: object, expected_version: int, current_version: int) -> None:
+    def __init__(
+        self,
+        artifact_id: object,
+        expected_version: int,
+        current_version: int,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """``reason`` is the coordinator's refusal reason when the raise site
+        has one. The coordinator distinguishes four — ``version_mismatch``,
+        ``other_holder``, ``stale_read_generation`` and
+        ``caller_in_transient_state`` — and each needs different recovery, so
+        collapsing them into the class default misdirected the caller. The
+        worst case is ``other_holder``: the version has NOT moved, so
+        "re-read at current and re-merge" produces a byte-identical CAS that
+        fails identically until the holder releases.
+        """
+        # isinstance, not truthiness alone: ``reason`` arrives from a JSON
+        # response body, and a non-string there (a list, a dict) would make the
+        # advice lookup below raise TypeError INSIDE an exception constructor,
+        # turning a recoverable conflict into an unhandled error at the raise
+        # site. A constructor must never raise.
+        self.reason = reason if isinstance(reason, str) and reason else VERSION_MISMATCH_REASON
         super().__init__(
-            f"version_mismatch artifact={artifact_id} expected={expected_version} "
-            f"current={current_version} (no write landed; re-read at current and re-merge)"
+            f"{self.reason} artifact={artifact_id} expected={expected_version} "
+            f"current={current_version} "
+            # .get, never []: an exception constructor must not raise. A reason
+            # this table has not learned yet still produces a usable terminal.
+            f"{_CAS_CONFLICT_ADVICE.get(self.reason, _CAS_CONFLICT_ADVICE_FALLBACK)}"
         )
         self.artifact_id = artifact_id
         self.expected_version = expected_version

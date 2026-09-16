@@ -546,8 +546,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "pop_pending_notices",
         MemberClass.INDEPENDENT,
         "sqlite_extended",
-        "Consumes all pending notices for an agent. Durable read-and-delete; not "
-        "part of the boundary.",
+        "Reads an agent's pending notices and consumes the ones the caller can "
+        "deliver (``consume_limit``). Durable read-and-delete; not part of the "
+        "boundary.",
     ),
     MemberContract(
         "evict_stale_notices",

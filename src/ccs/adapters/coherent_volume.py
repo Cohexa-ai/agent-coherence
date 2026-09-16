@@ -38,6 +38,7 @@ import io
 import logging
 import os
 import threading
+import time
 import urllib.error
 import uuid
 import warnings
@@ -120,11 +121,34 @@ class _ReadResult(NamedTuple):
 #   a silent drop). A stale-denied comparand read never POSTs, so it does NOT
 #   consume this budget.
 # - CONSECUTIVE stale-denied comparand reads are bounded at
-#   ``MAX_CAS_REACQUIRES + 1``; on exhaustion ``write_cas`` raises
+#   ``MAX_CAS_REACQUIRES + 1``, WITH a capped-exponential wait between re-reads
+#   (the transient clears on a peer's progress, so the poll yields to it — see
+#   ``DENIED_READ_BACKOFF_BASE_SEC``); on exhaustion ``write_cas`` raises
 #   :class:`~ccs.core.exceptions.CoherenceError` (a view that never clears —
 #   wedged coordinator / perpetually lagging disk — must not spin). A clean
 #   read resets the streak.
 MAX_CAS_REACQUIRES = 8
+
+# A stale-denied comparand read has two causes. One is LOCAL and clears on the
+# ``_remint()`` alone (this instance is ``INVALID``). The other is a TRANSIENT that
+# clears only on ANOTHER writer's progress: the window between a peer's confirmed
+# CAS and its ``_atomic_write`` landing on disk. Because the second cause is the one
+# a streak is made of, the denied-read retry must WAIT, not spin.
+# Polling it with no delay made the streak bound a proxy for CPU scheduling luck
+# rather than for a wedged view: measured, 9 undelayed re-reads burn through in
+# ~37ms of wall clock, so a peer descheduled inside that window (routine on a
+# loaded 2-vCPU CI runner) wedged the loser even though the view would have
+# cleared moments later. Worse, the undelayed loser COMPETES for CPU with
+# the very peer whose disk write unblocks it. A capped-exponential wait between
+# denied re-reads yields to that peer and denominates the bound in time, so the
+# streak still fails closed on a genuinely never-clearing view (foreign edit,
+# wedged coordinator) without going red on scheduler jitter.
+# The schedule below bounds ONE streak (8 waits, 212ms). A clean read resets the
+# streak, so a single ``write_cas`` call that alternates streaks with lost CAS races
+# can traverse up to ``MAX_CAS_REACQUIRES + 1`` of them — the per-call wait is
+# bounded, but by ~1.9s in aggregate, not by one schedule.
+DENIED_READ_BACKOFF_BASE_SEC = 0.002
+DENIED_READ_BACKOFF_CAP_SEC = 0.05
 
 # SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
 # model's retry loop sees identical text each attempt (KTD-P), and distinct from
@@ -893,8 +917,17 @@ class CoherentVolume:
         landed but its disk write hasn't) does NOT consume the commit budget;
         instead CONSECUTIVE denied reads are separately bounded (also at
         ``MAX_CAS_REACQUIRES + 1``) and raise ``ViewWedged`` (a ``CoherenceError``
-        subclass) if the view never clears. Both terminals are the honest fail-closed outcome,
-        **never** a silent lost update: the invariant this method guarantees is
+        subclass) if the view never clears. That poll WAITS between re-reads
+        (capped-exponential, :data:`DENIED_READ_BACKOFF_BASE_SEC` →
+        :data:`DENIED_READ_BACKOFF_CAP_SEC`) rather than spinning: the transient
+        clears on a PEER's progress, so the waiting writer must yield the CPU to
+        it instead of racing it — an undelayed poll made this bound a proxy for
+        scheduler luck (a measured ~37ms of wall clock) rather than for a wedged
+        view. That schedule bounds ONE streak (212ms); a clean read resets the
+        streak, so a call that alternates streaks with lost races can traverse up
+        to ``MAX_CAS_REACQUIRES + 1`` of them (~1.9s in aggregate).
+        Both terminals are the honest fail-closed outcome, **never** a silent
+        lost update: the invariant this method guarantees is
         *final == start + every applied delta, OR a typed raise* — a successful
         return always means the update landed.
 
@@ -993,6 +1026,14 @@ class CoherentVolume:
                         "landed (fail-closed)."
                     )
                 self._remint()
+                # WAIT, don't spin: yield the CPU to the peer whose disk write
+                # clears this view (see DENIED_READ_BACKOFF_BASE_SEC).
+                time.sleep(
+                    min(
+                        DENIED_READ_BACKOFF_BASE_SEC * (2 ** (denied_streak - 1)),
+                        DENIED_READ_BACKOFF_CAP_SEC,
+                    )
+                )
                 continue
             denied_streak = 0
 
@@ -1159,9 +1200,16 @@ class CoherentVolume:
             # version is deterministically expected+1 (atomic_publish surfaces it).
             return expected_version + 1
         if outcome == "conflict":
-            # A peer won the version between our read and the CAS → typed conflict.
+            # A peer won the version between our read and the CAS, OR a
+            # pessimistic peer holds the grant, OR the claim this read was taken
+            # under was reclaimed, OR a peer invalidated us mid-window. All four
+            # are conflicts; they are NOT the same conflict, so the coordinator's
+            # own reason travels with the terminal rather than being relabelled.
             raise CasVersionConflict(
-                rel, expected_version, self._cas_current_version(resp, current_version)
+                rel,
+                expected_version,
+                self._cas_current_version(resp, current_version),
+                reason=resp.get("reason"),
             )
         # outcome == "raise": corruption or the commit_unconfirmed degrade body.
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
@@ -1447,6 +1495,24 @@ class CoherentVolume:
             if isinstance(detail, dict):
                 current = detail.get("current_version")
                 held.current_version = current if isinstance(current, int) else None
+                # The per-member refusal reason: same four-way distinction the
+                # single-artifact CAS carries. The HOLD's own ``reason`` stays
+                # the batch-level constant, so this rides alongside it.
+                #
+                # Allowlisted against the SAME set the single-artifact path
+                # matches on, not merely type-checked. ``per_artifact`` is
+                # coordinator-supplied JSON, and this string is destined for
+                # prose a model reads; an isinstance check alone would let an
+                # unrecognized reason through to whatever first renders it.
+                # isinstance BEFORE the membership test: ``in`` against a
+                # frozenset raises TypeError on an unhashable value, and this
+                # body is JSON the coordinator supplied.
+                member_reason = detail.get("reason")
+                if (
+                    isinstance(member_reason, str)
+                    and member_reason in self._CAS_RETRY_REASONS
+                ):
+                    held.member_reason = member_reason
         return held
 
     # --- coordinator I/O helpers --------------------------------------------

@@ -17,16 +17,21 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import (
+    DENIED_READ_BACKOFF_BASE_SEC,
+    DENIED_READ_BACKOFF_CAP_SEC,
     MAX_CAS_REACQUIRES,
     CoherentVolume,
     coherent_workspace,
@@ -38,6 +43,7 @@ from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
     StaleView,
+    ViewWedged,
 )
 
 
@@ -1813,3 +1819,70 @@ def test_write_cas_on_foreign_edit_wedges_not_stale_view(
         assert target.read_bytes() == b"foreign-v2"  # foreign edit intact (not clobbered)
     finally:
         stop_coordinator(tmp_path)
+
+
+def test_write_cas_waits_between_denied_comparand_reads(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The denied comparand read polls a TRANSIENT that clears on ANOTHER writer's
+    progress (the window between a peer's confirmed CAS and its disk write), so the
+    poll must WAIT — yielding the CPU to that peer — not spin.
+
+    Regression for the intermittent concurrent-writers demo red (2026-09-09): with
+    no wait, the streak bound was denominated in local HTTP round trips, so it
+    bought only ~40ms of wall clock and a peer descheduled inside that window
+    (routine on a loaded CI runner) wedged the loser even though the view would
+    have cleared moments later.
+
+    Pins the SCHEDULE, not a scalar floor. An ``elapsed >= sum(schedule)`` assertion
+    derives its own threshold from these same constants, so it moves with them:
+    zeroing the base makes the bound ``>= 0`` and the fix can be reverted with the
+    test still green (measured — the zeroed mutant passed). The recorded sequence
+    plus the non-degeneracy assertions below fail on every reachable mutant: a
+    removed wait, a zeroed or inverted constant, a schedule flattened to the cap,
+    and an off-by-one in the exponent.
+    """
+    # Without this the rest is vacuous: a zeroed base makes every entry 0.0, so the
+    # recorded sequence still matches and the elapsed floor still holds.
+    assert DENIED_READ_BACKOFF_BASE_SEC > 0
+    assert DENIED_READ_BACKOFF_CAP_SEC >= DENIED_READ_BACKOFF_BASE_SEC
+    schedule = [
+        min(DENIED_READ_BACKOFF_BASE_SEC * 2**i, DENIED_READ_BACKOFF_CAP_SEC)
+        for i in range(MAX_CAS_REACQUIRES)  # one wait per denied read before the bound trips
+    ]
+
+    # Record what the loop asks to wait, and still wait it. ``time`` is used nowhere
+    # else in the adapter, so shimming that module-level name leaves the real
+    # time.sleep untouched for every other caller, the coordinator client included.
+    waits: list[float] = []
+
+    def recording_sleep(seconds: float) -> None:
+        waits.append(seconds)
+        time.sleep(seconds)
+
+    monkeypatch.setattr(
+        coherent_volume_module, "time", SimpleNamespace(sleep=recording_sleep)
+    )
+
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"foreign-v2")  # a denied view that never clears
+        waits.clear()  # only the write_cas call's own waits are the subject
+        started = time.perf_counter()
+        with pytest.raises(ViewWedged):
+            vol.write_cas("data/x.txt", lambda cur: cur + b"-cas")
+        elapsed = time.perf_counter() - started
+        observed = list(waits)
+    finally:
+        stop_coordinator(tmp_path)
+
+    assert observed == schedule, (
+        f"denied-read backoff schedule changed: waited {observed}, expected {schedule}"
+    )
+    # And the waits were real wall clock, not merely requested.
+    assert elapsed >= sum(schedule), (
+        f"write_cas wedged after {elapsed:.3f}s but its own backoff schedule is "
+        f"{sum(schedule):.3f}s — the recorded waits did not actually elapse"
+    )

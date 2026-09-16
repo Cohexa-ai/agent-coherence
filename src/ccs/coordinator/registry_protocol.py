@@ -613,7 +613,7 @@ class SqliteExtended(RegistryBase, Protocol):
         ...
 
     def pop_pending_notices(
-        self, agent_id: UUID
+        self, agent_id: UUID, *, consume_limit: int | None = None
     ) -> list[tuple[UUID, UUID, float]]:
         ...
 
