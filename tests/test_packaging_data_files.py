@@ -61,7 +61,14 @@ def _iter_packages(src_root: Path) -> list[str]:
     return sorted(
         str(directory.relative_to(src_root)).replace(os.sep, ".")
         for directory in src_root.glob("**/")
-        if directory != src_root and "__pycache__" not in directory.parts
+        if directory != src_root
+        and "__pycache__" not in directory.parts
+        # `<name>.egg-info` appears under src/ the moment anyone runs
+        # `pip install -e .`. setuptools does not discover it as a package, and
+        # counting it is fail-open in direction: an invented package only ever
+        # ADDS to the declared set, shrinking the undeclared difference this
+        # module reports.
+        and not any(part.endswith(".egg-info") for part in directory.parts)
     )
 
 
@@ -507,3 +514,39 @@ def test_this_worktree_is_its_own_git_toplevel() -> None:
     # answers at all here rather than bailing out as foreign.
     assert mod._git_toplevel(REPO_ROOT) == REPO_ROOT
     assert isinstance(mod._locally_ignored_paths(probe), set)
+
+
+def test_iter_packages_skips_build_artifact_directories(tmp_path: Path) -> None:
+    """`_iter_packages` enumerates directories, and a source checkout that has
+    been `pip install -e`'d carries `<name>.egg-info` under src/.
+
+    setuptools does not treat that as a package; counting it does, and every
+    extra "package" only ever ADDS to the declared set, shrinking the
+    undeclared difference the guard reports. Fail-open in direction, so it is
+    pinned here rather than left to the setuptools parity test below, which
+    skips whenever the backend is not importable.
+    """
+    (tmp_path / "ccs" / "output").mkdir(parents=True)
+    (tmp_path / "agent_coherence.egg-info").mkdir()
+    (tmp_path / "agent_coherence.egg-info" / "nested").mkdir()
+
+    found = set(mod._iter_packages(tmp_path))
+    assert "ccs" in found and "ccs.output" in found
+    assert not {name for name in found if "egg-info" in name}, (
+        f"build-artifact directories counted as packages: {sorted(found)}"
+    )
+
+
+def test_replayed_package_list_matches_setuptools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The existing parity test compares resolved DATA FILES, so a package the
+    replay invents but setuptools does not is invisible there whenever that
+    package contributes no data — which is exactly the egg-info case. Compare
+    the package sets directly."""
+    setuptools = pytest.importorskip("setuptools", reason="build backend not installed in this env")
+    from setuptools.config.pyprojecttoml import apply_configuration
+
+    monkeypatch.chdir(REPO_ROOT)
+    distribution = setuptools.Distribution()
+    apply_configuration(distribution, str(PYPROJECT_PATH))
+
+    assert set(distribution.packages or []) == set(mod._iter_packages(SRC_ROOT))
