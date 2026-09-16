@@ -354,8 +354,21 @@ def test_declared_templates_are_never_filtered_out() -> None:
     ):
         assert SRC_ROOT / rel in shipped, f"{rel} vanished from the asset walk"
 
+    # NOT `ignored & shipped`: `shipped` is the walk MINUS the filter, so that
+    # intersection is empty by construction and passes for every possible
+    # filter — including one returning every asset, which empties the walk
+    # entirely. Intersect against the DECLARED set instead. Nothing the
+    # packaging config says ships may be filtered out of the walk, and unlike
+    # the two names above that assertion keeps its teeth when a third asset is
+    # added.
+    declared = _declared_data_files()
+    swallowed = mod._locally_ignored_paths(declared | shipped) & declared
+    assert not swallowed, (
+        "the ignore filter hid an asset that pyproject declares as shipping: "
+        f"{sorted(swallowed)}"
+    )
+
     ignored = mod._locally_ignored_paths(shipped)
-    assert not ignored & shipped, "the filter and the walk must not overlap"
     # Under src/ccs specifically, not merely somewhere in the repo:
     # SRC_ROOT.parent is REPO_ROOT, which is a parent of EVERY repo path, so
     # asserting on it would pass for docs/ and tests/ alike — a check that
