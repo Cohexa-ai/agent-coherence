@@ -16,17 +16,25 @@ defaults would exercise nothing.
 
 from __future__ import annotations
 
+import logging
+import shutil
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from ccs.adapters.claude_code.foreign_write_detector import (
+    NO_WORK_TREE_REASON,
+    Coverage,
+    DetectionState,
     GitPollError,
     _classify_mismatch,
     _git_dirty_paths,
+    _has_git_entry,
     _parse_porcelain_v2,
     _poll_env,
+    _probe_work_tree,
     run_detection_pass,
 )
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
@@ -35,16 +43,30 @@ from ccs.core.substrate import sha256_hex
 
 WINDOW = 10.0
 POLL_BUDGET = 30.0
+_DETECTOR_LOGGER = "ccs.adapters.claude_code.foreign_write_detector"
 
 
-def _tick(coordinator, *, now_unix: float, window_sec: float = WINDOW, cache=None) -> int:
-    """One tick with the caller-owned stat cache the sweep loop holds."""
+def _tick(
+    coordinator,
+    *,
+    now_unix: float,
+    window_sec: float = WINDOW,
+    cache=None,
+    state: DetectionState | None = None,
+) -> int:
+    """One tick with the caller-owned cross-tick state the sweep loop holds.
+
+    ``cache`` stays a stat-cache dict so the tests that thread one across ticks
+    keep reading as "the same cache, two ticks"; it is wrapped in a fresh state
+    here rather than at each call site."""
     return run_detection_pass(
         coordinator,
         now_unix=now_unix,
         window_sec=window_sec,
         poll_budget_sec=POLL_BUDGET,
-        stat_cache=cache if cache is not None else {},
+        state=state
+        if state is not None
+        else DetectionState(stat_cache=cache if cache is not None else {}),
     )
 
 
@@ -726,3 +748,253 @@ def test_the_last_batch_is_queried_too(repo: Path) -> None:
         names[1],
         names[-1],
     }
+
+
+# ---------------------------------------------------------------------------
+# A workspace outside any git work tree: permanently uncoverable, not an outage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bare_workspace(tmp_path: Path):
+    """A coordinator root that is NOT a git work tree — the examples' shape.
+
+    Every example spawns a coordinator over ``tempfile.mkdtemp()``, and a temp
+    directory is not a repository. Nested under ``tmp_path`` and checked, rather
+    than assumed: a stray ``.git`` anywhere above would silently turn this into
+    a repository fixture and every assertion below would still pass vacuously.
+    """
+    root = tmp_path / "bare"
+    root.mkdir()
+    (root / "notes.md").write_text("v1\n")
+    assert not _has_git_entry(root), "fixture is inside a repository"
+    return root
+
+
+@pytest.fixture
+def bare_coordinator(bare_workspace: Path):
+    registry = SqliteArtifactRegistry(bare_workspace / ".coherence" / "state.db")
+    policy = _policy(bare_workspace, "notes.md")
+    yield _Coordinator(bare_workspace, registry, policy)
+    registry.close()
+
+
+def test_a_workspace_with_no_work_tree_is_probed_once_and_then_left_alone(
+    bare_coordinator, caplog
+) -> None:
+    """The defect: one traceback per tick, forever, for a permanent condition.
+
+    Asserts the WHOLE shape rather than the log alone — a fix that only quieted
+    the logger while still shelling out to a doomed `git status` every tick
+    would pass a log-only assertion.
+    """
+    _register(bare_coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _counting_run(argv, *args, **kwargs):
+        calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    with caplog.at_level(logging.DEBUG, logger=_DETECTOR_LOGGER):
+        with mock.patch.object(subprocess, "run", _counting_run):
+            for tick in range(5):
+                assert _tick(bare_coordinator, now_unix=100.0 + tick, state=state) == 0
+
+    assert state.coverage is Coverage.NO_WORK_TREE
+    # One probe across five ticks, and never a `git status` — the poll that can
+    # only fail here is not attempted at all.
+    assert len(calls) == 1, calls
+    assert "rev-parse" in calls[0]
+    assert not [argv for argv in calls if "status" in argv]
+
+    # Said once, at INFO, with no traceback — and actionable.
+    detector_records = [
+        r for r in caplog.records if r.name == _DETECTOR_LOGGER
+    ]
+    assert len(detector_records) == 1
+    record = detector_records[0]
+    assert record.levelno == logging.INFO
+    assert record.exc_info is None
+    assert "git init" in record.getMessage()
+
+
+def test_an_uncoverable_workspace_records_no_tick(bare_coordinator) -> None:
+    """The reason the disable cannot simply return early and say nothing.
+
+    A tick asserts the detector LOOKED. Recording one here would let a workspace
+    nothing can watch answer a coverage question with a clean span — the exact
+    false-clean reading the liveness row exists to prevent.
+    """
+    _register(bare_coordinator, "notes.md", "v1\n")
+    _tick(bare_coordinator, now_unix=100.0, state=DetectionState())
+
+    assert bare_coordinator.registry.detection_runs() == []
+    uncoverable = bare_coordinator.registry.detection_uncoverable()
+    assert [(u.reason, u.observed_at_unix) for u in uncoverable] == [
+        (NO_WORK_TREE_REASON, 100.0)
+    ]
+
+
+def test_the_offline_report_separates_uncoverable_from_never_instrumented(
+    bare_coordinator,
+) -> None:
+    """Success criterion: a zero is never ambiguous.
+
+    Both stores have no ticks and no counts. Before this, both read
+    ``not-instrumented`` — "the detector never ran" — which is a false
+    accusation against an instrument that ran and correctly reported that there
+    is nothing here to watch.
+    """
+    from ccs.diagnose.foreign_writes import (
+        NOT_COVERABLE,
+        NOT_INSTRUMENTED,
+        read_foreign_write_report,
+    )
+
+    _register(bare_coordinator, "notes.md", "v1\n")
+    _tick(bare_coordinator, now_unix=100.0, state=DetectionState())
+    db = Path(bare_coordinator.registry._db_path)  # noqa: SLF001 — the store under test
+    bare_coordinator.registry.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert report.state != NOT_INSTRUMENTED
+    assert report.instrumented is False
+    assert report.covers(100.0, 100.0) is False  # never a coverage claim
+    assert [u.reason for u in report.uncoverable] == [NO_WORK_TREE_REASON]
+
+
+def test_a_workspace_with_nothing_in_scope_is_never_even_probed(
+    bare_coordinator,
+) -> None:
+    """The empty-scope branch keeps its meaning, and keeps its cost.
+
+    Registering nothing leaves the pass with no covered artifact, and that
+    already returns without a tick. It must also return without a subprocess:
+    probing a workspace the detector has no reason to look at would spend a
+    process on every coordinator that never registers anything.
+    """
+    state = DetectionState()
+    with mock.patch.object(subprocess, "run", side_effect=AssertionError("probed")):
+        assert _tick(bare_coordinator, now_unix=100.0, state=state) == 0
+    assert state.coverage is None
+    assert bare_coordinator.registry.detection_uncoverable() == []
+
+
+def test_a_repository_that_is_broken_rather_than_absent_stays_loud(
+    coordinator, repo: Path, caplog
+) -> None:
+    """The distinction message-matching cannot make.
+
+    Git reports a corrupt ``HEAD`` with the SAME ``fatal: not a git repository``
+    text and the SAME exit 128 as a directory outside any repository (verified
+    against git 2.48). A substring check would file this under "not covered" and
+    retire the alarm on a genuine fault, so the quiet state is earned from the
+    filesystem instead: a ``.git`` is present here, so the poll speaks and it
+    raises.
+    """
+    _register(coordinator, "notes.md", "v1\n")
+    (repo / ".git" / "HEAD").write_text("garbage\n")
+    state = DetectionState()
+
+    with caplog.at_level(logging.DEBUG, logger=_DETECTOR_LOGGER):
+        assert _tick(coordinator, now_unix=100.0, state=state) == 0
+
+    assert state.coverage is not Coverage.NO_WORK_TREE
+    assert coordinator.registry.detection_uncoverable() == []
+    assert coordinator.registry.detection_runs() == []  # no tick over a failed poll
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors and errors[0].exc_info is not None
+
+
+def test_a_probe_that_cannot_run_still_earns_the_quiet_state_from_the_filesystem(
+    bare_coordinator,
+) -> None:
+    """A timeout and a missing git binary say nothing about the workspace.
+
+    The filesystem still does, and it is the evidence the quiet state rests on —
+    which is what keeps this fix working on the CI machine where a 0.1s sweep
+    interval leaves a cold `git` invocation no room.
+    """
+    _register(bare_coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+    with mock.patch.object(
+        subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 5.0)
+    ):
+        assert _tick(bare_coordinator, now_unix=100.0, state=state) == 0
+    assert state.coverage is Coverage.NO_WORK_TREE
+
+
+def test_a_probe_that_cannot_run_over_a_real_repository_does_not(
+    coordinator,
+) -> None:
+    """The other half of the same rule: no evidence, no quiet state."""
+    _register(coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+    with mock.patch.object(
+        subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 5.0)
+    ):
+        assert _tick(coordinator, now_unix=100.0, state=state) == 0
+    assert state.coverage is None  # undetermined is never cached
+    assert coordinator.registry.detection_uncoverable() == []
+
+
+def test_a_root_inside_a_git_directory_has_no_work_tree(repo: Path) -> None:
+    """Git answers ``false`` on exit 0 here — a positive, definitive negative.
+
+    Worth pinning separately from the absent-repository case: a ``.git`` IS
+    present, so the filesystem disambiguator would withhold the quiet state.
+    Git's own ``false`` is what grants it.
+    """
+    assert _probe_work_tree(repo, budget_sec=POLL_BUDGET) is Coverage.COVERED
+    assert (
+        _probe_work_tree(repo / ".git", budget_sec=POLL_BUDGET)
+        is Coverage.NO_WORK_TREE
+    )
+
+
+def test_losing_the_repository_after_a_tick_ends_that_interval(
+    coordinator, repo: Path
+) -> None:
+    """The narrow path on which an interval IS open when the probe first lands.
+
+    Normally the probe precedes every tick, so no interval can be open the first
+    time it answers. But an UNDETERMINED probe is deliberately not cached: it
+    lets the poll speak, the poll can succeed, and a tick is then recorded with
+    ``coverage`` still unset. The next tick probes for real — and by then the
+    repository can be gone.
+
+    Two properties, and the second is why the note is given its own run id: the
+    watched interval must END here rather than be extended across the blind
+    window by any later tick, and no single run may appear both as an interval
+    the detector watched and as one that had no workspace to watch. A store read
+    offline cannot see this control flow and must not be able to hold that pair.
+    """
+    _register(coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+
+    real_run = subprocess.run
+
+    def _probe_times_out(argv, *args, **kwargs):
+        if "rev-parse" in argv:
+            raise subprocess.TimeoutExpired("git", 5.0)
+        return real_run(argv, *args, **kwargs)
+
+    with mock.patch.object(subprocess, "run", _probe_times_out):
+        _tick(coordinator, now_unix=100.0, state=state)
+    assert state.coverage is None  # undetermined, so the next tick re-probes
+    watched = coordinator.registry.detection_runs()
+    assert [(r.first_tick_unix, r.last_tick_unix) for r in watched] == [(100.0, 100.0)]
+
+    shutil.rmtree(repo / ".git")
+    assert _tick(coordinator, now_unix=200.0, state=state) == 0
+    assert state.coverage is Coverage.NO_WORK_TREE
+
+    after = coordinator.registry.detection_runs()
+    assert [(r.first_tick_unix, r.last_tick_unix) for r in after] == [(100.0, 100.0)]
+    uncoverable = coordinator.registry.detection_uncoverable()
+    assert [u.reason for u in uncoverable] == [NO_WORK_TREE_REASON]
+    assert {u.run_id for u in uncoverable}.isdisjoint({r.run_id for r in after})

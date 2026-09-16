@@ -133,6 +133,7 @@ from .registry_protocol import (
     CheckpointRecord,
     DetectionRun,
     ReclamationSlot,
+    UncoverableRun,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -3461,8 +3462,8 @@ class SqliteArtifactRegistry:
     def _ensure_foreign_write_tables(self) -> None:
         """Create the foreign-write detection tables if absent (writer open only).
 
-        Two tables, matching the detector's two facts and R9's bound on what it
-        may mutate.
+        Three tables, matching the detector's three facts and R9's bound on what
+        it may mutate.
 
         ``foreign_write_counters`` is ONE ROW PER ARTIFACT rather than one per
         (artifact, outcome). KTD10 drops the agent dimension the conflict
@@ -3495,6 +3496,15 @@ class SqliteArtifactRegistry:
                 last_tick_unix   REAL NOT NULL,
                 tick_count       INTEGER NOT NULL DEFAULT 0,
                 covered_count    INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_uncoverable (
+                run_id            TEXT NOT NULL PRIMARY KEY,
+                reason            TEXT NOT NULL,
+                observed_at_unix  REAL NOT NULL
             )
             """
         )
@@ -3547,6 +3557,61 @@ class SqliteArtifactRegistry:
         coordinator that fails forever leaves no misleading row behind."""
         with self._lock:
             self._detection_run_id = uuid4().hex
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        """Record that this run found nothing it could ever watch here.
+
+        A THIRD table rather than a tick row or a column on one, because this is
+        a third fact. An observation row means "the detector looked", and
+        ``covers()`` reads a span of them as continuously watched; a row written
+        here would make a workspace nothing ever polled answer a coverage
+        question. A zero-tick row would be worse — the same claim with the
+        evidence removed.
+
+        One row per coordinator run, written once: the detector probes once and
+        stops, so there is no second write and nothing to accumulate.
+        ``ON CONFLICT DO UPDATE`` all the same, because idempotence under a
+        re-entered code path is cheaper than reasoning about whether one can
+        happen. Single statement under autocommit, like every other write on
+        this instrument."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO foreign_write_uncoverable
+                    (run_id, reason, observed_at_unix)
+                VALUES (?, ?, ?)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    reason           = excluded.reason,
+                    observed_at_unix = excluded.observed_at_unix
+                """,
+                (self._detection_run_id, reason, now_unix),
+            )
+
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        """Runs that found no watchable workspace. Empty is a real answer.
+
+        Absence of the table is tolerated on a READ-ONLY handle only, exactly as
+        :meth:`detection_runs` does it: a store written before this shipped has
+        no such table, and a read-only open never creates one. On a writer
+        handle the table is created at open, so its absence is a fault in the
+        store — reporting empty there would answer a question about the
+        workspace with news about the schema."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT run_id, reason, observed_at_unix "
+                    "FROM foreign_write_uncoverable ORDER BY observed_at_unix"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return []
+                raise
+        return [
+            UncoverableRun(
+                run_id=run_id, reason=reason, observed_at_unix=float(observed_at)
+            )
+            for run_id, reason, observed_at in rows
+        ]
 
     def record_foreign_write(
         self, artifact_id: UUID, outcome: str, disk_hash: str

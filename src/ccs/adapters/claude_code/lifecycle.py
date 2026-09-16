@@ -783,14 +783,18 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
         SWEEP_RECLAMATION_PREEMPTER_ID,
         monotonic_seconds,
     )
-    from ccs.adapters.claude_code.foreign_write_detector import run_detection_pass
+    from ccs.adapters.claude_code.foreign_write_detector import (
+        DetectionState,
+        run_detection_pass,
+    )
 
     coordinator = entry.coordinator
     # Held across ticks for this coordinator: which files the detector has
-    # already read, by size and modification time. It carries no coordination
-    # state and no safety comparand — only a hint about what is worth
-    # re-reading, so a stale entry costs one extra read and never a wrong count.
-    detection_stat_cache: dict[str, tuple[tuple[int, int], str]] = {}
+    # already read (by size and modification time), and whether this workspace
+    # is one git can be asked about at all. It carries no coordination state and
+    # no safety comparand — only a hint about what is worth re-reading, so a
+    # stale entry costs one extra read and never a wrong count.
+    detection_state = DetectionState()
 
     def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
         """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
@@ -881,7 +885,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             now_unix=now_tick,
             window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + cfg.sweep_interval_sec,
             poll_budget_sec=cfg.sweep_interval_sec,
-            stat_cache=detection_stat_cache,
+            state=detection_state,
         )
 
 

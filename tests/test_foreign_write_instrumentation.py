@@ -213,11 +213,15 @@ def _table_names(db: Path) -> set[str]:
         conn.close()
 
 
-def test_a_writer_open_creates_both_tables(tmp_path: Path) -> None:
+def test_a_writer_open_creates_every_table(tmp_path: Path) -> None:
     """Which is why their PRESENCE can never mean the detector ran."""
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()
-    assert {"foreign_write_counters", "foreign_write_observations"} <= _table_names(db)
+    assert {
+        "foreign_write_counters",
+        "foreign_write_observations",
+        "foreign_write_uncoverable",
+    } <= _table_names(db)
 
 
 def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
@@ -233,6 +237,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
@@ -242,6 +247,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     tables = _table_names(db)
     assert "foreign_write_counters" not in tables
     assert "foreign_write_observations" not in tables
+    assert "foreign_write_uncoverable" not in tables
 
 
 def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) -> None:
@@ -257,12 +263,14 @@ def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) 
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
     reg = SqliteArtifactRegistry(db, read_only=True)
     assert reg.foreign_write_totals() == {}
     assert reg.detection_runs() == []
+    assert reg.detection_uncoverable() == []
     reg.close()
 
 

@@ -25,6 +25,7 @@ from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.diagnose.foreign_writes import (
     COUNTS,
     INSTRUMENTED_ZERO,
+    NOT_COVERABLE,
     NOT_INSTRUMENTED,
     read_foreign_write_report,
 )
@@ -37,6 +38,7 @@ def _drop_detection_tables(db: Path) -> None:
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
@@ -220,3 +222,95 @@ def test_the_report_says_how_much_each_run_watched(tmp_path: Path) -> None:
 
     runs = read_foreign_write_report(db).runs
     assert len(runs) == 1 and runs[0].covered_count == 9
+
+
+# ---------------------------------------------------------------------------
+# The fourth state: a workspace nothing could ever watch
+# ---------------------------------------------------------------------------
+
+
+def _write_uncoverable(db: Path, run_id: str, reason: str, at: float) -> None:
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO foreign_write_uncoverable VALUES (?, ?, ?)", (run_id, reason, at)
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_an_uncoverable_workspace_is_not_the_never_instrumented_answer(
+    tmp_path: Path,
+) -> None:
+    """Both stores hold no ticks and no counts, and they are different news.
+
+    ``not-instrumented`` accuses the instrument; this store's detector ran and
+    correctly reported there is nothing here to watch.
+    """
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    _write_uncoverable(db, "r1", "no-git-work-tree", 100.0)
+
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert report.instrumented is False
+    assert report.runs == ()
+    assert [(u.run_id, u.reason, u.observed_at_unix) for u in report.uncoverable] == [
+        ("r1", "no-git-work-tree", 100.0)
+    ]
+
+
+def test_an_uncoverable_note_never_answers_a_coverage_question(tmp_path: Path) -> None:
+    """The whole reason it is not an observed run with a zero tick count."""
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    _write_uncoverable(db, "r1", "no-git-work-tree", 100.0)
+
+    assert read_foreign_write_report(db).covers(100.0, 100.0) is False
+
+
+def test_a_later_watched_run_outranks_an_earlier_uncoverable_note(
+    tmp_path: Path,
+) -> None:
+    """A workspace that gains a repository must not stay branded by the note
+    its earlier run left behind — the note explains an ABSENCE of ticks, so a
+    store that has ticks does not need it. It is still reported, because
+    hiding it would lose the reason the earlier window is empty."""
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    reg.record_detection_uncoverable("no-git-work-tree", 100.0)
+    reg.close_detection_run()
+    reg.record_detection_tick(200.0, covered_count=3)
+    reg.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == INSTRUMENTED_ZERO
+    assert report.instrumented is True
+    assert len(report.uncoverable) == 1
+    assert report.covers(200.0, 200.0) is True
+
+
+def test_an_unknown_reason_token_still_reaches_the_operator(tmp_path: Path) -> None:
+    """The reason is reported, never interpreted: a token written by a newer
+    detector must not be silently dropped by an older report."""
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    _write_uncoverable(db, "r1", "some-future-reason", 100.0)
+
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert [u.reason for u in report.uncoverable] == ["some-future-reason"]
+
+
+def test_a_store_predating_the_uncoverable_table_still_reads(tmp_path: Path) -> None:
+    """A missing table is news about the schema, not about the workspace —
+    the same tolerance the sibling readers give."""
+    db = tmp_path / "state.db"
+    SqliteArtifactRegistry(db).close()
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE foreign_write_uncoverable")
+    conn.commit()
+    conn.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_INSTRUMENTED
+    assert report.uncoverable == ()

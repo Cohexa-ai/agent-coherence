@@ -121,8 +121,10 @@ DETECTION_METHODS = frozenset(
         "clear_detection_edges",
         "close_detection_run",
         "detection_runs",
+        "detection_uncoverable",
         "foreign_write_totals",
         "record_detection_tick",
+        "record_detection_uncoverable",
         "record_foreign_write",
     }
 )

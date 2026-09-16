@@ -110,7 +110,7 @@ class MemberContract:
 
 
 # The 66 members of RegistryBase (45 methods + 1 property), SqliteExtended
-# (+13 methods) and ForeignWriteDetection (+7 methods), classified against the CoordinatorService call sites. The
+# (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
 # ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
@@ -642,6 +642,24 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "checked against. Non-mutating.",
     ),
     MemberContract(
+        "record_detection_uncoverable",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Records that a coordinator run found no workspace it could ever poll — "
+        "no git work tree — so the offline report can separate that from an "
+        "instrument that broke and from one that never ran. Written at most "
+        "once per run, outside the boundary; a backend need only make it "
+        "individually durable. It must NOT be recorded as a detection tick: a "
+        "tick asserts the detector looked, and a coverage claim is read off "
+        "those intervals.",
+    ),
+    MemberContract(
+        "detection_uncoverable",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads the runs that found no watchable workspace. Non-mutating.",
+    ),
+    MemberContract(
         "close_detection_run",
         MemberClass.INDEPENDENT,
         "detection",
@@ -670,7 +688,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 66-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 68-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

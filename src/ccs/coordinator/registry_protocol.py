@@ -119,6 +119,28 @@ class DetectionRun:
 
 
 @dataclass(frozen=True)
+class UncoverableRun:
+    """One coordinator run that had nothing it could ever watch.
+
+    Deliberately NOT a :class:`DetectionRun` with a zero tick count. A detection
+    run is an interval a coverage claim may be checked against; this is the
+    absence of any such interval, plus the reason. Folding it into the same type
+    would put a row that observed nothing into the sequence
+    ``ForeignWriteReport.covers`` walks, and a workspace nothing ever polled
+    would start answering coverage questions.
+
+    ``reason`` is an opaque stable token, not a message: it is written by the
+    detector and read by the offline report across a process and a release
+    boundary, which is the one place a human-readable string turns into a
+    parsing hazard.
+    """
+
+    run_id: str
+    reason: str
+    observed_at_unix: float
+
+
+@dataclass(frozen=True)
 class CheckpointRecord:
     """One workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9).
 
@@ -557,7 +579,13 @@ class ForeignWriteDetection(Protocol):
     def detection_runs(self) -> list[DetectionRun]:
         ...
 
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        ...
+
     def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        ...
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
         ...
 
     def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:

@@ -16,14 +16,26 @@ Alpha — APIs may change before `v1.0`.
   records each one as `foreign`, `mediated`, or `lag_suppressed` — the last being a
   mismatch that looked like a write still landing, counted separately so the
   benefit of the doubt is measurable rather than invisible. It never denies,
-  never invalidates, and writes nothing outside its own two tables.
+  never invalidates, and writes nothing outside its own three tables.
   `ccs.diagnose.foreign_writes.read_foreign_write_report(db_path)` reads it back
   **offline**, raw read-only sqlite against a closed `state.db`.
   The honesty rules are load-bearing and differ from the conflict counters on
   purpose. **Zero is only zero when the detector actually ran**: a store it never
-  ran against reports `not-instrumented`, a distinct third state, because a
+  ran against reports `not-instrumented`, a state of its own, because a
   coordinator started with the sweep disabled still creates the tables and an
-  empty table would otherwise read as a clean month. **A count is one per version
+  empty table would otherwise read as a clean month. **A workspace it can never
+  watch is a fourth answer, not an outage.** Detection works by asking git, so a
+  coordinator rooted outside a git working tree — a temp directory, an unpacked
+  archive, a folder nobody ran `git init` in — can never be polled. It now
+  establishes that once at startup, says so once at INFO, and stops polling
+  instead of raising a poll error every sweep tick for a permanent, expected
+  condition; the store reports `not-coverable`, which is neither a clean zero
+  nor a broken instrument. The check is a positive `git rev-parse
+  --is-inside-work-tree`, never a match on git's message text: git reports a
+  corrupt repository with the *same* `fatal: not a git repository` string and
+  the same exit code as an absent one, so the quiet state is granted only when
+  the filesystem confirms there is no `.git` at or above the root — a broken
+  repository stays loud. **A count is one per version
   of the content, not one per check** — git keeps reporting an unreconciled edit
   on every pass, so a level-triggered counter would turn one edit into thousands.
   **Coverage is files the coordinator already knows and git tracks**; anything

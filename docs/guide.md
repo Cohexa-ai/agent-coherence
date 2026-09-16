@@ -1475,17 +1475,22 @@ from ccs.diagnose.foreign_writes import read_foreign_write_report
 
 report = read_foreign_write_report(".coherence/state.db")
 
-print(report.state)        # 'not-instrumented' | 'instrumented-zero' | 'counts'
+print(report.state)   # 'not-instrumented' | 'not-coverable'
+                      # | 'instrumented-zero' | 'counts'
+
 for artifact, counts in sorted(report.totals.items()):
     print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
 
 for run in report.runs:                  # what each coordinator run watched
     print(run.tick_count, "checks over", run.covered_count, "files")
 
+for note in report.uncoverable:          # runs that had nothing to watch
+    print(note.reason)                   # 'no-git-work-tree'
+
 report.covers(started_at, ended_at)      # was that period watched end to end?
 ```
 
-Each file lands in one of three buckets:
+Each file the detector watched lands in one of three buckets:
 
 - **foreign** — the bytes on disk are not the bytes the coordinator has, and
   nothing it knows explains that.
@@ -1505,6 +1510,15 @@ plainly:**
   first — never a clean bill of health you did not earn. Each run also records
   how many files were in scope, because watching five hundred and finding
   nothing is a different result from watching none.
+- **Detection needs a git repository, and says so instead of failing.** It works
+  by asking git what changed, so a workspace that is not inside a git working
+  tree — a temp directory, an unpacked archive, a folder nobody ran `git init`
+  in — is one it can never watch. It checks once when it starts, says so once in
+  the log, and stops asking; the store then reports `not-coverable`. That is
+  deliberately its own answer. It is not `instrumented-zero`, which would be a
+  clean bill of health from a check that never happened, and it is not the
+  broken-instrument reading either, because nothing is broken. Run `git init`
+  and restart the coordinator to turn detection on.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
