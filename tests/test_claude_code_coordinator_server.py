@@ -4963,3 +4963,39 @@ def test_unlimited_drain_does_not_bind_one_variable_per_notice(
 
     assert len(drained) == 6
     assert _pending_count(coordinator, agent_id) == 0
+
+
+def test_session_stop_overflow_prose_does_not_claim_rows_are_queued(
+    coordinator, client: _Client
+) -> None:
+    """session-stop drains UNBOUNDED and returns everything in `notices`, so the
+    overflow line must not repeat the deferral promise the bounded prose paths
+    make. "still queued — they surface on your next tracked-file operation" is
+    false twice over here: the rows were just deleted, and a stopping session
+    has no next operation. It points at the response's own array instead."""
+    a, _paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert len(body["notices"]) == 7, "the structured array still carries all of them"
+    assert "Plus 4 more" in text
+    assert "still queued" not in text
+    assert "next tracked-file operation" not in text
+    assert "notices" in text, "the prose names the surface that actually has them"
+
+
+def test_bounded_prose_paths_still_promise_deferral(
+    coordinator, client: _Client
+) -> None:
+    """The four admit paths DO defer — their drain is capped — so they keep the
+    deferral wording. Guards against fixing session-stop by flattening both."""
+    a, paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "Plus 4 more" in text
+    assert "still queued" in text
+    assert "next tracked-file operation" in text
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 4

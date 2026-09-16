@@ -121,7 +121,10 @@ Alpha — APIs may change before `v1.0`.
   (`pop_pending_notices(consume_limit=...)`); the rest stay queued and surface
   on the session's next tracked-file operation, and the overflow line says that
   instead. `POST /hooks/session-stop` still drains everything — it returns the
-  full structured array, so its drain was always matched by its render.
+  full structured array, so its drain was always matched by its render — and its
+  overflow line names that array rather than repeating the deferral promise,
+  which would be false twice over on a path that consumed the rows and has no
+  next operation to surface them on.
 
 - **`CasVersionConflict` no longer relabels every CAS refusal as
   `version_mismatch`.** The coordinator distinguishes four refusals —

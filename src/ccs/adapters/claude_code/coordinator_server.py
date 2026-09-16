@@ -2427,7 +2427,11 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             # Render prose for stream-json consumers / human inspection.
             response["hookSpecificOutput"] = {
                 "hookEventName": "Stop",
-                "additionalContext": _build_preemption_text(coordinator, pending),
+                # Unbounded drain + full structured array in this same
+                # response: the overflow is not deferred anywhere.
+                "additionalContext": _build_preemption_text(
+                    coordinator, pending, overflow_deferred=False
+                ),
             }
         return response
 
@@ -4754,6 +4758,8 @@ _SESSION_START_ARTIFACT_VERBATIM_CAP = 3
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
     notices: list[tuple[UUID, UUID, float]],
+    *,
+    overflow_deferred: bool = True,
 ) -> str:
     """A1 + F3: render pending preemption notices as additionalContext prose.
 
@@ -4766,13 +4772,19 @@ def _build_preemption_text(
     This bounds the prose to a constant-size block regardless of N and sidesteps
     Claude Code's 10KB additionalContext cap.
 
-    The overflow is a DEFERRAL, not a truncation: callers pass that same cap as
-    ``pop_pending_notices(consume_limit=...)``, so only the rendered rows are
-    consumed and the rest surface on the session's next tracked-file operation
-    (or age out via ``evict_stale_notices``). The overflow line used to name
-    ``/agent-coherence status`` / ``GET /status`` as the place to read the
-    rest — neither has ever carried notice data, and the rows had already been
-    deleted by the call that under-reported them.
+    On the four admit paths the overflow is a DEFERRAL, not a truncation:
+    they pass that same cap as ``pop_pending_notices(consume_limit=...)``, so
+    only the rendered rows are consumed and the rest surface on the session's
+    next tracked-file operation (or age out via ``evict_stale_notices``). The
+    overflow line used to name ``/agent-coherence status`` / ``GET /status`` as
+    the place to read the rest — neither has ever carried notice data, and the
+    rows had already been deleted by the call that under-reported them.
+
+    ``overflow_deferred=False`` is for ``session-stop``, whose drain is
+    UNBOUNDED and whose response returns every notice in its ``notices`` array.
+    Nothing is queued there — the rows are gone and a stopping session has no
+    next operation — so repeating the deferral promise would be false twice
+    over. It names the response's own array instead, which is where they are.
     """
     # Sort newest first — the most recent preemption is the most informative
     # signal for the agent's next decision. The registry already returns rows
@@ -4806,14 +4818,21 @@ def _build_preemption_text(
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
     if overflow:
-        # The overflow rows are NOT consumed — the drain above is bounded to
-        # what is rendered here — so they surface on this session's next
-        # tracked-file operation. The line used to point at /status, which
-        # carries no notice data at any disclosure tier, while the rows it
-        # named had just been deleted by the same call.
+        # Say where the unrendered notices actually ARE, which differs by
+        # caller. The bounded admit paths leave them in the table, so they
+        # surface on the next tracked-file operation. session-stop consumed
+        # them all and hands them back structurally in the same response —
+        # claiming they are "still queued" there would be false twice over
+        # (deleted rows, and no next operation for a stopping session). The
+        # line used to point at /status, which carries no notice data at any
+        # disclosure tier, while the rows it named had just been deleted.
+        if overflow_deferred:
+            where = "still queued — they surface on your next tracked-file operation."
+        else:
+            where = "listed in full in the `notices` array of this response."
         lines.append(
-            f"  • Plus {len(overflow)} more preemptions since your last activity, "
-            f"still queued — they surface on your next tracked-file operation."
+            f"  • Plus {len(overflow)} more preemptions since your last "
+            f"activity, {where}"
         )
     lines.append(
         "Re-read affected files before continuing if you need the latest "
