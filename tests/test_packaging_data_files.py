@@ -110,6 +110,28 @@ def _declared_data_files() -> set[Path]:
     return declared
 
 
+def _git_toplevel(repo_root: Path) -> Path | None:
+    """The working-tree root git resolves for ``repo_root``, or None.
+
+    ``git -C <dir>`` searches UPWARD for a ``.git``, so a checkout sitting
+    inside another repository — an unpacked sdist under someone's ``build/``,
+    a vendored copy — is answered by THAT repository. Its ignore rules then
+    describe a tree they know nothing about. For a git worktree this correctly
+    returns the worktree root rather than the main checkout.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    resolved = completed.stdout.strip()
+    return Path(resolved).resolve() if resolved else None
+
+
 def _tracked(repo_root: Path, source: str) -> bool:
     """Is `source` — the file an ignore rule came from — part of the repo?
 
@@ -153,6 +175,12 @@ def _locally_ignored_paths(
     """
     root = REPO_ROOT if repo_root is None else repo_root
     if not candidates:
+        return set()
+    # Refuse to answer unless git resolves to the tree we asked about. A
+    # foreign context reports candidates as ignored under ITS rules, which
+    # empties the walk and leaves the guard passing with nothing to check —
+    # the fail-open this whole filter is built to avoid.
+    if _git_toplevel(root) != root.resolve():
         return set()
     ordered = sorted(candidates)
     stdin = "\0".join(str(path) for path in ordered) + "\0"
@@ -433,3 +461,49 @@ def test_a_machine_local_exclude_does_hide_an_asset(tmp_path: Path) -> None:
         "only the .git/info/exclude rule is developer-local; the tracked "
         f".gitignore rule and the unignored path must survive. got {sorted(hidden)}"
     )
+
+
+def test_a_foreign_git_context_subtracts_nothing(tmp_path: Path) -> None:
+    """`git -C <dir>` searches UPWARD for a .git, so a checkout sitting inside
+    another repository answers from THAT repository's ignore rules.
+
+    An outer `.gitignore` covering the containing directory then reports every
+    candidate as ignored, the walk empties, and the primary guard passes while
+    checking nothing. Pin that the filter refuses to answer unless git resolves
+    to the tree it was asked about.
+    """
+    import subprocess as sp
+
+    outer = tmp_path / "outer"
+    inner = outer / "build" / "checkout"
+    inner.mkdir(parents=True)
+    sp.run(["git", "init", "-q", str(outer)], check=True)
+    (outer / ".gitignore").write_text("build/\n", encoding="utf-8")
+
+    candidate = inner / "src" / "ccs" / "asset.json"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("{}", encoding="utf-8")
+
+    # The outer repo really does call it ignored — the hazard is genuine.
+    outer_view = sp.run(
+        ["git", "-C", str(inner), "check-ignore", "-q", str(candidate)],
+        capture_output=True,
+    )
+    assert outer_view.returncode == 0, "fixture drifted: outer repo must ignore it"
+
+    hidden = mod._locally_ignored_paths({candidate}, repo_root=inner)
+    assert hidden == set(), (
+        "a foreign git context must subtract nothing — otherwise an outer "
+        "repo's ignore rules can empty the walk and the guard checks nothing"
+    )
+
+
+def test_this_worktree_is_its_own_git_toplevel() -> None:
+    """The containment check must not reject the normal case. A git worktree's
+    toplevel is the worktree root, not the main checkout, so the real tree
+    still gets a real answer."""
+    probe = {SRC_ROOT / "ccs" / "adapters" / "CLAUDE.md"}
+    # Not an assertion about THIS machine's exclude file: only that the filter
+    # answers at all here rather than bailing out as foreign.
+    assert mod._git_toplevel(REPO_ROOT) == REPO_ROOT
+    assert isinstance(mod._locally_ignored_paths(probe), set)
