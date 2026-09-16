@@ -862,7 +862,8 @@ class WorkspaceVersioner:
         backed, ``pin_unavailable`` is a structural refusal (re-attempting
         cannot change the bucket's Object Lock configuration or resurrect a
         gone version), and ``released`` was deliberately dropped by the
-        internal release. Returns the refreshed durable member rows.
+        release path (``WorkspaceVersioner.release_checkpoint``, or the
+        engine beneath it). Returns the refreshed durable member rows.
 
         Raises the typed :class:`~ccs.core.exceptions.CheckpointUnknown` for
         an unknown id, ``TypeError`` for a service without the pin surface,

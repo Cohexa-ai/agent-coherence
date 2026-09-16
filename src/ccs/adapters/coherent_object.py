@@ -720,7 +720,7 @@ class CoherentObject:
         self._put_legal_hold(artifact_ref, version_id=version_id, status="ON")
 
     def release_legal_hold(self, artifact_ref: str, *, version_id: str) -> None:
-        """Release one version's legal hold (the pin's internal-only drop half).
+        """Release one version's legal hold (the pin's drop half).
 
         Same typed error surface as :meth:`set_legal_hold`. Drives the
         workspace layer's ref-counted release, which reaches it through the

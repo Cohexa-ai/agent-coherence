@@ -2936,19 +2936,35 @@ def test_pin_checkpoint_after_release_checkpoint_is_one_way(
     registry: ArtifactRegistry, service: CoordinatorService
 ) -> None:
     """``released`` is terminal: the re-drive must not resurrect a pin the
-    caller deliberately dropped, so the hold stays off."""
+    caller deliberately dropped, so the hold stays off.
+
+    The FILE member is the load-bearing half of this test. The released S3
+    row also carries ``restorable-unpinned``, which ``_pin_eligible`` blocks
+    on tier alone — so the S3 half stays released even with no ``pin_state``
+    guard. A file row's ``restorable-unpinned`` tier is its ELIGIBLE tier, so
+    for that member only the ``pin_state`` guard stands between ``released``
+    and a resurrected pin.
+    """
     client, obj = _s3()
     put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
-    versioner = _versioner(service)
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    versioner = _versioner(service, resolver=resolver)
     versioner.add_object_member(obj, "cfg.json")
+    versioner.add_file_member(files, "notes/plan.md")
     cp = versioner.checkpoint("held")
     versioner.release_checkpoint(cp.record.checkpoint_id)
 
-    rows = versioner.pin_checkpoint(cp.record.checkpoint_id)
+    rows = {row.member_path: row for row in versioner.pin_checkpoint(cp.record.checkpoint_id)}
 
-    assert rows[0].pin_state == PIN_STATE_RELEASED
-    assert rows[0].restore_tier == "restorable-unpinned"
+    assert rows["s3://cfg.json"].pin_state == PIN_STATE_RELEASED
+    assert rows["s3://cfg.json"].restore_tier == "restorable-unpinned"
     assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    # Tier does not gate the file leg — this row witnesses the pin_state guard.
+    assert rows["notes/plan.md"].pin_state == PIN_STATE_RELEASED
+    assert rows["notes/plan.md"].restore_tier == "restorable-unpinned"
     record = registry.get_checkpoint(cp.record.checkpoint_id)
     assert record is not None and record.pin_refcount == 0
 
