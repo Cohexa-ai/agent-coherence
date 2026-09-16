@@ -2909,9 +2909,7 @@ def test_release_checkpoint_untyped_substrate_error_propagates_and_strands(
     left ``released`` with its hold still standing — record-before-drop, so
     no later release or re-pin will drop it. ``CoherentObject.
     release_legal_hold`` is the recovery."""
-    client = LocalS3Client()
-    client.create_bucket("demo", versioned=True, object_lock=True)
-    healthy = CoherentObject("demo", client=client)
+    client, healthy = _s3()
     broken = _ReleaseRaisesUntyped("demo", client=client)
     put_ok = client.put_object(Bucket="demo", Key="a-ok.json", Body=b"a")
     put_bad = client.put_object(Bucket="demo", Key="z-bad.json", Body=b"b")
