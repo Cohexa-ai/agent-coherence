@@ -4624,3 +4624,184 @@ def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
     })
     assert "session f2f7eab3 at" in stale
     assert sid not in stale
+
+
+# ======================================================================
+# /status holder set survives a coordinator restart
+# ======================================================================
+#
+# ``sessions`` used to be built by walking the adapter's in-memory
+# ``_agent_names`` map and looking each agent up in the registry snapshot.
+# That map is seeded empty on every process start and is only ever written
+# by ``register_session`` on hook traffic, so a restart erased every holder
+# from the payload while ``agent_states`` — and enforcement — kept them.
+# The registry's own holder set is the source of truth; a name is a label
+# the adapter may or may not have.
+
+
+def _restart_on(root: Path, instance_id: str) -> CoordinatorHTTPServer:
+    server = CoordinatorHTTPServer(root, port=0, instance_id=instance_id)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    return server
+
+
+def test_status_lists_a_grant_holder_that_predates_the_restart(
+    tmp_path: Path,
+) -> None:
+    """A holder whose grant survived a restart is reported, keyed on its raw
+    agent id with a null name — not dropped. Enforcement never stopped, so a
+    caller polling /status must not read the workspace as idle."""
+    first = _restart_on(tmp_path, "restart-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+        _, before = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        assert [s["agent_name"] for s in before["sessions"]] == [
+            f"claude-session-{sid}"
+        ]
+        assert before["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "restart-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+
+        assert len(after["sessions"]) == 1, (
+            "the EXCLUSIVE grant is still in agent_states and still arbitrates; "
+            "dropping it from /status makes a held file read as idle"
+        )
+        holder = after["sessions"][0]
+        assert holder["agent_id"] == str(session_to_agent_id(sid))
+        assert holder["agent_name"] is None, (
+            "the agent id is a uuid5 of the session id — unrecoverable, so the "
+            "name is honestly absent rather than guessed"
+        )
+        assert holder["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The same grant that /status now reports is the one enforcement uses.
+        _, collide = client.post(
+            "/hooks/pre-edit",
+            {"session_id": _sid("peer"), "path": "docs/plan.md"},
+        )
+        assert collide["collision"] is True
+    finally:
+        second.shutdown()
+
+
+def test_post_restart_holder_is_listed_at_the_default_tier(tmp_path: Path) -> None:
+    """The unnamed holder appears at the DEFAULT tier, not only behind
+    ?detail=full + the operator header. That is the security-relevant case, so
+    it is pinned explicitly: `sessions` has always been a minimal-tier field,
+    and this row repeats an `agent_id` already emitted there while dropping the
+    session-id-bearing `agent_name` — narrower than the named row it replaces.
+    """
+    first = _restart_on(tmp_path, "tier-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("tier-survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "tier-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+
+        # Default tier: no query string, no operator header.
+        _, minimal = client.get("/status")
+        assert minimal["detail"] == "minimal"
+        assert [s["agent_id"] for s in minimal["sessions"]] == [
+            str(session_to_agent_id(sid))
+        ]
+        assert minimal["sessions"][0]["agent_name"] is None
+        assert minimal["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The metrics tier still omits the collection entirely.
+        _, metrics = client.get("/status?detail=metrics")
+        assert "sessions" not in metrics
+    finally:
+        second.shutdown()
+
+
+def test_status_omits_invalidated_holders_after_a_restart(tmp_path: Path) -> None:
+    """Only non-INVALID states count as holding. A session whose grant was
+    taken away must not reappear as a holder just because its row survives."""
+    first = _restart_on(tmp_path, "inv-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        loser, winner = _sid("inv-loser"), _sid("inv-winner")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": loser, "path": "docs/plan.md"})
+        client.post("/hooks/pre-edit", {"session_id": winner, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "inv-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        by_id = {s["agent_id"]: s for s in after["sessions"]}
+        assert str(session_to_agent_id(winner)) in by_id
+        assert str(session_to_agent_id(loser)) not in by_id
+    finally:
+        second.shutdown()
+
+
+def test_status_still_lists_a_registered_session_holding_nothing(
+    client: _Client,
+) -> None:
+    """No regression on the live path: a session that registered but holds no
+    grant keeps its named entry with an empty state map."""
+    sid = _sid("named-no-grants")
+    client.post("/hooks/session-start", {"session_id": sid})
+    _, body = client.get("/status")
+    named = {s["agent_name"]: s for s in body["sessions"]}
+    assert f"claude-session-{sid}" in named
+    assert named[f"claude-session-{sid}"]["states"] == {}
+
+
+def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
+    """``StatusResponse`` documented ``last_writer``/``session_id`` keys the
+    handler has never emitted, and nothing in the tree type-checks against it,
+    so the drift was invisible. Pin the shape against a live body instead."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = _sid("shape")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    _, body = client.get("/status")
+
+    assert set(hp.StatusResponse.__annotations__) <= set(body)
+    assert {k for a in body["tracked_artifacts"] for k in a} == {
+        "path", "version", "id",
+    }
+    assert {k for s in body["sessions"] for k in s} == {
+        "agent_name", "agent_id", "states",
+    }

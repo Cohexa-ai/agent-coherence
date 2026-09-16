@@ -4206,23 +4206,45 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
     # held under one registry lock so the view is consistent.
     artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
-    agent_names_snapshot = coordinator.agent_names_snapshot()
+    named_agents = coordinator.agent_names_snapshot()
 
     tracked: list[dict] = [
         {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
         for artifact_id, meta in artifact_by_id.items()
     ]
+
+    # The HOLDER set comes from the registry; a NAME comes from the adapter.
+    # They are not the same set. ``_agent_names`` is process-local, seeded
+    # empty, and written only by ``register_session`` on hook traffic — so
+    # walking it as the outer loop dropped every grant that outlived the
+    # coordinator process that issued it, while the durable ``agent_states``
+    # row kept arbitrating (a peer's pre-edit still collides against a holder
+    # the payload never named). Build from the registry, then label.
+    states_by_agent: dict[UUID, dict[str, str]] = {}
+    for artifact_id, meta in artifact_by_id.items():
+        for agent_id, state in state_by_artifact[artifact_id].items():
+            if state == MESIState.INVALID:
+                continue
+            states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
+
     sessions: list[dict] = []
-    for agent_id, name in agent_names_snapshot:
-        per_artifact: dict[str, str] = {}
-        for artifact_id, meta in artifact_by_id.items():
-            state = state_by_artifact[artifact_id].get(agent_id)
-            if state is not None and state != MESIState.INVALID:
-                per_artifact[meta["name"]] = state.name
+    named_ids: set[UUID] = set()
+    for agent_id, name in named_agents:
+        named_ids.add(agent_id)
         sessions.append({
             "agent_name": name,
             "agent_id": str(agent_id),
-            "states": per_artifact,
+            "states": states_by_agent.get(agent_id, {}),
+        })
+    # ``agent_name`` is null rather than a guess: ``session_to_agent_id`` is a
+    # uuid5 of the session id, so the session id is NOT recoverable from the
+    # row. An entry keyed on the raw agent id is the honest answer, and it is
+    # strictly more than the empty list these holders used to render as.
+    for agent_id in sorted(states_by_agent.keys() - named_ids, key=str):
+        sessions.append({
+            "agent_name": None,
+            "agent_id": str(agent_id),
+            "states": states_by_agent[agent_id],
         })
 
     policy_summary = coordinator.policy.summary()

@@ -390,7 +390,10 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         print("Sessions:")
         for s in sessions:
             sid = s.get("agent_id", "?")
-            name = s.get("agent_name", "")
+            # A null agent_name means the coordinator holds the grant but has
+            # no name for its holder — the session id is a one-way uuid5 input,
+            # so it cannot be recovered. Say that, rather than printing "None".
+            name = s.get("agent_name") or "(name unknown — grant predates this coordinator)"
             per_artifact = s.get("states", {})
             print(f"  {sid[:8]}  {name}")
             if not per_artifact:

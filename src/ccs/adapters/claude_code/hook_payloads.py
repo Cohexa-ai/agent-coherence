@@ -312,8 +312,19 @@ class PolicyUntrackResponse(TypedDict):
 
 
 class StatusResponse(TypedDict):
-    tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "last_writer": "..."}, ...]
-    sessions: list[dict]  # [{"session_id": "...", "states": {path: state_name}}, ...]
+    """The ``GET /status`` body, as ``_handle_status`` actually emits it.
+
+    ``tracked_artifacts`` entries are ``{"path", "version", "id"}``;
+    ``sessions`` entries are ``{"agent_name", "agent_id", "states"}``, where
+    ``agent_name`` is ``None`` for a holder the adapter has no name for (a
+    grant that outlived the coordinator process that issued it). The earlier
+    annotation documented ``last_writer`` and ``session_id`` keys the handler
+    has never emitted; nothing in the tree type-checks against this TypedDict,
+    so the drift went unnoticed.
+    """
+
+    tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "id": "..."}, ...]
+    sessions: list[dict]  # [{"agent_name": str|None, "agent_id": "...", "states": {path: state_name}}, ...]
     # AC-02: canonical name follows KTD-J convention (full-word _seconds
     # suffix). ``coordinator_uptime_s`` is emitted alongside as a
     # deprecated alias for one release; consumers should migrate to the

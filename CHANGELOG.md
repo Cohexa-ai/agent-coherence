@@ -52,6 +52,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`GET /status` no longer reports an empty workspace while a grant is still
+  being enforced.** `sessions` was built by walking the adapter's in-memory
+  name map and looking each agent up in the registry snapshot. That map is
+  seeded empty on every process start and written only by `register_session`
+  on hook traffic, so a coordinator restart erased every holder from the
+  payload while the durable `agent_states` row kept arbitrating: a peer's
+  `pre-edit` still came back `collision: true` against a holder `/status` said
+  did not exist, and `agent-coherence-status` rendered the affirmative
+  `No active sessions.` The sweep did not bound it either — it reclaims only
+  MODIFIED and EXCLUSIVE, so a SHARED row survived indefinitely. The holder set
+  now comes from the registry and the name is a label applied afterwards. A
+  holder the adapter cannot name is listed on its raw agent id with
+  `agent_name: null` — the agent id is a one-way uuid5 of the session id, so
+  the name is honestly absent rather than guessed — and the CLI says so instead
+  of printing `None`. `StatusResponse` was documenting `last_writer` and
+  `session_id` keys the handler has never emitted; it now matches the wire.
+
 - **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
   `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
   warn-mode renderers sliced it to eight characters unconditionally, so a
