@@ -325,3 +325,29 @@ def test_distinct_counts_are_not_transposed_between_outcomes(registry) -> None:
     assert registry.foreign_write_totals() == {
         art: {"foreign": 1, "mediated": 2, "lag_suppressed": 3}
     }
+
+
+def test_a_writer_handle_raises_on_a_missing_detection_table(tmp_path: Path) -> None:
+    """Kills dropping the ``self._read_only and`` qualifier.
+
+    The tolerance is scoped to a read-only handle on purpose: a writer open
+    CREATES the detection tables, so their absence under one is a fault in the
+    store, not news about its vintage. Returning ``[]`` there would answer a
+    question about the workspace with a lie about the schema — and the mutation
+    that removes the qualifier left all 96 tests in the three foreign-write
+    suites green, because every existing test of this path opens read-only.
+    """
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE foreign_write_uncoverable")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.OperationalError):
+            reg.detection_uncoverable()
+    finally:
+        reg.close()
