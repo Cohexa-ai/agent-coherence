@@ -49,9 +49,11 @@ otherwise re-scope or silently exclude the rest of the poll.
 any git work tree cannot be polled at all, and never will be while that
 coordinator runs. Treating that as a failed poll would spend a traceback per
 tick on a permanent, expected condition and, worse, spend the signal a real
-``GitPollError`` carries. So the pass probes once, says so once at INFO, records
-the fact for the offline report, and stops polling — a state of its own, neither
-a clean zero nor an instrument that broke.
+``GitPollError`` carries. So the pass probes, says so at INFO, records the fact
+for the offline report, and — once that record lands — stops polling: a state of
+its own, neither a clean zero nor an instrument that broke. It stops only then,
+because the record is the whole point; a verdict cached over a store that
+refused the record would read back as an instrument that never ran.
 """
 
 from __future__ import annotations
@@ -105,13 +107,14 @@ _GIT_REDIRECT_VARS = (
 # write is in flight, which the timestamp alone cannot supply — see _classify.
 _WRITE_GRANT_STATES = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
 
-# The one-shot work-tree probe gets its own floor rather than the caller's tick
-# budget. The poll's budget is a sweep interval because the poll runs every
-# tick; this runs once per coordinator, so it need not fit inside one — and a
-# short interval (the examples use 0.1s) would otherwise let a cold first `git`
-# invocation time out, read as undetermined, and re-arm the per-tick traceback
-# this probe exists to retire.
-_PROBE_BUDGET_SEC = 5.0
+# How many times one coordinator will FORK for the work-tree probe before it
+# stops asking. This caps the fork, never the verdict: an UNDETERMINED answer
+# stays uncached (a repository mid-clone must still be re-probed), so the cap is
+# what keeps a layout that can NEVER resolve from paying a `git` process every
+# tick forever. A nested mount inside a checkout is the reachable case — git's
+# discovery stops at the boundary while `_has_git_entry` walks past it, so the
+# probe is permanently undetermined there and the poll alone must speak.
+_MAX_PROBE_ATTEMPTS = 3
 
 # Recorded verbatim in the store and read back by the offline report, so it is
 # named once here rather than spelled at each site.
@@ -149,15 +152,26 @@ class DetectionState:
     coordination state and no safety comparand: only which files are worth
     re-reading, and whether this workspace is worth polling at all.
 
-    One object rather than two parameters because both facts have the same
-    lifetime and the same owner, and a second loose dictionary in the sweep loop
-    is how the first one stops being obviously scoped.
+    One object rather than three parameters because the facts share a lifetime
+    and an owner, and a second loose dictionary in the sweep loop is how the
+    first one stops being obviously scoped.
     """
 
     stat_cache: dict[str, tuple[tuple[int, int], str]] = field(default_factory=dict)
     coverage: Coverage | None = None
     """``None`` until the first tick that would actually poll. Only a
     DEFINITIVE answer is stored — see :func:`_ensure_coverable`."""
+    probe_attempts: int = 0
+    """How many times this coordinator has forked for the probe. NOT a verdict
+    cache: reaching the cap stops the fork and leaves ``coverage`` untouched, so
+    an undetermined workspace keeps being polled and keeps raising honestly."""
+    pending_verdict: Coverage | None = None
+    """A definitive ``NO_WORK_TREE`` that the store has not yet accepted a note
+    for. Holding it is what separates the two reasons a tick can repeat: asking
+    git again (bounded by ``probe_attempts``) and asking the store again
+    (unbounded, because the note is the whole point). Without it a refused write
+    spent a fork it never needed, and three of them retired the probe for good
+    — re-arming the per-tick traceback this pass exists to retire."""
 
 
 def _has_git_entry(root: Path) -> bool:
@@ -169,11 +183,26 @@ def _has_git_entry(root: Path) -> bool:
     error steering cross-boundary control flow (see the typed-signal rule in
     ``docs/solutions/best-practices/``).
 
-    Absence of any ``.git`` above the root is the single piece of positive
-    evidence that this workspace is not a repository, and it is what the quiet
-    state has to earn. Every ambiguity resolves the other way: an entry that
-    exists but is unreadable, a broken symlink, or a root that cannot even be
-    resolved all report True, so the poll stays loud.
+    The quiet state must be earned from a SUCCESSFUL NEGATIVE OBSERVATION — a
+    lookup that answered "no ``.git`` here" — never from one that merely failed
+    to answer. That distinction is the whole function, and getting it wrong is
+    not hypothetical: the first version of this walk used ``os.path.lexists``,
+    which swallows a permission error and reports the entry absent, so a real
+    repository whose root stopped being readable earned the permanent quiet
+    state and a durable note asserting something false.
+
+    So every ambiguity reports True and the poll stays loud: a root that cannot
+    be resolved, an entry that exists but cannot be stat-ed, a symlink loop. An
+    entry that is positively absent (``ENOENT``), or whose parent is not a
+    directory so it cannot exist (``ENOTDIR``), is the one answer that counts as
+    evidence.
+
+    ``strict=True`` is load-bearing rather than tidy: the non-strict form
+    happily returns a path for a root that does not exist, which then walks and
+    finds nothing and reads as a workspace we observed to be bare. And the catch
+    covers ``RuntimeError`` because ``Path.resolve`` raises THAT, not ``OSError``,
+    for a symlink loop on Python 3.11 and 3.12 — this project's CI matrix — so
+    an ``OSError``-only catch makes the verdict depend on the interpreter.
 
     Git's own discovery can stop earlier than this walk does — at a filesystem
     boundary, by default. That asymmetry is safe in one direction only, and this
@@ -181,13 +210,18 @@ def _has_git_entry(root: Path) -> bool:
     withholds the quiet state, never grants it wrongly.
     """
     try:
-        current = root.resolve()
-        return any(
-            os.path.lexists(directory / ".git")
-            for directory in (current, *current.parents)
-        )
-    except OSError:
+        current = root.resolve(strict=True)
+    except (OSError, RuntimeError):
         return True
+    for directory in (current, *current.parents):
+        try:
+            os.lstat(directory / ".git")
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # positively absent here; keep walking up
+        except (OSError, RuntimeError):
+            return True  # could not tell — withhold the quiet state
+        return True  # present
+    return False
 
 
 def _probe_work_tree(root: Path, *, budget_sec: float) -> Coverage:
@@ -232,45 +266,69 @@ def _ensure_coverable(
     root: Path,
     *,
     now_unix: float,
-    poll_budget_sec: float,
+    budget_sec: float,
     state: DetectionState,
 ) -> bool:
-    """Whether to poll this tick. Probes at most once per coordinator.
+    """Whether to poll this tick. Probes until a verdict sticks, then not again.
 
     The disable is deliberately for the coordinator's life rather than
     re-checked: a workspace does not become a repository under a running
     coordinator often enough to pay a probe per tick for, and the INFO line says
     what to do when it does.
 
-    Only a definitive answer is cached. ``UNDETERMINED`` is not, so a repository
-    that was mid-clone or briefly unreadable is re-probed on the next tick
-    instead of being written off, and a genuinely broken one keeps raising from
-    the poll exactly as it did before.
+    Only a definitive answer is cached, and ``UNDETERMINED`` is not one, so a
+    repository mid-clone or briefly unreadable is re-probed rather than written
+    off. That deliberately leaves a workspace whose probe can NEVER resolve
+    forking every tick, so the fork — never the verdict — is capped; past the
+    cap the poll speaks alone and raises exactly as it did before.
+
+    ``budget_sec`` is what remains of THIS tick, not a budget of its own. The
+    probe and the poll are one pass billed against one sweep interval, because
+    the four safety passes ahead of them in the loop are what a slow tick
+    actually costs.
     """
     if state.coverage is Coverage.COVERED:
         return True
     if state.coverage is Coverage.NO_WORK_TREE:
         return False
 
-    coverage = _probe_work_tree(
-        root, budget_sec=max(poll_budget_sec, _PROBE_BUDGET_SEC)
-    )
-    if coverage is Coverage.UNDETERMINED:
-        return True  # nothing established; the poll speaks for this tick
-    state.coverage = coverage
-    if coverage is Coverage.COVERED:
-        return True
+    coverage = state.pending_verdict
+    if coverage is None:
+        if state.probe_attempts >= _MAX_PROBE_ATTEMPTS or budget_sec <= 0:
+            # Nothing left to spend on an answer, or too many spent already.
+            # Same disposition as an undetermined probe: establish nothing,
+            # cache nothing, and let the poll be the thing that speaks.
+            return True
 
-    # INFO, once, and not `logger.exception`: this is a supported way to run the
-    # coordinator, not a fault. It still has to be actionable, so it names the
-    # workspace and the one thing that changes the answer.
-    logger.info(
-        "foreign-write detection is off for %s: it is not inside a git work "
-        "tree, so there is nothing for the poll to read. Detection covers "
-        "git-tracked files only; restart the coordinator after `git init` to "
-        "turn it on.",
-        root,
-    )
+        state.probe_attempts += 1
+        coverage = _probe_work_tree(root, budget_sec=budget_sec)
+        if coverage is Coverage.UNDETERMINED:
+            return True  # nothing established; the poll speaks for this tick
+        if coverage is Coverage.COVERED:
+            # Safe to settle here, and only here: this verdict says nothing more
+            # than "keep polling", and every write that follows it is on the
+            # loud path — a failure raises, the tick goes unrecorded, and the
+            # next tick polls again. Nothing is disabled, so nothing can be
+            # disabled wrongly.
+            state.coverage = coverage
+            return True
+
+        # Remembered BEFORE the writes below, so a store that refuses the note
+        # costs a retry of the note alone: no second `git` fork, no second INFO
+        # line, and — the defect this field exists for — no fork attempt spent
+        # out of the budget that a genuinely undetermined workspace needs.
+        state.pending_verdict = coverage
+        # INFO, once, and not `logger.exception`: this is a supported way to run
+        # the coordinator, not a fault. It still has to be actionable, so it
+        # names the workspace and the one thing that changes the answer.
+        logger.info(
+            "foreign-write detection is off for %s: git reports no work tree "
+            "there, so there is nothing for the poll to read. Detection covers "
+            "git-tracked files only. If this path should hold a repository, it "
+            "was not there when the coordinator started — mount it, or "
+            "`git init` — and restart the coordinator to turn detection on.",
+            root,
+        )
     # Closed BEFORE the note is recorded, which does two things with one call.
     #
     # It ends any interval that was open, for the same reason a failed poll ends
@@ -283,14 +341,24 @@ def _ensure_coverable(
     #
     # And it moves the note onto a run id of its own, so no single run can read
     # as both an interval the detector watched and one with no workspace to
-    # watch. Detection stops for this coordinator's life immediately below, so
-    # nothing further attaches to that id.
+    # watch. Detection stops for this coordinator's life as soon as the note
+    # below lands, so nothing further attaches to that id; if the note does NOT
+    # land, the pass retries, and the only thing that can attach is a tick over
+    # a workspace that genuinely became a repository in the meantime.
     registry.close_detection_run()
     # Recorded so the OFFLINE report can say this too. Without the row the store
     # reads as not-instrumented — the same answer a store gets when the sweep
     # was off or the instrument failed every tick, which is precisely the
     # collapse this instrument's states exist to prevent.
     registry.record_detection_uncoverable(NO_WORK_TREE_REASON, now_unix)
+    # Settled only now, and deliberately not before the two writes above. The
+    # cache is what ends the retries, so it must never outrun the record that
+    # makes this verdict readable offline: a store that refused the note —
+    # locked, out of disk — would otherwise have seen the LAST attempt this
+    # coordinator ever made, leaving no note, no tick, and a report that reads
+    # `not-instrumented`. That is the instrument accused of never running,
+    # which is the exact collapse these states exist to prevent.
+    state.coverage = coverage
     return False
 
 
@@ -336,7 +404,9 @@ def _poll_env() -> dict[str, str]:
 def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[str]:
     """Return the subset of ``names`` git reports as dirty in ``root``.
 
-    ``budget_sec`` bounds the WHOLE poll, not each batch. A per-batch timeout
+    ``budget_sec`` bounds the WHOLE poll, not each batch — and it is what the
+    pass has LEFT, not the configured interval, because the work-tree probe is
+    billed against the same tick. A per-batch timeout
     lets a large path list stall the sweep thread for the sum of its batches,
     and detection runs in the same loop as grant reclamation — so an instrument
     that overruns delays the next tick's safety work. Exhausting the budget
@@ -359,7 +429,8 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise GitPollError(
-                f"git poll exceeded its {budget_sec:.1f}s budget in {root}"
+                f"git poll exceeded its {budget_sec:.1f}s remaining budget "
+                f"in {root}"
             )
         try:
             result = subprocess.run(
@@ -640,11 +711,17 @@ def _detect(
     # After the empty-scope check, so a workspace with nothing in scope is never
     # probed, and before the poll, so a workspace with no work tree never runs a
     # `git status` that can only fail.
+    # ONE deadline for the whole pass, not one per `git` invocation. The probe
+    # and the poll are billed together, because what a slow tick actually costs
+    # is the four safety passes ahead of them in the sweep loop — grant
+    # reclamation and session liveness among them. Billing them separately let a
+    # pass occupy two sweep intervals while two comments promised one.
+    pass_deadline = time.monotonic() + poll_budget_sec
     if not _ensure_coverable(
         registry,
         root,
         now_unix=now_unix,
-        poll_budget_sec=poll_budget_sec,
+        budget_sec=max(0.0, pass_deadline - time.monotonic()),
         state=state,
     ):
         # Deliberately no tick, for the same reason the empty-scope branch
@@ -652,7 +729,11 @@ def _detect(
         # let an unwatchable workspace read as a clean one.
         return 0
 
-    dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
+    # Whatever the probe left. A probe that spent the tick leaves the poll none,
+    # and the poll then fails honestly rather than overrunning the interval.
+    dirty = _git_dirty_paths(
+        root, covered, budget_sec=max(0.0, pass_deadline - time.monotonic())
+    )
     counted = 0
     for name in sorted(dirty & set(covered)):
         try:

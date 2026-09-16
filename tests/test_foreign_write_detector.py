@@ -17,14 +17,19 @@ defaults would exercise nothing.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from ccs.adapters.claude_code import foreign_write_detector
 from ccs.adapters.claude_code.foreign_write_detector import (
+    _MAX_PROBE_ATTEMPTS,
     NO_WORK_TREE_REASON,
     Coverage,
     DetectionState,
@@ -876,11 +881,28 @@ def test_a_workspace_with_nothing_in_scope_is_never_even_probed(
     already returns without a tick. It must also return without a subprocess:
     probing a workspace the detector has no reason to look at would spend a
     process on every coordinator that never registers anything.
+
+    Asserts on the OBSERVED argv list rather than on a raising sentinel. A
+    sentinel is unusable here and the first version of this test used one: the
+    pass is contractually required to swallow every exception, so an
+    ``AssertionError`` side effect is caught by ``run_detection_pass`` and none
+    of the assertions below can see it. Moving the probe ahead of the
+    empty-scope check — deleting the guarantee this test is named for — left
+    that version green.
     """
     state = DetectionState()
-    with mock.patch.object(subprocess, "run", side_effect=AssertionError("probed")):
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _recording_run(argv, *args, **kwargs):
+        calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    with mock.patch.object(subprocess, "run", _recording_run):
         assert _tick(bare_coordinator, now_unix=100.0, state=state) == 0
+    assert calls == [], calls
     assert state.coverage is None
+    assert state.probe_attempts == 0
     assert bare_coordinator.registry.detection_uncoverable() == []
 
 
@@ -998,3 +1020,283 @@ def test_losing_the_repository_after_a_tick_ends_that_interval(
     uncoverable = coordinator.registry.detection_uncoverable()
     assert [u.reason for u in uncoverable] == [NO_WORK_TREE_REASON]
     assert {u.run_id for u in uncoverable}.isdisjoint({r.run_id for r in after})
+
+
+# ---------------------------------------------------------------------------
+# The quiet state is earned from a successful NEGATIVE observation, never from
+# a lookup that failed to produce one
+# ---------------------------------------------------------------------------
+
+
+def _unreadable(path: Path):
+    """Make ``path`` untraversable, restoring it even if the test fails."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        original = path.stat().st_mode
+        os.chmod(path, 0o000)
+        try:
+            yield
+        finally:
+            os.chmod(path, original)
+
+    return _ctx()
+
+
+def test_a_root_that_cannot_be_resolved_stays_loud(tmp_path: Path) -> None:
+    """Kills `resolve(strict=True)` -> `resolve()`.
+
+    The non-strict form cheerfully returns a path for a root that does not
+    exist; the walk then finds no `.git` above it and the workspace reads as one
+    we OBSERVED to be bare. It was never seen at all.
+    """
+    # Precondition, matching the bare_workspace fixture's own policy: if a .git
+    # sat above the pytest temp root, the non-strict mutant would answer True
+    # for that reason and this test would pass without testing anything.
+    assert _has_git_entry(tmp_path) is False, "temp root is inside a repository"
+    assert _has_git_entry(tmp_path / "never-existed") is True
+    assert (
+        _probe_work_tree(tmp_path / "never-existed", budget_sec=POLL_BUDGET)
+        is Coverage.UNDETERMINED
+    )
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod 000 denies nothing to root, so this guard would be vacuous",
+)
+def test_a_repository_whose_root_became_unreadable_stays_loud(repo: Path) -> None:
+    """Kills a revert to `os.path.lexists`, and the whole finding's point.
+
+    `lexists` swallows the permission error and answers "absent", so a real
+    repository whose root stopped being readable earned the permanent quiet
+    state and a durable note asserting something false — on an ordinary local
+    filesystem, with no network share and no unmount.
+    """
+    with _unreadable(repo):
+        assert _has_git_entry(repo) is True
+        assert _probe_work_tree(repo, budget_sec=POLL_BUDGET) is Coverage.UNDETERMINED
+
+
+def test_a_symlink_loop_root_stays_loud(tmp_path: Path) -> None:
+    """Kills `except (OSError, RuntimeError)` -> `except OSError`.
+
+    VERSION-SENSITIVE BY DESIGN, and that is the finding: `Path.resolve` raises
+    RuntimeError — not OSError — for a symlink loop on Python 3.11 and 3.12,
+    this project's CI matrix, while 3.13 raises OSError. An OSError-only catch
+    therefore makes the verdict depend on the interpreter: a traceback per tick
+    on the supported versions, a permanently quiet false note on 3.13. Do not
+    "simplify" the tuple away on a 3.13 laptop and watch this stay green.
+    """
+    loop = tmp_path / "loop"
+    os.symlink(str(loop), str(loop))
+    assert _has_git_entry(loop) is True
+    assert _probe_work_tree(loop, budget_sec=POLL_BUDGET) is Coverage.UNDETERMINED
+
+    # The arm that bites on EVERY interpreter, including the 3.13 most of this
+    # repo is developed on, where the real loop raises OSError and the assertion
+    # above therefore survives the narrowed catch.
+    with mock.patch.object(Path, "resolve", side_effect=RuntimeError("loop")):
+        assert _has_git_entry(tmp_path) is True
+
+
+def test_an_ordinary_bare_directory_is_still_quiet(bare_workspace: Path) -> None:
+    """Kills an over-broad fix that re-arms the noise this whole change retires.
+
+    Withhold the quiet state from a root we could not SEE; never from one we
+    saw and found bare. This is the case the feature exists for.
+    """
+    assert _has_git_entry(bare_workspace) is False
+    assert (
+        _probe_work_tree(bare_workspace, budget_sec=POLL_BUDGET)
+        is Coverage.NO_WORK_TREE
+    )
+
+
+def test_an_unseeable_root_records_no_note_and_caches_nothing(
+    bare_coordinator, bare_workspace: Path, caplog
+) -> None:
+    """The store, not just the enum — a fix that only moves `Coverage` is not one.
+
+    A root renamed away before the first probe must leave the detector with
+    nothing settled and the store with nothing asserted, and the poll must be
+    the thing that speaks (loudly).
+    """
+    _register(bare_coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+    bare_workspace.rename(bare_workspace.parent / "moved-away")
+    try:
+        with caplog.at_level(logging.DEBUG, logger=_DETECTOR_LOGGER):
+            assert _tick(bare_coordinator, now_unix=100.0, state=state) == 0
+        assert state.coverage is None
+        assert bare_coordinator.registry.detection_uncoverable() == []
+        assert bare_coordinator.registry.detection_runs() == []
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors and errors[0].exc_info is not None
+    finally:
+        (bare_workspace.parent / "moved-away").rename(bare_workspace)
+
+
+# ---------------------------------------------------------------------------
+# The verdict may never outrun the record that makes it readable
+# ---------------------------------------------------------------------------
+
+
+class _FailingUncoverable:
+    """Registry proxy whose uncoverable write fails the first ``fail_times``."""
+
+    def __init__(self, inner, fail_times: int) -> None:
+        self._inner = inner
+        self._remaining = fail_times
+        self.attempts = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        self.attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise sqlite3.OperationalError("database is locked")
+        self._inner.record_detection_uncoverable(reason, now_unix)
+
+
+@pytest.mark.parametrize("fail_times", [1, _MAX_PROBE_ATTEMPTS, _MAX_PROBE_ATTEMPTS + 2])
+def test_a_refused_note_leaves_the_verdict_unsettled_and_retries(
+    bare_coordinator, fail_times: int
+) -> None:
+    """Kills caching the verdict before the two registry writes.
+
+    One transient sqlite failure used to be permanent: the cache is what ends
+    the retries, so setting it first made a refused write the LAST attempt the
+    coordinator ever made — no note, no tick, and an offline report reading
+    `not-instrumented`, the instrument accused of never having run.
+    """
+    _register(bare_coordinator, "notes.md", "v1\n")
+    guarded = _FailingUncoverable(bare_coordinator.registry, fail_times=fail_times)
+    bare_coordinator.registry = guarded
+    state = DetectionState()
+    argv: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _recording_run(a, *args, **kwargs):
+        argv.append(list(a))
+        return real_run(a, *args, **kwargs)
+
+    with mock.patch.object(subprocess, "run", _recording_run):
+        for tick in range(fail_times + 3):
+            assert _tick(bare_coordinator, now_unix=100.0 + tick, state=state) == 0
+            if tick < fail_times:
+                assert state.coverage is None, "a refused note must not settle"
+                assert guarded._inner.detection_uncoverable() == []
+
+    # The note lands on the first tick the store accepts it, however many it
+    # refused first. The retry is the store's, so it must not be bounded by the
+    # probe's fork budget: counting a refused write as a spent probe attempt
+    # retired the probe after three of them and let `git status` run in a
+    # non-git workspace on every tick after that — the exact defect this whole
+    # change exists to remove, re-armed by a transient sqlite error.
+    assert state.coverage is Coverage.NO_WORK_TREE
+    assert [u.reason for u in guarded._inner.detection_uncoverable()] == [
+        NO_WORK_TREE_REASON
+    ]
+    assert guarded.attempts == fail_times + 1
+    assert not [a for a in argv if "status" in a], argv
+    # One fork and one INFO for the verdict, no matter how long the store
+    # refused it: the retry is of the note alone.
+    assert len([a for a in argv if "rev-parse" in a]) == 1, argv
+    assert state.probe_attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# The probe and the poll are one pass billed against one tick
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_and_the_poll_share_one_tick_budget(coordinator) -> None:
+    """Kills billing the probe its own floor on top of the poll's budget.
+
+    Detection is the fifth pass in a loop whose first four are safety work
+    (grant reclamation, session liveness). A pass that can occupy two sweep
+    intervals delays that work, and two comments in this codebase promised it
+    could not.
+    """
+    _register(coordinator, "notes.md", "v1\n")
+    budget, probe_cost = 1.0, 0.5
+    timeouts: list[float] = []
+    real_run = subprocess.run
+
+    def _recording_run(argv, *args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        if "rev-parse" in argv:
+            time.sleep(probe_cost)  # a probe that spends half the tick
+        return real_run(argv, *args, **kwargs)
+
+    with mock.patch.object(subprocess, "run", _recording_run):
+        run_detection_pass(
+            coordinator,
+            now_unix=100.0,
+            window_sec=WINDOW,
+            poll_budget_sec=budget,
+            state=DetectionState(),
+        )
+
+    assert len(timeouts) == 2, timeouts  # the probe, then the poll
+    # Asserting the ALLOWANCES, not their sum: a fast probe legitimately leaves
+    # the poll most of the interval, so a summed bound would fail on healthy
+    # behaviour. What must hold is that neither is granted more than the tick
+    # has left — the probe no floor of its own, the poll only the remainder.
+    assert timeouts[0] <= budget, f"probe billed its own floor: {timeouts}"
+    assert timeouts[1] <= budget - probe_cost + 0.05, (
+        f"poll billed the full interval after the probe spent half: {timeouts}"
+    )
+
+
+def test_a_never_resolving_probe_stops_forking_but_never_caches(
+    coordinator, repo: Path
+) -> None:
+    """Kills removing the fork cap, and kills "fixing" it by caching UNDETERMINED.
+
+    A nested mount inside a checkout answers UNDETERMINED forever (git's
+    discovery stops at the boundary, the filesystem walk climbs past it), so an
+    uncapped probe forks every tick for an answer it can never get. The cap
+    bounds the FORK; the verdict must stay unsettled so a repository that is
+    merely mid-clone is still re-probed by the poll's own honest failure.
+    """
+    _register(coordinator, "notes.md", "v1\n")
+    state = DetectionState()
+    probes = 0
+    real_run = subprocess.run
+
+    def _undetermined_probe(argv, *args, **kwargs):
+        nonlocal probes
+        if "rev-parse" in argv:
+            probes += 1
+            raise subprocess.TimeoutExpired("git", 5.0)
+        return real_run(argv, *args, **kwargs)
+
+    def _ticks_recorded() -> int:
+        return sum(r.tick_count for r in coordinator.registry.detection_runs())
+
+    with mock.patch.object(
+        foreign_write_detector, "_has_git_entry", lambda root: True
+    ), mock.patch.object(subprocess, "run", _undetermined_probe):
+        for tick in range(_MAX_PROBE_ATTEMPTS):
+            _tick(coordinator, now_unix=100.0 + tick, state=state)
+        assert probes == _MAX_PROBE_ATTEMPTS, probes
+        at_cap = _ticks_recorded()
+        for tick in range(5):
+            _tick(coordinator, now_unix=200.0 + tick, state=state)
+
+    assert probes == _MAX_PROBE_ATTEMPTS, "the cap must stop the fork"
+    assert state.coverage is None, "the cap bounds the fork, never the verdict"
+    # And the poll must keep running PAST the cap. Comparing against the count
+    # at the cap is the whole point: an `_ensure_coverable` that returned False
+    # there would leave the runs recorded BEFORE it in place, so merely
+    # asserting that some run exists passes while detection is silently off —
+    # the wrong-direction regression the docstring promises against.
+    assert _ticks_recorded() == at_cap + 5, (
+        f"the poll stopped at the cap: {at_cap} -> {_ticks_recorded()}"
+    )
+    assert coordinator.registry.detection_uncoverable() == []

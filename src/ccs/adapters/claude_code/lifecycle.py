@@ -871,10 +871,12 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
         # Two separate guards keep the failure domains apart in both
         # directions. ``run_detection_pass`` raises nothing by contract.
         #
-        # The poll gets one sweep interval as its whole budget, not per batch:
-        # detection runs in this loop, so an instrument that overruns delays the
-        # next tick's grant reclamation. Exhausting it fails the poll honestly,
-        # which leaves the tick unrecorded and the gap visible.
+        # Both `git` invocations in the pass share one sweep interval — the
+        # work-tree probe and the poll, with the poll billed for what the probe
+        # left. Not per batch, and not one budget each: detection runs in this
+        # loop, so a pass that overruns delays the next tick's grant
+        # reclamation. Exhausting it fails the poll honestly, which leaves the
+        # tick unrecorded and the gap visible.
         #
         # The window is the shipped benign commit-to-disk lag plus one tick.
         # They are otherwise both 5.0s and the comparison is inclusive, so a
