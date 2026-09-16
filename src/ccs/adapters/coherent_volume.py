@@ -38,6 +38,7 @@ import io
 import logging
 import os
 import threading
+import time
 import urllib.error
 import uuid
 import warnings
@@ -120,11 +121,34 @@ class _ReadResult(NamedTuple):
 #   a silent drop). A stale-denied comparand read never POSTs, so it does NOT
 #   consume this budget.
 # - CONSECUTIVE stale-denied comparand reads are bounded at
-#   ``MAX_CAS_REACQUIRES + 1``; on exhaustion ``write_cas`` raises
+#   ``MAX_CAS_REACQUIRES + 1``, WITH a capped-exponential wait between re-reads
+#   (the transient clears on a peer's progress, so the poll yields to it — see
+#   ``DENIED_READ_BACKOFF_BASE_SEC``); on exhaustion ``write_cas`` raises
 #   :class:`~ccs.core.exceptions.CoherenceError` (a view that never clears —
 #   wedged coordinator / perpetually lagging disk — must not spin). A clean
 #   read resets the streak.
 MAX_CAS_REACQUIRES = 8
+
+# A stale-denied comparand read has two causes. One is LOCAL and clears on the
+# ``_remint()`` alone (this instance is ``INVALID``). The other is a TRANSIENT that
+# clears only on ANOTHER writer's progress: the window between a peer's confirmed
+# CAS and its ``_atomic_write`` landing on disk. Because the second cause is the one
+# a streak is made of, the denied-read retry must WAIT, not spin.
+# Polling it with no delay made the streak bound a proxy for CPU scheduling luck
+# rather than for a wedged view: measured, 9 undelayed re-reads burn through in
+# ~37ms of wall clock, so a peer descheduled inside that window (routine on a
+# loaded 2-vCPU CI runner) wedged the loser even though the view would have
+# cleared moments later. Worse, the undelayed loser COMPETES for CPU with
+# the very peer whose disk write unblocks it. A capped-exponential wait between
+# denied re-reads yields to that peer and denominates the bound in time, so the
+# streak still fails closed on a genuinely never-clearing view (foreign edit,
+# wedged coordinator) without going red on scheduler jitter.
+# The schedule below bounds ONE streak (8 waits, 212ms). A clean read resets the
+# streak, so a single ``write_cas`` call that alternates streaks with lost CAS races
+# can traverse up to ``MAX_CAS_REACQUIRES + 1`` of them — the per-call wait is
+# bounded, but by ~1.9s in aggregate, not by one schedule.
+DENIED_READ_BACKOFF_BASE_SEC = 0.002
+DENIED_READ_BACKOFF_CAP_SEC = 0.05
 
 # SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
 # model's retry loop sees identical text each attempt (KTD-P), and distinct from
@@ -893,8 +917,17 @@ class CoherentVolume:
         landed but its disk write hasn't) does NOT consume the commit budget;
         instead CONSECUTIVE denied reads are separately bounded (also at
         ``MAX_CAS_REACQUIRES + 1``) and raise ``ViewWedged`` (a ``CoherenceError``
-        subclass) if the view never clears. Both terminals are the honest fail-closed outcome,
-        **never** a silent lost update: the invariant this method guarantees is
+        subclass) if the view never clears. That poll WAITS between re-reads
+        (capped-exponential, :data:`DENIED_READ_BACKOFF_BASE_SEC` →
+        :data:`DENIED_READ_BACKOFF_CAP_SEC`) rather than spinning: the transient
+        clears on a PEER's progress, so the waiting writer must yield the CPU to
+        it instead of racing it — an undelayed poll made this bound a proxy for
+        scheduler luck (a measured ~37ms of wall clock) rather than for a wedged
+        view. That schedule bounds ONE streak (212ms); a clean read resets the
+        streak, so a call that alternates streaks with lost races can traverse up
+        to ``MAX_CAS_REACQUIRES + 1`` of them (~1.9s in aggregate).
+        Both terminals are the honest fail-closed outcome, **never** a silent
+        lost update: the invariant this method guarantees is
         *final == start + every applied delta, OR a typed raise* — a successful
         return always means the update landed.
 
@@ -993,6 +1026,14 @@ class CoherentVolume:
                         "landed (fail-closed)."
                     )
                 self._remint()
+                # WAIT, don't spin: yield the CPU to the peer whose disk write
+                # clears this view (see DENIED_READ_BACKOFF_BASE_SEC).
+                time.sleep(
+                    min(
+                        DENIED_READ_BACKOFF_BASE_SEC * (2 ** (denied_streak - 1)),
+                        DENIED_READ_BACKOFF_CAP_SEC,
+                    )
+                )
                 continue
             denied_streak = 0
 
