@@ -31,9 +31,13 @@ Alpha — APIs may change before `v1.0`.
   records how many files were in scope so watching none is distinguishable from
   watching many and finding nothing. **A failed check is not recorded as a
   check**, and it ends that run's observed period, so a broken poll shows up as
-  a gap rather than being interpolated across — and **a workspace that has no
-  repository to poll says so once** rather than printing a traceback every
-  sweep, while a repository that exists but is broken keeps its traceback,
+  a gap rather than being interpolated across. So does a stretch with nothing in
+  scope, and so does a stretch in which the check did not run at all — a
+  suspended machine, a stalled coordinator — because **a run's period is a claim
+  that it was watched end to end**, and every way of not watching has to end it.
+  Separately, **a workspace that has no repository to poll says so once**
+  rather than printing a traceback every sweep, while a repository that exists
+  but is broken keeps its traceback,
   because git describes the two identically and only looking for the repository
   tells them apart. Both still record no check and still leave the gap visible:
   what differs is the log, never the report. **A suppression expires**: a

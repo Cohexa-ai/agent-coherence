@@ -41,6 +41,14 @@ exit and a clean tree to the same value; here a failed poll raises, the tick is
 NOT recorded, and the run's observed interval is closed so the offline report
 shows a hole rather than interpolating across it.
 
+**A run row is a claim about a span, so every way of not watching ends it.**
+There are three, and the first two are the only ones this pass can see: a poll
+that failed, and a tick that found nothing in scope. The third is the pass not
+running at all — a suspended host, or the four safety passes ahead of detection
+stuck on the store — which leaves no trace here by construction. So a tick that
+arrives further from the last one than the sweep cadence can explain opens a
+new interval instead of joining the old, and the stall reads as the hole it was.
+
 **An inert workspace is not a broken poll.** A workspace with no repository at
 or above it cannot be polled at all: the condition is permanent, no operator
 action clears it, and every tick would otherwise log the same traceback until
@@ -588,6 +596,8 @@ def run_detection_pass(
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
     reported_faults: set[str],
+    tick_clock: dict[str, float],
+    max_gap_sec: float,
 ) -> int:
     """Run one detection tick. Returns the number of observations counted.
 
@@ -605,6 +615,14 @@ def run_detection_pass(
     once per tick. Nothing reads it but the log, and a completed poll clears it
     — the latch tracks the condition, so a workspace that later becomes a
     repository and then is not one again reports the second time too.
+
+    ``tick_clock`` is the caller's third piece and holds one number: when this
+    pass last recorded a tick. It is what lets a stall be seen at all — the
+    pass cannot observe the interval in which it did not run, so the only
+    evidence is the distance back to the tick before it. ``max_gap_sec`` is how
+    far apart two ticks may be and still belong to one continuously observed
+    span; the caller owns it because the caller owns the cadence. Both reset
+    with the process, which is correct: a restart opens a fresh run anyway.
     """
     try:
         return _detect(
@@ -614,6 +632,8 @@ def run_detection_pass(
             poll_budget_sec=poll_budget_sec,
             stat_cache=stat_cache,
             reported_faults=reported_faults,
+            tick_clock=tick_clock,
+            max_gap_sec=max_gap_sec,
         )
     except NotAGitRepositoryError as exc:
         # Not an error to hand an operator every five seconds: the instrument is
@@ -634,13 +654,15 @@ def run_detection_pass(
 
 
 def _close_observed_interval(coordinator: DetectionTarget) -> None:
-    """End the run's observed interval after a failed tick.
+    """End the run's observed interval after a tick that observed nothing.
 
     Without this a later successful tick would extend the same interval across
     the outage, and a coverage question answered from that interval would claim
     a span nothing watched. The next success opens a new interval and the hole
-    shows. Every failed tick closes it, including the inert-workspace one: what
-    that case quiets is the log, never the report.
+    shows. Every tick that observed nothing closes it — a failed poll, the
+    inert workspace, a tick with nothing in scope, and a tick that arrives too
+    late to join the interval before it. What the inert-workspace case quiets
+    is the log, never the report.
     """
     try:
         coordinator.registry.close_detection_run()
@@ -656,6 +678,8 @@ def _detect(
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
     reported_faults: set[str],
+    tick_clock: dict[str, float],
+    max_gap_sec: float,
 ) -> int:
     # Bind both to locals for the whole tick. `/policy/track` swaps the policy
     # object atomically while the coordinator runs, and registration is
@@ -720,7 +744,20 @@ def _detect(
     # Only now, and only because the poll completed. A tick counted over a
     # failed poll would let the offline report call a broken instrument a quiet
     # month, which is the one reading the liveness row exists to prevent.
+    #
+    # And only into an interval this tick can honestly join. The run row says
+    # its span was continuously observed, so a tick that arrives further from
+    # the last one than the cadence explains would stretch that claim over a
+    # stretch nothing watched — the same false clean as a failed poll, reached
+    # by the pass not running rather than by the pass failing. Closing first
+    # makes this tick open a new interval and leaves the stall as a hole. A
+    # clock that steps backwards shortens the apparent gap rather than
+    # lengthening it, so it can only under-split, never invent a hole.
+    last_tick = tick_clock.get("last_tick_unix")
+    if last_tick is not None and (now_unix - last_tick) > max_gap_sec:
+        _close_observed_interval(coordinator)
     registry.record_detection_tick(now_unix, covered_count=len(covered))
+    tick_clock["last_tick_unix"] = now_unix
     return counted
 
 

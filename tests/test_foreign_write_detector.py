@@ -36,6 +36,9 @@ from ccs.core.substrate import sha256_hex
 
 WINDOW = 10.0
 POLL_BUDGET = 30.0
+# Generous by default so the existing tests, which step now_unix by whatever
+# suits them, never trip the staleness split; the tests that care pass their own.
+MAX_GAP = 1_000_000.0
 
 
 def _tick(
@@ -45,6 +48,8 @@ def _tick(
     window_sec: float = WINDOW,
     cache=None,
     faults=None,
+    clock=None,
+    max_gap_sec: float = MAX_GAP,
 ) -> int:
     """One tick with the two caller-owned pieces the sweep loop holds across
     ticks: the stat cache, and the latch of already-reported permanent faults.
@@ -56,6 +61,8 @@ def _tick(
         poll_budget_sec=POLL_BUDGET,
         stat_cache=cache if cache is not None else {},
         reported_faults=faults if faults is not None else set(),
+        tick_clock=clock if clock is not None else {},
+        max_gap_sec=max_gap_sec,
     )
 
 
@@ -393,10 +400,77 @@ def test_a_window_with_nothing_in_scope_is_a_hole_not_a_covered_span(
     coordinator.policy = _policy(repo, "notes.md")  # and restored
     _tick(coordinator, now_unix=10000.0)
 
+    from ccs.diagnose.foreign_writes import read_foreign_write_report
+
+    db = Path(coordinator.registry._db_path)  # noqa: SLF001 — the store under test
+    coordinator.registry.close()
+    report = read_foreign_write_report(db)
+
+    # Asserted through the offline report rather than the live run rows,
+    # because `covers` is what an operator actually asks and what this fix is
+    # about; the row boundaries are only how it comes to be true.
+    assert len(report.runs) == 2, "the blind window did not close the observed interval"
+    assert report.covers(100.0, 100.0) is True
+    assert report.covers(10000.0, 10000.0) is True
+    assert report.covers(100.0, 10000.0) is False
+
+
+def test_a_late_tick_opens_a_new_interval_rather_than_stretching_the_old(
+    coordinator, repo: Path
+) -> None:
+    """The other way a run row comes to span time nothing watched.
+
+    Closing the interval when a tick observes nothing only covers the windows
+    this pass can SEE. A sweep thread that arrives late — the host suspended,
+    the four safety passes ahead of detection stuck on the store — observes
+    nothing in between and says nothing about it, so the next successful tick
+    would extend the same interval across the stall and `covers()` would answer
+    True for it. A tick further from the last one than the sweep can explain
+    therefore starts a new interval instead of joining the old.
+    """
+    from ccs.diagnose.foreign_writes import read_foreign_write_report
+
+    _register(coordinator, "notes.md", "v1\n")
+    clock: dict = {}
+    _tick(coordinator, now_unix=100.0, clock=clock, max_gap_sec=15.0)
+    _tick(coordinator, now_unix=110.0, clock=clock, max_gap_sec=15.0)  # on cadence
+    _tick(coordinator, now_unix=9000.0, clock=clock, max_gap_sec=15.0)  # a stall
+
+    db = Path(coordinator.registry._db_path)  # noqa: SLF001 — the store under test
+    coordinator.registry.close()
+    report = read_foreign_write_report(db)
+
+    assert len(report.runs) == 2, "the stall did not end the observed interval"
+    assert report.covers(100.0, 110.0) is True  # the on-cadence pair is one span
+    assert report.covers(110.0, 9000.0) is False  # the stall is a hole
+    assert report.covers(9000.0, 9000.0) is True
+
+
+def test_narrowing_the_tracked_set_short_of_empty_keeps_one_interval(
+    coordinator, repo: Path
+) -> None:
+    """The boundary the blind-window fix rests on.
+
+    Only a scope that reaches ZERO ends the observed interval — a tracked set
+    that merely shrank is still being watched, and splitting the run there
+    would report a hole where there was none. Pinned because the sentence in
+    the guide is precise about it, and because the fix's own trigger is
+    `if not covered`, one edit away from `if len(covered) < previous`.
+    """
+    (repo / "second.md").write_text("v1\n")
+    _git(repo, "add", "second.md")
+    _git(repo, "commit", "-qm", "second")
+    coordinator.policy = _policy(repo, "notes.md", "second.md")
+    _register(coordinator, "notes.md", "v1\n")
+    _register(coordinator, "second.md", "v1\n")
+
+    _tick(coordinator, now_unix=100.0)
+    coordinator.policy = _policy(repo, "notes.md")  # narrowed, but not to nothing
+    _tick(coordinator, now_unix=110.0)
+
     runs = coordinator.registry.detection_runs()
-    assert len(runs) == 2, "the blind window did not close the observed interval"
-    assert runs[0].last_tick_unix == 100.0
-    assert runs[1].first_tick_unix == 10000.0
+    assert len(runs) == 1, "a narrowed-but-non-empty scope must not split the run"
+    assert runs[0].tick_count == 2
 
 
 def test_a_tick_records_how_much_was_in_scope(coordinator, repo: Path) -> None:

@@ -1527,9 +1527,12 @@ plainly:**
 - **`covers(start, end)` answers coverage, not the totals.** A coordinator that
   was down for the middle of a period still shows a healthy count of checks. Ask
   `covers` whether the period you care about was actually watched end to end.
-  A stretch in which nothing was in scope — because the tracked set was narrowed
-  and later restored, say — ends the watched period too, so `covers` reports it
-  as a gap rather than reading across it.
+  A stretch in which nothing at all was in scope — because the tracked set was
+  emptied and later restored, say — ends the watched period too, so `covers`
+  reports it as a gap rather than reading across it. Narrowing the set to a
+  smaller one does not: those files were still being watched. And a stretch in
+  which the check did not run at all, because the machine was asleep or the
+  coordinator was stalled, ends it as well.
 - **Attribution is by file only.** A change on disk carries no author, so the
   report names what changed and never who changed it.
 
