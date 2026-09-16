@@ -1477,6 +1477,7 @@ report = read_foreign_write_report(".coherence/state.db")
 
 print(report.state)   # 'not-instrumented' | 'not-coverable'
                       # | 'instrumented-zero' | 'counts'
+                      # what the WHOLE store proves, not its latest condition
 
 for artifact, counts in sorted(report.totals.items()):
     print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
@@ -1510,12 +1511,22 @@ plainly:**
   first — never a clean bill of health you did not earn. Each run also records
   how many files were in scope, because watching five hundred and finding
   nothing is a different result from watching none.
+- **`state` summarises the whole store, and it cannot fall.** One database can
+  outlive many runs, and nothing deletes a row, so `state` answers "what does
+  everything here prove?" — not "is it healthy now". A store whose newest fact
+  is "nothing to watch" still reports `instrumented-zero` if some earlier run
+  really did watch. That is not a contradiction: the note is still there in
+  `report.uncoverable`, so read that every time rather than only when `state`
+  invites you to, and ask `covers(start, end)` about a particular window.
 - **Detection needs a git repository, and says so instead of failing.** It works
   by asking git what changed, so a workspace that is not inside a git working
   tree — a temp directory, an unpacked archive, a folder nobody ran `git init`
-  in — is one it can never watch. It checks once when it starts, says so once in
-  the log, and stops asking; the store then reports `not-coverable`. That is
-  deliberately its own answer. It is not `instrumented-zero`, which would be a
+  in — is one it can never watch. So is one whose repository simply was not
+  there yet when the coordinator started: a drive that had not mounted counts
+  the same as a folder with no repository, and the remedy is the same restart.
+  It checks once it has something in scope to watch, says so in the log, and
+  stops asking; the store then reports `not-coverable`. That is deliberately its
+  own answer. It is not `instrumented-zero`, which would be a
   clean bill of health from a check that never happened, and it is not the
   broken-instrument reading either, because nothing is broken. Run `git init`
   and restart the coordinator to turn detection on.

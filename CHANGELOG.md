@@ -27,15 +27,18 @@ Alpha — APIs may change before `v1.0`.
   watch is a fourth answer, not an outage.** Detection works by asking git, so a
   coordinator rooted outside a git working tree — a temp directory, an unpacked
   archive, a folder nobody ran `git init` in — can never be polled. It now
-  establishes that once at startup, says so once at INFO, and stops polling
-  instead of raising a poll error every sweep tick for a permanent, expected
-  condition; the store reports `not-coverable`, which is neither a clean zero
-  nor a broken instrument. The check is a positive `git rev-parse
-  --is-inside-work-tree`, never a match on git's message text: git reports a
-  corrupt repository with the *same* `fatal: not a git repository` string and
-  the same exit code as an absent one, so the quiet state is granted only when
-  the filesystem confirms there is no `.git` at or above the root — a broken
-  repository stays loud. **A count is one per version
+  establishes that once it has something in scope to watch, says so at INFO, and
+  stops polling instead of raising a poll error every sweep tick for a
+  permanent, expected condition; the store reports `not-coverable`, which is
+  neither a clean zero nor a broken instrument. The check is a positive `git
+  rev-parse --is-inside-work-tree`, never a match on git's message text: git
+  reports a corrupt repository with the *same* `fatal: not a git repository`
+  string and the same exit code as an absent one. So the quiet state is granted
+  only by a **successful negative observation** — git's own `false`, or a
+  filesystem walk that started from a root the process actually resolved and
+  found no `.git` at or above it. A lookup that merely fails to see — an
+  unreadable root, one that does not exist, a symlink loop — is not evidence of
+  absence, and the poll stays loud. **A count is one per version
   of the content, not one per check** — git keeps reporting an unreconciled edit
   on every pass, so a level-triggered counter would turn one edit into thousands.
   **Coverage is files the coordinator already knows and git tracks**; anything
