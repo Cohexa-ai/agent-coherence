@@ -27,6 +27,7 @@ Covers, per the unit's test scenarios:
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -2752,6 +2753,39 @@ def test_release_checkpoint_shared_version_drops_only_on_last_holder(
     assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
 
 
+def test_release_checkpoint_different_versions_same_path_drop_independently(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The scan's identity is ``(member_path, native_token)``, and the TOKEN
+    half is what this pins. Two checkpoints over the same member path holding
+    DIFFERENT versions are not sharing anything, so the earlier one's release
+    must drop its own version's hold. A scan degraded to matching member_path
+    alone would see the later checkpoint as a holder and skip the drop, and
+    every other scan test pins both checkpoints at the SAME version, so none
+    of them can tell the two comparisons apart."""
+    client, obj = _s3()
+    v1 = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    older = versioner.checkpoint("older")
+    v2 = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    newer = versioner.checkpoint("newer")
+    assert v1["VersionId"] != v2["VersionId"]
+    assert older.members[0].member_path == newer.members[0].member_path
+    assert older.members[0].native_token != newer.members[0].native_token
+    assert obj.legal_hold_status("cfg.json", version_id=v1["VersionId"]) is True
+    assert obj.legal_hold_status("cfg.json", version_id=v2["VersionId"]) is True
+
+    versioner.release_checkpoint(older.record.checkpoint_id)
+
+    # The older version is nobody else's: its hold DROPS.
+    assert obj.legal_hold_status("cfg.json", version_id=v1["VersionId"]) is False
+    # The newer checkpoint is untouched at the same member path.
+    assert obj.legal_hold_status("cfg.json", version_id=v2["VersionId"]) is True
+    (still_held,) = registry.get_checkpoint_members(newer.record.checkpoint_id)
+    assert still_held.pin_state == PIN_STATE_HELD
+
+
 def test_release_checkpoint_drops_hold_and_downgrades_the_tier(
     registry: ArtifactRegistry, service: CoordinatorService
 ) -> None:
@@ -2850,7 +2884,8 @@ def test_release_checkpoint_undeclared_member_preflight_changes_nothing(
 
 
 def test_release_checkpoint_mismatched_key_records_released_but_keeps_hold(
-    registry: ArtifactRegistry, service: CoordinatorService
+    registry: ArtifactRegistry, service: CoordinatorService,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """AE5 (CHARACTERIZATION of shipped engine behaviour) — the pre-flight
     only asks that SOME object member is declared at the member path, never
@@ -2870,7 +2905,14 @@ def test_release_checkpoint_mismatched_key_records_released_but_keeps_hold(
     mismatched = _versioner(service)
     mismatched.add_object_member(obj, "other.json", member_path="s3://cfg.json")
 
-    rows = mismatched.release_checkpoint(cp.record.checkpoint_id)
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.workspace"):
+        rows = mismatched.release_checkpoint(cp.record.checkpoint_id)
+
+    # The silence is the bug: the caller gets no exception and no changed row,
+    # so a log line is the ONLY signal this happened.
+    (warned,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "s3://cfg.json" in warned.getMessage()
+    assert put["VersionId"] in warned.getMessage()
 
     assert rows[0].pin_state == PIN_STATE_RELEASED  # the record moved ...
     assert rows[0].restore_tier == "restorable-unpinned"
@@ -2901,7 +2943,8 @@ def test_release_checkpoint_without_pin_surface_raises_type_error(
 
 
 def test_release_checkpoint_untyped_substrate_error_propagates_and_strands(
-    registry: ArtifactRegistry, service: CoordinatorService
+    registry: ArtifactRegistry, service: CoordinatorService,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """CHARACTERIZATION of the stranding R5 names: an untyped substrate error
     (neither ``KeyError`` nor ``LegalHoldUnavailable``) propagates, the rows
@@ -2921,8 +2964,16 @@ def test_release_checkpoint_untyped_substrate_error_propagates_and_strands(
     # member is processed BEFORE the one that blows up.
     assert [row.member_path for row in cp.members] == ["s3://a-ok.json", "s3://z-bad.json"]
 
-    with pytest.raises(RuntimeError):
-        versioner.release_checkpoint(cp.record.checkpoint_id)
+    with caplog.at_level(logging.ERROR, logger="ccs.adapters.workspace"):
+        with pytest.raises(RuntimeError):
+            versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    # The row goes terminal, so this log line is the only record of WHICH
+    # version was stranded -- and the version id is what the documented
+    # recovery needs.
+    (logged,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "s3://z-bad.json" in logged.getMessage()
+    assert put_bad["VersionId"] in logged.getMessage()
 
     rows = {row.member_path: row for row in registry.get_checkpoint_members(cp.record.checkpoint_id)}
     assert rows["s3://a-ok.json"].pin_state == PIN_STATE_RELEASED

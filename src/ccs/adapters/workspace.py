@@ -174,6 +174,7 @@ re-drives pins idempotently (only ``unpinned`` members are attempted).
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final, Mapping, Protocol, Sequence, runtime_checkable
@@ -221,6 +222,8 @@ from ccs.core.exceptions import (
 from ccs.core.substrate import ArbitrationTier, RestoreTier, derive_restore_tier
 from ccs.core.substrate import sha256_hex as _sha256_hex
 from ccs.core.types import WorkspaceRegistrationResult, WorkspaceRestoreWrite
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -913,8 +916,11 @@ class WorkspaceVersioner:
         Idempotent means REPEAT calls, not concurrent ones: this instance's
         lock does not serialize a second versioner or process releasing the
         same checkpoint, and two that both read the same ``held`` rows will
-        both decrement the pin refcount — the registry fails that second
-        decrement closed with ``ValueError``.
+        both decrement the pin refcount — the registry fails closed with
+        ``ValueError`` on whichever decrement would take the count below zero.
+        That raise lands AFTER the member's row is already ``released`` and
+        BEFORE its substrate drop, so it strands that hold exactly as the
+        untyped-error case below does.
 
         Idempotent is NOT self-healing: the release RECORDS ``released``
         before it drops the substrate hold, so a crash or an untyped substrate
@@ -926,9 +932,14 @@ class WorkspaceVersioner:
         separate registry write) are documented on
         :meth:`_release_checkpoint_pins`, the engine this delegates to.
 
-        Raises ``ValueError`` for a blank/non-string id (BEFORE any store
-        access) and for a ``held`` S3 row with no declared binding (pre-flight,
-        before any write), the typed
+        Raises ``ValueError`` from three places, and only the first two are
+        before any write — do NOT read a ``ValueError`` as "nothing was
+        released": a blank/non-string id (BEFORE any store access); a ``held``
+        S3 row with no declared binding (pre-flight, before any write); and the
+        refcount decrement failing closed under a concurrent release, which
+        fires after that member is already recorded ``released`` and can leave
+        it terminal with its hold still ON (see the concurrency note above).
+        Also raises the typed
         :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, and
         ``TypeError`` for a service without the pin surface.
         """
@@ -1366,11 +1377,46 @@ class WorkspaceVersioner:
                     member.binding.release_legal_hold(
                         member.key, version_id=row.native_token
                     )
-                except (KeyError, LegalHoldUnavailable):
+                except (KeyError, LegalHoldUnavailable) as exc:
                     # The hold is moot — the version (or the lock
                     # configuration) is gone; the release's goal (no dangling
                     # hold) already stands. The record above is the truth.
+                    # EXCEPT when the member was re-declared through a binding
+                    # or key that does not address the pinned version: the
+                    # pre-flight cannot tell those apart (it only asks that
+                    # SOME object member is declared at the path), the hold is
+                    # then still ON, and the caller gets no exception and no
+                    # changed row. This line is the only signal either way.
+                    logger.warning(
+                        "checkpoint pin release could not reach the held "
+                        "version, treating the hold as moot: checkpoint=%s "
+                        "member=%s version=%s cause=%r — if this member was "
+                        "re-declared through a different binding or key, the "
+                        "hold is STILL ON",
+                        checkpoint_id,
+                        row.member_path,
+                        row.native_token,
+                        exc,
+                    )
                     continue
+                except Exception:
+                    # Record-before-drop already made this row terminal, so no
+                    # later release_checkpoint or pin_checkpoint walks it: this
+                    # line is the only record of WHICH version was stranded,
+                    # and that version id is exactly what the documented
+                    # recovery needs. Re-raise — absorbing it here would hide
+                    # the strand behind a clean return.
+                    logger.error(
+                        "checkpoint pin release STRANDED a live hold: "
+                        "checkpoint=%s member=%s version=%s — the row is "
+                        "already terminal, so recover out of band with "
+                        "CoherentObject.release_legal_hold on the binding, "
+                        "by version",
+                        checkpoint_id,
+                        row.member_path,
+                        row.native_token,
+                    )
+                    raise
             return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
 
     @staticmethod
