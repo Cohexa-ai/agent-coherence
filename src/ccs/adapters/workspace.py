@@ -910,6 +910,12 @@ class WorkspaceVersioner:
         disclosed under-retention window, where a pin landing after the
         last-instant re-check can still lose its hold.
 
+        Idempotent means REPEAT calls, not concurrent ones: this instance's
+        lock does not serialize a second versioner or process releasing the
+        same checkpoint, and two that both read the same ``held`` rows will
+        both decrement the pin refcount — the registry fails that second
+        decrement closed with ``ValueError``.
+
         Idempotent is NOT self-healing: the release RECORDS ``released``
         before it drops the substrate hold, so a crash or an untyped substrate
         error between the two strands a live hold on an already-terminal row.
