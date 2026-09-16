@@ -52,6 +52,47 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`write_cas` now waits, rather than spins, while a peer's committed write
+  reaches disk.** The OCC comparand read fails closed when the coordinator
+  records a version whose bytes are not on disk yet — the transient window
+  between a peer's confirmed CAS and its `_atomic_write` landing. Consecutive
+  denied reads were bounded by count (`MAX_CAS_REACQUIRES`) with no delay
+  between them, which made that bound a proxy for CPU scheduling rather than
+  for a wedged view: measured, nine undelayed re-reads burn through in **37 ms**
+  of wall clock, all of it emergent from local HTTP round-trip latency and
+  chosen by nobody. Any peer descheduled inside that window for longer than
+  37 ms raised `ViewWedged` even though the view would have cleared moments
+  later. On a loaded CI runner that is unremarkable, and it reddened the
+  two-writer `examples/concurrent_writers` demo intermittently — on the same
+  commit that passed on a less contended job.
+
+  The count bound is unchanged; a capped-exponential wait now separates the
+  denied re-reads (`DENIED_READ_BACKOFF_BASE_SEC` 2 ms, doubling to
+  `DENIED_READ_BACKOFF_CAP_SEC` 50 ms). The waiting matters more than the extra
+  time it buys: an undelayed loser **competes for CPU with the very peer whose
+  disk write unblocks it**, so sleeping removes the cause rather than merely
+  outlasting it — with a 50 ms stall injected into the winner, the patched loop
+  converges in five polls where the undelayed one burned all nine and still
+  wedged. Tolerance for one streak moves from ~40 ms to ~280 ms; a genuinely
+  never-clearing view (a foreign edit, a wedged coordinator) still fails closed
+  with `ViewWedged`, and the fail-closed guarantee is untouched — no write lands,
+  so no update was ever at risk. A clean read resets the streak, so a single call
+  that alternates streaks with lost races stays bounded but by ~1.9 s in
+  aggregate rather than by one schedule.
+
+  This distinction is the general one: the sibling commit budget counts
+  *contention losses*, where an iteration count is exactly the right unit, while
+  a poll of a transient that clears on **another** writer's progress has to be
+  denominated in time. A new guard,
+  `test_write_cas_waits_between_denied_comparand_reads`, records the waits the
+  loop actually requests and pins the **sequence** against the schedule, plus a
+  non-degeneracy check on the two constants. Pinning only an elapsed floor was
+  not enough and is the interesting part: the floor is computed from the same
+  constants it guards, so zeroing the base makes the assertion `>= 0` and the
+  whole fix could be reverted with the test still green. The sequence form fails
+  on all of it — a removed wait, a zeroed or inverted constant, a schedule
+  flattened to the cap, and an off-by-one in the exponent.
+
 - **The HTML report templates now ship in the distribution.** `ccs-compare`
   and `ccs-diagnose` read their templates off the filesystem beside the
   module (`Path(__file__).with_name("templates")`), but `pyproject.toml`
