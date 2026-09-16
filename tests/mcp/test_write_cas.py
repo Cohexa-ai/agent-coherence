@@ -264,3 +264,62 @@ def test_swg_write_denies_foreign_edit(tmp_path: Path, fast_cfg: LifecycleConfig
         assert target.read_bytes() == b"foreign-v2"  # foreign edit NOT clobbered
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- the refusal reason reaches the caller -----------------------------------
+#
+# The coordinator distinguishes four CAS refusals; each needs different
+# recovery. They all used to arrive as ``reason == "version_mismatch"``,
+# because the class pinned it as a CLASS attribute and no raise site consulted
+# the wire body. The worst case is ``other_holder``: the version has NOT moved,
+# so the exception's own advice ("re-read at current and re-merge") produces a
+# byte-identical CAS that fails identically until the holder releases.
+
+
+def test_cas_conflict_defaults_to_version_mismatch() -> None:
+    """Back-compat: consumers that never pass a reason keep the old value."""
+    exc = CasVersionConflict("data/shared.txt", 3, 4)
+    assert exc.reason == "version_mismatch"
+    assert "version_mismatch" in str(exc)
+
+
+def test_cas_conflict_carries_the_wire_reason() -> None:
+    """A supplied reason lands on the instance AND in the message — the text is
+    what ends up in logs and in anything that parses it."""
+    exc = CasVersionConflict("data/shared.txt", 1, 1, reason="other_holder")
+    assert exc.reason == "other_holder"
+    assert str(exc).startswith("other_holder artifact=data/shared.txt")
+    assert "version_mismatch" not in str(exc)
+    assert CasVersionConflict.reason == "version_mismatch", (
+        "the class default must survive so an `except` clause keyed on it works"
+    )
+
+
+def test_adapter_reports_other_holder_not_version_mismatch(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A pessimistic peer holding EXCLUSIVE refuses the CAS with the version
+    unchanged. Relabelling that as a version mismatch tells the caller to merge
+    and re-CAS, which cannot make progress until the holder lets go."""
+    import uuid
+
+    from ccs.cli._coherence_client import post, resolve_endpoint
+
+    _seed(tmp_path, b"v1")
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        _bytes, version = vol.read_with_version(_PATH)
+        peer = post(
+            resolve_endpoint(tmp_path),
+            "/hooks/pre-edit",
+            {"session_id": str(uuid.uuid4()), "path": _PATH},
+        )
+        assert peer["ok"] is True
+
+        with pytest.raises(CasVersionConflict) as exc:
+            vol.write_cas_at(_PATH, version, b"v2")
+
+        assert exc.value.reason == "other_holder"
+        assert exc.value.expected_version == exc.value.current_version == version
+    finally:
+        stop_coordinator(tmp_path)

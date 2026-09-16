@@ -4545,3 +4545,457 @@ def test_deferred_reground_preset_abort_does_not_consume_flag(
     assert status == 200
     assert _reground_text_of(body) == armed_text
     assert coordinator.has_compact_pending(sid) is False
+
+
+# ======================================================================
+# Unknown-holder sentinel: the warn-mode renderers must not slice it
+# ======================================================================
+#
+# ``emit_strict_deny`` already preserves a ``<...>`` placeholder verbatim
+# (a bare ``[:8]`` yields the malformed ``<unknown``). The two warn-mode
+# renderers sliced unconditionally, so a post-restart collision — where
+# the adapter has no name for the surviving holder — reached the model as
+# "another session (<unknown) has been editing …".
+
+
+def test_warn_renderers_preserve_unknown_sentinel_verbatim() -> None:
+    """A ``<...>`` placeholder is prose, not an id: it renders whole in all
+    THREE renderers. Slicing it to 8 chars drops the closing bracket."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    collision = hp.edit_collision_warning(
+        holder_session_id="<unknown>",
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(<unknown>)" in collision
+    assert "(<unknown)" not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "session <unknown> at" in stale
+    assert "session <unknown at" not in stale
+
+    # The guarded renderer is the reference behavior, not a third variant.
+    deny = hp.emit_strict_deny(source="test", summary={
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "<unknown>" in deny["permissionDecisionReason"]
+
+
+def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
+    """The sentinel guard is keyed on the ``<...>`` shape, so a real UUID
+    session id keeps its short form in both warn renderers."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = "f2f7eab3-1111-4111-8111-111111111111"
+    collision = hp.edit_collision_warning(
+        holder_session_id=sid,
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(f2f7eab3)" in collision
+    assert sid not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": sid,
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "session f2f7eab3 at" in stale
+    assert sid not in stale
+
+
+# ======================================================================
+# /status holder set survives a coordinator restart
+# ======================================================================
+#
+# ``sessions`` used to be built by walking the adapter's in-memory
+# ``_agent_names`` map and looking each agent up in the registry snapshot.
+# That map is seeded empty on every process start and is only ever written
+# by ``register_session`` on hook traffic, so a restart erased every holder
+# from the payload while ``agent_states`` — and enforcement — kept them.
+# The registry's own holder set is the source of truth; a name is a label
+# the adapter may or may not have.
+
+
+def _restart_on(root: Path, instance_id: str) -> CoordinatorHTTPServer:
+    server = CoordinatorHTTPServer(root, port=0, instance_id=instance_id)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    return server
+
+
+def test_status_lists_a_grant_holder_that_predates_the_restart(
+    tmp_path: Path,
+) -> None:
+    """A holder whose grant survived a restart is reported, keyed on its raw
+    agent id with a null name — not dropped. Enforcement never stopped, so a
+    caller polling /status must not read the workspace as idle."""
+    first = _restart_on(tmp_path, "restart-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+        _, before = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        assert [s["agent_name"] for s in before["sessions"]] == [
+            f"claude-session-{sid}"
+        ]
+        assert before["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "restart-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+
+        assert len(after["sessions"]) == 1, (
+            "the EXCLUSIVE grant is still in agent_states and still arbitrates; "
+            "dropping it from /status makes a held file read as idle"
+        )
+        holder = after["sessions"][0]
+        assert holder["agent_id"] == str(session_to_agent_id(sid))
+        assert holder["agent_name"] is None, (
+            "the agent id is a uuid5 of the session id — unrecoverable, so the "
+            "name is honestly absent rather than guessed"
+        )
+        assert holder["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The same grant that /status now reports is the one enforcement uses.
+        _, collide = client.post(
+            "/hooks/pre-edit",
+            {"session_id": _sid("peer"), "path": "docs/plan.md"},
+        )
+        assert collide["collision"] is True
+    finally:
+        second.shutdown()
+
+
+def test_post_restart_holder_is_listed_at_the_default_tier(tmp_path: Path) -> None:
+    """The unnamed holder appears at the DEFAULT tier, not only behind
+    ?detail=full + the operator header. That is the security-relevant case, so
+    it is pinned explicitly: `sessions` has always been a minimal-tier field,
+    and this row repeats an `agent_id` already emitted there while dropping the
+    session-id-bearing `agent_name` — narrower than the named row it replaces.
+    """
+    first = _restart_on(tmp_path, "tier-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("tier-survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "tier-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+
+        # Default tier: no query string, no operator header.
+        _, minimal = client.get("/status")
+        assert minimal["detail"] == "minimal"
+        assert [s["agent_id"] for s in minimal["sessions"]] == [
+            str(session_to_agent_id(sid))
+        ]
+        assert minimal["sessions"][0]["agent_name"] is None
+        assert minimal["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The metrics tier still omits the collection entirely.
+        _, metrics = client.get("/status?detail=metrics")
+        assert "sessions" not in metrics
+    finally:
+        second.shutdown()
+
+
+def test_status_omits_invalidated_holders_after_a_restart(tmp_path: Path) -> None:
+    """Only non-INVALID states count as holding. A session whose grant was
+    taken away must not reappear as a holder just because its row survives."""
+    first = _restart_on(tmp_path, "inv-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        loser, winner = _sid("inv-loser"), _sid("inv-winner")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": loser, "path": "docs/plan.md"})
+        client.post("/hooks/pre-edit", {"session_id": winner, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "inv-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        by_id = {s["agent_id"]: s for s in after["sessions"]}
+        assert str(session_to_agent_id(winner)) in by_id
+        assert str(session_to_agent_id(loser)) not in by_id
+    finally:
+        second.shutdown()
+
+
+def test_status_still_lists_a_registered_session_holding_nothing(
+    client: _Client,
+) -> None:
+    """No regression on the live path: a session that registered but holds no
+    grant keeps its named entry with an empty state map."""
+    sid = _sid("named-no-grants")
+    client.post("/hooks/session-start", {"session_id": sid})
+    _, body = client.get("/status")
+    named = {s["agent_name"]: s for s in body["sessions"]}
+    assert f"claude-session-{sid}" in named
+    assert named[f"claude-session-{sid}"]["states"] == {}
+
+
+def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
+    """``StatusResponse`` documented ``last_writer``/``session_id`` keys the
+    handler has never emitted, and nothing in the tree type-checks against it,
+    so the drift was invisible. Pin the shape against a live body instead."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = _sid("shape")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    _, body = client.get("/status")
+
+    assert set(hp.StatusResponse.__annotations__) <= set(body)
+    assert {k for a in body["tracked_artifacts"] for k in a} == {
+        "path", "version", "id",
+    }
+    assert {k for s in body["sessions"] for k in s} == {
+        "agent_name", "agent_id", "states",
+    }
+
+
+# ======================================================================
+# Preemption notices past the render cap must survive, not be destroyed
+# ======================================================================
+#
+# ``pop_pending_notices`` deleted EVERY row for the agent, while the prose
+# builder rendered only ``_PREEMPTION_PROSE_VERBATIM_CAP`` of them. One
+# pre-read on one path therefore destroyed every notice the response did
+# not show, and the overflow line pointed at /status, which has never
+# carried notice data. The drain is now bounded to what is rendered.
+
+
+def _pending_count(coordinator, agent_id) -> int:
+    """How many notices are still queued for this agent (non-destructive)."""
+    artifact_by_id, _ = coordinator.registry.status_snapshot()
+    return sum(
+        1
+        for artifact_id in artifact_by_id
+        if coordinator.registry.peek_preemption_notice(agent_id, artifact_id)
+        is not None
+    )
+
+
+def _seven_notices(client: _Client, coordinator) -> tuple[str, list[str]]:
+    """Leave session A holding seven pending preemption notices."""
+    paths = [f"docs/f{n}.md" for n in range(7)]
+    a, b = _sid("notice-victim"), _sid("notice-taker")
+    client.post("/policy/track", {"paths": paths})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": a, "path": p})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": b, "path": p})
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 7
+    return a, paths
+
+
+def test_pre_read_consumes_only_the_notices_it_renders(
+    coordinator, client: _Client
+) -> None:
+    """Seven pending, three rendered → four still queued. The four the
+    response could not show are the caller's only record of who took those
+    artifacts; deleting them made the preempters unrecoverable."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+    rendered = [ln for ln in text.splitlines() if ln.strip().startswith("•")]
+    verbatim = [ln for ln in rendered if "Plus " not in ln]
+
+    assert len(verbatim) == 3
+    assert "Plus 4 more" in text
+    assert _pending_count(coordinator, agent_a) == 4, (
+        "the four notices the response did not render must still be queued"
+    )
+
+
+def test_successive_reads_deliver_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """The overflow is a deferral, not a loss: three more arrive on the next
+    tracked-file operation, and the last one after that."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    seen: set[str] = set()
+    for expected_remaining in (4, 1, 0):
+        _, body = client.post(
+            "/hooks/pre-read", {"session_id": a, "path": paths[0]}
+        )
+        text = body["hookSpecificOutput"]["additionalContext"]
+        seen.update(p for p in paths if f"• {p} —" in text)
+        assert _pending_count(coordinator, agent_a) == expected_remaining
+
+    assert seen == set(paths), "every preempted artifact was eventually named"
+
+
+def test_overflow_line_does_not_point_at_a_surface_without_notices(
+    coordinator, client: _Client
+) -> None:
+    """/status carries no notice data at any tier, so the overflow line must
+    not send the caller there. It names the real delivery channel instead."""
+    a, paths = _seven_notices(client, coordinator)
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "GET /status" not in text
+    assert "agent-coherence status" not in text
+
+    _, status_body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert not any(
+        "notice" in k or "preempt" in k for k in status_body
+    ), "if /status ever carries notices, this test should be the one to change"
+
+
+def test_session_stop_still_drains_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """Stop returns the full structured array, so its drain is matched by its
+    render — it must keep consuming all of them."""
+    a, _paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    assert len(body["notices"]) == 7
+    assert _pending_count(coordinator, agent_a) == 0
+
+
+def test_unlimited_drain_does_not_bind_one_variable_per_notice(
+    coordinator, client: _Client
+) -> None:
+    """session-stop's full drain must bind only ``agent_id``, not one variable
+    per row. An IN-list of every pending notice can exceed SQLite's
+    bound-variable ceiling on an agent with a large pending set, raising
+    mid-transaction instead of committing.
+
+    Driven against the real ceiling, lowered for the duration: with a
+    per-row IN-list this raises OperationalError; with the bulk DELETE it does
+    not. Six notices against a limit of four is the same shape as 40k notices
+    against the stock 32766.
+    """
+    import sqlite3
+
+    sid = _sid("bulk-drain")
+    agent_id = session_to_agent_id(sid)
+    peer = session_to_agent_id(_sid("bulk-peer"))
+    paths = [f"docs/bulk{n}.md" for n in range(6)]
+    client.post("/policy/track", {"paths": paths})
+    # Mint the artifacts FIRST: a pre-read drains this session's notices, so
+    # recording inside the read loop would let each read consume what the
+    # previous iterations queued.
+    artifact_ids = []
+    for path in paths:
+        client.post("/hooks/pre-read",
+                    {"session_id": sid, "path": path, "content_hash": _hash(path)})
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        assert artifact_id is not None
+        artifact_ids.append(artifact_id)
+    for n, artifact_id in enumerate(artifact_ids):
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id, artifact_id=artifact_id,
+            preempter_agent_id=peer, preempted_at_unix_ts=1700000000.0 + n,
+        )
+
+    conn = coordinator.registry._conn
+    previous = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+    try:
+        drained = coordinator.registry.pop_pending_notices(agent_id)
+    finally:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+    assert len(drained) == 6
+    assert _pending_count(coordinator, agent_id) == 0
+
+
+def test_session_stop_overflow_prose_does_not_claim_rows_are_queued(
+    coordinator, client: _Client
+) -> None:
+    """session-stop drains UNBOUNDED and returns everything in `notices`, so the
+    overflow line must not repeat the deferral promise the bounded prose paths
+    make. "still queued — they surface on your next tracked-file operation" is
+    false twice over here: the rows were just deleted, and a stopping session
+    has no next operation. It points at the response's own array instead."""
+    a, _paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert len(body["notices"]) == 7, "the structured array still carries all of them"
+    assert "Plus 4 more" in text
+    assert "still queued" not in text
+    assert "next tracked-file operation" not in text
+    assert "notices" in text, "the prose names the surface that actually has them"
+
+
+def test_bounded_prose_paths_still_promise_deferral(
+    coordinator, client: _Client
+) -> None:
+    """The four admit paths DO defer — their drain is capped — so they keep the
+    deferral wording. Guards against fixing session-stop by flattening both."""
+    a, paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "Plus 4 more" in text
+    assert "still queued" in text
+    assert "next tracked-file operation" in text
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 4

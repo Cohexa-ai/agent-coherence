@@ -1200,9 +1200,16 @@ class CoherentVolume:
             # version is deterministically expected+1 (atomic_publish surfaces it).
             return expected_version + 1
         if outcome == "conflict":
-            # A peer won the version between our read and the CAS → typed conflict.
+            # A peer won the version between our read and the CAS, OR a
+            # pessimistic peer holds the grant, OR the claim this read was taken
+            # under was reclaimed, OR a peer invalidated us mid-window. All four
+            # are conflicts; they are NOT the same conflict, so the coordinator's
+            # own reason travels with the terminal rather than being relabelled.
             raise CasVersionConflict(
-                rel, expected_version, self._cas_current_version(resp, current_version)
+                rel,
+                expected_version,
+                self._cas_current_version(resp, current_version),
+                reason=resp.get("reason"),
             )
         # outcome == "raise": corruption or the commit_unconfirmed degrade body.
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
@@ -1488,6 +1495,24 @@ class CoherentVolume:
             if isinstance(detail, dict):
                 current = detail.get("current_version")
                 held.current_version = current if isinstance(current, int) else None
+                # The per-member refusal reason: same four-way distinction the
+                # single-artifact CAS carries. The HOLD's own ``reason`` stays
+                # the batch-level constant, so this rides alongside it.
+                #
+                # Allowlisted against the SAME set the single-artifact path
+                # matches on, not merely type-checked. ``per_artifact`` is
+                # coordinator-supplied JSON, and this string is destined for
+                # prose a model reads; an isinstance check alone would let an
+                # unrecognized reason through to whatever first renders it.
+                # isinstance BEFORE the membership test: ``in`` against a
+                # frozenset raises TypeError on an unhashable value, and this
+                # body is JSON the coordinator supplied.
+                member_reason = detail.get("reason")
+                if (
+                    isinstance(member_reason, str)
+                    and member_reason in self._CAS_RETRY_REASONS
+                ):
+                    held.member_reason = member_reason
         return held
 
     # --- coordinator I/O helpers --------------------------------------------

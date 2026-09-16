@@ -93,6 +93,63 @@ Alpha — APIs may change before `v1.0`.
   on all of it — a removed wait, a zeroed or inverted constant, a schedule
   flattened to the cap, and an off-by-one in the exponent.
 
+- **`GET /status` no longer reports an empty workspace while a grant is still
+  being enforced.** `sessions` was built by walking the adapter's in-memory
+  name map and looking each agent up in the registry snapshot. That map is
+  seeded empty on every process start and written only by `register_session`
+  on hook traffic, so a coordinator restart erased every holder from the
+  payload while the durable `agent_states` row kept arbitrating: a peer's
+  `pre-edit` still came back `collision: true` against a holder `/status` said
+  did not exist, and `agent-coherence-status` rendered the affirmative
+  `No active sessions.` The sweep did not bound it either — it reclaims only
+  MODIFIED and EXCLUSIVE, so a SHARED row survived indefinitely. The holder set
+  now comes from the registry and the name is a label applied afterwards. A
+  holder the adapter cannot name is listed on its raw agent id with
+  `agent_name: null` — the agent id is a one-way uuid5 of the session id, so
+  the name is honestly absent rather than guessed — and the CLI says so instead
+  of printing `None`. `StatusResponse` was documenting `last_writer` and
+  `session_id` keys the handler has never emitted; it now matches the wire.
+
+- **Preemption notices past the render cap are no longer destroyed.** One
+  `pre-read` on one path deleted *every* pending notice for the session while
+  rendering three of them, and the overflow line sent the caller to
+  `/agent-coherence status` / `GET /status`, neither of which has ever carried
+  notice data at any disclosure tier. Seven pending notices became three
+  rendered and four unrecoverable, so an agent reconciling after losing grants
+  learned who took three of its artifacts and got a bare count for the rest.
+  The drain is now bounded to what the response actually renders
+  (`pop_pending_notices(consume_limit=...)`); the rest stay queued and surface
+  on the session's next tracked-file operation, and the overflow line says that
+  instead. `POST /hooks/session-stop` still drains everything — it returns the
+  full structured array, so its drain was always matched by its render — and its
+  overflow line names that array rather than repeating the deferral promise,
+  which would be false twice over on a path that consumed the rows and has no
+  next operation to surface them on.
+
+- **`CasVersionConflict` no longer relabels every CAS refusal as
+  `version_mismatch`.** The coordinator distinguishes four refusals —
+  `version_mismatch`, `other_holder`, `stale_read_generation` and
+  `caller_in_transient_state` — and the client folded all four into one verdict
+  and discarded the reason, while the exception pinned `version_mismatch` as a
+  class attribute. Each needs different recovery, and the mislabel was
+  actively harmful for `other_holder`: the version has *not* moved, so the
+  message's own advice ("re-read at current and re-merge") produces a
+  byte-identical CAS that fails identically until the holder releases, and the
+  caller spins. The wire reason now travels onto the instance and into the
+  message, the MCP deny mapper routes a recover verb per reason
+  (`wait_and_retry` / `reacquire_and_reread` / `reacquire`), and a HELD batch
+  publish carries the first conflicting member's reason as
+  `StaleView.member_reason`. The class default and the `version_mismatch`
+  message are unchanged, so existing consumers and the byte-stability retry
+  contract are untouched.
+
+- **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
+  `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
+  warn-mode renderers sliced it to eight characters unconditionally, so a
+  post-restart collision reached the model as "another session (`<unknown`) has
+  been editing …". The guard is now one shared helper
+  (`hook_payloads.short_session_id`) used by all three renderers.
+
 - **The HTML report templates now ship in the distribution.** `ccs-compare`
   and `ccs-diagnose` read their templates off the filesystem beside the
   module (`Path(__file__).with_name("templates")`), but `pyproject.toml`

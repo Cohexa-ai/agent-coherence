@@ -1826,7 +1826,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 resp["hookSpecificOutput"]["additionalContext"] = (
@@ -1855,7 +1857,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 # Spread work()'s payload so additive fresh-path keys
@@ -2007,7 +2011,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
         if holder_id is not None:
@@ -2421,7 +2427,11 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             # Render prose for stream-json consumers / human inspection.
             response["hookSpecificOutput"] = {
                 "hookEventName": "Stop",
-                "additionalContext": _build_preemption_text(coordinator, pending),
+                # Unbounded drain + full structured array in this same
+                # response: the overflow is not deferred anywhere.
+                "additionalContext": _build_preemption_text(
+                    coordinator, pending, overflow_deferred=False
+                ),
             }
         return response
 
@@ -2759,7 +2769,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -2923,7 +2935,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -4206,23 +4220,45 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
     # held under one registry lock so the view is consistent.
     artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
-    agent_names_snapshot = coordinator.agent_names_snapshot()
+    named_agents = coordinator.agent_names_snapshot()
 
     tracked: list[dict] = [
         {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
         for artifact_id, meta in artifact_by_id.items()
     ]
+
+    # The HOLDER set comes from the registry; a NAME comes from the adapter.
+    # They are not the same set. ``_agent_names`` is process-local, seeded
+    # empty, and written only by ``register_session`` on hook traffic — so
+    # walking it as the outer loop dropped every grant that outlived the
+    # coordinator process that issued it, while the durable ``agent_states``
+    # row kept arbitrating (a peer's pre-edit still collides against a holder
+    # the payload never named). Build from the registry, then label.
+    states_by_agent: dict[UUID, dict[str, str]] = {}
+    for artifact_id, meta in artifact_by_id.items():
+        for agent_id, state in state_by_artifact[artifact_id].items():
+            if state == MESIState.INVALID:
+                continue
+            states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
+
     sessions: list[dict] = []
-    for agent_id, name in agent_names_snapshot:
-        per_artifact: dict[str, str] = {}
-        for artifact_id, meta in artifact_by_id.items():
-            state = state_by_artifact[artifact_id].get(agent_id)
-            if state is not None and state != MESIState.INVALID:
-                per_artifact[meta["name"]] = state.name
+    named_ids: set[UUID] = set()
+    for agent_id, name in named_agents:
+        named_ids.add(agent_id)
         sessions.append({
             "agent_name": name,
             "agent_id": str(agent_id),
-            "states": per_artifact,
+            "states": states_by_agent.get(agent_id, {}),
+        })
+    # ``agent_name`` is null rather than a guess: ``session_to_agent_id`` is a
+    # uuid5 of the session id, so the session id is NOT recoverable from the
+    # row. An entry keyed on the raw agent id is the honest answer, and it is
+    # strictly more than the empty list these holders used to render as.
+    for agent_id in sorted(states_by_agent.keys() - named_ids, key=str):
+        sessions.append({
+            "agent_name": None,
+            "agent_id": str(agent_id),
+            "states": states_by_agent[agent_id],
         })
 
     policy_summary = coordinator.policy.summary()
@@ -4722,6 +4758,8 @@ _SESSION_START_ARTIFACT_VERBATIM_CAP = 3
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
     notices: list[tuple[UUID, UUID, float]],
+    *,
+    overflow_deferred: bool = True,
 ) -> str:
     """A1 + F3: render pending preemption notices as additionalContext prose.
 
@@ -4730,14 +4768,30 @@ def _build_preemption_text(
     + the session-id prefixes.
 
     F3 hardening: render newest-first up to ``_PREEMPTION_PROSE_VERBATIM_CAP``
-    notices in full. If more remain, coalesce them into a single overflow line
-    pointing at the ``/agent-coherence status`` console for the full list.
-    This bounds the prose to a constant-size block regardless of N, sidesteps
-    Claude Code's 10KB additionalContext cap, and uses the status surface as
-    the overflow channel rather than silently truncating.
+    notices in full. If more remain, coalesce them into a single overflow line.
+    This bounds the prose to a constant-size block regardless of N and sidesteps
+    Claude Code's 10KB additionalContext cap.
+
+    On the four admit paths the overflow is a DEFERRAL, not a truncation:
+    they pass that same cap as ``pop_pending_notices(consume_limit=...)``, so
+    only the rendered rows are consumed and the rest surface on the session's
+    next tracked-file operation (or age out via ``evict_stale_notices``). The
+    overflow line used to name ``/agent-coherence status`` / ``GET /status`` as
+    the place to read the rest — neither has ever carried notice data, and the
+    rows had already been deleted by the call that under-reported them.
+
+    ``overflow_deferred=False`` is for ``session-stop``, whose drain is
+    UNBOUNDED and whose response returns every notice in its ``notices`` array.
+    Nothing is queued there — the rows are gone and a stopping session has no
+    next operation — so repeating the deferral promise would be false twice
+    over. It names the response's own array instead, which is where they are.
     """
     # Sort newest first — the most recent preemption is the most informative
-    # signal for the agent's next decision.
+    # signal for the agent's next decision. The registry already returns rows
+    # newest-first (ts DESC, artifact_id DESC) and this sort is STABLE, so the
+    # verbatim slice below picks exactly the rows the drain consumed; the rest
+    # are still queued. Changing either ordering without the other re-opens the
+    # drop (rows deleted that this never renders).
     sorted_notices = sorted(notices, key=lambda n: n[2], reverse=True)
     verbatim = sorted_notices[:_PREEMPTION_PROSE_VERBATIM_CAP]
     overflow = sorted_notices[_PREEMPTION_PROSE_VERBATIM_CAP:]
@@ -4764,10 +4818,21 @@ def _build_preemption_text(
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
     if overflow:
+        # Say where the unrendered notices actually ARE, which differs by
+        # caller. The bounded admit paths leave them in the table, so they
+        # surface on the next tracked-file operation. session-stop consumed
+        # them all and hands them back structurally in the same response —
+        # claiming they are "still queued" there would be false twice over
+        # (deleted rows, and no next operation for a stopping session). The
+        # line used to point at /status, which carries no notice data at any
+        # disclosure tier, while the rows it named had just been deleted.
+        if overflow_deferred:
+            where = "still queued — they surface on your next tracked-file operation."
+        else:
+            where = "listed in full in the `notices` array of this response."
         lines.append(
-            f"  • Plus {len(overflow)} more preemptions since your last activity; "
-            f"run `/agent-coherence status` (or query GET /status on the coordinator) "
-            f"for the full list."
+            f"  • Plus {len(overflow)} more preemptions since your last "
+            f"activity, {where}"
         )
     lines.append(
         "Re-read affected files before continuing if you need the latest "

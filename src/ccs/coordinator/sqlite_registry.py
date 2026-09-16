@@ -4424,11 +4424,25 @@ class SqliteArtifactRegistry:
                 raise
 
     def pop_pending_notices(
-        self, agent_id: UUID
+        self, agent_id: UUID, *, consume_limit: int | None = None
     ) -> list[tuple[UUID, UUID, float]]:
-        """Atomically SELECT and DELETE all pending notices for ``agent_id``.
-        Returns list of ``(artifact_id, preempter_agent_id, preempted_at_unix_ts)``.
-        Empty list if no pending notices."""
+        """Atomically SELECT every pending notice for ``agent_id``, DELETE the
+        ones the caller commits to consuming, and return ALL of them
+        newest-first as ``(artifact_id, preempter_agent_id,
+        preempted_at_unix_ts)``. Empty list if no pending notices.
+
+        ``consume_limit`` is how many the CALLER can actually deliver.
+        ``None`` (the default) means all of them — the ``session-stop`` drain,
+        which returns the full structured array and so renders everything it
+        removes. A prose caller passes its render cap instead: it renders the
+        newest N, coalesces the rest into a count, and those rest stay queued
+        for its next call. Deleting rows the response never showed destroyed
+        the caller's only record of who preempted those artifacts, and the
+        overflow count alone cannot drive a retry or a merge.
+
+        The returned list is ordered newest-first so the caller's own cap
+        selects the SAME rows this method deleted.
+        """
         self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -4437,14 +4451,30 @@ class SqliteArtifactRegistry:
                     """
                     SELECT artifact_id, preempter_agent_id, preempted_at_unix_ts
                     FROM pending_notices WHERE agent_id = ?
+                    ORDER BY preempted_at_unix_ts DESC, artifact_id DESC
                     """,
                     (agent_id.hex,),
                 ).fetchall()
-                if rows:
-                    self._conn.execute(
-                        "DELETE FROM pending_notices WHERE agent_id = ?",
-                        (agent_id.hex,),
-                    )
+                if consume_limit is None:
+                    consumed = rows
+                    if rows:
+                        # Unlimited drain keeps the bulk DELETE: an IN-list of
+                        # every row would bind one variable per notice and can
+                        # exceed SQLITE_LIMIT_VARIABLE_NUMBER on an agent with
+                        # a large pending set, raising instead of committing.
+                        self._conn.execute(
+                            "DELETE FROM pending_notices WHERE agent_id = ?",
+                            (agent_id.hex,),
+                        )
+                else:
+                    consumed = rows[:consume_limit]
+                    if consumed:
+                        placeholders = ", ".join("?" * len(consumed))
+                        self._conn.execute(
+                            "DELETE FROM pending_notices WHERE agent_id = ? "
+                            f"AND artifact_id IN ({placeholders})",
+                            (agent_id.hex, *(r[0] for r in consumed)),
+                        )
                 self._conn.execute("COMMIT")
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches

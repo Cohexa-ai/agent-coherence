@@ -35,6 +35,8 @@ from mcp.types import CallToolResult, TextContent
 from ccs.core.exceptions import (
     CAS_EXHAUSTED_REASON,
     COORDINATOR_UNAVAILABLE_REASON,
+    OCC_CALLER_TRANSIENT_REASON,
+    STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
     CasRetriesExhausted,
     CasVersionConflict,
@@ -66,6 +68,25 @@ _TERMINALS: dict[type, _Terminal] = {
     CommitUnconfirmed: _Terminal(CommitUnconfirmed.reason, "read_then_retry", False),
     CasRetriesExhausted: _Terminal(CasRetriesExhausted.reason, "stop", False),
     InternalConcurrencyError: _Terminal(InternalConcurrencyError.reason, "none", False),
+}
+
+# A CAS refusal is four different terminals wearing one exception type. The
+# recover verb is what the agent acts on, so it is keyed on the coordinator's
+# reason rather than on the exception class. ``version_mismatch`` keeps its
+# existing contract exactly; the other three used to inherit it and send the
+# caller to re-merge, which cannot make progress on any of them.
+_CAS_TERMINALS: dict[str, _Terminal] = {
+    VERSION_MISMATCH_REASON: _Terminal(
+        VERSION_MISMATCH_REASON, "read_then_merge", False
+    ),
+    # The holder will release; a bounded backoff is the recovery, not a merge.
+    "other_holder": _Terminal("other_holder", "wait_and_retry", True),
+    STALE_READ_GENERATION_REASON: _Terminal(
+        STALE_READ_GENERATION_REASON, "reacquire_and_reread", False
+    ),
+    OCC_CALLER_TRANSIENT_REASON: _Terminal(
+        OCC_CALLER_TRANSIENT_REASON, "reacquire", False
+    ),
 }
 
 # Fallback for any unrecognized exception (an unexpected ``CoherenceError`` such
@@ -100,8 +121,15 @@ def deny_result(exc: BaseException) -> CallToolResult:
     if isinstance(exc, CasVersionConflict):
         # Surface both versions so the agent can re-read at current_version and
         # re-CAS without another round-trip. Typed-conflict, NOT auto-merge.
+        # ``exc.reason`` is the coordinator's own refusal reason (the class
+        # default when the raise site had none), never substring-matched off
+        # the message. An unknown reason falls back to the version_mismatch
+        # contract rather than to internal_error — it is still a real conflict.
+        terminal = _CAS_TERMINALS.get(
+            exc.reason, _CAS_TERMINALS[VERSION_MISMATCH_REASON]
+        )
         return _result(
-            _Terminal(VERSION_MISMATCH_REASON, "read_then_merge", False),
+            terminal,
             str(exc),
             {"expected_version": exc.expected_version, "current_version": exc.current_version},
         )
