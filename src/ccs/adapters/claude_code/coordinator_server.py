@@ -1826,7 +1826,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 resp["hookSpecificOutput"]["additionalContext"] = (
@@ -1855,7 +1857,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 # Spread work()'s payload so additive fresh-path keys
@@ -2007,7 +2011,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
         if holder_id is not None:
@@ -2759,7 +2765,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -2923,7 +2931,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -4752,14 +4762,24 @@ def _build_preemption_text(
     + the session-id prefixes.
 
     F3 hardening: render newest-first up to ``_PREEMPTION_PROSE_VERBATIM_CAP``
-    notices in full. If more remain, coalesce them into a single overflow line
-    pointing at the ``/agent-coherence status`` console for the full list.
-    This bounds the prose to a constant-size block regardless of N, sidesteps
-    Claude Code's 10KB additionalContext cap, and uses the status surface as
-    the overflow channel rather than silently truncating.
+    notices in full. If more remain, coalesce them into a single overflow line.
+    This bounds the prose to a constant-size block regardless of N and sidesteps
+    Claude Code's 10KB additionalContext cap.
+
+    The overflow is a DEFERRAL, not a truncation: callers pass that same cap as
+    ``pop_pending_notices(consume_limit=...)``, so only the rendered rows are
+    consumed and the rest surface on the session's next tracked-file operation
+    (or age out via ``evict_stale_notices``). The overflow line used to name
+    ``/agent-coherence status`` / ``GET /status`` as the place to read the
+    rest — neither has ever carried notice data, and the rows had already been
+    deleted by the call that under-reported them.
     """
     # Sort newest first — the most recent preemption is the most informative
-    # signal for the agent's next decision.
+    # signal for the agent's next decision. The registry already returns rows
+    # newest-first (ts DESC, artifact_id DESC) and this sort is STABLE, so the
+    # verbatim slice below picks exactly the rows the drain consumed; the rest
+    # are still queued. Changing either ordering without the other re-opens the
+    # drop (rows deleted that this never renders).
     sorted_notices = sorted(notices, key=lambda n: n[2], reverse=True)
     verbatim = sorted_notices[:_PREEMPTION_PROSE_VERBATIM_CAP]
     overflow = sorted_notices[_PREEMPTION_PROSE_VERBATIM_CAP:]
@@ -4786,10 +4806,14 @@ def _build_preemption_text(
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
     if overflow:
+        # The overflow rows are NOT consumed — the drain above is bounded to
+        # what is rendered here — so they surface on this session's next
+        # tracked-file operation. The line used to point at /status, which
+        # carries no notice data at any disclosure tier, while the rows it
+        # named had just been deleted by the same call.
         lines.append(
-            f"  • Plus {len(overflow)} more preemptions since your last activity; "
-            f"run `/agent-coherence status` (or query GET /status on the coordinator) "
-            f"for the full list."
+            f"  • Plus {len(overflow)} more preemptions since your last activity, "
+            f"still queued — they surface on your next tracked-file operation."
         )
     lines.append(
         "Re-read affected files before continuing if you need the latest "

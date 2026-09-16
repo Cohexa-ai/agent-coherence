@@ -69,6 +69,19 @@ Alpha — APIs may change before `v1.0`.
   of printing `None`. `StatusResponse` was documenting `last_writer` and
   `session_id` keys the handler has never emitted; it now matches the wire.
 
+- **Preemption notices past the render cap are no longer destroyed.** One
+  `pre-read` on one path deleted *every* pending notice for the session while
+  rendering three of them, and the overflow line sent the caller to
+  `/agent-coherence status` / `GET /status`, neither of which has ever carried
+  notice data at any disclosure tier. Seven pending notices became three
+  rendered and four unrecoverable, so an agent reconciling after losing grants
+  learned who took three of its artifacts and got a bare count for the rest.
+  The drain is now bounded to what the response actually renders
+  (`pop_pending_notices(consume_limit=...)`); the rest stay queued and surface
+  on the session's next tracked-file operation, and the overflow line says that
+  instead. `POST /hooks/session-stop` still drains everything — it returns the
+  full structured array, so its drain was always matched by its render.
+
 - **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
   `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
   warn-mode renderers sliced it to eight characters unconditionally, so a

@@ -4805,3 +4805,161 @@ def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
     assert {k for s in body["sessions"] for k in s} == {
         "agent_name", "agent_id", "states",
     }
+
+
+# ======================================================================
+# Preemption notices past the render cap must survive, not be destroyed
+# ======================================================================
+#
+# ``pop_pending_notices`` deleted EVERY row for the agent, while the prose
+# builder rendered only ``_PREEMPTION_PROSE_VERBATIM_CAP`` of them. One
+# pre-read on one path therefore destroyed every notice the response did
+# not show, and the overflow line pointed at /status, which has never
+# carried notice data. The drain is now bounded to what is rendered.
+
+
+def _pending_count(coordinator, agent_id) -> int:
+    """How many notices are still queued for this agent (non-destructive)."""
+    artifact_by_id, _ = coordinator.registry.status_snapshot()
+    return sum(
+        1
+        for artifact_id in artifact_by_id
+        if coordinator.registry.peek_preemption_notice(agent_id, artifact_id)
+        is not None
+    )
+
+
+def _seven_notices(client: _Client, coordinator) -> tuple[str, list[str]]:
+    """Leave session A holding seven pending preemption notices."""
+    paths = [f"docs/f{n}.md" for n in range(7)]
+    a, b = _sid("notice-victim"), _sid("notice-taker")
+    client.post("/policy/track", {"paths": paths})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": a, "path": p})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": b, "path": p})
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 7
+    return a, paths
+
+
+def test_pre_read_consumes_only_the_notices_it_renders(
+    coordinator, client: _Client
+) -> None:
+    """Seven pending, three rendered → four still queued. The four the
+    response could not show are the caller's only record of who took those
+    artifacts; deleting them made the preempters unrecoverable."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+    rendered = [ln for ln in text.splitlines() if ln.strip().startswith("•")]
+    verbatim = [ln for ln in rendered if "Plus " not in ln]
+
+    assert len(verbatim) == 3
+    assert "Plus 4 more" in text
+    assert _pending_count(coordinator, agent_a) == 4, (
+        "the four notices the response did not render must still be queued"
+    )
+
+
+def test_successive_reads_deliver_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """The overflow is a deferral, not a loss: three more arrive on the next
+    tracked-file operation, and the last one after that."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    seen: set[str] = set()
+    for expected_remaining in (4, 1, 0):
+        _, body = client.post(
+            "/hooks/pre-read", {"session_id": a, "path": paths[0]}
+        )
+        text = body["hookSpecificOutput"]["additionalContext"]
+        seen.update(p for p in paths if f"• {p} —" in text)
+        assert _pending_count(coordinator, agent_a) == expected_remaining
+
+    assert seen == set(paths), "every preempted artifact was eventually named"
+
+
+def test_overflow_line_does_not_point_at_a_surface_without_notices(
+    coordinator, client: _Client
+) -> None:
+    """/status carries no notice data at any tier, so the overflow line must
+    not send the caller there. It names the real delivery channel instead."""
+    a, paths = _seven_notices(client, coordinator)
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "GET /status" not in text
+    assert "agent-coherence status" not in text
+
+    _, status_body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert not any(
+        "notice" in k or "preempt" in k for k in status_body
+    ), "if /status ever carries notices, this test should be the one to change"
+
+
+def test_session_stop_still_drains_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """Stop returns the full structured array, so its drain is matched by its
+    render — it must keep consuming all of them."""
+    a, _paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    assert len(body["notices"]) == 7
+    assert _pending_count(coordinator, agent_a) == 0
+
+
+def test_unlimited_drain_does_not_bind_one_variable_per_notice(
+    coordinator, client: _Client
+) -> None:
+    """session-stop's full drain must bind only ``agent_id``, not one variable
+    per row. An IN-list of every pending notice can exceed SQLite's
+    bound-variable ceiling on an agent with a large pending set, raising
+    mid-transaction instead of committing.
+
+    Driven against the real ceiling, lowered for the duration: with a
+    per-row IN-list this raises OperationalError; with the bulk DELETE it does
+    not. Six notices against a limit of four is the same shape as 40k notices
+    against the stock 32766.
+    """
+    import sqlite3
+
+    sid = _sid("bulk-drain")
+    agent_id = session_to_agent_id(sid)
+    peer = session_to_agent_id(_sid("bulk-peer"))
+    paths = [f"docs/bulk{n}.md" for n in range(6)]
+    client.post("/policy/track", {"paths": paths})
+    # Mint the artifacts FIRST: a pre-read drains this session's notices, so
+    # recording inside the read loop would let each read consume what the
+    # previous iterations queued.
+    artifact_ids = []
+    for path in paths:
+        client.post("/hooks/pre-read",
+                    {"session_id": sid, "path": path, "content_hash": _hash(path)})
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        assert artifact_id is not None
+        artifact_ids.append(artifact_id)
+    for n, artifact_id in enumerate(artifact_ids):
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id, artifact_id=artifact_id,
+            preempter_agent_id=peer, preempted_at_unix_ts=1700000000.0 + n,
+        )
+
+    conn = coordinator.registry._conn
+    previous = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+    try:
+        drained = coordinator.registry.pop_pending_notices(agent_id)
+    finally:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+    assert len(drained) == 6
+    assert _pending_count(coordinator, agent_id) == 0
