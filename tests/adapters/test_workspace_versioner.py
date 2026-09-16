@@ -2621,6 +2621,73 @@ class _PinBetweenScanAndDrop(WorkspaceVersioner):
         return result
 
 
+class _PinAfterLastInstantScan(WorkspaceVersioner):
+    """The NARROWER interleave: the injected pin lands after BOTH scans — the
+    admission check and the last-instant re-check — and therefore inside the
+    window between that re-check and the substrate drop, which no re-check can
+    close. Reproduced without threads by counting the scan calls."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.inject_after_scan_number: int | None = None
+        self.inject: Any | None = None
+        self._scans = 0
+
+    def _pin_shared_elsewhere(self, store: Any, checkpoint_id: str, row: Any) -> bool:
+        result = WorkspaceVersioner._pin_shared_elsewhere(store, checkpoint_id, row)
+        self._scans += 1
+        if self.inject is not None and self._scans == self.inject_after_scan_number:
+            inject, self.inject = self.inject, None
+            inject()
+        return result
+
+
+def test_release_checkpoint_replaces_a_hold_claimed_inside_the_drop_window(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """A pin landing AFTER the last-instant re-check still loses its hold —
+    the one under-retention direction this engine refuses everywhere else.
+
+    No re-check can close that window: the check is a registry read and the
+    drop is a separate substrate call. Converging can. After the drop, the
+    release re-reads and puts the hold back if a holder appeared, so the peer's
+    ``held`` row is backed again rather than left claiming a version that is
+    now expirable.
+    """
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    releasing = _PinAfterLastInstantScan(
+        service=service, owner=OWNER, clock=_TickClock()
+    )
+    releasing.add_object_member(obj, "cfg.json")
+    cp_a = releasing.checkpoint("holder-a")
+
+    sibling = _versioner(service)
+    sibling.add_object_member(obj, "cfg.json")
+    cp_b = sibling.checkpoint("holder-b", pin=False)  # invisible to both scans
+    assert cp_b.members[0].native_token == cp_a.members[0].native_token
+
+    # Scan 1 = admission check, scan 2 = last-instant re-check. Landing the
+    # pin after scan 2 puts it exactly in the window the re-check cannot see.
+    releasing.inject_after_scan_number = 2
+    releasing.inject = lambda: sibling.pin_checkpoint(cp_b.record.checkpoint_id)
+
+    releasing.release_checkpoint(cp_a.record.checkpoint_id)
+
+    (row_a,) = registry.get_checkpoint_members(cp_a.record.checkpoint_id)
+    (row_b,) = registry.get_checkpoint_members(cp_b.record.checkpoint_id)
+    assert row_a.pin_state == PIN_STATE_RELEASED
+    assert row_b.pin_state == PIN_STATE_HELD
+    # B's claim is BACKED: the hold it took in the window was put back.
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert held == [put["VersionId"]] and expired == []
+    # Last-out still drops.
+    sibling.release_checkpoint(cp_b.record.checkpoint_id)
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+
+
 def test_concurrent_pin_between_release_scan_and_drop_keeps_hold(
     registry: ArtifactRegistry, service: CoordinatorService
 ) -> None:
@@ -2981,6 +3048,44 @@ def test_release_checkpoint_untyped_substrate_error_propagates_and_strands(
     # The failing member: recorded released, hold STRANDED on the substrate.
     assert rows["s3://z-bad.json"].pin_state == PIN_STATE_RELEASED
     assert healthy.legal_hold_status("z-bad.json", version_id=put_bad["VersionId"]) is True
+
+
+def test_release_checkpoint_drops_the_hold_before_the_refcount_can_refuse(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """The refcount decrement is bookkeeping and it must not be able to skip
+    the substrate drop.
+
+    It fails CLOSED when the count would go below zero, which is what a second
+    releaser running concurrently causes. Ordered before the drop, that raise
+    aborts with the row already terminal and the hold still ON — and no later
+    call walks a released row, so the hold is stranded for good. Ordered after,
+    the same raise leaves only refcount drift, which this engine already
+    documents as benign.
+
+    Driving the refcount to zero out of band is the concurrent releaser's
+    effect, made deterministic: the next decrement must refuse.
+    """
+    client, obj = _s3()
+    put = client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    cp = versioner.checkpoint("held")
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is True
+    # Stand in for the peer releaser that already decremented this checkpoint.
+    service.adjust_workspace_checkpoint_pin_refcount(cp.record.checkpoint_id, -1)
+
+    with pytest.raises(ValueError):
+        versioner.release_checkpoint(cp.record.checkpoint_id)
+
+    # The bookkeeping refused, but the retention control was already cleared.
+    assert obj.legal_hold_status("cfg.json", version_id=put["VersionId"]) is False
+    (row,) = registry.get_checkpoint_members(cp.record.checkpoint_id)
+    assert row.pin_state == PIN_STATE_RELEASED
+    # And the version is genuinely expirable now, not merely marked released.
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v2")
+    expired, held = client.lifecycle_expire_noncurrent("demo", "cfg.json")
+    assert expired == [put["VersionId"]] and held == []
 
 
 def test_pin_checkpoint_after_release_checkpoint_is_one_way(

@@ -21,6 +21,13 @@ Alpha — APIs may change before `v1.0`.
   releasing versioner through the same binding and key that placed the hold.
   Python only, with no HTTP route and no CLI verb, because the substrate
   bindings carry your credentials.
+  Two ordering properties are worth knowing if you drive it from more than one
+  process. The pin refcount is decremented *after* the substrate hold is
+  dropped, so a concurrent release whose surplus decrement fails closed costs
+  you bookkeeping accuracy rather than leaving a live hold nothing will clear.
+  And the drop converges: it re-reads afterwards and puts the hold back if a
+  peer claimed that version in the instant between the last check and the
+  drop, rather than leaving the peer holding a claim with nothing behind it.
 
 - **Foreign-write detection — the window between the guards is now observable.**
   The coordinator sees writes routed through it; an editor, a script, or a

@@ -909,18 +909,22 @@ class WorkspaceVersioner:
         releases: S3's hold is a flag, not a counter, and the cross-checkpoint
         ``(member_path, native_token)`` scan is the counter. Two bounds on it:
         the scan walks THIS versioner's registry only — a holder recorded
-        elsewhere is invisible to it — and it cannot close the engine's
-        disclosed under-retention window, where a pin landing after the
-        last-instant re-check can still lose its hold.
+        elsewhere is invisible to it — and it cannot, by itself, close the
+        window between that re-check and the substrate drop. That window is
+        covered by CONVERGING rather than by checking harder: after the drop
+        this re-reads, and puts the hold back when a peer claimed it in the
+        gap. A failure to put it back is logged, so the residual is narrowed
+        to that logged case rather than open.
 
         Idempotent means REPEAT calls, not concurrent ones: this instance's
         lock does not serialize a second versioner or process releasing the
         same checkpoint, and two that both read the same ``held`` rows will
         both decrement the pin refcount — the registry fails closed with
         ``ValueError`` on whichever decrement would take the count below zero.
-        That raise lands AFTER the member's row is already ``released`` and
-        BEFORE its substrate drop, so it strands that hold exactly as the
-        untyped-error case below does.
+        That raise lands after the member's row is already ``released`` and
+        after its substrate drop has been attempted, so the hold is already
+        gone and what is left is refcount drift, not a stranded hold. The
+        call still fails; treat it as "some members were released".
 
         Idempotent is NOT self-healing: the release RECORDS ``released``
         before it drops the substrate hold, so a crash or an untyped substrate
@@ -937,8 +941,9 @@ class WorkspaceVersioner:
         released": a blank/non-string id (BEFORE any store access); a ``held``
         S3 row with no declared binding (pre-flight, before any write); and the
         refcount decrement failing closed under a concurrent release, which
-        fires after that member is already recorded ``released`` and can leave
-        it terminal with its hold still ON (see the concurrency note above).
+        fires after that member is already recorded ``released`` AND after its
+        hold has been dropped — so it aborts the rest of the checkpoint's
+        members, leaving them ``held`` for a later call (see above).
         Also raises the typed
         :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, and
         ``TypeError`` for a service without the pin surface.
@@ -1306,11 +1311,16 @@ class WorkspaceVersioner:
         different processes can each see the other still ``held`` and both
         skip the drop (over-retention, never data loss); a concurrent pin
         whose ``held`` row lands AFTER the last-instant re-check but BEFORE
-        the drop can still lose its hold (under-retention — the narrow
-        remaining window; closing it needs a registry-side transactional
-        claim spanning check-and-drop, outside v1's registry surface); the
-        refcount write is a separate registry write from the pin record, so a
-        crash between them leaves a benign bookkeeping drift.
+        the drop is no longer lost outright: the drop CONVERGES, re-reading
+        afterwards and re-placing the hold when a peer claimed it in that gap
+        (``set_legal_hold`` is idempotent, and re-placing one nobody needs is
+        over-retention, the safe direction). The residual is now the narrower
+        case where that re-place itself fails, which is logged; closing even
+        that needs a registry-side transactional claim spanning
+        check-and-drop, outside v1's registry surface. The refcount write is a
+        separate registry write from the pin record and lands AFTER the drop,
+        so neither a crash nor a fail-closed refcount between them can strand
+        a hold — what is left is benign bookkeeping drift.
         Cross-checkpoint identity is ``(member_path, native_token)`` — the
         bucket lives binding-side (real S3 version ids are unique; a
         cross-bucket collision is a documented residual of the fake's shape,
@@ -1353,71 +1363,136 @@ class WorkspaceVersioner:
                     pin_state=PIN_STATE_RELEASED,
                     restore_tier=downgrade,
                 )
-                store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
                 if (
                     row.arbitration_tier != ArbitrationTier.NATIVE_CAS.value
                     or row.native_token is None
                 ):
-                    continue  # the file verification pin has no substrate half
-                if self._pin_shared_elsewhere(store, checkpoint_id, row):
-                    continue  # another checkpoint's hold: survives (last-out drops)
-                member = declared[row.member_path]
-                assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
-                if self._pin_shared_elsewhere(store, checkpoint_id, row):
-                    # LAST-INSTANT re-check (fresh registry read): a concurrent
-                    # pin_checkpoint recorded ``held`` on this (member_path,
-                    # native_token) since the scan above — dropping now would
-                    # strip the hold the sibling just claimed (under-retention,
-                    # the UNSAFE direction). Skip instead: over-retention, safe
-                    # (the new holder's own release drops it last-out). The
-                    # window between THIS read and the drop remains — see the
-                    # docstring's disclosed residual.
-                    continue
-                try:
-                    member.binding.release_legal_hold(
-                        member.key, version_id=row.native_token
-                    )
-                except (KeyError, LegalHoldUnavailable) as exc:
-                    # The hold is moot — the version (or the lock
-                    # configuration) is gone; the release's goal (no dangling
-                    # hold) already stands. The record above is the truth.
-                    # EXCEPT when the member was re-declared through a binding
-                    # or key that does not address the pinned version: the
-                    # pre-flight cannot tell those apart (it only asks that
-                    # SOME object member is declared at the path), the hold is
-                    # then still ON, and the caller gets no exception and no
-                    # changed row. This line is the only signal either way.
-                    logger.warning(
-                        "checkpoint pin release could not reach the held "
-                        "version, treating the hold as moot: checkpoint=%s "
-                        "member=%s version=%s cause=%r — if this member was "
-                        "re-declared through a different binding or key, the "
-                        "hold is STILL ON",
-                        checkpoint_id,
-                        row.member_path,
-                        row.native_token,
-                        exc,
-                    )
-                    continue
-                except Exception:
-                    # Record-before-drop already made this row terminal, so no
-                    # later release_checkpoint or pin_checkpoint walks it: this
-                    # line is the only record of WHICH version was stranded,
-                    # and that version id is exactly what the documented
-                    # recovery needs. Re-raise — absorbing it here would hide
-                    # the strand behind a clean return.
-                    logger.error(
-                        "checkpoint pin release STRANDED a live hold: "
-                        "checkpoint=%s member=%s version=%s — the row is "
-                        "already terminal, so recover out of band with "
-                        "CoherentObject.release_legal_hold on the binding, "
-                        "by version",
-                        checkpoint_id,
-                        row.member_path,
-                        row.native_token,
-                    )
-                    raise
+                    pass  # the file verification pin has no substrate half
+                elif self._pin_shared_elsewhere(store, checkpoint_id, row):
+                    pass  # another checkpoint's hold: survives (last-out drops)
+                else:
+                    member = declared[row.member_path]
+                    assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
+                    if self._pin_shared_elsewhere(store, checkpoint_id, row):
+                        # LAST-INSTANT re-check (fresh registry read): a
+                        # concurrent pin_checkpoint recorded ``held`` on this
+                        # (member_path, native_token) since the scan above —
+                        # dropping now would strip the hold the sibling just
+                        # claimed (under-retention, the UNSAFE direction).
+                        # Skip: over-retention is the safe direction, and the
+                        # new holder's own release drops it last-out.
+                        pass
+                    else:
+                        try:
+                            member.binding.release_legal_hold(
+                                member.key, version_id=row.native_token
+                            )
+                        except (KeyError, LegalHoldUnavailable) as exc:
+                            # The hold is moot — the version (or the lock
+                            # configuration) is gone; the release's goal (no
+                            # dangling hold) already stands, and the record
+                            # above is the truth. EXCEPT when the member was
+                            # re-declared through a binding or key that does
+                            # not address the pinned version: the pre-flight
+                            # cannot tell those apart (it only asks that SOME
+                            # object member is declared at the path), the hold
+                            # is then still ON, and the caller gets no
+                            # exception and no changed row. This line is the
+                            # only signal either way.
+                            logger.warning(
+                                "checkpoint pin release could not reach the "
+                                "held version, treating the hold as moot: "
+                                "checkpoint=%s member=%s version=%s cause=%r "
+                                "— if this member was re-declared through a "
+                                "different binding or key, the hold is STILL ON",
+                                checkpoint_id,
+                                row.member_path,
+                                row.native_token,
+                                exc,
+                            )
+                        except Exception:
+                            # Record-before-drop already made this row
+                            # terminal, so no later release_checkpoint or
+                            # pin_checkpoint walks it: this line is the only
+                            # record of WHICH version was stranded, and that
+                            # version id is exactly what the documented
+                            # recovery needs. Re-raise — absorbing it here
+                            # would hide the strand behind a clean return.
+                            logger.error(
+                                "checkpoint pin release STRANDED a live hold: "
+                                "checkpoint=%s member=%s version=%s — the row "
+                                "is already terminal, so recover out of band "
+                                "with CoherentObject.release_legal_hold on the "
+                                "binding, by version",
+                                checkpoint_id,
+                                row.member_path,
+                                row.native_token,
+                            )
+                            raise
+                        else:
+                            self._reclaim_hold_taken_during_drop(
+                                store, checkpoint_id, row, member
+                            )
+                # The refcount decrement is a SEPARATE registry write and it
+                # lands AFTER the substrate attempt on purpose. It fails CLOSED
+                # below zero, which is exactly what a second releaser running
+                # concurrently causes — and ordered BEFORE the drop, that raise
+                # aborted with this row already terminal and its hold still ON,
+                # permanently, because nothing walks a released row again.
+                # Ordered here the same raise leaves only refcount drift, which
+                # this engine already documents as benign. Record-before-drop,
+                # the load-bearing order, is unchanged; only bookkeeping moved.
+                store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
             return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
+
+    def _reclaim_hold_taken_during_drop(
+        self,
+        store: CheckpointPinStore,
+        checkpoint_id: str,
+        row: CheckpointMember,
+        member: "_ObjectMember",
+    ) -> None:
+        """Put back a hold a peer claimed inside the drop window (CONVERGE).
+
+        The last-instant re-check is a registry read and the drop is a separate
+        substrate call, so a concurrent ``pin_checkpoint`` can record ``held``
+        between them and lose the hold it just took — under-retention, the one
+        direction this engine refuses everywhere else. No re-check can close
+        that gap; re-reading AFTER the drop can. Every outcome here is
+        acceptable: the peer's claim gets backed again, or this fails and the
+        result is exactly what it was without the call (plus a record), or it
+        re-places a hold nobody needs, which is over-retention — the safe
+        direction. ``set_legal_hold`` is idempotent, so re-placing a live hold
+        is a no-op.
+
+        Deliberately does not raise. The release itself already succeeded, and
+        the state without this call is the state with it failing, so raising
+        would turn a narrowed race into a hard error.
+        """
+        if not self._pin_shared_elsewhere(store, checkpoint_id, row):
+            return
+        try:
+            member.binding.set_legal_hold(member.key, version_id=row.native_token)
+        except Exception:
+            logger.error(
+                "checkpoint pin release dropped a hold a concurrent pin had "
+                "just claimed, and could not put it back: checkpoint=%s "
+                "member=%s version=%s — the peer checkpoint reads ``held`` "
+                "with nothing behind it; re-pin it or treat it as "
+                "restorable-unpinned",
+                checkpoint_id,
+                row.member_path,
+                row.native_token,
+            )
+        else:
+            logger.warning(
+                "checkpoint pin release re-placed a hold a concurrent pin "
+                "claimed inside the drop window: checkpoint=%s member=%s "
+                "version=%s",
+                checkpoint_id,
+                row.member_path,
+                row.native_token,
+            )
 
     @staticmethod
     def _pin_shared_elsewhere(
