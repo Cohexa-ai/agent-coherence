@@ -12,8 +12,9 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
-Protocols), this module names the CONTRACT that surface must satisfy for a
+names the registry SURFACE (the 59-member ``RegistryBase`` + ``SqliteExtended``
+Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
+this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
 IS (:data:`R9_ATOMIC_BOUNDARY`), the conformance tiers (:class:`Tier`), the
@@ -109,8 +110,9 @@ class MemberContract:
     rationale: str
 
 
-# The 66 members of RegistryBase (45 methods + 1 property), SqliteExtended
-# (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
+# The 68 members of RegistryBase (45 methods + 1 property), SqliteExtended
+# (+13 methods) and ForeignWriteDetection (+9 methods), classified against the
+# CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
 # ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
