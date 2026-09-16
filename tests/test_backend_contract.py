@@ -297,6 +297,56 @@ def test_module_states_the_never_own_the_store_non_goal() -> None:
     assert "never" in doc and "store we ship" in doc
 
 
+def test_the_module_prose_states_the_real_member_counts() -> None:
+    """The module says its member counts twice, in prose, and nothing read them.
+
+    The counts have one source of truth — the frozen name sets above — and it is
+    copied FOUR times: twice into this file's ``== 66`` literals, which are a
+    real guard because both sides are computed from the Protocols, and twice
+    into the module's own prose, which nothing checked. So a wrong number in
+    either sentence was invisible to the suite and to the linter. That is not
+    hypothetical: the surface sentence carried the all-three-protocols number
+    for a two-protocol surface until a human read it (PR #204), and mutating
+    either sentence to `999` passed every test in this file.
+
+    The two sentences count DIFFERENT things, which is the trap and the reason
+    this asserts them apart rather than checking that they agree:
+
+    * the surface sentence spans ``RegistryBase`` + ``SqliteExtended`` only,
+      because the detection members deliberately sit on their own
+      ``ForeignWriteDetection`` Protocol;
+    * the classification comment spans all three.
+
+    Matching on the surrounding words is deliberate. Reword either sentence past
+    these patterns and this fails rather than quietly stopping to guard it — an
+    empty match list is the failure this is here to prevent, so make the update
+    on purpose.
+    """
+    import re
+
+    import ccs.coordinator.backend_contract as mod
+
+    two_protocol = len(BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES)
+    three_protocol = two_protocol + len(DETECTION_METHODS)
+
+    source_path = mod.__file__
+    assert source_path is not None
+    with open(source_path, encoding="utf-8") as fh:
+        source = fh.read()
+
+    surface = re.findall(r"the (\d+)-member ``RegistryBase``", source)
+    classified = re.findall(r"# The (\d+) members of RegistryBase", source)
+
+    assert surface == [str(two_protocol)], (
+        f"the surface sentence says {surface}, but RegistryBase + SqliteExtended "
+        f"hold {two_protocol} members"
+    )
+    assert classified == [str(three_protocol)], (
+        f"the classification comment says {classified}, but all three Protocols "
+        f"hold {three_protocol} members"
+    )
+
+
 def test_module_imports_no_networked_code() -> None:
     """The module is pure vocabulary — it imports no I/O, networking, or higher
     layers. Guards against a networked dependency creeping in."""
