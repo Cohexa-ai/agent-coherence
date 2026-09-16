@@ -22,11 +22,19 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import subprocess
+import sys
 import tomllib
 from glob import glob
 from pathlib import Path
 
 import pytest
+
+#: This module's own object, for the tests that monkeypatch its helpers.
+#: ``sys.modules[__name__]`` rather than a dotted re-import: tests/ is not a
+#: package, and a re-import would hand the patches a different module object
+#: than the one under test.
+mod = sys.modules[__name__]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
@@ -102,12 +110,60 @@ def _declared_data_files() -> set[Path]:
     return declared
 
 
+def _git_ignored_paths() -> set[Path]:
+    """Absolute paths under ``src/ccs/`` that git reports as IGNORED.
+
+    A file git ignores is not in the repository, so no wheel or sdist built
+    from a checkout can carry it — it is not an asset this guard has any
+    business demanding a declaration for.
+
+    FAILS CLOSED. Every failure path returns an empty set, so nothing is
+    subtracted and the guard stays at its strictest. That asymmetry is the
+    whole reason this subtracts the IGNORED set instead of switching the walk
+    to ``git ls-files`` (tracked-only): a tracked-only walk fails OPEN — no
+    git means no assets, no undeclared set, and a module that reports green
+    while checking nothing. ``--exclude-standard`` reads ``.gitignore``,
+    ``.git/info/exclude`` and ``core.excludesFile``, and resolves the middle
+    one from the COMMON git dir, so this is correct inside a worktree too.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-C", str(REPO_ROOT), "ls-files",
+                "--others", "--ignored", "--exclude-standard", "-z",
+                "--", "src/ccs",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    # ValueError is not decoration: ``text=True`` decodes git's output, so a
+    # path this locale cannot decode raises UnicodeDecodeError (a ValueError)
+    # from inside ``run`` — neither OSError nor SubprocessError covers it, and
+    # without it here the helper would crash rather than fail closed.
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return set()
+    return {REPO_ROOT / rel for rel in completed.stdout.split("\0") if rel}
+
+
 def _shipped_assets() -> set[Path]:
-    """Every non-Python, non-cache file living under ``src/ccs/``."""
+    """Every non-Python, non-cache, non-git-ignored file under ``src/ccs/``.
+
+    The git-ignored subtraction is what keeps this honest on a developer
+    machine: local-only files (per-package ``CLAUDE.md`` instructions, a
+    macOS ``.DS_Store``) sit under ``src/ccs/`` but are absent from the CI
+    checkout, so without it this guard was red locally and green in CI — for
+    files that were never going to ship either way.
+    """
+    ignored = _git_ignored_paths()
     return {
         path
         for path in (SRC_ROOT / "ccs").glob("**/*")
-        if path.is_file() and path.suffix != ".py" and "__pycache__" not in path.parts
+        if path.is_file()
+        and path.suffix != ".py"
+        and "__pycache__" not in path.parts
+        and path not in ignored
     }
 
 
@@ -174,3 +230,84 @@ def test_replayed_data_files_match_setuptools(monkeypatch: pytest.MonkeyPatch) -
     }
 
     assert resolved == _declared_data_files()
+
+
+# ----------------------------------------------------------------------
+# The ignore filter: what git hides can never ship, so it is not an asset
+# ----------------------------------------------------------------------
+#
+# ``_shipped_assets`` walks the filesystem, so it used to count every
+# non-.py file under src/ccs/ — including local-only files git ignores.
+# Six ``CLAUDE.md`` files (and, on macOS, any ``.DS_Store``) made this guard
+# permanently red on a developer machine while staying green in CI, where
+# ``actions/checkout`` materializes tracked content only. A guard that is
+# always red is a guard nobody reads.
+
+
+def test_shipped_assets_excludes_paths_git_reports_ignored(monkeypatch) -> None:
+    """The walk consults the ignore filter. Proven with a sentinel — a real
+    on-disk asset forced into the ignored set must drop out of the walk."""
+    sentinel = SRC_ROOT / "ccs" / "output" / "templates" / "comparison_report.html"
+    assert sentinel.is_file(), "fixture drifted: the sentinel asset must exist"
+    assert sentinel in mod._shipped_assets(), "sentinel must be present before filtering"
+
+    monkeypatch.setattr(mod, "_git_ignored_paths", lambda: {sentinel})
+    assert sentinel not in mod._shipped_assets()
+
+
+def test_ignored_lookup_fails_closed_when_git_is_unavailable(monkeypatch) -> None:
+    """No git → an EMPTY ignored set, so nothing is subtracted and the guard
+    stays at its strictest.
+
+    This is why the filter subtracts the IGNORED set rather than switching the
+    walk to `git ls-files` (tracked-only): a tracked-only walk would fail OPEN
+    — a missing git yields no assets at all, no undeclared set, and a silently
+    green guard that has stopped checking anything.
+    """
+    def _boom(*_a, **_kw):
+        raise FileNotFoundError("git not on PATH")
+
+    monkeypatch.setattr(mod.subprocess, "run", _boom)
+    assert mod._git_ignored_paths() == set()
+
+    monkeypatch.setattr(
+        mod.subprocess, "run",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            mod.subprocess.CalledProcessError(128, "git")
+        ),
+    )
+    assert mod._git_ignored_paths() == set()
+
+    # `text=True` decodes git's output, so a path this locale cannot decode
+    # raises UnicodeDecodeError — a ValueError, which neither OSError nor
+    # SubprocessError covers. Without it in the except clause the helper
+    # CRASHES instead of failing closed, contradicting its own docstring.
+    def _undecodable(*_a, **_kw):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(mod.subprocess, "run", _undecodable)
+    assert mod._git_ignored_paths() == set()
+
+
+def test_declared_templates_are_never_filtered_out() -> None:
+    """Anti-fail-open: the two tracked, declared assets must survive the
+    filter on every machine. An over-broad ignore filter would empty the
+    walk and turn this whole module green while checking nothing."""
+    shipped = mod._shipped_assets()
+    for rel in (
+        "ccs/output/templates/comparison_report.html",
+        "ccs/diagnose/templates/diagnose_report.html",
+    ):
+        assert SRC_ROOT / rel in shipped, f"{rel} vanished from the asset walk"
+
+    ignored = mod._git_ignored_paths()
+    assert not ignored & shipped, "the filter and the walk must not overlap"
+    # Under src/ccs specifically, not merely somewhere in the repo:
+    # SRC_ROOT.parent is REPO_ROOT, which is a parent of EVERY repo path, so
+    # asserting on it would pass for docs/ and tests/ alike — a check that
+    # cannot see the case it names.
+    package_root = SRC_ROOT / "ccs"
+    for path in ignored:
+        assert package_root in path.parents, (
+            f"ignore filter reached outside the coordinated package: {path}"
+        )
