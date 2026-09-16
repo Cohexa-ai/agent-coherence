@@ -82,6 +82,23 @@ Alpha — APIs may change before `v1.0`.
   instead. `POST /hooks/session-stop` still drains everything — it returns the
   full structured array, so its drain was always matched by its render.
 
+- **`CasVersionConflict` no longer relabels every CAS refusal as
+  `version_mismatch`.** The coordinator distinguishes four refusals —
+  `version_mismatch`, `other_holder`, `stale_read_generation` and
+  `caller_in_transient_state` — and the client folded all four into one verdict
+  and discarded the reason, while the exception pinned `version_mismatch` as a
+  class attribute. Each needs different recovery, and the mislabel was
+  actively harmful for `other_holder`: the version has *not* moved, so the
+  message's own advice ("re-read at current and re-merge") produces a
+  byte-identical CAS that fails identically until the holder releases, and the
+  caller spins. The wire reason now travels onto the instance and into the
+  message, the MCP deny mapper routes a recover verb per reason
+  (`wait_and_retry` / `reacquire_and_reread` / `reacquire`), and a HELD batch
+  publish carries the first conflicting member's reason as
+  `StaleView.member_reason`. The class default and the `version_mismatch`
+  message are unchanged, so existing consumers and the byte-stability retry
+  contract are untouched.
+
 - **The `<unknown>` holder placeholder is no longer truncated to `<unknown`.**
   `emit_strict_deny` already preserved a `<...>` sentinel verbatim; the two
   warn-mode renderers sliced it to eight characters unconditionally, so a
