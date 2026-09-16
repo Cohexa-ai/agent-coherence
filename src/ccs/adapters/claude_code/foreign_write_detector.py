@@ -41,6 +41,14 @@ exit and a clean tree to the same value; here a failed poll raises, the tick is
 NOT recorded, and the run's observed interval is closed so the offline report
 shows a hole rather than interpolating across it.
 
+**A run row is a claim about a span, so every way of not watching ends it.**
+There are three, and the first two are the only ones this pass can see: a poll
+that failed, and a tick that found nothing in scope. The third is the pass not
+running at all — a suspended host, or the four safety passes ahead of detection
+stuck on the store — which leaves no trace here by construction. So a tick that
+arrives further from the last one than the sweep cadence can explain opens a
+new interval instead of joining the old, and the stall reads as the hole it was.
+
 **An inert workspace is not a broken poll.** A workspace with no repository at
 or above it cannot be polled at all: the condition is permanent, no operator
 action clears it, and every tick would otherwise log the same traceback until
@@ -56,6 +64,21 @@ Git answers a gutted repository — ``.git`` present, ``HEAD`` or ``objects`` or
 the parent directories): .git" and the same exit 128 it gives an absent one.
 Classifying on that sentence alone would quiet a corrupt repository, which is
 both actionable and precisely the false reassurance this pass exists to refuse.
+
+**What the quiet state cannot tell apart, and why no cheap memory fixes it.** A
+workspace whose filesystem drops back to an empty directory satisfies all three
+terms: git exits 128 with the sentence, and the walk genuinely finds no
+``.git``. That outage can be transient and actionable, and it is quieted as if
+permanent. The obvious discriminator — "this root completed a poll once, so a
+repository existed" — already exists in ``detection_runs`` and does NOT work
+here: the store IS ``<coordinator_root>/.coherence/state.db``, so the outage
+that hides the repository hides the memory with it. Measured on a real second
+filesystem: a forced unmount under a running coordinator kills the process at
+the registry read that PRECEDES the poll, a graceful one is refused while the
+store is open, and a coordinator that starts during the outage opens a fresh
+store whose ``detection_runs()`` is empty. What is lost is the log line only.
+Every branch here records no tick and closes the observed interval, so the
+offline report still shows the hole.
 
 **It asks git for literal paths.** A stored artifact name is data, and git reads
 pathspec magic in a path even after ``--``. A name beginning with a colon would
@@ -199,6 +222,12 @@ def _poll_env() -> dict[str, str]:
     an output shape this code parses must not be inherited from the ambient
     environment. It is a message-catalog setting only: ``-z`` already suppresses
     path quoting, so the porcelain bytes are unchanged.
+
+    The literal ``C`` is load-bearing. ``POSIX``, which reads as a synonym, does
+    NOT suppress ``LANGUAGE`` — gettext special-cases only ``C``/``C.UTF-8`` —
+    and on macOS an unset locale is not the C locale either, because libintl
+    falls back to CoreFoundation's preferred languages. Setting no locale is
+    therefore not equivalent to setting this one.
     """
     env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECT_VARS}
     env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -333,9 +362,23 @@ def _walk_for_repository(root: Path) -> bool:
     message is identical for an absent repository and for a corrupt one, so the
     quiet state is earned here or not at all.
 
-    The walk mirrors git's own discovery: ``-C <root>`` and upward, with the
-    ``GIT_*`` overrides already scrubbed from the poll environment, so the two
-    cannot disagree about which repository was being looked for.
+    It walks ``-C <root>`` and upward, like git — but it does NOT mirror git,
+    and the difference is deliberate. Git stops at a filesystem boundary unless
+    ``GIT_DISCOVERY_ACROSS_FILESYSTEM`` is set; this walk crosses. So a
+    workspace on its own mount under a repository keeps its per-tick traceback,
+    which is only noise.
+
+    Do not "fix" that by stopping when ``st_dev`` changes. Measured on a real
+    second filesystem: a GUTTED repository across a mount boundary produces the
+    byte-identical "fatal: not a git repository (or any of the parent
+    directories): .git", with no boundary line to tell it apart — so a walk
+    that stopped at the boundary would answer absent and quiet a BROKEN
+    repository, which is the one reading the third term exists to refuse.
+    Crossing is what keeps that case loud. Doing it safely would additionally
+    mean reimplementing git's boolean grammar for that variable and stat-ing a
+    second time per level, every failure of which would have to resolve loud —
+    new branches on the one path whose whole job is refusing a false quiet,
+    bought with log lines.
 
     Every asymmetry runs toward the loud answer, because a wrong "absent" is the
     expensive one — it is the reading that turns a broken repository into a
@@ -553,6 +596,8 @@ def run_detection_pass(
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
     reported_faults: set[str],
+    tick_clock: dict[str, float],
+    max_gap_sec: float,
 ) -> int:
     """Run one detection tick. Returns the number of observations counted.
 
@@ -570,6 +615,14 @@ def run_detection_pass(
     once per tick. Nothing reads it but the log, and a completed poll clears it
     — the latch tracks the condition, so a workspace that later becomes a
     repository and then is not one again reports the second time too.
+
+    ``tick_clock`` is the caller's third piece and holds one number: when this
+    pass last recorded a tick. It is what lets a stall be seen at all — the
+    pass cannot observe the interval in which it did not run, so the only
+    evidence is the distance back to the tick before it. ``max_gap_sec`` is how
+    far apart two ticks may be and still belong to one continuously observed
+    span; the caller owns it because the caller owns the cadence. Both reset
+    with the process, which is correct: a restart opens a fresh run anyway.
     """
     try:
         return _detect(
@@ -579,6 +632,8 @@ def run_detection_pass(
             poll_budget_sec=poll_budget_sec,
             stat_cache=stat_cache,
             reported_faults=reported_faults,
+            tick_clock=tick_clock,
+            max_gap_sec=max_gap_sec,
         )
     except NotAGitRepositoryError as exc:
         # Not an error to hand an operator every five seconds: the instrument is
@@ -599,13 +654,15 @@ def run_detection_pass(
 
 
 def _close_observed_interval(coordinator: DetectionTarget) -> None:
-    """End the run's observed interval after a failed tick.
+    """End the run's observed interval after a tick that observed nothing.
 
     Without this a later successful tick would extend the same interval across
     the outage, and a coverage question answered from that interval would claim
     a span nothing watched. The next success opens a new interval and the hole
-    shows. Every failed tick closes it, including the inert-workspace one: what
-    that case quiets is the log, never the report.
+    shows. Every tick that observed nothing closes it — a failed poll, the
+    inert workspace, a tick with nothing in scope, and a tick that arrives too
+    late to join the interval before it. What the inert-workspace case quiets
+    is the log, never the report.
     """
     try:
         coordinator.registry.close_detection_run()
@@ -621,6 +678,8 @@ def _detect(
     poll_budget_sec: float,
     stat_cache: dict[str, tuple[tuple[int, int], str]],
     reported_faults: set[str],
+    tick_clock: dict[str, float],
+    max_gap_sec: float,
 ) -> int:
     # Bind both to locals for the whole tick. `/policy/track` swaps the policy
     # object atomically while the coordinator runs, and registration is
@@ -644,6 +703,17 @@ def _detect(
         # clean zero — that is the reading this instrument exists to prevent,
         # and it is reachable whenever the tracked patterns match no registered,
         # git-tracked artifact.
+        #
+        # And the interval closes, exactly as it does on a failed poll. Not
+        # recording the tick is only half of it: the run row this window sits
+        # inside is read as CONTINUOUSLY observed, so leaving it open lets the
+        # next successful tick extend the same interval across the window and
+        # `covers()` answer True for a span nothing was polled in. That is the
+        # false clean the whole three-state report exists to refuse, and it
+        # needs no corruption, no mount and no locale to reach — `/policy/track`
+        # swaps the tracked set while the coordinator runs, and the shipped
+        # untrack command is one way an operator empties it.
+        _close_observed_interval(coordinator)
         return 0
 
     dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
@@ -674,7 +744,20 @@ def _detect(
     # Only now, and only because the poll completed. A tick counted over a
     # failed poll would let the offline report call a broken instrument a quiet
     # month, which is the one reading the liveness row exists to prevent.
+    #
+    # And only into an interval this tick can honestly join. The run row says
+    # its span was continuously observed, so a tick that arrives further from
+    # the last one than the cadence explains would stretch that claim over a
+    # stretch nothing watched — the same false clean as a failed poll, reached
+    # by the pass not running rather than by the pass failing. Closing first
+    # makes this tick open a new interval and leaves the stall as a hole. A
+    # clock that steps backwards shortens the apparent gap rather than
+    # lengthening it, so it can only under-split, never invent a hole.
+    last_tick = tick_clock.get("last_tick_unix")
+    if last_tick is not None and (now_unix - last_tick) > max_gap_sec:
+        _close_observed_interval(coordinator)
     registry.record_detection_tick(now_unix, covered_count=len(covered))
+    tick_clock["last_tick_unix"] = now_unix
     return counted
 
 

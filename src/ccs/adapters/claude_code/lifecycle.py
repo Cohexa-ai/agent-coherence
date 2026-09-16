@@ -796,6 +796,12 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     # never be polled, and logging that once per sweep interval for the life of
     # the coordinator buries the failures an operator can act on.
     detection_reported_faults: set[str] = set()
+    # And when detection last recorded a tick, so a sweep that stalls — a
+    # suspended host, or the safety passes above stuck on the store — ends the
+    # observed interval instead of being interpolated across. The pass cannot
+    # see the interval in which it did not run; the distance back to the last
+    # tick is the only evidence it left.
+    detection_tick_clock: dict[str, float] = {}
 
     def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
         """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
@@ -888,6 +894,12 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             poll_budget_sec=cfg.sweep_interval_sec,
             stat_cache=detection_stat_cache,
             reported_faults=detection_reported_faults,
+            tick_clock=detection_tick_clock,
+            # Three sweep intervals of slack: one tick that arrives late
+            # because the four passes ahead of it ran long must not fragment a
+            # healthy run, but a stall long enough to hide a write must not be
+            # read as continuously observed either.
+            max_gap_sec=cfg.sweep_interval_sec * 3,
         )
 
 
