@@ -1022,8 +1022,18 @@ def test_a1_prose_capped_under_10kb_with_many_notices(client: _Client) -> None:
                           {"session_id": x, "path": paths[0]})
     if "hookSpecificOutput" in body:
         msg = body["hookSpecificOutput"]["additionalContext"]
-        assert len(msg.encode("utf-8")) <= 10240, (
-            f"additionalContext should fit in 10KB cap; got {len(msg.encode('utf-8'))} bytes"
+        # 10,000, not 10240. Claude Code routes every hook's
+        # additionalContext through one helper that returns the string
+        # unchanged only while `length <= 1e4`; above that it persists the
+        # prose to a file and hands the model a ~2KB preview plus a path.
+        # 10240 is 10 KiB where the platform means 10,000, so this assertion
+        # permitted 240 bytes the platform would have offloaded. The Node
+        # sibling asserts the same figure on both its surfaces. Note the
+        # platform counts UTF-16 code units while this counts UTF-8 bytes,
+        # which is the stricter direction for prose carrying "⚠"/"•"/"—".
+        assert len(msg.encode("utf-8")) <= 10_000, (
+            f"additionalContext should fit in the 10,000-byte platform cap; "
+            f"got {len(msg.encode('utf-8'))} bytes"
         )
         # And the message should mention coalescing (e.g., "and N more")
         # so the model knows there are unsurfaced notices.
