@@ -53,6 +53,7 @@ from .registry_protocol import (
     CheckpointRecord,
     DetectionRun,
     ReclamationSlot,
+    UncoverableRun,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -243,6 +244,7 @@ class ArtifactRegistry:
         self._detection_run_id: str = uuid4().hex
         self._detection_run: DetectionRun | None = None
         self._detection_runs_closed: list[DetectionRun] = []
+        self._detection_uncoverable: dict[str, UncoverableRun] = {}
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
         # THE registry lock. Started life as a capture-only lock (the
         # multi-artifact session-pin critical sections); widened to serialize
@@ -745,6 +747,26 @@ class ArtifactRegistry:
                 self._detection_runs_closed.append(self._detection_run)
                 self._detection_run = None
             self._detection_run_id = uuid4().hex
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        """Record that this run found nothing it could ever watch here.
+
+        See :meth:`SqliteArtifactRegistry.record_detection_uncoverable` for why
+        this is a third fact rather than a tick row with a zero count."""
+        with self._lock:
+            self._detection_uncoverable[self._detection_run_id] = UncoverableRun(
+                run_id=self._detection_run_id,
+                reason=reason,
+                observed_at_unix=now_unix,
+            )
+
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        """Runs that found no watchable workspace; empty is a real answer."""
+        with self._lock:
+            return sorted(
+                self._detection_uncoverable.values(),
+                key=lambda run: run.observed_at_unix,
+            )
 
     def record_foreign_write(
         self, artifact_id: UUID, outcome: str, disk_hash: str

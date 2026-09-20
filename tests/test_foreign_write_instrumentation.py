@@ -213,11 +213,15 @@ def _table_names(db: Path) -> set[str]:
         conn.close()
 
 
-def test_a_writer_open_creates_both_tables(tmp_path: Path) -> None:
+def test_a_writer_open_creates_every_table(tmp_path: Path) -> None:
     """Which is why their PRESENCE can never mean the detector ran."""
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()
-    assert {"foreign_write_counters", "foreign_write_observations"} <= _table_names(db)
+    assert {
+        "foreign_write_counters",
+        "foreign_write_observations",
+        "foreign_write_uncoverable",
+    } <= _table_names(db)
 
 
 def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
@@ -233,6 +237,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
@@ -242,6 +247,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     tables = _table_names(db)
     assert "foreign_write_counters" not in tables
     assert "foreign_write_observations" not in tables
+    assert "foreign_write_uncoverable" not in tables
 
 
 def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) -> None:
@@ -257,12 +263,14 @@ def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) 
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
     reg = SqliteArtifactRegistry(db, read_only=True)
     assert reg.foreign_write_totals() == {}
     assert reg.detection_runs() == []
+    assert reg.detection_uncoverable() == []
     reg.close()
 
 
@@ -317,3 +325,47 @@ def test_distinct_counts_are_not_transposed_between_outcomes(registry) -> None:
     assert registry.foreign_write_totals() == {
         art: {"foreign": 1, "mediated": 2, "lag_suppressed": 3}
     }
+
+
+def test_a_second_note_on_the_same_run_id_overwrites_rather_than_raising(tmp_path: Path) -> None:
+    """The in-memory twin keeps notes in a dict keyed on run id, so a re-call
+    with no ``close_detection_run`` between overwrites. The sqlite side must
+    match: ``ON CONFLICT (run_id) DO UPDATE`` is that parity, and nothing else
+    reaches it. A plain-INSERT mutant survived every other test in the three
+    foreign-write suites and raises ``IntegrityError`` on exactly this call —
+    so this is the one place the clause is seen at all."""
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    try:
+        reg.record_detection_uncoverable("r1", 100.0)
+        reg.record_detection_uncoverable("r2", 200.0)  # same run id: no close between
+        notes = reg.detection_uncoverable()
+        assert [(n.reason, n.observed_at_unix) for n in notes] == [("r2", 200.0)]
+    finally:
+        reg.close()
+
+
+def test_a_writer_handle_raises_on_a_missing_detection_table(tmp_path: Path) -> None:
+    """Kills dropping the ``self._read_only and`` qualifier.
+
+    The tolerance is scoped to a read-only handle on purpose: a writer open
+    CREATES the detection tables, so their absence under one is a fault in the
+    store, not news about its vintage. Returning ``[]`` there would answer a
+    question about the workspace with a lie about the schema — and the mutation
+    that removes the qualifier left all 96 tests in the three foreign-write
+    suites green, because every existing test of this path opens read-only.
+    """
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE foreign_write_uncoverable")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.OperationalError):
+            reg.detection_uncoverable()
+    finally:
+        reg.close()
