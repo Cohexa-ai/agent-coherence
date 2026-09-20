@@ -38,7 +38,12 @@ from ccs.adapters.claude_code.foreign_write_detector import (
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.substrate import sha256_hex
-from ccs.diagnose.foreign_writes import NOT_COVERABLE, NOT_INSTRUMENTED, read_foreign_write_report
+from ccs.diagnose.foreign_writes import (
+    INSTRUMENTED_ZERO,
+    NOT_COVERABLE,
+    NOT_INSTRUMENTED,
+    read_foreign_write_report,
+)
 
 WINDOW = 10.0
 POLL_BUDGET = 30.0
@@ -1865,6 +1870,9 @@ def test_a_workspace_that_regains_and_loses_its_repository_is_noted_twice(
     faults: set[str] = set()
     _tick(bare_coordinator, now_unix=100.0, faults=faults)
     _git(root, "init", "-q")
+    # Indexed, not merely present: a poll over an empty index observes nothing,
+    # so without this the "watched interval" this test asserts never happens.
+    _git(root, "add", "notes.md")
     _tick(bare_coordinator, now_unix=200.0, faults=faults)  # completes: re-arms, ticks
     assert faults == set()
     shutil.rmtree(root / ".git")
@@ -1882,10 +1890,12 @@ def test_the_note_never_shares_a_run_id_with_a_tick(bare_coordinator) -> None:
     root = bare_coordinator.coordinator_root
     faults: set[str] = set()
     _git(root, "init", "-q")
+    _git(root, "add", "notes.md")  # indexed: the poll can report on it
     _tick(bare_coordinator, now_unix=100.0, faults=faults)  # a tick, on id A
     shutil.rmtree(root / ".git")
     _tick(bare_coordinator, now_unix=200.0, faults=faults)  # the note, on its own id
     _git(root, "init", "-q")
+    _git(root, "add", "notes.md")  # rmtree took the index with it; re-index
     _tick(bare_coordinator, now_unix=300.0, faults=faults)  # a tick, on a third id
 
     registry = bare_coordinator.registry
@@ -1966,3 +1976,336 @@ def test_a_bare_root_with_nothing_registered_stays_not_instrumented(bare_workspa
     report = read_foreign_write_report(db)
     assert report.state == NOT_INSTRUMENTED
     assert report.uncoverable == ()
+
+
+# ---------------------------------------------------------------------------
+# U4 — an artifact that leaves the visible set (R2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_artifact_coordinator(repo: Path):
+    """Two committed, tracked artifacts, so ONE can leave the visible set while
+    the other stays. The mixed shape is what separates eviction from the
+    empty-scope early return: an implementation that only evicted on the way to
+    that return would still pass an all-invisible test."""
+    (repo / "draft.md").write_text("v1\n")
+    _git(repo, "add", "draft.md")
+    _git(repo, "commit", "-qm", "draft")
+    registry = SqliteArtifactRegistry(repo / ".coherence" / "state.db")
+    yield _Coordinator(repo, registry, _policy(repo, "notes.md", "draft.md"))
+    registry.close()
+
+
+def test_an_artifact_that_becomes_gitignored_has_its_edge_evicted(
+    two_artifact_coordinator, repo: Path
+) -> None:
+    """R2. An edge held for an artifact the poll can no longer report on is a
+    stale suppressor: nothing will ever clear it, because ``_release_clean_edges``
+    only ever walks the VISIBLE set. The first identical edit after the artifact
+    comes back into view would then read as already-counted and go unrecorded.
+
+    Evicting is the only direction that neither lies nor leaks. Releasing it
+    through the clean path instead would assert cleanliness for a name git never
+    reported on — inferring clean from silence, the one inference this
+    instrument exists to refuse — so the totals are asserted unmoved beside the
+    edge: no ``lag_suppressed``, no anything, for a question never asked.
+    """
+    coordinator = two_artifact_coordinator
+    kept = _register(coordinator, "notes.md", "v1\n")
+    dropped = _register(coordinator, "draft.md", "v1\n")
+    (repo / "notes.md").write_text("foreign one\n")
+    (repo / "draft.md").write_text("foreign two\n")
+    _tick(coordinator, now_unix=1000.0)
+    assert coordinator.registry.artifacts_with_detection_edge() == {kept, dropped}
+    before = _totals(coordinator, dropped)
+
+    # It becomes git-ignored: out of the index, and excluded from re-entering it.
+    _git(repo, "rm", "--cached", "-q", "draft.md")
+    (repo / ".gitignore").write_text("draft.md\n")
+    assert "draft.md" not in _git_visible_names(repo, deadline=_deadline())
+
+    _tick(coordinator, now_unix=1001.0)
+
+    edges = coordinator.registry.artifacts_with_detection_edge()
+    assert dropped not in edges, "an artifact git can no longer report on kept its edge"
+    assert kept in edges, "a still-visible, still-dirty artifact lost its live edge"
+    assert _totals(coordinator, dropped) == before, "silence was read as an outcome"
+
+
+def test_an_artifact_back_in_view_unchanged_is_not_counted_a_second_time(
+    two_artifact_coordinator, repo: Path
+) -> None:
+    """The other half of "neither keeps a stale edge NOR is asserted clean".
+
+    Eviction says only that the suppressor may no longer speak. Running the
+    CLEAN release over the unnarrowed scope instead would additionally drop the
+    artifact's stat-cache entry — treating a name git never reported on as
+    reconciled — and the single divergence it was holding would be counted
+    again the moment the artifact came back into view. A count is one
+    observation of a distinct on-disk content, so a second row here is a false
+    accusation manufactured by nothing but the artifact's visibility flickering.
+
+    The cache is shared across the three ticks because the sweep loop shares
+    it; a fresh one per tick would make this pass for a reason production does
+    not have.
+    """
+    coordinator = two_artifact_coordinator
+    _register(coordinator, "notes.md", "v1\n")
+    flickering = _register(coordinator, "draft.md", "v1\n")
+    (repo / "notes.md").write_text("foreign one\n")
+    (repo / "draft.md").write_text("foreign two\n")
+    cache: dict = {}
+    _tick(coordinator, now_unix=1000.0, cache=cache)
+    assert _totals(coordinator, flickering) == {"foreign": 1}
+
+    _git(repo, "update-index", "--skip-worktree", "draft.md")
+    _tick(coordinator, now_unix=1001.0, cache=cache)  # out of the poll's reach
+    _git(repo, "update-index", "--no-skip-worktree", "draft.md")
+    _tick(coordinator, now_unix=1002.0, cache=cache)  # back, and the same bytes
+
+    assert _totals(coordinator, flickering) == {"foreign": 1}
+
+
+def test_an_emptied_visible_set_still_evicts_every_edge_before_it_returns(
+    coordinator, repo: Path
+) -> None:
+    """The ordering, pinned. U4's eviction runs BEFORE U3's early return, or an
+    all-invisible workspace keeps a stale edge on every artifact it holds — the
+    one tick shape where every edge goes stale at once and no later tick ever
+    reaches the release pass to clear it.
+    """
+    art = _register(coordinator, "notes.md", "v1\n")
+    (repo / "notes.md").write_text("foreign\n")
+    _tick(coordinator, now_unix=1000.0)
+    assert coordinator.registry.artifacts_with_detection_edge() == {art}
+
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    faults: set[str] = set()
+    assert _tick(coordinator, now_unix=1001.0, faults=faults) == 0
+
+    assert coordinator.registry.artifacts_with_detection_edge() == set()
+    # And the pass still took the empty-scope exit: no tick, and the note.
+    assert coordinator.registry.detection_runs()[0].tick_count == 1  # only the first
+    assert faults == {"no-visible-artifact"}
+
+
+def test_a_visible_artifact_reconciled_clean_still_has_its_edge_released(
+    coordinator, repo: Path
+) -> None:
+    """The shipped release path is untouched by the eviction beside it: an
+    artifact that stayed visible and is now clean is reconciled, not unreadable,
+    and is still cleared through ``_release_clean_edges``."""
+    art = _register(coordinator, "notes.md", "v1\n")
+    (repo / "notes.md").write_text("foreign\n")
+    _tick(coordinator, now_unix=1000.0)
+    assert coordinator.registry.artifacts_with_detection_edge() == {art}
+
+    _git(repo, "commit", "-qam", "reconciled")
+    _tick(coordinator, now_unix=1001.0)
+
+    assert coordinator.registry.artifacts_with_detection_edge() == set()
+
+
+def test_eviction_mints_no_artifact_row_and_moves_no_canonical_hash(
+    coordinator, repo: Path
+) -> None:
+    """Eviction writes to the detection tables and nowhere else. The pass looks
+    identities up with ``lookup_artifact_id_by_name``, never
+    ``resolve_or_register``, so a name that dropped out of sight cannot mint a
+    row; and healing the comparand a safety check reads is the defect this repo
+    has already shipped three times."""
+    art = _register(coordinator, "notes.md", "v1\n")
+    (repo / "notes.md").write_text("foreign\n")
+    _tick(coordinator, now_unix=1000.0)
+    before = coordinator.registry.get_artifact(art)
+    names_before = set(coordinator.registry.artifact_names_under_prefix(""))
+
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=1001.0)
+
+    after = coordinator.registry.get_artifact(art)
+    assert (after.content_hash, after.version) == (before.content_hash, before.version)
+    assert set(coordinator.registry.artifact_names_under_prefix("")) == names_before
+
+
+# ---------------------------------------------------------------------------
+# U3 — a workspace whose registered artifacts are all invisible to git (R4-R7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def invisible_scope_coordinator(repo: Path):
+    """A real repository whose one registered, tracked artifact git cannot
+    report on — the precondition R4 names, and a different fact from the bare
+    workspace above, which has no repository at all.
+
+    ``--skip-worktree`` rather than a never-added path, so the artifact is
+    provably IN the repository and provably out of the poll's reach. The empty
+    visible set is asserted here rather than assumed: every test below would
+    otherwise pass for the wrong reason if git ever stopped honouring the bit.
+    """
+    registry = SqliteArtifactRegistry(repo / ".coherence" / "state.db")
+    coordinator = _Coordinator(repo, registry, _policy(repo, "notes.md"))
+    registry.resolve_or_register("notes.md", sha256_hex(b"v1\n"))
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    assert _git_visible_names(repo, deadline=_deadline()) == set()
+    yield coordinator
+    registry.close()
+
+
+def test_a_workspace_with_no_visible_artifact_is_noted_once_and_never_ticked(
+    invisible_scope_coordinator,
+) -> None:
+    """R4, R6. The registered and tracked set is non-empty and its git-visible
+    subset is empty, so the pass records no tick — and says why, under a token
+    of its own, so the offline report reads ``not-coverable`` instead of
+    accusing an instrument that ran on every tick of never having run.
+
+    Once per became-uncoverable transition, not once per tick: unlike the
+    no-work-tree condition, this one COMPLETES its poll every tick, so a latch
+    that re-armed on a completed poll would write one note per sweep interval.
+    """
+    coordinator = invisible_scope_coordinator
+    faults: set[str] = set()
+    for tick in range(3):
+        assert _tick(coordinator, now_unix=100.0 + tick, faults=faults) == 0
+
+    registry = coordinator.registry
+    assert registry.detection_runs() == []  # never a tick: the note is not an interval
+    notes = registry.detection_uncoverable()
+    assert len(notes) == 1, f"one note per transition, not per tick: {notes}"
+    assert notes[0].reason == "no-git-visible-artifact"
+    assert notes[0].observed_at_unix == 100.0  # the tick the latch closed on
+    assert faults == {"no-visible-artifact"}
+
+    db = coordinator.coordinator_root / ".coherence" / "state.db"
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert report.instrumented is False
+    assert [n.reason for n in report.uncoverable] == ["no-git-visible-artifact"]
+    assert report.covers(100.0, 102.0) is False
+
+
+def test_a_prior_tick_outranks_the_note_but_never_hides_it(
+    coordinator, repo: Path
+) -> None:
+    """R7, and the qualifier the reader's own ranking makes necessary.
+
+    The reader ranks observed runs ABOVE notes, so a store that holds a real
+    interval keeps its ``instrumented-zero`` headline when the scope later
+    empties. Asserted rather than assumed: ``state`` answers "what is the
+    strongest fact here" and ``uncoverable`` answers "did a run find nothing to
+    watch", and a second reason token must not change either answer — which is
+    what makes it a token reported rather than interpreted.
+    """
+    _register(coordinator, "notes.md", "v1\n")
+    faults: set[str] = set()
+    _tick(coordinator, now_unix=100.0, faults=faults)  # a real, watched tick
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=200.0, faults=faults)
+
+    report = read_foreign_write_report(repo / ".coherence" / "state.db")
+    assert report.state == INSTRUMENTED_ZERO
+    assert report.instrumented is True
+    assert [n.reason for n in report.uncoverable] == ["no-git-visible-artifact"]
+    assert report.covers(100.0, 100.0) is True
+
+
+def test_a_repository_with_nothing_registered_writes_no_note(repo: Path) -> None:
+    """R5. The empty-scope return at the top of the pass sits UPSTREAM of the
+    visibility read, so a workspace that has registered nothing never reaches
+    this check and reads exactly as it did before the note existed — the shape
+    of every shipped example until its first ``/session/begin``.
+
+    The policy assertion fixes which half is missing: the pattern does track
+    ``notes.md``, so the empty scope is provably non-registration.
+    """
+    db = repo / ".coherence" / "state.db"
+    registry = SqliteArtifactRegistry(db)
+    coordinator = _Coordinator(repo, registry, _policy(repo, "notes.md"))
+    assert coordinator.policy.is_tracked("notes.md")
+    faults: set[str] = set()
+    try:
+        for tick in range(3):
+            assert _tick(coordinator, now_unix=100.0 + tick, faults=faults) == 0
+        assert faults == set()
+        assert registry.detection_runs() == []
+        assert registry.detection_uncoverable() == []
+    finally:
+        registry.close()
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_INSTRUMENTED
+    assert report.uncoverable == ()
+
+
+def test_a_scope_that_becomes_visible_again_and_empties_is_noted_twice(
+    invisible_scope_coordinator, repo: Path
+) -> None:
+    """R6. The latch re-arms on a completed poll whose visible set is NON-empty,
+    and on nothing else. A workspace that regains a watchable artifact and later
+    loses it again is a second fact, recorded a second time, with the watched
+    interval between — and the interval is asserted too, so a latch that never
+    re-armed cannot pass by leaving the middle tick unrecorded."""
+    coordinator = invisible_scope_coordinator
+    faults: set[str] = set()
+    _tick(coordinator, now_unix=100.0, faults=faults)
+    _git(repo, "update-index", "--no-skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=200.0, faults=faults)  # visible again: re-arms, ticks
+    assert faults == set()
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=300.0, faults=faults)
+
+    registry = coordinator.registry
+    assert [n.observed_at_unix for n in registry.detection_uncoverable()] == [100.0, 300.0]
+    assert [r.first_tick_unix for r in registry.detection_runs()] == [200.0]
+
+
+def test_the_empty_scope_note_never_shares_a_run_id_with_a_tick(
+    invisible_scope_coordinator, repo: Path
+) -> None:
+    """No single run id may read as both an interval the detector watched and a
+    workspace with nothing to watch. The poll here succeeds on every tick, so
+    the note's id has to be retired on BOTH sides of it: closed before, and
+    closed again after it is durable."""
+    coordinator = invisible_scope_coordinator
+    faults: set[str] = set()
+    _git(repo, "update-index", "--no-skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=100.0, faults=faults)  # a tick, on id A
+    _git(repo, "update-index", "--skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=200.0, faults=faults)  # the note, on its own id
+    _git(repo, "update-index", "--no-skip-worktree", "notes.md")
+    _tick(coordinator, now_unix=300.0, faults=faults)  # a tick, on a third id
+
+    registry = coordinator.registry
+    tick_ids = {r.run_id for r in registry.detection_runs()}
+    note_ids = {n.run_id for n in registry.detection_uncoverable()}
+    assert len(tick_ids) == 2 and len(note_ids) == 1, (tick_ids, note_ids)
+    assert not (tick_ids & note_ids), "a run id reads as both watched and unwatchable"
+
+
+def test_a_refused_empty_scope_note_keeps_the_latch_open_and_is_retried(
+    invisible_scope_coordinator, caplog
+) -> None:
+    """A store that refuses the note — locked, out of disk — must not leave the
+    report accusing the instrument of never running. The latch closes only once
+    the note is durable, so the next tick tries again; and the refusal is a real
+    fault, so unlike the condition it interrupts it stays loud."""
+    import logging
+
+    coordinator = invisible_scope_coordinator
+    inner = coordinator.registry
+    refusing = _RefusingUncoverable(inner, refusals=2)
+    coordinator.registry = refusing
+    faults: set[str] = set()
+    with caplog.at_level(logging.ERROR):
+        _tick(coordinator, now_unix=100.0, faults=faults)
+        _tick(coordinator, now_unix=101.0, faults=faults)
+        assert faults == set()  # nothing durable yet, so nothing latched
+        _tick(coordinator, now_unix=102.0, faults=faults)
+
+    assert faults == {"no-visible-artifact"}
+    assert refusing.attempts == 3
+    assert [n.observed_at_unix for n in inner.detection_uncoverable()] == [102.0]
+    refused = [r for r in caplog.records if "could not record" in r.getMessage()]
+    assert len(refused) == 2 and all(r.exc_info is not None for r in refused)

@@ -146,14 +146,34 @@ _GIT_REDIRECT_VARS = (
 # fail-closed direction here is the one that keeps an artifact in scope.
 _STATUS_BLIND_TAGS = frozenset({"S"})
 
-# The one poll fault reported once rather than per tick. A key rather than a
-# bare bool so the caller holds one latch whatever else later joins it.
+# The poll faults reported once rather than per tick. Keys rather than bare
+# bools so the caller holds one latch whatever else later joins them.
 _FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
 
+# The second such latch, and it needs its OWN re-arm condition rather than
+# sharing the poll's. The no-work-tree condition fails its poll every tick, so
+# "a completed poll" is evidence the condition lifted; this one COMPLETES its
+# poll every tick and still has nothing to watch, so re-arming on that would
+# write one note per sweep interval forever. It re-arms only on a completed
+# poll whose visible set is non-empty — see ``_detect``.
+_FAULT_NO_VISIBLE_SCOPE = "no-visible-artifact"
+
 # What the OFFLINE report is told when the poll can never read this workspace.
-# An opaque stable token, not a message: written here and read back across a
+# Opaque stable tokens, not messages: written here and read back across a
 # process and a release boundary by ``ccs.diagnose.foreign_writes``.
+#
+# Two conditions, two tokens, and deliberately no frozen set on either side.
+# ``UncoverableRun.reason`` is documented as reported rather than interpreted,
+# so a second token needs no reader change, no stored column and no migration —
+# and a token a later release invents still reaches the operator through a
+# report that has never heard of it.
 _REASON_NO_WORK_TREE = "no-git-work-tree"
+
+# No repository is missing here and no poll failed: git ran, answered, and can
+# speak about NONE of the artifacts this workspace registered and tracks. A
+# distinct token because it is a distinct fact with a distinct remedy — an
+# operator fixes this by tracking the files in git, not by finding a repository.
+_REASON_NO_VISIBLE_SCOPE = "no-git-visible-artifact"
 
 # The CEILING on how long the repository walk may take. A handful of `lstat`
 # calls is microseconds whenever the filesystem answers at all; the bound is for
@@ -725,10 +745,13 @@ def run_detection_pass(
 
     ``reported_faults`` is the caller's too, and holds strictly less: which
     permanent, non-actionable conditions have already been reported for this
-    coordinator, so a workspace that can never be polled says so once instead of
-    once per tick. Nothing reads it but the log, and a completed poll clears it
-    — the latch tracks the condition, so a workspace that later becomes a
-    repository and then is not one again reports the second time too.
+    coordinator, so a workspace that can never be usefully polled says so once
+    instead of once per tick. Nothing reads it but the log. Each latch tracks
+    its own condition and re-arms on its own evidence — a completed poll for
+    the missing repository, a completed poll with a NON-EMPTY visible set for
+    the unwatchable scope — so a workspace that recovers and then relapses
+    reports the second time too, and neither latch can be re-armed by news
+    about the other.
 
     ``tick_clock`` is the caller's third piece and holds one number: when this
     pass last recorded a tick. It is what lets a stall be seen at all — the
@@ -761,7 +784,7 @@ def run_detection_pass(
         _close_observed_interval(coordinator)
         if _FAULT_NOT_A_REPOSITORY not in reported_faults:
             logger.debug("foreign-write detection is inert: %s", exc)
-            if _record_uncoverable(coordinator, now_unix):
+            if _record_uncoverable(coordinator, now_unix, _REASON_NO_WORK_TREE):
                 reported_faults.add(_FAULT_NOT_A_REPOSITORY)
         return 0
     except Exception as exc:  # noqa: BLE001 — an instrument may never break the sweep
@@ -787,9 +810,16 @@ def _close_observed_interval(coordinator: DetectionTarget) -> None:
         logger.exception("detection: could not close the observed run interval")
 
 
-def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
-    """Record that this workspace has nothing the poll can ever read, so the
-    OFFLINE report can say so. True once the note is durable.
+def _record_uncoverable(
+    coordinator: DetectionTarget, now_unix: float, reason: str
+) -> bool:
+    """Record that this workspace has nothing the poll can read, so the OFFLINE
+    report can say so. True once the note is durable.
+
+    ``reason`` is the caller's, because there is more than one way to have
+    nothing to watch and the report is meant to say WHICH. It is written
+    through unexamined: the token is the detector's vocabulary, and a guard set
+    here would be a second place to update every time it grows.
 
     Without the row the store reads as not-instrumented — the same answer a
     store gets when the sweep was off or the instrument failed every tick,
@@ -797,9 +827,9 @@ def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
 
     The caller gates this on the latch that also gates the log, and closes the
     latch only on True. Once per transition rather than once per tick because
-    the poll retries every tick and ``_close_observed_interval`` rotates the
-    run id on every failure, so a per-tick record keyed on that id would write
-    one row per sweep interval. And only on True so a store that refuses the
+    the pass retries every tick and ``_close_observed_interval`` rotates the
+    run id before every attempt, so a per-tick record keyed on that id would
+    write one row per sweep interval. And only on True so a store that refuses the
     note — locked, out of disk — is retried on the next tick rather than left
     holding a report that accuses the instrument of never running; that
     failure is a real fault and stays loud. The latch re-arms when a poll
@@ -813,10 +843,12 @@ def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
     watched and a workspace with nothing to watch.
     """
     try:
-        coordinator.registry.record_detection_uncoverable(_REASON_NO_WORK_TREE, now_unix)
+        coordinator.registry.record_detection_uncoverable(reason, now_unix)
         coordinator.registry.close_detection_run()
     except Exception:  # noqa: BLE001 — an instrument may never break the sweep
-        logger.exception("detection: could not record that the workspace has no work tree")
+        logger.exception(
+            "detection: could not record that the workspace is uncoverable (%s)", reason
+        )
         return False
     return True
 
@@ -896,9 +928,46 @@ def _detect(
     # "swallowed error reads as a clean tree" defect wearing a different hat,
     # and an unrecorded tick is the honest answer to a scope nobody could read.
     #
-    # `covered` stays bound. The eviction pass needs the difference between the
-    # two sets, which overwriting the name here would destroy.
+    # `covered` stays bound. The eviction pass below needs the difference
+    # between the two sets, and the empty-scope check needs to know the claimed
+    # scope was non-empty; overwriting the name here would destroy both.
     visible = set(covered) & _git_visible_names(root, deadline=deadline)
+
+    # FIRST, and before either the empty-scope return below or the clean-edge
+    # pass at the bottom. An artifact that has left the visible set can never be
+    # reached by `_release_clean_edges` again — that pass walks `visible` — so
+    # its edge would suppress the first identical edit after it comes back into
+    # view. Handing the clean pass the unnarrowed list instead would assert
+    # cleanliness for names git never reported on, which is inferring clean from
+    # silence: the one inference this instrument exists to refuse. Evicting is
+    # the only direction that neither lies nor leaks.
+    _evict_invisible_edges(registry, covered, visible)
+
+    if covered and not visible:
+        # Git answered, and can speak about none of it. The tracked-and-
+        # registered set is non-empty — the guard above guarantees that, and the
+        # conjunct is kept as a statement of the precondition rather than as a
+        # live branch — so this is not the empty-scope case that returns above:
+        # it is a workspace whose artifacts are all outside the poll's reach,
+        # which reads as a clean zero forever unless it is written down.
+        #
+        # No tick, and the interval closes, for the reason every other
+        # observed-nothing path does: a run row is read as CONTINUOUSLY
+        # observed, so leaving it open lets the next success stretch it over a
+        # window nothing was polled in.
+        _close_observed_interval(coordinator)
+        if _FAULT_NO_VISIBLE_SCOPE not in reported_faults:
+            logger.debug(
+                "foreign-write detection has nothing git can report on in %s", root
+            )
+            if _record_uncoverable(coordinator, now_unix, _REASON_NO_VISIBLE_SCOPE):
+                reported_faults.add(_FAULT_NO_VISIBLE_SCOPE)
+        return 0
+    # A completed poll that spoke about SOMETHING, which is the only evidence
+    # that lifts this condition. Re-arming on the poll alone — the way the
+    # no-work-tree latch does — would re-arm on every tick of an all-invisible
+    # workspace, because that workspace's poll completes every time.
+    reported_faults.discard(_FAULT_NO_VISIBLE_SCOPE)
 
     counted = 0
     for name in sorted(dirty & visible):
@@ -941,6 +1010,52 @@ def _detect(
     registry.record_detection_tick(now_unix, covered_count=len(visible))
     tick_clock["last_tick_unix"] = now_unix
     return counted
+
+
+def _evict_invisible_edges(
+    registry,
+    covered: list[str],
+    visible: set[str],
+) -> None:
+    """Clear the edge gate for artifacts that have left the visible set.
+
+    The edge gate suppresses a repeat of an observation already counted, and it
+    is cleared by exactly one other path: ``_release_clean_edges``, which walks
+    the VISIBLE set. So an artifact that drops out of that set — git-ignored,
+    removed from the index, marked ``--skip-worktree`` — takes its edge with it
+    and nothing will ever clear it again. The first identical edit after it
+    comes back into view would read as already-counted and go unrecorded.
+
+    Evicting rather than releasing, and the difference is the whole point. A
+    release asserts the artifact is now CLEAN, which for a name git never
+    reported on would be inferred from silence — the one inference this
+    instrument exists to refuse, and the reason ``_release_clean_edges`` is
+    handed ``visible`` and not ``covered``. Eviction asserts nothing: it says
+    only that the suppressor describes a divergence this pass can no longer
+    speak about, so it must not go on speaking for it.
+
+    Writes to the detection tables and nowhere else. Identities are resolved
+    with ``lookup_artifact_id_by_name``, never ``resolve_or_register``, so a
+    name that fell out of sight cannot mint an artifact row; no canonical hash
+    moves, because healing the comparand a safety check reads is the defect
+    this repository has already shipped three times.
+
+    Scoped to the artifacts that actually carry an edge, so a permanently
+    invisible artifact costs one SELECT per tick and no write at all.
+    """
+    lost = set(covered) - visible
+    if not lost:
+        return
+    counted_ids = registry.artifacts_with_detection_edge()
+    if not counted_ids:
+        return
+    to_clear = [
+        artifact_id
+        for name in lost
+        if (artifact_id := registry.lookup_artifact_id_by_name(name)) in counted_ids
+    ]
+    if to_clear:
+        registry.clear_detection_edges(to_clear)
 
 
 def _release_clean_edges(
