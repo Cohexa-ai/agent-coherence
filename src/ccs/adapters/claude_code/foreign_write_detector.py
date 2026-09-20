@@ -131,6 +131,21 @@ _GIT_REDIRECT_VARS = (
     "GIT_NAMESPACE",
 )
 
+# The ONLY `git ls-files -v` tags `git status --untracked-files=no` provably
+# cannot report on. `S` is skip-worktree: git is told to treat the worktree
+# entry as matching the index, so status diffs it never. A LOWERCASE tag is the
+# assume-unchanged bit, which buys the same silence by a different mechanism.
+# Both were established by mutating the file and watching the poll stay quiet,
+# not by reading the manual.
+#
+# Every other tag is RETAINED, including `M` (unmerged, which the poll reports
+# as a `u` record the shipped parser keeps deliberately) and any tag a later git
+# emits that this module has never seen. An allowlist of known-good tags would
+# instead drop every artifact in the repository for the whole of every merge
+# conflict, and would go blind again the day git grows a letter — so the
+# fail-closed direction here is the one that keeps an artifact in scope.
+_STATUS_BLIND_TAGS = frozenset({"S"})
+
 # The one poll fault reported once rather than per tick. A key rather than a
 # bare bool so the caller holds one latch whatever else later joins it.
 _FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
@@ -243,14 +258,17 @@ def _poll_env() -> dict[str, str]:
     return env
 
 
-def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[str]:
+def _git_dirty_paths(root: Path, names: list[str], *, deadline: float) -> set[str]:
     """Return the subset of ``names`` git reports as dirty in ``root``.
 
-    ``budget_sec`` bounds the WHOLE poll, not each batch. A per-batch timeout
-    lets a large path list stall the sweep thread for the sum of its batches,
-    and detection runs in the same loop as grant reclamation — so an instrument
-    that overruns delays the next tick's safety work. Exhausting the budget
-    raises, which correctly leaves the tick unrecorded.
+    ``deadline`` is a monotonic INSTANT, not a duration, and the caller mints
+    exactly one of them per tick. That is the whole mechanism by which the
+    budget bounds the tick rather than each helper: a second git call handed a
+    copied duration would mint a second full budget, and one tick could run for
+    twice ``poll_budget_sec`` on the sweep thread that also reclaims grants and
+    reaps dead sessions. The same reasoning rules out a per-batch timeout, which
+    would let a large path list stall that thread for the sum of its batches.
+    Exhausting the deadline raises, which correctly leaves the tick unrecorded.
 
     ``-c status.relativePaths=true`` is forced rather than assumed: porcelain
     v2 honours that setting, so a checkout configured otherwise would return
@@ -264,13 +282,10 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
     """
     dirty: set[str] = set()
     env = _poll_env()
-    deadline = time.monotonic() + budget_sec
     for batch in _batched_pathspecs(names):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise GitPollError(
-                f"git poll exceeded its {budget_sec:.1f}s budget in {root}"
-            )
+            raise GitPollError(f"git poll exceeded its budget in {root}")
         try:
             result = subprocess.run(
                 [
@@ -313,6 +328,69 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
             raise GitPollError(message)
         dirty.update(_parse_porcelain_v2(result.stdout.decode("utf-8", "replace")))
     return dirty
+
+
+def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
+    """Return every name in ``root``'s index that the status poll can report on.
+
+    The pass claims coverage of what it polls, and the poll runs with
+    ``--untracked-files=no``. A registered artifact git never tracked, or one an
+    exclude rule hides, is therefore reported clean on every tick forever;
+    counting it as covered manufactures the quiet month this whole module exists
+    to refuse. So the claimed scope has to be intersected with what git can
+    speak about at all, and this is the read that says which names those are.
+
+    ONE invocation over the whole index, with NO pathspecs. That is not an
+    optimisation. Handing it the stored names would reinstate pathspec magic on
+    data, let one out-of-repo name fail an entire batch, let a registered
+    directory name match its children instead of itself, and drag the argv
+    batching along with all three. None of it can happen to a command that takes
+    no paths at all.
+
+    ``--full-name`` is required for the opposite reason to the obvious one.
+    Without it ``ls-files`` prints names relative to the invocation directory;
+    with it they are pinned to the repository top — the shape porcelain v2
+    already emits, and the shape the registry holds, so the two intersect. The
+    poll's ``-c status.relativePaths=true`` is deliberately NOT copied across:
+    ``ls-files`` does not honour it, so it would read as a pin while pinning
+    nothing, and a name shape this code compares must never be inherited.
+
+    Any non-zero exit RAISES, for the same reason the poll's does and one more.
+    An empty visible set is about to mean "nothing here can be watched", so
+    returning it for a read that failed would hand out that verdict on no
+    evidence — a swallowed error reading as a narrowed scope is the same defect
+    as a swallowed poll reading as a clean tree.
+
+    It never classifies. The exit-128 ``NotAGitRepositoryError`` split, its
+    bounded filesystem walk and its once-per-arrival latch belong to the status
+    poll, which runs FIRST. A second classifier here would make this call the
+    one that meets a non-repository, and put the entire no-work-tree story
+    behind a classifier nothing else has ever exercised.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        # Checked before the spawn, not after: a helper that started git anyway
+        # and let the timeout catch it would still cost a process launch on a
+        # budget that is already gone.
+        raise GitPollError(f"git poll exceeded its budget before ls-files in {root}")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "-v", "--full-name"],
+            check=False,
+            capture_output=True,
+            timeout=remaining,
+            env=_poll_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitPollError(f"git ls-files timed out in {root}") from exc
+    except FileNotFoundError as exc:
+        raise GitPollError("git is not on PATH") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise GitPollError(
+            f"git ls-files exited {result.returncode} in {root}: {stderr[:200]}"
+        )
+    return _parse_ls_files_v(result.stdout.decode("utf-8", "replace"))
 
 
 def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -> bool:
@@ -472,6 +550,35 @@ def _parse_porcelain_v2(payload: str) -> set[str]:
                 paths.add(fields[index])
             index += 1
     return paths
+
+
+def _parse_ls_files_v(payload: str) -> set[str]:
+    """Extract the status-visible names from ``git ls-files -z -v`` output.
+
+    Each NUL-separated record is ``<tag> <path>``. Under ``-z`` git applies no
+    quoting and no C-escaping, so the bytes after that first space ARE the name:
+    running an unescape helper over them would corrupt every path holding a
+    space, a quote or a non-ASCII byte into a registry key that matches nothing,
+    and the artifact would drop out of scope with no error anywhere.
+
+    A set, because an unmerged path appears once per index stage — three records
+    naming one artifact.
+
+    Only ``_STATUS_BLIND_TAGS`` and the lowercase assume-unchanged tags are
+    dropped; every other tag is kept, recognised or not. A record carrying no
+    space carries no path either, so there is nothing to keep and it is skipped.
+    """
+    names: set[str] = set()
+    for record in payload.split("\0"):
+        if not record:
+            continue
+        tag, separator, path = record.partition(" ")
+        if not separator or not path:
+            continue
+        if tag in _STATUS_BLIND_TAGS or tag.islower():
+            continue
+        names.add(path)
+    return names
 
 
 def _argv_encodable(name: str) -> bool:
@@ -760,7 +867,12 @@ def _detect(
         _close_observed_interval(coordinator)
         return 0
 
-    dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
+    # Minted once, here, and shared by every git call this tick makes. A helper
+    # handed the DURATION instead would mint a second full budget, letting one
+    # tick run for twice `poll_budget_sec` on the thread that also reclaims
+    # grants and reaps dead sessions.
+    deadline = time.monotonic() + poll_budget_sec
+    dirty = _git_dirty_paths(root, covered, deadline=deadline)
     # The poll completed, so whatever this workspace was when the latch was set,
     # it is pollable now: re-arm, and a workspace that stops being a repository
     # again is reported the second time too. Only a completed poll clears it —

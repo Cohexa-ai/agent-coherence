@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,8 @@ from ccs.adapters.claude_code.foreign_write_detector import (
     NotAGitRepositoryError,
     _classify_mismatch,
     _git_dirty_paths,
+    _git_visible_names,
+    _parse_ls_files_v,
     _parse_porcelain_v2,
     _poll_env,
     _repository_is_absent,
@@ -42,6 +45,16 @@ POLL_BUDGET = 30.0
 # Generous by default so the existing tests, which step now_unix by whatever
 # suits them, never trip the staleness split; the tests that care pass their own.
 MAX_GAP = 1_000_000.0
+
+
+def _deadline(budget_sec: float = POLL_BUDGET) -> float:
+    """The poll's one monotonic deadline, minted the way ``_detect`` mints it.
+
+    ``_git_dirty_paths`` takes the INSTANT rather than the duration so that
+    every git call in a tick shares one budget; a helper handed a duration
+    would mint a second full one.
+    """
+    return time.monotonic() + budget_sec
 
 
 def _tick(
@@ -496,7 +509,7 @@ def test_a_non_zero_git_exit_raises_rather_than_reading_clean(tmp_path: Path) ->
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
     with pytest.raises(GitPollError):
-        _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(not_a_repo, ["notes.md"], deadline=_deadline())
 
 
 def test_a_missing_repository_is_typed_apart_from_a_genuine_failure(
@@ -509,14 +522,14 @@ def test_a_missing_repository_is_typed_apart_from_a_genuine_failure(
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
     with pytest.raises(NotAGitRepositoryError):
-        _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(not_a_repo, ["notes.md"], deadline=_deadline())
 
     # A real repository, a real fatal, the same exit code — and not the quiet
     # one: git refuses a pathspec that resolves outside the work tree.
     outside = tmp_path / "outside.txt"
     outside.write_text("x")
     with pytest.raises(GitPollError) as caught:
-        _git_dirty_paths(repo, [str(outside)], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(repo, [str(outside)], deadline=_deadline())
     assert not isinstance(caught.value, NotAGitRepositoryError)
 
 
@@ -538,7 +551,7 @@ def test_a_corrupt_repository_is_never_mistaken_for_an_absent_one(
     shutil.rmtree(target) if target.is_dir() else target.unlink()
 
     with pytest.raises(GitPollError) as caught:
-        _git_dirty_paths(repo, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(repo, ["notes.md"], deadline=_deadline())
 
     # The sentence IS there. The classification still is not — which is the
     # whole point: it is decided by `.git` existing, not by what git said.
@@ -563,7 +576,7 @@ def test_a_workspace_that_vanished_is_broken_rather_than_absent(
     assert _repository_is_absent(gone) is True  # the walk says absent ...
 
     with pytest.raises(GitPollError) as caught:
-        _git_dirty_paths(gone, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(gone, ["notes.md"], deadline=_deadline())
     assert not isinstance(caught.value, NotAGitRepositoryError)  # ... git does not
     assert "not a git repository" not in str(caught.value).lower()
 
@@ -630,7 +643,7 @@ def test_a_dangling_git_symlink_is_broken_rather_than_absent(
     (workspace / ".git").symlink_to(tmp_path / "gone")
 
     with pytest.raises(GitPollError) as caught:
-        _git_dirty_paths(workspace, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(workspace, ["notes.md"], deadline=_deadline())
     assert not isinstance(caught.value, NotAGitRepositoryError)
 
 
@@ -797,7 +810,7 @@ def test_the_walk_is_bounded_by_what_is_left_of_the_poll_budget(
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
     with pytest.raises(NotAGitRepositoryError):
-        _git_dirty_paths(not_a_repo, ["notes.md"], budget_sec=0.5)
+        _git_dirty_paths(not_a_repo, ["notes.md"], deadline=_deadline(0.5))
 
     assert seen and seen[0] <= 0.5
     assert seen[0] < detector._WALK_BUDGET_SEC  # the ceiling did not win
@@ -846,7 +859,7 @@ def test_the_pinned_environment_reaches_the_git_process(
     workspace = tmp_path / "plain"
     workspace.mkdir()
     with pytest.raises(GitPollError):
-        _git_dirty_paths(workspace, ["notes.md"], budget_sec=POLL_BUDGET)
+        _git_dirty_paths(workspace, ["notes.md"], deadline=_deadline())
 
     # A subscript, not a .get(): a poll that never reached subprocess.run at
     # all must fail here rather than pass vacuously.
@@ -873,7 +886,7 @@ def test_the_poll_never_takes_the_index_lock(repo: Path) -> None:
     before = index.read_bytes()
     (repo / "notes.md").write_text("dirty\n")
 
-    assert _git_dirty_paths(repo, ["notes.md"], budget_sec=POLL_BUDGET) == {"notes.md"}
+    assert _git_dirty_paths(repo, ["notes.md"], deadline=_deadline()) == {"notes.md"}
 
     assert index.read_bytes() == before
 
@@ -889,7 +902,7 @@ def test_a_large_path_set_is_polled_in_batches(repo: Path) -> None:
     _git(repo, "commit", "-qm", "generated")
     (repo / names[1]).write_text("changed\n")
 
-    assert _git_dirty_paths(repo, names, budget_sec=POLL_BUDGET) == {names[1]}
+    assert _git_dirty_paths(repo, names, deadline=_deadline()) == {names[1]}
 
 
 def test_porcelain_v2_rename_records_report_both_paths() -> None:
@@ -1231,7 +1244,7 @@ def test_the_poll_budget_bounds_the_whole_pass_not_each_batch(repo: Path) -> Non
     _git(repo, "commit", "-qm", "generated")
 
     with pytest.raises(GitPollError, match="budget"):
-        _git_dirty_paths(repo, names, budget_sec=0.0)
+        _git_dirty_paths(repo, names, deadline=_deadline(0.0))
 
 
 def test_the_last_batch_is_queried_too(repo: Path) -> None:
@@ -1244,10 +1257,283 @@ def test_the_last_batch_is_queried_too(repo: Path) -> None:
     (repo / names[1]).write_text("changed\n")
     (repo / names[-1]).write_text("changed\n")
 
-    assert _git_dirty_paths(repo, names, budget_sec=POLL_BUDGET) == {
+    assert _git_dirty_paths(repo, names, deadline=_deadline()) == {
         names[1],
         names[-1],
     }
+
+
+# ---------------------------------------------------------------------------
+# The git-visibility read (U1) — which registered names git can report on
+# ---------------------------------------------------------------------------
+
+
+def _status_reports(root: Path, *names: str) -> set[str]:
+    """Which of ``names`` the SHIPPED poll reports right now.
+
+    The visibility helper's entire claim is that it agrees with this call, so
+    every exclusion below is justified by asking git rather than by restating
+    what git is believed to do.
+    """
+    return _git_dirty_paths(root, list(names), deadline=_deadline())
+
+
+def _conflict(root: Path, name: str) -> None:
+    """Leave ``name`` genuinely unmerged — a real three-stage index entry.
+
+    Hand-written porcelain would prove nothing here: the point is what ``git
+    ls-files -v`` actually tags a conflicted path, which only git can say.
+    """
+    base = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+    ).stdout.decode().strip()
+    _git(root, "branch", "other")
+    (root / name).write_text("ours\n")
+    _git(root, "commit", "-qam", "ours")
+    _git(root, "checkout", "-q", "other")
+    (root / name).write_text("theirs\n")
+    _git(root, "commit", "-qam", "theirs")
+    _git(root, "checkout", "-q", base)
+    merged = subprocess.run(
+        ["git", "-C", str(root), "merge", "other"], capture_output=True
+    )
+    assert merged.returncode != 0, "the fixture produced no conflict to observe"
+
+
+def test_only_index_entries_are_visible(repo: Path) -> None:
+    """A tracked file is in scope; a git-ignored one and a never-added one are
+    not — and the poll cannot report either even once they are MUTATED, so
+    dropping them narrows nothing the instrument could ever have watched."""
+    (repo / ".gitignore").write_text("ignored.md\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore")
+    (repo / "ignored.md").write_text("edited\n")
+    (repo / "never.md").write_text("edited\n")
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+
+    assert "notes.md" in visible
+    assert "ignored.md" not in visible
+    assert "never.md" not in visible
+    assert _status_reports(repo, "ignored.md", "never.md", "notes.md") == set()
+
+
+def test_a_staged_and_a_worktree_deleted_entry_stay_visible(repo: Path) -> None:
+    """Both are index entries the poll DOES report — a file added but not yet
+    committed, and one removed from the worktree while still in the index.
+    Narrowing either away would drop an observable artifact out of the coverage
+    claim, which is the one direction R3 forbids."""
+    (repo / "staged.md").write_text("new\n")
+    _git(repo, "add", "staged.md")
+    (repo / "notes.md").unlink()
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+
+    assert {"staged.md", "notes.md"} <= visible
+    assert _status_reports(repo, "staged.md", "notes.md") == {"staged.md", "notes.md"}
+
+
+def test_skip_worktree_and_assume_unchanged_are_excluded(repo: Path) -> None:
+    """The only two exclusions, earned from the same evidence the rule rests on.
+
+    Both files are MUTATED and the shipped poll still reports neither: git has
+    been told to stop looking at them, so claiming coverage of them would be
+    the false clean this instrument exists to refuse. Asserting the exclusion
+    without asserting git's silence would leave the rule resting on belief.
+    """
+    for name in ("skipped.md", "assumed.md"):
+        (repo / name).write_text("v1\n")
+    _git(repo, "add", "skipped.md", "assumed.md")
+    _git(repo, "commit", "-qm", "two more")
+    _git(repo, "update-index", "--skip-worktree", "skipped.md")
+    _git(repo, "update-index", "--assume-unchanged", "assumed.md")
+    for name in ("skipped.md", "assumed.md"):
+        (repo / name).write_text("MUTATED\n")
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+
+    assert "skipped.md" not in visible
+    assert "assumed.md" not in visible
+    assert _status_reports(repo, "skipped.md", "assumed.md") == set()
+
+
+def test_an_unmerged_path_is_visible_and_collapses_to_one_member(repo: Path) -> None:
+    """``git ls-files -v`` tags a conflicted path ``M`` and repeats it once per
+    stage. An allowlist of known-good tags would drop it, and the poll reports
+    it as a ``u`` record — so every merge conflict would go blind in exactly
+    the window an operator most wants watched. Consumed as a set, so the three
+    stage lines are one member; the raw listing is asserted to really repeat,
+    or the set claim would pass vacuously."""
+    _conflict(repo, "notes.md")
+
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "-z", "-v", "--full-name"],
+        check=True,
+        capture_output=True,
+    ).stdout.decode()
+    assert listing.split("\0").count("M notes.md") > 1
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+    assert [name for name in visible if name == "notes.md"] == ["notes.md"]
+
+    reported = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain=v2", "-z", "--untracked-files=no"],
+        check=True,
+        capture_output=True,
+    ).stdout.decode()
+    assert any(
+        record.startswith("u ") and record.endswith(" notes.md")
+        for record in reported.split("\0")
+    )
+
+
+def test_an_unrecognized_tag_is_retained_rather_than_dropped() -> None:
+    """R3's fail-closed direction applied to the tag vocabulary. No shipped git
+    emits this tag, so only the parser can be asked: an allowlist would go
+    silently blind the day git grows a letter, and the artifact it dropped
+    would still be one the poll reports."""
+    payload = "H notes.md\0Z future.md\0S skipped.md\0h assumed.md\0"
+
+    assert _parse_ls_files_v(payload) == {"notes.md", "future.md"}
+
+
+def test_the_visibility_read_pins_its_own_path_shape(repo: Path, monkeypatch) -> None:
+    """``--full-name`` pins names to the repository top — the shape the registry
+    holds and the shape porcelain v2 emits. Omitting it prints them relative to
+    the invocation directory, which would intersect with the registry nowhere:
+    the silent permanent zero this module's own learning records. And the poll's
+    ``-c status.relativePaths=true`` must NOT be copied across, because
+    ``ls-files`` ignores it — copying it would read as a pin while pinning
+    nothing.
+
+    Both are asserted on the argv, as the ``GIT_LITERAL_PATHSPECS`` scenario is:
+    at a coordinator root that IS the repository top — every fixture in these
+    suites — the two forms emit identical names, so no behavioural test can see
+    the difference.
+    """
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    seen: dict = {}
+    real_run = subprocess.run
+
+    def _capture(cmd, **kwargs):
+        seen["argv"] = list(cmd)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(detector.subprocess, "run", _capture)
+
+    _git_visible_names(repo, deadline=_deadline())
+
+    argv = seen["argv"]
+    assert "--full-name" in argv
+    assert not any("relativePaths" in part for part in argv)
+    assert "ls-files" in argv and "-z" in argv and "-v" in argv
+
+
+def test_a_name_beginning_with_a_colon_is_visible_and_read_literally(
+    repo: Path, monkeypatch
+) -> None:
+    """The pathspec-magic regression this module has already shipped once. The
+    read passes no pathspecs, so nothing can be re-scoped here today — but the
+    env is pinned at the end of the wire anyway, because a later change that
+    adds one must not reintroduce it silently."""
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    (repo / ":colon.md").write_text("v1\n")
+    # `add -A` rather than a pathspec: the fixture's own git runs WITHOUT
+    # `GIT_LITERAL_PATHSPECS`, so naming this file would trip the very magic
+    # the read under test pins against.
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "colon")
+
+    handed: dict = {}
+    real_run = subprocess.run
+
+    def _capture(cmd, **kwargs):
+        handed["env"] = dict(kwargs.get("env") or {})
+        handed["passed_env"] = kwargs.get("env") is not None
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(detector.subprocess, "run", _capture)
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+
+    assert ":colon.md" in visible
+    assert handed["passed_env"] is True, "subprocess.run was called without env="
+    assert handed["env"]["GIT_LITERAL_PATHSPECS"] == "1"
+    assert handed["env"]["LC_ALL"] == "C"
+    assert handed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_awkward_names_round_trip_unchanged(repo: Path) -> None:
+    """``-z`` means no quoting and no C-escaping, so no unescape helper may be
+    applied — one would corrupt exactly these names into registry keys that
+    match nothing."""
+    for name in ("a file.md", "café.md"):
+        (repo / name).write_text("v1\n")
+    _git(repo, "add", "a file.md", "café.md")
+    _git(repo, "commit", "-qm", "awkward")
+
+    visible = _git_visible_names(repo, deadline=_deadline())
+
+    assert {"a file.md", "café.md"} <= visible
+
+
+def test_a_non_zero_exit_raises_rather_than_returning_an_empty_set(
+    tmp_path: Path,
+) -> None:
+    """An empty visible set is about to mean "nothing here can be watched".
+    Returning it for a failed read would turn a broken instrument into that
+    verdict — the same swallow the status poll already refuses."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+
+    with pytest.raises(GitPollError):
+        _git_visible_names(not_a_repo, deadline=_deadline())
+
+
+def test_a_read_that_never_classifies_leaves_that_to_the_poll(
+    tmp_path: Path,
+) -> None:
+    """The status poll owns the exit-128 classification and the latch re-arm.
+    A second classifier here would put the whole no-work-tree story behind it,
+    so this one raises the plain type even where the poll would not."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+
+    with pytest.raises(GitPollError) as caught:
+        _git_visible_names(not_a_repo, deadline=_deadline())
+
+    assert not isinstance(caught.value, NotAGitRepositoryError)
+
+
+def test_a_deadline_already_past_raises_rather_than_spawning(
+    repo: Path, monkeypatch
+) -> None:
+    """The shared deadline is the whole mechanism: a helper that spawned anyway
+    would let one tick run for twice ``poll_budget_sec`` on the thread that also
+    reclaims grants. Asserted by the absence of the spawn, not by the raise —
+    a raise after a spawn would look identical."""
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    spawned: list = []
+
+    def _record(cmd, **kwargs):
+        # A CLEAN result, deliberately: a stub that blew up would kill the
+        # no-pre-check mutant by accident, on the exception rather than on the
+        # spawn. This one lets that mutant return a perfectly good empty set,
+        # so the raise below is what catches it.
+        spawned.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(detector.subprocess, "run", _record)
+
+    with pytest.raises(GitPollError):
+        _git_visible_names(repo, deadline=time.monotonic() - 1.0)
+
+    assert spawned == []
 
 
 # ---------------------------------------------------------------------------
