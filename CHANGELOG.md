@@ -61,6 +61,21 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
+  own preemption prose.** `short_session_id` landed in `hook_payloads` and was
+  routed through the three renderers there, but `coordinator_server.py` never
+  called it — that file imports `hook_payloads as _payloads` and had zero
+  references to the helper, so its own two preemption renderers
+  (`_handle_post_edit`'s `commit_not_allowed` reason and `_build_preemption_text`)
+  kept slicing unconditionally and shipped `session <unknown at …` into
+  `additionalContext`. The condition is the same post-restart state the original
+  fix described: pending notices persist in SQLite while the agent-name map is an
+  in-process dict, so `_agent_id_to_session` returns `None` and the sentinel
+  reaches the renderer. Both now route through the helper. Prose for a real
+  session id is byte-identical — only the sentinel path changes. A third
+  `preempter_session[:8]` in that file is deliberately left alone: its value comes
+  from `... or ""`, so its ternary already emits the full sentinel.
+
 - **`write_cas` now waits, rather than spins, while a peer's committed write
   reaches disk.** The OCC comparand read fails closed when the coordinator
   records a version whose bytes are not on disk yet — the transient window

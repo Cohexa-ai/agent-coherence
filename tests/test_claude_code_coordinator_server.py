@@ -4626,6 +4626,92 @@ def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
     assert sid not in stale
 
 
+# ``coordinator_server`` has its OWN two renderers of the same prose, and PR
+# #200 -- which added ``short_session_id`` and the three tests above -- never
+# generalized the guard to them. Its commit message says so outright. That file
+# imports ``hook_payloads as _payloads`` but never called the helper, so the
+# docstring contract at hook_payloads.py:125-126 ("Every renderer that shortens
+# a session id for prose goes through here") was asserted and unenforced.
+
+
+def test_preemption_prose_preserves_unknown_sentinel_verbatim() -> None:
+    """``_build_preemption_text`` must not slice the ``<unknown>`` sentinel.
+
+    Reachable whenever the adapter cannot name the preempter, which is the
+    ordinary state after a coordinator restart: pending notices live in SQLite
+    while the agent-name map is an in-process dict seeded empty on every start.
+    A bare ``[:8]`` shipped ``session <unknown at ...`` into additionalContext,
+    where the dropped bracket reads as a truncated word rather than a
+    placeholder.
+    """
+    from uuid import uuid4
+
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    class _Artifact:
+        name = "docs/plan.md"
+
+    class _Registry:
+        def get_artifact(self, artifact_id):  # noqa: ANN001, ANN201
+            return _Artifact()
+
+    class _NamelessCoordinator:
+        """A coordinator with no name for the preempter -- ``agent_name_for``
+        returning None is what drives ``_agent_id_to_session`` to None."""
+
+        registry = _Registry()
+
+        def agent_name_for(self, agent_id):  # noqa: ANN001, ANN201
+            return None
+
+    text = cs._build_preemption_text(
+        _NamelessCoordinator(),
+        [(uuid4(), uuid4(), 1700000000.0)],
+    )
+    assert "session <unknown> at" in text
+    assert "session <unknown at" not in text
+
+
+def test_post_edit_preemption_reason_preserves_unknown_sentinel(
+    coordinator, client: _Client
+) -> None:
+    """The second renderer, ``_handle_post_edit``'s ``commit_not_allowed`` reason,
+    driven through the real HTTP seam rather than asserted at source.
+
+    ``test_a1_preemption_surfaces_in_post_edit_failure_reason`` already walks this
+    path for a resolvable preempter and asserts ``y[:8] in reason``. The only
+    thing it does not cover is the branch where the preempter CANNOT be named --
+    so clear the agent-name map after the preemption is recorded, which is exactly
+    what a coordinator restart does to it: the notice survives in SQLite, the
+    in-process name map does not.
+    """
+    x = _sid("X")
+    y = _sid("Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+
+    # The restart, simulated: the preemption notice is already durable, but no
+    # agent id resolves to a session name any more.
+    with coordinator._agent_names_lock:
+        coordinator._agent_names.clear()
+
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": x, "path": "plan.md", "content_hash": _hash("h"), "success": True},
+    )
+    assert status == 200
+    assert body.get("ok") is False, f"post-edit on a preempted grant must fail; got {body}"
+
+    reason = body.get("reason", "")
+    assert "preempted by session" in reason, f"expected the preemption reason; got: {reason}"
+    assert "session <unknown> at" in reason, (
+        f"the sentinel must render whole; got: {reason}"
+    )
+    assert "session <unknown at" not in reason, (
+        f"the sentinel was sliced to 8 chars, dropping its bracket; got: {reason}"
+    )
+
+
 # ======================================================================
 # /status holder set survives a coordinator restart
 # ======================================================================
