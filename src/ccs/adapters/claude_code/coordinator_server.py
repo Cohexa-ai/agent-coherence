@@ -2172,7 +2172,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
-                    f"preempted by session {preempter_session[:8]} at "
+                    f"preempted by session {_payloads.short_session_id(preempter_session)} at "
                     f"{_iso_utc(preempted_at)}. Your edit landed in your local "
                     f"worktree but will not be reflected in the coordinator's "
                     f"version. Underlying coordinator error: {exc}"
@@ -4813,7 +4813,8 @@ def _build_preemption_text(
             continue
         preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
         lines.append(
-            f"  • {path} — preempted/revoked by session {preempter_session[:8]} "
+            f"  • {path} — preempted/revoked by session "
+            f"{_payloads.short_session_id(preempter_session)} "
             f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
             f"in your worktree but is NOT reflected in the coordinator's version."
         )

@@ -4626,6 +4626,163 @@ def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
     assert sid not in stale
 
 
+# ``coordinator_server`` has its OWN two renderers of the same prose, and PR
+# #200 -- which added ``short_session_id`` and the three tests above -- never
+# generalized the guard to them. Its commit message says so outright. That file
+# imports ``hook_payloads as _payloads`` but never called the helper, so the
+# docstring contract at hook_payloads.py:125-126 ("Every renderer that shortens
+# a session id for prose goes through here") was asserted and unenforced.
+
+
+def test_preemption_prose_preserves_unknown_sentinel_verbatim() -> None:
+    """``_build_preemption_text`` must not slice the ``<unknown>`` sentinel.
+
+    Reachable whenever the adapter cannot name the preempter, which is the
+    ordinary state after a coordinator restart: pending notices live in SQLite
+    while the agent-name map is an in-process dict seeded empty on every start.
+    A bare ``[:8]`` shipped ``session <unknown at ...`` into additionalContext,
+    where the dropped bracket reads as a truncated word rather than a
+    placeholder.
+    """
+    from uuid import uuid4
+
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    class _Artifact:
+        name = "docs/plan.md"
+
+    class _Registry:
+        def get_artifact(self, artifact_id):  # noqa: ANN001, ANN201
+            return _Artifact()
+
+    class _NamelessCoordinator:
+        """A coordinator with no name for the preempter -- ``agent_name_for``
+        returning None is what drives ``_agent_id_to_session`` to None."""
+
+        registry = _Registry()
+
+        def agent_name_for(self, agent_id):  # noqa: ANN001, ANN201
+            return None
+
+    text = cs._build_preemption_text(
+        _NamelessCoordinator(),
+        [(uuid4(), uuid4(), 1700000000.0)],
+    )
+    assert "session <unknown> at" in text
+    assert "session <unknown at" not in text
+
+
+def test_preemption_prose_is_byte_stable_for_a_real_session_id() -> None:
+    """Pin the WHOLE rendered string, not substrings.
+
+    This file is held at cross-backend wire parity and the sentinel fix reflowed
+    one f-string across two physical lines to stay inside ruff's limit. That
+    reflow was proved byte-neutral by executing both module versions side by
+    side -- a one-time check, which is exactly the kind that does not survive the
+    next edit. Every other test here asserts substrings, so a stray space or a
+    re-wrapped clause moves bytes and stays green.
+
+    Scoped deliberately to ``_build_preemption_text``: it is the renderer that
+    was reflowed, and its output is fully determined by its inputs. The sibling
+    renderer at ``_handle_post_edit`` closes with ``Underlying coordinator error:
+    {exc}`` over a preemption timestamp the test does not choose, so a golden
+    there would pin values that legitimately vary -- worse than the substring
+    assertions it would replace. That one keeps them.
+    """
+    from uuid import UUID
+
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    class _Artifact:
+        name = "docs/plan.md"
+
+    class _Registry:
+        def get_artifact(self, artifact_id):  # noqa: ANN001, ANN201
+            return _Artifact()
+
+    class _NamedCoordinator:
+        """Resolvable preempter -- the REAL-id path, where bytes must not move."""
+
+        registry = _Registry()
+
+        def agent_name_for(self, agent_id):  # noqa: ANN001, ANN201
+            return "claude-session-f2f7eab3-1111-4111-8111-111111111111"
+
+    text = cs._build_preemption_text(
+        _NamedCoordinator(),
+        [(
+            UUID("11111111-1111-4111-8111-111111111111"),
+            UUID("22222222-2222-4222-8222-222222222222"),
+            1700000000.0,
+        )],
+    )
+
+    assert text == (
+        "\u26a0 Coordinator notice: your EXCLUSIVE grant was preempted:\n"
+        "  \u2022 docs/plan.md \u2014 preempted/revoked by session f2f7eab3 at "
+        "2023-11-14T22:13:20+00:00. Any local edit you made to this file will "
+        "land in your worktree but is NOT reflected in the coordinator's version.\n"
+        "Re-read affected files before continuing if you need the latest "
+        "coordinator-tracked version, or proceed knowing your edits remain "
+        "local-only until you re-acquire and commit."
+    )
+
+
+def test_post_edit_preemption_reason_survives_a_real_restart(tmp_path: Path) -> None:
+    """The second renderer, ``_handle_post_edit``'s ``commit_not_allowed`` reason,
+    driven across an ACTUAL coordinator restart.
+
+    ``test_a1_preemption_surfaces_in_post_edit_failure_reason`` already walks this
+    path for a resolvable preempter and asserts ``y[:8] in reason``. What it never
+    reaches is the branch where the preempter cannot be named -- and that branch is
+    not hypothetical, it is what a restart produces: the preemption notice is
+    durable in SQLite, the agent-name map is process-local and starts empty, so
+    ``_agent_id_to_session`` returns None and the sentinel reaches the renderer.
+
+    Restarting for real rather than clearing ``_agent_names`` in place keeps the
+    test off a private attribute AND proves the half the simulation had to assume:
+    that the notice actually survives the process. The agent id is a uuid5 of the
+    session id, so X's id is the same on both sides of the restart -- which is
+    exactly why the notice still finds it.
+    """
+    x = _sid("X")
+    y = _sid("Y")
+
+    before = _restart_on(tmp_path, "notice-before-restart")
+    try:
+        secret = load_secret(before.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", before.port, secret)
+        client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+        client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+    finally:
+        before.shutdown()
+
+    after = _restart_on(tmp_path, "notice-after-restart")
+    try:
+        secret = load_secret(after.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", after.port, secret)
+        status, body = client.post(
+            "/hooks/post-edit",
+            {"session_id": x, "path": "plan.md", "content_hash": _hash("h"), "success": True},
+        )
+    finally:
+        after.shutdown()
+
+    assert status == 200
+    assert body.get("ok") is False, f"post-edit on a preempted grant must fail; got {body}"
+
+    reason = body.get("reason", "")
+    assert "preempted by session" in reason, (
+        f"the notice did not survive the restart, so this asserts nothing; got: {reason}"
+    )
+    assert "session <unknown> at" in reason, f"the sentinel must render whole; got: {reason}"
+    assert "session <unknown at" not in reason, (
+        f"the sentinel was sliced to 8 chars, dropping its bracket; got: {reason}"
+    )
+
+
 # ======================================================================
 # /status holder set survives a coordinator restart
 # ======================================================================
