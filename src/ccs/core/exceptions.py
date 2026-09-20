@@ -951,8 +951,10 @@ RESTORE_STATUSES: frozenset[str] = frozenset(
 #   off / the version not retained, or retained bytes that no longer match the
 #   captured fingerprint). Always written together with the loud tier
 #   downgrade — never a silent pass.
-# - ``released`` — a previously ``held`` pin was dropped by the INTERNAL
-#   release path (there is no public checkpoint-delete/release verb in v1);
+# - ``released`` — a previously ``held`` pin was dropped by the release path
+#   (``WorkspaceVersioner.release_checkpoint``, or the engine beneath it);
+#   TERMINAL — ``pin_checkpoint`` will not re-drive it, and there is still no
+#   public checkpoint-DELETE verb in v1;
 #   written together with the tier downgrade where the tier was ``restorable``
 #   (the claim is no longer backed).
 PIN_STATE_UNPINNED = "unpinned"

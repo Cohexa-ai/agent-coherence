@@ -2504,7 +2504,7 @@ class CoordinatorService:
         """Every checkpoint header, ordered ``(created_at, checkpoint_id)``.
 
         The pin engine's cross-checkpoint read (WV plan Unit 6 / R9): before
-        an internal release drops an S3 legal hold, it scans the OTHER
+        a checkpoint release drops an S3 legal hold, it scans the OTHER
         checkpoints' members for another ``held`` pin of the same
         ``(member_path, native_token)`` — a shared hold must survive the
         first checkpoint's release. Also the Unit-8 ``list`` verb's source.
@@ -2564,7 +2564,7 @@ class CoordinatorService:
         """Atomically adjust a checkpoint's pin refcount; the new value returned.
 
         The Unit-6 bookkeeping counter: +1 per pin the checkpoint establishes,
-        -1 per pin the internal release drops. The registry refuses a result
+        -1 per pin the checkpoint release drops. The registry refuses a result
         below zero (``ValueError`` — a release without a matching pin is a
         bookkeeping bug, fail-closed). ``abort`` threads into
         :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
