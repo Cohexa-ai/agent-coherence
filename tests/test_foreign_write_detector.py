@@ -16,6 +16,7 @@ defaults would exercise nothing.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -28,11 +29,13 @@ from ccs.adapters.claude_code.foreign_write_detector import (
     _git_dirty_paths,
     _parse_porcelain_v2,
     _poll_env,
+    _repository_is_absent,
     run_detection_pass,
 )
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.substrate import sha256_hex
+from ccs.diagnose.foreign_writes import NOT_COVERABLE, read_foreign_write_report
 
 WINDOW = 10.0
 POLL_BUDGET = 30.0
@@ -1367,3 +1370,146 @@ def test_a_corrupt_repository_stays_loud_on_every_tick(
     assert all(r.exc_info is not None for r in logged)
     assert faults == set()  # nothing latched
     assert coordinator.registry.detection_runs() == []
+
+
+# ---------------------------------------------------------------------------
+# A workspace nothing can ever watch (#207)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bare_workspace(tmp_path: Path) -> Path:
+    """A coordinator root that is NOT a git work tree — the examples' shape.
+
+    Every example spawns a coordinator over ``tempfile.mkdtemp()``, and a temp
+    directory is not a repository. Checked rather than assumed: a stray ``.git``
+    anywhere above ``tmp_path`` would silently turn this into a repository
+    fixture, and every assertion below would then pass for the wrong reason.
+    """
+    root = tmp_path / "bare"
+    root.mkdir()
+    (root / "notes.md").write_text("v1\n")
+    assert _repository_is_absent(root), "fixture is inside a repository"
+    return root
+
+
+@pytest.fixture
+def bare_coordinator(bare_workspace: Path):
+    registry = SqliteArtifactRegistry(bare_workspace / ".coherence" / "state.db")
+    policy = _policy(bare_workspace, "notes.md")
+    coordinator = _Coordinator(bare_workspace, registry, policy)
+    # Tracked AND registered, so the tick reaches the git poll. With nothing in
+    # scope the pass returns before git is asked, which is a different fact.
+    _register(coordinator, "notes.md", "v1\n")
+    yield coordinator
+    registry.close()
+
+
+def test_a_workspace_with_no_work_tree_is_noted_once_and_never_ticked(
+    bare_coordinator,
+) -> None:
+    """The note is what lets the offline report say "nothing here can be
+    watched" instead of accusing the instrument of never having run — and it
+    is recorded ONCE per became-uncoverable transition, not once per tick: the
+    poll retries every tick and the run id rotates on every failure, so a
+    per-tick record keyed on that id would write one row per sweep interval.
+    """
+    faults: set[str] = set()
+    for tick in range(3):
+        assert _tick(bare_coordinator, now_unix=100.0 + tick, faults=faults) == 0
+    registry = bare_coordinator.registry
+    assert registry.detection_runs() == []  # never a tick: the note is not an interval
+    notes = registry.detection_uncoverable()
+    assert len(notes) == 1, f"one note per transition, not per tick: {notes}"
+    assert notes[0].reason == "no-git-work-tree"
+    assert notes[0].observed_at_unix == 100.0  # the tick the latch closed on
+    assert faults == {"not-a-git-repository"}
+
+    db = bare_coordinator.coordinator_root / ".coherence" / "state.db"
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert report.instrumented is False
+    assert report.covers(100.0, 102.0) is False
+
+
+def test_a_workspace_that_regains_and_loses_its_repository_is_noted_twice(
+    bare_coordinator,
+) -> None:
+    """The note follows the latch, and the latch re-arms on a completed poll —
+    so a workspace that becomes a repository and later stops being one is a
+    second fact, recorded a second time, with the watched interval between."""
+    root = bare_coordinator.coordinator_root
+    faults: set[str] = set()
+    _tick(bare_coordinator, now_unix=100.0, faults=faults)
+    _git(root, "init", "-q")
+    _tick(bare_coordinator, now_unix=200.0, faults=faults)  # completes: re-arms, ticks
+    assert faults == set()
+    shutil.rmtree(root / ".git")
+    _tick(bare_coordinator, now_unix=300.0, faults=faults)
+
+    registry = bare_coordinator.registry
+    assert [n.observed_at_unix for n in registry.detection_uncoverable()] == [100.0, 300.0]
+    assert [r.first_tick_unix for r in registry.detection_runs()] == [200.0]
+
+
+def test_the_note_never_shares_a_run_id_with_a_tick(bare_coordinator) -> None:
+    """No single run id may read as both an interval the detector watched and
+    a workspace with nothing to watch. Here the poll can succeed on the very
+    next tick, so the note's id has to be retired on BOTH sides of the note."""
+    root = bare_coordinator.coordinator_root
+    faults: set[str] = set()
+    _git(root, "init", "-q")
+    _tick(bare_coordinator, now_unix=100.0, faults=faults)  # a tick, on id A
+    shutil.rmtree(root / ".git")
+    _tick(bare_coordinator, now_unix=200.0, faults=faults)  # the note, on its own id
+    _git(root, "init", "-q")
+    _tick(bare_coordinator, now_unix=300.0, faults=faults)  # a tick, on a third id
+
+    registry = bare_coordinator.registry
+    tick_ids = {r.run_id for r in registry.detection_runs()}
+    note_ids = {n.run_id for n in registry.detection_uncoverable()}
+    assert len(tick_ids) == 2 and len(note_ids) == 1, (tick_ids, note_ids)
+    assert not (tick_ids & note_ids), "a run id reads as both watched and unwatchable"
+
+
+class _RefusingUncoverable:
+    """A registry whose note write fails ``refusals`` times, then succeeds."""
+
+    def __init__(self, inner, refusals: int) -> None:
+        self._inner = inner
+        self.refusals = refusals
+        self.attempts = 0
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        self.attempts += 1
+        if self.attempts <= self.refusals:
+            raise RuntimeError("store refused the note")
+        self._inner.record_detection_uncoverable(reason, now_unix)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+def test_a_refused_note_keeps_the_latch_open_and_is_retried(
+    bare_coordinator, caplog
+) -> None:
+    """A store that refuses the note — locked, out of disk — must not leave the
+    report accusing the instrument of never running. The latch closes only
+    once the note is durable, so the next tick tries again; and the refusal is
+    a real fault, so unlike the condition it interrupts it stays loud."""
+    import logging
+
+    refusing = _RefusingUncoverable(bare_coordinator.registry, refusals=2)
+    bare_coordinator.registry = refusing
+    faults: set[str] = set()
+    with caplog.at_level(logging.ERROR):
+        _tick(bare_coordinator, now_unix=100.0, faults=faults)
+        _tick(bare_coordinator, now_unix=101.0, faults=faults)
+        assert faults == set()  # nothing durable yet, so nothing latched
+        _tick(bare_coordinator, now_unix=102.0, faults=faults)
+
+    assert faults == {"not-a-git-repository"}
+    assert refusing.attempts == 3
+    assert [n.observed_at_unix for n in refusing.detection_uncoverable()] == [102.0]
+    refused = [r for r in caplog.records if "could not record" in r.getMessage()]
+    assert len(refused) == 2 and all(r.exc_info is not None for r in refused)

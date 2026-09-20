@@ -135,6 +135,11 @@ _GIT_REDIRECT_VARS = (
 # bare bool so the caller holds one latch whatever else later joins it.
 _FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
 
+# What the OFFLINE report is told when the poll can never read this workspace.
+# An opaque stable token, not a message: written here and read back across a
+# process and a release boundary by ``ccs.diagnose.foreign_writes``.
+_REASON_NO_WORK_TREE = "no-git-work-tree"
+
 # The CEILING on how long the repository walk may take. A handful of `lstat`
 # calls is microseconds whenever the filesystem answers at all; the bound is for
 # the case where it never does. It is a cap and not the operand — the caller
@@ -186,11 +191,13 @@ class NotAGitRepositoryError(GitPollError):
     caller that wants to say something different about a permanent,
     non-actionable condition can name it.
 
-    It changes nothing about how the tick is accounted — no tick is recorded and
-    the observed interval is closed, exactly as for any other failed poll. What
-    it changes is the log: this one is reported once at debug rather than as a
-    traceback per sweep tick, because repeating it buries the failures an
-    operator can actually act on.
+    No tick is recorded and the observed interval is closed, exactly as for
+    any other failed poll. What it changes is two things. The log: this one is
+    reported once at debug rather than as a traceback per sweep tick, because
+    repeating it buries the failures an operator can actually act on. And the
+    store: once per time the condition arrives, a note is recorded so the
+    offline report can separate "nothing here can be watched" from "the
+    instrument never ran" — see ``_record_uncoverable``.
 
     Which is why it is earned from the FILESYSTEM and not from what git said.
     A repository whose ``.git`` survives but whose ``HEAD``, ``objects`` or
@@ -641,11 +648,14 @@ def run_detection_pass(
         # traceback, because the stack says nothing the sentence does not, and
         # a per-tick traceback buries the failures that ARE actionable — the
         # demo whose temp workspace surfaced this printed one per tick over its
-        # own stdout. The accounting below is identical to any other failure.
-        if _FAULT_NOT_A_REPOSITORY not in reported_faults:
-            reported_faults.add(_FAULT_NOT_A_REPOSITORY)
-            logger.debug("foreign-write detection is inert: %s", exc)
+        # own stdout. No tick is recorded and the interval closes, as for any
+        # other failure — and, once per time the condition arrives, a note is
+        # written so the offline report can say WHY there are no ticks.
         _close_observed_interval(coordinator)
+        if _FAULT_NOT_A_REPOSITORY not in reported_faults:
+            logger.debug("foreign-write detection is inert: %s", exc)
+            if _record_uncoverable(coordinator, now_unix):
+                reported_faults.add(_FAULT_NOT_A_REPOSITORY)
         return 0
     except Exception as exc:  # noqa: BLE001 — an instrument may never break the sweep
         logger.exception("foreign-write detection tick failed: %s", exc)
@@ -661,13 +671,47 @@ def _close_observed_interval(coordinator: DetectionTarget) -> None:
     a span nothing watched. The next success opens a new interval and the hole
     shows. Every tick that observed nothing closes it — a failed poll, the
     inert workspace, a tick with nothing in scope, and a tick that arrives too
-    late to join the interval before it. What the inert-workspace case quiets
-    is the log, never the report.
+    late to join the interval before it. The inert-workspace case closes it
+    too, and then records why — see ``_record_uncoverable``.
     """
     try:
         coordinator.registry.close_detection_run()
     except Exception:  # noqa: BLE001 — best effort; never mask the original
         logger.exception("detection: could not close the observed run interval")
+
+
+def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
+    """Record that this workspace has nothing the poll can ever read, so the
+    OFFLINE report can say so. True once the note is durable.
+
+    Without the row the store reads as not-instrumented — the same answer a
+    store gets when the sweep was off or the instrument failed every tick,
+    which is precisely the collapse the report's states exist to prevent.
+
+    The caller gates this on the latch that also gates the log, and closes the
+    latch only on True. Once per transition rather than once per tick because
+    the poll retries every tick and ``_close_observed_interval`` rotates the
+    run id on every failure, so a per-tick record keyed on that id would write
+    one row per sweep interval. And only on True so a store that refuses the
+    note — locked, out of disk — is retried on the next tick rather than left
+    holding a report that accuses the instrument of never running; that
+    failure is a real fault and stays loud. The latch re-arms when a poll
+    completes, so a workspace that becomes a repository and later stops being
+    one is noted again: that is a second fact.
+
+    The note lands on a run id of its own. The caller has just retired any
+    interval that was open, so no tick precedes it on this id; the close here
+    retires the id so no tick can follow it — the poll can succeed on the very
+    next tick, and a run must never read as both an interval the detector
+    watched and a workspace with nothing to watch.
+    """
+    try:
+        coordinator.registry.record_detection_uncoverable(_REASON_NO_WORK_TREE, now_unix)
+        coordinator.registry.close_detection_run()
+    except Exception:  # noqa: BLE001 — an instrument may never break the sweep
+        logger.exception("detection: could not record that the workspace has no work tree")
+        return False
+    return True
 
 
 def _detect(
@@ -709,7 +753,7 @@ def _detect(
         # inside is read as CONTINUOUSLY observed, so leaving it open lets the
         # next successful tick extend the same interval across the window and
         # `covers()` answer True for a span nothing was polled in. That is the
-        # false clean the whole three-state report exists to refuse, and it
+        # false clean the whole four-state report exists to refuse, and it
         # needs no corruption, no mount and no locale to reach — `/policy/track`
         # swaps the tracked set while the coordinator runs, and the shipped
         # untrack command is one way an operator empties it.
