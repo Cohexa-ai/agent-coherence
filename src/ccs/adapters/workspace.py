@@ -461,7 +461,7 @@ class CheckpointPinStore(Protocol):
     Pin legs are driven FROM the durable member rows and record their answer
     THROUGH ``set_workspace_checkpoint_member_pin`` — the pin state and any
     loud tier downgrade land in ONE registry write.
-    ``list_workspace_checkpoints`` feeds the internal release's
+    ``list_workspace_checkpoints`` feeds the checkpoint release's
     cross-checkpoint scan (a legal hold shared by another checkpoint's
     ``held`` member must survive this checkpoint's release).
     :meth:`WorkspaceVersioner.checkpoint` verifies its service speaks this
@@ -1298,8 +1298,8 @@ class WorkspaceVersioner:
         ``pin_state="released"`` — downgrading a ``restorable`` tier to
         ``restorable-unpinned`` in the SAME write, so no instant leaves an
         unbacked ``restorable`` claim; (2) for an S3 member, drop the legal
-        hold ONLY when no OTHER
-        checkpoint still holds a ``held`` pin on the same ``(member_path,
+        hold ONLY when no OTHER checkpoint still holds a ``held`` pin on the
+        same ``(member_path,
         native_token)`` — the cross-checkpoint scan: a shared hold survives
         until the LAST holder releases (S3's hold is a flag, not a counter;
         the scan is the counter). The scan runs TWICE, fresh both times: once
