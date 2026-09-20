@@ -224,7 +224,13 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     """``get_artifact_and_generation`` returns the pair the effect gate compares:
     a sweep reclamation moves ONLY the generation leg (the shape a version-only
     comparand cannot see), a commit moves ONLY the version leg, and an unknown
-    artifact raises KeyError like the sibling fence accessors."""
+    artifact answers None rather than raising.
+
+    That None is the rule the fence accessors follow, and
+    ``get_owner_generation`` is the ONE exception to it -- it raises KeyError
+    for an artifact the registry has never seen, on both backends. Every leg
+    of that split is asserted below (the rule twice, the exception once) so
+    the sentence cannot drift away from the code again."""
     reg = registry
     art = _register(reg)
     a = uuid4()
@@ -241,7 +247,13 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
     assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
     assert _pair(reg, art.id) == (2, 1)
-    assert reg.get_artifact_and_generation(uuid4()) is None
+    # Absent-artifact contract: reads answer None ...
+    absent = uuid4()
+    assert reg.get_artifact_and_generation(absent) is None
+    assert reg.get_read_generation(absent, a) is None
+    # ... and get_owner_generation is the single accessor that raises instead.
+    with pytest.raises(KeyError):
+        reg.get_owner_generation(absent)
 
 
 def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -> None:
