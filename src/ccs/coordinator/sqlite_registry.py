@@ -33,7 +33,12 @@ Contract divergence from in-memory ``ArtifactRegistry`` (per plan KTD-13):
   actually exercises; ``tests/test_coordinator.py`` patterns that exercise
   content-fetch semantics are NOT a v0.1 goal for this storage layer.
 
-Schema (KTD-3, applied via ``PRAGMA user_version`` on init):
+Schema: the v1 BASELINE only (KTD-3), kept for orientation. The live schema is
+``SCHEMA_USER_VERSION`` (currently 7); the ``_migrate_vN_to_vM`` chain below is
+the source of truth for everything the baseline does not show, including the
+columns later versions add to ``agent_states`` (``read_generation``,
+``last_observed_version``) and every table and index added after v1. Read a db's
+own ``sqlite_master`` rather than this block when the exact shape matters.
 
   PRAGMA user_version = 1;
   CREATE TABLE artifacts (
@@ -57,7 +62,6 @@ Schema (KTD-3, applied via ``PRAGMA user_version`` on init):
     last_reclaim_tick INTEGER,
     PRIMARY KEY (artifact_id, agent_id)
   );
-  CREATE INDEX idx_agent_states_agent ON agent_states(agent_id);
   CREATE TABLE heartbeats (
     agent_id   TEXT PRIMARY KEY,
     last_tick  INTEGER NOT NULL
@@ -2898,17 +2902,44 @@ class SqliteArtifactRegistry:
         means no agents, never all of them: the artifact half is still read,
         so the workspace-level emptiness signal is unaffected either way.
 
-        The predicate is NOT index-backed: ``agent_states`` is keyed
-        ``(artifact_id, agent_id)`` and nothing indexes ``agent_id`` alone,
-        so SQLite walks the table either way (``EXPLAIN QUERY PLAN`` reports
-        ``SCAN`` for both forms). What the scope removes is the per-row cost
-        — a ``UUID(hex=...)`` and a ``MESIState`` lookup for every row the
-        caller would then discard. Measured on a 500k-row table with a
-        four-agent session: 2804ms unscoped, 174ms scoped. An index on
-        ``agent_id`` would turn the remaining constant into a bound, but it
-        needs a migration in BOTH backends (a one-sided ``user_version`` bump
-        trips the cross-runtime schema guard), so it is deliberately not done
-        here.
+        The predicate IS index-backed. ``agent_states`` is keyed
+        ``(artifact_id, agent_id)``, whose leftmost prefix does not serve
+        ``agent_id`` alone, so ``idx_agent_states_agent`` covers that column:
+        created with the table on a fresh db, and added to existing ones by
+        ``_migrate_v6_to_v7`` (see that method for the KTD9 coordination with
+        the sibling Node coordinator). The scoped form plans as a SEARCH
+        through that index and only the unscoped form still reports ``SCAN
+        agent_states`` --
+        ``test_status_snapshot_scoped_query_is_index_backed`` in
+        ``tests/test_sqlite_registry.py`` is what holds that, asserting the
+        index name and the absence of ``SCAN`` rather than a full
+        ``EXPLAIN QUERY PLAN`` rendering, which SQLite is free to reword
+        between versions.
+
+        That index is the only one this predicate needs; it is NOT a
+        precedent for adding others freely. Any FURTHER index still needs the
+        two-sided migration ``_migrate_v6_to_v7`` performed, because a
+        one-sided ``user_version`` bump leaves a ledger the sibling runtime
+        rejects as foreign (``_reject_foreign_ledger_db``, the
+        ``registry_meta.schema_runtime`` stamp).
+
+        What scoping bounds is the ``agent_states`` half, on both of its legs:
+
+        - the SQL leg, which the index turned from a walk of every page into
+          a lookup — 61ms -> 1.5ms on a 500k-row ledger with a four-agent
+          session (measured in ``_migrate_v6_to_v7``); and
+        - the per-row Python cost — a ``UUID(hex=...)`` and a ``MESIState``
+          lookup for every row the caller would then discard — which stays
+          the dominant term and is what the whole-call figure on that same
+          ledger measures: 2804ms unscoped, 174ms scoped. That pair was
+          recorded when neither form was index-backed, so its unscoped side
+          is unchanged (still a SCAN) while its scoped side now carries the
+          cheaper SQL leg underneath.
+
+        The artifact half is NOT bounded by the scope: it always reads every
+        artifact row and mints a ``UUID(hex=...)`` per artifact, so a scoped
+        call on an artifact-heavy workspace stays O(all artifacts) however
+        small the session is.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}

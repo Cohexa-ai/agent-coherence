@@ -224,7 +224,15 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     """``get_artifact_and_generation`` returns the pair the effect gate compares:
     a sweep reclamation moves ONLY the generation leg (the shape a version-only
     comparand cannot see), a commit moves ONLY the version leg, and an unknown
-    artifact raises KeyError like the sibling fence accessors."""
+    artifact answers None rather than raising.
+
+    Answering None is the rule every SCALAR read follows for an artifact the
+    registry has never seen, and ``get_owner_generation`` is the sole
+    exception -- it raises KeyError instead, on both backends. The rule is
+    asserted over the whole accessor list rather than a sample, so a later
+    read that starts raising fails here instead of quietly falsifying this
+    sentence. (Container reads are outside the rule: ``get_state_map`` and
+    ``get_transient_map`` answer an empty dict, ``has_artifact`` False.)"""
     reg = registry
     art = _register(reg)
     a = uuid4()
@@ -241,7 +249,26 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
     assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
     assert _pair(reg, art.id) == (2, 1)
-    assert reg.get_artifact_and_generation(uuid4()) is None
+    # Absent-artifact contract, pinned over the whole scalar-read surface so
+    # the "sole exception" claim above cannot quietly gain a second member.
+    absent = uuid4()
+    for accessor in ("get_artifact", "get_artifact_and_generation", "get_content"):
+        assert getattr(reg, accessor)(absent) is None, accessor
+    for accessor in ("get_agent_state", "get_agent_transient",
+                     "get_read_generation", "get_transient_tick",
+                     "last_observed_version_for"):
+        assert getattr(reg, accessor)(absent, a) is None, accessor
+    if isinstance(reg, SqliteArtifactRegistry):  # no in-memory counterpart
+        assert reg.get_artifact_updated_at(absent) is None
+        assert reg.last_writer_for(absent) is None
+    # get_owner_generation is the one scalar read that raises instead.
+    with pytest.raises(KeyError):
+        reg.get_owner_generation(absent)
+    # Container reads sit outside the None rule -- pinned so the docstring's
+    # carve-out is checked too, not just asserted in prose.
+    assert reg.get_state_map(absent) == {}
+    assert reg.get_transient_map(absent) == {}
+    assert reg.has_artifact(absent) is False
 
 
 def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -> None:
