@@ -58,7 +58,7 @@ class Statement:
 STATEMENTS: tuple[Statement, ...] = (
     Statement(
         name="the coverage number is narrowed to what git could report on",
-        phrase="counts only the files git could actually report on at that check",
+        phrase="the widest scope that run ever watched, not the scope of its last check",
     ),
     Statement(
         name="the uncoverable note leads the report only for a store with no checks",

@@ -1509,13 +1509,15 @@ plainly:**
   first — never a clean bill of health you did not earn. Each run also records
   how many files were in scope, because watching five hundred and finding
   nothing is a different result from watching none. That number counts only the
-  files git could actually report on at that check: one your patterns name and
-  the coordinator knows, but that nobody has added to git, is not among them,
-  because a check that can never see a file must not be counted as having
-  watched it. The count is therefore a subset of the files you asked to have
-  tracked, and a check that could see only some of them leaves no separate mark
-  anywhere in the report, so the report alone will not tell you how far the two
-  have drifted apart.
+  files git could actually report on: one your patterns name and the coordinator
+  knows, but that nobody has added to git, is not among them, because a check
+  that can never see a file must not be counted as having watched it. Read it as
+  the widest scope that run ever watched, not the scope of its last check — a
+  run whose visible files fall away keeps reporting the larger number, and the
+  run is not split when that happens. The count is therefore a subset of the
+  files you asked to have tracked, and a check that could see only some of them
+  leaves no separate mark anywhere in the report, so the report alone will not
+  tell you how far the two have drifted apart.
 - **A workspace the detector cannot watch is its own answer.** Detection can
   only watch a git work tree, and a coordinator rooted outside one — a temp
   directory, an unpacked archive, a directory nobody ran `git init` in — can

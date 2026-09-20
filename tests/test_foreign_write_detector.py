@@ -1997,6 +1997,62 @@ def two_artifact_coordinator(repo: Path):
     registry.close()
 
 
+def test_a_path_the_poll_reports_stays_watchable_when_the_index_omits_it(
+    two_artifact_coordinator, repo: Path
+) -> None:
+    """The narrowing asks the INDEX; the claim it must honour is what the POLL
+    can report. Those disagree, and every disagreement in the narrowing
+    direction silently drops a foreign write git actively told us about.
+
+    Three shapes, each measured rather than assumed, each asserted through
+    ``_status_reports`` so the premise is git's answer and not ours:
+
+    * a path removed with ``git rm --cached`` and left on disk — the poll emits
+      a ``1 D.`` record for the staged deletion, ``ls-files`` omits it;
+    * the OLD side of a rename — porcelain emits one ``2 R.`` record carrying
+      BOTH paths, and the shipped parser keeps both, while the index holds only
+      the new name;
+    * a change STAGED BEFORE ``--skip-worktree`` was set — the poll reports a
+      ``1 M.`` record, and the index entry is tagged ``S``.
+
+    The tag rule alone would drop the third and the index read alone would drop
+    the first two. Uniting the index read with ``dirty`` is what keeps them, and
+    removing that union turns every arm of this test red.
+    """
+    coordinator = two_artifact_coordinator
+    art = _register(coordinator, "draft.md", "v1\n")
+
+    # Shape 1: staged deletion, file still on disk and still diverging.
+    _git(repo, "rm", "--cached", "-q", "draft.md")
+    (repo / "draft.md").write_text("foreign one\n")
+    assert _status_reports(repo, "draft.md") == {"draft.md"}, "premise: the poll sees it"
+    assert "draft.md" not in _git_visible_names(repo, deadline=_deadline())
+    _tick(coordinator, now_unix=1000.0, cache={})
+    assert _totals(coordinator, art) == {"foreign": 1}, (
+        "a staged deletion the poll reported was dropped by the index read"
+    )
+
+    # Shape 2: the old side of a rename, which the registry still names.
+    _git(repo, "add", "draft.md")
+    _git(repo, "commit", "-qm", "restore draft")
+    _git(repo, "mv", "draft.md", "renamed.md")
+    assert _status_reports(repo, "draft.md") == {"draft.md"}, "premise: the poll names the old path"
+    assert "draft.md" not in _git_visible_names(repo, deadline=_deadline())
+
+    # Shape 3: a change staged BEFORE the skip-worktree bit is set.
+    _git(repo, "mv", "renamed.md", "draft.md")
+    (repo / "draft.md").write_text("foreign two\n")
+    _git(repo, "add", "draft.md")
+    _git(repo, "update-index", "--skip-worktree", "draft.md")
+    assert _status_reports(repo, "draft.md") == {"draft.md"}, "premise: a staged diff is reported"
+    visible = _git_visible_names(repo, deadline=_deadline())
+    assert "draft.md" not in visible, "premise: the S tag hides it from the index read"
+    _tick(coordinator, now_unix=1001.0, cache={})
+    assert _totals(coordinator, art) == {"foreign": 2}, (
+        "a staged change under skip-worktree was dropped, though the poll reported it"
+    )
+
+
 def test_an_artifact_that_becomes_gitignored_keeps_its_edge_and_loses_its_shortcut(
     two_artifact_coordinator, repo: Path
 ) -> None:
@@ -2024,8 +2080,14 @@ def test_an_artifact_that_becomes_gitignored_keeps_its_edge_and_loses_its_shortc
     before = _totals(coordinator, dropped)
 
     # It becomes git-ignored: out of the index, and excluded from re-entering it.
+    # The removal is COMMITTED on purpose. A `git rm --cached` left uncommitted
+    # is a staged deletion the poll still reports as a `1 D.` record, so the
+    # artifact would remain watchable and this test would be asserting eviction
+    # for a name git can still speak about.
     _git(repo, "rm", "--cached", "-q", "draft.md")
     (repo / ".gitignore").write_text("draft.md\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore draft.md")
     assert "draft.md" not in _git_visible_names(repo, deadline=_deadline())
 
     cache: dict = {"draft.md": ((1, 1), "foreign"), "notes.md": ((1, 1), "foreign")}
@@ -2153,12 +2215,36 @@ def test_eviction_mints_no_artifact_row_and_moves_no_canonical_hash(
 ) -> None:
     """The visibility boundary touches the caller's dict and nothing else.
 
-    Asserting only that no row was minted would pass vacuously now that the pass
-    makes no registry call at all, so the registry is wrapped and asserted
-    untouched across the tick's boundary work — that is the claim with content:
-    no identity lookup, no edge write, and above all no canonical hash moved,
-    healing the comparand a safety check reads being the defect this repository
-    has already shipped three times."""
+    A before/after snapshot of the registry would pass vacuously: the boundary
+    helper takes no registry argument at all, so it could not mint a row however
+    broken it was. The claim with content is that it makes no registry CALL, so
+    the call is what is counted — the pass is driven with a recording proxy and
+    the boundary window asserted empty. Mutating the helper to reach for the
+    registry is then the only way to turn this red, which is what the snapshot
+    version could not manage.
+
+    The canonical-hash half stays asserted too. Healing the comparand a safety
+    check reads is the defect this repository has already shipped three times.
+    """
+
+    class _Recording:
+        """Passes everything through and remembers what was asked for."""
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self.calls: list[str] = []
+
+        def __getattr__(self, name: str):
+            attr = getattr(self._inner, name)
+            if not callable(attr):
+                return attr
+
+            def _record(*args, **kwargs):
+                self.calls.append(name)
+                return attr(*args, **kwargs)
+
+            return _record
+
     art = _register(coordinator, "notes.md", "v1\n")
     (repo / "notes.md").write_text("foreign\n")
     _tick(coordinator, now_unix=1000.0)
@@ -2166,7 +2252,19 @@ def test_eviction_mints_no_artifact_row_and_moves_no_canonical_hash(
     names_before = set(coordinator.registry.artifact_names_under_prefix(""))
 
     _git(repo, "update-index", "--skip-worktree", "notes.md")
-    _tick(coordinator, now_unix=1001.0)
+    recording = _Recording(coordinator.registry)
+    coordinator.registry = recording
+    try:
+        _tick(coordinator, now_unix=1001.0)
+    finally:
+        coordinator.registry = recording._inner
+
+    assert "resolve_or_register" not in recording.calls, "the boundary minted an identity"
+    assert "set_artifact_and_content" not in recording.calls, "the boundary moved a hash"
+    assert "lookup_artifact_id_by_name" not in recording.calls, (
+        "the boundary resolved an identity it no longer needs — the eviction it "
+        "was written for is gone, so a lookup here is dead weight or a regression"
+    )
 
     after = coordinator.registry.get_artifact(art)
     assert (after.content_hash, after.version) == (before.content_hash, before.version)
@@ -2224,6 +2322,7 @@ def test_a_workspace_with_no_visible_artifact_is_noted_once_and_never_ticked(
     assert faults == {"no-visible-artifact"}
 
     db = coordinator.coordinator_root / ".coherence" / "state.db"
+    coordinator.registry.close()  # the offline reader opens the file itself
     report = read_foreign_write_report(db)
     assert report.state == NOT_COVERABLE
     assert report.instrumented is False
@@ -2249,6 +2348,7 @@ def test_a_prior_tick_outranks_the_note_but_never_hides_it(
     _git(repo, "update-index", "--skip-worktree", "notes.md")
     _tick(coordinator, now_unix=200.0, faults=faults)
 
+    coordinator.registry.close()  # the offline reader opens the file itself
     report = read_foreign_write_report(repo / ".coherence" / "state.db")
     assert report.state == INSTRUMENTED_ZERO
     assert report.instrumented is True

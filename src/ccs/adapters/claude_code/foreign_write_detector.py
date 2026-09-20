@@ -132,11 +132,17 @@ _GIT_REDIRECT_VARS = (
 )
 
 # The ONLY `git ls-files -v` tags `git status --untracked-files=no` provably
-# cannot report on. `S` is skip-worktree: git is told to treat the worktree
-# entry as matching the index, so status diffs it never. A LOWERCASE tag is the
-# assume-unchanged bit, which buys the same silence by a different mechanism.
-# Both were established by mutating the file and watching the poll stay quiet,
-# not by reading the manual.
+# cannot report a WORKTREE change for. `S` is skip-worktree: git is told to
+# treat the worktree entry as matching the index, so status diffs it never. A
+# LOWERCASE tag is the assume-unchanged bit, which buys the same silence by a
+# different mechanism. Both were established by mutating the file and watching
+# the poll stay quiet, not by reading the manual.
+#
+# They are NOT blind in general, and the narrower claim is the load-bearing one:
+# an entry whose INDEX already differs from HEAD when the bit is set is still
+# reported, as a `1 M.` record. Dropping such a name here would lose a write the
+# poll can see, so the union at the call site re-admits anything `dirty` names
+# and this set only ever decides a name the poll stayed silent about.
 #
 # Every other tag is RETAINED, including `M` (unmerged, which the poll reports
 # as a `u` record the shipped parser keeps deliberately) and any tag a later git
@@ -145,6 +151,17 @@ _GIT_REDIRECT_VARS = (
 # conflict, and would go blind again the day git grows a letter — so the
 # fail-closed direction here is the one that keeps an artifact in scope.
 _STATUS_BLIND_TAGS = frozenset({"S"})
+
+# The slice of a tick's budget held back for the visibility read. Both git calls
+# share one deadline and the status poll runs first, so without a reserve a slow
+# poll can spend the whole budget and leave the second call raising on an
+# already-expired deadline. That discards the tick — honest, but it turns a slow
+# repository into an instrument that records nothing, which is the reading the
+# four states exist to keep apart from a healthy detector. Capped as a FRACTION
+# as well as an absolute, so a deployment that shortens the sweep interval does
+# not hand most of the budget to the reserve.
+_VISIBILITY_RESERVE_SEC = 1.0
+_VISIBILITY_RESERVE_FRACTION = 0.2
 
 # The poll faults reported once rather than per tick. Keys rather than bare
 # bools so the caller holds one latch whatever else later joins them.
@@ -896,6 +913,12 @@ def _detect(
         # needs no corruption, no mount and no locale to reach — `/policy/track`
         # swaps the tracked set while the coordinator runs, and the shipped
         # untrack command is one way an operator empties it.
+        #
+        # The shortcuts go too. This return never reaches the visibility read,
+        # so nothing below can vouch for them, and an emptied scope is a blind
+        # window exactly like invisibility — an untracked name can be rewritten
+        # while unwatched and come back with the same size and mtime.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         return 0
 
@@ -904,7 +927,12 @@ def _detect(
     # tick run for twice `poll_budget_sec` on the thread that also reclaims
     # grants and reaps dead sessions.
     deadline = time.monotonic() + poll_budget_sec
-    dirty = _git_dirty_paths(root, covered, deadline=deadline)
+    # The poll gets the budget minus the visibility read's reserve; the
+    # visibility read then gets whatever is genuinely left, up to the full
+    # deadline. Ordering is unchanged: the poll still runs first and still owns
+    # the not-a-repository classification.
+    reserve = min(_VISIBILITY_RESERVE_SEC, poll_budget_sec * _VISIBILITY_RESERVE_FRACTION)
+    dirty = _git_dirty_paths(root, covered, deadline=deadline - reserve)
     # The poll completed, so whatever this workspace was when the latch was set,
     # it is pollable now: re-arm, and a workspace that stops being a repository
     # again is reported the second time too. Only a completed poll clears it —
@@ -929,12 +957,24 @@ def _detect(
     # `covered` stays bound. The eviction pass below needs the difference
     # between the two sets, and the empty-scope check needs to know the claimed
     # scope was non-empty; overwriting the name here would destroy both.
-    visible = set(covered) & _git_visible_names(root, deadline=deadline)
+    # The union is the whole point, and it is not belt-and-braces. The index
+    # read answers "is this name cached in the index", while the question that
+    # matters is "can the poll report on this name" — and those disagree in the
+    # narrowing direction, which is the direction that loses a foreign write.
+    # Measured on git 2.50.1: a path removed with `git rm --cached` but left on
+    # disk, the OLD side of a rename (porcelain emits a `2 R.` record carrying
+    # BOTH paths), and a change staged BEFORE `--skip-worktree` was set are all
+    # reported by the poll and all absent from, or blinded in, the index read.
+    # `dirty` is by construction what the poll just said it can see, so adding
+    # it back admits exactly those and nothing else: a name git never mentions
+    # is absent from `dirty` too, so the narrowing this pass exists for is
+    # untouched.
+    visible = set(covered) & (_git_visible_names(root, deadline=deadline) | dirty)
 
     # FIRST, and before either the empty-scope return below or the clean-edge
     # pass at the bottom, because the all-invisible tick returns without
     # reaching that pass.
-    _forget_invisible_stat_entries(stat_cache, covered, visible)
+    _forget_invisible_stat_entries(stat_cache, visible)
 
     if covered and not visible:
         # Git answered, and can speak about none of it. The tracked-and-
@@ -1007,7 +1047,6 @@ def _detect(
 
 def _forget_invisible_stat_entries(
     stat_cache: dict[str, tuple[tuple[int, int], str]],
-    covered: list[str],
     visible: set[str],
 ) -> None:
     """Forget the stat shortcut for artifacts that have left the visible set.
@@ -1032,18 +1071,27 @@ def _forget_invisible_stat_entries(
     artifact did so without needing a restart at all, because ``_observe``
     excludes that outcome from the cache skip by design.
 
-    What retaining the edge costs is bounded and is not specific to invisibility:
-    an artifact reconciled and then re-diverged to byte-identical content between
-    two observations is not counted again, because the content+outcome key is
-    what identifies a count. That is a property of sampling an interval, and it
-    holds just as much for an artifact that never left the visible set — so
-    clearing the edge here would buy a double count in exchange for repairing one
-    corner of a limitation the instrument accepts everywhere else.
+    What retaining the edge costs: an artifact reconciled and then re-diverged to
+    byte-identical content between two observations is not counted again, because
+    the content+outcome key is what identifies a count. The same loss happens to
+    an artifact that never left the visible set, so the class is not specific to
+    invisibility — but the two are not equally bounded, and the difference is
+    worth stating rather than glossing. A visible artifact gets
+    ``_release_clean_edges`` every tick, so its exposure is one interval; an
+    invisible one is never released, so its exposure lasts as long as it stays
+    out of sight. Clearing the edge here would trade a measured double count for
+    a narrower version of a limitation the instrument already accepts, which is
+    why it is not done — not because the two windows are the same size.
+
+    Keyed off the CACHE rather than off the scope. Every entry was written for a
+    name that was visible when it was observed, so anything not visible now is
+    exactly the unsafe set — and a name that left the scope entirely, by an
+    untrack rather than by going invisible, is only reachable this way.
 
     Touches the caller's dict and nothing else: no registry write, no identity
     lookup, no canonical hash moved.
     """
-    for name in set(covered) - visible:
+    for name in set(stat_cache) - visible:
         stat_cache.pop(name, None)
 
 
