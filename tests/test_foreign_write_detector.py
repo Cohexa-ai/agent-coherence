@@ -436,6 +436,55 @@ def test_a_window_with_nothing_in_scope_is_a_hole_not_a_covered_span(
     assert report.covers(100.0, 10000.0) is False
 
 
+def test_an_emptied_scope_drops_the_stat_shortcut_it_could_not_vouch_for(
+    coordinator, repo: Path
+) -> None:
+    """The blind-window rule at the exit that reaches it first.
+
+    ``/policy/track`` swaps the tracked set while the coordinator runs and
+    untracking is a shipped command, so a scope can empty and refill without
+    anything failing. While it is empty the pass returns before it polls, which
+    makes it a window nobody watched — and an artifact rewritten during it can
+    return with the same size and mtime, so a surviving shortcut would suppress
+    the divergence rather than merely delay a read.
+
+    Driven with ONE cache dict across all three ticks. A fresh dict per tick,
+    which is what the sibling coverage test uses, models no persistence at all
+    and cannot see this line whether it is there or not.
+    """
+    import os
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    target = repo / "notes.md"
+    cache: dict = {}
+
+    target.write_text("xx\n")
+    _tick(coordinator, now_unix=100.0, cache=cache)
+    assert _totals(coordinator, art).get("foreign", 0) == 1
+    assert cache, "the tick recorded no shortcut, so this test proves nothing"
+    before = os.stat(target)
+
+    coordinator.policy = _policy(repo)  # tracked set narrowed to nothing
+    _tick(coordinator, now_unix=200.0, cache=cache)
+    assert cache == {}, "the empty-scope return kept a shortcut it never watched"
+
+    # And the consequence that makes the line load-bearing rather than tidy.
+    target.write_text("yy\n")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(target)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns), (
+        "the rewrite moved the signature, so the shortcut was never consulted "
+        "and the assertion below would hold whatever the pass did"
+    )
+    coordinator.policy = _policy(repo, "notes.md")  # and restored
+    _tick(coordinator, now_unix=300.0, cache=cache)
+
+    assert _totals(coordinator, art).get("foreign", 0) == 2, (
+        "a divergence written while the scope was empty was skipped by a "
+        "shortcut the blind tick had no evidence for"
+    )
+
+
 def test_a_late_tick_opens_a_new_interval_rather_than_stretching_the_old(
     coordinator, repo: Path
 ) -> None:
@@ -1269,6 +1318,108 @@ def test_an_ordinary_failed_tick_closes_the_observed_interval_too(
     assert report.covers(100.0, 300.0) is False
 
 
+def test_a_failed_poll_drops_the_stat_shortcut_it_could_not_vouch_for(
+    coordinator, repo: Path, monkeypatch
+) -> None:
+    """The blind-window rule, applied to the exit that stays blind longest.
+
+    The pass states that a window it was not watching invalidates the
+    ``(size, mtime)`` shortcut, and honours it at the emptied scope and the
+    visibility boundary. A failed poll is the same kind of window and the most
+    common one — a stalled mount, a corrupt index, git off PATH — and it can
+    span many ticks.
+
+    A writer that rewrites an artifact during that window preserving size and
+    mtime (``cp -p``, ``rsync -t``, or any rewrite inside one mtime granule)
+    leaves a signature the surviving cache entry still matches, so ``_observe``
+    returns before it hashes anything and the divergence is never counted. And
+    because the entry is only rewritten after a real read, the skip persists on
+    every later tick: the write is counted zero times, permanently, under a
+    report showing recorded ticks either side of the outage.
+
+    ``os.utime`` restores the timestamp the rewrite moved, which is what makes
+    the blind write invisible to the shortcut rather than merely unlikely."""
+    import os
+
+    import ccs.adapters.claude_code.foreign_write_detector as detector
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    target = repo / "notes.md"
+    cache: dict = {}
+
+    # A first, watched divergence: counted, and it seeds the shortcut.
+    target.write_text("xx\n")
+    _tick(coordinator, now_unix=100.0, cache=cache)
+    assert _totals(coordinator, art).get("foreign", 0) == 1
+    assert cache, "the tick recorded no shortcut, so this test proves nothing"
+    before = os.stat(target)
+
+    # The instrument goes blind.
+    real = detector._git_dirty_paths  # noqa: SLF001 — the pass under test
+
+    def _boom(*_args, **_kwargs):
+        raise GitPollError("git status exited 128 in X: fatal: bad object HEAD")
+
+    monkeypatch.setattr(detector, "_git_dirty_paths", _boom)
+    _tick(coordinator, now_unix=200.0, cache=cache)
+    monkeypatch.setattr(detector, "_git_dirty_paths", real)
+
+    # A second divergence lands inside the blind window, same size, same mtime.
+    target.write_text("yy\n")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(target)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns), (
+        "the rewrite moved the signature, so the shortcut was never consulted"
+    )
+
+    _tick(coordinator, now_unix=300.0, cache=cache)
+
+    assert _totals(coordinator, art).get("foreign", 0) == 2, (
+        "a divergence written while the poll was blind was skipped by a "
+        "shortcut the failed tick had no evidence for"
+    )
+
+
+def test_an_inert_workspace_drops_the_stat_shortcut_too(
+    coordinator, repo: Path
+) -> None:
+    """The same rule on the other unguarded exit. A workspace whose repository
+    is gone rides the quiet branch instead of the loud one, and that branch can
+    stay open for hours — longer than any other blind window this pass has."""
+    import os
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    target = repo / "notes.md"
+    cache: dict = {}
+
+    target.write_text("xx\n")
+    _tick(coordinator, now_unix=100.0, cache=cache)
+    assert _totals(coordinator, art).get("foreign", 0) == 1
+    assert cache, "the tick recorded no shortcut, so this test proves nothing"
+    before = os.stat(target)
+
+    git_dir = repo / ".git"
+    stashed = repo.parent / "git-stashed"
+    shutil.move(str(git_dir), str(stashed))
+    _tick(coordinator, now_unix=200.0, cache=cache)  # inert: no repository
+    shutil.move(str(stashed), str(git_dir))
+
+    target.write_text("yy\n")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(target)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns), (
+        "the rewrite moved the signature, so the shortcut was never consulted "
+        "and the assertion below would hold whatever the pass did"
+    )
+
+    _tick(coordinator, now_unix=300.0, cache=cache)
+
+    assert _totals(coordinator, art).get("foreign", 0) == 2, (
+        "a divergence written while the workspace was inert was skipped by a "
+        "shortcut the blind tick had no evidence for"
+    )
+
+
 def test_an_unencodable_name_is_filtered_out_of_the_poll() -> None:
     """A name that cannot reach argv would escape the poll's two handled
     failures and, because it stays in the registry, kill every later tick.
@@ -1572,6 +1723,96 @@ def test_the_visibility_read_pins_its_own_path_shape(repo: Path, monkeypatch) ->
     assert "--full-name" in argv
     assert not any("relativePaths" in part for part in argv)
     assert "ls-files" in argv and "-z" in argv and "-v" in argv
+
+
+@pytest.fixture
+def subroot_repo(tmp_path: Path):
+    """A repository whose coordinator root sits BELOW the repository top.
+
+    Every other fixture in these suites roots the coordinator AT the repository
+    top, and that is precisely where the two ``ls-files`` path shapes agree — so
+    a flag that changes the shape only below the top is invisible to all of
+    them. The artifact lives two directories down and a second file sits at the
+    top, so a read that answers about the whole repository is distinguishable
+    from one scoped to the coordinator's own subtree.
+    """
+    top = tmp_path / "top"
+    top.mkdir()
+    _git(top, "init", "-q")
+    _git(top, "config", "user.email", "t@example.com")
+    _git(top, "config", "user.name", "t")
+    (top / "elsewhere.md").write_text("above the coordinator\n")
+    deep = top / "nested" / "deep"
+    deep.mkdir(parents=True)
+    (deep / "notes.md").write_text("v1\n")
+    _git(top, "add", "-A")
+    _git(top, "commit", "-qm", "seed")
+    return deep
+
+
+def test_the_visibility_read_emits_the_same_path_shape_as_the_poll(
+    subroot_repo: Path,
+) -> None:
+    """The two git calls whose outputs are intersected must agree on name shape.
+
+    Driven below the repository top because that is the ONLY place the shapes
+    can disagree; at a coordinator root that is the repository top — every other
+    fixture here — ``ls-files`` emits the same string with or without
+    ``--full-name``, so no test rooted there can see a divergence.
+
+    ``--full-name`` is what holds the visibility read to the poll's shape. The
+    poll's own shape is not negotiable and not what ``status.relativePaths``
+    suggests: ``-z`` overrides that setting, so porcelain v2 emits
+    repository-top-relative names whatever the config says. Dropping
+    ``--full-name`` would make this read answer ``notes.md`` where the poll
+    answers ``nested/deep/notes.md``, putting a name into the visible set that
+    the poll can never report dirty — which is the false-coverage claim this
+    whole narrowing exists to remove, reintroduced one directory down.
+    """
+    (subroot_repo / "notes.md").write_text("foreign\n")
+    deadline = _deadline()
+
+    visible = _git_visible_names(subroot_repo, deadline=deadline)
+    # The pathspec is the registry's own root-relative name, which is what the
+    # pass hands the poll. Note the asymmetry this exposes: the poll ACCEPTS a
+    # root-relative pathspec and RETURNS a repository-top-relative name.
+    dirty = _git_dirty_paths(subroot_repo, ["notes.md"], deadline=deadline)
+
+    assert dirty == {"nested/deep/notes.md"}, (
+        "the poll's shape changed; the visibility read must follow it"
+    )
+    assert visible == dirty, (
+        "the visibility read and the poll disagree on name shape, so their "
+        "intersection is empty for every artifact"
+    )
+
+
+def test_minus_z_overrides_status_relative_paths_in_the_poll(
+    subroot_repo: Path,
+) -> None:
+    """The fact the shape rule rests on, pinned against the running git.
+
+    ``status.relativePaths=true`` reads like it makes porcelain emit names
+    relative to the invocation directory, and without ``-z`` it does. The poll
+    passes ``-z``, which overrides it. That single flag is the reason the poll
+    is repository-top-relative, and a reader who checks the setting without the
+    flag concludes the opposite — so it is asserted here rather than trusted.
+    """
+    (subroot_repo / "notes.md").write_text("foreign\n")
+    argv = [
+        "git", "-C", str(subroot_repo),
+        "-c", "status.relativePaths=true",
+        "status", "--porcelain=v2", "--untracked-files=no",
+    ]
+
+    without_z = subprocess.run(argv, check=True, capture_output=True).stdout.decode()
+    with_z = subprocess.run(
+        [*argv[:-1], "-z", argv[-1]], check=True, capture_output=True
+    ).stdout.decode()
+
+    assert without_z.rstrip("\n").endswith("notes.md")
+    assert not without_z.rstrip("\n").endswith("deep/notes.md")
+    assert with_z.rstrip("\0").endswith("nested/deep/notes.md")
 
 
 def test_a_name_beginning_with_a_colon_is_visible_and_read_literally(
@@ -2146,18 +2387,37 @@ def test_a_restart_while_invisible_does_not_count_the_same_divergence_twice(
     out of sight and nothing is left holding the line: one edit, two counts, and
     an operator sent looking for a second incident that never happened.
 
-    A fresh dict here is not a convenience — it is the restart.
+    The fresh dict models the restart, and ONLY the restart. The ticks before it
+    share one cache the way the sweep loop does, because that is what puts the
+    artifact in the cache for the invisible tick to drop — hand every tick its
+    own empty dict and ``_forget_invisible_stat_entries`` iterates an empty set,
+    so the edge-retention arm this test exists for is never reached and the test
+    passes whatever that helper does to the edge.
     """
     coordinator = two_artifact_coordinator
     _register(coordinator, "notes.md", "v1\n")
     flickering = _register(coordinator, "draft.md", "v1\n")
     (repo / "notes.md").write_text("foreign one\n")
     (repo / "draft.md").write_text("foreign two\n")
-    _tick(coordinator, now_unix=1000.0, cache={})
+    live: dict = {}
+    _tick(coordinator, now_unix=1000.0, cache=live)
     assert _totals(coordinator, flickering) == {"foreign": 1}
+    assert "draft.md" in live, (
+        "premise: the artifact is in the cache, so the invisible tick has "
+        "something to drop and the retention arm is actually reached"
+    )
+    assert flickering in coordinator.registry.artifacts_with_detection_edge()
 
+    # Out of sight, on the same cache the sweep loop would still be holding.
     _git(repo, "update-index", "--skip-worktree", "draft.md")
-    _tick(coordinator, now_unix=1001.0, cache={})
+    _tick(coordinator, now_unix=1001.0, cache=live)
+    assert "draft.md" not in live, "the shortcut outlived the artifact's visibility"
+    assert flickering in coordinator.registry.artifacts_with_detection_edge(), (
+        "the durable edge was cleared, leaving a process-local dict as the only "
+        "thing standing between one edit and two counts"
+    )
+
+    # Back in view, in a NEW process: the edge is the only suppressor left.
     _git(repo, "update-index", "--no-skip-worktree", "draft.md")
     _tick(coordinator, now_unix=1002.0, cache={})  # a new process, an empty cache
 

@@ -307,10 +307,17 @@ def _git_dirty_paths(root: Path, names: list[str], *, deadline: float) -> set[st
     would let a large path list stall that thread for the sum of its batches.
     Exhausting the deadline raises, which correctly leaves the tick unrecorded.
 
-    ``-c status.relativePaths=true`` is forced rather than assumed: porcelain
-    v2 honours that setting, so a checkout configured otherwise would return
-    repository-root-relative paths while the registry holds coordinator-root
-    ones, and the two would never intersect — a silent permanent zero.
+    ``-c status.relativePaths=true`` is forced but does NOT decide the shape,
+    and the difference matters to anyone reasoning about which names come back.
+    ``-z`` makes that setting inert: under it porcelain v2 emits names relative
+    to the REPOSITORY TOP whatever the configuration says. The flag is kept as
+    a belt against a future that drops ``-z``, not as the thing aligning the
+    shapes. What aligns them is that the coordinator root is normally the
+    repository top, where top-relative and root-relative are the same string;
+    a coordinator rooted below the top gets names the registry never matches,
+    which is a limitation of this pass rather than a property of the flag.
+    ``_git_visible_names`` passes ``--full-name`` for exactly this reason — to
+    hold the index read to the top-relative shape this call emits.
 
     Any non-zero exit raises. The shipped ``_git`` helper maps a clean non-zero
     exit to the same value as an empty result, which is right for "am I in a
@@ -684,11 +691,17 @@ def _stat_signature(path: Path) -> tuple[int, int] | None:
 
     Used only to skip work: an artifact whose signature has not moved since the
     last observation usually has no new content to count. A missed skip costs
-    one extra read, never a wrong count, so trusting size and modification time
-    here carries none of the risk it would carry on a correctness path.
+    one extra read, so trusting size and modification time is cheap where the
+    alternative is hashing every tracked file on every tick.
 
-    "Usually" is doing real work in that sentence. One outcome is a function of
-    time as well as content — see the cache guard in :func:`_observe`.
+    "Usually" is doing real work in that sentence, in two ways. One outcome is a
+    function of time as well as content — see the cache guard in
+    :func:`_observe`. And the claim is only ever safe across a window the pass
+    was WATCHING: a rewrite that preserves size and mtime is invisible to this
+    fingerprint, so an entry carried across a blind window can suppress a real
+    divergence rather than merely delay a read. Every exit that observed nothing
+    therefore drops the cache before returning — the emptied scope, the
+    invisible scope, the failed poll and the inert workspace.
     """
     try:
         info = os.stat(path)
@@ -798,6 +811,12 @@ def run_detection_pass(
         # own stdout. No tick is recorded and the interval closes, as for any
         # other failure — and, once per time the condition arrives, a note is
         # written so the offline report can say WHY there are no ticks.
+        # The shortcut goes too, for the reason the emptied scope drops it: this
+        # tick watched nothing, so it can vouch for nothing, and an artifact
+        # rewritten while the workspace was inert can come back with the same
+        # size and mtime. This is the LONGEST blind window the pass has — an
+        # absent repository can stay absent for hours.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         if _FAULT_NOT_A_REPOSITORY not in reported_faults:
             logger.debug("foreign-write detection is inert: %s", exc)
@@ -806,6 +825,9 @@ def run_detection_pass(
         return 0
     except Exception as exc:  # noqa: BLE001 — an instrument may never break the sweep
         logger.exception("foreign-write detection tick failed: %s", exc)
+        # As above: a tick that failed observed nothing, so every shortcut it
+        # would otherwise carry forward rests on a window nobody watched.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         return 0
 
@@ -954,9 +976,12 @@ def _detect(
     # "swallowed error reads as a clean tree" defect wearing a different hat,
     # and an unrecorded tick is the honest answer to a scope nobody could read.
     #
-    # `covered` stays bound. The eviction pass below needs the difference
-    # between the two sets, and the empty-scope check needs to know the claimed
-    # scope was non-empty; overwriting the name here would destroy both.
+    # `covered` stays bound, for exactly one reason: the check below has to be
+    # able to tell a scope that was non-empty and narrowed to nothing from one
+    # that started empty, and only the unnarrowed name still carries that. It is
+    # NOT what the eviction pass reads — that is keyed off the stat cache, so
+    # that a name which left the scope entirely by an untrack is reachable at
+    # all — nor what the edge release reads, which takes `visible`.
     # The union is the whole point, and it is not belt-and-braces. The index
     # read answers "is this name cached in the index", while the question that
     # matters is "can the poll report on this name" — and those disagree in the
