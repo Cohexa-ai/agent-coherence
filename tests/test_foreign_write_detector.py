@@ -498,6 +498,143 @@ def test_a_tick_records_how_much_was_in_scope(coordinator, repo: Path) -> None:
     assert len(runs) == 1 and runs[0].covered_count == 1
 
 
+def test_an_artifact_git_cannot_report_on_is_not_counted_as_covered(
+    coordinator, repo: Path
+) -> None:
+    """R1. The poll runs ``--untracked-files=no``, so a git-ignored artifact is
+    reported clean on every tick for the life of the workspace. Counting it as
+    covered is how a number meant to say "500 watched, all clean" comes to
+    include artifacts nothing could ever have watched — the manufactured quiet
+    month this module exists to refuse.
+
+    The foreign write on the same tick is asserted beside it: narrowing the
+    claim must not narrow the detection, and an implementation that dropped the
+    artifact from the observe loop as well would still satisfy the count.
+    """
+    (repo / ".gitignore").write_text("ignored.md\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore")
+    (repo / "ignored.md").write_text("v1\n")
+    coordinator.policy = _policy(repo, "notes.md", "ignored.md")
+    watched = _register(coordinator, "notes.md", "v1\n")
+    _register(coordinator, "ignored.md", "v1\n")
+    (repo / "notes.md").write_text("foreign\n")
+    (repo / "ignored.md").write_text("foreign\n")
+
+    _tick(coordinator, now_unix=1000.0)
+
+    runs = coordinator.registry.detection_runs()
+    assert len(runs) == 1
+    assert runs[0].covered_count == 1, "an unreportable artifact was claimed as covered"
+    assert _totals(coordinator, watched).get("foreign", 0) == 1
+
+
+def test_the_count_the_observation_and_the_edge_gate_are_one_population(
+    coordinator, repo: Path
+) -> None:
+    """R2, and the scenario that actually pins it.
+
+    Every other test here has an all-visible or an all-invisible scope, and an
+    implementation that special-cased only the all-invisible workspace would
+    pass each of them. Two visible artifacts beside two invisible ones is the
+    mixed case: the number the tick records, the set that can produce an
+    observation row, and the set the edge gate holds must be the SAME two, or
+    the report answers a coverage question about one population with a count
+    taken over another.
+    """
+    (repo / "second.md").write_text("v1\n")
+    _git(repo, "add", "second.md")
+    _git(repo, "commit", "-qm", "second")
+    (repo / ".gitignore").write_text("ignored.md\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore")
+    (repo / "ignored.md").write_text("v1\n")
+    (repo / "never.md").write_text("v1\n")  # never added: no index entry at all
+    coordinator.policy = _policy(
+        repo, "notes.md", "second.md", "ignored.md", "never.md"
+    )
+    visible_ids = {
+        _register(coordinator, "notes.md", "v1\n"),
+        _register(coordinator, "second.md", "v1\n"),
+    }
+    invisible_ids = {
+        _register(coordinator, "ignored.md", "v1\n"),
+        _register(coordinator, "never.md", "v1\n"),
+    }
+    for name in ("notes.md", "second.md", "ignored.md", "never.md"):
+        (repo / name).write_text("foreign\n")
+
+    _tick(coordinator, now_unix=1000.0)
+
+    runs = coordinator.registry.detection_runs()
+    assert len(runs) == 1
+    assert runs[0].covered_count == 2, "the count spans more than the tick could poll"
+    totals = coordinator.registry.foreign_write_totals()
+    assert set(totals) == visible_ids
+    assert invisible_ids.isdisjoint(totals)
+    assert coordinator.registry.artifacts_with_detection_edge() == visible_ids
+
+
+def test_narrowing_the_visible_set_short_of_empty_keeps_one_interval(
+    coordinator, repo: Path
+) -> None:
+    """The same boundary the tracked-set narrowing has, on the new axis.
+
+    A scope that merely shrank is still being watched, so splitting the run
+    there would report a hole where there was none. Pinned on its own because
+    the visible set is a second way to reach zero, and the narrowed-but-
+    non-empty case must never acquire the empty case's behaviour.
+    """
+    (repo / "second.md").write_text("v1\n")
+    _git(repo, "add", "second.md")
+    _git(repo, "commit", "-qm", "second")
+    coordinator.policy = _policy(repo, "notes.md", "second.md")
+    _register(coordinator, "notes.md", "v1\n")
+    _register(coordinator, "second.md", "v1\n")
+
+    _tick(coordinator, now_unix=100.0)
+    # Git is told to stop looking at it, which is exactly what makes it
+    # invisible to the poll — the scope narrows to one, not to nothing.
+    _git(repo, "update-index", "--skip-worktree", "second.md")
+    _tick(coordinator, now_unix=110.0)
+
+    runs = coordinator.registry.detection_runs()
+    assert len(runs) == 1, "a narrowed-but-non-empty visible set must not split the run"
+    assert runs[0].tick_count == 2
+
+
+def test_covered_count_is_the_runs_high_water_mark_not_its_latest_tick(
+    coordinator, repo: Path
+) -> None:
+    """What the recorded number means, stated rather than assumed.
+
+    Each tick passes ITS OWN visible set, but both backends merge the column as
+    ``MAX`` within a run id. So the value a report reads is the widest scope the
+    run ever watched, not the scope of its last tick — and a test that asserted
+    the post-narrowing value would be asserting the merge, not the pass. The
+    grow leg runs first so the final assertion cannot pass vacuously on a
+    column that never moved.
+    """
+    coordinator.policy = _policy(repo, "notes.md", "second.md")
+    _register(coordinator, "notes.md", "v1\n")
+    _tick(coordinator, now_unix=100.0)
+    assert coordinator.registry.detection_runs()[0].covered_count == 1
+
+    (repo / "second.md").write_text("v1\n")
+    _git(repo, "add", "second.md")
+    _git(repo, "commit", "-qm", "second")
+    _register(coordinator, "second.md", "v1\n")
+    _tick(coordinator, now_unix=110.0)
+    assert coordinator.registry.detection_runs()[0].covered_count == 2
+
+    _git(repo, "update-index", "--skip-worktree", "second.md")
+    _tick(coordinator, now_unix=120.0)
+
+    runs = coordinator.registry.detection_runs()
+    assert len(runs) == 1
+    assert runs[0].covered_count == 2, "MAX within a run id, so the peak survives"
+
+
 # ---------------------------------------------------------------------------
 # The git layer in isolation
 # ---------------------------------------------------------------------------

@@ -878,8 +878,30 @@ def _detect(
     # again is reported the second time too. Only a completed poll clears it —
     # the early returns above observed nothing about the condition.
     reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
+
+    # The claimed scope, narrowed to what the poll above can actually speak
+    # about. `--untracked-files=no` means a registered artifact git never
+    # tracked — or one an exclude rule, `--skip-worktree` or `--assume-unchanged`
+    # hides — is reported clean on every tick for the life of the workspace, so
+    # counting it as covered manufactures exactly the quiet month this module
+    # exists to refuse.
+    #
+    # The SAME deadline the status poll used, deliberately: one budget bounds
+    # the whole tick, and a second instant minted here would let one pass run
+    # for twice `poll_budget_sec` on the thread that also reclaims grants and
+    # reaps dead sessions.
+    #
+    # It raises like the poll does, and is not caught here. A visibility read
+    # that failed must never be read as a narrowed scope — that is the poll's
+    # "swallowed error reads as a clean tree" defect wearing a different hat,
+    # and an unrecorded tick is the honest answer to a scope nobody could read.
+    #
+    # `covered` stays bound. The eviction pass needs the difference between the
+    # two sets, which overwriting the name here would destroy.
+    visible = set(covered) & _git_visible_names(root, deadline=deadline)
+
     counted = 0
-    for name in sorted(dirty & set(covered)):
+    for name in sorted(dirty & visible):
         try:
             counted += _observe(
                 registry,
@@ -895,7 +917,7 @@ def _detect(
     # An artifact git now reports clean has been reconciled, so the content the
     # edge gate is holding is no longer the current divergence. Leaving it
     # would make an identical later edit look already-counted.
-    _release_clean_edges(registry, covered, dirty, stat_cache)
+    _release_clean_edges(registry, visible, dirty, stat_cache)
 
     # Only now, and only because the poll completed. A tick counted over a
     # failed poll would let the offline report call a broken instrument a quiet
@@ -912,23 +934,33 @@ def _detect(
     last_tick = tick_clock.get("last_tick_unix")
     if last_tick is not None and (now_unix - last_tick) > max_gap_sec:
         _close_observed_interval(coordinator)
-    registry.record_detection_tick(now_unix, covered_count=len(covered))
+    # The visible set, not the claimed one: the number a report reads has to
+    # describe the same population the observe loop and the edge pass just ran
+    # over, or a coverage question is answered about one scope with a count
+    # taken over another.
+    registry.record_detection_tick(now_unix, covered_count=len(visible))
     tick_clock["last_tick_unix"] = now_unix
     return counted
 
 
 def _release_clean_edges(
     registry,
-    covered: list[str],
+    visible: set[str],
     dirty: set[str],
     stat_cache: dict[str, tuple[tuple[int, int], str]],
 ) -> None:
-    """Clear the edge gate for covered artifacts git now reports clean.
+    """Clear the edge gate for visible artifacts git now reports clean.
 
     Scoped to artifacts that actually carry an edge, which is the small set the
     detector has ever counted — not every clean artifact on every tick.
+
+    ``visible`` and not the whole claimed scope, for the reason the count is
+    narrowed too: an artifact the poll cannot report on is absent from ``dirty``
+    on every tick regardless of its bytes, so reading that absence as "git now
+    reports it clean" would call it reconciled on the strength of a question
+    never asked.
     """
-    clean = set(covered) - dirty
+    clean = visible - dirty
     if not clean:
         return
     for name in clean:
