@@ -2898,17 +2898,30 @@ class SqliteArtifactRegistry:
         means no agents, never all of them: the artifact half is still read,
         so the workspace-level emptiness signal is unaffected either way.
 
-        The predicate is NOT index-backed: ``agent_states`` is keyed
-        ``(artifact_id, agent_id)`` and nothing indexes ``agent_id`` alone,
-        so SQLite walks the table either way (``EXPLAIN QUERY PLAN`` reports
-        ``SCAN`` for both forms). What the scope removes is the per-row cost
-        — a ``UUID(hex=...)`` and a ``MESIState`` lookup for every row the
-        caller would then discard. Measured on a 500k-row table with a
-        four-agent session: 2804ms unscoped, 174ms scoped. An index on
-        ``agent_id`` would turn the remaining constant into a bound, but it
-        needs a migration in BOTH backends (a one-sided ``user_version`` bump
-        trips the cross-runtime schema guard), so it is deliberately not done
-        here.
+        The predicate IS index-backed. ``agent_states`` is keyed
+        ``(artifact_id, agent_id)``, which does not serve ``agent_id`` alone,
+        so ``idx_agent_states_agent`` covers that column: created with the
+        table on a fresh db, and added to existing ones by the v7 step
+        ``_migrate_v6_to_v7`` (which also coordinated the same index name on
+        the sibling Node coordinator, so the cross-runtime schema guard is
+        already satisfied — there is nothing left to gate a further index on,
+        and nothing to re-add). ``EXPLAIN QUERY PLAN`` reports ``SEARCH
+        agent_states USING INDEX idx_agent_states_agent (agent_id=?)`` for the
+        scoped form and ``SCAN agent_states`` only for the unscoped one.
+
+        So scoping now bounds BOTH costs by the session's own rows rather
+        than the ledger's:
+
+        - the SQL leg, which the index turned from a walk of every page into
+          a lookup — 61ms -> 1.5ms on a 500k-row ledger with a four-agent
+          session (measured in ``_migrate_v6_to_v7``); and
+        - the per-row Python cost — a ``UUID(hex=...)`` and a ``MESIState``
+          lookup for every row the caller would then discard — which stays
+          the dominant term and is what the whole-call figure on that same
+          ledger measures: 2804ms unscoped, 174ms scoped. That pair was
+          recorded when neither form was index-backed, so its unscoped side
+          is unchanged (still a SCAN) while its scoped side now carries the
+          cheaper SQL leg underneath.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
