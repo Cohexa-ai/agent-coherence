@@ -706,7 +706,7 @@ class SqliteArtifactRegistry:
         # KTD14). Same posture and the same reason as the conflict counters
         # above: observability exhaust, idempotent writer-open ensure, outside
         # the versioned migration chain, never run on the write-free read-only
-        # open. One difference is load-bearing — because BOTH tables exist after
+        # open. One difference is load-bearing — because all three tables exist after
         # any writer open, whether or not the sweep thread was ever created
         # (``sweep_interval_sec <= 0`` skips it), the table's PRESENCE cannot
         # mean "the detector ran". Only an observation ROW can, which is what
@@ -3738,7 +3738,7 @@ class SqliteArtifactRegistry:
         """Return every recorded run interval, oldest first.
 
         An EMPTY list is the not-instrumented signal. It cannot be inferred from
-        the table's absence: both tables exist after any writer open, including
+        the table's absence: all three tables exist after any writer open, including
         one where ``sweep_interval_sec <= 0`` meant the sweep thread was never
         created and the detector never ran."""
         with self._lock:

@@ -1511,13 +1511,18 @@ plainly:**
 - **A workspace that is not a git repository is its own answer.** Detection can
   only watch a git work tree, and a coordinator rooted outside one — a temp
   directory, an unpacked archive, a directory nobody ran `git init` in — can
-  never be polled. That store reports `not-coverable`: the detector ran and
-  correctly found nothing it could watch. It is neither a zero nor an outage,
-  and it is kept apart from `not-instrumented` so a healthy instrument is not
-  accused of never having run. `report.uncoverable` lists each coordinator run
-  that found no work tree and when it looked; `covers()` still answers `False`
-  for every span, because nothing was watched. A workspace that gains a
-  repository is watched from the next sweep, with no restart.
+  never be polled. Once the detector has at least one artifact it already
+  knows and tracks to poll, that store reports `not-coverable`: the detector
+  ran and correctly found nothing it could watch. That is neither a zero nor
+  an outage, and it is kept apart from `not-instrumented` so a healthy
+  instrument is not accused of never having run. `report.uncoverable` lists
+  each coordinator run that found no work tree and when it looked; `covers()`
+  still answers `False` for every span, because nothing was watched. With
+  nothing in scope the detector never reaches git and records nothing, so a
+  store that has never been polled reads `not-instrumented`, exactly as the
+  bullet above says — that precedence is deliberate, and the state reflects
+  what the store retains rather than the latest sweep. A workspace that gains
+  a repository is watched from the next sweep, with no restart.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
