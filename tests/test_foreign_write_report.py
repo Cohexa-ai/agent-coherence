@@ -1,16 +1,16 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""U3 — the offline foreign-write report and its three distinguishable states.
+"""U3 — the offline foreign-write report and its four distinguishable states.
 
 The sibling conflict-counter reader deliberately maps an absent table and an
 empty one to the same value, and documents that as "zero recorded conflicts".
 This reader cannot: a coverage claim is gated on the detector having actually
 observed a span, so reading a store where it never ran as a clean zero is the
-one failure the instrument exists to prevent. Hence three states, and a
-discriminator that keys on the observation ROW rather than on the table — both
-tables are created on every writer open, including one whose sweep thread was
-never started.
+one failure the instrument exists to prevent. Hence four states, and a
+discriminator that keys on the observation ROW rather than on the table — all
+three tables are created on every writer open, including one whose sweep thread
+was never started.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _drop_detection_tables(db: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The three states (R8, Success Criterion 2)
+# The four states (R8, Success Criterion 2)
 # ---------------------------------------------------------------------------
 
 
@@ -62,7 +62,7 @@ def test_a_store_predating_the_instrument_reads_as_not_instrumented(tmp_path: Pa
 def test_tables_present_but_never_ticked_reads_as_not_instrumented(tmp_path: Path) -> None:
     """The load-bearing case, and the one the sibling pattern cannot express.
     A coordinator started with the sweep disabled still opens the store as a
-    writer, so both tables exist and are empty. That is not a zero."""
+    writer, so all three tables exist and are empty. That is not a zero."""
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()
     report = read_foreign_write_report(db)

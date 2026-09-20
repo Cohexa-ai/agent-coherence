@@ -35,7 +35,7 @@ from ccs.adapters.claude_code.foreign_write_detector import (
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.substrate import sha256_hex
-from ccs.diagnose.foreign_writes import NOT_COVERABLE, read_foreign_write_report
+from ccs.diagnose.foreign_writes import NOT_COVERABLE, NOT_INSTRUMENTED, read_foreign_write_report
 
 WINDOW = 10.0
 POLL_BUDGET = 30.0
@@ -1513,3 +1513,33 @@ def test_a_refused_note_keeps_the_latch_open_and_is_retried(
     assert [n.observed_at_unix for n in refusing.detection_uncoverable()] == [102.0]
     refused = [r for r in caplog.records if "could not record" in r.getMessage()]
     assert len(refused) == 2 and all(r.exc_info is not None for r in refused)
+
+
+def test_a_bare_root_with_nothing_registered_stays_not_instrumented(bare_workspace: Path) -> None:
+    """The guide's precondition, pinned: ``not-coverable`` needs at least one
+    artifact the coordinator already knows AND tracks to have reached git.
+    The policy assertion fixes which half is missing here — the pattern does
+    track ``notes.md``; nothing ever registered it — so the empty scope is
+    provably non-registration, not a policy that tracks nothing. With nothing
+    registered the pass returns before the poll ("Deliberately no tick"), so no
+    fault is latched, no note is written, and the store reads
+    ``not-instrumented`` exactly as it did before the fourth state existed —
+    the shape of every shipped example until its first ``/session/begin``.
+    Removing that early return makes this fail: with an empty scope the tick
+    then records a covered_count=0 run."""
+    db = bare_workspace / ".coherence" / "state.db"
+    registry = SqliteArtifactRegistry(db)
+    coordinator = _Coordinator(bare_workspace, registry, _policy(bare_workspace, "notes.md"))
+    assert coordinator.policy.is_tracked("notes.md")
+    faults: set[str] = set()
+    try:
+        for tick in range(3):
+            assert _tick(coordinator, now_unix=100.0 + tick, faults=faults) == 0
+        assert faults == set()
+        assert registry.detection_runs() == []
+        assert registry.detection_uncoverable() == []
+    finally:
+        registry.close()
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_INSTRUMENTED
+    assert report.uncoverable == ()
