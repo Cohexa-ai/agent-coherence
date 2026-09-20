@@ -918,10 +918,8 @@ def _detect(
     # counting it as covered manufactures exactly the quiet month this module
     # exists to refuse.
     #
-    # The SAME deadline the status poll used, deliberately: one budget bounds
-    # the whole tick, and a second instant minted here would let one pass run
-    # for twice `poll_budget_sec` on the thread that also reclaims grants and
-    # reaps dead sessions.
+    # The SAME deadline minted above, deliberately, and for the reason stated
+    # there: one budget bounds the whole tick.
     #
     # It raises like the poll does, and is not caught here. A visibility read
     # that failed must never be read as a narrowed scope — that is the poll's
