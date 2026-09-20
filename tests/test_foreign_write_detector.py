@@ -1997,19 +1997,22 @@ def two_artifact_coordinator(repo: Path):
     registry.close()
 
 
-def test_an_artifact_that_becomes_gitignored_has_its_edge_evicted(
+def test_an_artifact_that_becomes_gitignored_keeps_its_edge_and_loses_its_shortcut(
     two_artifact_coordinator, repo: Path
 ) -> None:
-    """R2. An edge held for an artifact the poll can no longer report on is a
-    stale suppressor: nothing will ever clear it, because ``_release_clean_edges``
-    only ever walks the VISIBLE set. The first identical edit after the artifact
-    comes back into view would then read as already-counted and go unrecorded.
+    """R2. The two suppressors part company when an artifact leaves the visible
+    set, because they claim different things.
 
-    Evicting is the only direction that neither lies nor leaks. Releasing it
-    through the clean path instead would assert cleanliness for a name git never
-    reported on — inferring clean from silence, the one inference this
-    instrument exists to refuse — so the totals are asserted unmoved beside the
-    edge: no ``lag_suppressed``, no anything, for a question never asked.
+    The durable edge claims this exact content, with this exact outcome, was
+    already counted — still true while nobody can see the artifact, and the only
+    claim of the two that survives a restart. It is kept. The stat shortcut
+    claims (size, mtime) has not moved since the last look, which is only safe
+    across a window the poll was actually watching; it is dropped.
+
+    Clearing the edge here instead would leave a process-local dict as the sole
+    thing between one edit and two counts. The totals are asserted unmoved
+    beside it: silence is never read as an outcome, so no ``lag_suppressed``,
+    no anything, for a question never asked.
     """
     coordinator = two_artifact_coordinator
     kept = _register(coordinator, "notes.md", "v1\n")
@@ -2025,11 +2028,13 @@ def test_an_artifact_that_becomes_gitignored_has_its_edge_evicted(
     (repo / ".gitignore").write_text("draft.md\n")
     assert "draft.md" not in _git_visible_names(repo, deadline=_deadline())
 
-    _tick(coordinator, now_unix=1001.0)
+    cache: dict = {"draft.md": ((1, 1), "foreign"), "notes.md": ((1, 1), "foreign")}
+    _tick(coordinator, now_unix=1001.0, cache=cache)
 
     edges = coordinator.registry.artifacts_with_detection_edge()
-    assert dropped not in edges, "an artifact git can no longer report on kept its edge"
+    assert dropped in edges, "the durable record that it was already counted was destroyed"
     assert kept in edges, "a still-visible, still-dirty artifact lost its live edge"
+    assert "draft.md" not in cache, "a stat shortcut survived a window nobody watched"
     assert _totals(coordinator, dropped) == before, "silence was read as an outcome"
 
 
@@ -2067,13 +2072,47 @@ def test_an_artifact_back_in_view_unchanged_is_not_counted_a_second_time(
     assert _totals(coordinator, flickering) == {"foreign": 1}
 
 
+def test_a_restart_while_invisible_does_not_count_the_same_divergence_twice(
+    two_artifact_coordinator, repo: Path
+) -> None:
+    """The same flicker, across a coordinator restart — the arm the sibling
+    above cannot reach, because it shares one cache the way the sweep loop does.
+
+    The stat cache lives in ``_sweep_loop``'s frame and dies with the process, so
+    after a restart the ONLY thing that can still say "this exact content was
+    already counted" is the durable edge. Clear that edge when the artifact goes
+    out of sight and nothing is left holding the line: one edit, two counts, and
+    an operator sent looking for a second incident that never happened.
+
+    A fresh dict here is not a convenience — it is the restart.
+    """
+    coordinator = two_artifact_coordinator
+    _register(coordinator, "notes.md", "v1\n")
+    flickering = _register(coordinator, "draft.md", "v1\n")
+    (repo / "notes.md").write_text("foreign one\n")
+    (repo / "draft.md").write_text("foreign two\n")
+    _tick(coordinator, now_unix=1000.0, cache={})
+    assert _totals(coordinator, flickering) == {"foreign": 1}
+
+    _git(repo, "update-index", "--skip-worktree", "draft.md")
+    _tick(coordinator, now_unix=1001.0, cache={})
+    _git(repo, "update-index", "--no-skip-worktree", "draft.md")
+    _tick(coordinator, now_unix=1002.0, cache={})  # a new process, an empty cache
+
+    assert _totals(coordinator, flickering) == {"foreign": 1}, (
+        "one divergence was counted twice because a restart emptied the only "
+        "suppressor left standing"
+    )
+
+
 def test_an_emptied_visible_set_still_evicts_every_edge_before_it_returns(
     coordinator, repo: Path
 ) -> None:
-    """The ordering, pinned. U4's eviction runs BEFORE U3's early return, or an
-    all-invisible workspace keeps a stale edge on every artifact it holds — the
-    one tick shape where every edge goes stale at once and no later tick ever
-    reaches the release pass to clear it.
+    """The ordering, pinned. The shortcut drop runs BEFORE the empty-scope
+    return, or the one tick shape where every artifact goes blind at once is
+    also the one shape that keeps every stale shortcut — no later tick reaches
+    the release pass, because this workspace never ticks again until something
+    becomes visible.
     """
     art = _register(coordinator, "notes.md", "v1\n")
     (repo / "notes.md").write_text("foreign\n")
@@ -2082,9 +2121,11 @@ def test_an_emptied_visible_set_still_evicts_every_edge_before_it_returns(
 
     _git(repo, "update-index", "--skip-worktree", "notes.md")
     faults: set[str] = set()
-    assert _tick(coordinator, now_unix=1001.0, faults=faults) == 0
+    cache: dict = {"notes.md": ((1, 1), "foreign")}
+    assert _tick(coordinator, now_unix=1001.0, faults=faults, cache=cache) == 0
 
-    assert coordinator.registry.artifacts_with_detection_edge() == set()
+    assert cache == {}, "the all-invisible tick returned before dropping the shortcut"
+    assert coordinator.registry.artifacts_with_detection_edge() == {art}
     # And the pass still took the empty-scope exit: no tick, and the note.
     assert coordinator.registry.detection_runs()[0].tick_count == 1  # only the first
     assert faults == {"no-visible-artifact"}
@@ -2110,10 +2151,13 @@ def test_a_visible_artifact_reconciled_clean_still_has_its_edge_released(
 def test_eviction_mints_no_artifact_row_and_moves_no_canonical_hash(
     coordinator, repo: Path
 ) -> None:
-    """Eviction writes to the detection tables and nowhere else. The pass looks
-    identities up with ``lookup_artifact_id_by_name``, never
-    ``resolve_or_register``, so a name that dropped out of sight cannot mint a
-    row; and healing the comparand a safety check reads is the defect this repo
+    """The visibility boundary touches the caller's dict and nothing else.
+
+    Asserting only that no row was minted would pass vacuously now that the pass
+    makes no registry call at all, so the registry is wrapped and asserted
+    untouched across the tick's boundary work — that is the claim with content:
+    no identity lookup, no edge write, and above all no canonical hash moved,
+    healing the comparand a safety check reads being the defect this repository
     has already shipped three times."""
     art = _register(coordinator, "notes.md", "v1\n")
     (repo / "notes.md").write_text("foreign\n")

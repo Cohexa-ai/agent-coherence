@@ -934,14 +934,9 @@ def _detect(
     visible = set(covered) & _git_visible_names(root, deadline=deadline)
 
     # FIRST, and before either the empty-scope return below or the clean-edge
-    # pass at the bottom. An artifact that has left the visible set can never be
-    # reached by `_release_clean_edges` again — that pass walks `visible` — so
-    # its edge would suppress the first identical edit after it comes back into
-    # view. Handing the clean pass the unnarrowed list instead would assert
-    # cleanliness for names git never reported on, which is inferring clean from
-    # silence: the one inference this instrument exists to refuse. Evicting is
-    # the only direction that neither lies nor leaks.
-    _evict_invisible_edges(registry, covered, visible)
+    # pass at the bottom, because the all-invisible tick returns without
+    # reaching that pass.
+    _forget_invisible_stat_entries(stat_cache, covered, visible)
 
     if covered and not visible:
         # Git answered, and can speak about none of it. The tracked-and-
@@ -1012,50 +1007,46 @@ def _detect(
     return counted
 
 
-def _evict_invisible_edges(
-    registry,
+def _forget_invisible_stat_entries(
+    stat_cache: dict[str, tuple[tuple[int, int], str]],
     covered: list[str],
     visible: set[str],
 ) -> None:
-    """Clear the edge gate for artifacts that have left the visible set.
+    """Forget the stat shortcut for artifacts that have left the visible set.
 
-    The edge gate suppresses a repeat of an observation already counted, and it
-    is cleared by exactly one other path: ``_release_clean_edges``, which walks
-    the VISIBLE set. So an artifact that drops out of that set — git-ignored,
-    removed from the index, marked ``--skip-worktree`` — takes its edge with it
-    and nothing will ever clear it again. The first identical edit after it
-    comes back into view would read as already-counted and go unrecorded.
+    Two suppressors stop one divergence being counted twice, and they make
+    different claims. The durable edge in the detector's own counters table says
+    "this exact content, with this exact outcome, was already counted" — which
+    stays true while the artifact is out of sight, and is the only one of the two
+    that survives a coordinator restart. The ``stat_cache`` says something much
+    weaker: "(size, mtime) has not moved since I last looked, so do not even
+    hash it". That claim is safe only across a window the poll was watching.
 
-    Evicting rather than releasing, and the difference is the whole point. A
-    release asserts the artifact is now CLEAN, which for a name git never
-    reported on would be inferred from silence — the one inference this
-    instrument exists to refuse, and the reason ``_release_clean_edges`` is
-    handed ``visible`` and not ``covered``. Eviction asserts nothing: it says
-    only that the suppressor describes a divergence this pass can no longer
-    speak about, so it must not go on speaking for it.
+    Across a blind window it is not safe, so it is dropped here. A file can be
+    rewritten while invisible in a way that leaves size and mtime untouched, and
+    a surviving cache entry would skip the hash and return before
+    ``record_foreign_write`` is ever consulted.
 
-    Writes to the detection tables and nowhere else. Identities are resolved
-    with ``lookup_artifact_id_by_name``, never ``resolve_or_register``, so a
-    name that fell out of sight cannot mint an artifact row; no canonical hash
-    moves, because healing the comparand a safety check reads is the defect
-    this repository has already shipped three times.
+    The edge is deliberately NOT cleared. Clearing it destroys the only durable
+    record that the divergence was counted, leaving a process-local dict as the
+    sole thing standing between one edit and two counts — so a restart while the
+    artifact was invisible counted it a second time, and a ``lag_suppressed``
+    artifact did so without needing a restart at all, because ``_observe``
+    excludes that outcome from the cache skip by design.
 
-    Scoped to the artifacts that actually carry an edge, so a permanently
-    invisible artifact costs one SELECT per tick and no write at all.
+    What retaining the edge costs is bounded and is not specific to invisibility:
+    an artifact reconciled and then re-diverged to byte-identical content between
+    two observations is not counted again, because the content+outcome key is
+    what identifies a count. That is a property of sampling an interval, and it
+    holds just as much for an artifact that never left the visible set — so
+    clearing the edge here would buy a double count in exchange for repairing one
+    corner of a limitation the instrument accepts everywhere else.
+
+    Touches the caller's dict and nothing else: no registry write, no identity
+    lookup, no canonical hash moved.
     """
-    lost = set(covered) - visible
-    if not lost:
-        return
-    counted_ids = registry.artifacts_with_detection_edge()
-    if not counted_ids:
-        return
-    to_clear = [
-        artifact_id
-        for name in lost
-        if (artifact_id := registry.lookup_artifact_id_by_name(name)) in counted_ids
-    ]
-    if to_clear:
-        registry.clear_detection_edges(to_clear)
+    for name in set(covered) - visible:
+        stat_cache.pop(name, None)
 
 
 def _release_clean_edges(
