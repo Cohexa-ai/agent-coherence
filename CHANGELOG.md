@@ -11,8 +11,10 @@ Alpha — APIs may change before `v1.0`.
 - **Checkpoint pins can now be released through the Python API.**
   A workspace checkpoint over S3 object members places a legal hold on each
   captured version. Those holds outlive lifecycle expiry, version-targeted
-  delete and coordinator teardown, and until now no public verb dropped them,
-  so a bucket accumulated un-expirable versions.
+  delete and coordinator teardown, and until now no public CHECKPOINT-LEVEL
+  verb dropped them — `CoherentObject.release_legal_hold` could clear one
+  version at a time, without the cross-checkpoint check — so a bucket
+  accumulated un-expirable versions.
   `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins one
   checkpoint holds, keeping a hold that another checkpoint in the same
   registry still relies on — that cross-checkpoint scan is what it offers over

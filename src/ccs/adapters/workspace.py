@@ -168,8 +168,10 @@ re-drives pins idempotently (only ``unpinned`` members are attempted).
   Each released member is recorded ``pin_state="released"`` (tier downgraded
   to ``restorable-unpinned`` where it was ``restorable``) BEFORE the substrate
   hold is dropped — a crash between the record and the drop leaves an
-  over-retained version (safe direction) whose next release attempt (any
-  checkpoint) still drops it, never an unbacked ``restorable`` claim.
+  over-retained version (safe direction), never an unbacked ``restorable``
+  claim. A SHARING peer's own release still drops it; where this checkpoint
+  was the sole holder nothing in the product does, and the recovery is
+  ``CoherentObject.release_legal_hold`` on the binding, by version.
 """
 
 from __future__ import annotations
@@ -907,14 +909,18 @@ class WorkspaceVersioner:
 
         A hold SHARED with another checkpoint survives until the LAST holder
         releases: S3's hold is a flag, not a counter, and the cross-checkpoint
-        ``(member_path, native_token)`` scan is the counter. Two bounds on it:
-        the scan walks THIS versioner's registry only — a holder recorded
-        elsewhere is invisible to it — and it cannot, by itself, close the
-        window between that re-check and the substrate drop. That window is
-        covered by CONVERGING rather than by checking harder: after the drop
-        this re-reads, and puts the hold back when a peer claimed it in the
-        gap. A failure to put it back is logged, so the residual is narrowed
-        to that logged case rather than open.
+        ``(member_path, native_token)`` scan is the counter. Two bounds on it. The
+        scan walks THIS versioner's registry only, so a holder recorded
+        elsewhere is invisible to it. And it only ever counts holds this
+        system placed: ``set_legal_hold`` writes ON unconditionally and
+        records nothing about whether a hold was already there, so a hold set
+        by a person or another tool is indistinguishable from one of ours and
+        this verb will drop it.
+
+        Separately from those bounds, the window between the last re-check and
+        the drop is covered by CONVERGING rather than by checking harder:
+        after the drop this re-reads and puts the hold back when a peer
+        claimed it in the gap. A failure to put it back is logged.
 
         Idempotent means REPEAT calls, not concurrent ones: this instance's
         lock does not serialize a second versioner or process releasing the
@@ -1291,8 +1297,8 @@ class WorkspaceVersioner:
         Per ``held`` member, in the fail-closed order: (1) record
         ``pin_state="released"`` — downgrading a ``restorable`` tier to
         ``restorable-unpinned`` in the SAME write, so no instant leaves an
-        unbacked ``restorable`` claim; (2) decrement the checkpoint's pin
-        refcount; (3) for an S3 member, drop the legal hold ONLY when no OTHER
+        unbacked ``restorable`` claim; (2) for an S3 member, drop the legal
+        hold ONLY when no OTHER
         checkpoint still holds a ``held`` pin on the same ``(member_path,
         native_token)`` — the cross-checkpoint scan: a shared hold survives
         until the LAST holder releases (S3's hold is a flag, not a counter;
@@ -1303,9 +1309,18 @@ class WorkspaceVersioner:
         does not serialize it) that recorded ``held`` on the same identity
         since the first scan is seen there and the drop is SKIPPED, failing
         toward over-retention (safe: the new holder's own release drops the
-        hold last-out). A crash between (1) and (3) leaves an over-retained
-        hold — the safe direction — which the sharing peer's own release
-        still drops (its scan sees this row as ``released``).
+        hold last-out); and (3) decrement the checkpoint's pin refcount —
+        LAST, because that write fails closed below zero under a concurrent
+        release, and ordered before the drop it aborted with the row already
+        terminal and the hold still ON.
+
+        A crash between (1) and (2) leaves an over-retained hold — the safe
+        direction. Where a sharing peer exists its own release still drops it
+        (its scan sees this row as ``released``); where this checkpoint was
+        the SOLE holder nothing in the product drops it, and the recovery is
+        :meth:`~ccs.adapters.coherent_object.CoherentObject.release_legal_hold`
+        on the binding, by version — the released row keeps its
+        ``native_token`` for exactly that.
 
         Documented residuals: two checkpoints releasing CONCURRENTLY from
         different processes can each see the other still ``held`` and both
