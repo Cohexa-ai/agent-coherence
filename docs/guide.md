@@ -1477,7 +1477,7 @@ from ccs.diagnose.foreign_writes import read_foreign_write_report
 
 report = read_foreign_write_report(".coherence/state.db")
 
-print(report.state)        # 'not-instrumented' | 'instrumented-zero' | 'counts'
+print(report.state)        # 'not-instrumented' | 'not-coverable' | 'instrumented-zero' | 'counts'
 for artifact, counts in sorted(report.totals.items()):
     print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
 
@@ -1485,6 +1485,7 @@ for run in report.runs:                  # what each coordinator run watched
     print(run.tick_count, "checks over", run.covered_count, "files")
 
 report.covers(started_at, ended_at)      # was that period watched end to end?
+report.uncoverable                       # runs that found no git work tree to watch
 ```
 
 Each file lands in one of three buckets:
@@ -1503,11 +1504,25 @@ plainly:**
 - **Zero is only zero when the detector actually ran.** A store it never ran
   against reports `not-instrumented`, which is a different answer from
   `instrumented-zero`. Turning the sweep off, reading a store from a coordinator
-  that never started one, running where nothing is in scope, or running in a
-  workspace that is not a git repository all give you the first — never a clean
-  bill of health you did not earn. Each run also records how many files were in
-  scope, because watching five hundred and finding nothing is a different result
-  from watching none.
+  that never started one, or running where nothing is in scope all give you the
+  first — never a clean bill of health you did not earn. Each run also records
+  how many files were in scope, because watching five hundred and finding
+  nothing is a different result from watching none.
+- **A workspace that is not a git repository is its own answer.** Detection can
+  only watch a git work tree, and a coordinator rooted outside one — a temp
+  directory, an unpacked archive, a directory nobody ran `git init` in — can
+  never be polled. Once the detector has at least one artifact it already
+  knows and tracks to poll, that store reports `not-coverable`: the detector
+  ran and correctly found nothing it could watch. That is neither a zero nor
+  an outage, and it is kept apart from `not-instrumented` so a healthy
+  instrument is not accused of never having run. `report.uncoverable` lists
+  each coordinator run that found no work tree and when it looked; `covers()`
+  still answers `False` for every span, because nothing was watched. With
+  nothing in scope the detector never reaches git and records nothing, so a
+  store that has never been polled reads `not-instrumented`, exactly as the
+  bullet above says — that precedence is deliberate, and the state reflects
+  what the store retains rather than the latest sweep. A workspace that gains
+  a repository is watched from the next sweep, with no restart.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.

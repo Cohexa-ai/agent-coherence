@@ -8,7 +8,7 @@ The detector counts each newly observed on-disk content once per artifact as
 disk hash it last counted so one unreconciled divergence cannot accumulate a
 count every tick (R15, KTD14). A separate per-run observation row records that
 the detector actually ran (R8, R12, KTD6): mirroring the conflict counters alone
-cannot distinguish "ran and saw nothing" from "never ran", because both tables
+cannot distinguish "ran and saw nothing" from "never ran", because all three tables
 are created on every writer open whether or not the sweep thread exists.
 
 Nothing here enforces: these are counts, and a count denies nothing (R9).
@@ -213,11 +213,15 @@ def _table_names(db: Path) -> set[str]:
         conn.close()
 
 
-def test_a_writer_open_creates_both_tables(tmp_path: Path) -> None:
+def test_a_writer_open_creates_every_table(tmp_path: Path) -> None:
     """Which is why their PRESENCE can never mean the detector ran."""
     db = tmp_path / "state.db"
     SqliteArtifactRegistry(db).close()
-    assert {"foreign_write_counters", "foreign_write_observations"} <= _table_names(db)
+    assert {
+        "foreign_write_counters",
+        "foreign_write_observations",
+        "foreign_write_uncoverable",
+    } <= _table_names(db)
 
 
 def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
@@ -233,6 +237,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
@@ -242,6 +247,7 @@ def test_a_read_only_open_creates_neither_table(tmp_path: Path) -> None:
     tables = _table_names(db)
     assert "foreign_write_counters" not in tables
     assert "foreign_write_observations" not in tables
+    assert "foreign_write_uncoverable" not in tables
 
 
 def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) -> None:
@@ -257,12 +263,14 @@ def test_read_only_handle_tolerates_a_pre_instrumentation_store(tmp_path: Path) 
     conn = sqlite3.connect(db)
     conn.execute("DROP TABLE foreign_write_counters")
     conn.execute("DROP TABLE foreign_write_observations")
+    conn.execute("DROP TABLE foreign_write_uncoverable")
     conn.commit()
     conn.close()
 
     reg = SqliteArtifactRegistry(db, read_only=True)
     assert reg.foreign_write_totals() == {}
     assert reg.detection_runs() == []
+    assert reg.detection_uncoverable() == []
     reg.close()
 
 
@@ -277,13 +285,15 @@ def test_both_backends_expose_the_same_detection_surface() -> None:
         "record_detection_tick",
         "foreign_write_totals",
         "detection_runs",
+        "record_detection_uncoverable",
+        "detection_uncoverable",
     ):
         assert callable(getattr(ArtifactRegistry(), name)), name
         assert hasattr(SqliteArtifactRegistry, name), name
 
 
 def test_detection_writes_touch_no_artifact_row(tmp_path: Path) -> None:
-    """R9 — the detector mutates nothing outside its own two tables. A count
+    """R9 — the detector mutates nothing outside its own detection tables. A count
     against an unregistered artifact id must not seed one."""
     import sqlite3
 
@@ -317,3 +327,66 @@ def test_distinct_counts_are_not_transposed_between_outcomes(registry) -> None:
     assert registry.foreign_write_totals() == {
         art: {"foreign": 1, "mediated": 2, "lag_suppressed": 3}
     }
+
+
+def test_a_second_note_on_the_same_run_id_overwrites_rather_than_raising(registry) -> None:
+    """Both backends must agree: a re-call with no ``close_detection_run``
+    between lands on the same run id and OVERWRITES. In memory that is a dict
+    keyed on run id; in sqlite it is ``ON CONFLICT (run_id) DO UPDATE``, and
+    nothing else reaches that clause — a plain-INSERT mutant survived every
+    other test and raises ``IntegrityError`` on exactly this call. Parametrized
+    over both so the in-memory side is asserted too: a ``dict.setdefault``
+    mutant there (first note wins) survived the whole suite until this ran on
+    the memory backend as well. The first note is asserted BEFORE the second
+    call: a final-state-only check is also satisfied by a mutant that drops the
+    first write and stores the second — and the detector treats "did not raise"
+    as durable, so that mutant would lose a workspace's only note."""
+
+    def notes() -> list[tuple[str, float]]:
+        return [(n.reason, n.observed_at_unix) for n in registry.detection_uncoverable()]
+
+    registry.record_detection_uncoverable("r1", 100.0)
+    assert notes() == [("r1", 100.0)]
+    registry.record_detection_uncoverable("r2", 200.0)  # same run id: no close between
+    assert notes() == [("r2", 200.0)]
+
+
+def test_notes_from_separate_runs_come_back_in_observation_order(registry) -> None:
+    """``detection_uncoverable`` sorts by ``observed_at_unix`` on both backends —
+    not by insertion order and not by run id. Run ids are minted as random
+    UUIDs, so left alone a sort-by-run-id mutant would pass whenever the two
+    happened to sort the wrong way round — about half the runs. Pinning them so
+    that lexical order and insertion order BOTH oppose timestamp order makes
+    either mutant fail every time."""
+    registry._detection_run_id = "0" * 32
+    registry.record_detection_uncoverable("later", 300.0)
+    registry.close_detection_run()
+    registry._detection_run_id = "f" * 32
+    registry.record_detection_uncoverable("earlier", 100.0)
+    assert [n.reason for n in registry.detection_uncoverable()] == ["earlier", "later"]
+
+
+def test_a_writer_handle_raises_on_a_missing_detection_table(tmp_path: Path) -> None:
+    """Kills dropping the ``self._read_only and`` qualifier.
+
+    The tolerance is scoped to a read-only handle on purpose: a writer open
+    CREATES the detection tables, so their absence under one is a fault in the
+    store, not news about its vintage. Returning ``[]`` there would answer a
+    question about the workspace with a lie about the schema — and the mutation
+    that removes the qualifier left all 96 tests in the three foreign-write
+    suites green, because every existing test of this path opens read-only.
+    """
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE foreign_write_uncoverable")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.OperationalError):
+            reg.detection_uncoverable()
+    finally:
+        reg.close()

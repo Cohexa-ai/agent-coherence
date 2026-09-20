@@ -39,7 +39,7 @@ Alpha — APIs may change before `v1.0`.
   records each one as `foreign`, `mediated`, or `lag_suppressed` — the last being a
   mismatch that looked like a write still landing, counted separately so the
   benefit of the doubt is measurable rather than invisible. It never denies,
-  never invalidates, and writes nothing outside its own two tables.
+  never invalidates, and writes nothing outside its own detection tables.
   `ccs.diagnose.foreign_writes.read_foreign_write_report(db_path)` reads it back
   **offline**, raw read-only sqlite against a closed `state.db`.
   The honesty rules are load-bearing and differ from the conflict counters on
@@ -219,6 +219,19 @@ Alpha — APIs may change before `v1.0`.
   test pins that replay against the real build backend, which is why
   `setuptools` joins the `dev` extra: neither a fresh venv nor CI's
   interpreter ships it, so without that the pin would skip everywhere.
+- **The offline foreign-write report no longer accuses a healthy detector of
+  never having run when the workspace is not a git repository.**
+  Detection can only watch a git work tree, and a coordinator rooted outside
+  one — every shipped example spawns over `tempfile.mkdtemp()` — can never be
+  polled. Until now that store read `not-instrumented`, the same answer as a sweep
+  that was switched off or an instrument that failed every tick. Once the
+  detector has at least one artifact it already knows and tracks to poll, it
+  now reads `not-coverable`, a fourth state that ranks below a real observation
+  and above nothing at all, and `report.uncoverable` lists each run that found
+  no work tree. The note is a fact of its own, never an observation row, so
+  `covers()` still answers `False` for a span nothing watched. It is recorded
+  once per time the condition arrives, and again if the workspace becomes a
+  repository and later stops being one. (#207)
 
 ## [0.14.1] - 2026-09-05
 
