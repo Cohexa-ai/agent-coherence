@@ -87,6 +87,8 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     PIN_STATE_UNPINNED,
+    RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NOT_RECORDED,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_TARGET_LOST,
@@ -758,6 +760,43 @@ def _member_line(row: CheckpointMember) -> str:
     return "  ".join(bits)
 
 
+def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
+    """One restored member's summary line (the detail prose rides below it).
+
+    Two observations earn a flag, in the shape ``resumed-from-prior-run``
+    already set: the run put this member back OVER content that differed from
+    the captured state, and the run holds no observation at all. Every other
+    state renders exactly as it did before the observation existed — a member
+    whose leg never reached a write decision must not be made noisier.
+
+    The differing case is annotated whatever the differing content WAS. The
+    engine reads one live state and cannot separate a half-written file from a
+    peer's committed work, so a rule that flagged only the second would be
+    guessing; the flag reports what was seen, and the operator decides.
+    """
+    line = (
+        f"  {outcome.member_path}  outcome={outcome.outcome}  "
+        f"attempts={outcome.attempts}"
+    )
+    if outcome.resumed_from_prior_run:
+        line += "  resumed-from-prior-run"
+    state = outcome.observation.state
+    if state == RESTORE_OBSERVATION_DIFFERS:
+        line += "  overwrote-differing-content"
+        # Only this state MAY carry a pointer; it is not guaranteed to (a
+        # source can land a write without naming a version), so the version is
+        # appended only when there is one rather than printed as an empty
+        # claim. The digest stays off this summary line and in the JSON: 64
+        # hex characters per member would bury the line it rides on.
+        if outcome.observation.pointer is not None:
+            line += f"  overwritten-version={outcome.observation.pointer}"
+    elif state == RESTORE_OBSERVATION_NOT_RECORDED:
+        # An observation the run never made is its own answer, and not a clean
+        # one: silence here would read as "nothing was overwritten".
+        line += "  overwritten-content-not-recorded"
+    return line
+
+
 def _record_payload(record: CheckpointRecord) -> dict[str, Any]:
     return {
         "checkpoint_id": record.checkpoint_id,
@@ -779,6 +818,19 @@ def _outcome_payload(outcome: MemberRestoreOutcome) -> dict[str, Any]:
         "new_native_token": outcome.new_native_token,
         "deleted_at_restore": outcome.deleted_at_restore,
         "resumed_from_prior_run": outcome.resumed_from_prior_run,
+        # Nested, mirroring how the ``registration`` block renders its own
+        # companion dataclass as one keyed object: the three values are read
+        # together and only mean anything together. Flat keys would also put
+        # ``fingerprint`` and a pointer beside ``status``'s member payload
+        # spellings, where they name the CAPTURED digest and token — the same
+        # words for the opposite state. Under this key they unambiguously
+        # describe what the restore overwrote. The block is always present,
+        # so a consumer never has to read its absence as clean.
+        "observation": {
+            "state": outcome.observation.state,
+            "pointer": outcome.observation.pointer,
+            "fingerprint": outcome.observation.fingerprint,
+        },
     }
 
 
@@ -1088,10 +1140,7 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
     print(f"restore of checkpoint {report.checkpoint_id} {report.status.upper()}")
     print("members:")
     for outcome in report.members:
-        line = f"  {outcome.member_path}  outcome={outcome.outcome}  attempts={outcome.attempts}"
-        if outcome.resumed_from_prior_run:
-            line += "  resumed-from-prior-run"
-        print(line)
+        print(_restore_outcome_line(outcome))
         print(f"    {outcome.detail}")
     if report.registration is not None:
         print(

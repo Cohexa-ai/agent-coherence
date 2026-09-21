@@ -27,6 +27,7 @@ Covers, per the plan's Unit-8 scenarios:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -38,12 +39,15 @@ from uuid import uuid4
 import pytest
 
 import ccs
+from ccs.adapters.workspace import MemberRestoreOutcome, RestoreObservation
 from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
     MEMBER_PATH_REFUSED_REASON,
     MemberPathRefused,
     WorkingTreeSource,
+    _outcome_payload,
+    _restore_outcome_line,
 )
 from ccs.cli.workspace import (
     main as workspace_main,
@@ -51,6 +55,13 @@ from ccs.cli.workspace import (
 from ccs.coordinator.registry_protocol import CheckpointMember
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.exceptions import (
+    RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NO_LIVE_STATE,
+    RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+)
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -940,6 +951,199 @@ def test_restore_surfaces_invalidated_peers_and_attempts(
     assert rc == 0
     assert "peers invalidated by registration:" in out
     assert "attempts=" in out
+
+
+# --- restore observation: what the run put the checkpoint back OVER -------------
+
+# The seven keys a consumer written against the pre-observation payload reads.
+# Frozen deliberately: derived from the builder at runtime this set would move
+# its own goalposts, and the rename that breaks a consumer would report green.
+PRE_OBSERVATION_MEMBER_KEYS = frozenset(
+    {
+        "member_path",
+        "outcome",
+        "attempts",
+        "detail",
+        "new_native_token",
+        "deleted_at_restore",
+        "resumed_from_prior_run",
+    }
+)
+
+# Captured from the renderer BEFORE any annotation existed. A member whose leg
+# never reached a write decision must still render exactly these bytes. The
+# forward-only skip is the guaranteed-quiet case: a converged member can be
+# rebuilt from durable state on a later run and then honestly reports an
+# unrecorded observation, so "converged" is not a synonym for "quiet".
+QUIET_MEMBER_LINE = "  actions/deploy  outcome=forward_only_skipped  attempts=0"
+
+# What the restore lands on top of, so the file leg reads a live state that
+# differs from the captured one.
+DISCARDED_BYTES = b"committed by a peer after the capture\n"
+
+
+def _checkpoint_then_diverge(capsys, root: Path) -> str:
+    """Capture ``docs/plan.md`` plus a forward-only member, then overwrite the
+    file — so one member is restored over differing content and the other never
+    reaches a write decision at all."""
+    plan = _seed_file(root)
+    _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "docs/plan.md",
+        "--forward-only",
+        "actions/deploy",
+        "--root",
+        str(root),
+    )
+    ckpt = _checkpoint_id(capsys, root)
+    plan.write_bytes(DISCARDED_BYTES)
+    return ckpt
+
+
+def _members_by_path(out: str) -> dict[str, dict]:
+    return {m["member_path"]: m for m in json.loads(out)["members"]}
+
+
+def test_restore_json_names_the_version_and_digest_the_write_discarded(
+    tmp_path: Path, capsys
+) -> None:
+    """R8: the observation is machine-readable as keyed values — an operator's
+    tooling reads WHICH version was discarded without parsing any prose."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    observation = _members_by_path(out)["docs/plan.md"]["observation"]
+    assert observation["state"] == RESTORE_OBSERVATION_DIFFERS
+    # The pointer is the version that was OVERWRITTEN, reachable as its own
+    # value; the fingerprint is the digest of the bytes the restore replaced.
+    assert isinstance(observation["pointer"], str) and observation["pointer"]
+    assert observation["fingerprint"] == hashlib.sha256(DISCARDED_BYTES).hexdigest()
+
+
+def test_restore_json_keeps_every_pre_observation_member_key(
+    tmp_path: Path, capsys
+) -> None:
+    """A consumer reading only the keys that existed before the observation is
+    unaffected: same names, same meanings."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    member = _members_by_path(out)["docs/plan.md"]
+    assert PRE_OBSERVATION_MEMBER_KEYS <= set(member)
+    assert member["outcome"] == "restored"
+    assert member["attempts"] == 1
+    assert member["new_native_token"] is not None
+    assert member["deleted_at_restore"] is None
+    assert member["resumed_from_prior_run"] is False
+    assert "version-CAS" in member["detail"]
+
+
+def test_restore_leaves_a_quiet_members_human_line_byte_identical(
+    tmp_path: Path, capsys
+) -> None:
+    """A member that attempted no write is not made noisier by this change."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    assert rc == 0
+    assert QUIET_MEMBER_LINE in out.splitlines()
+
+    # ...and this guard can SEE the case it claims to cover: the pinned line
+    # belongs to a member whose observation really is the no-write state, not
+    # one that merely happens to render quietly.
+    _run(capsys, "checkpoint", "cp2", "--file", "docs/plan.md", "--forward-only",
+         "actions/deploy", "--root", str(tmp_path))
+    records = json.loads(_run(capsys, "list", "--json", "--root", str(tmp_path))[1])
+    ckpt2 = next(
+        r["checkpoint_id"] for r in records["checkpoints"] if r["name"] == "cp2"
+    )
+    rc, out, _ = _run(capsys, "restore", ckpt2, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    quiet = _members_by_path(out)["actions/deploy"]["observation"]
+    assert quiet["state"] == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+
+
+def test_restore_human_line_says_it_overwrote_differing_content(
+    tmp_path: Path, capsys
+) -> None:
+    """The operator reads from the run's own report that this restore did not
+    put back a state nothing else had touched."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    assert rc == 0
+    lines = out.splitlines()
+    index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("  docs/plan.md  outcome=restored")
+    )
+    assert "overwrote-differing-content" in lines[index]
+    assert "overwritten-version=" in lines[index]
+    # The detail fragment the engine tests match on is still the NEXT line and
+    # still reads exactly as it did — annotation rides the member line only.
+    assert lines[index + 1] == (
+        "    pinned bytes landed via the detection-guarded version-CAS "
+        "(attempt 1; no-arbiter: adapter-local detection, never substrate "
+        "arbitration)"
+    )
+
+
+def test_resumed_member_reports_an_unrecorded_observation_not_a_clean_one(
+    tmp_path: Path, capsys
+) -> None:
+    """R3: a run that never made the observation says so on every surface —
+    it never reads as the no-write-attempted (quiet) answer."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+    _run(capsys, "restore", ckpt, "--root", str(tmp_path))  # the run that wrote
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    observation = _members_by_path(out)["docs/plan.md"]["observation"]
+    assert observation["state"] == RESTORE_OBSERVATION_NOT_RECORDED
+    assert observation["state"] != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert observation["pointer"] is None
+    assert observation["fingerprint"] is None
+
+    rc, out, _ = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    assert rc == 0
+    line = next(
+        line for line in out.splitlines() if line.startswith("  docs/plan.md")
+    )
+    assert "resumed-from-prior-run" in line
+    assert "overwritten-content-not-recorded" in line
+
+
+def test_object_only_observation_states_render_without_a_pointer() -> None:
+    """``restore`` refuses a checkpoint holding a pending object member before
+    the engine runs, so the two states only an object leg can reach are driven
+    through the payload builder and the line renderer directly."""
+    for state in (
+        RESTORE_OBSERVATION_NO_LIVE_STATE,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    ):
+        outcome = MemberRestoreOutcome(
+            member_path="bucket/key",
+            outcome="restored",
+            attempts=1,
+            detail="synthesized for the renderer",
+            observation=RestoreObservation(state),
+        )
+        payload = _outcome_payload(outcome)
+        assert payload["observation"] == {
+            "state": state,
+            "pointer": None,
+            "fingerprint": None,
+        }
+        # Neither state claims content was discarded, so neither annotates.
+        assert _restore_outcome_line(outcome) == (
+            "  bucket/key  outcome=restored  attempts=1"
+        )
 
 
 # --- duplicate-name disclosure --------------------------------------------------
