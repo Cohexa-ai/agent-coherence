@@ -739,10 +739,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Drive one conditional leg per durable member row under the "
             "termination contract. Absorbing outcomes (conflict / target_lost / "
             "held_unconfirmed) are REPORT content: the restore still concludes "
-            "and the exit code distinguishes a clean restore (0) from a "
-            "concluded-with-absorbed-outcomes one (3). A restore over content "
-            "committed after the capture is reported per member and still "
-            "exits 0 unless the flag below asks for its own code."
+            "and the exit code distinguishes a restore with no such outcome "
+            "(0) from a concluded-with-absorbed-outcomes one (3). Exit 0 is "
+            "not a claim that nothing was overwritten: a restore that put a "
+            "member back over content committed after the capture says so per "
+            "member in the report and still exits 0 unless the flag below "
+            "asks for its own code."
         ),
     )
     p_restore.add_argument("checkpoint_id", help="The persisted checkpoint id.")

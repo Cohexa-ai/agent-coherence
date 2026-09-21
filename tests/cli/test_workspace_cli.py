@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -1493,3 +1494,85 @@ def test_example_default_arm_guarded_only() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Negative control" not in result.stdout
     assert "outcome=restored" in result.stdout
+
+
+# --- the published claim: what a restore promises about post-capture content ----
+#
+# A restore puts captured bytes back OVER whatever is live. The engine reports
+# that; it does not refuse it. Two guide tables carry that claim to anyone
+# deciding whether to trust this verb — the restore outcome table and the CLI
+# exit-code table — and both of them said something weaker before this run's
+# signal existed ("the captured bytes landed via the member's conditional
+# write"; "concluded with every member clean"). These pins are what keep the
+# published text and the behaviour from drifting apart again.
+#
+# Every match runs over WHITESPACE-NORMALIZED guide text. The guide's tables
+# are single very long lines today, but a re-wrap (or an editor's reflow) would
+# defeat a line-wise search while leaving the sentence intact and correct — a
+# false RED — and, worse, a half-deleted sentence could pass a shorter search.
+# Each phrase below is therefore ONE contiguous fragment carrying a whole claim.
+
+_GUIDE_PATH = REPO_ROOT / "docs" / "guide.md"
+
+#: The corrected statements, keyed by what each one promises the reader.
+_GUIDE_RESTORE_CLAIMS: dict[str, str] = {
+    "the restored outcome says what the write landed over": (
+        "over whatever was live at that moment, including content committed "
+        "after the capture; the report below says, per member, what that write "
+        "discarded"
+    ),
+    "restore is not a merge and nothing refuses the write": (
+        "A restore is not a merge, and nothing on this path refuses a write: a "
+        "member whose content moved after the capture is put back over, and "
+        "that later content is gone"
+    ),
+    "exit 0 is not a claim that nothing was overwritten": (
+        "never a claim that nothing was overwritten: a restore that put a "
+        "member back over content committed after the capture also exits `0`, "
+        "and says so per member in the report"
+    ),
+    "exit 4 has a row, and it is opt-in and after the fact": (
+        "the restore concluded clean by the codes above, but at least one "
+        "member's write discarded content the checkpoint did not hold, or the "
+        "run holds no record of what that member's write overwrote"
+    ),
+}
+
+#: Wordings the tables carried while the claim was wrong. A guide that reverts
+#: to one of these has to fail even if the corrected sentence were also present
+#: somewhere — the reader hits the table, not the search.
+_RETIRED_GUIDE_WORDINGS: tuple[str, ...] = (
+    "concluded with every member clean",
+    "| `restored` | the captured bytes landed via the member's conditional write |",
+)
+
+
+def _normalized(text: str) -> str:
+    """Collapse every run of whitespace, so a re-wrapped sentence still matches."""
+    return re.sub(r"\s+", " ", text)
+
+
+@pytest.fixture(scope="module")
+def guide_text() -> str:
+    return _normalized(_GUIDE_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    list(_GUIDE_RESTORE_CLAIMS.values()),
+    ids=list(_GUIDE_RESTORE_CLAIMS),
+)
+def test_guide_states_what_restore_promises(guide_text: str, phrase: str) -> None:
+    """Each corrected table statement is present, wrapping notwithstanding."""
+    assert _normalized(phrase) in guide_text, (
+        "docs/guide.md no longer carries this restore claim.\n"
+        f"missing text: {phrase!r}"
+    )
+
+
+@pytest.mark.parametrize("wording", _RETIRED_GUIDE_WORDINGS)
+def test_guide_does_not_revert_to_the_over_claim(guide_text: str, wording: str) -> None:
+    """The retired wordings never come back — a clean exit is not a clean workspace."""
+    assert _normalized(wording) not in guide_text, (
+        f"docs/guide.md reverted to the over-claiming wording: {wording!r}"
+    )

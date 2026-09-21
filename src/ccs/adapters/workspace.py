@@ -40,7 +40,8 @@ forward-only members (actions/effects with no state to capture).
   read but BEFORE the manifest persists is NOT flagged — the cut itself stays
   internally consistent (every token and fingerprint comes from the capture
   reads) and restore never trusts the flag (every leg re-reads its live
-  comparand), so the residual under-flags the window; it never corrupts the
+  comparand, and RECORDS what that read saw — see the restore ``observation``
+  below), so the residual under-flags the window; it never corrupts the
   manifest (the safe direction).
 - **The window** — ``[window_min, window_max]`` is the min/max of the members'
   capture timestamps (whole-second wall-clock ticks; the skew is DECLARED, not
@@ -90,6 +91,24 @@ conditional leg per DURABLE member row under a TERMINATION CONTRACT:
   exists live is deleted (S3: an unconditional-latest ``delete``, minting a
   marker on a versioned bucket; the pre-delete race window is a documented
   residual).
+- **What restore does NOT promise, and what it reports instead** — restore is
+  not a merge and nothing on this path refuses a write: a member whose content
+  moved after the capture is put back OVER, and that later content is gone.
+  What the engine promises is that the run SAYS so. Each leg's comparand read
+  is also recorded, as a :class:`RestoreObservation` on that member's outcome
+  (``state`` / ``pointer`` / ``fingerprint``, from the closed
+  :data:`~ccs.core.exceptions.RESTORE_OBSERVATION_STATES` vocabulary):
+  ``observed_differs`` (a live state was read, it differed, and the write
+  discarded it — the ONLY state carrying the pointer to the version
+  overwritten and a digest of the content overwritten), ``no_live_state``
+  (create-on-absent; nothing discarded), ``present_not_comparable`` (the
+  delete leg's probe established live state EXISTED and destroyed it without
+  reading a comparand to name it by), ``no_write_attempted`` (no write
+  decision was reached — the default), and ``not_recorded`` (this run holds no
+  observation at all; never clean). The values ride the read each leg was
+  ALREADY making — no second substrate call — so the split-comparand rule
+  stands: on the S3 leg the ETag remains the comparand and is never recorded,
+  the versionId is the pointer.
 
 **Registration (WV Unit 5 / R4–R5)** — after every member is terminal and
 before ``concluded``, :meth:`WorkspaceVersioner._registration_seam` registers
