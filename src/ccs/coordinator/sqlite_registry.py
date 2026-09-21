@@ -4493,6 +4493,23 @@ class SqliteArtifactRegistry:
         more recent fact about the world. The WHERE clause makes the
         update conditional on excluded.preempted_at_unix_ts being strictly
         greater than the existing row's.
+
+        WHY THIS STAYS STRICT WHILE NODE'S IS `>=`. The Node coordinator
+        relaxed the identical guard to `>=` (plugin PR #152). Not a parity
+        drift to reconcile -- the two backends feed this comparison different
+        clocks. Node stamps `Math.floor(Date.now() / 1000)`, so two
+        preemptions of one (victim, artifact) pair inside the same second tie
+        exactly, and a strict `>` there declines the second and leaves the row
+        naming a session that no longer holds the grant. Here the caller
+        passes float `time.time()`, so two preemptions arriving on separate
+        requests do not produce an equal timestamp and the strict form does
+        what this docstring says it does.
+
+        The tripwire is the clock, not the operator. If anything ever floors
+        or coarsens the timestamps this method is handed, Python inherits
+        Node's bug and this guard must move to `>=` with it. No fixture can
+        catch that -- a same-second race is not something the cross-backend
+        corpus can express -- so this comment is the only warning there is.
         """
         self._guard_writable()
         with self._lock:
