@@ -43,6 +43,8 @@ from ccs.adapters.workspace import (
     STRUCTURAL_MEMBER_REFUSAL_REASON,
     BinaryFileMemberRefused,
     CheckpointPersistFailed,
+    MemberRestoreOutcome,
+    RestoreObservation,
     StructuralMemberRefused,
     WorkspaceVersioner,
 )
@@ -54,6 +56,13 @@ from ccs.core.exceptions import (
     PIN_STATE_RELEASED,
     PIN_STATE_UNAVAILABLE,
     PIN_STATE_UNPINNED,
+    RESTORE_MEMBER_OUTCOMES,
+    RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NO_LIVE_STATE,
+    RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    RESTORE_OBSERVATION_STATES,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_CONVERGED,
     RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
@@ -1577,6 +1586,185 @@ def test_service_restore_vocabulary_fails_closed(
     assert record is not None and record.restore_status == RESTORE_STATUS_NONE
     (member,) = registry.get_checkpoint_members(checkpoint_id)
     assert member.restore_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# Restore OBSERVATION vocabulary and type (restore-divergence-signal U1 /
+# R1-R4): what a writing leg SAW, carried beside the unchanged outcome
+# ---------------------------------------------------------------------------
+
+
+def test_default_constructed_outcome_observes_no_write_attempted() -> None:
+    """A member that never reached a write decision is not reported as lost.
+
+    Prevents the conflation the five-state split exists to avoid. The converged,
+    skipped and pre-write absorbing sites all construct the outcome without
+    naming an observation; if the additive field defaulted to ``not_recorded``,
+    every one of them would claim its observation went missing and an operator
+    gate that fires on ``not_recorded`` would fire on a workspace nothing
+    touched. ``no_write_attempted`` is the TRUTH at those sites: nothing was
+    written, so nothing was overwritten.
+    """
+    outcome = MemberRestoreOutcome(
+        member_path="notes/calm.md",
+        outcome=RESTORE_OUTCOME_CONVERGED,
+        attempts=0,
+        detail="live state already matched the manifest",
+    )
+    assert outcome.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert outcome.observation.state != RESTORE_OBSERVATION_NOT_RECORDED
+    # Nothing was observed, so there is nothing to point at — never a sentinel.
+    assert outcome.observation.pointer is None
+    assert outcome.observation.fingerprint is None
+
+
+def test_outcome_rebuilt_from_a_durable_row_observes_not_recorded() -> None:
+    """A terminal reconstructed with no leg having run reports not-recorded.
+
+    The rebuild site has no observation to report: the run that wrote the row is
+    gone and the observation is run-local by decision (no schema column). Taking
+    the field's default here would report ``no_write_attempted``, asserting a
+    fact THIS run never established — the prior run may well have written over a
+    peer's committed content. "Cannot tell" never collapses into clean.
+    """
+    from ccs.coordinator.registry_protocol import CheckpointMember
+
+    row = CheckpointMember(
+        member_path="s3://cfg.json",
+        artifact_id=None,
+        native_token="v1",
+        fingerprint=None,
+        captured_at=1.0,
+        restore_outcome=RESTORE_OUTCOME_RESTORED,
+    )
+
+    rebuilt = WorkspaceVersioner._outcome_from_durable_row(row)
+
+    assert rebuilt.resumed_from_prior_run is True
+    assert rebuilt.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert rebuilt.observation.pointer is None
+    assert rebuilt.observation.fingerprint is None
+
+
+def test_re_restore_of_a_concluded_checkpoint_observes_not_recorded(
+    service: CoordinatorService,
+) -> None:
+    """The report-only second restore claims nothing about what it overwrote.
+
+    End-to-end twin of the rebuild-site unit above: a concluded checkpoint
+    restored again drives no leg at all, so every member's observation is the
+    one state that never reads as clean. Without this arm the rebuild site could
+    be reached only through a private helper, and a caller-facing regression
+    (the report path dropping the explicit state) would go unseen.
+    """
+    client, obj = _s3()
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
+    versioner = _versioner(service)
+    versioner.add_object_member(obj, "cfg.json")
+    checkpoint_id = versioner.checkpoint("twice-observed").record.checkpoint_id
+
+    versioner.restore(checkpoint_id)
+    second = versioner.restore(checkpoint_id)
+
+    assert [m.observation.state for m in second.members] == [
+        RESTORE_OBSERVATION_NOT_RECORDED
+    ]
+
+
+def test_the_five_observation_states_are_distinct_identities() -> None:
+    """Five states, none reachable from another by a substring match.
+
+    Control flow keys off the typed value, never a fragment of prose, so the
+    spellings must not nest: were one state's token a substring of another's, a
+    consumer that reached for ``in`` would silently classify ``not_recorded`` as
+    clean (or the reverse), which is exactly the collapse R3 forbids. Pinned as
+    LITERALS — a set derived from the code under test moves its own goalposts.
+    """
+    states = [
+        RESTORE_OBSERVATION_DIFFERS,
+        RESTORE_OBSERVATION_NO_LIVE_STATE,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        RESTORE_OBSERVATION_NOT_RECORDED,
+    ]
+    assert len(set(states)) == 5  # pairwise distinct, not five aliases
+    assert RESTORE_OBSERVATION_STATES == frozenset(
+        {
+            "observed_differs",
+            "no_live_state",
+            "present_not_comparable",
+            "no_write_attempted",
+            "not_recorded",
+        }
+    )
+    assert len(RESTORE_OBSERVATION_STATES) == 5  # add+remove cannot slip past
+    for one in states:
+        others = [other for other in states if other != one]
+        assert not any(one in other for other in others)
+
+
+def test_restore_member_outcome_vocabulary_is_unchanged() -> None:
+    """The observation is additive: no member outcome token was added.
+
+    The outcome set is validated fail-closed in the coordinator and again at the
+    HTTP boundary, and is pinned by the cross-implementation kit, so growing it
+    is a wire change with three external consequences. Pinned as LITERALS here,
+    never derived from the code under test, with cardinality asserted separately
+    so a same-size add+remove cannot slip past set equality.
+    """
+    assert RESTORE_MEMBER_OUTCOMES == frozenset(
+        {
+            "restored",
+            "converged",
+            "conflict",
+            "held_unconfirmed",
+            "target_lost",
+            "forward_only_skipped",
+        }
+    )
+    assert len(RESTORE_MEMBER_OUTCOMES) == 6
+    # The observation states are their OWN closed set — never merged into the
+    # outcome vocabulary, which is what keeps `restored` meaning `restored`.
+    assert RESTORE_OBSERVATION_STATES.isdisjoint(RESTORE_MEMBER_OUTCOMES)
+
+
+def test_restore_observation_refuses_an_out_of_vocabulary_state() -> None:
+    """An unknown state fails closed at construction, never reads as clean.
+
+    A typo'd or invented state would be classified by no consumer: the gate
+    fires on three named states, so an unrecognised one silently reports clean —
+    the one outcome an honesty field must never produce. Refusing it where it is
+    built is what keeps every consumer's branch total.
+    """
+    with pytest.raises(ValueError, match="unknown restore observation state"):
+        RestoreObservation(state="magic")
+
+
+def test_only_the_differs_state_may_carry_a_pointer_or_fingerprint() -> None:
+    """A state that observed no comparand can never name one.
+
+    The delete leg's probe verifies no content and the create-on-absent path
+    discards nothing, so neither has a pointer or fingerprint to report; a
+    rebuilt or never-attempted member has no read at all. Letting one of them
+    carry values would over-claim — an operator reading a version number would
+    believe the run compared content it never saw.
+    """
+    for state in (
+        RESTORE_OBSERVATION_NO_LIVE_STATE,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        RESTORE_OBSERVATION_NOT_RECORDED,
+    ):
+        with pytest.raises(ValueError, match="observed no comparand"):
+            RestoreObservation(state=state, pointer="7")
+        with pytest.raises(ValueError, match="observed no comparand"):
+            RestoreObservation(state=state, fingerprint="deadbeef")
+    # The one state that DID read a comparand carries both halves (KTD5: a
+    # pointer and a content fingerprint, from the read that fed the CAS).
+    observed = RestoreObservation(
+        state=RESTORE_OBSERVATION_DIFFERS, pointer="7", fingerprint="deadbeef"
+    )
+    assert (observed.pointer, observed.fingerprint) == ("7", "deadbeef")
 
 
 # ===========================================================================

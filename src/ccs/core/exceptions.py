@@ -895,6 +895,64 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
     RESTORE_SUCCESS_OUTCOMES | RESTORE_ABSORBING_OUTCOMES | RESTORE_HOLD_OUTCOMES
 )
 
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore OBSERVATION vocabulary (restore-divergence
+# signal / R1-R3)
+# ---------------------------------------------------------------------------
+#
+# What a restore leg SAW of the live state immediately before it wrote, carried
+# BESIDE the member outcome (``MemberRestoreOutcome.observation``) and never
+# folded into it: a member restored over a peer's committed content still
+# concludes ``restored``. Wire-stable constants matched by IDENTITY (add, never
+# rename); no token here is a substring of another, because a consumer must
+# never be able to classify one state by matching a fragment of a second.
+#
+# - ``observed_differs`` — the leg read a live state, compared it with the
+#   capture, and they differ: the write discarded content committed after the
+#   capture. This is the ONLY state that carries a pointer and a fingerprint,
+#   both lifted from the read that produced the leg's CAS comparand.
+# - ``no_live_state`` — the leg wrote onto nothing (create-on-absent); nothing
+#   was discarded, so this state is not a divergence.
+# - ``present_not_comparable`` — the leg established that live state EXISTED
+#   but read no comparand for it (the delete leg's presence probe verifies no
+#   content), so it reports the state alone: honest about what it destroyed,
+#   silent about what that content was.
+# - ``no_write_attempted`` — the member reached its terminal without a write
+#   decision (converged, skipped, or absorbed before the write). The DEFAULT,
+#   because it is the truth at every such site.
+# - ``not_recorded`` — no leg ran at all, so this run observed nothing: a
+#   member resumed from a prior run, or a concluded restore rebuilt from its
+#   durable rows. The observation is run-local by decision (no schema column),
+#   so it cannot be recovered — and an observation the run never made is its
+#   own answer, never a clean one. Consumers MUST NOT read it as clean.
+RESTORE_OBSERVATION_DIFFERS = "observed_differs"
+RESTORE_OBSERVATION_NO_LIVE_STATE = "no_live_state"
+RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE = "present_not_comparable"
+RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED = "no_write_attempted"
+RESTORE_OBSERVATION_NOT_RECORDED = "not_recorded"
+
+# The closed set of observation states. DELIBERATELY disjoint from
+# RESTORE_MEMBER_OUTCOMES: the observation is an additive report value and the
+# outcome vocabulary is unchanged, which is what keeps the coordinator's
+# fail-closed check and the cross-implementation kit green with no edits.
+RESTORE_OBSERVATION_STATES: frozenset[str] = frozenset(
+    {
+        RESTORE_OBSERVATION_DIFFERS,
+        RESTORE_OBSERVATION_NO_LIVE_STATE,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        RESTORE_OBSERVATION_NOT_RECORDED,
+    }
+)
+
+# The states that observed NO comparand, so they can never name a pointer or a
+# fingerprint: three never read one, and the delete leg's probe read presence
+# only. Enforced at construction — a state carrying values it never observed
+# would tell an operator the run compared content it never saw.
+RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND: frozenset[str] = (
+    RESTORE_OBSERVATION_STATES - {RESTORE_OBSERVATION_DIFFERS}
+)
+
 # Checkpoint-level restore status (the ``CheckpointRecord.restore_status``
 # vocabulary — the registry stores the string, THIS is its meaning). Kept
 # deliberately small: ``none`` (never restored) → ``in_progress`` (a restore

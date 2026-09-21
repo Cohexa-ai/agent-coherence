@@ -198,6 +198,10 @@ from ccs.core.exceptions import (
     PIN_STATE_UNAVAILABLE,
     PIN_STATE_UNPINNED,
     RESTORE_MEMBER_OUTCOMES,
+    RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_STATES,
+    RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_CONVERGED,
     RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
@@ -243,6 +247,9 @@ __all__ = [
     "FileRestoreTarget",
     "MAX_RESTORE_LEG_REDRIVES",
     "MemberRestoreOutcome",
+    "OBSERVATION_NO_WRITE_ATTEMPTED",
+    "OBSERVATION_NOT_RECORDED",
+    "RestoreObservation",
     "RestoreRegistration",
     "STRUCTURAL_MEMBER_REFUSAL_REASON",
     "StructuralMemberRefused",
@@ -592,6 +599,63 @@ class _Observation:
 
 
 @dataclass(frozen=True)
+class RestoreObservation:
+    """What ONE restore leg saw of the live state immediately before it wrote.
+
+    An additive REPORT value carried beside the member outcome — the outcome
+    vocabulary is unchanged, so a member restored over content committed after
+    the capture still concludes ``restored``. ``state`` is one of the closed
+    :data:`~ccs.core.exceptions.RESTORE_OBSERVATION_STATES`, matched by IDENTITY
+    (never a substring of any ``detail`` line). ``pointer`` (the live restore
+    pointer the leg read) and ``fingerprint`` (that state's content digest) are
+    lifted from the SAME read that produced the leg's CAS comparand, so no
+    second read is ever issued to populate them — and both stay ``None`` on
+    every state that read no comparand, which construction enforces rather than
+    documents.
+
+    NEVER a comparand: nothing downstream may seed a CAS, an If-Match or a
+    pinned read from a value recorded here. It describes what the leg
+    overwrote, not what the next write may overwrite.
+    """
+
+    state: str
+    pointer: str | None = None
+    fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        # Fail closed on an unclassifiable state: every consumer branches on a
+        # named state, so an unrecognised one would fall through every arm and
+        # be read as clean — the one answer an honesty field must never give.
+        if self.state not in RESTORE_OBSERVATION_STATES:
+            raise ValueError(
+                f"unknown restore observation state {self.state!r}; the "
+                f"vocabulary is {sorted(RESTORE_OBSERVATION_STATES)} "
+                "(fail-closed: an unclassifiable state would read as clean)"
+            )
+        if self.state in RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND and (
+            self.pointer is not None or self.fingerprint is not None
+        ):
+            raise ValueError(
+                f"restore observation {self.state!r} observed no comparand, so "
+                "it carries no pointer and no fingerprint (naming one would "
+                "claim content the leg never compared)"
+            )
+
+
+# The two observations no leg's read produces, as shared immutable singletons
+# (frozen, so one instance is safe as a default). They are kept DISTINCT on
+# purpose: ``no_write_attempted`` is a fact this run established (the member
+# converged, was skipped, or was absorbed before any write), while
+# ``not_recorded`` is the absence of a fact — this run drove no leg at all.
+OBSERVATION_NO_WRITE_ATTEMPTED: Final = RestoreObservation(
+    state=RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+)
+OBSERVATION_NOT_RECORDED: Final = RestoreObservation(
+    state=RESTORE_OBSERVATION_NOT_RECORDED
+)
+
+
+@dataclass(frozen=True)
 class MemberRestoreOutcome:
     """One member's TERMINAL restore outcome — the termination contract's unit.
 
@@ -605,6 +669,15 @@ class MemberRestoreOutcome:
     is recorded via ``deleted_at_restore``, its marker id is never a content
     pointer). ``resumed_from_prior_run`` marks a member whose terminal outcome
     a crashed run already recorded durably: reported, never re-driven.
+
+    ``observation`` is what the leg SAW of the live state before writing (see
+    :class:`RestoreObservation`) — additive, run-local, and never a comparand.
+    It defaults to the no-write-attempted state, which is the truth at every
+    converged, skipped and pre-write absorbing site: a member that never
+    reached a write decision must not be reported as one whose observation was
+    lost. The one site that reconstructs a terminal with no leg having run
+    (:meth:`WorkspaceVersioner._outcome_from_durable_row`) sets ``not_recorded``
+    explicitly.
     """
 
     member_path: str
@@ -614,6 +687,7 @@ class MemberRestoreOutcome:
     new_native_token: str | None = None
     deleted_at_restore: float | None = None
     resumed_from_prior_run: bool = False
+    observation: RestoreObservation = OBSERVATION_NO_WRITE_ATTEMPTED
 
 
 @dataclass(frozen=True)
@@ -2455,6 +2529,11 @@ class WorkspaceVersioner:
             ),
             deleted_at_restore=row.deleted_at_restore,
             resumed_from_prior_run=True,
+            # No leg ran in THIS run, and the observation is run-local (it is
+            # not a manifest column), so nothing about what the prior run
+            # overwrote is recoverable here. Say so rather than defaulting to
+            # no-write-attempted, which would assert a fact never established.
+            observation=OBSERVATION_NOT_RECORDED,
         )
 
     def _report_from_durable_rows(
