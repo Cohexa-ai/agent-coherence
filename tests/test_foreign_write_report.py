@@ -363,3 +363,34 @@ def test_report_state_never_contradicts_covers(tmp_path: Path) -> None:
     assert report.covers(100.0, 1000.0) is True
     assert report.instrumented is True
     assert report.state == INSTRUMENTED_ZERO
+
+
+def test_two_reason_tokens_coexist_in_one_store_with_no_reader_change(
+    tmp_path: Path,
+) -> None:
+    """R7, from the reader's side. The detector grew a SECOND uncoverable
+    condition — a workspace git can poll but whose registered artifacts it can
+    speak about none of — and that cost the report no state, no column, no
+    migration and no frozen set of tokens.
+
+    The proof is a store holding both: each note reaches the operator under its
+    own token and in its own right, because ``UncoverableRun.reason`` is
+    reported rather than interpreted. A reader that classified the token would
+    have had to be taught the second one, and until it was it would have shown
+    the operator a note with the reason removed.
+    """
+    db = tmp_path / "state.db"
+    reg = SqliteArtifactRegistry(db)
+    reg.record_detection_uncoverable("no-git-work-tree", 100.0)
+    reg.close_detection_run()
+    reg.record_detection_uncoverable("no-git-visible-artifact", 200.0)
+    reg.close()
+
+    report = read_foreign_write_report(db)
+    assert report.state == NOT_COVERABLE
+    assert report.instrumented is False
+    assert [(u.reason, u.observed_at_unix) for u in report.uncoverable] == [
+        ("no-git-work-tree", 100.0),
+        ("no-git-visible-artifact", 200.0),
+    ]
+    assert len({u.run_id for u in report.uncoverable}) == 2

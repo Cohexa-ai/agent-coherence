@@ -233,6 +233,36 @@ Alpha — APIs may change before `v1.0`.
   once per time the condition arrives, and again if the workspace becomes a
   repository and later stops being one. (#207)
 
+- **The coverage number in an offline foreign-write report now counts only the
+  files git could report on.** Every recorded check claims a number of files in
+  scope, and the poll behind it runs with `--untracked-files=no`: a file the
+  coordinator knows and the tracked patterns name, but that nobody ever added
+  to git — or that an exclude rule, `--skip-worktree` or `--assume-unchanged`
+  hides — is reported clean on every tick for the life of the workspace.
+  Counting it as watched manufactured exactly the quiet month this instrument
+  exists to refuse. The claimed count, the observation loop and the clean-edge
+  release now run over that one narrowed population rather than three
+  overlapping ones. The number is therefore a subset of the files the
+  coordinator knows and the patterns track, and a check narrowed to only some
+  of them carries no separate signal anywhere in the report — the count can no
+  longer be reconciled against the tracked patterns the way it could before.
+
+  A workspace whose files are *all* invisible to git would otherwise trade a
+  wrong number for a worse silence: nothing is recorded, and a store with no
+  observation rows reads `not-instrumented`, the same answer a sweep that was
+  switched off gives. Such a pass now records an uncoverable note of its own,
+  under the reason `no-git-visible-artifact` beside the existing
+  `no-git-work-tree`, latched separately because a workspace like that
+  completes its poll every tick and would otherwise write one note per sweep.
+  The note lifts `report.state` to `not-coverable` only for a store holding no
+  observation rows at all; where a run row already exists those runs outrank
+  it, and the signal is read from `report.uncoverable` instead. `covers()`
+  answers `False` across such a stretch either way. The reason is an opaque
+  token the reader reports rather than interprets, so it needs no migration and
+  no reader change. Files deliberately kept out of git are outside the
+  instrument by design and need no fixing; where coverage is wanted, the
+  tracked set has to name files git tracks.
+
 ## [0.14.1] - 2026-09-05
 
 **Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.

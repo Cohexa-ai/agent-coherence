@@ -1482,10 +1482,11 @@ for artifact, counts in sorted(report.totals.items()):
     print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
 
 for run in report.runs:                  # what each coordinator run watched
+    # covered_count is the files git could report on, not every file you track
     print(run.tick_count, "checks over", run.covered_count, "files")
 
 report.covers(started_at, ended_at)      # was that period watched end to end?
-report.uncoverable                       # runs that found no git work tree to watch
+report.uncoverable                       # runs that found nothing to watch
 ```
 
 Each file lands in one of three buckets:
@@ -1507,22 +1508,42 @@ plainly:**
   that never started one, or running where nothing is in scope all give you the
   first — never a clean bill of health you did not earn. Each run also records
   how many files were in scope, because watching five hundred and finding
-  nothing is a different result from watching none.
-- **A workspace that is not a git repository is its own answer.** Detection can
+  nothing is a different result from watching none. That number counts only the
+  files git could actually report on: one your patterns name and the coordinator
+  knows, but that nobody has added to git, is not among them, because a check
+  that can never see a file must not be counted as having watched it. Read it as
+  the widest scope that run ever watched, not the scope of its last check — a
+  run whose visible files fall away keeps reporting the larger number, and the
+  run is not split when that happens. The count is therefore a subset of the
+  files you asked to have tracked, and a check that could see only some of them
+  leaves no separate mark anywhere in the report, so the report alone will not
+  tell you how far the two have drifted apart.
+- **A workspace the detector cannot watch is its own answer.** Detection can
   only watch a git work tree, and a coordinator rooted outside one — a temp
   directory, an unpacked archive, a directory nobody ran `git init` in — can
-  never be polled. Once the detector has at least one artifact it already
-  knows and tracks to poll, that store reports `not-coverable`: the detector
-  ran and correctly found nothing it could watch. That is neither a zero nor
-  an outage, and it is kept apart from `not-instrumented` so a healthy
-  instrument is not accused of never having run. `report.uncoverable` lists
-  each coordinator run that found no work tree and when it looked; `covers()`
-  still answers `False` for every span, because nothing was watched. With
-  nothing in scope the detector never reaches git and records nothing, so a
-  store that has never been polled reads `not-instrumented`, exactly as the
-  bullet above says — that precedence is deliberate, and the state reflects
+  never be polled. There is a second way to arrive at the same nothing: a real
+  repository in which none of the files the coordinator knows and tracks are
+  files git tracks, so git answers and has nothing to say about any of them.
+  Either way, once the detector has at least one artifact it already knows and
+  tracks, it writes a note that it looked and found nothing it could watch, and
+  records no check for that sweep. `report.uncoverable` lists each such run,
+  why it could watch nothing, and when it looked. That note leads the report —
+  the state you read is `not-coverable` — only in a store that never recorded a
+  check; where an earlier run did record checks, those runs lead instead and
+  the note is read from `report.uncoverable`. Read it there whatever the state
+  says. `not-coverable` is neither a zero nor an outage — the detector ran and
+  correctly found nothing it could watch — and it is kept apart from
+  `not-instrumented` so a healthy instrument is not accused of never having
+  run. `covers()` is untouched by either condition: it walks recorded checks
+  alone, so a span in which nothing was watched still answers `False`. With
+  nothing in scope at all the detector never reaches git and records nothing,
+  so a store that has never been polled reads `not-instrumented`, exactly as
+  the bullet above says — that precedence is deliberate, and the state reflects
   what the store retains rather than the latest sweep. A workspace that gains
-  a repository is watched from the next sweep, with no restart.
+  a repository is watched from the next sweep, with no restart, and so is one
+  whose files reach git's index. Files you deliberately keep out of git are
+  outside the instrument by design and need no fixing; where you do want them
+  watched, the tracked set has to name files git tracks.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
@@ -1546,9 +1567,12 @@ plainly:**
   `covers` whether the period you care about was actually watched end to end.
   A stretch in which nothing at all was in scope — because the tracked set was
   emptied and later restored, say — ends the watched period too, so `covers`
-  reports it as a gap rather than reading across it. Narrowing the set to a
-  smaller one does not: those files were still being watched. And a stretch in
-  which the check did not run at all, because the machine was asleep or the
+  reports it as a gap rather than reading across it. So does a stretch in which
+  git could report on none of the files in scope, because they were never added
+  or an exclude rule hides them: the tracked set was not empty, but nothing in
+  it was being watched. Narrowing the set to a smaller one git can still speak
+  about does not: those files were still being watched. And a stretch in which
+  the check did not run at all, because the machine was asleep or the
   coordinator was stalled, ends it as well.
 - **Attribution is by file only.** A change on disk carries no author, so the
   report names what changed and never who changed it.

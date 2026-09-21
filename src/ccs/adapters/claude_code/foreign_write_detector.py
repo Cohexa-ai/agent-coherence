@@ -131,14 +131,66 @@ _GIT_REDIRECT_VARS = (
     "GIT_NAMESPACE",
 )
 
-# The one poll fault reported once rather than per tick. A key rather than a
-# bare bool so the caller holds one latch whatever else later joins it.
+# The ONLY `git ls-files -v` tags `git status --untracked-files=no` provably
+# cannot report a WORKTREE change for. `S` is skip-worktree: git is told to
+# treat the worktree entry as matching the index, so status diffs it never. A
+# LOWERCASE tag is the assume-unchanged bit, which buys the same silence by a
+# different mechanism. Both were established by mutating the file and watching
+# the poll stay quiet, not by reading the manual.
+#
+# They are NOT blind in general, and the narrower claim is the load-bearing one:
+# an entry whose INDEX already differs from HEAD when the bit is set is still
+# reported, as a `1 M.` record. Dropping such a name here would lose a write the
+# poll can see, so the union at the call site re-admits anything `dirty` names
+# and this set only ever decides a name the poll stayed silent about.
+#
+# Every other tag is RETAINED, including `M` (unmerged, which the poll reports
+# as a `u` record the shipped parser keeps deliberately) and any tag a later git
+# emits that this module has never seen. An allowlist of known-good tags would
+# instead drop every artifact in the repository for the whole of every merge
+# conflict, and would go blind again the day git grows a letter — so the
+# fail-closed direction here is the one that keeps an artifact in scope.
+_STATUS_BLIND_TAGS = frozenset({"S"})
+
+# The slice of a tick's budget held back for the visibility read. Both git calls
+# share one deadline and the status poll runs first, so without a reserve a slow
+# poll can spend the whole budget and leave the second call raising on an
+# already-expired deadline. That discards the tick — honest, but it turns a slow
+# repository into an instrument that records nothing, which is the reading the
+# four states exist to keep apart from a healthy detector. Capped as a FRACTION
+# as well as an absolute, so a deployment that shortens the sweep interval does
+# not hand most of the budget to the reserve.
+_VISIBILITY_RESERVE_SEC = 1.0
+_VISIBILITY_RESERVE_FRACTION = 0.2
+
+# The poll faults reported once rather than per tick. Keys rather than bare
+# bools so the caller holds one latch whatever else later joins them.
 _FAULT_NOT_A_REPOSITORY = "not-a-git-repository"
 
+# The second such latch, and it needs its OWN re-arm condition rather than
+# sharing the poll's. The no-work-tree condition fails its poll every tick, so
+# "a completed poll" is evidence the condition lifted; this one COMPLETES its
+# poll every tick and still has nothing to watch, so re-arming on that would
+# write one note per sweep interval forever. It re-arms only on a completed
+# poll whose visible set is non-empty — see ``_detect``.
+_FAULT_NO_VISIBLE_SCOPE = "no-visible-artifact"
+
 # What the OFFLINE report is told when the poll can never read this workspace.
-# An opaque stable token, not a message: written here and read back across a
+# Opaque stable tokens, not messages: written here and read back across a
 # process and a release boundary by ``ccs.diagnose.foreign_writes``.
+#
+# Two conditions, two tokens, and deliberately no frozen set on either side.
+# ``UncoverableRun.reason`` is documented as reported rather than interpreted,
+# so a second token needs no reader change, no stored column and no migration —
+# and a token a later release invents still reaches the operator through a
+# report that has never heard of it.
 _REASON_NO_WORK_TREE = "no-git-work-tree"
+
+# No repository is missing here and no poll failed: git ran, answered, and can
+# speak about NONE of the artifacts this workspace registered and tracks. A
+# distinct token because it is a distinct fact with a distinct remedy — an
+# operator fixes this by tracking the files in git, not by finding a repository.
+_REASON_NO_VISIBLE_SCOPE = "no-git-visible-artifact"
 
 # The CEILING on how long the repository walk may take. A handful of `lstat`
 # calls is microseconds whenever the filesystem answers at all; the bound is for
@@ -243,19 +295,29 @@ def _poll_env() -> dict[str, str]:
     return env
 
 
-def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[str]:
+def _git_dirty_paths(root: Path, names: list[str], *, deadline: float) -> set[str]:
     """Return the subset of ``names`` git reports as dirty in ``root``.
 
-    ``budget_sec`` bounds the WHOLE poll, not each batch. A per-batch timeout
-    lets a large path list stall the sweep thread for the sum of its batches,
-    and detection runs in the same loop as grant reclamation — so an instrument
-    that overruns delays the next tick's safety work. Exhausting the budget
-    raises, which correctly leaves the tick unrecorded.
+    ``deadline`` is a monotonic INSTANT, not a duration, and the caller mints
+    exactly one of them per tick. That is the whole mechanism by which the
+    budget bounds the tick rather than each helper: a second git call handed a
+    copied duration would mint a second full budget, and one tick could run for
+    twice ``poll_budget_sec`` on the sweep thread that also reclaims grants and
+    reaps dead sessions. The same reasoning rules out a per-batch timeout, which
+    would let a large path list stall that thread for the sum of its batches.
+    Exhausting the deadline raises, which correctly leaves the tick unrecorded.
 
-    ``-c status.relativePaths=true`` is forced rather than assumed: porcelain
-    v2 honours that setting, so a checkout configured otherwise would return
-    repository-root-relative paths while the registry holds coordinator-root
-    ones, and the two would never intersect — a silent permanent zero.
+    ``-c status.relativePaths=true`` is forced but does NOT decide the shape,
+    and the difference matters to anyone reasoning about which names come back.
+    ``-z`` makes that setting inert: under it porcelain v2 emits names relative
+    to the REPOSITORY TOP whatever the configuration says. The flag is kept as
+    a belt against a future that drops ``-z``, not as the thing aligning the
+    shapes. What aligns them is that the coordinator root is normally the
+    repository top, where top-relative and root-relative are the same string;
+    a coordinator rooted below the top gets names the registry never matches,
+    which is a limitation of this pass rather than a property of the flag.
+    ``_git_visible_names`` passes ``--full-name`` for exactly this reason — to
+    hold the index read to the top-relative shape this call emits.
 
     Any non-zero exit raises. The shipped ``_git`` helper maps a clean non-zero
     exit to the same value as an empty result, which is right for "am I in a
@@ -264,13 +326,10 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
     """
     dirty: set[str] = set()
     env = _poll_env()
-    deadline = time.monotonic() + budget_sec
     for batch in _batched_pathspecs(names):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise GitPollError(
-                f"git poll exceeded its {budget_sec:.1f}s budget in {root}"
-            )
+            raise GitPollError(f"git poll exceeded its budget in {root}")
         try:
             result = subprocess.run(
                 [
@@ -313,6 +372,69 @@ def _git_dirty_paths(root: Path, names: list[str], *, budget_sec: float) -> set[
             raise GitPollError(message)
         dirty.update(_parse_porcelain_v2(result.stdout.decode("utf-8", "replace")))
     return dirty
+
+
+def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
+    """Return every name in ``root``'s index that the status poll can report on.
+
+    The pass claims coverage of what it polls, and the poll runs with
+    ``--untracked-files=no``. A registered artifact git never tracked, or one an
+    exclude rule hides, is therefore reported clean on every tick forever;
+    counting it as covered manufactures the quiet month this whole module exists
+    to refuse. So the claimed scope has to be intersected with what git can
+    speak about at all, and this is the read that says which names those are.
+
+    ONE invocation over the whole index, with NO pathspecs. That is not an
+    optimisation. Handing it the stored names would reinstate pathspec magic on
+    data, let one out-of-repo name fail an entire batch, let a registered
+    directory name match its children instead of itself, and drag the argv
+    batching along with all three. None of it can happen to a command that takes
+    no paths at all.
+
+    ``--full-name`` is required for the opposite reason to the obvious one.
+    Without it ``ls-files`` prints names relative to the invocation directory;
+    with it they are pinned to the repository top — the shape porcelain v2
+    already emits, and the shape the registry holds, so the two intersect. The
+    poll's ``-c status.relativePaths=true`` is deliberately NOT copied across:
+    ``ls-files`` does not honour it, so it would read as a pin while pinning
+    nothing, and a name shape this code compares must never be inherited.
+
+    Any non-zero exit RAISES, for the same reason the poll's does and one more.
+    An empty visible set is about to mean "nothing here can be watched", so
+    returning it for a read that failed would hand out that verdict on no
+    evidence — a swallowed error reading as a narrowed scope is the same defect
+    as a swallowed poll reading as a clean tree.
+
+    It never classifies. The exit-128 ``NotAGitRepositoryError`` split, its
+    bounded filesystem walk and its once-per-arrival latch belong to the status
+    poll, which runs FIRST. A second classifier here would make this call the
+    one that meets a non-repository, and put the entire no-work-tree story
+    behind a classifier nothing else has ever exercised.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        # Checked before the spawn, not after: a helper that started git anyway
+        # and let the timeout catch it would still cost a process launch on a
+        # budget that is already gone.
+        raise GitPollError(f"git poll exceeded its budget before ls-files in {root}")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "-v", "--full-name"],
+            check=False,
+            capture_output=True,
+            timeout=remaining,
+            env=_poll_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitPollError(f"git ls-files timed out in {root}") from exc
+    except FileNotFoundError as exc:
+        raise GitPollError("git is not on PATH") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise GitPollError(
+            f"git ls-files exited {result.returncode} in {root}: {stderr[:200]}"
+        )
+    return _parse_ls_files_v(result.stdout.decode("utf-8", "replace"))
 
 
 def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -> bool:
@@ -474,6 +596,35 @@ def _parse_porcelain_v2(payload: str) -> set[str]:
     return paths
 
 
+def _parse_ls_files_v(payload: str) -> set[str]:
+    """Extract the status-visible names from ``git ls-files -z -v`` output.
+
+    Each NUL-separated record is ``<tag> <path>``. Under ``-z`` git applies no
+    quoting and no C-escaping, so the bytes after that first space ARE the name:
+    running an unescape helper over them would corrupt every path holding a
+    space, a quote or a non-ASCII byte into a registry key that matches nothing,
+    and the artifact would drop out of scope with no error anywhere.
+
+    A set, because an unmerged path appears once per index stage — three records
+    naming one artifact.
+
+    Only ``_STATUS_BLIND_TAGS`` and the lowercase assume-unchanged tags are
+    dropped; every other tag is kept, recognised or not. A record carrying no
+    space carries no path either, so there is nothing to keep and it is skipped.
+    """
+    names: set[str] = set()
+    for record in payload.split("\0"):
+        if not record:
+            continue
+        tag, separator, path = record.partition(" ")
+        if not separator or not path:
+            continue
+        if tag in _STATUS_BLIND_TAGS or tag.islower():
+            continue
+        names.add(path)
+    return names
+
+
 def _argv_encodable(name: str) -> bool:
     """Whether ``name`` can reach a subprocess argument list at all.
 
@@ -540,11 +691,17 @@ def _stat_signature(path: Path) -> tuple[int, int] | None:
 
     Used only to skip work: an artifact whose signature has not moved since the
     last observation usually has no new content to count. A missed skip costs
-    one extra read, never a wrong count, so trusting size and modification time
-    here carries none of the risk it would carry on a correctness path.
+    one extra read, so trusting size and modification time is cheap where the
+    alternative is hashing every tracked file on every tick.
 
-    "Usually" is doing real work in that sentence. One outcome is a function of
-    time as well as content — see the cache guard in :func:`_observe`.
+    "Usually" is doing real work in that sentence, in two ways. One outcome is a
+    function of time as well as content — see the cache guard in
+    :func:`_observe`. And the claim is only ever safe across a window the pass
+    was WATCHING: a rewrite that preserves size and mtime is invisible to this
+    fingerprint, so an entry carried across a blind window can suppress a real
+    divergence rather than merely delay a read. Every exit that observed nothing
+    therefore drops the cache before returning — the emptied scope, the
+    invisible scope, the failed poll and the inert workspace.
     """
     try:
         info = os.stat(path)
@@ -618,10 +775,13 @@ def run_detection_pass(
 
     ``reported_faults`` is the caller's too, and holds strictly less: which
     permanent, non-actionable conditions have already been reported for this
-    coordinator, so a workspace that can never be polled says so once instead of
-    once per tick. Nothing reads it but the log, and a completed poll clears it
-    — the latch tracks the condition, so a workspace that later becomes a
-    repository and then is not one again reports the second time too.
+    coordinator, so a workspace that can never be usefully polled says so once
+    instead of once per tick. Nothing reads it but the log. Each latch tracks
+    its own condition and re-arms on its own evidence — a completed poll for
+    the missing repository, a completed poll with a NON-EMPTY visible set for
+    the unwatchable scope — so a workspace that recovers and then relapses
+    reports the second time too, and neither latch can be re-armed by news
+    about the other.
 
     ``tick_clock`` is the caller's third piece and holds one number: when this
     pass last recorded a tick. It is what lets a stall be seen at all — the
@@ -651,14 +811,23 @@ def run_detection_pass(
         # own stdout. No tick is recorded and the interval closes, as for any
         # other failure — and, once per time the condition arrives, a note is
         # written so the offline report can say WHY there are no ticks.
+        # The shortcut goes too, for the reason the emptied scope drops it: this
+        # tick watched nothing, so it can vouch for nothing, and an artifact
+        # rewritten while the workspace was inert can come back with the same
+        # size and mtime. This is the LONGEST blind window the pass has — an
+        # absent repository can stay absent for hours.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         if _FAULT_NOT_A_REPOSITORY not in reported_faults:
             logger.debug("foreign-write detection is inert: %s", exc)
-            if _record_uncoverable(coordinator, now_unix):
+            if _record_uncoverable(coordinator, now_unix, _REASON_NO_WORK_TREE):
                 reported_faults.add(_FAULT_NOT_A_REPOSITORY)
         return 0
     except Exception as exc:  # noqa: BLE001 — an instrument may never break the sweep
         logger.exception("foreign-write detection tick failed: %s", exc)
+        # As above: a tick that failed observed nothing, so every shortcut it
+        # would otherwise carry forward rests on a window nobody watched.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         return 0
 
@@ -680,9 +849,16 @@ def _close_observed_interval(coordinator: DetectionTarget) -> None:
         logger.exception("detection: could not close the observed run interval")
 
 
-def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
-    """Record that this workspace has nothing the poll can ever read, so the
-    OFFLINE report can say so. True once the note is durable.
+def _record_uncoverable(
+    coordinator: DetectionTarget, now_unix: float, reason: str
+) -> bool:
+    """Record that this workspace has nothing the poll can read, so the OFFLINE
+    report can say so. True once the note is durable.
+
+    ``reason`` is the caller's, because there is more than one way to have
+    nothing to watch and the report is meant to say WHICH. It is written
+    through unexamined: the token is the detector's vocabulary, and a guard set
+    here would be a second place to update every time it grows.
 
     Without the row the store reads as not-instrumented — the same answer a
     store gets when the sweep was off or the instrument failed every tick,
@@ -690,9 +866,9 @@ def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
 
     The caller gates this on the latch that also gates the log, and closes the
     latch only on True. Once per transition rather than once per tick because
-    the poll retries every tick and ``_close_observed_interval`` rotates the
-    run id on every failure, so a per-tick record keyed on that id would write
-    one row per sweep interval. And only on True so a store that refuses the
+    the pass retries every tick and ``_close_observed_interval`` rotates the
+    run id before every attempt, so a per-tick record keyed on that id would
+    write one row per sweep interval. And only on True so a store that refuses the
     note — locked, out of disk — is retried on the next tick rather than left
     holding a report that accuses the instrument of never running; that
     failure is a real fault and stays loud. The latch re-arms when a poll
@@ -706,10 +882,12 @@ def _record_uncoverable(coordinator: DetectionTarget, now_unix: float) -> bool:
     watched and a workspace with nothing to watch.
     """
     try:
-        coordinator.registry.record_detection_uncoverable(_REASON_NO_WORK_TREE, now_unix)
+        coordinator.registry.record_detection_uncoverable(reason, now_unix)
         coordinator.registry.close_detection_run()
     except Exception:  # noqa: BLE001 — an instrument may never break the sweep
-        logger.exception("detection: could not record that the workspace has no work tree")
+        logger.exception(
+            "detection: could not record that the workspace is uncoverable (%s)", reason
+        )
         return False
     return True
 
@@ -757,17 +935,100 @@ def _detect(
         # needs no corruption, no mount and no locale to reach — `/policy/track`
         # swaps the tracked set while the coordinator runs, and the shipped
         # untrack command is one way an operator empties it.
+        #
+        # The shortcuts go too. This return never reaches the visibility read,
+        # so nothing below can vouch for them, and an emptied scope is a blind
+        # window exactly like invisibility — an untracked name can be rewritten
+        # while unwatched and come back with the same size and mtime.
+        stat_cache.clear()
         _close_observed_interval(coordinator)
         return 0
 
-    dirty = _git_dirty_paths(root, covered, budget_sec=poll_budget_sec)
+    # Minted once, here, and shared by every git call this tick makes. A helper
+    # handed the DURATION instead would mint a second full budget, letting one
+    # tick run for twice `poll_budget_sec` on the thread that also reclaims
+    # grants and reaps dead sessions.
+    deadline = time.monotonic() + poll_budget_sec
+    # The poll gets the budget minus the visibility read's reserve; the
+    # visibility read then gets whatever is genuinely left, up to the full
+    # deadline. Ordering is unchanged: the poll still runs first and still owns
+    # the not-a-repository classification.
+    reserve = min(_VISIBILITY_RESERVE_SEC, poll_budget_sec * _VISIBILITY_RESERVE_FRACTION)
+    dirty = _git_dirty_paths(root, covered, deadline=deadline - reserve)
     # The poll completed, so whatever this workspace was when the latch was set,
     # it is pollable now: re-arm, and a workspace that stops being a repository
     # again is reported the second time too. Only a completed poll clears it —
     # the early returns above observed nothing about the condition.
     reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
+
+    # The claimed scope, narrowed to what the poll above can actually speak
+    # about. `--untracked-files=no` means a registered artifact git never
+    # tracked — or one an exclude rule, `--skip-worktree` or `--assume-unchanged`
+    # hides — is reported clean on every tick for the life of the workspace, so
+    # counting it as covered manufactures exactly the quiet month this module
+    # exists to refuse.
+    #
+    # The SAME deadline minted above, deliberately, and for the reason stated
+    # there: one budget bounds the whole tick.
+    #
+    # It raises like the poll does, and is not caught here. A visibility read
+    # that failed must never be read as a narrowed scope — that is the poll's
+    # "swallowed error reads as a clean tree" defect wearing a different hat,
+    # and an unrecorded tick is the honest answer to a scope nobody could read.
+    #
+    # `covered` stays bound, for exactly one reason: the check below has to be
+    # able to tell a scope that was non-empty and narrowed to nothing from one
+    # that started empty, and only the unnarrowed name still carries that. It is
+    # NOT what the eviction pass reads — that is keyed off the stat cache, so
+    # that a name which left the scope entirely by an untrack is reachable at
+    # all — nor what the edge release reads, which takes `visible`.
+    # The union is the whole point, and it is not belt-and-braces. The index
+    # read answers "is this name cached in the index", while the question that
+    # matters is "can the poll report on this name" — and those disagree in the
+    # narrowing direction, which is the direction that loses a foreign write.
+    # Measured on git 2.50.1: a path removed with `git rm --cached` but left on
+    # disk, the OLD side of a rename (porcelain emits a `2 R.` record carrying
+    # BOTH paths), and a change staged BEFORE `--skip-worktree` was set are all
+    # reported by the poll and all absent from, or blinded in, the index read.
+    # `dirty` is by construction what the poll just said it can see, so adding
+    # it back admits exactly those and nothing else: a name git never mentions
+    # is absent from `dirty` too, so the narrowing this pass exists for is
+    # untouched.
+    visible = set(covered) & (_git_visible_names(root, deadline=deadline) | dirty)
+
+    # FIRST, and before either the empty-scope return below or the clean-edge
+    # pass at the bottom, because the all-invisible tick returns without
+    # reaching that pass.
+    _forget_invisible_stat_entries(stat_cache, visible)
+
+    if covered and not visible:
+        # Git answered, and can speak about none of it. The tracked-and-
+        # registered set is non-empty — the guard above guarantees that, and the
+        # conjunct is kept as a statement of the precondition rather than as a
+        # live branch — so this is not the empty-scope case that returns above:
+        # it is a workspace whose artifacts are all outside the poll's reach,
+        # which reads as a clean zero forever unless it is written down.
+        #
+        # No tick, and the interval closes, for the reason every other
+        # observed-nothing path does: a run row is read as CONTINUOUSLY
+        # observed, so leaving it open lets the next success stretch it over a
+        # window nothing was polled in.
+        _close_observed_interval(coordinator)
+        if _FAULT_NO_VISIBLE_SCOPE not in reported_faults:
+            logger.debug(
+                "foreign-write detection has nothing git can report on in %s", root
+            )
+            if _record_uncoverable(coordinator, now_unix, _REASON_NO_VISIBLE_SCOPE):
+                reported_faults.add(_FAULT_NO_VISIBLE_SCOPE)
+        return 0
+    # A completed poll that spoke about SOMETHING, which is the only evidence
+    # that lifts this condition. Re-arming on the poll alone — the way the
+    # no-work-tree latch does — would re-arm on every tick of an all-invisible
+    # workspace, because that workspace's poll completes every time.
+    reported_faults.discard(_FAULT_NO_VISIBLE_SCOPE)
+
     counted = 0
-    for name in sorted(dirty & set(covered)):
+    for name in sorted(dirty & visible):
         try:
             counted += _observe(
                 registry,
@@ -783,7 +1044,7 @@ def _detect(
     # An artifact git now reports clean has been reconciled, so the content the
     # edge gate is holding is no longer the current divergence. Leaving it
     # would make an identical later edit look already-counted.
-    _release_clean_edges(registry, covered, dirty, stat_cache)
+    _release_clean_edges(registry, visible, dirty, stat_cache)
 
     # Only now, and only because the poll completed. A tick counted over a
     # failed poll would let the offline report call a broken instrument a quiet
@@ -800,23 +1061,83 @@ def _detect(
     last_tick = tick_clock.get("last_tick_unix")
     if last_tick is not None and (now_unix - last_tick) > max_gap_sec:
         _close_observed_interval(coordinator)
-    registry.record_detection_tick(now_unix, covered_count=len(covered))
+    # The visible set, not the claimed one: the number a report reads has to
+    # describe the same population the observe loop and the edge pass just ran
+    # over, or a coverage question is answered about one scope with a count
+    # taken over another.
+    registry.record_detection_tick(now_unix, covered_count=len(visible))
     tick_clock["last_tick_unix"] = now_unix
     return counted
 
 
+def _forget_invisible_stat_entries(
+    stat_cache: dict[str, tuple[tuple[int, int], str]],
+    visible: set[str],
+) -> None:
+    """Forget the stat shortcut for artifacts that have left the visible set.
+
+    Two suppressors stop one divergence being counted twice, and they make
+    different claims. The durable edge in the detector's own counters table says
+    "this exact content, with this exact outcome, was already counted" — which
+    stays true while the artifact is out of sight, and is the only one of the two
+    that survives a coordinator restart. The ``stat_cache`` says something much
+    weaker: "(size, mtime) has not moved since I last looked, so do not even
+    hash it". That claim is safe only across a window the poll was watching.
+
+    Across a blind window it is not safe, so it is dropped here. A file can be
+    rewritten while invisible in a way that leaves size and mtime untouched, and
+    a surviving cache entry would skip the hash and return before
+    ``record_foreign_write`` is ever consulted.
+
+    The edge is deliberately NOT cleared. Clearing it destroys the only durable
+    record that the divergence was counted, leaving a process-local dict as the
+    sole thing standing between one edit and two counts — so a restart while the
+    artifact was invisible counted it a second time, and a ``lag_suppressed``
+    artifact did so without needing a restart at all, because ``_observe``
+    excludes that outcome from the cache skip by design.
+
+    What retaining the edge costs: an artifact reconciled and then re-diverged to
+    byte-identical content between two observations is not counted again, because
+    the content+outcome key is what identifies a count. The same loss happens to
+    an artifact that never left the visible set, so the class is not specific to
+    invisibility — but the two are not equally bounded, and the difference is
+    worth stating rather than glossing. A visible artifact gets
+    ``_release_clean_edges`` every tick, so its exposure is one interval; an
+    invisible one is never released, so its exposure lasts as long as it stays
+    out of sight. Clearing the edge here would trade a measured double count for
+    a narrower version of a limitation the instrument already accepts, which is
+    why it is not done — not because the two windows are the same size.
+
+    Keyed off the CACHE rather than off the scope. Every entry was written for a
+    name that was visible when it was observed, so anything not visible now is
+    exactly the unsafe set — and a name that left the scope entirely, by an
+    untrack rather than by going invisible, is only reachable this way.
+
+    Touches the caller's dict and nothing else: no registry write, no identity
+    lookup, no canonical hash moved.
+    """
+    for name in set(stat_cache) - visible:
+        stat_cache.pop(name, None)
+
+
 def _release_clean_edges(
     registry,
-    covered: list[str],
+    visible: set[str],
     dirty: set[str],
     stat_cache: dict[str, tuple[tuple[int, int], str]],
 ) -> None:
-    """Clear the edge gate for covered artifacts git now reports clean.
+    """Clear the edge gate for visible artifacts git now reports clean.
 
     Scoped to artifacts that actually carry an edge, which is the small set the
     detector has ever counted — not every clean artifact on every tick.
+
+    ``visible`` and not the whole claimed scope, for the reason the count is
+    narrowed too: an artifact the poll cannot report on is absent from ``dirty``
+    on every tick regardless of its bytes, so reading that absence as "git now
+    reports it clean" would call it reconciled on the strength of a question
+    never asked.
     """
-    clean = set(covered) - dirty
+    clean = visible - dirty
     if not clean:
         return
     for name in clean:
