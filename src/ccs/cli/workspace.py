@@ -74,7 +74,7 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code.lifecycle import _ensure_coherence_dir
@@ -160,9 +160,15 @@ _EXIT3_OUTCOMES = frozenset(
     }
 )
 
-#: The exit-code-4 observation set — CLI-PRIVATE and named for what it decides,
-#: following :data:`_EXIT3_OUTCOMES`. These are the observations that say this
-#: run put a checkpoint back over content the capture did not hold:
+#: The observations that say this run put a checkpoint back over content the
+#: capture did not hold, each mapped to the flag its member's line carries.
+#: CLI-PRIVATE and named for what it decides, following :data:`_EXIT3_OUTCOMES`.
+#:
+#: ONE mapping, two consumers: the exit gate reads its keys and the human render
+#: reads its values. They were two hand-maintained lists once, and a state that
+#: fired the gate without earning a flag was exactly the defect that produced —
+#: an operator handed a non-zero exit whose reason appeared nowhere in the
+#: printed report. Adding a state here cannot now change one without the other.
 #:
 #: - ``observed_differs`` — a live state was read and it differed, so the write
 #:   discarded content committed after the capture;
@@ -175,14 +181,17 @@ _EXIT3_OUTCOMES = frozenset(
 #:   the runs that cannot say what they overwrote.
 #:
 #: ``no_live_state`` wrote onto nothing and ``no_write_attempted`` never
-#: reached a write decision, so neither discarded anything and neither fires.
-_DISCARDED_POST_CAPTURE_OBSERVATIONS = frozenset(
-    {
-        RESTORE_OBSERVATION_DIFFERS,
-        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
-        RESTORE_OBSERVATION_NOT_RECORDED,
-    }
-)
+#: reached a write decision, so neither discarded anything, neither fires the
+#: gate, and neither makes its line noisier.
+_DISCARDED_CONTENT_FLAGS: Mapping[str, str] = {
+    RESTORE_OBSERVATION_DIFFERS: "overwrote-differing-content",
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE: "destroyed-uncompared-content",
+    RESTORE_OBSERVATION_NOT_RECORDED: "overwritten-content-not-recorded",
+}
+
+#: The exit-code-4 observation set, derived so it can never drift from the
+#: flags above.
+_DISCARDED_POST_CAPTURE_OBSERVATIONS = frozenset(_DISCARDED_CONTENT_FLAGS)
 
 #: read_with_version's observe-commit loop bound: a racing second CLI process
 #: can move the ledger between the lookup and the CAS; three attempts absorb
@@ -816,16 +825,13 @@ def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
     """One restored member's summary line (the detail prose rides below it).
 
     Every observation the exit gate fires on earns a flag, in the shape
-    ``resumed-from-prior-run`` already set: the run wrote OVER content that
-    differed from the capture, it destroyed live state without comparing it,
-    or it holds no observation at all. Keeping that set aligned with
-    :data:`_DISCARDED_POST_CAPTURE_OBSERVATIONS` is what stops the flag
-    returning a non-zero exit whose reason appears nowhere in the human report.
-
-    The two states it does not flag are the two the gate does not fire on:
-    a write that landed on nothing discarded nothing, and a member whose leg
-    never reached a write decision must not be made noisier. Both render
-    exactly as they did before the observation existed.
+    ``resumed-from-prior-run`` already set, and it earns it by lookup rather
+    than by a branch: both this render and the gate read
+    :data:`_DISCARDED_CONTENT_FLAGS`, so a state cannot fire one and not the
+    other. The two states absent from that mapping are the two the gate does
+    not fire on — a write that landed on nothing discarded nothing, and a
+    member whose leg never reached a write decision must not be made noisier.
+    Both render exactly as they did before the observation existed.
 
     The differing case is annotated whatever the differing content WAS. The
     engine reads one live state and cannot separate a half-written file from a
@@ -838,26 +844,17 @@ def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
     )
     if outcome.resumed_from_prior_run:
         line += "  resumed-from-prior-run"
-    state = outcome.observation.state
-    if state == RESTORE_OBSERVATION_DIFFERS:
-        line += "  overwrote-differing-content"
-        # Only this state MAY carry a pointer; it is not guaranteed to (a
+    observation = outcome.observation
+    flag = _DISCARDED_CONTENT_FLAGS.get(observation.state)
+    if flag is not None:
+        line += f"  {flag}"
+    if observation.state == RESTORE_OBSERVATION_DIFFERS and observation.pointer is not None:
+        # Only this state MAY carry a pointer, and it is not guaranteed to (a
         # source can land a write without naming a version), so the version is
         # appended only when there is one rather than printed as an empty
         # claim. The digest stays off this summary line and in the JSON: 64
         # hex characters per member would bury the line it rides on.
-        if outcome.observation.pointer is not None:
-            line += f"  overwritten-version={outcome.observation.pointer}"
-    elif state == RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE:
-        # The delete leg's probe established that live state existed and this
-        # run destroyed it, having compared no content — so the flag says
-        # exactly that and names nothing. Silence would leave the gate able to
-        # fail a run for a member whose line looked like every quiet one.
-        line += "  destroyed-uncompared-content"
-    elif state == RESTORE_OBSERVATION_NOT_RECORDED:
-        # An observation the run never made is its own answer, and not a clean
-        # one: silence here would read as "nothing was overwritten".
-        line += "  overwritten-content-not-recorded"
+        line += f"  overwritten-version={observation.pointer}"
     return line
 
 

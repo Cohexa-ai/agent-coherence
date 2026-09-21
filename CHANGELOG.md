@@ -26,18 +26,24 @@ Alpha — APIs may change before `v1.0`.
   comparand to name it by), `no_write_attempted` (the member reached its
   terminal without a write decision), and `not_recorded` — the run holds no
   observation for that member, which is its own answer and never a clean one.
-  The human report appends `overwrote-differing-content`, and
-  `overwritten-version=<pointer>` where the leg named one; under `--json` each
-  member carries a nested `observation` block beside the keys it already had.
-  No second substrate call was added for any of it, and no existing key,
-  outcome name or line changed.
+  The human report flags each member the exit code below can fail a run for —
+  `overwrote-differing-content` with `overwritten-version=<pointer>` where the
+  leg named one, `destroyed-uncompared-content`, or
+  `overwritten-content-not-recorded` — and leaves every other member's line as
+  it was; under `--json` each member carries a nested `observation` block
+  beside the keys it already had. No second substrate call was added for any of
+  it, and no existing key, outcome name or line changed.
   What a restore *does* is deliberately unchanged: nothing refuses, absorbs or
   fences a member on account of this, and a restore is still not a merge. If
   you would rather such a run be a failure,
   `agent-coherence-workspace restore --exit-nonzero-on-discarded-content`
   exits 4 when any member discarded post-capture content or holds no record of
-  what it overwrote. It is opt-in — the same run exits 0 without it — the two
-  existing producers of exit 3 take precedence over it, and it is read after
+  what it overwrote. Because the observation is not persisted, re-running a
+  restore that did write reports no record for those members and exits 4 again
+  whatever the second run found, so the flag answers "did this run discard
+  anything" rather than "is this checkpoint settled" and does not belong in a
+  retry-until-zero loop. It is opt-in — the same run exits 0 without it — the
+  two existing producers of exit 3 take precedence over it, and it is read after
   the engine returns, so it reports the write and cannot prevent it.
 
 - **Checkpoint pins can now be released through the Python API.**

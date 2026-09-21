@@ -69,6 +69,7 @@ from ccs.core.exceptions import (
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_RESTORED,
     RESTORE_OUTCOME_TARGET_LOST,
+    RESTORE_OUTCOMES_PROVING_NO_WRITE,
     RESTORE_STATUS_CONCLUDED,
     RESTORE_STATUS_IN_PROGRESS,
     RESTORE_STATUS_NONE,
@@ -1308,6 +1309,44 @@ def test_s3_unknown_write_outcome_reconciles_to_held_unconfirmed(
     assert member.outcome == RESTORE_OUTCOME_HELD_UNCONFIRMED
     assert "HELD" in member.detail and "best-effort" in member.detail
     assert report.status == RESTORE_STATUS_CONCLUDED
+    # A put WAS issued here and its outcome is unknowable, so this arm must not
+    # borrow the state reserved for legs that never reached a write. Left
+    # unpinned, this branch could be rewritten to claim a confirmed overwrite
+    # with a fabricated pointer and no test in either suite would notice.
+    assert member.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert member.observation.state != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert member.observation.pointer is None
+
+
+def test_an_absorbed_failure_does_not_vouch_for_the_bytes_it_may_have_destroyed(
+    service: CoordinatorService,
+) -> None:
+    """A leg that raised mid-write reports no observation, never a quiet one.
+
+    The absorbing boundary catches a deterministic failure raised from ANYWHERE
+    inside a leg. The shipped file target truncates the live member before it
+    writes, so an OSError from that write leaves the member truncated or half
+    rewritten — and the boundary cannot tell that from a failure raised before
+    the leg read anything. Reporting ``no_write_attempted`` would tell an
+    operator nothing was overwritten over bytes this run destroyed, so the
+    state must be the one that claims nothing either way.
+    """
+
+    class _RaisesMidWriteStore(_FakeFileStore):
+        """Truncate-then-fail: the live content is gone, the write never finished."""
+
+        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+            self.put(path, b"", expected_version)  # the truncate half landed
+            raise OSError(28, "No space left on device")
+
+    store = _RaisesMidWriteStore()
+    member = _drive_one_file_arm(service, store)
+
+    assert member.outcome == RESTORE_OUTCOME_TARGET_LOST
+    assert member.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert member.observation.state != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    # The premise: the peer's content really is gone from the store.
+    assert store.read_with_version("doc.md")[0] == b""
 
 
 def test_file_commit_unconfirmed_is_held(service: CoordinatorService) -> None:
@@ -1643,14 +1682,34 @@ def test_default_constructed_outcome_observes_no_write_attempted() -> None:
     assert outcome.observation.fingerprint is None
 
 
-def test_outcome_rebuilt_from_a_durable_row_observes_not_recorded() -> None:
-    """A terminal reconstructed with no leg having run reports not-recorded.
+@pytest.mark.parametrize(
+    ("durable_outcome", "expected_state"),
+    [
+        # The row itself proves no write landed, by any run.
+        (RESTORE_OUTCOME_CONVERGED, RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED),
+        (RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED, RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED),
+        (RESTORE_OUTCOME_CONFLICT, RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED),
+        # A write landed, or may have, and what it overwrote is unrecoverable.
+        (RESTORE_OUTCOME_RESTORED, RESTORE_OBSERVATION_NOT_RECORDED),
+        (RESTORE_OUTCOME_HELD_UNCONFIRMED, RESTORE_OBSERVATION_NOT_RECORDED),
+        # target_lost is absorbed from ANYWHERE in a leg, including after the
+        # live file was truncated and partly rewritten, so it proves nothing.
+        (RESTORE_OUTCOME_TARGET_LOST, RESTORE_OBSERVATION_NOT_RECORDED),
+    ],
+)
+def test_a_rebuilt_row_reports_what_its_durable_outcome_proves(
+    durable_outcome: str, expected_state: str
+) -> None:
+    """The rebuild reads the row's outcome instead of assuming it knows nothing.
 
-    The rebuild site has no observation to report: the run that wrote the row is
-    gone and the observation is run-local by decision (no schema column). Taking
-    the field's default here would report ``no_write_attempted``, asserting a
-    fact THIS run never established — the prior run may well have written over a
-    peer's committed content. "Cannot tell" never collapses into clean.
+    No leg ran in this run, so the tempting blanket answer is ``not_recorded``.
+    But the durable outcome is not silent: a converged, skipped or conflicted
+    member provably never wrote, by any run, so the quiet answer is established
+    rather than assumed. Reporting ``not_recorded`` for those makes a re-restore
+    of a workspace nothing ever touched fail the operator's gate on its second
+    identical run — a false alarm is what gets a safety flag switched off.
+    Every outcome in the closed vocabulary is covered here, so a new one cannot
+    be added without deciding which side it falls on.
     """
     from ccs.coordinator.registry_protocol import CheckpointMember
 
@@ -1660,27 +1719,55 @@ def test_outcome_rebuilt_from_a_durable_row_observes_not_recorded() -> None:
         native_token="v1",
         fingerprint=None,
         captured_at=1.0,
-        restore_outcome=RESTORE_OUTCOME_RESTORED,
+        restore_outcome=durable_outcome,
     )
 
     rebuilt = WorkspaceVersioner._outcome_from_durable_row(row)
 
     assert rebuilt.resumed_from_prior_run is True
-    assert rebuilt.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert rebuilt.observation.state == expected_state
     assert rebuilt.observation.pointer is None
     assert rebuilt.observation.fingerprint is None
 
 
-def test_re_restore_of_a_concluded_checkpoint_observes_not_recorded(
+def test_every_member_outcome_is_decided_by_the_rebuild() -> None:
+    """The parametrisation above covers the vocabulary, not a hand-picked subset.
+
+    Derived from the closed set rather than a literal list: a seventh outcome
+    added to the vocabulary fails here instead of silently inheriting whichever
+    branch the rebuild's conditional happens to take.
+    """
+    from ccs.coordinator.registry_protocol import CheckpointMember
+
+    assert RESTORE_OUTCOMES_PROVING_NO_WRITE < RESTORE_MEMBER_OUTCOMES
+    decided = {
+        outcome
+        for outcome in RESTORE_MEMBER_OUTCOMES
+        if WorkspaceVersioner._outcome_from_durable_row(
+            CheckpointMember(
+                member_path="m",
+                artifact_id=None,
+                native_token=None,
+                fingerprint=None,
+                captured_at=1.0,
+                restore_outcome=outcome,
+            )
+        ).observation.state
+        in (RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED, RESTORE_OBSERVATION_NOT_RECORDED)
+    }
+    assert decided == RESTORE_MEMBER_OUTCOMES
+
+
+def test_re_restore_of_a_converged_checkpoint_stays_as_quiet_as_the_first_run(
     service: CoordinatorService,
 ) -> None:
-    """The report-only second restore claims nothing about what it overwrote.
+    """Re-running a restore that overwrote nothing must not start claiming it did.
 
-    End-to-end twin of the rebuild-site unit above: a concluded checkpoint
-    restored again drives no leg at all, so every member's observation is the
-    one state that never reads as clean. Without this arm the rebuild site could
-    be reached only through a private helper, and a caller-facing regression
-    (the report path dropping the explicit state) would go unseen.
+    End-to-end twin of the rebuild-site unit above, and the case a private
+    helper cannot reach: an operator re-runs an already-concluded restore.
+    Nothing was ever overwritten, so the second run must read exactly as quiet
+    as the first — otherwise the identical command reports differently the
+    second time, and under the operator's gate the second run fails.
     """
     client, obj = _s3()
     client.put_object(Bucket="demo", Key="cfg.json", Body=b"v1")
@@ -1688,11 +1775,15 @@ def test_re_restore_of_a_concluded_checkpoint_observes_not_recorded(
     versioner.add_object_member(obj, "cfg.json")
     checkpoint_id = versioner.checkpoint("twice-observed").record.checkpoint_id
 
-    versioner.restore(checkpoint_id)
+    first = versioner.restore(checkpoint_id)
     second = versioner.restore(checkpoint_id)
 
+    # The first run converged: the live object already matched the manifest, so
+    # no leg wrote. The rebuild reads that from the durable row rather than
+    # claiming it knows nothing, so the second run is as quiet as the first.
+    assert [m.outcome for m in first.members] == [RESTORE_OUTCOME_CONVERGED]
     assert [m.observation.state for m in second.members] == [
-        RESTORE_OBSERVATION_NOT_RECORDED
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
     ]
 
 
@@ -1989,47 +2080,88 @@ def test_file_leg_records_differs_when_only_the_content_moved(
     assert member.observation.fingerprint != sha256_hex(b"captured")
 
 
-def test_file_leg_arms_that_landed_no_write_observe_no_write_attempted(
-    service: CoordinatorService,
-) -> None:
-    """A wedged view and an unconfirmed commit overwrote nothing, and say so.
+def _drive_one_file_arm(
+    service: CoordinatorService, store: "_FakeFileStore"
+) -> MemberRestoreOutcome:
+    """Capture a member, let a peer edit it, then restore through ``store``."""
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, store, resolver, "doc.md", b"captured", 3, "no-landing"
+    )
+    store.put("doc.md", b"edited", 5)
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(store, "doc.md")
+    (member,) = restorer.restore(checkpoint_id).members
+    return member
 
-    Both arms read a live comparand, so the tempting answer is
-    ``observed_differs`` — but the state names what the leg OVERWROTE, and
-    neither arm has a confirmed write behind it. ``held_unconfirmed`` in
-    particular may yet have landed; reporting a discarded version there would
-    assert a loss that may not have happened, while ``no_write_attempted``
-    understates in the safe direction and leaves ``held_unconfirmed`` as the
-    field an operator must act on. Neither may carry a pointer, so the honest
-    answer is also the only constructible one.
+
+class _WedgedStore(_FakeFileStore):
+    """The comparand view stayed strict-denied, so no write was ever issued."""
+
+    def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+        raise ViewWedged("the comparand view stayed strict-denied")
+
+
+class _UnconfirmedStore(_FakeFileStore):
+    """The bytes reached disk; only the version commit was refused.
+
+    Mirrors the ordering the shipped command-line file target actually uses —
+    write the member, THEN commit the ledger, and raise only when that commit
+    is refused. The engine cannot see which order a target chose, which is the
+    whole reason its arm must not claim no write was attempted.
     """
 
-    class _WedgedStore(_FakeFileStore):
-        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
-            raise ViewWedged("the comparand view stayed strict-denied")
-
-    class _UnconfirmedStore(_FakeFileStore):
-        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
-            raise CommitUnconfirmed("transport failed mid-commit")
-
-    for store, expected_outcome in (
-        (_WedgedStore(), RESTORE_OUTCOME_CONFLICT),
-        (_UnconfirmedStore(), RESTORE_OUTCOME_HELD_UNCONFIRMED),
-    ):
-        resolver = _FakeResolver()
-        checkpoint_id = _file_checkpoint(
-            service, store, resolver, "doc.md", b"captured", 3, "no-landing"
+    def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+        self.put(path, new_content, expected_version + 1)
+        raise CommitUnconfirmed(
+            f"file member {path!r}: the restored bytes landed on disk but "
+            "the version-CAS ledger commit was refused"
         )
-        store.put("doc.md", b"edited", 5)
 
-        restorer = _versioner(service, resolver=resolver)
-        restorer.add_file_member(store, "doc.md")
-        (member,) = restorer.restore(checkpoint_id).members
 
-        assert member.outcome == expected_outcome
-        assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
-        assert member.observation.pointer is None
-        assert member.observation.fingerprint is None
+def test_file_leg_wedged_view_observes_no_write_attempted(
+    service: CoordinatorService,
+) -> None:
+    """A wedged view issued no write at all, so the quiet answer is the true one.
+
+    This is the control for the arm below: both read a live comparand and both
+    conclude without a confirmed write, so a rule that keyed off either fact
+    would give them the same answer. Only the wedged arm never reached the
+    write, which is what ``no_write_attempted`` means.
+    """
+    member = _drive_one_file_arm(service, _WedgedStore())
+
+    assert member.outcome == RESTORE_OUTCOME_CONFLICT
+    assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+
+
+def test_file_leg_unconfirmed_commit_does_not_claim_it_left_the_bytes_alone(
+    service: CoordinatorService,
+) -> None:
+    """A write whose outcome was lost must not report that none was attempted.
+
+    The shipped file target writes the member and then commits the ledger,
+    raising here only when that commit is refused — so on the path this
+    project actually ships, the peer's content is already gone when this arm
+    runs. Reporting ``no_write_attempted`` reads as "nothing was overwritten"
+    over bytes that were, which is the exact failure the observation exists to
+    prevent. ``not_recorded`` is the answer that is true whichever order the
+    target chose: a write was issued and this run cannot say what it destroyed.
+    Asserted against the store above, which writes before it raises.
+    """
+    store = _UnconfirmedStore()
+    member = _drive_one_file_arm(service, store)
+
+    assert member.outcome == RESTORE_OUTCOME_HELD_UNCONFIRMED
+    assert member.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert member.observation.state != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    # It claims no loss either: nothing was confirmed, so nothing is named.
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+    # The premise this arm rests on: the bytes really did reach the store.
+    assert store.read_with_version("doc.md")[0] == b"captured"
 
 
 # ---------------------------------------------------------------------------

@@ -895,6 +895,24 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
     RESTORE_SUCCESS_OUTCOMES | RESTORE_ABSORBING_OUTCOMES | RESTORE_HOLD_OUTCOMES
 )
 
+# The outcomes that PROVE no write landed, readable from a durable row alone.
+# ``converged`` short-circuits before every leg's write; ``forward_only_skipped``
+# is enumerated and never driven; and every ``conflict`` construction site is
+# either pre-write or says "no write landed" in its own detail (a budget
+# exhausted, a wedged view, an absent member the v1 leg cannot recreate).
+#
+# ``target_lost`` is DELIBERATELY absent: the absorbing boundary catches an
+# OSError raised from anywhere in a leg, including one raised after the live
+# file was truncated and partially rewritten, so that outcome cannot vouch for
+# the bytes. ``restored`` and ``held_unconfirmed`` wrote, or may have.
+RESTORE_OUTCOMES_PROVING_NO_WRITE: frozenset[str] = frozenset(
+    {
+        RESTORE_OUTCOME_CONVERGED,
+        RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
+        RESTORE_OUTCOME_CONFLICT,
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Workspace-Versioning restore OBSERVATION vocabulary (restore-divergence
 # signal / R1-R3)
@@ -918,15 +936,21 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
 #   content), so it reports the state alone: honest about what it destroyed,
 #   silent about what that content was.
 # - ``no_write_attempted`` — the member reached its terminal without a write
-#   decision (converged, skipped, or absorbed before the write). The DEFAULT,
-#   because it is the truth at every such site.
-# - ``not_recorded`` — this run holds no observation for the member. Either no
-#   leg ran at all (a member resumed from a prior run, or a concluded restore
-#   rebuilt from its durable rows — the observation is run-local by decision,
-#   so a prior run's is unrecoverable), or a leg ran and its write outcome was
-#   lost, leaving it unable to say whether IT destroyed the divergent state or
-#   a peer converged first. An observation the run never made is its own
-#   answer, never a clean one. Consumers MUST NOT read it as clean.
+#   decision: converged, enumerated and skipped, or absorbed before any write
+#   was issued (a wedged view, an exhausted re-drive budget). The DEFAULT,
+#   because it is the truth at every such site. It is NOT the answer for an arm
+#   that issued a write and could not learn the outcome — see ``not_recorded``.
+# - ``not_recorded`` — this run holds no observation for the member, in either
+#   of two ways. (1) No leg ran: a member resumed from a prior run, or a
+#   concluded restore rebuilt from its durable rows, where the row's outcome
+#   does not itself prove the member never wrote (see
+#   RESTORE_OUTCOMES_PROVING_NO_WRITE — the observation is run-local by
+#   decision, so a prior run's is unrecoverable). (2) A leg ran and its write
+#   outcome was lost: an unconfirmed commit, a reconciled unknown write, or a
+#   failure absorbed from anywhere inside the leg. Such a leg cannot say
+#   whether IT destroyed live state or never reached it. An observation the run
+#   never made is its own answer, never a clean one: consumers MUST NOT read it
+#   as clean.
 RESTORE_OBSERVATION_DIFFERS = "observed_differs"
 RESTORE_OBSERVATION_NO_LIVE_STATE = "no_live_state"
 RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE = "present_not_comparable"

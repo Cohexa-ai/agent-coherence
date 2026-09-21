@@ -230,6 +230,7 @@ from ccs.core.exceptions import (
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_RESTORED,
     RESTORE_OUTCOME_TARGET_LOST,
+    RESTORE_OUTCOMES_PROVING_NO_WRITE,
     RESTORE_STATUS_CONCLUDED,
     RESTORE_STATUS_IN_PROGRESS,
     RESTORE_STATUS_REGISTERED,
@@ -631,9 +632,11 @@ class RestoreObservation:
     (never a substring of any ``detail`` line). ``pointer`` (the live restore
     pointer the leg read) and ``fingerprint`` (that state's content digest) are
     lifted from the SAME read that produced the leg's CAS comparand, so no
-    second read is ever issued to populate them — and both stay ``None`` on
-    every state that read no comparand, which construction enforces rather than
-    documents.
+    second read is ever issued to populate them. Construction enforces one half
+    of that: every state that read no comparand is refused a pointer and a
+    fingerprint. It does not require them on ``observed_differs``, because a
+    source may land a write without naming a version, so the report treats both
+    as optional there.
 
     NEVER a comparand: nothing downstream may seed a CAS, an If-Match or a
     pinned read from a value recorded here. It describes what the leg
@@ -2094,6 +2097,14 @@ class WorkspaceVersioner:
                     "succeed; the restore still concludes (termination "
                     "contract)"
                 ),
+                # This boundary catches a failure raised from ANYWHERE inside
+                # the leg, including after the live member was truncated and
+                # partially rewritten (the file target truncates before it
+                # writes). It cannot tell that from a failure raised before the
+                # leg read anything, so it must not report that no write was
+                # attempted — the one answer that would read as clean over
+                # bytes this run may have destroyed.
+                observation=OBSERVATION_NOT_RECORDED,
             )
 
     def _drive_member(self, row: CheckpointMember) -> MemberRestoreOutcome:
@@ -2486,6 +2497,12 @@ class WorkspaceVersioner:
                 "write outcome still UNCONFIRMED after the reconciliation "
                 "read — HELD, never best-effort"
             ),
+            # Same ambiguity as the CONVERGE arm above and the same answer: a
+            # put was issued and its outcome is unknowable, so this run cannot
+            # say what it destroyed. Defaulting here would report a leg that
+            # read divergent content and wrote exactly like one that never
+            # reached a write decision.
+            observation=self._observation_of_overwritten(view, write_confirmed=False),
         )
 
     # --- the file CAS leg (no-arbiter: detection-guarded ONLY) ----------------
@@ -2641,12 +2658,16 @@ class WorkspaceVersioner:
                 ),
             )
         except CommitUnconfirmed:
-            # Deliberately the default too, and for a STRONGER reason than the
-            # wedged arm: this write may yet have landed. Naming a discarded
-            # version here would assert a loss nothing confirmed, and the
-            # honest understatement leaves ``held_unconfirmed`` — which is
-            # already the loudest terminal — as the signal. Fail closed toward
-            # claiming less, never toward claiming a divergence.
+            # NOT the default, and the wedged arm above is why: that one never
+            # issued a write, this one did and cannot learn the outcome. The
+            # split matters because the target decides the order. A CAS-first
+            # binding may never have touched the bytes; the file target this
+            # CLI ships writes them to disk FIRST and raises here only when the
+            # ledger commit is refused, so on that path the live content is
+            # already gone. The engine cannot tell the two apart through the
+            # seam, so it reports what it knows: no observation. Claiming a
+            # discarded version would over-claim on the first shape; claiming
+            # no write was attempted would read as clean over the second.
             return MemberRestoreOutcome(
                 member_path=path,
                 outcome=RESTORE_OUTCOME_HELD_UNCONFIRMED,
@@ -2655,6 +2676,7 @@ class WorkspaceVersioner:
                     "the version-CAS commit could not be confirmed (transport "
                     "failed mid-commit) — HELD, never best-effort"
                 ),
+                observation=OBSERVATION_NOT_RECORDED,
             )
         return MemberRestoreOutcome(
             member_path=path,
@@ -2697,11 +2719,19 @@ class WorkspaceVersioner:
             ),
             deleted_at_restore=row.deleted_at_restore,
             resumed_from_prior_run=True,
-            # No leg ran in THIS run, and the observation is run-local (it is
-            # not a manifest column), so nothing about what the prior run
-            # overwrote is recoverable here. Say so rather than defaulting to
-            # no-write-attempted, which would assert a fact never established.
-            observation=OBSERVATION_NOT_RECORDED,
+            # No leg ran in THIS run and the observation is run-local, so what
+            # a prior run overwrote is unrecoverable — but the durable outcome
+            # is not silent. A row that concluded in
+            # RESTORE_OUTCOMES_PROVING_NO_WRITE proves no write landed, by any
+            # run, so no-write-attempted is established rather than assumed and
+            # the honest answer is the quiet one. Reporting not-recorded for
+            # those would make a re-restore of a workspace nothing ever touched
+            # fail under the operator's gate, on its second identical run.
+            observation=(
+                OBSERVATION_NO_WRITE_ATTEMPTED
+                if row.restore_outcome in RESTORE_OUTCOMES_PROVING_NO_WRITE
+                else OBSERVATION_NOT_RECORDED
+            ),
         )
 
     def _report_from_durable_rows(

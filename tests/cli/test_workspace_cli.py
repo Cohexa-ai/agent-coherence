@@ -62,6 +62,7 @@ from ccs.core.exceptions import (
     RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
     RESTORE_OBSERVATION_NOT_RECORDED,
     RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    RESTORE_OBSERVATION_STATES,
     RESTORE_OUTCOME_RESTORED,
     STALE_READ_GENERATION_REASON,
     WORKSPACE_REGISTRATION_REFUSED,
@@ -1331,6 +1332,49 @@ def test_quiescent_restore_exits_zero_under_the_flag(tmp_path: Path, capsys) -> 
     }
 
 
+def test_re_running_a_restore_that_overwrote_nothing_still_exits_zero(
+    tmp_path: Path, capsys
+) -> None:
+    """The same command twice over an untouched workspace must answer the same.
+
+    This is the acceptance case for the whole opt-in flag: a run over a
+    workspace nothing touched exits 0, which is what shows the gate can tell a
+    member that never wrote from one whose observation was lost. The second run
+    drives no leg — every member is already terminal — so its answer comes from
+    the durable rows. Those rows record ``converged`` and
+    ``forward_only_skipped``, which prove no write landed by any run, so
+    claiming no observation there would fail an operator's pipeline on the
+    identical second invocation and teach them to drop the flag.
+    """
+    _seed_file(tmp_path)
+    _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "docs/plan.md",
+        "--forward-only",
+        "actions/deploy",
+        "--root",
+        str(tmp_path),
+    )
+    ckpt = _checkpoint_id(capsys, tmp_path)
+
+    first, _, _ = _run(capsys, "restore", ckpt, DISCARD_FLAG, "--root", str(tmp_path))
+    rc, out, _ = _run(
+        capsys, "restore", ckpt, DISCARD_FLAG, "--json", "--root", str(tmp_path)
+    )
+
+    assert (first, rc) == (0, 0)
+    members = _members_by_path(out)
+    # The rebuild really is the path under test: nothing was re-driven.
+    assert all(m["resumed_from_prior_run"] for m in members.values())
+    assert {path: m["observation"]["state"] for path, m in members.items()} == {
+        "docs/plan.md": RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        "actions/deploy": RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    }
+
+
 def test_re_restore_of_a_concluded_checkpoint_exits_four_under_the_flag(
     tmp_path: Path, capsys
 ) -> None:
@@ -1371,17 +1415,13 @@ def test_gate_fires_on_destroyed_presence_but_not_on_an_absent_target() -> None:
         )
         is False
     )
-    # The whole closed vocabulary is decided here, so a state cannot be added
-    # to the engine and silently default into (or out of) the gate.
+    # Driven from the ENGINE's closed set, not a literal list of five names.
+    # The gate is allowlist membership, so an unlisted state is silently clean;
+    # a test that enumerated the states itself would agree with the gate about
+    # a sixth state neither of them had ever seen.
     assert {
         state: _discarded_post_capture_content(_synthetic_outcome(state))
-        for state in (
-            RESTORE_OBSERVATION_DIFFERS,
-            RESTORE_OBSERVATION_NO_LIVE_STATE,
-            RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
-            RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
-            RESTORE_OBSERVATION_NOT_RECORDED,
-        )
+        for state in RESTORE_OBSERVATION_STATES
     } == {
         RESTORE_OBSERVATION_DIFFERS: True,
         RESTORE_OBSERVATION_NO_LIVE_STATE: False,
@@ -1389,6 +1429,30 @@ def test_gate_fires_on_destroyed_presence_but_not_on_an_absent_target() -> None:
         RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED: False,
         RESTORE_OBSERVATION_NOT_RECORDED: True,
     }
+
+
+def test_every_state_the_gate_fails_a_run_for_says_so_on_its_line() -> None:
+    """A non-zero exit whose reason appears nowhere in the printed report.
+
+    That is what these two sets drifting apart produces, and they drifted once
+    already: the delete leg's state fired the gate while rendering a line
+    indistinguishable from a quiet member's. Derived from the engine's closed
+    vocabulary on both sides, so the guard sees a sixth state instead of
+    agreeing with the code about a state neither has met.
+    """
+    flagged = {
+        state
+        for state in RESTORE_OBSERVATION_STATES
+        if _restore_outcome_line(_synthetic_outcome(state))
+        != _restore_outcome_line(_synthetic_outcome(RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED))
+    }
+    fires = {
+        state
+        for state in RESTORE_OBSERVATION_STATES
+        if _discarded_post_capture_content(_synthetic_outcome(state))
+    }
+    assert flagged == fires
+    assert fires  # a vacuous pass if both sets were somehow empty
 
 
 def test_restore_help_says_the_flag_reports_and_cannot_prevent(capsys) -> None:
