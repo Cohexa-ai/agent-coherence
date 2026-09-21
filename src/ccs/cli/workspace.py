@@ -815,11 +815,17 @@ def _member_line(row: CheckpointMember) -> str:
 def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
     """One restored member's summary line (the detail prose rides below it).
 
-    Two observations earn a flag, in the shape ``resumed-from-prior-run``
-    already set: the run put this member back OVER content that differed from
-    the captured state, and the run holds no observation at all. Every other
-    state renders exactly as it did before the observation existed — a member
-    whose leg never reached a write decision must not be made noisier.
+    Every observation the exit gate fires on earns a flag, in the shape
+    ``resumed-from-prior-run`` already set: the run wrote OVER content that
+    differed from the capture, it destroyed live state without comparing it,
+    or it holds no observation at all. Keeping that set aligned with
+    :data:`_DISCARDED_POST_CAPTURE_OBSERVATIONS` is what stops the flag
+    returning a non-zero exit whose reason appears nowhere in the human report.
+
+    The two states it does not flag are the two the gate does not fire on:
+    a write that landed on nothing discarded nothing, and a member whose leg
+    never reached a write decision must not be made noisier. Both render
+    exactly as they did before the observation existed.
 
     The differing case is annotated whatever the differing content WAS. The
     engine reads one live state and cannot separate a half-written file from a
@@ -842,6 +848,12 @@ def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
         # hex characters per member would bury the line it rides on.
         if outcome.observation.pointer is not None:
             line += f"  overwritten-version={outcome.observation.pointer}"
+    elif state == RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE:
+        # The delete leg's probe established that live state existed and this
+        # run destroyed it, having compared no content — so the flag says
+        # exactly that and names nothing. Silence would leave the gate able to
+        # fail a run for a member whose line looked like every quiet one.
+        line += "  destroyed-uncompared-content"
     elif state == RESTORE_OBSERVATION_NOT_RECORDED:
         # An observation the run never made is its own answer, and not a clean
         # one: silence here would read as "nothing was overwritten".

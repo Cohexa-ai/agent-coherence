@@ -1124,31 +1124,69 @@ def test_resumed_member_reports_an_unrecorded_observation_not_a_clean_one(
     assert "overwritten-content-not-recorded" in line
 
 
-def test_object_only_observation_states_render_without_a_pointer() -> None:
-    """``restore`` refuses a checkpoint holding a pending object member before
-    the engine runs, so the two states only an object leg can reach are driven
-    through the payload builder and the line renderer directly."""
-    for state in (
-        RESTORE_OBSERVATION_NO_LIVE_STATE,
-        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
-    ):
-        outcome = MemberRestoreOutcome(
-            member_path="bucket/key",
-            outcome=RESTORE_OUTCOME_RESTORED,
-            attempts=1,
-            detail="synthesized for the renderer",
-            observation=RestoreObservation(state),
-        )
-        payload = _outcome_payload(outcome)
-        assert payload["observation"] == {
-            "state": state,
-            "pointer": None,
-            "fingerprint": None,
-        }
-        # Neither state claims content was discarded, so neither annotates.
-        assert _restore_outcome_line(outcome) == (
-            "  bucket/key  outcome=restored  attempts=1"
-        )
+def _object_state_outcome(state: str) -> MemberRestoreOutcome:
+    """One synthesized member carrying a state only an object leg can reach.
+
+    ``restore`` refuses a checkpoint holding a pending object member before the
+    engine runs, so these states never arrive through the command. Driving the
+    payload builder and the line renderer directly is what keeps them covered.
+    """
+    return MemberRestoreOutcome(
+        member_path="bucket/key",
+        outcome=RESTORE_OUTCOME_RESTORED,
+        attempts=1,
+        detail="synthesized for the renderer",
+        observation=RestoreObservation(state),
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [RESTORE_OBSERVATION_NO_LIVE_STATE, RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE],
+)
+def test_object_only_observation_states_carry_no_pointer(state: str) -> None:
+    """Neither state read a comparand, so neither names a version or a digest.
+
+    Both are constructed with the state alone, and the payload must render the
+    two absent halves as explicit nulls rather than omitting them — a consumer
+    that had to read a missing key would be reading absence as an answer.
+    """
+    payload = _outcome_payload(_object_state_outcome(state))
+    assert payload["observation"] == {
+        "state": state,
+        "pointer": None,
+        "fingerprint": None,
+    }
+
+
+def test_a_write_that_landed_on_nothing_leaves_the_line_quiet() -> None:
+    """Create-on-absent discarded nothing, so its line must not be annotated.
+
+    This is the control for the test below: it proves the renderer distinguishes
+    the two object-only states rather than flagging whatever it does not
+    recognise. The exit gate does not fire on this state either, so an annotated
+    line here would report a loss the run did not cause.
+    """
+    line = _restore_outcome_line(_object_state_outcome(RESTORE_OBSERVATION_NO_LIVE_STATE))
+    assert line == "  bucket/key  outcome=restored  attempts=1"
+
+
+def test_a_destroyed_uncompared_member_says_so_on_its_own_line() -> None:
+    """A state the exit gate fires on must never render as a quiet line.
+
+    The delete leg's probe established that live state existed and destroyed it,
+    which is why ``present_not_comparable`` sits in the exit-4 set beside
+    ``observed_differs``. Were the line left unannotated, an operator running
+    with the flag could be handed a non-zero exit whose reason appears nowhere
+    in the human report — readable only by re-running under ``--json``. The
+    wording claims no comparison, because the probe made none.
+    """
+    line = _restore_outcome_line(
+        _object_state_outcome(RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE)
+    )
+    assert line == "  bucket/key  outcome=restored  attempts=1  destroyed-uncompared-content"
+    # No version and no digest are appended: the probe read neither.
+    assert "overwritten-version=" not in line
 
 
 # --- restore exit code: the opt-in discarded-content gate -----------------------
