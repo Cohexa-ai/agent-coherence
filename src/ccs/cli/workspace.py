@@ -47,6 +47,13 @@ Exit codes:
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
+- 4: restore CONCLUDED clean by the codes above, but the operator asked
+     (``restore --exit-nonzero-on-discarded-content``) for a run that put a
+     member back over content the capture did not hold — or that holds no
+     record of what it overwrote — to be a failure. Opt-in and never the
+     default: the same run exits 0 without the flag, and both producers of 3
+     take precedence over it. The flag is read after the engine returns, so it
+     reports the write, it never prevents one.
 
 A containment refusal is exit 2 on the CAPTURE leg (nothing persists). On the
 RESTORE leg it is NOT: the engine's termination contract absorbs it into that
@@ -89,6 +96,7 @@ from ccs.core.exceptions import (
     PIN_STATE_UNPINNED,
     RESTORE_OBSERVATION_DIFFERS,
     RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_TARGET_LOST,
@@ -149,6 +157,30 @@ _EXIT3_OUTCOMES = frozenset(
         RESTORE_OUTCOME_CONFLICT,
         RESTORE_OUTCOME_TARGET_LOST,
         RESTORE_OUTCOME_HELD_UNCONFIRMED,
+    }
+)
+
+#: The exit-code-4 observation set — CLI-PRIVATE and named for what it decides,
+#: following :data:`_EXIT3_OUTCOMES`. These are the observations that say this
+#: run put a checkpoint back over content the capture did not hold:
+#:
+#: - ``observed_differs`` — a live state was read and it differed, so the write
+#:   discarded content committed after the capture;
+#: - ``present_not_comparable`` — the delete leg's probe established that live
+#:   state EXISTED and destroyed it. A member captured ABSENT that is present
+#:   live was created after the capture, so this discarded post-capture content
+#:   even though the probe read no comparand to name it by;
+#: - ``not_recorded`` — the run holds no observation, which is its own answer
+#:   and never a clean one; a gate that passed it would report clean on exactly
+#:   the runs that cannot say what they overwrote.
+#:
+#: ``no_live_state`` wrote onto nothing and ``no_write_attempted`` never
+#: reached a write decision, so neither discarded anything and neither fires.
+_DISCARDED_POST_CAPTURE_OBSERVATIONS = frozenset(
+    {
+        RESTORE_OBSERVATION_DIFFERS,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+        RESTORE_OBSERVATION_NOT_RECORDED,
     }
 )
 
@@ -708,10 +740,28 @@ def build_parser() -> argparse.ArgumentParser:
             "termination contract. Absorbing outcomes (conflict / target_lost / "
             "held_unconfirmed) are REPORT content: the restore still concludes "
             "and the exit code distinguishes a clean restore (0) from a "
-            "concluded-with-absorbed-outcomes one (3)."
+            "concluded-with-absorbed-outcomes one (3). A restore over content "
+            "committed after the capture is reported per member and still "
+            "exits 0 unless the flag below asks for its own code."
         ),
     )
     p_restore.add_argument("checkpoint_id", help="The persisted checkpoint id.")
+    # Named for what it changes — the exit code — and nothing else. A fencing
+    # name would promise a refusal this cannot deliver: the flag is read after
+    # the engine returns, when every member has already been written and the
+    # registration has already run.
+    p_restore.add_argument(
+        "--exit-nonzero-on-discarded-content",
+        action="store_true",
+        help=(
+            "Exit 4 when the report says this run put a member back over "
+            "content the checkpoint did not hold, or holds no record of what "
+            "it overwrote. Read after every member has already been written, "
+            "so it reports what happened and cannot prevent the write. A "
+            "restore that also ends with an absorbing/hold outcome or a "
+            "refused registration still exits 3."
+        ),
+    )
     return parser
 
 
@@ -1066,6 +1116,23 @@ def _cmd_status(stack: _Stack, args: argparse.Namespace) -> int:
     return 0
 
 
+def _discarded_post_capture_content(outcome: MemberRestoreOutcome) -> bool:
+    """Did this member's restore put the checkpoint back over content the
+    capture did not hold?
+
+    The opt-in exit gate's whole decision, over the member outcome alone — it
+    reads no rendered payload, because the exit code is computed whether or not
+    ``--json`` was asked for. Kept a named function rather than an inline
+    comprehension so the two states the command line cannot reach are still
+    decidable directly: ``restore`` refuses a checkpoint carrying a pending
+    object member before the engine runs, so only the file leg's states arrive
+    here end to end, while the delete leg's ``present_not_comparable`` and the
+    create-on-absent ``no_live_state`` are covered at the engine level and
+    through this predicate.
+    """
+    return outcome.observation.state in _DISCARDED_POST_CAPTURE_OBSERVATIONS
+
+
 def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
     record = stack.service.get_workspace_checkpoint(args.checkpoint_id)
     if record is None:
@@ -1113,6 +1180,13 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
         and report.registration.status == WORKSPACE_REGISTRATION_REFUSED
     )
     rc = 3 if absorbed or registration_refused else 0
+    # The operator's opt-in gate, evaluated ONLY on a run that would otherwise
+    # exit 0: both of exit 3's producers — an absorbing/hold outcome and a
+    # refused registration — take precedence, so a consumer reading 3 still
+    # reads exactly what it always did.
+    if rc == 0 and args.exit_nonzero_on_discarded_content:
+        if any(_discarded_post_capture_content(m) for m in report.members):
+            rc = 4
 
     if args.json:
         payload: dict[str, Any] = {

@@ -46,6 +46,7 @@ from ccs.cli.workspace import (
     MEMBER_PATH_REFUSED_REASON,
     MemberPathRefused,
     WorkingTreeSource,
+    _discarded_post_capture_content,
     _outcome_payload,
     _restore_outcome_line,
 )
@@ -61,8 +62,11 @@ from ccs.core.exceptions import (
     RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
     RESTORE_OBSERVATION_NOT_RECORDED,
     RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    STALE_READ_GENERATION_REASON,
+    WORKSPACE_REGISTRATION_REFUSED,
 )
 from ccs.core.substrate import ArbitrationTier, RestoreTier
+from ccs.core.types import ConflictDetail, WorkspaceRegistrationResult
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "examples" / "workspace_versioning" / "main.py"
@@ -1144,6 +1148,223 @@ def test_object_only_observation_states_render_without_a_pointer() -> None:
         assert _restore_outcome_line(outcome) == (
             "  bucket/key  outcome=restored  attempts=1"
         )
+
+
+# --- restore exit code: the opt-in discarded-content gate -----------------------
+
+# Spelled once. Inlined in six places this string renames in five of them and
+# the sixth test keeps passing against a flag argparse no longer accepts.
+DISCARD_FLAG = "--exit-nonzero-on-discarded-content"
+
+
+def _synthetic_outcome(state: str) -> MemberRestoreOutcome:
+    """A member outcome carrying exactly one observation state — the gate's
+    input, without a command invocation around it."""
+    return MemberRestoreOutcome(
+        member_path="bucket/key",
+        outcome="restored",
+        attempts=1,
+        detail="synthesized for the gate",
+        observation=RestoreObservation(state),
+    )
+
+
+def test_divergent_restore_exits_four_only_under_the_flag(
+    tmp_path: Path, capsys
+) -> None:
+    """R6 + R5: one run shape, one report — the operator's flag is the only
+    thing that turns a restore over post-capture content into a failure."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, DISCARD_FLAG, "--root", str(tmp_path))
+    assert rc == 4
+    assert "overwrote-differing-content" in out
+
+    # The same divergence in a workspace of its own, without the flag: still 0.
+    # A second run against the FIRST checkpoint would observe not_recorded, a
+    # different state — the default-path arm has to see observed_differs too.
+    other = tmp_path / "second-workspace"
+    other.mkdir()
+    ckpt_other = _checkpoint_then_diverge(capsys, other)
+
+    rc, out, _ = _run(capsys, "restore", ckpt_other, "--root", str(other))
+    assert rc == 0
+    assert "overwrote-differing-content" in out
+
+
+def test_absorbed_outcome_takes_precedence_over_the_discard_code(
+    tmp_path: Path, capsys
+) -> None:
+    """R7, exit 3's first producer: one member ends absorbed while another was
+    restored over post-capture content. The run exits 3 and the report still
+    carries BOTH facts — the new code never hides the older one."""
+    plan = _seed_file(tmp_path)
+    rc, _, _ = _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "docs/plan.md",
+        "--file",
+        "docs/ghost.md",  # absent at capture -> present live -> absorbed
+        "--root",
+        str(tmp_path),
+    )
+    assert rc == 0
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    plan.write_bytes(DISCARDED_BYTES)
+    (tmp_path / "docs" / "ghost.md").write_bytes(b"appeared after capture\n")
+
+    rc, out, _ = _run(capsys, "restore", ckpt, DISCARD_FLAG, "--root", str(tmp_path))
+    assert rc == 3
+    assert "docs/ghost.md  outcome=conflict" in out
+    assert "overwrote-differing-content" in out
+
+
+def test_refused_registration_takes_precedence_over_the_discard_code(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """R7, exit 3's SECOND producer: a fence-refused registration holds the run
+    at 3 even though a member was restored over post-capture content.
+
+    The refusal is injected at the coordinator seam the engine calls rather
+    than through the registry, because the CLI's file bridge commits every
+    written member through that same registry: by the time registration runs,
+    the artifact already carries the manifest fingerprint and the seam honestly
+    answers ``empty_write_set``, so no fence is reachable end to end. The
+    engine's refusal path and the CLI's exit computation are both real here.
+    """
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+
+    def _fenced(self, *, checkpoint_id, controller, writes, issued_at_tick=0, abort=None):
+        return WorkspaceRegistrationResult(
+            checkpoint_id=checkpoint_id,
+            status=WORKSPACE_REGISTRATION_REFUSED,
+            detail="the read-generation fence rejected a superseded controller",
+            refused={
+                write.member_path: ConflictDetail(
+                    reason=STALE_READ_GENERATION_REASON, current_version=1
+                )
+                for write in writes
+            },
+        )
+
+    monkeypatch.setattr(CoordinatorService, "register_workspace_restore", _fenced)
+
+    rc, out, _ = _run(capsys, "restore", ckpt, DISCARD_FLAG, "--root", str(tmp_path))
+    assert rc == 3
+    # The guard can SEE its case: the refusal really reached the report, and
+    # the discard the gate would otherwise have fired on is there beside it.
+    assert f"registration: {WORKSPACE_REGISTRATION_REFUSED}" in out
+    assert "overwrote-differing-content" in out
+
+
+def test_quiescent_restore_exits_zero_under_the_flag(tmp_path: Path, capsys) -> None:
+    """R5 under the flag: nothing touched the workspace since the capture, so
+    one file member converges and one forward-only member is skipped. Neither
+    wrote, neither discarded anything, and the run still exits 0."""
+    _seed_file(tmp_path)
+    _run(
+        capsys,
+        "checkpoint",
+        "cp1",
+        "--file",
+        "docs/plan.md",
+        "--forward-only",
+        "actions/deploy",
+        "--root",
+        str(tmp_path),
+    )
+    ckpt = _checkpoint_id(capsys, tmp_path)
+
+    rc, out, _ = _run(
+        capsys, "restore", ckpt, DISCARD_FLAG, "--json", "--root", str(tmp_path)
+    )
+    assert rc == 0
+    # ...and this guard can SEE the case it claims to cover: both members
+    # really hold the no-write state, rather than merely exiting quietly.
+    assert {
+        path: member["observation"]["state"]
+        for path, member in _members_by_path(out).items()
+    } == {
+        "docs/plan.md": RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        "actions/deploy": RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    }
+
+
+def test_re_restore_of_a_concluded_checkpoint_exits_four_under_the_flag(
+    tmp_path: Path, capsys
+) -> None:
+    """R3 on the exit surface: the second run holds no observation of its own,
+    and an observation the run never made must not buy a clean exit."""
+    ckpt = _checkpoint_then_diverge(capsys, tmp_path)
+    rc, _, _ = _run(capsys, "restore", ckpt, "--root", str(tmp_path))
+    assert rc == 0
+
+    rc, out, _ = _run(
+        capsys, "restore", ckpt, DISCARD_FLAG, "--json", "--root", str(tmp_path)
+    )
+    assert rc == 4
+    state = _members_by_path(out)["docs/plan.md"]["observation"]["state"]
+    assert state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert state != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED  # never the quiet answer
+
+
+def test_gate_fires_on_destroyed_presence_but_not_on_an_absent_target() -> None:
+    """``restore`` refuses a checkpoint carrying a pending object member before
+    the engine runs, so the two states only an object leg can reach are driven
+    through the gate directly.
+
+    Deleting an object a peer created after the capture DID destroy live state
+    — a member captured absent that is present live was created after the
+    capture — which is exactly what the flag exists for. Creating a member onto
+    nothing discarded nothing at all.
+    """
+    assert (
+        _discarded_post_capture_content(
+            _synthetic_outcome(RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE)
+        )
+        is True
+    )
+    assert (
+        _discarded_post_capture_content(
+            _synthetic_outcome(RESTORE_OBSERVATION_NO_LIVE_STATE)
+        )
+        is False
+    )
+    # The whole closed vocabulary is decided here, so a state cannot be added
+    # to the engine and silently default into (or out of) the gate.
+    assert {
+        state: _discarded_post_capture_content(_synthetic_outcome(state))
+        for state in (
+            RESTORE_OBSERVATION_DIFFERS,
+            RESTORE_OBSERVATION_NO_LIVE_STATE,
+            RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+            RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+            RESTORE_OBSERVATION_NOT_RECORDED,
+        )
+    } == {
+        RESTORE_OBSERVATION_DIFFERS: True,
+        RESTORE_OBSERVATION_NO_LIVE_STATE: False,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE: True,
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED: False,
+        RESTORE_OBSERVATION_NOT_RECORDED: True,
+    }
+
+
+def test_restore_help_says_the_flag_reports_and_cannot_prevent(capsys) -> None:
+    """The flag is named for its exit behavior and ``--help`` says why: it is
+    read after every member has already been written, so it can never fence
+    one, and it does not displace the codes the restore already returns."""
+    with pytest.raises(SystemExit) as excinfo:
+        workspace_main(["restore", "--help"])
+    assert excinfo.value.code == 0
+    # argparse re-wraps help to the terminal width, so match on the prose with
+    # its line breaks normalized away rather than on a formatted line.
+    out = " ".join(capsys.readouterr().out.split())
+    assert DISCARD_FLAG in out
+    assert "cannot prevent the write" in out
+    assert "still exits 3" in out
 
 
 # --- duplicate-name disclosure --------------------------------------------------
