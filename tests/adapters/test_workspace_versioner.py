@@ -82,6 +82,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CommitUnconfirmed,
     OccCallerTransientError,
+    ViewWedged,
     WatchdogAbandoned,
 )
 from ccs.core.invariants import check_monotonic_version
@@ -725,6 +726,10 @@ class _FakeFileStore:
         self._state: dict[str, tuple[bytes, int]] = {}
         self._foreign_after_read: dict[str, list[bytes]] = {}
         self.cas_calls: dict[str, int] = {}
+        #: Every ``expected_version`` the engine handed the CAS, in order —
+        #: the comparand as the SUBSTRATE saw it, so a test can prove the
+        #: reported pointer came from the same read rather than re-deriving it.
+        self.cas_expected: dict[str, list[int]] = {}
 
     def put(self, path: str, data: bytes, version: int) -> None:
         self._state[path] = (bytes(data), version)
@@ -750,6 +755,7 @@ class _FakeFileStore:
 
     def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
         self.cas_calls[path] = self.cas_calls.get(path, 0) + 1
+        self.cas_expected.setdefault(path, []).append(expected_version)
         if path not in self._state:
             raise CasVersionConflict(path, expected_version, 0)
         _data, version = self._state[path]
@@ -1765,6 +1771,246 @@ def test_only_the_differs_state_may_carry_a_pointer_or_fingerprint() -> None:
         state=RESTORE_OBSERVATION_DIFFERS, pointer="7", fingerprint="deadbeef"
     )
     assert (observed.pointer, observed.fingerprint) == ("7", "deadbeef")
+
+
+# ---------------------------------------------------------------------------
+# The FILE leg's observation (restore-divergence-signal U2 / R1-R2): what the
+# version-CAS leg saw of the live state in the iteration that WON
+# ---------------------------------------------------------------------------
+
+
+def _file_checkpoint(
+    service: CoordinatorService,
+    files: _FakeFileStore,
+    resolver: _FakeResolver,
+    path: str,
+    body: bytes,
+    version: int,
+    name: str,
+) -> str:
+    """Capture ONE file member at (body, version), with that version retained.
+
+    The two-step shape every test below needs: a checkpoint taken while the
+    member is quiescent, so whatever the restore leg later observes came from a
+    write that landed AFTER the capture — never from the capture itself.
+    """
+    files.put(path, body, version)
+    resolver.keep(path, version, body)
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, path)
+    return versioner.checkpoint(name).record.checkpoint_id
+
+
+def test_file_leg_restored_over_a_peer_write_names_the_discarded_version(
+    service: CoordinatorService,
+) -> None:
+    """The issue's reproduction: the report names what the restore threw away.
+
+    Two steps, because one cannot express the defect: a peer commits after the
+    capture and STOPS (no contention, no re-drive), then the operator restores.
+    The member concludes ``restored`` either way — the outcome vocabulary is
+    unchanged by decision — so ``restored`` alone cannot distinguish "put back a
+    state nothing had touched" from "discarded a colleague's committed work".
+    Before the observation, an operator reading this report had no field that
+    differed between the two, and the peer's version number was unrecoverable
+    the instant the CAS advanced it.
+    """
+    files = _FakeFileStore()
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, files, resolver, "notes/plan.md", b"plan text", 7, "pre-peer"
+    )
+
+    # A peer commits and stops: content AND version move, then quiesce.
+    files.put("notes/plan.md", b"peer's committed edit", 9)
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "notes/plan.md")
+    (member,) = restorer.restore(checkpoint_id).members
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED  # unchanged vocabulary
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    # Both halves name the state that was OVERWRITTEN, not the one that landed.
+    assert member.observation.pointer == "9"
+    assert member.observation.fingerprint == sha256_hex(b"peer's committed edit")
+    # The minted pointer is a DIFFERENT value: new_native_token is what the
+    # write produced (9 + 1), the observation is what it destroyed. Conflating
+    # them would hand a Unit-5 registration the wrong artifact version.
+    assert member.new_native_token == "10"
+    assert member.new_native_token != member.observation.pointer
+    assert files.state("notes/plan.md")[0] == b"plan text"
+
+
+def test_file_leg_converged_member_observes_no_write_attempted(
+    service: CoordinatorService,
+) -> None:
+    """A quiescent member reports the no-write state, never a divergence.
+
+    The converged short-circuit returns before the leg resolves pinned bytes or
+    touches the CAS, so there is no comparand to report — and reporting one
+    would be a false alarm on the exact workspace an operator gate must stay
+    quiet about. Pinned here rather than left to the field default: this is the
+    control arm that makes the ``observed_differs`` assertions above mean
+    something, because a leg that recorded ``observed_differs`` unconditionally
+    would satisfy every other test in this section.
+    """
+    files = _FakeFileStore()
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, files, resolver, "notes/calm.md", b"steady", 4, "quiescent"
+    )
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "notes/calm.md")
+    (member,) = restorer.restore(checkpoint_id).members
+
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED
+    assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+    assert "notes/calm.md" not in files.cas_calls  # no write was even attempted
+
+
+def test_file_leg_re_drive_observes_the_winning_iteration_not_the_first_read(
+    service: CoordinatorService,
+) -> None:
+    """Under contention the report names the state the write actually replaced.
+
+    KTD7: the live read sits INSIDE the budget loop, so an observation captured
+    once and held across re-drives names a state the write did not overwrite —
+    the engine would truthfully say ``restored`` while pointing at a version
+    some other write had already superseded, which is worse than silence
+    because it reads as evidence. One foreign edit is interleaved between the
+    first read and its CAS; the first read saw (``edited``, 5) and the second,
+    winning read saw (``foreign-edit``, 6). Only the latter may be reported.
+    """
+    files = _FakeFileStore()
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, files, resolver, "doc.md", b"captured", 3, "raced"
+    )
+
+    files.put("doc.md", b"edited", 5)
+    files.schedule_foreign_edit_after_read("doc.md", b"foreign-edit")
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    (member,) = restorer.restore(checkpoint_id).members
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.attempts == 2  # attempt 1 lost the CAS, attempt 2 landed
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    # The WINNING iteration's read.
+    assert member.observation.pointer == "6"
+    assert member.observation.fingerprint == sha256_hex(b"foreign-edit")
+    # Explicitly NOT the first read's — the mutation this test exists to kill.
+    assert member.observation.pointer != "5"
+    assert member.observation.fingerprint != sha256_hex(b"edited")
+
+
+def test_file_leg_observation_pointer_is_the_version_the_cas_used(
+    service: CoordinatorService,
+) -> None:
+    """The pointer is the CAS comparand itself, not a second read's answer.
+
+    R1 requires the observation to come from the SAME read that produced the
+    leg's comparand; a re-read would describe a state the write never compared
+    against, and on a contended path the two answers differ. Asserted against
+    the value the substrate received, recorded by the fake at the CAS boundary —
+    the only vantage point from which "same read" is checkable at all.
+    """
+    files = _FakeFileStore()
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, files, resolver, "doc.md", b"captured", 3, "comparand"
+    )
+
+    files.put("doc.md", b"edited", 5)
+    files.schedule_foreign_edit_after_read("doc.md", b"foreign-edit")
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    (member,) = restorer.restore(checkpoint_id).members
+
+    winning_comparand = files.cas_expected["doc.md"][-1]
+    assert files.cas_expected["doc.md"] == [5, 6]  # both attempts, in order
+    assert member.observation.pointer == str(winning_comparand)
+
+
+def test_file_leg_records_differs_when_only_the_content_moved(
+    service: CoordinatorService,
+) -> None:
+    """An unchanged pointer beside changed content is still a divergence.
+
+    Proves the fingerprint does independent work. A source that rewrites bytes
+    without advancing its version (a restored backup, a touch-preserving editor,
+    a coarse mtime-derived version) hands the leg a pointer identical to the
+    captured one — so a pointer-only observation would read as "nothing moved"
+    and an operator gate keyed on it would pass over content it just destroyed.
+    The CAS itself cannot catch this either: the comparand matches, so the write
+    lands.
+    """
+    files = _FakeFileStore()
+    resolver = _FakeResolver()
+    checkpoint_id = _file_checkpoint(
+        service, files, resolver, "doc.md", b"captured", 3, "silent-edit"
+    )
+
+    # Same version, different bytes — the CAS will pass, the content did not.
+    files.put("doc.md", b"silently rewritten", 3)
+
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    (member,) = restorer.restore(checkpoint_id).members
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert member.observation.pointer == "3"  # indistinguishable from capture
+    assert member.observation.fingerprint == sha256_hex(b"silently rewritten")
+    assert member.observation.fingerprint != sha256_hex(b"captured")
+
+
+def test_file_leg_arms_that_landed_no_write_observe_no_write_attempted(
+    service: CoordinatorService,
+) -> None:
+    """A wedged view and an unconfirmed commit overwrote nothing, and say so.
+
+    Both arms read a live comparand, so the tempting answer is
+    ``observed_differs`` — but the state names what the leg OVERWROTE, and
+    neither arm has a confirmed write behind it. ``held_unconfirmed`` in
+    particular may yet have landed; reporting a discarded version there would
+    assert a loss that may not have happened, while ``no_write_attempted``
+    understates in the safe direction and leaves ``held_unconfirmed`` as the
+    field an operator must act on. Neither may carry a pointer, so the honest
+    answer is also the only constructible one.
+    """
+
+    class _WedgedStore(_FakeFileStore):
+        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+            raise ViewWedged("the comparand view stayed strict-denied")
+
+    class _UnconfirmedStore(_FakeFileStore):
+        def write_cas_at(self, path: str, expected_version: int, new_content: bytes) -> None:
+            raise CommitUnconfirmed("transport failed mid-commit")
+
+    for store, expected_outcome in (
+        (_WedgedStore(), RESTORE_OUTCOME_CONFLICT),
+        (_UnconfirmedStore(), RESTORE_OUTCOME_HELD_UNCONFIRMED),
+    ):
+        resolver = _FakeResolver()
+        checkpoint_id = _file_checkpoint(
+            service, store, resolver, "doc.md", b"captured", 3, "no-landing"
+        )
+        store.put("doc.md", b"edited", 5)
+
+        restorer = _versioner(service, resolver=resolver)
+        restorer.add_file_member(store, "doc.md")
+        (member,) = restorer.restore(checkpoint_id).members
+
+        assert member.outcome == expected_outcome
+        assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+        assert member.observation.pointer is None
+        assert member.observation.fingerprint is None
 
 
 # ===========================================================================

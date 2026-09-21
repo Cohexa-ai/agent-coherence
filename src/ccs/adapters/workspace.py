@@ -198,6 +198,7 @@ from ccs.core.exceptions import (
     PIN_STATE_UNAVAILABLE,
     PIN_STATE_UNPINNED,
     RESTORE_MEMBER_OUTCOMES,
+    RESTORE_OBSERVATION_DIFFERS,
     RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
     RESTORE_OBSERVATION_NOT_RECORDED,
     RESTORE_OBSERVATION_STATES,
@@ -2402,7 +2403,14 @@ class WorkspaceVersioner:
                         "lands in Unit 5) — divergence not converged (no-arbiter)"
                     ),
                 )
-            if _sha256_hex(live_bytes) == row.fingerprint:
+            # The converged check's digest is the leg's own observation of the
+            # live content, and it is computed from the SAME read that produced
+            # the CAS comparand — keeping it is what lets the write arm report
+            # what it overwrote without a second read (R1, KTD5). Recomputed
+            # every iteration on purpose: the loop re-reads, so a hoisted
+            # digest would name a state a later attempt never saw (KTD7).
+            live_fingerprint = _sha256_hex(live_bytes)
+            if live_fingerprint == row.fingerprint:
                 return MemberRestoreOutcome(
                     member_path=row.member_path,
                     outcome=RESTORE_OUTCOME_CONVERGED,
@@ -2417,7 +2425,9 @@ class WorkspaceVersioner:
                 if isinstance(resolved, MemberRestoreOutcome):
                     return resolved
                 pinned = resolved
-            outcome = self._file_cas_attempt(row, member, pinned, live_version, budget)
+            outcome = self._file_cas_attempt(
+                row, member, pinned, live_version, live_fingerprint, budget
+            )
             if outcome is not None:
                 return outcome
 
@@ -2463,6 +2473,7 @@ class WorkspaceVersioner:
         member: _FileMember,
         pinned: bytes,
         live_version: int,
+        live_fingerprint: str,
         budget: _LegBudget,
     ) -> MemberRestoreOutcome | None:
         """One version-checked CAS write; ``None`` means re-drive.
@@ -2470,6 +2481,14 @@ class WorkspaceVersioner:
         Detection-guarded ONLY: the CAS detects a foreign edit adapter-locally
         (typed :class:`~ccs.core.exceptions.CasVersionConflict`) — nothing here
         is, or may ever be labeled, substrate arbitration (no-arbiter).
+
+        ``live_version``/``live_fingerprint`` are the caller's CURRENT read,
+        passed per call rather than held by the loop, so a re-drive re-reads
+        both and the landed arm reports the iteration that WON (KTD7). The
+        version fills two roles at once here — the CAS comparand and the
+        observation's pointer — while the fingerprint is the leg's independent
+        evidence that the content differed (a source may rewrite bytes without
+        advancing its version, which the CAS alone cannot see).
         """
         path = row.member_path
         source = member.source
@@ -2481,6 +2500,12 @@ class WorkspaceVersioner:
             # read and the CAS — re-drive from a fresh read (leg-budgeted).
             return None
         except ViewWedged:
+            # This arm DID read a live comparand, but the observation states
+            # what the leg OVERWROTE and a wedged view landed nothing — so
+            # ``no_write_attempted`` (the default) is the truthful answer, and
+            # ``observed_differs`` would report a loss that did not occur. The
+            # member still concludes ``conflict``, which is the field an
+            # operator acts on.
             return MemberRestoreOutcome(
                 member_path=path,
                 outcome=RESTORE_OUTCOME_CONFLICT,
@@ -2491,6 +2516,12 @@ class WorkspaceVersioner:
                 ),
             )
         except CommitUnconfirmed:
+            # Deliberately the default too, and for a STRONGER reason than the
+            # wedged arm: this write may yet have landed. Naming a discarded
+            # version here would assert a loss nothing confirmed, and the
+            # honest understatement leaves ``held_unconfirmed`` — which is
+            # already the loudest terminal — as the signal. Fail closed toward
+            # claiming less, never toward claiming a divergence.
             return MemberRestoreOutcome(
                 member_path=path,
                 outcome=RESTORE_OUTCOME_HELD_UNCONFIRMED,
@@ -2511,6 +2542,18 @@ class WorkspaceVersioner:
                 "pinned bytes landed via the detection-guarded version-CAS "
                 f"(attempt {budget.attempts}; no-arbiter: adapter-local "
                 "detection, never substrate arbitration)"
+            ),
+            # The ONE arm with a confirmed write behind it, and the leg reached
+            # it only past the converged short-circuit — so the live content
+            # provably differed from the capture. Both halves name the state
+            # just OVERWRITTEN (``live_version``), never the one just minted
+            # (``live_version + 1``, carried separately above): conflating them
+            # would hand an operator the pointer of the state they still have.
+            # A REPORT value only — nothing may seed a later comparand from it.
+            observation=RestoreObservation(
+                state=RESTORE_OBSERVATION_DIFFERS,
+                pointer=str(live_version),
+                fingerprint=live_fingerprint,
             ),
         )
 
