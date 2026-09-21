@@ -670,10 +670,10 @@ class RestoreObservation:
 # converged, was skipped, or was absorbed before any write), while
 # ``not_recorded`` is the absence of a fact — this run drove no leg, or drove
 # one whose outcome it could not learn.
-OBSERVATION_NO_WRITE_ATTEMPTED: Final = RestoreObservation(
+OBSERVATION_NO_WRITE_ATTEMPTED: Final[RestoreObservation] = RestoreObservation(
     state=RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
 )
-OBSERVATION_NOT_RECORDED: Final = RestoreObservation(
+OBSERVATION_NOT_RECORDED: Final[RestoreObservation] = RestoreObservation(
     state=RESTORE_OBSERVATION_NOT_RECORDED
 )
 

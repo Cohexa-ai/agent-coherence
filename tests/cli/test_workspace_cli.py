@@ -27,7 +27,6 @@ Covers, per the plan's Unit-8 scenarios:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -63,10 +62,11 @@ from ccs.core.exceptions import (
     RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
     RESTORE_OBSERVATION_NOT_RECORDED,
     RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    RESTORE_OUTCOME_RESTORED,
     STALE_READ_GENERATION_REASON,
     WORKSPACE_REGISTRATION_REFUSED,
 )
-from ccs.core.substrate import ArbitrationTier, RestoreTier
+from ccs.core.substrate import ArbitrationTier, RestoreTier, sha256_hex
 from ccs.core.types import ConflictDetail, WorkspaceRegistrationResult
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1026,7 +1026,7 @@ def test_restore_json_names_the_version_and_digest_the_write_discarded(
     # The pointer is the version that was OVERWRITTEN, reachable as its own
     # value; the fingerprint is the digest of the bytes the restore replaced.
     assert isinstance(observation["pointer"], str) and observation["pointer"]
-    assert observation["fingerprint"] == hashlib.sha256(DISCARDED_BYTES).hexdigest()
+    assert observation["fingerprint"] == sha256_hex(DISCARDED_BYTES)
 
 
 def test_restore_json_keeps_every_pre_observation_member_key(
@@ -1134,7 +1134,7 @@ def test_object_only_observation_states_render_without_a_pointer() -> None:
     ):
         outcome = MemberRestoreOutcome(
             member_path="bucket/key",
-            outcome="restored",
+            outcome=RESTORE_OUTCOME_RESTORED,
             attempts=1,
             detail="synthesized for the renderer",
             observation=RestoreObservation(state),
@@ -1163,7 +1163,7 @@ def _synthetic_outcome(state: str) -> MemberRestoreOutcome:
     input, without a command invocation around it."""
     return MemberRestoreOutcome(
         member_path="bucket/key",
-        outcome="restored",
+        outcome=RESTORE_OUTCOME_RESTORED,
         attempts=1,
         detail="synthesized for the gate",
         observation=RestoreObservation(state),
