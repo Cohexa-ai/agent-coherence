@@ -8,6 +8,44 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A restore now says what it put the captured bytes back over.**
+  `WorkspaceVersioner.restore()` lands a checkpoint's captured bytes over
+  whatever is live at that moment. Where a member's content had moved after
+  the capture, the write discarded that later version — and the run reported
+  the member `restored`, exited 0, and said nothing anywhere about what it had
+  overwritten. The information was never missing, only dropped: each leg
+  already reads the live state to build its conditional write's comparand, and
+  then threw the read away.
+  That read is now kept. Every member outcome carries an `observation` naming
+  what its leg saw. `observed_differs` is the one that matters — a live state
+  was read, it differed from the capture, and the write discarded it; it alone
+  also names the version overwritten and a digest of the content overwritten.
+  The other four are as honest about seeing nothing: `no_live_state` (the
+  write landed on nothing), `present_not_comparable` (a delete leg's probe
+  established that live state existed and destroyed it, without reading a
+  comparand to name it by), `no_write_attempted` (the member reached its
+  terminal without a write decision), and `not_recorded` — the run holds no
+  observation for that member, which is its own answer and never a clean one.
+  The human report flags each member the exit code below can fail a run for —
+  `overwrote-differing-content` with `overwritten-version=<pointer>` where the
+  leg named one, `destroyed-uncompared-content`, or
+  `overwritten-content-not-recorded` — and leaves every other member's line as
+  it was; under `--json` each member carries a nested `observation` block
+  beside the keys it already had. No second substrate call was added for any of
+  it, and no existing key, outcome name or line changed.
+  What a restore *does* is deliberately unchanged: nothing refuses, absorbs or
+  fences a member on account of this, and a restore is still not a merge. If
+  you would rather such a run be a failure,
+  `agent-coherence-workspace restore --exit-nonzero-on-discarded-content`
+  exits 4 when any member discarded post-capture content or holds no record of
+  what it overwrote. Because the observation is not persisted, re-running a
+  restore that did write reports no record for those members and exits 4 again
+  whatever the second run found, so the flag answers "did this run discard
+  anything" rather than "is this checkpoint settled" and does not belong in a
+  retry-until-zero loop. It is opt-in — the same run exits 0 without it — the
+  two existing producers of exit 3 take precedence over it, and it is read after
+  the engine returns, so it reports the write and cannot prevent it.
+
 - **Checkpoint pins can now be released through the Python API.**
   A workspace checkpoint over S3 object members places a legal hold on each
   captured version. Those holds outlive lifecycle expiry, version-targeted

@@ -887,12 +887,24 @@ for member in report.members:
 
 | Outcome | Meaning |
 |---|---|
-| `restored` | the captured bytes landed via the member's conditional write |
+| `restored` | the captured bytes landed via the member's conditional write — over whatever was live at that moment, including content committed after the capture; the report below says, per member, what that write discarded |
 | `converged` | the live state already matched the manifest — nothing written |
 | `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives** |
 | `target_lost` | the captured version is no longer reachable (expired retention, a vanished S3 version), or the member itself can no longer be driven safely (its path became a symlink, a hardlink with an outside co-owner, or a non-regular file) — reported, never substituted |
 | `forward_only_skipped` | a declared action surface (or an uncapturable member) — enumerated, skipped |
 | `held_unconfirmed` | a write whose outcome could not be confirmed — held, never guessed |
+
+**What a restore does not promise.** A restore is not a merge, and nothing on this path refuses a write: a member whose content moved after the capture is put back over, and that later content is gone. What the run gives you is the record of it. Every leg already reads the live state to build its conditional write's comparand, and each member now carries that read as an **observation** in one of five states:
+
+| Observation | Meaning |
+|---|---|
+| `observed_differs` | a live state was read, it differed from the capture, and the write discarded it — the only state that names the version overwritten and a digest of the content overwritten |
+| `no_live_state` | the write landed on nothing (create-on-absent) — it discarded nothing |
+| `present_not_comparable` | a delete leg's probe established that live state existed and destroyed it, but read no comparand — so it names neither version nor digest |
+| `no_write_attempted` | the member reached its terminal without a write decision: converged, forward-only skipped, or absorbed before any write was issued (a wedged view, an exhausted re-drive budget). Also what a resumed member reports when its recorded outcome proves no write landed |
+| `not_recorded` | this run holds no observation for the member. Either a leg ran and its outcome was lost — an unconfirmed commit, a reconciled unknown write, or a failure absorbed from inside the leg, any of which may have destroyed live state — or no leg ran and the recorded outcome does not itself prove none ever did. Never read it as clean |
+
+Nothing was added to the substrate wire for this: the values ride the read each leg was already making, and on an S3 leg the ETag stays the comparand while the `versionId` is the pointer. The human report flags every state the exit code below can fire on, on that member's line: `overwrote-differing-content` — and, where the leg named one, `overwritten-version=<pointer>` — for `observed_differs`, `destroyed-uncompared-content` for `present_not_comparable`, and `overwritten-content-not-recorded` for `not_recorded`. The two states it does not flag are the two that exit code does not fire on, and their lines read exactly as they did before. Under `--json` each member carries a nested `observation` block (`state`, `pointer`, `fingerprint`) alongside the keys it already had. If you would rather a run like that be a failure, `restore --exit-nonzero-on-discarded-content` makes it exit `4` — see the exit codes below; it is read after the engine returns, so it reports the write and cannot prevent it. One caveat before you put it in a loop: the observation is not persisted, so re-running a restore that *did* write reports `not_recorded` for those members and exits `4` again, whatever the second run found. It answers "did this run discard anything", not "is this checkpoint settled", so it does not belong in a retry-until-zero script.
 
 Each member's leg rides its own backend's arbitration: S3 legs are a native conditional write (`If-Match` — the substrate arbitrates a racing foreign writer); file legs are a version-checked write whose foreign-edit signal is **detection only** (`no-arbiter`) — a foreign edit racing a file restore is detected and reported as a typed conflict, never presented as substrate arbitration. Restore progress is durable, so a restore interrupted mid-way resumes idempotently: already-terminal members are skipped, and a member whose live state already matches concludes `converged` without a second write.
 
@@ -931,10 +943,11 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| `0` | the verb succeeded (restore: concluded with every member clean) |
+| `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
 | `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
+| `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
 **Where a refusal lands.** A containment refusal at **capture** is a hard exit-`2` refusal with nothing persisted. The same refusal raised inside a **restore** leg is deliberately not: the termination contract absorbs it into that member's `target_lost` so every other member still concludes, and the refusal text becomes that member's outcome detail — exit `3`, never a checkpoint left stuck mid-restore.
 
