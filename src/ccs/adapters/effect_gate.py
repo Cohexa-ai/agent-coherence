@@ -57,6 +57,7 @@ from ccs.core.exceptions import (
     HOLD_READ_DENIED,
     HOLD_VERSION_MOVED,
     HOLD_VERSION_UNCONFIRMED,
+    InvariantViolationError,
     StaleView,
 )
 from ccs.core.fence import classify_hold
@@ -125,6 +126,12 @@ def gate(
         StaleView: the input moved, vanished, or lost its grant between capture
             and fire; the effect did not run. Recover via
             ``volume.reacquire(path)`` then re-decide.
+        InvariantViolationError: ``volume`` cannot report the grant state of
+            its reads, so the fence cannot answer its third leg for it (see
+            :func:`_require_grant_state`). A ``CoherentVolume`` always can; a
+            duck-typed stand-in must declare both flags. Not a ``StaleView``,
+            because no re-read can clear it -- but still under
+            ``CoherenceError``, so an existing handler catches it.
     """
     if not callable(decide):
         raise TypeError("gate() requires a callable decide=")
@@ -253,6 +260,54 @@ def _held(
     return exc
 
 
+#: The two answers the fence's third leg is MADE of: whether the coordinator
+#: REFUSED the re-validate read, and whether it served that read without a
+#: standing grant. A volume REPORTS both on its last read and the fence cannot
+#: derive either from the ``(version, owner_generation)`` pair -- which is
+#: precisely why a peer's write-claim preemption is invisible without them.
+_GRANT_STATE_FLAGS: tuple[str, str] = ("_last_read_denied", "_last_read_stale")
+
+
+def _require_grant_state(volume: "CoherentVolume") -> None:
+    """Refuse a volume that cannot report the grant state of its last read.
+
+    These two were once read through a defaulting accessor, justified as
+    compatibility for duck-typed volumes that predated the flags. That
+    allowance is WITHDRAWN: an absent flag is indistinguishable from an
+    affirmative "nothing was wrong", so it did not degrade the fence, it
+    silently DELETED a leg -- the one that catches a peer's pessimistic
+    write-acquire, which moves NEITHER comparand. ``CoherentVolume`` declares
+    both in its class body, so every real instance carries them from
+    construction and nothing shipped reaches this raise.
+
+    Typed INSIDE the coherence hierarchy on purpose, and that -- not the
+    requirement itself -- is the compatibility that matters here: a bare
+    ``AttributeError`` from reading the flag directly, or the ``TypeError`` a
+    missing :class:`~ccs.core.types.FenceComparands` keyword would raise, is
+    catchable as neither :class:`~ccs.core.exceptions.StaleView` nor its base
+    :class:`~ccs.core.exceptions.CoherenceError`, so a caller that catches a
+    HOLD today (``ccs.mcp.server`` catches the base around :func:`check_fence`)
+    would CRASH where it used to hold. It is deliberately NOT a ``StaleView``
+    either: re-reading cannot supply a flag the volume never declares, so the
+    retryable ``stale_view`` recovery would send a cooperating agent into a
+    reacquire loop that can never clear.
+
+    Raises:
+        InvariantViolationError: the volume reports neither flag, or only one
+            of the two -- a half-equipped volume keeps the deny leg and loses
+            the preemption leg, which is the same fail-open wearing one flag.
+    """
+    missing = [name for name in _GRANT_STATE_FLAGS if not hasattr(volume, name)]
+    if missing:
+        raise InvariantViolationError(
+            f"{type(volume).__name__} cannot report the grant state of its "
+            f"reads (missing {', '.join(missing)}), so the effect fence cannot "
+            "see a write-claim preemption -- which moves neither the version "
+            "nor the ownership generation. Declare both flags and set them on "
+            "every read_with_version_generation()"
+        )
+
+
 def check_fence(
     volume: "CoherentVolume",
     path: str | os.PathLike[str],
@@ -279,7 +334,18 @@ def check_fence(
     re-grant), since a peer's write-claim preemption moves neither comparand. Same honest
     boundary as :func:`gate`: the verdict is true as of THIS check, and the
     caller's dispatch still follows it.
+
+    A volume that cannot report the grant state of its reads is refused before
+    the re-validate read even runs (:func:`_require_grant_state`) -- typed
+    inside the coherence hierarchy, so a caller that catches a HOLD catches
+    this too rather than crashing on a bare ``AttributeError``.
     """
+
+    # PRECONDITION, checked before the re-validate read rather than around it:
+    # the third leg is built from answers only the volume can give, so a volume
+    # that cannot give them fails LOUD here instead of gating on a fabricated
+    # "nothing was wrong". Unconditional, so no read path can slip past it.
+    _require_grant_state(volume)
 
     current_version: int | None
     current_generation: int | None
@@ -292,7 +358,10 @@ def check_fence(
         _, current_version, current_generation = volume.read_with_version_generation(
             path, observe=False
         )
-        denied = bool(getattr(volume, "_last_read_denied", False))
+        # Read DIRECTLY, no default: _require_grant_state() above proved both
+        # flags exist, and a defaulting accessor is what silently admitted a
+        # volume that answers neither question.
+        denied = bool(volume._last_read_denied)
         # The third leg of the fence: the pair answers "did the value or the
         # epoch move", but a peer's pessimistic write-acquire ends the caller's
         # grant while moving NEITHER (no commit yet, and trigger="write" is
@@ -300,9 +369,9 @@ def check_fence(
         # even see an S-holder's preemption). The re-validate read itself
         # carries the answer: a stale-status response (warn re-grant or deny)
         # means the grant the decision was read under did NOT stand at this
-        # check. getattr keeps duck-typed volumes that predate the flag on the
-        # pair-only behavior.
-        lapsed = bool(getattr(volume, "_last_read_stale", False))
+        # check. A volume that does not report it never reaches here -- the
+        # pair-only fallback that allowance produced WAS this leg's absence.
+        lapsed = bool(volume._last_read_stale)
     except FileNotFoundError:
         # The input is GONE: the vanish sentinels, and no read to have been
         # refused or served grantless (the stale ``_last_read_*`` flags describe
