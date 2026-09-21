@@ -46,6 +46,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
@@ -81,9 +82,11 @@ from ccs.core.exceptions import (
     StaleReadGeneration,
     WatchdogAbandoned,
 )
+from ccs.core.fence import coordinator_holds_content_claim
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
+    Artifact,
     ConflictDetail,
     DataPlaneDeferredRead,
     MultiCommitConflict,
@@ -5273,6 +5276,196 @@ def _is_recent_self_commit_lag(
     if updated_at is None:
         return False
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+
+
+# ----------------------------------------------------------------------
+# The tracked-artifact pre-read decision, as a value
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TrackedReadDecision:
+    """The fresh / stale / denied verdict for an ALREADY-TRACKED artifact.
+
+    ``_handle_pre_read`` answers this question today by interleaving the
+    decision with the mutations it triggers — the fresh arm bumps two counters
+    and can return a strict deny; the stale arm re-grants SHARED, marks the
+    session stale-warned and drains notices — so a surface that must answer
+    the SAME question WITHOUT granting anything cannot reach the answer by
+    calling the handler. This type is that answer with the mutations left
+    behind, so two surfaces branch off one classification rather than off two
+    copies of a safety rule.
+
+    Every field keys a branch a caller still has to take:
+
+    ``outcome``
+        which response to build: the fresh payload, the stale envelope, or
+        the byte-stable strict deny.
+    ``version``
+        the fresh payload's ``version`` and the stale summary's
+        ``current_version`` — both from the SAME pair-atomic snapshot the
+        caller read, never a second read a peer commit could overtake.
+    ``owner_generation``
+        the effect-gate opt-in pair member. ``None`` means the snapshot
+        carried none and the key is omitted rather than coerced to ``0``.
+    ``fresh_hash_differs``
+        the FRESH arm's mismatch: bumps ``fresh_shared_hash_mismatch_total``
+        and sets ``hash_differs`` on the fresh payload.
+    ``stale_hash_differs``
+        the STALE arm's mismatch: the summary's ``hash_differs``, and half
+        the no-prior-grant deny gate.
+    ``commit_lag_suppressed``
+        the fresh arm's deny was WITHHELD as the benign commit→disk-write lag
+        (Survivor #6 R2); bumps ``shared_foreign_lag_suppressed_total``.
+    ``holds_valid_grant``
+        which arm produced the verdict, and therefore which ``source`` a deny
+        carries (``pre_read_shared_hash_deny`` vs ``pre_read_strict_deny``) —
+        ``denied`` alone cannot tell the two deny arms apart.
+    ``prior_version_seen``
+        the summary's ``prior_version_seen_by_session``, already resolved for
+        the arm that ran: the current version for a still-granted holder, one
+        below it for an INVALIDated one, ``None`` for a session with no prior
+        grant.
+
+    THE TWO HASH PREDICATES ARE NOT ONE PREDICATE, and folding them into one
+    field silently moves the strict-deny gate in whichever direction the
+    survivor points. ``fresh_hash_differs`` excludes the no-claim recorded
+    hashes (``None``, ``""``, the all-``f`` launch-gate sentinel) because a
+    still-SHARED holder must never be denied against content the coordinator
+    never claimed. ``stale_hash_differs`` keeps them IN, because the
+    launch-gate scenarios reach their deny THROUGH the stale arm and the
+    sentinel is precisely what makes their hashes differ.
+    """
+
+    outcome: Literal["fresh", "stale", "denied"]
+    version: int
+    owner_generation: int | None
+    fresh_hash_differs: bool
+    stale_hash_differs: bool
+    commit_lag_suppressed: bool
+    holds_valid_grant: bool
+    prior_version_seen: int | None
+
+
+def decide_tracked_read(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    artifact_id: UUID,
+    agent_id: UUID,
+    artifact: Artifact,
+    owner_generation: int | None,
+    agent_state: MESIState | None,
+    caller_content_hash: str | None,
+    now_unix: float,
+) -> TrackedReadDecision:
+    """Classify a pre-read of an already-tracked artifact. PURE QUERY.
+
+    Takes the values the caller has ALREADY read — the pair-atomic
+    ``(artifact, owner_generation)`` snapshot, this agent's MESI state, the
+    hash the caller offered — and reads nothing further except
+    ``policy.is_strict_mode`` and, on the one arm that consults it, the lag
+    gate's two registry lookups. It grants nothing, re-grants nothing,
+    advances no observation baseline, bumps no counter, records no heartbeat,
+    marks no stale pair, records no deny and pops no notice. That is the whole
+    point: a read on the safety path must not mutate or heal what it checks,
+    so a verdict surface can ANSWER without also committing to the effects
+    ``_handle_pre_read`` performs around the same decision — a verdict that
+    healed a grant would turn a level-triggered HOLD into an edge-triggered
+    one.
+
+    ``now_unix`` is the CALLER's single clock read (KTD-P): the lag gate and
+    every summary timestamp stamped from this verdict must share one instant,
+    so the clock is an argument rather than a call inside.
+
+    The classification mirrors ``_handle_pre_read``'s tracked branch exactly.
+    The untracked and first-observation branches are deliberately NOT covered:
+    each reaches its answer BY mutating (registering the artifact, seeding v1,
+    granting SHARED), so neither has a side-effect-free form to extract.
+
+    Args:
+        artifact: the artifact from the caller's snapshot. Non-optional —
+            a vanished row is the caller's branch to take, as it is today.
+    """
+    # A grant that is present and not INVALID is the fresh arm's admission
+    # ticket: the holder was granted on the current version, and a peer commit
+    # would have invalidated it.
+    holds_valid_grant = agent_state is not None and agent_state != MESIState.INVALID
+
+    # The FRESH arm's mismatch predicate. ``coordinator_holds_content_claim``
+    # is the core fence's own no-claim normalisation — the same three spellings
+    # of "nothing was recorded" (``None``, ``""``, the all-``f`` sentinel) that
+    # the in-process fence refuses to treat as a content claim — so this
+    # surface asks the shared rule instead of restating it against a local copy
+    # of the sentinel literal.
+    fresh_hash_differs = bool(
+        caller_content_hash
+        and coordinator_holds_content_claim(artifact.content_hash)
+        and caller_content_hash != artifact.content_hash
+    )
+    # The STALE arm's mismatch predicate: the same comparison MINUS the
+    # no-claim exclusion. Kept separate on purpose (see TrackedReadDecision).
+    stale_hash_differs = bool(
+        caller_content_hash
+        and artifact.content_hash
+        and caller_content_hash != artifact.content_hash
+    )
+
+    if holds_valid_grant:
+        # Survivor #6 v1: a still-SHARED holder whose disk hash mismatches the
+        # canonical content is this session's own disk diverging — either its
+        # own un-flushed recent commit (benign lag, suppress) or a foreign
+        # out-of-band edit (deny). Warn mode never denies here.
+        commit_lag_suppressed = False
+        outcome: Literal["fresh", "stale", "denied"] = "fresh"
+        if fresh_hash_differs and coordinator.policy.is_strict_mode(path):
+            if _is_recent_self_commit_lag(
+                coordinator, artifact_id, agent_id, now_unix=now_unix,
+            ):
+                commit_lag_suppressed = True
+            else:
+                outcome = "denied"
+        return TrackedReadDecision(
+            outcome=outcome,
+            version=artifact.version,
+            owner_generation=owner_generation,
+            fresh_hash_differs=fresh_hash_differs,
+            stale_hash_differs=stale_hash_differs,
+            commit_lag_suppressed=commit_lag_suppressed,
+            holds_valid_grant=True,
+            # A SHARED holder was granted on the current version; that is the
+            # version it last saw.
+            prior_version_seen=artifact.version,
+        )
+
+    # No valid grant: either a peer commit INVALIDated this session, or it has
+    # never seen this artifact.
+    prior_version_seen = None
+    if agent_state == MESIState.INVALID:
+        prior_version_seen = artifact.version - 1 if artifact.version > 0 else 0
+
+    # v0.2 KTD-O / KTD-P deny gate, unchanged: strict mode AND the session
+    # demonstrably lacks a fresh view — a true preemption (INVALID), or no
+    # prior grant at all while the bytes it just hashed differ from the
+    # canonical. Matching hashes mean the session is observing what the
+    # registry recorded, so there is nothing stale to act on: warn-mode allow.
+    denied = coordinator.policy.is_strict_mode(path) and (
+        agent_state == MESIState.INVALID
+        or (agent_state is None and stale_hash_differs)
+    )
+    return TrackedReadDecision(
+        outcome="denied" if denied else "stale",
+        version=artifact.version,
+        owner_generation=owner_generation,
+        fresh_hash_differs=fresh_hash_differs,
+        stale_hash_differs=stale_hash_differs,
+        # The lag gate belongs to the fresh arm only: it answers "is this
+        # holder's OWN un-flushed commit", and a caller with no standing grant
+        # has no such commit to be waiting on.
+        commit_lag_suppressed=False,
+        holds_valid_grant=False,
+        prior_version_seen=prior_version_seen,
+    )
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:

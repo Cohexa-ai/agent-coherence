@@ -28,7 +28,9 @@ from ccs.adapters.claude_code.coordinator_server import (
     _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
     CoordinatorHTTPServer,
+    TrackedReadDecision,
     _is_recent_self_commit_lag,
+    decide_tracked_read,
     session_to_agent_id,
 )
 from ccs.core.states import MESIState
@@ -5166,3 +5168,709 @@ def test_bounded_prose_paths_still_promise_deferral(
     assert "still queued" in text
     assert "next tracked-file operation" in text
     assert _pending_count(coordinator, session_to_agent_id(a)) == 4
+
+
+# ----------------------------------------------------------------------
+# U3a — decide_tracked_read: the tracked-artifact verdict as a VALUE
+#
+# _handle_pre_read decides fresh / stale / denied for an already-tracked
+# artifact WHILE it mutates: the fresh arm bumps two counters and can return
+# the strict deny, the stale arm re-grants SHARED, marks the pair stale-warned
+# and drains notices. A surface that must answer the SAME question without
+# granting anything therefore cannot reach the answer by calling the handler.
+# These tests pin the extracted verdict: that each arm returns what the handler
+# would have reported, that the two hash-differs predicates stay DISTINCT, and
+# — the claim any verdict route rests on — that asking changes nothing.
+# ----------------------------------------------------------------------
+
+_U3A_STRICT_PATH = "CLAUDE.md"  # tracked by default AND listed in strict_mode.yaml
+_U3A_WARN_PATH = "plan.md"      # tracked by the default **/plan.md glob, never strict
+# Per-arm paths, so the seven arms below own seven DISTINCT artifacts: they are
+# seeded at different versions, and sharing one row would let the last seed
+# silently rewrite what the earlier arms assert about.
+_U3A_STRICT_GLOB = "docs/specs/**/*.md"
+
+
+def _u3a_strict_path(name: str) -> str:
+    return f"docs/specs/{name}.md"
+
+
+def _u3a_warn_path(name: str) -> str:
+    return f"docs/plans/{name}.md"
+
+
+def _u3a_write_policy(root: Path) -> None:
+    """Materialize strict_mode.yaml: CLAUDE.md and docs/specs/** are strict,
+    everything else tracked stays warn-mode.
+
+    Policy is loaded ONCE at construction, so this must run before the server
+    is built — mutating ``server.policy`` afterwards would test a shape no
+    operator can produce.
+    """
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "strict_mode.yaml").write_text(
+        f"- {_U3A_STRICT_PATH}\n- {_U3A_STRICT_GLOB}\n"
+    )
+
+
+def _u3a_assert_policy(server: CoordinatorHTTPServer) -> None:
+    """Fail loudly if the fixture paths are not the modes every test below
+    assumes — a silently warn-mode "strict" path would turn every deny
+    assertion into a vacuous fresh/stale assertion."""
+    assert server.policy.is_strict_mode(_U3A_STRICT_PATH)
+    assert server.policy.is_strict_mode(_u3a_strict_path("probe"))
+    assert server.policy.is_tracked(_U3A_WARN_PATH)
+    assert not server.policy.is_strict_mode(_U3A_WARN_PATH)
+    assert server.policy.is_tracked(_u3a_warn_path("probe"))
+    assert not server.policy.is_strict_mode(_u3a_warn_path("probe"))
+
+
+@pytest.fixture
+def decider(tmp_path: Path):
+    """A coordinator built but NOT served: decide_tracked_read is an in-process
+    call, so an accept loop would add a thread and a port to every assertion
+    and nothing else."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-decider")
+    _u3a_assert_policy(server)
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def served_decider(tmp_path: Path):
+    """The same policy on a LIVE coordinator, yielded with its client, so a
+    verdict can be compared against the response the real handler builds."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-served")
+    _u3a_assert_policy(server)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    secret = load_secret(server.coordinator_root)
+    assert secret is not None
+    try:
+        yield server, _Client("127.0.0.1", server.port, secret)
+    finally:
+        server.shutdown()
+
+
+def _u3a_seed(
+    server: CoordinatorHTTPServer,
+    path: str,
+    *,
+    recorded_hash: str,
+    state: Optional[MESIState],
+    label: str = "s1",
+    version: Optional[int] = None,
+    last_writer: Optional[uuid.UUID] = None,
+):
+    """Park an (agent, artifact) pair in the state an arm needs.
+
+    Returns ``(session_id, agent_id, artifact_id)``. ``state=None`` leaves the
+    session with no grant at all — the "stale beliefs from somewhere else"
+    case the no-prior-grant deny gate exists for.
+    """
+    sid = _sid(label)
+    agent_id = server.register_session(sid)
+    artifact_id = server.registry.resolve_or_register(path, content_hash=recorded_hash)
+    if version is not None or last_writer is not None:
+        art = server.registry.get_artifact(artifact_id)
+        server.registry.set_artifact_and_content(
+            artifact_id,
+            dataclasses.replace(art, version=art.version if version is None else version),
+            "",
+            last_writer=last_writer,
+        )
+    if state is not None:
+        server.registry.set_agent_state(
+            artifact_id, agent_id, state,
+            trigger="u3a-test", tick=1, content_hash=recorded_hash,
+        )
+    return sid, agent_id, artifact_id
+
+
+def _u3a_decide(
+    server: CoordinatorHTTPServer,
+    artifact_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    *,
+    path: str,
+    caller_hash: Optional[str],
+    now_unix: float = 1000.0,
+) -> TrackedReadDecision:
+    """Call the verdict with exactly the values the handler has already read at
+    the point its tracked branch begins — one pair-atomic snapshot, this
+    agent's MESI state, the hash the caller offered."""
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None
+    artifact, generation = pair
+    return decide_tracked_read(
+        server,
+        path=path,
+        artifact_id=artifact_id,
+        agent_id=agent_id,
+        artifact=artifact,
+        owner_generation=generation,
+        agent_state=server.registry.get_agent_state(artifact_id, agent_id),
+        caller_content_hash=caller_hash,
+        now_unix=now_unix,
+    )
+
+
+# --- one arm per state that produces it ------------------------------------
+
+
+def test_decide_fresh_for_granted_holder_whose_hash_matches(decider) -> None:
+    """The plain fresh arm: a still-SHARED holder re-reading the bytes the
+    registry recorded. Neither hash predicate fires, nothing is suppressed, and
+    the version reported is the one from the caller's own snapshot."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("v3-bytes"))
+
+    assert d.outcome == "fresh"
+    assert d.version == 3
+    assert d.holds_valid_grant is True
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.commit_lag_suppressed is False
+    # A SHARED holder was granted on the current version; that is what it saw.
+    assert d.prior_version_seen == 3
+
+
+def test_decide_fresh_with_hash_differs_in_warn_mode(decider) -> None:
+    """Warn mode never denies: the mismatch is surfaced on the verdict (the
+    handler turns it into the additive ``hash_differs`` key and one counter
+    bump) but the outcome stays fresh."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("out-of-band"))
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_denied_for_granted_holder_foreign_edit_in_strict_mode(decider) -> None:
+    """Survivor #6: a still-SHARED holder proves no peer commit since its
+    grant, so a differing disk hash written by SOMEONE ELSE is a foreign
+    out-of-band edit — denied, through the fresh arm."""
+    peer = decider.register_session(_sid("peer-writer"))
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, last_writer=peer,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("foreign-edit"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is True, "the deny came through the FRESH arm"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+    assert d.version == 2
+    assert d.prior_version_seen == 2
+
+
+def test_decide_fresh_when_the_lag_gate_withholds_the_deny(decider) -> None:
+    """The same state, except the caller IS the artifact's recent last
+    committer: the benign commit -> disk-write lag, suppressed rather than
+    denied. Two distinct facts on one value — the outcome flipped back to fresh
+    AND the suppression that flipped it, which is the counter bump a caller
+    still owes."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    # Self-commit: make the caller the writer and read one second after it.
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is True
+
+
+def test_decide_denied_outside_the_lag_window(decider) -> None:
+    """The recency clause is load-bearing: the same self-commit read LATER than
+    the window is a genuine foreign edit again. Without this the suppression
+    field could be hard-wired True and every test above would still pass."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+    late = updated_at + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("foreign-edit"), now_unix=late)
+
+    assert d.outcome == "denied"
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_stale_for_invalidated_session_in_warn_mode(decider) -> None:
+    """A peer commit invalidated this session; warn mode allows with the stale
+    warning. ``prior_version_seen`` is one BELOW the current version — the
+    version the session last held a grant on."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.holds_valid_grant is False
+    assert d.version == 4
+    assert d.prior_version_seen == 3
+
+
+def test_decide_denied_for_invalidated_session_in_strict_mode(decider) -> None:
+    """True preemption under strict mode: denied on the INVALID state ALONE,
+    with no hash comparison needed — the session's context still carries the
+    beliefs the peer commit superseded."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is False
+    assert d.stale_hash_differs is False, "the INVALID leg denies without a mismatch"
+    assert d.prior_version_seen == 3
+
+
+def test_decide_stale_for_unseen_session_whose_hash_matches(decider) -> None:
+    """No prior grant but the session is looking at the bytes the registry
+    recorded: nothing stale to act on, so strict mode falls through to the
+    warn-mode allow. ``prior_version_seen`` is None — it saw no version."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None, version=2,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.prior_version_seen is None
+
+
+def test_decide_denied_for_unseen_session_whose_hash_differs(decider) -> None:
+    """No prior grant AND different bytes: stale beliefs from somewhere else,
+    denied. This is the leg the launch-gate scenarios arrive through."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("stale-beliefs"))
+
+    assert d.outcome == "denied"
+    assert d.stale_hash_differs is True
+
+
+def test_decide_reports_the_generation_from_the_callers_snapshot(decider) -> None:
+    """The generation rides the SAME pair-atomic read as the version, on every
+    arm — never a second read a peer commit could overtake, and never coerced
+    to 0 when absent."""
+    for path, state, outcome in (
+        (_U3A_STRICT_PATH, MESIState.SHARED, "fresh"),
+        (_U3A_WARN_PATH, MESIState.INVALID, "stale"),
+    ):
+        _, agent_id, artifact_id = _u3a_seed(
+            decider, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"gen-{outcome}",
+        )
+        pair = decider.registry.get_artifact_and_generation(artifact_id)
+        assert pair is not None
+
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=_hash("canonical"))
+
+        assert d.outcome == outcome
+        assert d.owner_generation == pair[1]
+        assert d.version == pair[0].version
+
+
+# --- the deliberate asymmetry between the two hash predicates --------------
+
+
+def test_sentinel_recorded_hash_differs_on_the_stale_arm_only(decider) -> None:
+    """The all-``f`` launch-gate sentinel is not a SHA-256 of anything, so the
+    coordinator holds no content claim against it.
+
+    The FRESH arm must not fire on it — denying a still-SHARED holder against
+    content the coordinator never claimed would be a false deny. The STALE arm
+    must, because the launch-gate scenarios reach their deny THROUGH that arm
+    and the sentinel is exactly what makes their hashes differ. One value
+    carries both answers; unifying the two predicates silently moves the
+    strict-deny gate whichever way the survivor points.
+    """
+    _, granted_agent, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="f" * 64,
+        state=MESIState.SHARED, label="granted",
+    )
+    unseen_agent = decider.register_session(_sid("unseen"))
+
+    granted = _u3a_decide(decider, artifact_id, granted_agent,
+                          path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+    unseen = _u3a_decide(decider, artifact_id, unseen_agent,
+                         path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    # Same artifact, same caller hash — the two predicates disagree on purpose.
+    assert granted.fresh_hash_differs is False
+    assert granted.outcome == "fresh", "no content claim => no foreign-edit deny"
+    assert unseen.stale_hash_differs is True
+    assert unseen.outcome == "denied", "the launch-gate deny still fires"
+
+
+def test_empty_recorded_hash_never_fires_either_predicate(decider) -> None:
+    """The OTHER no-claim seed: a KTD-9 first observation with no caller hash
+    records "" and surfaces as None. Nothing to compare against on either arm,
+    so no mismatch and — with no mismatch — no deny for a session with no
+    prior grant."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="", state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+def test_absent_caller_hash_never_fires_either_predicate(decider) -> None:
+    """A pre-read may carry no content_hash at all (the caller does not have
+    one yet). With nothing on the caller's side there is no comparison to make
+    on either arm."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"), state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=None)
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+# --- R7: the call is a pure query ------------------------------------------
+
+
+def _u3a_observable(server: CoordinatorHTTPServer, agent_id, artifact_id) -> dict:
+    """Everything _handle_pre_read moves around this decision, read through
+    NON-destructive accessors only (peek, not pop).
+
+    Anything the verdict quietly granted, healed, counted or recorded shows up
+    as a difference here — which is the only thing that makes the purity claim
+    testable rather than eyeballed.
+    """
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    coherence = server.coordinator_root / ".coherence"
+    return {
+        "counters": server.counters_snapshot(),
+        "version": pair[0].version if pair else None,
+        # The coordinator-side observation baseline: the canonical content the
+        # registry vouches for. A verdict that "healed" it would absolve the
+        # very out-of-band edit it exists to report.
+        "canonical_hash": pair[0].content_hash if pair else None,
+        "owner_generation": pair[1] if pair else None,
+        "grant": server.registry.get_agent_state(artifact_id, agent_id),
+        "heartbeat": server.registry.last_heartbeat_tick(agent_id),
+        "notice": server.registry.peek_preemption_notice(agent_id, artifact_id),
+        "stale_warned": set(server._stale_warned_pairs),
+        "strict_denies": dict(server._recent_strict_denies),
+        # Names for "nothing new appeared"; sizes only for the append-only logs
+        # (a deny writes audit.log). SQLite's own db/-wal/-shm sizes are not
+        # asserted — a read can legitimately move them, and asserting on them
+        # would trade a real guard for a flaky one.
+        "coherence_files": sorted(p.name for p in coherence.iterdir()),
+        "audit_logs": sorted((p.name, p.stat().st_size) for p in coherence.glob("*.log")),
+    }
+
+
+def _u3a_arms(server: CoordinatorHTTPServer) -> dict:
+    """Every arm of the verdict, each with the call that drives it. Keyed by
+    the handler behaviour it stands in for, so a regression names itself."""
+    arms: dict[str, tuple] = {}
+    for name, strict, state, caller, version in (
+        ("fresh-granted", True, MESIState.SHARED, "canonical", 1),
+        ("fresh-mismatch-warn", False, MESIState.SHARED, "out-of-band", 1),
+        ("denied-shared-foreign", True, MESIState.SHARED, "foreign", 2),
+        ("stale-invalid-warn", False, MESIState.INVALID, "canonical", 4),
+        ("denied-invalid-strict", True, MESIState.INVALID, "canonical", 4),
+        ("stale-unseen", True, None, "canonical", 2),
+        ("denied-unseen-mismatch", True, None, "stale-beliefs", 2),
+    ):
+        path = _u3a_strict_path(name) if strict else _u3a_warn_path(name)
+        # A PEER is the last writer everywhere here, so the lag gate answers
+        # False on its own merits and no arm depends on the injected clock.
+        peer = server.register_session(_sid(f"peer-{name}"))
+        _, agent_id, artifact_id = _u3a_seed(
+            server, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"arm-{name}", version=version, last_writer=peer,
+        )
+        arms[name] = (path, agent_id, artifact_id, _hash(caller))
+    return arms
+
+
+@pytest.mark.parametrize("arm", [
+    "fresh-granted",
+    "fresh-mismatch-warn",
+    "denied-shared-foreign",
+    "stale-invalid-warn",
+    "denied-invalid-strict",
+    "stale-unseen",
+    "denied-unseen-mismatch",
+])
+def test_decide_twice_changes_nothing_observable(decider, arm: str) -> None:
+    """R7, asserted as a before/after rather than by reading the source.
+
+    On every arm the handler does something here — bumps a counter, re-grants
+    SHARED, marks the pair stale-warned, records the deny, appends the audit
+    row, pops the notice. The verdict must do NONE of it, so calling it twice
+    in a row leaves version, generation, canonical hash, grant state, heartbeat
+    tick, pending notice, stale markers, deny records, the .coherence files and
+    EVERY counter exactly as they were — and answers the same both times.
+    """
+    arms = _u3a_arms(decider)
+    path, agent_id, artifact_id, caller_hash = arms[arm]
+    # Give each dimension a non-default value first: an assertion that None
+    # stayed None proves much less than one that 41 stayed 41.
+    decider.registry.record_heartbeat(agent_id, 41)
+    decider.registry.record_preemption_notice(
+        victim_agent_id=agent_id, artifact_id=artifact_id,
+        preempter_agent_id=decider.register_session(_sid("preempter")),
+        preempted_at_unix_ts=1234.0,
+    )
+    before = _u3a_observable(decider, agent_id, artifact_id)
+    assert before["heartbeat"] == 41
+    assert before["notice"] is not None
+
+    first = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+    second = _u3a_decide(decider, artifact_id, agent_id,
+                         path=path, caller_hash=caller_hash)
+
+    assert first == second, "the verdict is not a function of its own history"
+    assert _u3a_observable(decider, agent_id, artifact_id) == before
+
+
+def test_purity_check_covers_the_arm_that_would_deny(decider) -> None:
+    """Control for the test above: prove the parametrized arms really do reach
+    the deny and suppression legs. A purity proof over seven arms that all
+    quietly returned "stale" would be seven copies of one weak assertion."""
+    arms = _u3a_arms(decider)
+    outcomes = {
+        name: _u3a_decide(decider, artifact_id, agent_id,
+                          path=path, caller_hash=caller_hash).outcome
+        for name, (path, agent_id, artifact_id, caller_hash) in arms.items()
+    }
+    assert outcomes == {
+        "fresh-granted": "fresh",
+        "fresh-mismatch-warn": "fresh",
+        "denied-shared-foreign": "denied",
+        "stale-invalid-warn": "stale",
+        "denied-invalid-strict": "denied",
+        "stale-unseen": "stale",
+        "denied-unseen-mismatch": "denied",
+    }
+
+
+# --- every branch is drivable from the decision alone ----------------------
+
+
+def _u3a_render(d: TrackedReadDecision, *, want_generation: bool) -> dict:
+    """Rebuild the handler's response shape from the VERDICT ONLY.
+
+    No coordinator, no artifact, no agent state — if a field the handler
+    branches on were missing from the decision, this could not be written and
+    the next unit would have to re-derive it in the handler, which is the
+    duplication the extraction exists to remove.
+    """
+    if d.outcome == "denied":
+        return {
+            "source": (
+                "pre_read_shared_hash_deny" if d.holds_valid_grant
+                else "pre_read_strict_deny"
+            ),
+            "current_version": d.version,
+            "prior_version_seen_by_session": d.prior_version_seen,
+            # The fresh arm denies only ON a mismatch, so it reports True flat;
+            # the stale arm reports its own predicate (the INVALID leg denies
+            # without one).
+            "hash_differs": True if d.holds_valid_grant else d.stale_hash_differs,
+            "counter_bumps": ["strict_mode_denials_total"],
+        }
+    if d.outcome == "fresh":
+        payload: dict[str, Any] = {"status": "fresh", "version": d.version}
+        if d.fresh_hash_differs:
+            payload["hash_differs"] = True
+        if want_generation and d.owner_generation is not None:
+            payload["owner_generation"] = d.owner_generation
+        payload["counter_bumps"] = (
+            (["fresh_shared_hash_mismatch_total"] if d.fresh_hash_differs else [])
+            + (["shared_foreign_lag_suppressed_total"] if d.commit_lag_suppressed else [])
+        )
+        return payload
+    stale: dict[str, Any] = {
+        "status": "stale",
+        "current_version": d.version,
+        "prior_version_seen_by_session": d.prior_version_seen,
+        "hash_differs": d.stale_hash_differs,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    if want_generation and d.owner_generation is not None:
+        stale["owner_generation"] = d.owner_generation
+    return stale
+
+
+def test_every_handler_branch_is_drivable_from_the_decision_alone(decider) -> None:
+    """Each arm rendered from its verdict and nothing else. The expectations
+    are written out literally rather than recomputed from the decision — a
+    renderer checked against itself would report green on any field set."""
+    arms = _u3a_arms(decider)
+
+    def rendered(name: str, *, want_generation: bool = False) -> dict:
+        path, agent_id, artifact_id, caller_hash = arms[name]
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+        return _u3a_render(d, want_generation=want_generation)
+
+    assert rendered("fresh-granted") == {
+        "status": "fresh", "version": 1, "counter_bumps": [],
+    }
+    assert rendered("fresh-mismatch-warn") == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": ["fresh_shared_hash_mismatch_total"],
+    }
+    assert rendered("denied-shared-foreign") == {
+        "source": "pre_read_shared_hash_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": 2,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("stale-invalid-warn") == {
+        "status": "stale", "current_version": 4,
+        "prior_version_seen_by_session": 3, "hash_differs": False,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    assert rendered("denied-invalid-strict") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 4,
+        "prior_version_seen_by_session": 3,
+        "hash_differs": False,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("denied-unseen-mismatch") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": None,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    # The opt-in pair: present only when asked for, and carrying the
+    # generation the REGISTRY holds (the expectation is sourced from the
+    # registry, not from the decision being checked).
+    _path, _agent, artifact_id, _caller = arms["stale-unseen"]
+    pair = decider.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None and pair[1] is not None
+    assert rendered("stale-unseen", want_generation=True)["owner_generation"] == pair[1]
+    assert "owner_generation" not in rendered("stale-unseen")
+
+
+def test_lag_suppression_is_visible_to_the_renderer(decider) -> None:
+    """The suppression arm needs its own setup (the caller must be the recent
+    writer), and it is the one arm whose counter bump is NOT implied by the
+    outcome: a suppressed deny looks exactly like a warn-mode mismatch unless
+    the decision says otherwise."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert _u3a_render(d, want_generation=False) == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": [
+            "fresh_shared_hash_mismatch_total",
+            "shared_foreign_lag_suppressed_total",
+        ],
+    }
+
+
+# --- integration: the verdict agrees with the live handler -----------------
+
+
+@pytest.mark.parametrize("path,state,caller,expect", [
+    (_U3A_STRICT_PATH, MESIState.SHARED, "canonical", "fresh"),
+    (_U3A_WARN_PATH, MESIState.INVALID, "canonical", "stale"),
+    (_U3A_STRICT_PATH, MESIState.INVALID, "canonical", "denied"),
+])
+def test_verdict_matches_the_live_pre_read_handler(
+    served_decider, path: str, state: MESIState, caller: str, expect: str,
+) -> None:
+    """The extraction is only worth anything if it agrees with the surface it
+    was extracted from. Ask the verdict FIRST (it changes nothing), then let
+    the real handler answer over HTTP and check they say the same thing about
+    version, prior version and the stale-arm mismatch.
+    """
+    server, client = served_decider
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=state, version=4,
+    )
+
+    d = _u3a_decide(server, artifact_id, agent_id, path=path, caller_hash=_hash(caller))
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": path, "content_hash": _hash(caller)},
+    )
+
+    assert status == 200
+    assert d.outcome == expect
+    if expect == "fresh":
+        assert body == {"status": "fresh", "version": d.version}
+        return
+    # Both stale and denied carry the summary; the deny adds the permission
+    # decision the warn-mode allow does not.
+    assert body["summary"]["current_version"] == d.version
+    assert body["summary"]["prior_version_seen_by_session"] == d.prior_version_seen
+    assert body["summary"]["hash_differs"] == d.stale_hash_differs
+    decision = body["hookSpecificOutput"].get("permissionDecision")
+    assert decision == ("deny" if expect == "denied" else "allow")
