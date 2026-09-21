@@ -83,6 +83,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from ccs.core.fence import confirmed_generation
 
 logger = logging.getLogger(__name__)
 
@@ -1871,13 +1872,17 @@ class CoherentVolume:
         version comparand alone would re-validate clean at an effect boundary and
         fire a decision derived from superseded bytes. Reporting the generation
         as UNCONFIRMED makes the effect gate HOLD instead; the plain
-        ``read``/``read_with_version`` paths are unaffected."""
-        if CoherentVolume._pre_read_hash_differs(resp):
-            return None
-        g = resp.get("owner_generation")
-        if isinstance(g, int) and not isinstance(g, bool):
-            return g
-        return None
+        ``read``/``read_with_version`` paths are unaffected.
+
+        Only the WIRE DECODING is local (which key on which response shape);
+        the demotion rule itself lives in ``ccs.core.fence`` because the
+        coordinator route reaching the same fence must apply the identical
+        rule, and a second copy of a safety rule is the drift this split
+        exists to remove."""
+        return confirmed_generation(
+            resp.get("owner_generation"),
+            content_hash_differs=CoherentVolume._pre_read_hash_differs(resp),
+        )
 
     @staticmethod
     def _pre_read_hash_differs(resp: dict) -> bool:

@@ -49,6 +49,7 @@ import os
 from typing import TYPE_CHECKING, Callable, TypeVar
 
 from ccs.core.exceptions import (
+    HOLD_CONTENT_CLAIM_ABSENT,
     HOLD_GENERATION_UNCONFIRMED,
     HOLD_GRANT_PREEMPTED,
     HOLD_GRANT_RECLAIMED,
@@ -58,6 +59,8 @@ from ccs.core.exceptions import (
     HOLD_VERSION_UNCONFIRMED,
     StaleView,
 )
+from ccs.core.fence import classify_hold
+from ccs.core.types import FenceComparands
 
 if TYPE_CHECKING:
     from ccs.adapters.coherent_volume import CoherentVolume
@@ -145,83 +148,92 @@ def gate(
     return effect(decision)
 
 
-def _held(
-    path: str | os.PathLike[str],
-    expected_version: int,
-    current_version: int | None,
-    expected_generation: int | None,
-    current_generation: int | None,
-    *,
-    denied: bool = False,
-    lapsed: bool = False,
-) -> StaleView:
-    """Build the HOLD exception, carrying the drift, for a moved / vanished /
-    unconfirmed / reclaimed / preempted input. ``lapsed`` says the re-validate
-    read itself came back stale — the caller had no standing grant at that read
-    (the coordinator declines to re-grant a ``verify_only`` fence read) — the
-    only signal left when a peer's write-claim acquire preempted the grant
-    while moving neither comparand."""
-    generation_unconfirmed = expected_generation is None or current_generation is None
-    if current_version is None:
-        cause = HOLD_INPUT_VANISHED
-        detail = "vanished"
-    elif expected_version == 0 or current_version == 0:
-        cause = HOLD_VERSION_UNCONFIRMED
-        detail = "could not be confirmed (coordinator degraded or unresolved)"
-    elif current_version != expected_version:
-        cause = HOLD_VERSION_MOVED
-        detail = f"moved to v{current_version}"
-    elif denied and generation_unconfirmed:
-        # The coordinator REFUSED the re-read (strict mode). That is a distinct,
-        # recoverable answer — and on the strict path it is how a sweep reclaim
-        # actually reaches the client, so folding it into the residual bucket
-        # would hide the very case this fence exists for.
-        cause = HOLD_READ_DENIED
-        detail = "was denied at re-read by the coordinator (view is INVALID)"
-    elif generation_unconfirmed:
-        cause = HOLD_GENERATION_UNCONFIRMED
-        detail = (
+# The human half of a HOLD, keyed by the typed reason ``ccs.core.fence``
+# already decided. Pure formatting: every entry reads values off the comparands
+# and NONE of them re-tests a condition, so the message can never disagree with
+# the ``hold_cause`` an agent branches on. The prose is byte-stable by house
+# rule (a model's retry loop measurably worsens when deny bytes change between
+# attempts), so drift rides the ``expected_*``/``current_*`` attributes.
+_HOLD_DETAILS: dict[str, Callable[[FenceComparands], str]] = {
+    HOLD_INPUT_VANISHED: lambda c: "vanished",
+    HOLD_VERSION_UNCONFIRMED: (
+        lambda c: "could not be confirmed (coordinator degraded or unresolved)"
+    ),
+    HOLD_VERSION_MOVED: lambda c: f"moved to v{c.current_version}",
+    # The coordinator REFUSED the re-read (strict mode). A distinct, recoverable
+    # answer -- and on the strict path it is how a sweep reclaim actually
+    # reaches the client, so folding it into the residual bucket would hide the
+    # very case this fence exists for.
+    HOLD_READ_DENIED: (
+        lambda c: "was denied at re-read by the coordinator (view is INVALID)"
+    ),
+    # The coordinator records no content hash for this artifact at all, so it
+    # cannot vouch that the bytes in hand are the content at the version it
+    # reports. Recovery is a fresh read, NOT an operator -- which is exactly why
+    # this does not share the residual bucket's prose.
+    HOLD_CONTENT_CLAIM_ABSENT: (
+        lambda c: (
+            "has no recorded content claim at the coordinator (it cannot "
+            "vouch that these bytes are the content at this version)"
+        )
+    ),
+    HOLD_GENERATION_UNCONFIRMED: (
+        lambda c: (
             "has no confirmed ownership generation (degraded read, an "
             "unconfirmable out-of-band edit, or a coordinator that does not "
             "report generations)"
         )
-    elif current_generation != expected_generation:
-        cause = HOLD_GRANT_RECLAIMED
-        # Version unchanged, both generations confirmed: the grant was reclaimed
-        # out from under the decision -- the failure class a version-only check
-        # cannot see.
-        detail = (
+    ),
+    # Version unchanged, both generations confirmed: the grant was reclaimed out
+    # from under the decision -- the failure class a version-only check cannot
+    # see.
+    HOLD_GRANT_RECLAIMED: (
+        lambda c: (
             f"had its grant reclaimed (ownership generation "
-            f"g{expected_generation} -> g{current_generation}, version unchanged)"
+            f"g{c.expected_generation} -> g{c.current_generation}, version unchanged)"
         )
-    elif lapsed:
-        cause = HOLD_GRANT_PREEMPTED
-        # Both comparands unchanged AND confirmed, yet the re-validate read was
-        # served WITHOUT a standing grant (``lapsed``): the caller's grant did
-        # not stand at the re-validate. The usual cause is a peer write-claim
-        # acquire that preempted the caller between capture and fire -- no
-        # commit has landed (version unmoved) and trigger="write" deliberately
-        # does not bump the ownership epoch, so the pair is structurally blind
-        # here; only the grant-state answer on the re-read itself sees it. A
-        # grantless re-read with NO peer lands here too (a re-minted identity
-        # gating with an earlier read's comparands), so the detail says
-        # "typically" rather than asserting a peer the fence never observed.
-        detail = (
+    ),
+    # Both comparands unchanged AND confirmed, yet the re-validate read was
+    # served WITHOUT a standing grant: the caller's grant did not stand at the
+    # re-validate. The usual cause is a peer write-claim acquire that preempted
+    # the caller between capture and fire -- no commit has landed (version
+    # unmoved) and trigger="write" deliberately does not bump the ownership
+    # epoch, so the pair is structurally blind here; only the grant-state answer
+    # on the re-read itself sees it. A grantless re-read with NO peer lands here
+    # too (a re-minted identity gating with an earlier read's comparands), so
+    # the detail says "typically" rather than asserting a peer the fence never
+    # observed.
+    HOLD_GRANT_PREEMPTED: (
+        lambda c: (
             f"was not under a standing grant at re-validate (version and "
-            f"ownership generation g{expected_generation} unchanged -- "
+            f"ownership generation g{c.expected_generation} unchanged -- "
             f"typically a peer write-claim preemption)"
         )
-    else:
-        # Unreachable by construction: check_fence calls _held only when a
-        # comparand is unconfirmed, moved, or ``lapsed``, and every such
-        # condition is handled above. A future disjunct in check_fence, or a
-        # new _held caller, that reaches here would otherwise silently mislabel
-        # its HOLD as grant_preempted -- fail loud so the drift is caught.
+    ),
+}
+
+
+def _held(
+    path: str | os.PathLike[str],
+    comparands: FenceComparands,
+    reason: str,
+) -> StaleView:
+    """Format the HOLD exception for a reason :func:`classify_hold` ALREADY
+    decided, carrying the drift and the path.
+
+    A formatter, not a decision: the branch table lives in ``ccs.core.fence``
+    so the coordinator route and this wrapper answer with one rule. The only
+    branch left here is the lookup miss, which fails LOUD — a missing entry
+    would otherwise let a newly minted reason reach a caller with no message
+    at all, or (worse, on a ``.get(...) or ""`` shape) an empty one that reads
+    like nothing is wrong.
+    """
+    detail_of = _HOLD_DETAILS.get(reason)
+    if detail_of is None:
         raise AssertionError(
-            "internal: _held() reached its residual branch with an unchanged, "
-            f"confirmed, standing pair (v{expected_version}, "
-            f"g{expected_generation}) -- no HOLD condition holds; check_fence "
-            "and _held have drifted"
+            f"internal: no HOLD message for reason {reason!r} -- "
+            "ccs.core.fence.classify_hold returned a reason effect_gate cannot "
+            "render; the vocabulary and its formatter have drifted"
         )
     # A real CoherentVolume rejects a non-PathLike path before gate() runs, but
     # volume is duck-typed at runtime -- never let fspath() mask the HOLD.
@@ -230,14 +242,14 @@ def _held(
     except TypeError:
         target = str(path)
     exc = StaleView(
-        f"effect held: {target} {detail} since it was read at "
-        f"v{expected_version}; effect not fired (reacquire and re-decide)"
+        f"effect held: {target} {detail_of(comparands)} since it was read at "
+        f"v{comparands.expected_version}; effect not fired (reacquire and re-decide)"
     )
-    exc.expected_version = expected_version
-    exc.current_version = current_version
-    exc.expected_generation = expected_generation
-    exc.current_generation = current_generation
-    exc.hold_cause = cause
+    exc.expected_version = comparands.expected_version
+    exc.current_version = comparands.current_version
+    exc.expected_generation = comparands.expected_generation
+    exc.current_generation = comparands.current_generation
+    exc.hold_cause = reason
     return exc
 
 
@@ -269,6 +281,8 @@ def check_fence(
     caller's dispatch still follows it.
     """
 
+    current_version: int | None
+    current_generation: int | None
     try:
         # observe=False: this read exists only to COMPARE comparands and its
         # bytes are discarded, so it must not advance the volume's foreign-edit
@@ -278,48 +292,57 @@ def check_fence(
         _, current_version, current_generation = volume.read_with_version_generation(
             path, observe=False
         )
+        denied = bool(getattr(volume, "_last_read_denied", False))
+        # The third leg of the fence: the pair answers "did the value or the
+        # epoch move", but a peer's pessimistic write-acquire ends the caller's
+        # grant while moving NEITHER (no commit yet, and trigger="write" is
+        # outside EPOCH_BUMP_TRIGGERS -- the epoch is per-artifact and cannot
+        # even see an S-holder's preemption). The re-validate read itself
+        # carries the answer: a stale-status response (warn re-grant or deny)
+        # means the grant the decision was read under did NOT stand at this
+        # check. getattr keeps duck-typed volumes that predate the flag on the
+        # pair-only behavior.
+        lapsed = bool(getattr(volume, "_last_read_stale", False))
     except FileNotFoundError:
-        raise _held(path, expected_version, None, expected_generation, None) from None
-    denied = bool(getattr(volume, "_last_read_denied", False))
-    # The third leg of the fence: the pair answers "did the value or the epoch
-    # move", but a peer's pessimistic write-acquire ends the caller's grant
-    # while moving NEITHER (no commit yet, and trigger="write" is outside
-    # EPOCH_BUMP_TRIGGERS -- the epoch is per-artifact and cannot even see an
-    # S-holder's preemption). The re-validate read itself carries the answer:
-    # a stale-status response (warn re-grant or deny) means the grant the
-    # decision was read under did NOT stand at this check. getattr keeps
-    # duck-typed volumes that predate the flag on the pair-only behavior.
-    lapsed = bool(getattr(volume, "_last_read_stale", False))
+        # The input is GONE: the vanish sentinels, and no read to have been
+        # refused or served grantless (the stale ``_last_read_*`` flags describe
+        # some EARLIER read, never this one). Reported as observations, not as a
+        # verdict -- classify_hold still names the HOLD.
+        current_version = None
+        current_generation = None
+        denied = False
+        lapsed = False
 
-    # HOLD unless the coordinator CONFIRMED an unchanged (version, generation)
-    # pair. Version 0 is the "could not resolve" sentinel (an older/degraded
-    # coordinator, or a degrade-mode volume whose read did not fail closed);
-    # generation None is its sibling (an older coordinator that predates this
-    # release's generation reporting, a strict-mode deny, or a degraded read). Firing on
-    # either would act on input the coordinator never confirmed. Treating an
-    # unconfirmed comparand as a HOLD keeps the gate fail-closed by
-    # construction, independent of the volume's on_error mode -- and it is why
-    # this wrapper against a pre-fence coordinator HOLDs loudly instead of
-    # silently reverting to the generation-blind check.
-    unconfirmed = (
-        expected_version == 0
-        or current_version == 0
-        or expected_generation is None
-        or current_generation is None
+    # ONE classification, shared with the coordinator route: HOLD unless the
+    # coordinator CONFIRMED an unchanged (version, generation) pair under a
+    # standing grant. Version 0 is the "could not resolve" sentinel (an
+    # older/degraded coordinator, or a degrade-mode volume whose read did not
+    # fail closed); generation None is its sibling (an older coordinator that
+    # predates this release's generation reporting, a strict-mode deny, or a
+    # degraded read). Firing on either would act on input the coordinator never
+    # confirmed. Treating an unconfirmed comparand as a HOLD keeps the gate
+    # fail-closed by construction, independent of the volume's on_error mode --
+    # and it is why this wrapper against a pre-fence coordinator HOLDs loudly
+    # instead of silently reverting to the generation-blind check.
+    comparands = FenceComparands(
+        expected_version=expected_version,
+        current_version=current_version,
+        expected_generation=expected_generation,
+        current_generation=current_generation,
+        read_refused=denied,
+        grant_did_not_stand=lapsed,
+        # HONEST LIMIT, in-process: the pre-read wire carries ``hash_differs``
+        # (a comparison) and never the coordinator's RECORDED hash, so this
+        # client cannot distinguish "the claim matches" from "there is no claim
+        # at all" -- both arrive as hash_differs=False. Passing True preserves
+        # the shipped verdict rather than HOLDing every gate on a blind spot;
+        # the coordinator route, which reads the recorded hash straight off the
+        # registry, calls ``coordinator_holds_content_claim`` and passes the
+        # real answer. Closing this leg in-process needs an additive wire field,
+        # not a client-side guess.
+        content_claim_present=True,
     )
-    if (
-        unconfirmed
-        or current_version != expected_version
-        or current_generation != expected_generation
-        or lapsed
-    ):
-        raise _held(
-            path,
-            expected_version,
-            current_version,
-            expected_generation,
-            current_generation,
-            denied=denied,
-            lapsed=lapsed,
-        )
+    reason = classify_hold(comparands)
+    if reason is not None:
+        raise _held(path, comparands, reason)
 

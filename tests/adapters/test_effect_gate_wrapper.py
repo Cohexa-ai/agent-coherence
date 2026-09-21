@@ -981,7 +981,15 @@ def test_bare_stale_view_exposes_none_version_attrs() -> None:
 def test_hold_cause_is_typed_per_class() -> None:
     """Every HOLD class carries a distinct typed cause, so an agent branches on
     a value rather than substring-matching the human message — and can tell a
-    HOLD reacquire() clears from one that it never will."""
+    HOLD reacquire() clears from one that it never will.
+
+    All SEVEN shipped causes, asserted through the wrapper's public surface.
+    This is the characterisation that pins the in-process verdict across the
+    move of the branch table into ``ccs.core.fence``: the classification now has
+    a second caller, and a reason that quietly changed identity during the move
+    would keep every message-text assertion in this file green while sending an
+    agent down the wrong recovery.
+    """
     from ccs.core.exceptions import (
         HOLD_GENERATION_UNCONFIRMED,
         HOLD_GRANT_RECLAIMED,
@@ -990,16 +998,66 @@ def test_hold_cause_is_typed_per_class() -> None:
         HOLD_VERSION_UNCONFIRMED,
     )
 
+    class _FlaggedStub(_StubVolume):
+        """A stub whose re-validate read (``observe=False``) reports the
+        coordinator's grant-state answer — a strict deny, a lapsed grant, or
+        neither — the way a real volume records it on ``_last_read_*``."""
+
+        def __init__(self, reads: list, *, denied: bool, lapsed: bool) -> None:
+            super().__init__(reads)
+            self._denied = denied
+            self._lapsed = lapsed
+            self._last_read_denied = False
+            self._last_read_stale = False
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            out = super().read_with_version_generation(path, observe=observe)
+            self._last_read_denied = self._denied and not observe
+            self._last_read_stale = self._lapsed and not observe
+            return out
+
     cases = [
-        ([(b"c", 5, 7), (b"c", 6, 7)], HOLD_VERSION_MOVED),
-        ([(b"c", 5, 7), (b"c", 5, 8)], HOLD_GRANT_RECLAIMED),
-        ([(b"c", 5, 7), FileNotFoundError()], HOLD_INPUT_VANISHED),
-        ([(b"c", 5, 7), (b"c", 0, 7)], HOLD_VERSION_UNCONFIRMED),
-        ([(b"c", 5, 7), (b"c", 5, None)], HOLD_GENERATION_UNCONFIRMED),
+        ([(b"c", 5, 7), (b"c", 6, 7)], False, False, HOLD_VERSION_MOVED),
+        ([(b"c", 5, 7), (b"c", 5, 8)], False, False, HOLD_GRANT_RECLAIMED),
+        ([(b"c", 5, 7), FileNotFoundError()], False, False, HOLD_INPUT_VANISHED),
+        ([(b"c", 5, 7), (b"c", 0, 7)], False, False, HOLD_VERSION_UNCONFIRMED),
+        ([(b"c", 5, 7), (b"c", 5, None)], False, False, HOLD_GENERATION_UNCONFIRMED),
+        # A strict deny: the coordinator refused the re-read, which on the
+        # in-process wire also means it reported no generation.
+        ([(b"c", 5, 7), (b"c", 5, None)], True, False, HOLD_READ_DENIED),
+        # A peer's write-claim preemption: both comparands confirmed AND
+        # unchanged, but the re-read was served without a standing grant.
+        ([(b"c", 5, 7), (b"c", 5, 7)], False, True, HOLD_GRANT_PREEMPTED),
     ]
-    for reads, expected_cause in cases:
+    for reads, denied, lapsed, expected_cause in cases:
         with pytest.raises(StaleView) as exc:
-            gate(_StubVolume(reads), "p", decide=lambda d: "go", effect=lambda x: x)
-        assert exc.value.hold_cause == expected_cause, reads
+            gate(
+                _FlaggedStub(reads, denied=denied, lapsed=lapsed),
+                "p",
+                decide=lambda d: "go",
+                effect=lambda x: x,
+            )
+        assert exc.value.hold_cause == expected_cause, (reads, denied, lapsed)
     # A bare coordinator-raised StaleView carries no cause (uniform shape).
     assert StaleView("peer committed").hold_cause is None
+
+
+def test_in_process_fence_still_admits_a_clean_pair_after_the_core_move() -> None:
+    """The other half of the characterisation: a confirmed, unchanged pair under
+    a standing grant still PROCEEDS.
+
+    A move that only ever adds HOLDs is not behaviour-preserving either — an
+    over-eager new leg (the content-claim leg is one) would hold every effect in
+    the product, and every HOLD assertion above would still pass.
+    """
+    fired: list[str] = []
+    result = gate(
+        _StubVolume([(b"cfg", 5, 7), (b"cfg", 5, 7)]),
+        "p",
+        decide=lambda d: "go",
+        effect=lambda x: (fired.append(x), "ok")[1],
+    )
+    assert result == "ok"
+    assert fired == ["go"]

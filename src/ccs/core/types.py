@@ -544,3 +544,57 @@ class FetchResponse:
     content: str
     state_grant: MESIState
 
+
+@dataclass(frozen=True, kw_only=True)
+class FenceComparands:
+    """Everything the effect fence classifies, as ONE named, frozen value.
+
+    The input to :func:`ccs.core.fence.classify_hold` — the branch table that
+    decides whether an irreversible effect may still fire. Both surfaces that
+    ask that question build one of these: the in-process wrapper
+    (``adapters.effect_gate``) and the coordinator route that answers the same
+    question over HTTP. One object, not six positionals: two ints, two optional
+    ints and two bools in a row is a transposition hazard, and this is the one
+    path in the product where a silently swapped pair IS the lost update the
+    fence exists to prevent. ``kw_only`` makes the swap unexpressible rather
+    than merely unlikely, and NO field carries a default — a caller that
+    forgets the grant state must fail at construction, naming the field it
+    omitted, instead of silently gating on a fabricated "nothing was wrong".
+
+    Field names come from the PROTOCOL, not from either caller's internals, so
+    core never acquires volume-shaped vocabulary and the adapter stays the only
+    place a private ``_last_read_*`` attribute is read:
+
+    - ``expected_version`` / ``current_version`` — the value comparand:
+      "is this still the version the decision was derived from". ``0`` is the
+      "could not resolve" SENTINEL on either side (a degraded or pre-fence
+      coordinator), never a comparable value; ``current_version is None`` means
+      the input VANISHED between capture and re-validate.
+    - ``expected_generation`` / ``current_generation`` — the authority
+      comparand: "is the grant it was read under still standing". ``None`` is
+      the sentinel for "the coordinator confirmed no generation" and is NEVER
+      coerced to ``0``, which is a REAL generation. A sweep reclamation moves
+      this pair while the version stays put — the drift a version-only check
+      structurally cannot see.
+    - ``read_refused`` — the coordinator REFUSED the re-validate read
+      (strict-mode deny). A distinct, recoverable answer, and on the strict
+      path it is how a sweep reclaim actually reaches a client.
+    - ``grant_did_not_stand`` — the re-validate read was served WITHOUT a
+      standing grant. A peer's pessimistic write-acquire preempts a holder
+      while moving NEITHER comparand (no commit yet, and ``trigger="write"``
+      is outside ``EPOCH_BUMP_TRIGGERS``), so this is the only leg that sees it.
+    - ``content_claim_present`` — the coordinator records SOME content claim
+      for this artifact (see
+      :func:`ccs.core.fence.coordinator_holds_content_claim`). ``False`` means
+      it holds no hash at all and therefore cannot vouch that the bytes in hand
+      are the content at the version it reports.
+    """
+
+    expected_version: int
+    current_version: int | None
+    expected_generation: int | None
+    current_generation: int | None
+    read_refused: bool
+    grant_did_not_stand: bool
+    content_claim_present: bool
+

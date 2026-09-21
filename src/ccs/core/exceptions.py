@@ -26,14 +26,17 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 # an agent or operator can branch.
 #
 # Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
-# GRANT_PREEMPTED, INPUT_VANISHED and READ_DENIED are recoverable — reacquire,
-# re-decide, re-gate. GENERATION_UNCONFIRMED is the residual bucket and is NOT a clean
+# GRANT_PREEMPTED, INPUT_VANISHED, READ_DENIED and CONTENT_CLAIM_ABSENT are
+# recoverable — reacquire, re-decide, re-gate. GENERATION_UNCONFIRMED is the
+# residual bucket and is NOT a clean
 # permanent/transient signal: a degraded read, an unconfirmable foreign edit,
 # and a coordinator that predates generation reporting all land there. Treat it
 # as "reacquire and re-gate first"; a HOLD that survives a SUCCESSFUL reacquire
 # is the one that needs an operator (check the daemon's version). Splitting
 # READ_DENIED out is what keeps the common strict-mode reclaim — which reaches
-# the client as a deny, not as a missing field — from hiding in that bucket.
+# the client as a deny, not as a missing field — from hiding in that bucket, and
+# splitting CONTENT_CLAIM_ABSENT out keeps a coordinator that simply holds no
+# content claim — whose fix is a re-read, not an operator — from hiding there too.
 HOLD_VERSION_MOVED = "version_moved"
 HOLD_GRANT_RECLAIMED = "grant_reclaimed"
 # The grant the decision was read under did not STAND at the re-validate read
@@ -44,7 +47,37 @@ HOLD_GRANT_PREEMPTED = "grant_preempted"
 HOLD_INPUT_VANISHED = "input_vanished"
 HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
 HOLD_READ_DENIED = "read_denied"
+# The coordinator records NO content claim for this artifact at all — the
+# recorded hash is absent, empty, or the all-``f`` launch-gate sentinel — so it
+# cannot vouch that the bytes the decision was derived from ARE the content at
+# the version it reports. Split OUT of the residual bucket because the caller's
+# recovery differs: re-read your bytes (the coordinator will record a claim on
+# the next observation), NOT "check the daemon's version and call an operator".
+# Before this reason existed the empty-recorded-hash form did not HOLD at all:
+# ``hash_differs`` needs a TRUTHY recorded hash on both sides, so the generation
+# was never demoted and the effect fired against a value nothing backs.
+HOLD_CONTENT_CLAIM_ABSENT = "content_claim_absent"
 HOLD_GENERATION_UNCONFIRMED = "generation_unconfirmed"
+
+# The closed, published set every consumer matches against
+# (``hold_cause in HOLD_REASONS``). Same discipline as
+# :data:`READ_AT_VERSION_REASONS` below: the EXACT string values are the WIRE
+# CONTRACT, so a reason may be ADDED but is NEVER renamed or repurposed — a
+# rename silently un-matches every consumer's branch and downgrades a HOLD it
+# no longer recognises. Membership is the only legal test; never a substring of
+# the human message (the typed-signal-not-substring house rule).
+HOLD_REASONS: frozenset[str] = frozenset(
+    {
+        HOLD_VERSION_MOVED,
+        HOLD_GRANT_RECLAIMED,
+        HOLD_GRANT_PREEMPTED,
+        HOLD_INPUT_VANISHED,
+        HOLD_VERSION_UNCONFIRMED,
+        HOLD_READ_DENIED,
+        HOLD_CONTENT_CLAIM_ABSENT,
+        HOLD_GENERATION_UNCONFIRMED,
+    }
+)
 
 # ---------------------------------------------------------------------------
 # read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
