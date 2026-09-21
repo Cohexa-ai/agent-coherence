@@ -920,11 +920,13 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
 # - ``no_write_attempted`` — the member reached its terminal without a write
 #   decision (converged, skipped, or absorbed before the write). The DEFAULT,
 #   because it is the truth at every such site.
-# - ``not_recorded`` — no leg ran at all, so this run observed nothing: a
-#   member resumed from a prior run, or a concluded restore rebuilt from its
-#   durable rows. The observation is run-local by decision (no schema column),
-#   so it cannot be recovered — and an observation the run never made is its
-#   own answer, never a clean one. Consumers MUST NOT read it as clean.
+# - ``not_recorded`` — this run holds no observation for the member. Either no
+#   leg ran at all (a member resumed from a prior run, or a concluded restore
+#   rebuilt from its durable rows — the observation is run-local by decision,
+#   so a prior run's is unrecoverable), or a leg ran and its write outcome was
+#   lost, leaving it unable to say whether IT destroyed the divergent state or
+#   a peer converged first. An observation the run never made is its own
+#   answer, never a clean one. Consumers MUST NOT read it as clean.
 RESTORE_OBSERVATION_DIFFERS = "observed_differs"
 RESTORE_OBSERVATION_NO_LIVE_STATE = "no_live_state"
 RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE = "present_not_comparable"

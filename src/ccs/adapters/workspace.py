@@ -199,8 +199,10 @@ from ccs.core.exceptions import (
     PIN_STATE_UNPINNED,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NO_LIVE_STATE,
     RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
     RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
     RESTORE_OBSERVATION_STATES,
     RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND,
     RESTORE_OUTCOME_CONFLICT,
@@ -647,7 +649,8 @@ class RestoreObservation:
 # (frozen, so one instance is safe as a default). They are kept DISTINCT on
 # purpose: ``no_write_attempted`` is a fact this run established (the member
 # converged, was skipped, or was absorbed before any write), while
-# ``not_recorded`` is the absence of a fact — this run drove no leg at all.
+# ``not_recorded`` is the absence of a fact — this run drove no leg, or drove
+# one whose outcome it could not learn.
 OBSERVATION_NO_WRITE_ATTEMPTED: Final = RestoreObservation(
     state=RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
 )
@@ -676,9 +679,11 @@ class MemberRestoreOutcome:
     It defaults to the no-write-attempted state, which is the truth at every
     converged, skipped and pre-write absorbing site: a member that never
     reached a write decision must not be reported as one whose observation was
-    lost. The one site that reconstructs a terminal with no leg having run
-    (:meth:`WorkspaceVersioner._outcome_from_durable_row`) sets ``not_recorded``
-    explicitly.
+    lost. ``not_recorded`` is set explicitly at the two sites that hold no
+    observation: the rebuild of a terminal with no leg having run
+    (:meth:`WorkspaceVersioner._outcome_from_durable_row`), and an object write
+    whose outcome was lost and then reconciled (see
+    :meth:`WorkspaceVersioner._observation_of_overwritten`).
     """
 
     member_path: str
@@ -763,6 +768,31 @@ class WorkspaceRestoreReport:
     def members_by_path(self) -> "dict[str, MemberRestoreOutcome]":
         """The report keyed by member path (paths are unique per manifest)."""
         return {m.member_path: m for m in self.members}
+
+
+@dataclass(frozen=True)
+class _ObjectLiveView:
+    """What ONE versioned live read of an object member yielded.
+
+    All three fields come from the SAME ``get_object`` response (SPLIT-COMPARAND,
+    extended to the triple), and they are kept NAMED rather than positional
+    because two of them are same-typed strings that must never be swapped:
+    ``comparand`` is the ETag and the ONLY value that may arbitrate a write,
+    while ``pointer`` is the versionId, which addresses a version and arbitrates
+    nothing. ``fingerprint`` is the content digest the converged check already
+    computes.
+
+    ``pointer``/``fingerprint`` are ``None`` exactly on the create-on-absent
+    path, where ``comparand`` is the :data:`CREATE_IF_ABSENT` sentinel and the
+    read found no live state at all. A ``pointer`` present here is always a REAL
+    versionId — the ``"null"``/absent case raises ``VersionPointerUnconfirmed``
+    upstream rather than reaching this type — so no sentinel guard is needed on
+    it, and none may be invented (a sentinel must never seed a comparand).
+    """
+
+    comparand: str
+    pointer: str | None = None
+    fingerprint: str | None = None
 
 
 class _LegBudget:
@@ -2131,6 +2161,14 @@ class WorkspaceVersioner:
                 "a documented residual)"
             ),
             deleted_at_restore=float(self._clock()),
+            # The state ALONE (R1's carve-out): the probe above established that
+            # live state existed and this leg destroyed it, but it compared no
+            # content and holds no versionId — the plain read is what works on
+            # an unversioned bucket, and a second call to fetch a pointer is
+            # forbidden (SPLIT-COMPARAND), so the honest answer is presence
+            # without evidence. Never ``observed_differs``: that state asserts a
+            # comparison with the capture that this leg never ran.
+            observation=RestoreObservation(state=RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE),
         )
 
     def _drive_file_absent_leg(
@@ -2199,8 +2237,7 @@ class WorkspaceVersioner:
             view = self._object_live_view(row, member, budget)
             if isinstance(view, MemberRestoreOutcome):
                 return view
-            live_token, live_hash = view
-            if live_hash == row.fingerprint:
+            if view.fingerprint == row.fingerprint:
                 return MemberRestoreOutcome(
                     member_path=row.member_path,
                     outcome=RESTORE_OUTCOME_CONVERGED,
@@ -2215,25 +2252,32 @@ class WorkspaceVersioner:
                 if isinstance(resolved, MemberRestoreOutcome):
                     return resolved
                 pinned_bytes = resolved
-            outcome = self._object_cas_attempt(row, member, pinned_bytes, live_token, budget)
+            # The WHOLE view is handed on, re-read every iteration and never
+            # hoisted: a leg that re-drives under contention must report the
+            # state the winning attempt overwrote, not the first read's (KTD7).
+            outcome = self._object_cas_attempt(row, member, pinned_bytes, view, budget)
             if outcome is not None:
                 return outcome
 
     def _object_live_view(
         self, row: CheckpointMember, member: _ObjectMember, budget: _LegBudget
-    ) -> "MemberRestoreOutcome | tuple[str, str | None]":
-        """One live read → ``(comparand, content_hash)``, or a terminal outcome.
+    ) -> "MemberRestoreOutcome | _ObjectLiveView":
+        """One live read → a :class:`_ObjectLiveView`, or a terminal outcome.
 
-        The (bytes, ETag) pair comes from ONE response (the split-comparand
-        rule); the manifested versionId is only ever the POINTER, never the
-        comparand (the F4 split). Live-absent yields the explicit
-        :data:`CREATE_IF_ABSENT` comparand — the create leg loses to any
+        The (bytes, ETag, versionId) triple comes from ONE response (the
+        split-comparand rule); the versionId is only ever the POINTER, never the
+        comparand (the F4 split). It is KEPT rather than discarded because it is
+        the only handle that still resolves the state a restore is about to
+        overwrite, and the write arms record it (R1/KTD6) — carrying it out of
+        the read that already returned it is what keeps that report free of a
+        second call. Live-absent yields the explicit :data:`CREATE_IF_ABSENT`
+        comparand with no pointer and no digest — the create leg loses to any
         concurrent re-creation, never overwrites one.
         """
         try:
             live = member.binding.read_versioned(member.key)
         except KeyError:
-            return (CREATE_IF_ABSENT, None)
+            return _ObjectLiveView(comparand=CREATE_IF_ABSENT)
         except VersionPointerUnconfirmed:
             # The live pointer axis broke mid-restore (versioning suspended
             # since capture): what a write would mint can no longer be
@@ -2247,7 +2291,11 @@ class WorkspaceVersioner:
                     "suspended since capture) — HELD, never best-effort"
                 ),
             )
-        return (live.etag, _sha256_hex(live.data))
+        return _ObjectLiveView(
+            comparand=live.etag,
+            pointer=live.version_id,
+            fingerprint=_sha256_hex(live.data),
+        )
 
     def _resolve_pinned_object(
         self, row: CheckpointMember, member: _ObjectMember
@@ -2268,24 +2316,60 @@ class WorkspaceVersioner:
             )
         return pinned.data
 
+    @staticmethod
+    def _observation_of_overwritten(
+        view: _ObjectLiveView, *, write_confirmed: bool
+    ) -> RestoreObservation:
+        """What an object CAS arm DESTROYED, from the read that fed its comparand.
+
+        ``write_confirmed`` says whether a landing was established, and it only
+        ever matters on the live path: what a leg overwrote is settled by its
+        READ, not by whose put won. A live read that found the member absent
+        proves no writer — this run or a peer — could have destroyed content
+        that was not there, so the create-on-absent path answers
+        ``no_live_state`` either way and never fires a divergence gate.
+
+        Branching on the CREATE_IF_ABSENT comparand rather than on a missing
+        pointer is the fail-closed direction: were a live read ever to yield a
+        real ETag without a pointer, this reports a divergence with the digest
+        it has, instead of reporting that nothing was there to lose.
+        """
+        if view.comparand == CREATE_IF_ABSENT:
+            return RestoreObservation(state=RESTORE_OBSERVATION_NO_LIVE_STATE)
+        if not write_confirmed:
+            return OBSERVATION_NOT_RECORDED
+        return RestoreObservation(
+            state=RESTORE_OBSERVATION_DIFFERS,
+            # The versionId, never the ETag: the comparand arbitrates the write
+            # and addresses nothing, while this pointer is what still resolves
+            # the bytes the operator just lost (KTD5).
+            pointer=view.pointer,
+            fingerprint=view.fingerprint,
+        )
+
     def _object_cas_attempt(
         self,
         row: CheckpointMember,
         member: _ObjectMember,
         pinned_bytes: bytes,
-        live_token: str,
+        view: _ObjectLiveView,
         budget: _LegBudget,
     ) -> MemberRestoreOutcome | None:
         """One conditional put under the freshly read comparand; ``None`` = re-drive.
 
         ``row.fingerprint`` doubles as the intended hash: a pinned S3 version
         is immutable, so its bytes always hash to the captured fingerprint.
+
+        ``view`` is the caller's CURRENT read, passed per call rather than held
+        by the loop, so a re-drive re-reads it and the landed arms report the
+        iteration that WON (KTD7). Only its ``comparand`` reaches the substrate;
+        its pointer and digest reach the report and nothing else.
         """
         binding, key = member.binding, member.key
         intended_hash = row.fingerprint or _sha256_hex(pinned_bytes)
         try:
             result = binding.cas_write_versioned(
-                key, expected_token=live_token, new_bytes=pinned_bytes
+                key, expected_token=view.comparand, new_bytes=pinned_bytes
             )
         except CasRetriesExhausted:
             # The binding's OWN 409-transient budget (this leg's in-binding
@@ -2313,6 +2397,12 @@ class WorkspaceVersioner:
                     "pointer (bucket unversioned mid-restore) — the restored "
                     "state cannot be re-pinned"
                 ),
+                # What is missing here is the pointer this write MINTED, not the
+                # one it DESTROYED: the durable landing is confirmed, and the
+                # state it replaced was read, compared and overwritten like any
+                # other landed arm. Silence would leave the least recoverable
+                # member the least described one.
+                observation=self._observation_of_overwritten(view, write_confirmed=True),
             )
         if isinstance(result, VersionedCasWritten):
             return MemberRestoreOutcome(
@@ -2324,6 +2414,11 @@ class WorkspaceVersioner:
                     f"(attempt {budget.attempts})"
                 ),
                 new_native_token=result.version_id,
+                # Two versionIds sit three lines apart and mean opposite things:
+                # ``result.version_id`` is the state the operator now HAS, the
+                # observation names the state this put DESTROYED. A REPORT value
+                # only — nothing may seed a later comparand from it.
+                observation=self._observation_of_overwritten(view, write_confirmed=True),
             )
         if isinstance(result, CasConflict):
             # A foreign writer moved the comparand (412 / raced delete): the
@@ -2332,7 +2427,7 @@ class WorkspaceVersioner:
             return None
         # CasUnknown: ONE reconciliation read decides; still-unknown → HOLD.
         decision = binding.reconcile_after_unknown(
-            key, expected_token=live_token, intended_hash=intended_hash
+            key, expected_token=view.comparand, intended_hash=intended_hash
         )
         if decision.verdict is ReconcileVerdict.CONVERGE:
             return MemberRestoreOutcome(
@@ -2343,6 +2438,17 @@ class WorkspaceVersioner:
                     "unconfirmed write reconciled CONVERGE: the live object is "
                     "byte-identical to the manifest (authorship not claimed)"
                 ),
+                # ``write_confirmed=False``: a put was issued and its outcome
+                # was lost, so on the live path this run cannot say whether IT
+                # discarded the divergent state or a peer converged it first —
+                # and R2's five states hold no "attempted, outcome unknowable".
+                # ``not_recorded`` is the one that does not lie: its consumer
+                # contract is "an observation the run never made, never read as
+                # clean", which is exactly this. The default would under-claim
+                # on the QUIETEST terminal in the vocabulary — the file leg's
+                # unconfirmed arm can afford that only because it lands on
+                # ``held_unconfirmed``, which is already loud.
+                observation=self._observation_of_overwritten(view, write_confirmed=False),
             )
         if decision.verdict in (ReconcileVerdict.RE_DRIVE, ReconcileVerdict.CONFLICT):
             # Knowledge either way — an unmoved comparand (retry the intent)

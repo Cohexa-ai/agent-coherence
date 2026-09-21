@@ -927,6 +927,19 @@ def test_happy_full_restore_all_terminal_outcomes(
     assert by_path["notes/plan.md"].new_native_token == "10"  # 9 (live) + 1
     assert by_path["notes/calm.md"].outcome == RESTORE_OUTCOME_CONVERGED
     assert by_path["effects/notify"].outcome == RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED
+    # Four members conclude `restored` and mean four different things to an
+    # operator; the observation is the field that separates them in ONE report.
+    assert by_path["s3://cfg.json"].observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert by_path["s3://gone.json"].observation.state == RESTORE_OBSERVATION_NO_LIVE_STATE
+    assert (
+        by_path["s3://ghost.json"].observation.state
+        == RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE
+    )
+    assert by_path["notes/plan.md"].observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert by_path["notes/calm.md"].observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert (
+        by_path["effects/notify"].observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    )
 
     # The substrates hold the manifest state again.
     data, _etag = obj.read("cfg.json")
@@ -1011,6 +1024,12 @@ def test_sustained_contention_exhausts_budget_into_conflict_no_livelock(
     # the report names the losing member; the healthy peer converged untouched.
     assert hot.outcome == RESTORE_OUTCOME_CONFLICT
     assert hot.attempts == MAX_RESTORE_LEG_REDRIVES + 1
+    # Every iteration READ a live state that differed from the capture, so the
+    # tempting observation is the differs one — but the observation names what
+    # the leg OVERWROTE and every If-Match attempt lost its race. Reporting a
+    # discarded version here would assert a loss that provably did not happen.
+    assert hot.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert hot.observation.pointer is None
     assert by_path["s3://calm.json"].outcome == RESTORE_OUTCOME_CONVERGED
     assert report.status == RESTORE_STATUS_CONCLUDED
     record = registry.get_checkpoint(checkpoint_id)
@@ -2011,6 +2030,408 @@ def test_file_leg_arms_that_landed_no_write_observe_no_write_attempted(
         assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
         assert member.observation.pointer is None
         assert member.observation.fingerprint is None
+
+
+# ---------------------------------------------------------------------------
+# The OBJECT legs' observation (restore-divergence-signal U3 / R1-R2): the
+# native-CAS leg reports the versionId it discarded; the delete leg reports
+# only that live state existed, because its probe compares no content
+# ---------------------------------------------------------------------------
+
+
+class _PointerlessOnCasPut:
+    """Versioning SUSPENDED between the live read and the CAS put.
+
+    The If-Match put still LANDS in the inner store — the response's ETag is
+    real — but carries no ``VersionId``, which is exactly what an unversioned
+    bucket returns. ``cas_write_versioned`` then raises
+    ``VersionPointerUnconfirmed`` from a write that durably landed, the one arm
+    where the leg overwrote live state yet can register nothing for it.
+    """
+
+    def __init__(self, inner: LocalS3Client, key: str) -> None:
+        self._inner = inner
+        self._key = key
+
+    def put_object(self, **kwargs: Any) -> Any:
+        resp = self._inner.put_object(**kwargs)
+        if kwargs.get("Key") == self._key and kwargs.get("IfMatch") is not None:
+            return {k: v for k, v in resp.items() if k != "VersionId"}
+        return resp
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _ConvergeOnCasPut:
+    """UNKNOWN outcome whose reconciliation read finds the intended content.
+
+    The If-Match put lands the SAME bytes unconditionally and then dies
+    transport-shaped, so the engine sees ``CasUnknown`` and
+    ``reconcile_after_unknown`` observes a MOVED token carrying the intended
+    hash — verdict CONVERGE, terminal ``converged``, authorship not claimed.
+    Whether this run's put or a peer produced that content is unknowable.
+    """
+
+    def __init__(self, inner: LocalS3Client, bucket: str, key: str) -> None:
+        self._inner = inner
+        self._bucket = bucket
+        self._key = key
+
+    def put_object(self, **kwargs: Any) -> Any:
+        # Both conditional shapes: the modify leg sends If-Match, the
+        # create-on-absent leg sends If-None-Match — matching only the former
+        # would let the create arm land normally and never reach reconcile.
+        conditional = kwargs.get("IfMatch") is not None or kwargs.get("IfNoneMatch") is not None
+        if kwargs.get("Key") == self._key and conditional:
+            self._inner.put_object(Bucket=self._bucket, Key=self._key, Body=kwargs["Body"])
+            raise ConnectionError("socket dropped mid-put")
+        return self._inner.put_object(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _object_checkpoint(
+    service: CoordinatorService,
+    client: LocalS3Client,
+    key: str,
+    body: bytes | None,
+    name: str,
+) -> str:
+    """Capture ONE object member at ``body`` — or ABSENT when ``body`` is None.
+
+    The two-step shape every test below needs (U2's file-leg helper, object
+    side): the capture happens while the member is quiescent, so whatever the
+    restore leg later observes came from a write that landed AFTER it.
+    """
+    if body is not None:
+        client.put_object(Bucket="demo", Key=key, Body=body)
+    versioner = _versioner(service)
+    versioner.add_object_member(CoherentObject("demo", client=client), key)
+    return versioner.checkpoint(name).record.checkpoint_id
+
+
+def _restore_one_object(
+    service: CoordinatorService, client: Any, key: str, checkpoint_id: str
+) -> MemberRestoreOutcome:
+    restorer = _versioner(service)
+    restorer.add_object_member(CoherentObject("demo", client=client), key)
+    (member,) = restorer.restore(checkpoint_id).members
+    return member
+
+
+def test_object_leg_restored_over_a_peer_write_names_the_discarded_version_id(
+    service: CoordinatorService,
+) -> None:
+    """The report names the versionId the restore threw away — not the ETag.
+
+    The object leg reads bytes, ETag and versionId from ONE response and today
+    keeps only the first two: the ETag arbitrates the write and the versionId is
+    dropped on the floor. That drop is what leaves ``restored`` unable to
+    distinguish "put back a state nothing had touched" from "discarded a
+    colleague's committed object", and the peer's versionId — the only handle
+    that still resolves their bytes through S3 versioning — is unrecoverable
+    from the report the moment the CAS mints a newer one.
+
+    The ETag is asserted ABSENT from both halves on purpose (KTD5): it is the
+    leg's comparand, it is not a pointer any S3 call accepts, and recording it
+    where an operator expects a versionId would hand them a string that looks
+    actionable and resolves nothing.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "cfg.json", b"captured", "pre-peer")
+
+    # A peer commits and stops: content, ETag and versionId all move, then quiesce.
+    peer = client.put_object(Bucket="demo", Key="cfg.json", Body=b"peer's committed object")
+
+    member = _restore_one_object(service, client, "cfg.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED  # unchanged vocabulary
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert member.observation.pointer == peer["VersionId"]
+    assert member.observation.fingerprint == sha256_hex(b"peer's committed object")
+    # The comparand is NOT the observation: an ETag never resolves a version.
+    assert member.observation.pointer != peer["ETag"]
+    assert member.observation.fingerprint != peer["ETag"]
+    # Nor is the pointer the one this write MINTED — that is new_native_token,
+    # the state the operator still has; conflating them would name the survivor.
+    assert member.new_native_token is not None
+    assert member.observation.pointer != member.new_native_token
+    # The discarded version is still resolvable BY that pointer (versioning
+    # preserved it), which is what makes the recorded string worth reporting.
+    resp = client.get_object(Bucket="demo", Key="cfg.json", VersionId=member.observation.pointer)
+    assert resp["Body"].read() == b"peer's committed object"
+    assert CoherentObject("demo", client=client).read("cfg.json")[0] == b"captured"
+
+
+def test_object_leg_create_on_absent_records_no_live_state(
+    service: CoordinatorService,
+) -> None:
+    """A create-on-absent leg discarded nothing, and must not read as divergence.
+
+    The leg's live read raised ``KeyError`` and it wrote under the
+    ``CREATE_IF_ABSENT`` comparand, so there was no live state to overwrite —
+    the one landed arm where ``restored`` really does mean "put back a state
+    nothing had touched". Collapsing it into the differs state would fire an
+    operator's gate on every deleted-then-restored member, which is the most
+    ordinary restore there is.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "gone.json", b"keep-me", "pre-delete")
+
+    client.delete_object(Bucket="demo", Key="gone.json")  # marker-current: live absent
+
+    member = _restore_one_object(service, client, "gone.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.observation.state == RESTORE_OBSERVATION_NO_LIVE_STATE
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+    assert CoherentObject("demo", client=client).read("gone.json")[0] == b"keep-me"
+
+
+def test_object_delete_leg_records_presence_without_claiming_content(
+    service: CoordinatorService,
+) -> None:
+    """The delete leg says live state EXISTED, and claims nothing about it.
+
+    Its probe is the plain ``read`` — the versioned read refuses an unversioned
+    bucket, and R1's constraint forbids a second call to fetch a pointer — so
+    the leg never compares the live content with the capture and holds no
+    versionId for it. It is nonetheless the one leg CERTAIN it destroyed live
+    state, so silence would be the wrong answer too: the state alone is the
+    honest middle, and a later gate can fire on it (a member captured absent
+    that is present live was created after the capture) without the report ever
+    asserting the deleted bytes were verified.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "ghost.json", None, "absent-fact")
+
+    client.put_object(Bucket="demo", Key="ghost.json", Body=b"created after the capture")
+
+    member = _restore_one_object(service, client, "ghost.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.deleted_at_restore is not None
+    assert member.observation.state == RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE
+    # Never the differs state: that one asserts a COMPARISON this leg never ran.
+    assert member.observation.state != RESTORE_OBSERVATION_DIFFERS
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+
+
+def test_object_delete_leg_over_an_already_absent_member_observes_no_write(
+    service: CoordinatorService,
+) -> None:
+    """Already-absent converges and observed no live state to destroy.
+
+    The control arm for the presence state: without it, a delete leg recording
+    ``present_not_comparable`` unconditionally would satisfy the test above
+    while firing an operator's gate on a workspace where nothing was deleted at
+    all — the probe's ``KeyError`` is precisely the evidence that distinguishes
+    them.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "ghost.json", None, "absent-fact")
+
+    member = _restore_one_object(service, client, "ghost.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED
+    assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert member.deleted_at_restore is None
+
+
+def test_object_leg_converged_member_observes_no_write_attempted(
+    service: CoordinatorService,
+) -> None:
+    """A quiescent object member reports the no-write state, never a divergence.
+
+    The converged short-circuit returns before the leg resolves pinned bytes or
+    touches the CAS, so there is no overwrite to describe. The control arm that
+    makes the differs assertions mean something: a leg recording
+    ``observed_differs`` unconditionally would pass every other test here.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "calm.json", b"steady", "quiescent")
+    puts_before = len(client.put_calls)
+
+    member = _restore_one_object(service, client, "calm.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED
+    assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+    assert len(client.put_calls) == puts_before  # no write was even attempted
+
+
+def test_object_leg_re_drive_observes_the_winning_iteration_not_the_first_read(
+    service: CoordinatorService,
+) -> None:
+    """Under contention the report names the state the write actually replaced.
+
+    KTD7: the live read sits INSIDE the budget loop, so a view captured once
+    and held across re-drives names a version the write did not overwrite — the
+    engine would truthfully say ``restored`` while pointing at a versionId some
+    other write had already superseded, which is worse than silence because it
+    reads as evidence. One foreign put is interleaved between the first live
+    read and its CAS; only the second, winning read may be reported.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "raced.json", b"captured", "raced")
+    diverged = client.put_object(Bucket="demo", Key="raced.json", Body=b"diverged")
+    racing = _ForeignWriterOnLiveReads(client, "demo", "raced.json", times=1)
+
+    member = _restore_one_object(service, racing, "raced.json", checkpoint_id)
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.attempts == 2  # attempt 1 lost the If-Match race, attempt 2 landed
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert member.observation.fingerprint == sha256_hex(b"foreign-1")
+    # Explicitly NOT the first read's — the hoist this test exists to kill.
+    assert member.observation.pointer != diverged["VersionId"]
+    assert member.observation.fingerprint != sha256_hex(b"diverged")
+    # The winning read's versionId still resolves the bytes it named.
+    resp = client.get_object(Bucket="demo", Key="raced.json", VersionId=member.observation.pointer)
+    assert resp["Body"].read() == b"foreign-1"
+
+
+def test_object_leg_pointerless_landing_still_names_what_it_overwrote(
+    service: CoordinatorService,
+) -> None:
+    """A write that landed but minted no pointer still discarded live content.
+
+    Versioning was suspended between the live read and the put, so
+    ``cas_write_versioned`` raises after a durable landing whose ETag it
+    captured. Nothing can be registered FOR the new state — ``new_native_token``
+    stays None — but the state it replaced was read, compared and overwritten,
+    and the live view already holds both halves. Staying silent here would drop
+    the divergence signal on the one arm that cannot even be re-pinned, leaving
+    an operator with the least recoverable member and the least information
+    about it.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "cfg.json", b"captured", "pointerless")
+    peer = client.put_object(Bucket="demo", Key="cfg.json", Body=b"peer's committed object")
+
+    member = _restore_one_object(
+        service, _PointerlessOnCasPut(client, "cfg.json"), "cfg.json", checkpoint_id
+    )
+
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.new_native_token is None  # nothing to pin or register
+    assert member.observation.state == RESTORE_OBSERVATION_DIFFERS
+    assert member.observation.pointer == peer["VersionId"]
+    assert member.observation.fingerprint == sha256_hex(b"peer's committed object")
+    assert CoherentObject("demo", client=client).read("cfg.json")[0] == b"captured"
+
+
+def test_object_leg_unknown_write_reconciled_converge_records_not_recorded(
+    service: CoordinatorService,
+) -> None:
+    """Authorship unknowable ⇒ the observation says "not recorded", never clean.
+
+    A put was issued, its outcome was lost with the socket, and the
+    reconciliation read found the live object byte-identical to the manifest.
+    Either this run's put landed and discarded the peer's object, or it never
+    landed and something else converged it — the terminal says ``converged``
+    and its detail says authorship is not claimed, and that uncertainty is
+    exactly what the observation must carry too.
+
+    ``no_write_attempted`` is the wrong answer here for the same reason the file
+    leg's unconfirmed arm could safely take it and this one cannot: there, the
+    terminal was ``held_unconfirmed``, already the loudest in the vocabulary.
+    Here the terminal is the QUIETEST one, so an under-claiming observation
+    makes a leg that read divergent content and issued a write indistinguishable
+    from a workspace nobody touched. ``observed_differs`` would over-claim in
+    the other direction — it asserts the write discarded that content, which is
+    the very thing no read can establish.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "flaky.json", b"captured", "unknown")
+    client.put_object(Bucket="demo", Key="flaky.json", Body=b"peer's committed object")
+
+    member = _restore_one_object(
+        service, _ConvergeOnCasPut(client, "demo", "flaky.json"), "flaky.json", checkpoint_id
+    )
+
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED
+    assert "authorship not claimed" in member.detail
+    assert member.observation.state == RESTORE_OBSERVATION_NOT_RECORDED
+    assert member.observation.pointer is None
+    assert member.observation.fingerprint is None
+
+
+def test_object_leg_unknown_create_reconciled_converge_records_no_live_state(
+    service: CoordinatorService,
+) -> None:
+    """On the create path, unknowable authorship still discards nothing.
+
+    The companion to the test above, and the reason the unknown arm is not one
+    blanket answer: what the leg overwrote is settled by its READ, not by whose
+    put landed. The live read found the member absent, so no writer — this run
+    or a peer — could have destroyed content that was not there. Answering
+    ``not_recorded`` here would fire an operator's gate on a member that
+    provably lost nothing.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    checkpoint_id = _object_checkpoint(service, client, "gone.json", b"keep-me", "unknown-create")
+    client.delete_object(Bucket="demo", Key="gone.json")
+
+    member = _restore_one_object(
+        service, _ConvergeOnCasPut(client, "demo", "gone.json"), "gone.json", checkpoint_id
+    )
+
+    assert member.outcome == RESTORE_OUTCOME_CONVERGED
+    assert member.observation.state == RESTORE_OBSERVATION_NO_LIVE_STATE
+    assert member.observation.pointer is None
+
+
+def test_object_legs_add_no_substrate_call_to_record_the_observation(
+    service: CoordinatorService,
+) -> None:
+    """The observation rides the read the leg already issues (SPLIT-COMPARAND).
+
+    The counts below are the ones the engine issued BEFORE the observation
+    existed, pinned verbatim. A second read to fetch a pointer would describe
+    bytes it never saw — and on the delete leg it is also impossible, because
+    the versioned read refuses an unversioned bucket, so the honest state alone
+    is what that leg can afford. Counted at the client, not on a mock's call
+    list, so a helper quietly gaining a second GET is visible here.
+    """
+    client = LocalS3Client()
+    client.create_bucket("demo", versioned=True, object_lock=True)
+    modify = _object_checkpoint(service, client, "cfg.json", b"captured", "cp-modify")
+    create = _object_checkpoint(service, client, "gone.json", b"keep-me", "cp-create")
+    delete = _object_checkpoint(service, client, "ghost.json", None, "cp-delete")
+    client.put_object(Bucket="demo", Key="cfg.json", Body=b"peer edit")
+    client.delete_object(Bucket="demo", Key="gone.json")
+    client.put_object(Bucket="demo", Key="ghost.json", Body=b"intruder")
+
+    for checkpoint_id, key, expected in (
+        # modify: one live comparand read + one pinned read, one If-Match put.
+        (modify, "cfg.json", (2, 1, 0)),
+        # create: the live read (absent) + one pinned read, one create put.
+        (create, "gone.json", (2, 1, 0)),
+        # delete: the presence probe alone, then the unconditional delete.
+        (delete, "ghost.json", (1, 0, 1)),
+    ):
+        before = (len(client.get_calls), len(client.put_calls), len(client.delete_calls))
+        member = _restore_one_object(service, client, key, checkpoint_id)
+        after = (len(client.get_calls), len(client.put_calls), len(client.delete_calls))
+        assert member.outcome == RESTORE_OUTCOME_RESTORED
+        assert tuple(a - b for a, b in zip(after, before)) == expected, key
+        # And the observation is still populated from those calls alone.
+        assert member.observation.state != RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
 
 
 # ===========================================================================
