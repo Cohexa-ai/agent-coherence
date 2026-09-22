@@ -680,7 +680,12 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     restored here — pid is public on POSIX (any `ps` invocation lists
     it) so it does not exceed the threat model's accepted disclosure,
     and operators rely on it to verify "is the coordinator I think is
-    running actually mine"."""
+    running actually mine".
+
+    R6: the session row is keyed on ``agent_id`` here, not ``agent_name`` —
+    the name embeds the raw session id and is null below the operator tier.
+    The name itself is asserted at the full tier by
+    ``test_status_operator_tier_still_names_the_session``."""
     a_sid = _sid("A")
     client.post("/hooks/pre-read", {"session_id": a_sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": a_sid, "path": "spec.md"})
@@ -689,8 +694,8 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     tracked_paths = {a["path"] for a in b["tracked_artifacts"]}
     assert "plan.md" in tracked_paths
     assert "spec.md" in tracked_paths
-    sessions = {sess["agent_name"] for sess in b["sessions"]}
-    assert f"claude-session-{a_sid}" in sessions
+    sessions = {sess["agent_id"] for sess in b["sessions"]}
+    assert str(session_to_agent_id(a_sid)) in sessions
     # AC-02: canonical field; old _s alias also present for one release.
     assert b["coordinator_uptime_seconds"] > 0
     assert b["coordinator_uptime_s"] == b["coordinator_uptime_seconds"]
@@ -4949,13 +4954,30 @@ def test_status_still_lists_a_registered_session_holding_nothing(
     client: _Client,
 ) -> None:
     """No regression on the live path: a session that registered but holds no
-    grant keeps its named entry with an empty state map."""
+    grant keeps its entry with an empty state map.
+
+    R6 split this across tiers. The row is keyed on ``agent_id`` at both, and
+    the operator tier is where the name proves the entry came from the
+    registration path rather than the registry's unnamed-holder branch — at
+    the default tier the two shapes are deliberately indistinguishable.
+    """
     sid = _sid("named-no-grants")
     client.post("/hooks/session-start", {"session_id": sid})
+    agent_id = str(session_to_agent_id(sid))
+
     _, body = client.get("/status")
-    named = {s["agent_name"]: s for s in body["sessions"]}
-    assert f"claude-session-{sid}" in named
-    assert named[f"claude-session-{sid}"]["states"] == {}
+    by_id = {s["agent_id"]: s for s in body["sessions"]}
+    assert agent_id in by_id
+    assert by_id[agent_id]["states"] == {}
+    assert by_id[agent_id]["agent_name"] is None
+
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    named = {s["agent_id"]: s for s in full["sessions"]}
+    assert named[agent_id]["agent_name"] == f"claude-session-{sid}"
+    assert named[agent_id]["states"] == {}
 
 
 def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
@@ -4975,6 +4997,196 @@ def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
     assert {k for s in body["sessions"] for k in s} == {
         "agent_name", "agent_id", "states",
     }
+
+
+# ======================================================================
+# R6 — per-artifact state below the operator tier carries no raw
+#       session identifier
+# ======================================================================
+#
+# ``agent_name`` renders ``claude-session-<session_id>`` verbatim, so every
+# tier that carried a session row also republished the raw session id beside
+# that session's per-artifact state. ``agent_id`` — a uuid5 of the same
+# session id, documented at ``session_to_agent_id`` as not reversible — is
+# already on the row and is the handle callers should attribute by. The
+# operator (full-detail) tier keeps the name; everything below it drops it
+# and renders through the null-name fallback the CLI already has.
+#
+# Each test here drives a LIVE session holding a real grant. An empty
+# workspace emits ``sessions: []``, which cannot observe any of this.
+
+
+def _session_id_appears_in(body: dict, sid: str) -> bool:
+    """True if the raw session id is reachable anywhere in the payload —
+    any key, any value, any nesting depth."""
+    return sid in json.dumps(body)
+
+
+def test_status_default_tier_reports_state_without_the_session_id(
+    client: _Client,
+) -> None:
+    """The default tier still answers "who holds what", and answers it with
+    the non-reversible ``agent_id`` only.
+
+    The control matters more than the assertion: an empty ``sessions`` list
+    would satisfy "no session id in the body" while observing nothing, so the
+    row and its per-artifact state are asserted present FIRST.
+    """
+    sid = _sid("r6-default-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get("/status")
+    assert body["detail"] == "minimal"
+
+    # Control: the case this test claims to inspect is actually present.
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1, f"no row for the live session; sessions={body['sessions']}"
+    assert rows[0]["states"] == {"docs/plan.md": "EXCLUSIVE"}, (
+        "per-artifact state must still be reported — dropping the whole row "
+        "would pass the redaction assertion while telling the operator nothing"
+    )
+
+    # The requirement.
+    assert rows[0]["agent_name"] is None
+    assert not _session_id_appears_in(body, sid), (
+        f"the raw session id is still reachable in the default-tier body: "
+        f"{json.dumps(body)[:400]}"
+    )
+
+
+def test_status_operator_tier_still_names_the_session(client: _Client) -> None:
+    """The positive control for the redaction above: at the operator
+    (full-detail) tier the name is present, in full, session id included.
+
+    Without this, a handler that dropped ``agent_name`` at EVERY tier would
+    look correct.
+    """
+    sid = _sid("r6-operator-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert body["detail"] == "full"
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1
+    assert rows[0]["agent_name"] == f"claude-session-{sid}"
+    assert _session_id_appears_in(body, sid), (
+        "the operator tier keeps the name; if this is false the test above "
+        "cannot distinguish redaction from an empty payload"
+    )
+
+
+def test_status_agent_id_is_identical_across_tiers(client: _Client) -> None:
+    """``agent_id`` is the handle callers attribute by, so it must not move.
+    Same value, same row, at the default tier and the operator tier."""
+    sid = _sid("r6-stable-agent-id")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, minimal = client.get("/status")
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+
+    expected = str(session_to_agent_id(sid))
+    minimal_ids = {s["agent_id"] for s in minimal["sessions"]}
+    full_ids = {s["agent_id"] for s in full["sessions"]}
+    assert expected in minimal_ids
+    assert minimal_ids == full_ids, (
+        "redacting the display name must not change which agents are listed"
+    )
+    by_id_minimal = {s["agent_id"]: s["states"] for s in minimal["sessions"]}
+    by_id_full = {s["agent_id"]: s["states"] for s in full["sessions"]}
+    assert by_id_minimal == by_id_full
+
+
+def test_status_cli_renders_a_redacted_row_without_the_session_id(
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The redacted row is a shape the CLI already handles: it renders the
+    existing null-name fallback rather than printing "None", and the rendered
+    text carries no raw session id.
+
+    Driven off a LIVE default-tier body so the renderer sees exactly what the
+    handler emits, not a shape this test invented.
+    """
+    from ccs.cli import coherence_status
+
+    monkeypatch.setenv("COLUMNS", "100")
+    sid = _sid("r6-cli-render")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    coherence_status._render_table(body)
+    out = capsys.readouterr().out
+
+    assert "Sessions:" in out
+    assert "docs/plan.md" in out and "EXCLUSIVE" in out
+    assert "name unknown" in out
+    assert "None" not in out
+    assert sid not in out
+    # The fallback must not assert a cause it cannot know. This row is a
+    # redacted live session, NOT a grant that outlived its coordinator, and
+    # the renderer cannot distinguish the two — so it names both.
+    assert "redacted below the operator tier" in out, (
+        "the fallback blamed a pre-restart grant for what is a tier redaction"
+    )
+
+
+def test_detail_help_text_names_only_redactions_the_handler_performs(
+    client: _Client,
+) -> None:
+    """R9: the ``--detail`` help text claimed the minimal tier redacts
+    ``coordinator_pid``. It never has — pid is emitted at every tier on
+    purpose (it is public on POSIX and operators verify ownership with it).
+
+    Each redaction the help text names is checked against a LIVE minimal-tier
+    body, and the one it used to name falsely is checked the other way.
+    """
+    from ccs.cli import coherence_status
+
+    sid = _sid("r6-help-text")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    action = next(
+        a for a in coherence_status.build_parser()._actions
+        if "--detail" in (a.option_strings or [])
+    )
+    help_text = action.help or ""
+
+    # The false claim is gone, and the behaviour that falsified it is pinned.
+    assert "coordinator_pid" not in help_text, (
+        "the help text must not claim a pid redaction the handler never does"
+    )
+    assert body["coordinator_pid"] == os.getpid()
+
+    # Each redaction the text now names is real at the minimal tier.
+    assert "absolute path" in help_text
+    assert body["coordinator_root"] == "."
+
+    assert "session name" in help_text
+    assert [s["agent_name"] for s in body["sessions"]] == [None]
+
+    assert "tracked pattern" in help_text
+    assert "user_added_patterns" not in body["policy_summary"]
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert "user_added_patterns" in full["policy_summary"], (
+        "control: the pattern list exists at the operator tier, so its "
+        "absence above is a redaction and not an empty policy"
+    )
 
 
 # ======================================================================

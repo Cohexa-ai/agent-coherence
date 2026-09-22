@@ -4624,9 +4624,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
 
     ``minimal`` is the default and includes no absolute paths (workspace
-    root is reported as a sentinel ``.``). ``metrics`` returns only the
+    root is reported as a sentinel ``.``) and no session names (R6:
+    ``agent_name`` embeds the raw session id, so it is null below the
+    operator tier; the non-reversible ``agent_id`` and the per-artifact
+    ``states`` map stay). ``metrics`` returns only the
     counter block — useful for operators scraping /status into a
-    dashboard without leaking workspace state. ``full`` is the legacy
+    dashboard without leaking workspace state; it carries no sessions at
+    all and is unaffected by R6. ``full`` is the legacy
     everything-block plus absolute ``coordinator_root`` and ``coordinator_pid``,
     gated by the explicit ``Coherence-Local-Operator: true`` header so a
     same-user adversary (Adversary 1 in auth.py) cannot trivially grab
@@ -4721,12 +4725,23 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 continue
             states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
 
+    # R6: ``agent_name`` renders the raw session id verbatim
+    # (``session_to_agent_name`` → ``claude-session-<sid>``, and the SB-25
+    # subagent form carries it too), so every tier that listed a session row
+    # republished that session's identifier alongside its per-artifact state.
+    # Below the operator tier the row keeps ``agent_id`` — already a uuid5 of
+    # the session id and documented at ``session_to_agent_id`` as not
+    # reversible — and drops the name. Nothing new is derived here: a second
+    # derivation would duplicate the one the Node backend is parity-pinned to.
+    # The null-name row is the shape the unnamed-holder branch below already
+    # emits and the status CLI already renders.
+    name_visible = detail == "full"
     sessions: list[dict] = []
     named_ids: set[UUID] = set()
     for agent_id, name in named_agents:
         named_ids.add(agent_id)
         sessions.append({
-            "agent_name": name,
+            "agent_name": name if name_visible else None,
             "agent_id": str(agent_id),
             "states": states_by_agent.get(agent_id, {}),
         })
