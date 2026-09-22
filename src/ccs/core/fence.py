@@ -44,9 +44,12 @@ from .types import FenceComparands
 # caller — the coordinator cannot identify this artifact's content — so they
 # resolve to one answer rather than three.
 #
-# The coordinator server keeps its own copy of this literal for the hash-differs
-# suppression it applies before the wire (``_F_SENTINEL_CONTENT_HASH``); grep
-# both if either moves.
+# The all-f literal also exists as ``_F_SENTINEL_CONTENT_HASH`` in the
+# coordinator server, where the foreign-write detector imports it for its
+# canonical-hash no-claim check. The coordinator's own hash-differs suppression
+# no longer reads it -- that path asks this module instead -- so the two copies
+# now serve different mechanisms. Deduping them would need core to import from
+# an adapter, which the layering forbids; grep both if either moves.
 _NO_CLAIM_CONTENT_HASHES: frozenset[str] = frozenset({"", "f" * 64})
 
 
