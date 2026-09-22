@@ -1,0 +1,69 @@
+{
+  "name": "harness-stale-read-names-the-writing-session",
+  "description": "R15, DISTINGUISH HALF. Session A reads, peer session B acquires and commits, A re-reads and is told it is stale -- and `summary.last_writer_session_id` names B. That field is the whole point: a client decides whether to re-read based on WHO moved the bytes underneath it. The harness scrubbed every 8-4-4-4-12 hex value to <UUID> unconditionally, so before this unit a fixture asserting the writer was A and a fixture asserting it was B were byte-identical after normalization and BOTH passed -- a decorative assertion. `preserve_identity` opts this one key out of that scrub so the identity is compared verbatim; every other UUID-shaped value in every other fixture keeps the portability default, which is what lets one corpus run against two implementations that mint different ids. The two timestamps and the prose context stay ignored (they vary per run, following warn_mode/14); the ATTRIBUTION is the contract.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md",
+          "success": true,
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "docs/plan.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      },
+      "status": "stale",
+      "summary": {
+        "path": "docs/plan.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "22222222-2222-4222-8222-222222222222",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "ignore_keys": ["additionalContext", "last_writer_at_unix_ts", "warning_generated_at_unix_ts"],
+  "preserve_identity": ["last_writer_session_id"],
+  "backends": ["python"]
+}
