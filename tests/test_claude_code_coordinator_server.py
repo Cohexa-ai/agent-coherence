@@ -7130,3 +7130,68 @@ def test_the_verdict_runs_once_per_tracked_pre_read_on_the_handlers_clock(
     # A real clock read, bracketed by the request — not 0, not None, and not a
     # constant a later refactor could freeze without anyone noticing.
     assert wall_before <= now_unix <= wall_after
+
+
+@pytest.mark.parametrize(
+    "bad_agent_id",
+    ["has a space", "way-too-long" * 12, 42, ["a"], {"a": 1}, True],
+)
+def test_fence_refuses_a_malformed_agent_id_instead_of_answering_as_the_parent(
+    served_decider, bad_agent_id
+) -> None:
+    """A present-but-malformed subagent id must be a 400, never a verdict.
+
+    ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    PARENT identity. On a read path that only changes attribution prose, which
+    is why the session-stop guard's comment scopes the allowance to read paths.
+    Here it changes WHOSE grant the verdict is about, and grant standing is the
+    one leg computed per agent: a subagent whose grant a peer preempted would
+    be answered about a parent that still holds SHARED, and told to PROCEED.
+    That is the fail-open this route exists to close, reached through an
+    identity field rather than a comparand.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("malformed-agent")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="malformed-agent-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    body = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+    body["agent_id"] = bad_agent_id
+
+    status, payload = client.post(_U4_ROUTE, body)
+
+    assert status == 400, f"malformed agent_id answered {status}, not a client error"
+    assert "agent_id" in payload["error"], payload
+    assert "verdict" not in payload, "a malformed identity produced a verdict"
+
+
+def test_fence_still_answers_for_an_absent_or_well_formed_agent_id(
+    served_decider,
+) -> None:
+    """The control for the refusal above. Rejecting a MALFORMED id must not
+    reject an ABSENT one -- omitting the field is the legitimate parent call
+    and every hook route accepts it -- nor a well-formed subagent id. Without
+    this, the guard could be tightened into refusing every caller and the
+    test above would still pass."""
+    server, client = served_decider
+    path = _u3a_warn_path("agent-id-controls")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="agent-id-controls-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    base = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+
+    absent_status, absent_payload = client.post(_U4_ROUTE, dict(base))
+    assert absent_status == 200, absent_payload
+    assert "verdict" in absent_payload
+
+    scoped = dict(base)
+    scoped["agent_id"] = "sub-agent_1"
+    scoped_status, scoped_payload = client.post(_U4_ROUTE, scoped)
+    assert scoped_status == 200, scoped_payload
+    assert "verdict" in scoped_payload

@@ -439,3 +439,29 @@ def test_comparands_are_keyword_only_and_frozen() -> None:
         FenceComparands(5, 5, 7, 7, False, False, True)  # type: ignore[misc]
     with pytest.raises(Exception):
         _CLEAN.expected_version = 9  # type: ignore[misc]
+
+
+def test_a_refused_read_outranks_an_absent_content_claim() -> None:
+    """Pins leg 4 over leg 5 -- the one precedence pair the docstring's "each
+    leg's precedence is pinned by a test" claim did not actually cover.
+
+    Both predicates are reachable AT ONCE on the coordinator route: an
+    artifact seeded with no content claim (the launch-gate all-``f`` form, or
+    a first observation that carried no caller hash) whose holder is then
+    invalidated by a peer under strict mode arrives with ``read_refused`` and
+    ``content_claim_present=False`` both set. Without this test the two legs
+    could be swapped and nothing would go red -- and their order is published
+    contract, so a swap changes the reason a real, reachable state answers
+    with. The refusal wins because it is the immediate blocker: the
+    coordinator declined to serve the read at all, so there is no served view
+    whose content claim could be evaluated.
+    """
+    both = _with(read_refused=True, content_claim_present=False)
+    assert classify_hold(both) == HOLD_READ_DENIED
+
+    # Controls. Without these the assertion above passes for the wrong
+    # reason -- a table that always answered ``read_denied`` would satisfy it.
+    only_refused = _with(read_refused=True, content_claim_present=True)
+    assert classify_hold(only_refused) == HOLD_READ_DENIED
+    only_no_claim = _with(read_refused=False, content_claim_present=False)
+    assert classify_hold(only_no_claim) == HOLD_CONTENT_CLAIM_ABSENT

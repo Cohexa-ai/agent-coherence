@@ -2321,6 +2321,17 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # here would let a verdict answer a LATER question about its own caller.
     # The derivation is deterministic, so an unknown session resolves to an
     # agent with no grant and holds, which is the correct answer.
+    # A malformed subagent id is REFUSED here, not degraded to the parent.
+    # ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    # parent identity -- and the session-stop guard's comment scopes that
+    # allowance to "read paths (where degrading to parent attribution is
+    # benign)". This is not one: grant standing is the single leg computed
+    # PER AGENT, so answering about the parent would tell a preempted
+    # subagent to proceed while the parent still holds SHARED. Every other
+    # malformed field on this route answers 400; so does this one.
+    if read_subagent_id(body) is None and has_subagent_id_field(body):
+        req._json(400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
+        return
     agent_id = session_to_agent_id(session_id, read_subagent_id(body))
 
     def work() -> dict:
@@ -2349,8 +2360,12 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             coordinator.increment_effect_fence_hold()
         return verdict
 
-    # No abort Event: the work body performs no registry write, so there is
-    # nothing a late completion could land after the degraded response.
+    # No abort Event: the work body performs no REGISTRY write, so a late
+    # completion cannot land coordinator state after the degraded response.
+    # It can still land the advisory hold counter above, which is deliberate
+    # -- that counter's contract is "verdicts the handler REACHED", and a
+    # late completion did reach one. The degraded hold the caller actually
+    # received is counted by ``watchdog_timeouts_total``.
     _run_or_degrade(
         req, coordinator, work, degraded_response=_EFFECT_FENCE_DEGRADED_RESPONSE,
     )
@@ -5753,7 +5768,7 @@ def _is_recent_self_commit_lag(
 # ----------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TrackedReadDecision:
     """The fresh / stale / denied verdict for an ALREADY-TRACKED artifact.
 
