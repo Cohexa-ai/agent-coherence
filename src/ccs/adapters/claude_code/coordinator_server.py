@@ -2439,8 +2439,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary: _payloads.StaleSummary = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if editor_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=editor_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
@@ -2499,9 +2501,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if holder_id is not None:
             # Existing collision surfacing path. If we also have preemption
             # notices for this session, prepend them.
-            holder_session = _agent_id_to_session(coordinator, holder_id)
+            # R7: name the incumbent by the agent id the registry holds it
+            # under, not by the session id that id was derived from.
             resp = _payloads.build_collision_response(
-                holder_session_id=holder_session or "<unknown>",
+                holder_session_id=holder_id.hex,
                 holder_acquired_at_unix_ts=float(holder_ts or _payloads.now_unix()),
                 path=path,
             )
@@ -2649,10 +2652,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         f"retry. Underlying coordinator error: {exc}"
                     )
                     return {"ok": False, "reason": reason, "reclaimed": True}
-                preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+                # R7: the popped notice carries the preempter's agent id.
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
-                    f"preempted by session {_payloads.short_session_id(preempter_session)} at "
+                    f"preempted by agent {_payloads.short_session_id(preempter_id.hex)} at "
                     f"{_iso_utc(preempted_at)}. Your edit landed in your local "
                     f"worktree but will not be reflected in the coordinator's "
                     f"version. Underlying coordinator error: {exc}"
@@ -2892,11 +2895,20 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
-            preempter_session = _agent_id_to_session(coordinator, preempter_id) or ""
+            # R7: this was the most reachable of the two paths — a structured
+            # field carrying the preempter's session id in FULL, not just its
+            # prose prefix. The keys are RENAMED rather than aliased, against
+            # the module's usual additive-evolution rule: keeping
+            # ``preempter_session_id`` alive would either go on emitting the
+            # session id or hand a consumer that parses by exact shape an
+            # agent id under a name promising a session id, which is the
+            # worse of the two. The value is never absent now — the notice
+            # row carries the agent id, so there is no unnamed-preempter arm
+            # left to sentinel.
             notices_payload.append({
                 "path": art.name if art else "<unknown-artifact>",
-                "preempter_session_id": preempter_session,
-                "preempter_session_short": (preempter_session[:8] if preempter_session else "<unknown>"),
+                "preempter_agent_id": preempter_id.hex,
+                "preempter_agent_short": preempter_id.hex[:8],
                 "preempted_at_unix_ts": ts,
                 "preempted_at_iso": _iso_utc(ts),
             })
@@ -3204,8 +3216,10 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
@@ -3379,8 +3393,10 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
@@ -5314,10 +5330,14 @@ def _build_preemption_text(
                 f"Re-fetch via pre-read and retry."
             )
             continue
-        preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+        # R7: the notice row already carries the preempter's agent id, which
+        # is what the registry stores and what /status publishes. Rendering
+        # it directly also removes the restart degradation the reverse
+        # lookup had — the agent-name map is process-local and starts empty,
+        # so a preempter that survived a restart used to render "<unknown>".
         lines.append(
-            f"  • {path} — preempted/revoked by session "
-            f"{_payloads.short_session_id(preempter_session)} "
+            f"  • {path} — preempted/revoked by agent "
+            f"{_payloads.short_session_id(preempter_id.hex)} "
             f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
@@ -5664,7 +5684,7 @@ def _deliver_pending_reground(
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
-    """Return the session_id (not agent UUID) of the artifact's last writer, if any.
+    """Return the AGENT id (hex) of the artifact's last writer, if any.
 
     COR-09 (fixed): authoritative source is ``artifacts.last_writer_id``
     in the registry — set by the commit path on successful post-edit and
@@ -5674,11 +5694,23 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     successful commit). The previous state-map fallback could attribute
     the write to the very session receiving the warning (agent appears
     in state_map as SHARED, becomes the "first known agent").
+
+    R7: this used to run ``session_to_agent_id`` backwards through the
+    adapter's agent-name map and return the recovered session id, so the
+    stale/deny response handed to one session named a peer by that peer's
+    session id. It returns the registry's own handle instead. Nothing new is
+    derived — the agent id is a uuid5 of the session id that ``/status``
+    already emits, and a second derivation here would duplicate the one the
+    Node backend is parity-pinned to.
+
+    The hex form (32 lowercase chars, no hyphens) rather than ``str(uuid)``:
+    it is byte-identical to what Node's ``sessionToAgentId`` returns, and the
+    value lands in a corpus field compared verbatim across both backends.
     """
     # COR-09 primary path: authoritative last_writer_id from the registry.
     committed_writer = coordinator.registry.last_writer_for(artifact_id)
     if committed_writer is not None:
-        return _agent_id_to_session(coordinator, committed_writer)
+        return committed_writer.hex
     # Fallback for artifacts that exist but never had a successful commit
     # (first-observation seeding with no post-edit yet). Best signal: an
     # agent currently in MODIFIED state (mid-commit, in case the write
@@ -5686,12 +5718,51 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     state_map = coordinator.registry.get_state_map(artifact_id)
     for agent_id, state in state_map.items():
         if state == MESIState.MODIFIED:
-            return _agent_id_to_session(coordinator, agent_id)
+            return agent_id.hex
     # No committed writer + no MODIFIED holder → genuinely unknown.
     # Return None rather than the misleading "first state-map entry"
     # which could be the querying agent itself.
     return None
-    return None
+
+
+def _prior_version_observed(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    agent_state: MESIState | None,
+    current_version: int,
+) -> int | None:
+    """The version this agent last ACTUALLY observed, for the stale summary.
+
+    ``None`` for an agent that has never held a grant on the artifact — there
+    is no observation to report, and a 0-sentinel would read as "saw v0".
+
+    R8. Every stale summary used to compute this as ``current_version - 1``,
+    which is only correct if the invalidation came from a commit. When a peer
+    merely TAKES the grant (Cohexa-ai/agent-coherence#196) the version does
+    not move, so the inference reported a version the session never saw and
+    made an unchanged version look changed — which is also what hid the false
+    "was updated by" claim, because ``current > prior`` held unconditionally.
+
+    ``agent_states.last_observed_version`` is the durable per-agent record
+    (SB-10 R6/R7), written GIL-atomically with every non-INVALID grant and
+    deliberately PRESERVED across the transition to INVALID: the last version
+    whose bytes the agent actually held. The Node backend keeps the same
+    column and reads it the same way.
+
+    The old inference survives as the fallback for a row that predates the
+    column (a v5 database migrated forward leaves it NULL). That degrades to
+    today's behaviour rather than to a worse one, and it cannot silently
+    become the normal path: the fallback needs an INVALID agent whose grant
+    was written before the v6 migration.
+    """
+    if agent_state != MESIState.INVALID:
+        return None
+    observed = coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+    if observed is not None:
+        return observed
+    return current_version - 1 if current_version > 0 else 0
 
 
 def _last_writer_unix_ts(
@@ -5823,9 +5894,11 @@ class TrackedReadDecision:
         ``denied`` alone cannot tell the two deny arms apart.
     ``prior_version_seen``
         the summary's ``prior_version_seen_by_session``, already resolved for
-        the arm that ran: the current version for a still-granted holder, one
-        below it for an INVALIDated one, ``None`` for a session with no prior
-        grant.
+        the arm that ran: the current version for a still-granted holder, the
+        registry's recorded ``last_observed_version`` for an INVALIDated one
+        (R8 — see :func:`_prior_version_observed`; it used to be inferred as
+        one below current, which is wrong whenever a peer took the grant
+        without committing), ``None`` for a session with no prior grant.
 
     THE TWO HASH PREDICATES ARE NOT ONE PREDICATE, and folding them into one
     field silently moves the strict-deny gate in whichever direction the
@@ -5864,8 +5937,9 @@ def decide_tracked_read(
     Takes the values the caller has ALREADY read — the pair-atomic
     ``(artifact, owner_generation)`` snapshot, this agent's MESI state, the
     hash the caller offered — and reads nothing further except
-    ``policy.is_strict_mode`` and, on the one arm that consults it, the lag
-    gate's two registry lookups. It grants nothing, re-grants nothing,
+    ``policy.is_strict_mode``, the INVALIDated arm's ``last_observed_version``
+    lookup, and, on the one arm that consults it, the lag gate's two registry
+    lookups. All three are READS. It grants nothing, re-grants nothing,
     advances no observation baseline, bumps no counter, records no heartbeat,
     marks no stale pair, records no deny and pops no notice. That is the whole
     point: a read on the safety path must not mutate or heal what it checks,
@@ -5940,9 +6014,10 @@ def decide_tracked_read(
 
     # No valid grant: either a peer commit INVALIDated this session, or it has
     # never seen this artifact.
-    prior_version_seen = None
-    if agent_state == MESIState.INVALID:
-        prior_version_seen = artifact.version - 1 if artifact.version > 0 else 0
+    prior_version_seen = _prior_version_observed(
+        coordinator, artifact_id, agent_id,
+        agent_state=agent_state, current_version=artifact.version,
+    )
 
     # v0.2 KTD-O / KTD-P deny gate, unchanged: strict mode AND the session
     # demonstrably lacks a fresh view — a true preemption (INVALID), or no
@@ -5968,21 +6043,15 @@ def decide_tracked_read(
     )
 
 
-def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:
-    """Reverse the session_to_agent_id mapping via agent_names. R10 (Unit 6):
-    routes through the lock-aware public accessor instead of reaching into
-    the private dict directly."""
-    name = coordinator.agent_name_for(agent_id)
-    if name and name.startswith("claude-session-"):
-        rest = name[len("claude-session-"):]
-        # SB-25 (R2 attribution): a subagent identity attributes to the
-        # SUBAGENT id, not the parent session — the [:8] short form in
-        # deny/warn prose must name the actual writer. The parent linkage
-        # stays visible via the full agent_name on /status.
-        if ":subagent-" in rest:
-            return rest.split(":subagent-", 1)[1]
-        return rest
-    return None
+# R7: ``_agent_id_to_session`` used to live here — it reversed
+# ``session_to_agent_id`` through the agent-name map so the five renderers
+# below could print a session id. Every one of them now prints the agent id
+# the registry already holds, and the helper is DELETED rather than left
+# unused: kept around, the next renderer that wants a friendlier label reaches
+# for it and re-introduces the mapping. SB-25 attribution is unaffected — a
+# subagent's composite agent id is distinct per (session, subagent), so the
+# short form still names the actual writer, and the parent linkage stays
+# visible via ``agent_name`` on /status's operator tier.
 
 
 def _parse_yaml_pattern_lines(text: str) -> set[str]:

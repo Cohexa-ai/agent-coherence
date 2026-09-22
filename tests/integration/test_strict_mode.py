@@ -761,3 +761,110 @@ def test_pre_read_strict_deny_ignores_want_owner_generation(
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "owner_generation" not in body
     assert "version" not in body
+
+
+# ----------------------------------------------------------------------
+# A grant handover is not a write (R8) -- Cohexa-ai/agent-coherence#196
+# ----------------------------------------------------------------------
+#
+# The reported sequence: A holds the artifact, B calls pre-edit and takes the
+# grant, nothing is committed, and A's next read is denied with "was updated
+# by session <unknown> at <t>". No commit happened, the version never moved,
+# and the deny named a writer that does not exist. This is the end-to-end
+# form of the two renderer tests in
+# ``tests/test_claude_code_coordinator_server.py``.
+
+
+def _setup_grant_handover(client: _Client, path: str) -> None:
+    """A reads (SHARED on v1), B takes the grant via pre-edit, B never commits.
+
+    A is INVALID afterwards with its last-observed version still v1, which is
+    also the artifact's current version -- nothing was written.
+    """
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("A"), "path": path, "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": path})
+
+
+def test_grant_handover_deny_reports_no_write_and_an_unchanged_version(
+    strict_client: _Client,
+) -> None:
+    """Both halves, because either alone passes while the other is wrong.
+
+    The prose alone would pass with a version the response got wrong, and the
+    version alone would pass with prose still claiming a write.
+    """
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "was updated by" not in reason, (
+        f"no write happened, so the deny must not report one; got: {reason}"
+    )
+    assert "your grant on CLAUDE.md was revoked and no new version was committed" in reason, reason
+    assert "CLAUDE.md is still at v1" in reason, reason
+
+    summary = body["summary"]
+    assert summary["current_version"] == 1, summary
+    assert summary["prior_version_seen_by_session"] == 1, (
+        f"A observed v1 and v1 is still current; reporting v0 invents a "
+        f"version A never saw: {summary}"
+    )
+
+
+def test_a_real_commit_still_denies_with_the_write_wording(
+    strict_client: _Client,
+) -> None:
+    """The control for the test above: when a peer really did commit, the
+    deny keeps naming the write and the version it moved to."""
+    _setup_stale(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "CLAUDE.md was updated by agent " in reason, reason
+    assert "was revoked" not in reason, reason
+    assert body["summary"]["current_version"] == 2, body["summary"]
+    assert body["summary"]["prior_version_seen_by_session"] == 1, body["summary"]
+
+
+def test_grant_handover_deny_is_byte_stable_across_retries(
+    strict_client: _Client,
+) -> None:
+    """KTD-T still holds on the new arm: retrying reproduces the same bytes.
+
+    The grant-change reason interpolates only the path and the current
+    version, so unlike the write arm it carries no timestamp at all.
+    """
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    reasons = set()
+    for _ in range(4):
+        _, body = strict_client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+        )
+        reasons.add(body["hookSpecificOutput"]["permissionDecisionReason"])
+    assert len(reasons) == 1, reasons
+
+
+def test_pre_edit_deny_after_a_grant_handover_reports_no_write(
+    strict_client: _Client,
+) -> None:
+    """The Edit surface takes the same arm: A's pre-edit after losing the
+    grant must not be told the artifact was updated."""
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "CLAUDE.md"},
+    )
+    assert status == 200
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "was updated by" not in reason, reason
+    assert "CLAUDE.md is still at v1" in reason, reason
+    assert body["summary"]["prior_version_seen_by_session"] == 1, body["summary"]

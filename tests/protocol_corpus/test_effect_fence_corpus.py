@@ -43,6 +43,7 @@ import copy
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -461,6 +462,14 @@ _EXPECTED_IDENTITY_FIXTURE_COUNT = 2
 _SESSION_A = "11111111-1111-4111-8111-111111111111"
 _SESSION_B = "22222222-2222-4222-8222-222222222222"
 
+# The writer field names the AGENT, not the session: the coordinator stopped
+# reversing an agent id back to a session id. Both runtimes derive this the same
+# way (uuid5 over the session id), and the hex form is deliberate -- a hyphenated
+# UUID would be scrubbed by the portability default, which is what made an
+# attribution assertion decorative in the first place.
+_AGENT_A = uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_A}").hex
+_AGENT_B = uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_B}").hex
+
 _CAPTURE_FIXTURE = "harness-captured-token-reaches-the-coordinator"
 _IDENTITY_FIXTURE = "harness-stale-read-names-the-writing-session"
 
@@ -677,7 +686,7 @@ def test_identity_preserving_fixture_fails_on_a_different_identity(
         fixture=fixture, backend_id="python", workspace=tmp_path
     )
 
-    assert actual["summary"]["last_writer_session_id"] == _SESSION_B, (
+    assert actual["summary"]["last_writer_session_id"] == _AGENT_B, (
         "the declared key must survive normalization verbatim, got "
         f"{actual['summary']['last_writer_session_id']!r}"
     )
@@ -690,7 +699,7 @@ def test_identity_preserving_fixture_fails_on_a_different_identity(
     assert actual == right, f"expected={right!r}\nactual=  {actual!r}"
 
     wrong_body = copy.deepcopy(fixture.expected["body"])
-    wrong_body["summary"]["last_writer_session_id"] = _SESSION_A
+    wrong_body["summary"]["last_writer_session_id"] = _AGENT_A
     wrong = normalize_response(
         wrong_body,
         ignore_keys=fixture.ignore_keys,
@@ -702,33 +711,47 @@ def test_identity_preserving_fixture_fails_on_a_different_identity(
     )
 
 
-def test_without_the_opt_in_the_writer_identity_is_scrubbed_as_before(
+def test_the_writer_field_is_portable_by_derivation_not_by_scrubbing(
     tmp_path: Path,
 ) -> None:
-    """The portability default, unchanged — and why it needed an opt-in.
+    """Why this field no longer needs the scrub, and what still does.
 
-    The same live response, normalized WITHOUT the declaration, scrubs the
-    writer to ``<UUID>``; the A-pin and the B-pin then normalize to the same
-    bytes and both compare equal. That is not a regression to fix, it is the
-    property that lets one corpus run against two implementations minting
-    different ids — which is precisely why preserving an identity had to become
-    a per-fixture declaration rather than a global change."""
+    The writer is named by agent id in hex, which ``_UUID_RE`` does not match,
+    so the portability default leaves it alone. That is not a hole: both
+    runtimes derive the value the same way from the session id the fixture
+    itself supplies, so it is deterministic rather than backend noise, and the
+    A-pin and the B-pin differ for a real reason. The opt-in still matters
+    because a genuinely UUID-shaped identity IS collapsed — asserted below, so
+    a change to the default cannot pass unnoticed."""
     fixture = _identity_fixture(_IDENTITY_FIXTURE)
     default = replace(fixture, preserve_identity=frozenset())
     _, actual = run_scenario(
         fixture=default, backend_id="python", workspace=tmp_path
     )
-    assert actual["summary"]["last_writer_session_id"] == UUID_SENTINEL
+    assert actual["summary"]["last_writer_session_id"] == _AGENT_B, (
+        "the writer is deterministic hex and must survive the default "
+        f"untouched, got {actual['summary']['last_writer_session_id']!r}"
+    )
 
     pins = []
-    for session in (_SESSION_A, _SESSION_B):
+    for agent in (_AGENT_A, _AGENT_B):
         body = copy.deepcopy(fixture.expected["body"])
-        body["summary"]["last_writer_session_id"] = session
+        body["summary"]["last_writer_session_id"] = agent
         pins.append(normalize_response(body, ignore_keys=fixture.ignore_keys))
-    assert pins[0] == pins[1] == actual, (
-        "today's default must still collapse both identities — if it does not, "
-        "the opt-in changed the default and every existing fixture's "
-        "portability is now conditional on which ids the backend mints"
+    assert pins[0] != pins[1], (
+        "two agents must stay distinguishable under the default — if they "
+        "collapse, this field went back to being scrubbed and every "
+        "attribution fixture asserting it is decorative again"
+    )
+    assert pins[1] == actual, f"expected={pins[1]!r}\nactual=  {actual!r}"
+
+    # The scrub itself is intact for a UUID-shaped identity, which is what the
+    # opt-in exists to override.
+    shaped = normalize_response(
+        {"session_id": _SESSION_A}, ignore_keys=frozenset()
+    )
+    assert shaped["session_id"] == UUID_SENTINEL, (
+        "the portability default must still collapse a UUID-shaped identity"
     )
 
 
