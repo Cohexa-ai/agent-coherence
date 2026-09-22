@@ -1654,11 +1654,35 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         owner_generation = artifact_pair[1] if artifact_pair else None
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
-        if agent_state is not None and agent_state != MESIState.INVALID:
+        # ONE clock read for the whole decision, handed IN rather than taken
+        # inside, so the lag gate and every timestamp stamped from this verdict
+        # share an instant — no intra-block skew, and the deny reason stays
+        # stable within the call (KTD-P).
+        _now = _payloads.now_unix()
+        # THE classification, not a second copy of it. Everything below keys off
+        # a field of this value; the mutations the handler owes each branch —
+        # the two hash-mismatch counters, the strict-deny emission, the SHARED
+        # re-grant, the stale-warned marker and the notice drain — stay here,
+        # because the verdict must stay a pure query for the surfaces that ask
+        # it WITHOUT granting anything (``/hooks/effect-fence``). The handler
+        # decides what to DO; the decision only says which way.
+        decision = decide_tracked_read(
+            coordinator,
+            path=path,
+            artifact_id=artifact_id,
+            agent_id=agent_id,
+            artifact=artifact,
+            owner_generation=owner_generation,
+            agent_state=agent_state,
+            caller_content_hash=content_hash,
+            now_unix=_now,
+        )
+
+        if decision.holds_valid_grant:
             # Reader has a valid grant on the current version. Unit 6:
             # include the version so an OCC writer can source
             # ``expected_version`` (additive — status clients ignore it).
-            fresh: dict[str, Any] = {"status": "fresh", "version": artifact.version}
+            fresh: dict[str, Any] = {"status": "fresh", "version": decision.version}
             # Defense-in-depth (PR #108 follow-up): a SHARED holder whose
             # supplied disk hash mismatches the recorded content is
             # anomalous — a peer commit would have left it INVALID — so a
@@ -1669,14 +1693,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # allow — the plugin path is fail-open by design; a
             # strict-mode deny knob waits on this counter proving a
             # ~zero false-positive rate. Sentinel recorded hashes carry
-            # no content claim and must not fire ("" seeds surface as
-            # None; the truthiness check covers them).
-            if (
-                content_hash
-                and artifact.content_hash
-                and artifact.content_hash != _F_SENTINEL_CONTENT_HASH
-                and content_hash != artifact.content_hash
-            ):
+            # no content claim and must not fire — ``fresh_hash_differs``
+            # is the arm-specific predicate that already excludes them
+            # (``None``, ``""`` and the all-``f`` launch-gate sentinel);
+            # the STALE arm's ``stale_hash_differs`` deliberately keeps
+            # them in, so reading either field on both arms would move the
+            # strict-deny gate.
+            if decision.fresh_hash_differs:
                 coordinator.increment_fresh_shared_hash_mismatch()
                 # Survivor #6 v1: promote the SHARED-holder mismatch from a
                 # fail-open allow to a strict-mode deny. A still-SHARED reader
@@ -1686,84 +1709,78 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # lag, R2 — suppress) or a foreign out-of-band edit (deny).
                 # reacquire() forces the fresh re-read; KTD-T leaves the grant
                 # untouched so retries re-deny byte-stably (no INVALID needed).
-                if coordinator.policy.is_strict_mode(path):
-                    # Capture one clock read for the whole deny decision so the
-                    # lag gate and every summary timestamp share an instant —
-                    # no intra-block skew, and the deny reason stays stable
-                    # within the call (KTD-P).
-                    _now = _payloads.now_unix()
-                    if _is_recent_self_commit_lag(
-                        coordinator, artifact_id, agent_id, now_unix=_now,
-                    ):
-                        # Benign commit→disk-write lag (R2): count the
-                        # suppression so operators can size the lag-window
-                        # false-negative rate, then fall through to the
-                        # warn-mode hash_differs allow.
-                        coordinator.increment_shared_foreign_lag_suppressed()
-                    else:
-                        shared_summary: _payloads.StaleSummary = {
-                            "path": path,
-                            "current_version": artifact.version,
-                            # A SHARED holder was granted on the current
-                            # version; that is the version it last saw.
-                            "prior_version_seen_by_session": artifact.version,
-                            "last_writer_session_id": (
-                                _last_writer_for(coordinator, artifact_id)
-                                or "<unknown>"
-                            ),
-                            "last_writer_at_unix_ts": (
-                                _last_writer_unix_ts(coordinator, artifact_id)
-                                or _now
-                            ),
-                            "warning_generated_at_unix_ts": _now,
-                            "hash_differs": True,
-                        }
-                        return _emit_pre_read_strict_deny(
-                            coordinator,
-                            agent_id=agent_id,
-                            session_id=session_id,
-                            artifact_id=artifact_id,
-                            path=path,
-                            summary=shared_summary,
-                            source="pre_read_shared_hash_deny",
-                        )
+                # Warn mode reaches neither field: the verdict consults the
+                # strict-mode gate before either can be set.
+                if decision.commit_lag_suppressed:
+                    # Benign commit→disk-write lag (R2): count the
+                    # suppression so operators can size the lag-window
+                    # false-negative rate, then fall through to the
+                    # warn-mode hash_differs allow.
+                    coordinator.increment_shared_foreign_lag_suppressed()
+                elif decision.outcome == "denied":
+                    shared_summary: _payloads.StaleSummary = {
+                        "path": path,
+                        "current_version": decision.version,
+                        # A SHARED holder was granted on the current
+                        # version; that is the version it last saw — the
+                        # verdict resolved that per-arm already.
+                        "prior_version_seen_by_session": decision.prior_version_seen,
+                        "last_writer_session_id": (
+                            _last_writer_for(coordinator, artifact_id)
+                            or "<unknown>"
+                        ),
+                        "last_writer_at_unix_ts": (
+                            _last_writer_unix_ts(coordinator, artifact_id)
+                            or _now
+                        ),
+                        "warning_generated_at_unix_ts": _now,
+                        # Flat True, not a re-read of the predicate: this arm
+                        # denies only ON a mismatch, so the enclosing branch
+                        # has already established it.
+                        "hash_differs": True,
+                    }
+                    return _emit_pre_read_strict_deny(
+                        coordinator,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        artifact_id=artifact_id,
+                        path=path,
+                        summary=shared_summary,
+                        source="pre_read_shared_hash_deny",
+                    )
                 fresh["hash_differs"] = True
-            if want_generation and owner_generation is not None:
-                fresh["owner_generation"] = owner_generation
+            if want_generation and decision.owner_generation is not None:
+                fresh["owner_generation"] = decision.owner_generation
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
-        # were invalidated by a peer commit.
-        prior_seen = None
-        if agent_state == MESIState.INVALID:
-            prior_seen = artifact.version - 1 if artifact.version > 0 else 0
-
-        # Compute hash_differs against the caller's last-observed hash, if any.
-        # Per KTD-9 we track filesystem-state; a content_hash from the caller's
-        # current Read attempt could differ from what's persisted.
-        hash_differs = bool(
-            content_hash
-            and artifact.content_hash
-            and content_hash != artifact.content_hash
-        )
-
-        last_writer_id = _last_writer_for(coordinator, artifact_id)
+        # were invalidated by a peer commit. ``prior_version_seen`` is the
+        # arm-resolved value (one below current for an INVALIDated session,
+        # ``None`` for one with no prior grant), and ``stale_hash_differs`` is
+        # this arm's predicate — the caller's bytes against whatever the
+        # registry recorded, no-claim seeds INCLUDED, which is exactly how the
+        # launch-gate scenarios reach their deny.
+        #
         # last_writer_at_unix_ts is REAL — from the artifact's updated_at
         # in the registry (semantically honest, A5). warning_generated_at
         # is now() to guarantee per-invocation variation (A5 + structural
         # defense for v0.2 strict-mode flip).
+        last_writer_id = _last_writer_for(coordinator, artifact_id)
         last_writer_ts = _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
         summary: _payloads.StaleSummary = {
             "path": path,
-            "current_version": artifact.version,
-            "prior_version_seen_by_session": prior_seen,
+            "current_version": decision.version,
+            "prior_version_seen_by_session": decision.prior_version_seen,
             "last_writer_session_id": last_writer_id or "<unknown>",
             "last_writer_at_unix_ts": last_writer_ts,
             "warning_generated_at_unix_ts": _payloads.now_unix(),
-            "hash_differs": hash_differs,
+            "hash_differs": decision.stale_hash_differs,
         }
 
-        # v0.2 KTD-O / KTD-P: strict-mode deny branch.
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch. The gate itself lives in
+        # ``decide_tracked_read`` (the fence route answers off the same rule);
+        # what stays here is the EMISSION, which records the deny, bumps the
+        # counter and writes the audit row.
         #
         # Gate (refined 2026-05-24 per launch-gate finding): strict-deny
         # fires when the artifact is in strict mode AND the session
@@ -1811,13 +1828,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # attempts and routes to alternative behavior; the deny IS the
         # signal. Re-granting would let the second retry get fresh and
         # silently downgrade the operator's hard guardrail.
-        if (
-            coordinator.policy.is_strict_mode(path)
-            and (
-                agent_state == MESIState.INVALID
-                or (agent_state is None and hash_differs)
-            )
-        ):
+        if decision.outcome == "denied":
             return _emit_pre_read_strict_deny(
                 coordinator,
                 agent_id=agent_id,
@@ -1842,13 +1853,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 trigger="post_stale_read", tick=now, content_hash=content_hash,
             )
         resp = _payloads.build_stale_response(summary)
-        if want_generation and owner_generation is not None:
+        if want_generation and decision.owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
             # reclaim (the zombie's re-read is warn-stale with the version
             # unchanged) — the attached generation is what lets it see the epoch
-            # moved even though the version did not. It shares the snapshot that
-            # produced summary.current_version, so the pair cannot disagree.
-            resp["owner_generation"] = owner_generation
+            # moved even though the version did not. It rides the SAME snapshot
+            # the verdict classified from, which is what produced
+            # summary.current_version, so the pair cannot disagree.
+            resp["owner_generation"] = decision.owner_generation
         if not verify_only:
             # KTD-J (Unit 8): bump the stale-warning emission counter +
             # mark the pair so a follow-up pre-read counts as a re-read. A

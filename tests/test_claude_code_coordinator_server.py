@@ -6882,3 +6882,251 @@ def test_tool_tables_name_the_http_fence() -> None:
         assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
             f"{doc.name} lists the fence tool without its HTTP sibling"
         )
+
+
+# ----------------------------------------------------------------------
+# U3b — the pre-read handler ANSWERS FROM the verdict
+#
+# U3a extracted decide_tracked_read; U3b rewired _handle_pre_read's tracked
+# branch to call it. The risk that rewiring carries is cosmetic
+# de-duplication: a handler that calls the verdict and then quietly re-derives
+# the same answer beside it would keep every response byte-identical and every
+# existing assertion green, while leaving two copies of the safety rule to
+# drift apart. These tests close that by DOCTORING the verdict and asserting
+# the response follows it — a handler still computing its own gate answers the
+# old way and fails here. Each doctored arm is paired with an un-doctored
+# control, so a fixture that silently stopped reaching the arm cannot pass as a
+# derivation proof.
+# ----------------------------------------------------------------------
+
+_U3B_TARGET = "ccs.adapters.claude_code.coordinator_server.decide_tracked_read"
+
+
+def _u3b_doctor(monkeypatch, **changes) -> None:
+    """Replace the verdict with the real one plus ``changes``.
+
+    Wrapping rather than fabricating keeps every field the test does not name
+    at its true value, so a response that moves can only have moved because of
+    the field under test.
+    """
+    real = decide_tracked_read
+
+    def fake(*args, **kwargs) -> TrackedReadDecision:
+        return dataclasses.replace(real(*args, **kwargs), **changes)
+
+    monkeypatch.setattr(_U3B_TARGET, fake)
+
+
+def _u3b_seed_invalid(server, path: str, label: str):
+    """A session a peer commit INVALIDated on a warn-mode path: the plain
+    stale arm, which never denies on its own."""
+    peer = server.register_session(_sid(f"u3b-peer-{label}"))
+    return _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.INVALID,
+        label=f"u3b-{label}", version=4, last_writer=peer,
+    )
+
+
+def _u3b_reset(server, artifact_id, agent_id, state) -> None:
+    """Put the pair back in its seeded state so the doctored call sees exactly
+    the input the control saw — the stale arm re-grants SHARED, so without this
+    the second call would be measuring a different scenario."""
+    server.registry.set_agent_state(
+        artifact_id, agent_id, state,
+        trigger="u3b-reset", tick=1, content_hash=_hash("canonical"),
+    )
+
+
+def _u3b_read(client: _Client, sid: str, path: str, caller_hash: str) -> dict:
+    status, body = client.post("/hooks/pre-read", {
+        "session_id": sid, "path": path, "content_hash": caller_hash,
+    })
+    # Every protocol outcome — fresh, stale and deny alike — is an HTTP 200
+    # here; a non-200 would mean the hook client degraded and the assertion
+    # below would be about a fault, not a verdict.
+    assert status == 200, body
+    return body
+
+
+def _u3b_decision_kind(body: dict) -> str:
+    hook = body.get("hookSpecificOutput") or {}
+    if hook.get("permissionDecision") == "deny":
+        return "denied"
+    return body.get("status", "?")
+
+
+def test_pre_read_deny_follows_the_verdict_not_a_second_gate(
+    served_decider, monkeypatch
+) -> None:
+    """The strict-deny GATE lives in the verdict; only the EMISSION is the
+    handler's. Doctoring a warn-mode stale into ``denied`` must turn the
+    response into the byte-stable deny and bump ``strict_mode_denials_total``.
+
+    A handler that kept its own ``is_strict_mode(...) and (INVALID or ...)``
+    test alongside the call would answer ``stale`` here and the two copies
+    could then drift — which is the failure this unit exists to make
+    impossible.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-deny")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "derive-deny")
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "stale", (
+        "control: a warn-mode INVALID session must reach the stale arm, or the "
+        "doctored call below proves nothing"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    before = server.counters_snapshot()["strict_mode_denials_total"]
+    _u3b_doctor(monkeypatch, outcome="denied")
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "denied"
+    assert server.counters_snapshot()["strict_mode_denials_total"] == before + 1
+
+
+def test_pre_read_arm_selection_follows_the_verdict(
+    served_decider, monkeypatch
+) -> None:
+    """Which ARM runs — fresh payload or stale envelope — is
+    ``holds_valid_grant``, not a second reading of the MESI state.
+
+    The session below really does hold SHARED throughout; only the verdict
+    says otherwise. If the handler still branched on ``agent_state`` it would
+    answer fresh and this would fail.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-arm")
+    peer = server.register_session(_sid("u3b-peer-derive-arm"))
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-derive-arm", version=4, last_writer=peer,
+    )
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "fresh", "control: this is the fresh arm"
+
+    _u3b_doctor(monkeypatch, holds_valid_grant=False, outcome="stale",
+                prior_version_seen=3)
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "stale"
+    assert doctored["summary"]["prior_version_seen_by_session"] == 3, (
+        "the summary's prior version is the verdict's arm-resolved value, not "
+        "a second `artifact.version - 1` computed in the handler"
+    )
+    assert server.registry.get_agent_state(artifact_id, agent_id) == MESIState.SHARED
+
+
+def test_fresh_arm_reads_only_the_fresh_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The two hash predicates are NOT one predicate, and the fresh arm must
+    read its own.
+
+    ``stale_hash_differs`` keeps the no-claim recorded hashes IN (the
+    launch-gate denies reach their answer through the stale arm); the fresh arm
+    excludes them, because a still-SHARED holder must never be denied against
+    content the coordinator never claimed. A handler that folded them would
+    surface ``hash_differs`` and bump the mismatch counter here — on a read
+    whose hash MATCHES.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-fresh-pred")
+    peer = server.register_session(_sid("u3b-peer-fresh-pred"))
+    sid, _agent_id, _artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-fresh-pred", version=2, last_writer=peer,
+    )
+
+    before = server.counters_snapshot()["fresh_shared_hash_mismatch_total"]
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2}, (
+        "the fresh payload read the STALE arm's predicate"
+    )
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before
+
+    # Control for the assertion above: the fresh arm DOES follow its own
+    # predicate, so the silence just asserted is about which field was read and
+    # not about a branch that never fires.
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2, "hash_differs": True}
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before + 1
+
+
+def test_stale_arm_reads_only_the_stale_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The mirror of the test above: the stale summary's ``hash_differs`` is
+    ``stale_hash_differs``. Folding the two here would flip the no-prior-grant
+    deny gate, which is defined against exactly this field."""
+    server, client = served_decider
+    path = _u3a_warn_path("derive-stale-pred")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "stale-pred")
+
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(body) == "stale"
+    assert body["summary"]["hash_differs"] is False, (
+        "the stale summary read the FRESH arm's predicate"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert body["summary"]["hash_differs"] is True
+
+
+def test_the_verdict_runs_once_per_tracked_pre_read_on_the_handlers_clock(
+    served_decider, monkeypatch
+) -> None:
+    """One classification per request, on the handler's single clock read.
+
+    Two calls would mean two snapshots of a moving registry backing one
+    response; a clock read taken INSIDE the verdict would let the lag gate and
+    the deny summary's timestamps disagree within a single deny (KTD-P). The
+    untracked and first-observation arms are asserted NOT to reach the verdict
+    at all — each reaches its answer BY mutating, so neither has a
+    side-effect-free form for it to classify.
+    """
+    server, client = served_decider
+    calls: list[dict] = []
+    real = decide_tracked_read
+
+    def spy(*args, **kwargs) -> TrackedReadDecision:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_U3B_TARGET, spy)
+
+    untracked_sid = _sid("u3b-untracked")
+    assert not server.policy.is_tracked("vendor/blob.bin")
+    client.post("/hooks/pre-read", {
+        "session_id": untracked_sid, "path": "vendor/blob.bin",
+        "content_hash": _hash("x"),
+    })
+    assert calls == [], "the untracked fast path classified through the verdict"
+
+    first_obs_sid = _sid("u3b-first-obs")
+    client.post("/hooks/pre-read", {
+        "session_id": first_obs_sid, "path": _u3a_warn_path("derive-first-obs"),
+        "content_hash": _hash("seed"),
+    })
+    assert calls == [], "first observation classified through the verdict"
+
+    path = _u3a_warn_path("derive-clock")
+    sid, _agent_id, _artifact_id = _u3b_seed_invalid(server, path, "clock")
+    wall_before = time.time()
+    _u3b_read(client, sid, path, _hash("canonical"))
+    wall_after = time.time()
+
+    assert len(calls) == 1, "the tracked branch classified more than once"
+    now_unix = calls[0]["now_unix"]
+    # A real clock read, bracketed by the request — not 0, not None, and not a
+    # constant a later refactor could freeze without anyone noticing.
+    assert wall_before <= now_unix <= wall_after
