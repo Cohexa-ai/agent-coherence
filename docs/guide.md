@@ -1054,6 +1054,17 @@ registers nothing, and heals nothing it checks — so a hold is level-triggered.
 Asking again changes no state and gets the same answer until you actually
 recover.
 
+**Authentication.** This route carries the same two checks every coordinator
+route does, and both run before it: the request must come from a loopback or
+allowlisted host, and it must present the coordinator's bearer token —
+`Authorization: Bearer <secret>`, where the secret is the contents of
+`.coherence/hook.secret` in the workspace the coordinator was started for.
+That file is created `0600`, so "any client" means any client running as the
+same OS user, not any client on the network. A wrong or missing token answers
+`401` and a non-allowlisted host answers `403`; by the rule below, your caller
+treats both as a hold, so a misconfigured client fails closed rather than
+firing.
+
 ### Request
 
 | Field | Type | What it is |
