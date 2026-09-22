@@ -675,7 +675,19 @@ class _StubVolume:
     read_with_version_generation calls yield scripted
     (bytes, version, owner_generation) triples, or raise. A confirmed but
     arbitrary generation (7) is the default in version-focused tests so the
-    version semantics stay isolated from the generation leg."""
+    version semantics stay isolated from the generation leg.
+
+    Both grant-state flags are declared in the CLASS BODY, the way
+    ``CoherentVolume`` declares them — the fence now refuses a volume that
+    reports neither, so a double that omits them is testing the refusal, not
+    the comparand legs. Subclasses below override them per read; the two
+    refusal tests deliberately do NOT derive from this class."""
+
+    #: Whether the last read was refused by the coordinator (strict deny), and
+    #: whether it was served without a standing grant. False on every read here
+    #: unless a subclass says otherwise.
+    _last_read_denied: bool = False
+    _last_read_stale: bool = False
 
     def __init__(self, reads: list) -> None:
         self._reads = list(reads)
@@ -817,8 +829,6 @@ def test_gate_holds_on_lapsed_grant_with_pair_unchanged() -> None:
     admit; the standing-grant check HOLDs with the typed cause."""
 
     class _LapsedStub(_StubVolume):
-        _last_read_stale = False
-
         def read_with_version_generation(
             self, path: str, *, observe: bool = True
         ) -> tuple[bytes, int, int | None]:
@@ -842,6 +852,86 @@ def test_gate_holds_on_lapsed_grant_with_pair_unchanged() -> None:
     assert exc.value.current_generation == 7
 
 
+def test_check_fence_refuses_a_volume_that_cannot_report_grant_state() -> None:
+    """A volume that cannot report the grant state of its last read is REFUSED,
+    not silently treated as standing under a live grant.
+
+    The two flags used to be read through ``getattr(..., False)``, justified as
+    compatibility for duck-typed volumes predating them. That allowance
+    silently disabled the third fence leg — the one that catches a peer's
+    pessimistic write-acquire, which moves NEITHER comparand — so the clean,
+    unchanged pair below FIRED the escaping effect for any such object. Its
+    twin above (``test_gate_holds_on_lapsed_grant_with_pair_unchanged``) is the
+    same pair with the flags supplied, and still HOLDs: this closes the hole
+    without disabling the leg.
+
+    The refusal is caught on the DOCUMENTED BASE CLASS, never on the concrete
+    type. A missing ``FenceComparands`` keyword raises ``TypeError`` and a bare
+    attribute read raises ``AttributeError``; neither is catchable as a
+    coherence failure, so the caller that holds today (``ccs.mcp.server``
+    catches exactly this base around ``check_fence``) would CRASH instead of
+    holding. A ``pytest.raises`` on the concrete type cannot see that
+    regression — which is the whole reason this test exists.
+    """
+
+    class _GrantStateBlindVolume:
+        """Duck-typed volume that answers with both comparands but never says
+        whether its read was refused or served without a standing grant."""
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            return (b"cfg", 5, 7)
+
+    fired: list[str] = []
+    with pytest.raises(CoherenceError) as exc:
+        gate(
+            _GrantStateBlindVolume(),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    # PRE-FIX this pair was confirmed, unchanged and (by default) ungrant-checked:
+    # the effect fired. The refusal is worth nothing if the effect still ran.
+    assert fired == []
+    # Typed, not a HOLD: re-reading cannot supply a flag the volume never
+    # declares, so answering with the retryable ``stale_view`` recovery would
+    # send a cooperating agent into a reacquire loop that can never clear.
+    assert not isinstance(exc.value, StaleView)
+
+
+def test_check_fence_refuses_a_volume_reporting_only_the_deny_flag() -> None:
+    """The half-equipped shape, which is exactly the fail-open the pair-only
+    default produced: a volume that reports the strict-deny answer but not the
+    standing-grant one keeps the deny leg and silently loses the preemption
+    leg. Refused as well — the fence needs BOTH answers, and a partially
+    equipped volume is the one an incremental implementer actually writes.
+
+    Caught on the base class for the same reason as its sibling above.
+    """
+
+    class _HalfBlindVolume:
+        #: Declared. Its sibling ``_last_read_stale`` deliberately is NOT — that
+        #: asymmetry is the point of this double.
+        _last_read_denied = False
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            return (b"cfg", 5, 7)
+
+    fired: list[str] = []
+    with pytest.raises(CoherenceError) as exc:
+        gate(
+            _HalfBlindVolume(),
+            "p",
+            decide=lambda d: "go",
+            effect=fired.append,
+        )
+    assert fired == []
+    assert not isinstance(exc.value, StaleView)
+
+
 def test_grant_reclaimed_wins_when_lapsed_and_generation_both_moved() -> None:
     """Branch-priority pin for _held(): when the re-read is BOTH lapsed AND the
     ownership generation moved (a sweep reclaim that also left the caller
@@ -851,8 +941,6 @@ def test_grant_reclaimed_wins_when_lapsed_and_generation_both_moved() -> None:
     preemption label."""
 
     class _LapsedStub(_StubVolume):
-        _last_read_stale = False
-
         def read_with_version_generation(
             self, path: str, *, observe: bool = True
         ) -> tuple[bytes, int, int | None]:
@@ -981,7 +1069,15 @@ def test_bare_stale_view_exposes_none_version_attrs() -> None:
 def test_hold_cause_is_typed_per_class() -> None:
     """Every HOLD class carries a distinct typed cause, so an agent branches on
     a value rather than substring-matching the human message — and can tell a
-    HOLD reacquire() clears from one that it never will."""
+    HOLD reacquire() clears from one that it never will.
+
+    All SEVEN shipped causes, asserted through the wrapper's public surface.
+    This is the characterisation that pins the in-process verdict across the
+    move of the branch table into ``ccs.core.fence``: the classification now has
+    a second caller, and a reason that quietly changed identity during the move
+    would keep every message-text assertion in this file green while sending an
+    agent down the wrong recovery.
+    """
     from ccs.core.exceptions import (
         HOLD_GENERATION_UNCONFIRMED,
         HOLD_GRANT_RECLAIMED,
@@ -990,16 +1086,66 @@ def test_hold_cause_is_typed_per_class() -> None:
         HOLD_VERSION_UNCONFIRMED,
     )
 
+    class _FlaggedStub(_StubVolume):
+        """A stub whose re-validate read (``observe=False``) reports the
+        coordinator's grant-state answer — a strict deny, a lapsed grant, or
+        neither — the way a real volume records it on ``_last_read_*``."""
+
+        def __init__(self, reads: list, *, denied: bool, lapsed: bool) -> None:
+            super().__init__(reads)
+            self._denied = denied
+            self._lapsed = lapsed
+            self._last_read_denied = False
+            self._last_read_stale = False
+
+        def read_with_version_generation(
+            self, path: str, *, observe: bool = True
+        ) -> tuple[bytes, int, int | None]:
+            out = super().read_with_version_generation(path, observe=observe)
+            self._last_read_denied = self._denied and not observe
+            self._last_read_stale = self._lapsed and not observe
+            return out
+
     cases = [
-        ([(b"c", 5, 7), (b"c", 6, 7)], HOLD_VERSION_MOVED),
-        ([(b"c", 5, 7), (b"c", 5, 8)], HOLD_GRANT_RECLAIMED),
-        ([(b"c", 5, 7), FileNotFoundError()], HOLD_INPUT_VANISHED),
-        ([(b"c", 5, 7), (b"c", 0, 7)], HOLD_VERSION_UNCONFIRMED),
-        ([(b"c", 5, 7), (b"c", 5, None)], HOLD_GENERATION_UNCONFIRMED),
+        ([(b"c", 5, 7), (b"c", 6, 7)], False, False, HOLD_VERSION_MOVED),
+        ([(b"c", 5, 7), (b"c", 5, 8)], False, False, HOLD_GRANT_RECLAIMED),
+        ([(b"c", 5, 7), FileNotFoundError()], False, False, HOLD_INPUT_VANISHED),
+        ([(b"c", 5, 7), (b"c", 0, 7)], False, False, HOLD_VERSION_UNCONFIRMED),
+        ([(b"c", 5, 7), (b"c", 5, None)], False, False, HOLD_GENERATION_UNCONFIRMED),
+        # A strict deny: the coordinator refused the re-read, which on the
+        # in-process wire also means it reported no generation.
+        ([(b"c", 5, 7), (b"c", 5, None)], True, False, HOLD_READ_DENIED),
+        # A peer's write-claim preemption: both comparands confirmed AND
+        # unchanged, but the re-read was served without a standing grant.
+        ([(b"c", 5, 7), (b"c", 5, 7)], False, True, HOLD_GRANT_PREEMPTED),
     ]
-    for reads, expected_cause in cases:
+    for reads, denied, lapsed, expected_cause in cases:
         with pytest.raises(StaleView) as exc:
-            gate(_StubVolume(reads), "p", decide=lambda d: "go", effect=lambda x: x)
-        assert exc.value.hold_cause == expected_cause, reads
+            gate(
+                _FlaggedStub(reads, denied=denied, lapsed=lapsed),
+                "p",
+                decide=lambda d: "go",
+                effect=lambda x: x,
+            )
+        assert exc.value.hold_cause == expected_cause, (reads, denied, lapsed)
     # A bare coordinator-raised StaleView carries no cause (uniform shape).
     assert StaleView("peer committed").hold_cause is None
+
+
+def test_in_process_fence_still_admits_a_clean_pair_after_the_core_move() -> None:
+    """The other half of the characterisation: a confirmed, unchanged pair under
+    a standing grant still PROCEEDS.
+
+    A move that only ever adds HOLDs is not behaviour-preserving either — an
+    over-eager new leg (the content-claim leg is one) would hold every effect in
+    the product, and every HOLD assertion above would still pass.
+    """
+    fired: list[str] = []
+    result = gate(
+        _StubVolume([(b"cfg", 5, 7), (b"cfg", 5, 7)]),
+        "p",
+        decide=lambda d: "go",
+        effect=lambda x: (fired.append(x), "ok")[1],
+    )
+    assert result == "ok"
+    assert fired == ["go"]

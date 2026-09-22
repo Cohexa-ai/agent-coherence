@@ -26,6 +26,7 @@
       "coordinator_uptime_seconds": "<UPTIME>",
       "coordinator_version": "<IGNORED>",
       "detail": "minimal",
+      "effect_fence_holds_total": 0,
       "endpoint_counters": "<IGNORED>",
       "fresh_shared_hash_mismatch_total": 0,
       "handler_concurrency_overflows_total": 0,
@@ -46,6 +47,6 @@
       "watchdog_timeouts_total": 0
     }
   },
-  "_comment": "cold_start_duration_ms is emitted as 0.0 (float) by Python; the harness normalizer compares structural equality so int 0 vs float 0.0 are not equal. We accept the float here. If Node drifts cold_start to int, the corpus catches it. coordinator_version is ignored because it tracks the Python __version__ constant which bumps independently of the wire-shape contract.",
+  "_comment": "cold_start_duration_ms is emitted as 0.0 (float) by Python; the harness normalizer compares structural equality so int 0 vs float 0.0 are not equal. We accept the float here. If Node drifts cold_start to int, the corpus catches it. coordinator_version is ignored because it tracks the Python __version__ constant which bumps independently of the wire-shape contract. effect_fence_holds_total joined the envelope with the /hooks/effect-fence route; paired with the endpoint counter effect_fence_total it is the operator's hold RATE, so the corpus pins its PRESENCE at zero on a cold coordinator — a fixture that omitted it would have gone red the moment the counter shipped, which is exactly what it did.",
   "backends": ["python"]
 }

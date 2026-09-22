@@ -28,9 +28,12 @@ from ccs.adapters.claude_code.coordinator_server import (
     _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
     CoordinatorHTTPServer,
+    TrackedReadDecision,
     _is_recent_self_commit_lag,
+    decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.core.exceptions import HOLD_REASONS
 from ccs.core.states import MESIState
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
@@ -5166,3 +5169,2029 @@ def test_bounded_prose_paths_still_promise_deferral(
     assert "still queued" in text
     assert "next tracked-file operation" in text
     assert _pending_count(coordinator, session_to_agent_id(a)) == 4
+
+
+# ----------------------------------------------------------------------
+# U3a — decide_tracked_read: the tracked-artifact verdict as a VALUE
+#
+# _handle_pre_read decides fresh / stale / denied for an already-tracked
+# artifact WHILE it mutates: the fresh arm bumps two counters and can return
+# the strict deny, the stale arm re-grants SHARED, marks the pair stale-warned
+# and drains notices. A surface that must answer the SAME question without
+# granting anything therefore cannot reach the answer by calling the handler.
+# These tests pin the extracted verdict: that each arm returns what the handler
+# would have reported, that the two hash-differs predicates stay DISTINCT, and
+# — the claim any verdict route rests on — that asking changes nothing.
+# ----------------------------------------------------------------------
+
+_U3A_STRICT_PATH = "CLAUDE.md"  # tracked by default AND listed in strict_mode.yaml
+_U3A_WARN_PATH = "plan.md"      # tracked by the default **/plan.md glob, never strict
+# Per-arm paths, so the seven arms below own seven DISTINCT artifacts: they are
+# seeded at different versions, and sharing one row would let the last seed
+# silently rewrite what the earlier arms assert about.
+_U3A_STRICT_GLOB = "docs/specs/**/*.md"
+
+
+def _u3a_strict_path(name: str) -> str:
+    return f"docs/specs/{name}.md"
+
+
+def _u3a_warn_path(name: str) -> str:
+    return f"docs/plans/{name}.md"
+
+
+def _u3a_write_policy(root: Path) -> None:
+    """Materialize strict_mode.yaml: CLAUDE.md and docs/specs/** are strict,
+    everything else tracked stays warn-mode.
+
+    Policy is loaded ONCE at construction, so this must run before the server
+    is built — mutating ``server.policy`` afterwards would test a shape no
+    operator can produce.
+    """
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "strict_mode.yaml").write_text(
+        f"- {_U3A_STRICT_PATH}\n- {_U3A_STRICT_GLOB}\n"
+    )
+
+
+def _u3a_assert_policy(server: CoordinatorHTTPServer) -> None:
+    """Fail loudly if the fixture paths are not the modes every test below
+    assumes — a silently warn-mode "strict" path would turn every deny
+    assertion into a vacuous fresh/stale assertion."""
+    assert server.policy.is_strict_mode(_U3A_STRICT_PATH)
+    assert server.policy.is_strict_mode(_u3a_strict_path("probe"))
+    assert server.policy.is_tracked(_U3A_WARN_PATH)
+    assert not server.policy.is_strict_mode(_U3A_WARN_PATH)
+    assert server.policy.is_tracked(_u3a_warn_path("probe"))
+    assert not server.policy.is_strict_mode(_u3a_warn_path("probe"))
+
+
+@pytest.fixture
+def decider(tmp_path: Path):
+    """A coordinator built but NOT served: decide_tracked_read is an in-process
+    call, so an accept loop would add a thread and a port to every assertion
+    and nothing else."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-decider")
+    _u3a_assert_policy(server)
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def served_decider(tmp_path: Path):
+    """The same policy on a LIVE coordinator, yielded with its client, so a
+    verdict can be compared against the response the real handler builds."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-served")
+    _u3a_assert_policy(server)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    secret = load_secret(server.coordinator_root)
+    assert secret is not None
+    try:
+        yield server, _Client("127.0.0.1", server.port, secret)
+    finally:
+        server.shutdown()
+
+
+def _u3a_seed(
+    server: CoordinatorHTTPServer,
+    path: str,
+    *,
+    recorded_hash: str,
+    state: Optional[MESIState],
+    label: str = "s1",
+    version: Optional[int] = None,
+    last_writer: Optional[uuid.UUID] = None,
+):
+    """Park an (agent, artifact) pair in the state an arm needs.
+
+    Returns ``(session_id, agent_id, artifact_id)``. ``state=None`` leaves the
+    session with no grant at all — the "stale beliefs from somewhere else"
+    case the no-prior-grant deny gate exists for.
+    """
+    sid = _sid(label)
+    agent_id = server.register_session(sid)
+    artifact_id = server.registry.resolve_or_register(path, content_hash=recorded_hash)
+    if version is not None or last_writer is not None:
+        art = server.registry.get_artifact(artifact_id)
+        server.registry.set_artifact_and_content(
+            artifact_id,
+            dataclasses.replace(art, version=art.version if version is None else version),
+            "",
+            last_writer=last_writer,
+        )
+    if state is not None:
+        server.registry.set_agent_state(
+            artifact_id, agent_id, state,
+            trigger="u3a-test", tick=1, content_hash=recorded_hash,
+        )
+    return sid, agent_id, artifact_id
+
+
+def _u3a_decide(
+    server: CoordinatorHTTPServer,
+    artifact_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    *,
+    path: str,
+    caller_hash: Optional[str],
+    now_unix: float = 1000.0,
+) -> TrackedReadDecision:
+    """Call the verdict with exactly the values the handler has already read at
+    the point its tracked branch begins — one pair-atomic snapshot, this
+    agent's MESI state, the hash the caller offered."""
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None
+    artifact, generation = pair
+    return decide_tracked_read(
+        server,
+        path=path,
+        artifact_id=artifact_id,
+        agent_id=agent_id,
+        artifact=artifact,
+        owner_generation=generation,
+        agent_state=server.registry.get_agent_state(artifact_id, agent_id),
+        caller_content_hash=caller_hash,
+        now_unix=now_unix,
+    )
+
+
+# --- one arm per state that produces it ------------------------------------
+
+
+def test_decide_fresh_for_granted_holder_whose_hash_matches(decider) -> None:
+    """The plain fresh arm: a still-SHARED holder re-reading the bytes the
+    registry recorded. Neither hash predicate fires, nothing is suppressed, and
+    the version reported is the one from the caller's own snapshot."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("v3-bytes"))
+
+    assert d.outcome == "fresh"
+    assert d.version == 3
+    assert d.holds_valid_grant is True
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.commit_lag_suppressed is False
+    # A SHARED holder was granted on the current version; that is what it saw.
+    assert d.prior_version_seen == 3
+
+
+def test_decide_fresh_with_hash_differs_in_warn_mode(decider) -> None:
+    """Warn mode never denies: the mismatch is surfaced on the verdict (the
+    handler turns it into the additive ``hash_differs`` key and one counter
+    bump) but the outcome stays fresh."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("out-of-band"))
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_denied_for_granted_holder_foreign_edit_in_strict_mode(decider) -> None:
+    """Survivor #6: a still-SHARED holder proves no peer commit since its
+    grant, so a differing disk hash written by SOMEONE ELSE is a foreign
+    out-of-band edit — denied, through the fresh arm."""
+    peer = decider.register_session(_sid("peer-writer"))
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, last_writer=peer,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("foreign-edit"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is True, "the deny came through the FRESH arm"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+    assert d.version == 2
+    assert d.prior_version_seen == 2
+
+
+def test_decide_fresh_when_the_lag_gate_withholds_the_deny(decider) -> None:
+    """The same state, except the caller IS the artifact's recent last
+    committer: the benign commit -> disk-write lag, suppressed rather than
+    denied. Two distinct facts on one value — the outcome flipped back to fresh
+    AND the suppression that flipped it, which is the counter bump a caller
+    still owes."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    # Self-commit: make the caller the writer and read one second after it.
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is True
+
+
+def test_decide_denied_outside_the_lag_window(decider) -> None:
+    """The recency clause is load-bearing: the same self-commit read LATER than
+    the window is a genuine foreign edit again. Without this the suppression
+    field could be hard-wired True and every test above would still pass."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+    late = updated_at + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("foreign-edit"), now_unix=late)
+
+    assert d.outcome == "denied"
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_stale_for_invalidated_session_in_warn_mode(decider) -> None:
+    """A peer commit invalidated this session; warn mode allows with the stale
+    warning. ``prior_version_seen`` is one BELOW the current version — the
+    version the session last held a grant on."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.holds_valid_grant is False
+    assert d.version == 4
+    assert d.prior_version_seen == 3
+
+
+def test_decide_denied_for_invalidated_session_in_strict_mode(decider) -> None:
+    """True preemption under strict mode: denied on the INVALID state ALONE,
+    with no hash comparison needed — the session's context still carries the
+    beliefs the peer commit superseded."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is False
+    assert d.stale_hash_differs is False, "the INVALID leg denies without a mismatch"
+    assert d.prior_version_seen == 3
+
+
+def test_decide_stale_for_unseen_session_whose_hash_matches(decider) -> None:
+    """No prior grant but the session is looking at the bytes the registry
+    recorded: nothing stale to act on, so strict mode falls through to the
+    warn-mode allow. ``prior_version_seen`` is None — it saw no version."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None, version=2,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.prior_version_seen is None
+
+
+def test_decide_denied_for_unseen_session_whose_hash_differs(decider) -> None:
+    """No prior grant AND different bytes: stale beliefs from somewhere else,
+    denied. This is the leg the launch-gate scenarios arrive through."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("stale-beliefs"))
+
+    assert d.outcome == "denied"
+    assert d.stale_hash_differs is True
+
+
+def test_decide_reports_the_generation_from_the_callers_snapshot(decider) -> None:
+    """The generation rides the SAME pair-atomic read as the version, on every
+    arm — never a second read a peer commit could overtake, and never coerced
+    to 0 when absent."""
+    for path, state, outcome in (
+        (_U3A_STRICT_PATH, MESIState.SHARED, "fresh"),
+        (_U3A_WARN_PATH, MESIState.INVALID, "stale"),
+    ):
+        _, agent_id, artifact_id = _u3a_seed(
+            decider, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"gen-{outcome}",
+        )
+        pair = decider.registry.get_artifact_and_generation(artifact_id)
+        assert pair is not None
+
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=_hash("canonical"))
+
+        assert d.outcome == outcome
+        assert d.owner_generation == pair[1]
+        assert d.version == pair[0].version
+
+
+# --- the deliberate asymmetry between the two hash predicates --------------
+
+
+def test_sentinel_recorded_hash_differs_on_the_stale_arm_only(decider) -> None:
+    """The all-``f`` launch-gate sentinel is not a SHA-256 of anything, so the
+    coordinator holds no content claim against it.
+
+    The FRESH arm must not fire on it — denying a still-SHARED holder against
+    content the coordinator never claimed would be a false deny. The STALE arm
+    must, because the launch-gate scenarios reach their deny THROUGH that arm
+    and the sentinel is exactly what makes their hashes differ. One value
+    carries both answers; unifying the two predicates silently moves the
+    strict-deny gate whichever way the survivor points.
+    """
+    _, granted_agent, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="f" * 64,
+        state=MESIState.SHARED, label="granted",
+    )
+    unseen_agent = decider.register_session(_sid("unseen"))
+
+    granted = _u3a_decide(decider, artifact_id, granted_agent,
+                          path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+    unseen = _u3a_decide(decider, artifact_id, unseen_agent,
+                         path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    # Same artifact, same caller hash — the two predicates disagree on purpose.
+    assert granted.fresh_hash_differs is False
+    assert granted.outcome == "fresh", "no content claim => no foreign-edit deny"
+    assert unseen.stale_hash_differs is True
+    assert unseen.outcome == "denied", "the launch-gate deny still fires"
+
+
+def test_empty_recorded_hash_never_fires_either_predicate(decider) -> None:
+    """The OTHER no-claim seed: a KTD-9 first observation with no caller hash
+    records "" and surfaces as None. Nothing to compare against on either arm,
+    so no mismatch and — with no mismatch — no deny for a session with no
+    prior grant."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="", state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+def test_absent_caller_hash_never_fires_either_predicate(decider) -> None:
+    """A pre-read may carry no content_hash at all (the caller does not have
+    one yet). With nothing on the caller's side there is no comparison to make
+    on either arm."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"), state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=None)
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+# --- R7: the call is a pure query ------------------------------------------
+
+
+def _u3a_observable(server: CoordinatorHTTPServer, agent_id, artifact_id) -> dict:
+    """Everything _handle_pre_read moves around this decision, read through
+    NON-destructive accessors only (peek, not pop).
+
+    Anything the verdict quietly granted, healed, counted or recorded shows up
+    as a difference here — which is the only thing that makes the purity claim
+    testable rather than eyeballed.
+    """
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    coherence = server.coordinator_root / ".coherence"
+    return {
+        "counters": server.counters_snapshot(),
+        "version": pair[0].version if pair else None,
+        # The coordinator-side observation baseline: the canonical content the
+        # registry vouches for. A verdict that "healed" it would absolve the
+        # very out-of-band edit it exists to report.
+        "canonical_hash": pair[0].content_hash if pair else None,
+        "owner_generation": pair[1] if pair else None,
+        "grant": server.registry.get_agent_state(artifact_id, agent_id),
+        "heartbeat": server.registry.last_heartbeat_tick(agent_id),
+        "notice": server.registry.peek_preemption_notice(agent_id, artifact_id),
+        "stale_warned": set(server._stale_warned_pairs),
+        "strict_denies": dict(server._recent_strict_denies),
+        # Names for "nothing new appeared"; sizes only for the append-only logs
+        # (a deny writes audit.log). SQLite's own db/-wal/-shm sizes are not
+        # asserted — a read can legitimately move them, and asserting on them
+        # would trade a real guard for a flaky one.
+        "coherence_files": sorted(p.name for p in coherence.iterdir()),
+        "audit_logs": sorted((p.name, p.stat().st_size) for p in coherence.glob("*.log")),
+    }
+
+
+def _u3a_arms(server: CoordinatorHTTPServer) -> dict:
+    """Every arm of the verdict, each with the call that drives it. Keyed by
+    the handler behaviour it stands in for, so a regression names itself."""
+    arms: dict[str, tuple] = {}
+    for name, strict, state, caller, version in (
+        ("fresh-granted", True, MESIState.SHARED, "canonical", 1),
+        ("fresh-mismatch-warn", False, MESIState.SHARED, "out-of-band", 1),
+        ("denied-shared-foreign", True, MESIState.SHARED, "foreign", 2),
+        ("stale-invalid-warn", False, MESIState.INVALID, "canonical", 4),
+        ("denied-invalid-strict", True, MESIState.INVALID, "canonical", 4),
+        ("stale-unseen", True, None, "canonical", 2),
+        ("denied-unseen-mismatch", True, None, "stale-beliefs", 2),
+    ):
+        path = _u3a_strict_path(name) if strict else _u3a_warn_path(name)
+        # A PEER is the last writer everywhere here, so the lag gate answers
+        # False on its own merits and no arm depends on the injected clock.
+        peer = server.register_session(_sid(f"peer-{name}"))
+        _, agent_id, artifact_id = _u3a_seed(
+            server, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"arm-{name}", version=version, last_writer=peer,
+        )
+        arms[name] = (path, agent_id, artifact_id, _hash(caller))
+    return arms
+
+
+@pytest.mark.parametrize("arm", [
+    "fresh-granted",
+    "fresh-mismatch-warn",
+    "denied-shared-foreign",
+    "stale-invalid-warn",
+    "denied-invalid-strict",
+    "stale-unseen",
+    "denied-unseen-mismatch",
+])
+def test_decide_twice_changes_nothing_observable(decider, arm: str) -> None:
+    """R7, asserted as a before/after rather than by reading the source.
+
+    On every arm the handler does something here — bumps a counter, re-grants
+    SHARED, marks the pair stale-warned, records the deny, appends the audit
+    row, pops the notice. The verdict must do NONE of it, so calling it twice
+    in a row leaves version, generation, canonical hash, grant state, heartbeat
+    tick, pending notice, stale markers, deny records, the .coherence files and
+    EVERY counter exactly as they were — and answers the same both times.
+    """
+    arms = _u3a_arms(decider)
+    path, agent_id, artifact_id, caller_hash = arms[arm]
+    # Give each dimension a non-default value first: an assertion that None
+    # stayed None proves much less than one that 41 stayed 41.
+    decider.registry.record_heartbeat(agent_id, 41)
+    decider.registry.record_preemption_notice(
+        victim_agent_id=agent_id, artifact_id=artifact_id,
+        preempter_agent_id=decider.register_session(_sid("preempter")),
+        preempted_at_unix_ts=1234.0,
+    )
+    before = _u3a_observable(decider, agent_id, artifact_id)
+    assert before["heartbeat"] == 41
+    assert before["notice"] is not None
+
+    first = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+    second = _u3a_decide(decider, artifact_id, agent_id,
+                         path=path, caller_hash=caller_hash)
+
+    assert first == second, "the verdict is not a function of its own history"
+    assert _u3a_observable(decider, agent_id, artifact_id) == before
+
+
+def test_purity_check_covers_the_arm_that_would_deny(decider) -> None:
+    """Control for the test above: prove the parametrized arms really do reach
+    the deny and suppression legs. A purity proof over seven arms that all
+    quietly returned "stale" would be seven copies of one weak assertion."""
+    arms = _u3a_arms(decider)
+    outcomes = {
+        name: _u3a_decide(decider, artifact_id, agent_id,
+                          path=path, caller_hash=caller_hash).outcome
+        for name, (path, agent_id, artifact_id, caller_hash) in arms.items()
+    }
+    assert outcomes == {
+        "fresh-granted": "fresh",
+        "fresh-mismatch-warn": "fresh",
+        "denied-shared-foreign": "denied",
+        "stale-invalid-warn": "stale",
+        "denied-invalid-strict": "denied",
+        "stale-unseen": "stale",
+        "denied-unseen-mismatch": "denied",
+    }
+
+
+# --- every branch is drivable from the decision alone ----------------------
+
+
+def _u3a_render(d: TrackedReadDecision, *, want_generation: bool) -> dict:
+    """Rebuild the handler's response shape from the VERDICT ONLY.
+
+    No coordinator, no artifact, no agent state — if a field the handler
+    branches on were missing from the decision, this could not be written and
+    the next unit would have to re-derive it in the handler, which is the
+    duplication the extraction exists to remove.
+    """
+    if d.outcome == "denied":
+        return {
+            "source": (
+                "pre_read_shared_hash_deny" if d.holds_valid_grant
+                else "pre_read_strict_deny"
+            ),
+            "current_version": d.version,
+            "prior_version_seen_by_session": d.prior_version_seen,
+            # The fresh arm denies only ON a mismatch, so it reports True flat;
+            # the stale arm reports its own predicate (the INVALID leg denies
+            # without one).
+            "hash_differs": True if d.holds_valid_grant else d.stale_hash_differs,
+            "counter_bumps": ["strict_mode_denials_total"],
+        }
+    if d.outcome == "fresh":
+        payload: dict[str, Any] = {"status": "fresh", "version": d.version}
+        if d.fresh_hash_differs:
+            payload["hash_differs"] = True
+        if want_generation and d.owner_generation is not None:
+            payload["owner_generation"] = d.owner_generation
+        payload["counter_bumps"] = (
+            (["fresh_shared_hash_mismatch_total"] if d.fresh_hash_differs else [])
+            + (["shared_foreign_lag_suppressed_total"] if d.commit_lag_suppressed else [])
+        )
+        return payload
+    stale: dict[str, Any] = {
+        "status": "stale",
+        "current_version": d.version,
+        "prior_version_seen_by_session": d.prior_version_seen,
+        "hash_differs": d.stale_hash_differs,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    if want_generation and d.owner_generation is not None:
+        stale["owner_generation"] = d.owner_generation
+    return stale
+
+
+def test_every_handler_branch_is_drivable_from_the_decision_alone(decider) -> None:
+    """Each arm rendered from its verdict and nothing else. The expectations
+    are written out literally rather than recomputed from the decision — a
+    renderer checked against itself would report green on any field set."""
+    arms = _u3a_arms(decider)
+
+    def rendered(name: str, *, want_generation: bool = False) -> dict:
+        path, agent_id, artifact_id, caller_hash = arms[name]
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+        return _u3a_render(d, want_generation=want_generation)
+
+    assert rendered("fresh-granted") == {
+        "status": "fresh", "version": 1, "counter_bumps": [],
+    }
+    assert rendered("fresh-mismatch-warn") == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": ["fresh_shared_hash_mismatch_total"],
+    }
+    assert rendered("denied-shared-foreign") == {
+        "source": "pre_read_shared_hash_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": 2,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("stale-invalid-warn") == {
+        "status": "stale", "current_version": 4,
+        "prior_version_seen_by_session": 3, "hash_differs": False,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    assert rendered("denied-invalid-strict") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 4,
+        "prior_version_seen_by_session": 3,
+        "hash_differs": False,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("denied-unseen-mismatch") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": None,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    # The opt-in pair: present only when asked for, and carrying the
+    # generation the REGISTRY holds (the expectation is sourced from the
+    # registry, not from the decision being checked).
+    _path, _agent, artifact_id, _caller = arms["stale-unseen"]
+    pair = decider.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None and pair[1] is not None
+    assert rendered("stale-unseen", want_generation=True)["owner_generation"] == pair[1]
+    assert "owner_generation" not in rendered("stale-unseen")
+
+
+def test_lag_suppression_is_visible_to_the_renderer(decider) -> None:
+    """The suppression arm needs its own setup (the caller must be the recent
+    writer), and it is the one arm whose counter bump is NOT implied by the
+    outcome: a suppressed deny looks exactly like a warn-mode mismatch unless
+    the decision says otherwise."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert _u3a_render(d, want_generation=False) == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": [
+            "fresh_shared_hash_mismatch_total",
+            "shared_foreign_lag_suppressed_total",
+        ],
+    }
+
+
+# --- integration: the verdict agrees with the live handler -----------------
+
+
+@pytest.mark.parametrize("path,state,caller,expect", [
+    (_U3A_STRICT_PATH, MESIState.SHARED, "canonical", "fresh"),
+    (_U3A_WARN_PATH, MESIState.INVALID, "canonical", "stale"),
+    (_U3A_STRICT_PATH, MESIState.INVALID, "canonical", "denied"),
+])
+def test_verdict_matches_the_live_pre_read_handler(
+    served_decider, path: str, state: MESIState, caller: str, expect: str,
+) -> None:
+    """The extraction is only worth anything if it agrees with the surface it
+    was extracted from. Ask the verdict FIRST (it changes nothing), then let
+    the real handler answer over HTTP and check they say the same thing about
+    version, prior version and the stale-arm mismatch.
+    """
+    server, client = served_decider
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=state, version=4,
+    )
+
+    d = _u3a_decide(server, artifact_id, agent_id, path=path, caller_hash=_hash(caller))
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": path, "content_hash": _hash(caller)},
+    )
+
+    assert status == 200
+    assert d.outcome == expect
+    if expect == "fresh":
+        assert body == {"status": "fresh", "version": d.version}
+        return
+    # Both stale and denied carry the summary; the deny adds the permission
+    # decision the warn-mode allow does not.
+    assert body["summary"]["current_version"] == d.version
+    assert body["summary"]["prior_version_seen_by_session"] == d.prior_version_seen
+    assert body["summary"]["hash_differs"] == d.stale_hash_differs
+    decision = body["hookSpecificOutput"].get("permissionDecision")
+    assert decision == ("deny" if expect == "denied" else "allow")
+
+
+# ----------------------------------------------------------------------
+# U4 — POST /hooks/effect-fence: the verdict route
+#
+# "May this irreversible effect still fire, and if not, WHY" asked over HTTP.
+# The route reads the registry directly, so it can answer the one leg the
+# in-process fence structurally cannot: the pre-read WIRE carries only
+# ``hash_differs`` (a comparison), never the coordinator's recorded hash, so
+# in-process "the claim matches" and "there is no claim at all" are one value
+# and the wrapper passes ``content_claim_present=True`` unconditionally. This
+# route passes the real answer, which is why the AE8 arms below live here.
+#
+# Every test in this block is written against a coordinator whose state was
+# parked by hand, so each names ONE condition. The recurring hazard they exist
+# to close is the same one in every arm: the naive implementation — copy
+# pre-read's untracked fast path, let the shared wrapper own the degraded
+# arms, take the coordinator's reported generation at face value — answers
+# PROCEED on a view the coordinator never confirmed.
+# ----------------------------------------------------------------------
+
+_U4_ROUTE = "/hooks/effect-fence"
+
+
+def _u4_body(
+    sid: str,
+    path: str,
+    *,
+    version: Any,
+    generation: Any,
+    content_hash: Any,
+) -> dict:
+    """A complete, well-formed fence request. Tests that exercise a MISSING
+    field pop it from this dict, so "well-formed" stays defined in one place
+    and a malformed-input test cannot silently drift into testing two faults."""
+    return {
+        "session_id": sid,
+        "path": path,
+        "expected_version": version,
+        "expected_generation": generation,
+        "content_hash": content_hash,
+    }
+
+
+def _u4_captured(server: CoordinatorHTTPServer, artifact_id: uuid.UUID) -> tuple[int, Optional[int]]:
+    """The (version, generation) pair an honest caller captured at read time.
+
+    Sourced from the registry rather than written as a literal: an arm that
+    hard-coded the pair would keep asserting against a number the seeder no
+    longer produces, and every such arm would silently become "the caller sent
+    the wrong version" — a version_moved hold that looks like a pass.
+    """
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None
+    return pair[0].version, pair[1]
+
+
+# --- AE1: nothing moved ----------------------------------------------------
+
+
+def test_ae1_nothing_moved_answers_proceed_and_repeats(served_decider) -> None:
+    """The one arm that may proceed: the caller's comparands are the
+    coordinator's, the grant still stands, and the coordinator claims the
+    content in hand. Asked twice, it answers the same — a verdict that healed
+    or consumed anything would drift on the second call."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    body = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                    generation=generation, content_hash=_hash("v3-bytes"))
+    first = client.post(_U4_ROUTE, body)
+    second = client.post(_U4_ROUTE, body)
+
+    assert first == (200, {"verdict": "proceed"})
+    assert second == first
+
+
+# --- AE2 / AE3 / AE4 / AE5: one hold per condition -------------------------
+
+
+def test_ae2_peer_commit_holds_naming_the_moved_input(served_decider) -> None:
+    """A peer committed after the caller's read. The value the decision was
+    derived from moved, so the hold names THAT and not some downstream
+    symptom of it."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+    captured_version, generation = _u4_captured(server, artifact_id)
+    # The peer commit: the version the caller captured is no longer current.
+    art = server.registry.get_artifact(artifact_id)
+    server.registry.set_artifact_and_content(
+        artifact_id, dataclasses.replace(art, version=captured_version + 1), "",
+    )
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=captured_version,
+        generation=generation, content_hash=_hash("v3-bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "version_moved"}
+
+
+def test_ae3_write_acquire_preemption_holds_naming_the_lost_grant(served_decider) -> None:
+    """A peer's pessimistic write-acquire ends the caller's grant while moving
+    NEITHER comparand — no commit yet, and the acquire trigger is outside the
+    epoch-bump set. A version-and-generation check structurally cannot see it,
+    so the hold must come from the grant leg. The control assertions below are
+    the point of the test: if the acquire HAD moved either comparand, the hold
+    would be real but this arm would prove nothing about the grant leg."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    captured_version, captured_generation = _u4_captured(server, artifact_id)
+
+    peer = _sid("ae3-write-acquirer")
+    acquire_status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": peer, "path": _U3A_WARN_PATH},
+    )
+    assert acquire_status == 200
+
+    # Controls: neither comparand moved, and the caller really did lose the grant.
+    assert _u4_captured(server, artifact_id) == (captured_version, captured_generation)
+    assert server.registry.get_agent_state(
+        artifact_id, session_to_agent_id(sid),
+    ) != MESIState.SHARED
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=captured_version,
+        generation=captured_generation, content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "grant_preempted"}
+
+
+def test_ae4_differing_content_hash_demotes_the_generation(served_decider) -> None:
+    """The coordinator still REPORTS an integer generation here, and both
+    comparands match. Proceeding on that integer is the failure: a differing
+    content hash means the coordinator cannot vouch that the bytes in hand are
+    the content at that version, so the authority comparand is unconfirmed and
+    the fence holds."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    # Control: the coordinator reports a REAL generation for this artifact, so
+    # the hold below is the demotion firing and not an absent generation.
+    assert isinstance(generation, int)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("bytes-the-coordinator-never-recorded"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "generation_unconfirmed"}
+
+
+def test_ae5_zero_captured_version_holds_as_unconfirmed(served_decider) -> None:
+    """Zero is the "could not resolve" sentinel a degraded or pre-fence
+    coordinator hands back, never a comparable value. Comparing it is how "I
+    do not know" becomes "I know it is unchanged"."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    _version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=0, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "version_unconfirmed"}
+
+
+# --- AE8: the coordinator holds no content claim ---------------------------
+
+
+@pytest.mark.parametrize("recorded_hash,form", [
+    ("", "empty-string seed — what a KTD-9 first observation with no caller "
+         "hash writes, and the form eight of nine code paths produce"),
+    ("f" * 64, "the all-f launch-gate sentinel — no real SHA-256 matches it"),
+])
+def test_ae8_no_content_claim_holds_under_its_own_reason(
+    served_decider, recorded_hash: str, form: str,
+) -> None:
+    """AE8, and the reason this route exists at all.
+
+    Both comparands match, the grant stands, the read was not refused — every
+    leg the in-process fence can see says proceed. But the coordinator records
+    NO content hash, so it cannot vouch that the bytes in hand are the content
+    at that version. The in-process wrapper passes
+    ``content_claim_present=True`` unconditionally (its wire carries a
+    comparison, not the recorded hash) and therefore ADMITS here; this route
+    reads the registry and answers under ``content_claim_absent``.
+
+    The reason matters as much as the hold: falling into the residual
+    ``generation_unconfirmed`` bucket would make this byte-identical on the
+    wire to a degraded read, whose recovery is "re-read your bytes" rather
+    than "call an operator".
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("ae8-no-claim")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=recorded_hash,
+        state=MESIState.SHARED, version=2, label=f"ae8-{len(recorded_hash)}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, path, version=version, generation=generation,
+        content_hash=_hash("whatever-the-caller-holds"),
+    ))
+
+    assert status == 200, form
+    assert body == {"verdict": "hold", "reason": "content_claim_absent"}, form
+
+
+# --- the refused read ------------------------------------------------------
+
+
+def test_strict_refused_read_holds_with_the_refusal_reason(served_decider) -> None:
+    """A strict-mode deny with BOTH comparands matching. The refusal alone
+    must hold it: a caller that fell past the refusal leg would either
+    mislabel the hold as a lost grant or — with everything matching —
+    proceed on a view the coordinator had just refused to serve."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "read_denied"}
+
+
+# --- the artifact the coordinator does not track ---------------------------
+
+
+def test_untracked_artifact_holds_rather_than_answering_fresh(served_decider) -> None:
+    """pre-read's untracked fast path returns a fresh-shaped answer carrying
+    NO version, which a client reads as the zero sentinel. Copying that shape
+    here would turn "the coordinator knows nothing about this file" into "the
+    coordinator agrees nothing moved" — the exact admit this route exists to
+    close. It reaches its own held conclusion instead."""
+    server, client = served_decider
+    untracked = "notes/scratch.txt"
+    assert not server.policy.is_tracked(untracked)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        _sid("untracked-caller"), untracked, version=7, generation=1,
+        content_hash=_hash("bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "input_vanished"}
+
+
+def test_tracked_but_never_observed_artifact_holds(served_decider) -> None:
+    """Tracked by policy, but no row: pre-read answers this by MUTATING
+    (registering the artifact, seeding v1, granting SHARED). A verdict must
+    not mint the record it is asked to check, so it holds on the absence."""
+    server, client = served_decider
+    path = _u3a_warn_path("never-observed")
+    assert server.policy.is_tracked(path)
+    assert server.registry.lookup_artifact_id_by_name(path) is None
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        _sid("first-caller"), path, version=1, generation=0,
+        content_hash=_hash("bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "input_vanished"}
+    assert server.registry.lookup_artifact_id_by_name(path) is None, (
+        "the verdict minted the artifact row it was asked to check"
+    )
+
+
+def test_unknown_agent_holds_and_no_retry_can_clear_it(served_decider) -> None:
+    """R5's sharpest case, and the reason a MISSING FIELD must not be a hold:
+    a caller resolving to an agent the coordinator has never seen legitimately
+    produces a hold that no number of identical retries can clear. If an
+    incomplete request also answered "hold", the two would be indistinguishable
+    on the wire — and only one of them is fixable by retrying."""
+    server, client = served_decider
+    path = _u3a_warn_path("unknown-agent")
+    _seeder_sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="unknown-agent-seeder",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    stranger = _sid("never-registered-stranger")
+    assert server.agent_name_for(session_to_agent_id(stranger)) is None
+
+    body = _u4_body(stranger, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+    first = client.post(_U4_ROUTE, body)
+    second = client.post(_U4_ROUTE, body)
+
+    assert first[0] == 200
+    assert first[1]["verdict"] == "hold"
+    assert second == first, "an identical retry cleared a hold it cannot clear"
+    # And the stranger stayed a stranger — the route derives the identity, it
+    # does not mint one (the pre-read handler registers before its work body).
+    #
+    # DO NOT DELETE THIS PAIR AS OFF-TOPIC. It is the only NON-VACUOUS pin on
+    # the agent-name map: ``test_the_fence_call_mutates_nothing`` carries that
+    # map in its before/after set too, but every one of its arms uses a session
+    # the seeder already registered, so a stray ``register_session`` there is a
+    # no-op and the dimension cannot fail. Verified by mutation: making the
+    # handler register instead of derive leaves the purity harness GREEN and
+    # turns only this test red.
+    assert server.agent_name_for(session_to_agent_id(stranger)) is None
+
+
+# --- R5: an incomplete request is a client error, never a hold -------------
+
+
+def _u4_complete(sid: str, path: str) -> dict:
+    """A request that would PROCEED if nothing were removed from it — so a
+    400 below is attributable to the removed field alone."""
+    return _u4_body(sid, path, version=2, generation=0, content_hash=_hash("canonical"))
+
+
+@pytest.mark.parametrize("drop,expected_error", [
+    ("expected_version", "missing expected_version"),
+    ("expected_generation", "missing expected_generation"),
+    ("content_hash", "missing content_hash"),
+])
+def test_ae6_omitted_input_is_a_client_error_naming_the_field(
+    served_decider, drop: str, expected_error: str,
+) -> None:
+    """AE6 and its two siblings. A hold invites a retry, and no number of
+    retries can supply a comparand the caller never captured — so an
+    incomplete request is told what to send, by name, rather than handed a
+    verdict it will bounce off forever.
+
+    Each error names a DIFFERENT field: an omitted generation and an omitted
+    content hash must not collapse into one message, or a caller cannot tell
+    which one it forgot."""
+    server, client = served_decider
+    sid, _agent_id, _artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    body = _u4_complete(sid, _U3A_WARN_PATH)
+    del body[drop]
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+@pytest.mark.parametrize("field,value,expected_error", [
+    ("expected_version", "2", "expected_version must be an integer"),
+    ("expected_version", 2.0, "expected_version must be an integer"),
+    # bool is an int subclass: ``isinstance(True, int)`` is True, so a fence
+    # that merely type-checks accepts ``True`` as version 1 and compares it.
+    ("expected_version", True, "expected_version must be an integer"),
+    ("expected_generation", "0", "expected_generation must be an integer or null"),
+    ("expected_generation", False, "expected_generation must be an integer or null"),
+])
+def test_malformed_comparand_is_a_client_error(
+    served_decider, field: str, value: Any, expected_error: str,
+) -> None:
+    """Comparands are parsed as integers and NEVER coerced. A string "2" that
+    became 2, or a ``True`` that became 1, is a comparand the caller never
+    captured being compared as though it had been."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("malformed-comparand"), _U3A_WARN_PATH)
+    body[field] = value
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+def test_explicit_null_generation_is_the_sentinel_not_an_error(served_decider) -> None:
+    """The one asymmetry: an OMITTED generation is a client mistake, but an
+    explicit ``null`` is a captured fact — "the coordinator I read from
+    confirmed no generation". That is representable in the fence vocabulary,
+    so it is answered as the hold it is rather than as a malformed request."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, _generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=None,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "generation_unconfirmed"}
+
+
+@pytest.mark.parametrize("session_id,expected_error", [
+    (None, "missing session_id"),
+    (42, "missing session_id"),
+    ("not-a-uuid", "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"),
+])
+def test_missing_or_malformed_session_id_is_a_client_error(
+    served_decider, session_id: Any, expected_error: str,
+) -> None:
+    """Grant standing is PER SESSION: without the session identifier the route
+    cannot compute two of the six values the verdict needs. It says so rather
+    than gating on the four it can compute."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("placeholder"), _U3A_WARN_PATH)
+    if session_id is None:
+        del body["session_id"]
+    else:
+        body["session_id"] = session_id
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+@pytest.mark.parametrize("path,expected_error", [
+    ("/etc/passwd", "path must be relative (no leading /)"),
+    ("../../etc/passwd", "path contains '..' traversal"),
+    ("plan\nmd", "path contains control characters"),
+    ("", "missing or empty path"),
+])
+def test_path_gate_rejects_before_classifying(
+    served_decider, path: str, expected_error: str,
+) -> None:
+    """The route validates through the SAME server-side path gate every other
+    route uses. Skipping it would let an absolute or traversing path fall
+    through to the policy check, which answers False and therefore HOLDS — a
+    200 that looks like a safe answer while the boundary check never ran."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("path-gate"), _U3A_WARN_PATH)
+    body["path"] = path
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+def test_malformed_content_hash_is_a_client_error(served_decider) -> None:
+    """A present-but-wrong-shape hash is rejected for the same reason the
+    other routes reject it: a caller-supplied hash that is not a SHA-256 can
+    only ever mismatch, so admitting it turns every verdict into a hold with
+    no way to tell a broken client from a real divergence."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("bad-hash"), _U3A_WARN_PATH)
+    body["content_hash"] = "not-a-sha"
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": "content_hash must be 64 hex characters (sha-256)"}
+
+
+# --- R12: neither non-normal arm may leak the wrapper's default shapes -----
+
+
+def test_watchdog_timeout_answers_hold_not_the_default_fresh_shape(served_decider) -> None:
+    """The shared wrapper's default degraded envelope is
+    ``{"status": "fresh", "degraded": true, ...}`` — a PROCEED shape, correct
+    for a pre-read whose contract is fresh/stale and catastrophic for a safety
+    verdict. This route owns its own envelope, and it reads as a hold carrying
+    a listed reason: a coordinator that timed out resolved nothing, which is
+    exactly what the "could not resolve" sentinel means."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
+
+    server, client = served_decider
+    with patch.object(server, "run_with_watchdog", side_effect=FuturesTimeout()):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("watchdog"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] in HOLD_REASONS
+    assert body["held_by"] == "watchdog_timeout"
+    assert "status" not in body, "the wrapper's fresh-shaped default reached the wire"
+
+
+def test_handler_exception_answers_hold_not_the_wrappers_ok_false(served_decider) -> None:
+    """The wrapper's OTHER non-normal arm turns a handler exception into HTTP
+    200 ``{"ok": false, "reason": "internal: ..."}`` — a shape no
+    ``degraded_response`` parameter overrides, carrying no verdict and a
+    ``reason`` drawn from no published vocabulary. A fence client branching on
+    ``verdict`` would read that as neither proceed nor hold."""
+    from unittest.mock import patch
+
+    server, client = served_decider
+    with patch.object(
+        server.registry, "lookup_artifact_id_by_name",
+        side_effect=RuntimeError("simulated registry failure"),
+    ):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("boom"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] in HOLD_REASONS
+    assert body["held_by"] == "handler_error"
+    assert "ok" not in body, "the wrapper's {ok: false} arm reached the wire"
+
+
+def test_an_unlisted_reason_never_reaches_the_wire(served_decider) -> None:
+    """R3, enforced rather than documented: the reason vocabulary is declared
+    protocol, so a reason outside it is a drift fault, not a verdict. It fails
+    into this route's own hold envelope instead of teaching a client a word no
+    published set contains."""
+    from unittest.mock import patch
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _server, client = served_decider
+    with patch.object(mod, "classify_hold", return_value="reason_from_the_future"):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("drift"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] != "reason_from_the_future"
+    assert body["reason"] in HOLD_REASONS
+
+
+def test_every_hold_reason_this_route_emits_is_published(served_decider) -> None:
+    """The closed set, checked against the reasons this suite actually drives
+    rather than against the constant module (which would check the set against
+    itself). Also pins that the route reaches MORE than one leg — a guard over
+    a single reason would pass on a route that answered ``input_vanished`` to
+    everything."""
+    server, client = served_decider
+    reasons = set()
+    for name, recorded, state, caller, strict, sent_version in (
+        ("moved", "canonical", MESIState.SHARED, "canonical", False, 1),
+        ("unconfirmed-version", "canonical", MESIState.SHARED, "canonical", False, 0),
+        ("no-claim", "", MESIState.SHARED, "canonical", False, None),
+        ("hash", "canonical", MESIState.SHARED, "other-bytes", False, None),
+        ("denied", "canonical", MESIState.INVALID, "canonical", True, None),
+    ):
+        path = _u3a_strict_path(name) if strict else _u3a_warn_path(name)
+        sid, _agent, artifact_id = _u3a_seed(
+            server, path, recorded_hash=(_hash(recorded) if recorded else ""),
+            state=state, version=3, label=f"published-{name}",
+        )
+        version, generation = _u4_captured(server, artifact_id)
+        status, body = client.post(_U4_ROUTE, _u4_body(
+            sid, path,
+            version=version if sent_version is None else sent_version,
+            generation=generation, content_hash=_hash(caller),
+        ))
+        assert status == 200
+        assert body["verdict"] == "hold", f"{name} answered {body}"
+        reasons.add(body["reason"])
+
+    assert reasons <= HOLD_REASONS
+    assert len(reasons) >= 4, f"only reached {reasons}; the legs are not separable"
+
+
+# --- the wire carries no session identifier --------------------------------
+
+
+def test_the_verdict_body_carries_no_session_identifier(served_decider) -> None:
+    """The verdict answers about an artifact, not about who asked. Echoing the
+    session id back would put a caller-supplied identifier into a body other
+    tooling logs, for no branch any client takes."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    _status, proceed = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    _status, held = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + 99, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert proceed == {"verdict": "proceed"}
+    assert held["verdict"] == "hold"
+    for body in (proceed, held):
+        assert sid not in json.dumps(body)
+        assert "session_id" not in body
+
+
+# --- the route rides the one dispatcher seam -------------------------------
+
+
+def test_missing_bearer_is_refused(coordinator) -> None:
+    """No handler re-implements authentication: the route is registered in the
+    single table, so the central Bearer check runs before it is reached."""
+    bare = _Client("127.0.0.1", coordinator.port, "unused")
+    status, body = bare.request(
+        "POST", _U4_ROUTE, _u4_complete(_sid("noauth"), "plan.md"),
+        headers_override={"Authorization": ""},
+    )
+    assert status == 401
+    assert body == {"error": "missing or invalid bearer token"}
+
+
+def test_wrong_bearer_is_refused(coordinator) -> None:
+    wrong = _Client("127.0.0.1", coordinator.port, "not-the-secret")
+    status, body = wrong.post(_U4_ROUTE, _u4_complete(_sid("badauth"), "plan.md"))
+    assert status == 401
+    assert body == {"error": "missing or invalid bearer token"}
+
+
+def test_non_allowlisted_host_is_refused(client: _Client) -> None:
+    status, body = client.post(
+        _U4_ROUTE, _u4_complete(_sid("badhost"), "plan.md"),
+        headers_override={"Host": "evil.example.com"},
+    )
+    assert status == 403
+    assert body == {"error": "host header not allowlisted"}
+
+
+# --- the two counters ------------------------------------------------------
+
+
+def test_request_counter_counts_every_attempt_including_the_malformed(
+    served_decider,
+) -> None:
+    """The per-endpoint counter is bumped by the dispatcher BEFORE the handler
+    runs, so it counts attempts rather than successes. Registering the route in
+    the name map without also initialising the counter leaves the increment a
+    silent no-op — the name lookup fails closed — and the route becomes
+    invisible on /status while looking wired up in the source."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    good = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                    generation=generation, content_hash=_hash("canonical"))
+    malformed = dict(good)
+    del malformed["content_hash"]
+
+    assert server.endpoint_counters_snapshot()["effect_fence_total"] == 0
+    client.post(_U4_ROUTE, good)
+    client.post(_U4_ROUTE, malformed)
+
+    _status, metrics = client.request("GET", "/status?detail=metrics")
+    assert metrics["endpoint_counters"]["effect_fence_total"] == 2
+
+
+def test_hold_counter_moves_on_a_hold_and_stands_still_on_a_proceed(
+    served_decider,
+) -> None:
+    """The hold counter is the operator's view of how often the fence actually
+    stopped something. A counter that also ticked on a proceed would report a
+    healthy workspace and a wedged one identically."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    def holds() -> int:
+        _s, metrics = client.request("GET", "/status?detail=metrics")
+        return metrics["effect_fence_holds_total"]
+
+    assert holds() == 0
+
+    _s, proceed = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    assert proceed == {"verdict": "proceed"}
+    assert holds() == 0, "a proceed moved the hold counter"
+
+    _s, held = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + 1, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    assert held["verdict"] == "hold"
+    assert holds() == 1
+
+    # A malformed request is not a hold: it never reached a verdict.
+    malformed = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                         generation=generation, content_hash=_hash("canonical"))
+    del malformed["expected_generation"]
+    client.post(_U4_ROUTE, malformed)
+    assert holds() == 1, "a 400 was counted as a hold"
+
+
+# --- R7: the call mutates nothing -----------------------------------------
+
+
+def _u4_observable(
+    server: CoordinatorHTTPServer,
+    agent_id: uuid.UUID,
+    artifact_id: uuid.UUID,
+    session_id: str,
+) -> dict:
+    """Everything ``_handle_pre_read`` moves around this same decision, read
+    through NON-destructive accessors only, MINUS this route's own two
+    counters.
+
+    Those two are the documented exception and nothing else is: R7 forbids a
+    record that changes a LATER ANSWER, and an advisory count changes none.
+    Dropping them by name (rather than comparing whole snapshots loosely) keeps
+    every OTHER counter — the stale-warning pair, the strict-denial total, the
+    route-around total — inside the guard.
+    """
+    observable = _u3a_observable(server, agent_id, artifact_id)
+    counters = dict(observable["counters"])
+    endpoint = dict(counters["endpoint_counters"])
+    endpoint.pop("effect_fence_total", None)
+    counters["endpoint_counters"] = endpoint
+    counters.pop("effect_fence_holds_total", None)
+    observable["counters"] = counters
+    # The pre-read path registers the session BEFORE its work body, and
+    # session-start reads this map to decide whether a session was ever seen.
+    observable["agent_names"] = sorted(str(a) for a, _ in server.agent_names_snapshot())
+    # The untracked fast path CONSUMES the pending re-grounding flag.
+    observable["compact_pending"] = server.has_compact_pending(session_id)
+    return observable
+
+
+def _u4_seed_every_dimension(
+    server: CoordinatorHTTPServer, client: _Client, agent_id: uuid.UUID,
+    artifact_id: uuid.UUID, session_id: str, path: str,
+) -> None:
+    """Put a NON-DEFAULT value in every dimension before the before/after
+    snapshot. An assertion that ``None`` stayed ``None`` proves much less than
+    one that 41 stayed 41 — and a zero counter that stayed zero cannot tell a
+    route that never increments from one whose increment did not run."""
+    server.registry.record_heartbeat(agent_id, 41)
+    server.registry.record_preemption_notice(
+        victim_agent_id=agent_id, artifact_id=artifact_id,
+        preempter_agent_id=server.register_session(_sid("u4-preempter")),
+        preempted_at_unix_ts=1234.0,
+    )
+    server.mark_compact_pending(session_id)
+    server.mark_stale_warned(agent_id, artifact_id)
+    server.record_strict_deny(session_id, path)
+    for _ in range(3):
+        server.increment_stale_warning_emitted()
+    for _ in range(2):
+        server.increment_strict_mode_denial()
+    server.increment_strict_mode_routed_around_via_bash()
+    # A REAL strict deny, so audit.log exists with a non-zero size before the
+    # comparison: "no audit row appeared" is a much weaker claim against a
+    # file that does not exist yet than against one that does.
+    deny_sid, _deny_agent, _deny_artifact = _u3a_seed(
+        server, _u3a_strict_path("u4-audit-seed"), recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=2, label="u4-audit-seed",
+    )
+    status, _ = client.post("/hooks/pre-read", {
+        "session_id": deny_sid, "path": _u3a_strict_path("u4-audit-seed"),
+        "content_hash": _hash("canonical"),
+    })
+    assert status == 200
+
+
+@pytest.mark.parametrize("arm,sent_version_delta,expect", [
+    ("proceed", 0, "proceed"),
+    ("hold", 1, "hold"),
+])
+def test_the_fence_call_mutates_nothing(
+    served_decider, arm: str, sent_version_delta: int, expect: str,
+) -> None:
+    """R7, asserted as a before/after rather than read off the source.
+
+    The pre-read path mutates far more than it looks like: it registers the
+    session before the work body, records a heartbeat as its first statement
+    (the sweep reclaims grants on heartbeat staleness), re-grants SHARED on the
+    stale arm, marks the pair stale-warned, pops notices, fires five mutations
+    on a strict deny — one of which makes a later command increment a
+    route-around counter and writes an audit row — and consumes the pending
+    re-grounding flag on its untracked fast path.
+
+    A verdict that did ANY of it would turn a level-triggered hold into an
+    edge-triggered one: the next bare re-check would take the healed branch and
+    admit the effect whose grant a peer already revoked. This project has
+    recorded three prior instances of a read healing what it checks; this is
+    the guard that keeps the fence from being the fourth. Both arms are
+    checked, because a proceed and a hold leave through different branches.
+    """
+    server, client = served_decider
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    _u4_seed_every_dimension(server, client, agent_id, artifact_id, sid, _U3A_WARN_PATH)
+
+    before = _u4_observable(server, agent_id, artifact_id, sid)
+    # Controls for the seeding: a guard whose dimensions are all at their
+    # defaults is a guard that cannot fail.
+    assert before["heartbeat"] == 41
+    assert before["notice"] is not None
+    assert before["compact_pending"] is True
+    assert before["stale_warned"]
+    assert before["strict_denies"]
+    assert before["counters"]["strict_mode_denials_total"] > 0
+    assert before["counters"]["stale_warning_emitted_total"] > 0
+    assert before["counters"]["strict_mode_routed_around_via_bash_total"] > 0
+    assert before["audit_logs"] and all(size > 0 for _name, size in before["audit_logs"])
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + sent_version_delta,
+        generation=generation, content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body["verdict"] == expect, f"the {arm} arm did not take its branch"
+    assert _u4_observable(server, agent_id, artifact_id, sid) == before
+
+
+# ----------------------------------------------------------------------
+# U6 — the PUBLISHED contract for the verdict route
+#
+# The goal these guard is derivability: a client written from the published
+# documentation alone, without reading this repository's source, reaches the
+# same verdict. Four claims carry that, and each is one a reader ACTS on:
+#
+#   * the reason vocabulary is wire-stable — added to, never renamed;
+#   * each reason names WHO establishes it and has its OWN recovery, including
+#     both senses of the vanished-input case, under the identifier it holds by;
+#   * the content hash is defined, because the server validates only its SHAPE
+#     and a client that picks the other plausible convention holds forever
+#     wearing the same reason a genuine conflict would;
+#   * every answer that is not a recognised verdict is a hold on the client's
+#     side — which is the whole of the story for a coordinator that answers 404.
+#
+# Every search runs over WHITESPACE-NORMALIZED text. The guide wraps its prose,
+# so a line-wise search for any of these sentences would report clean while the
+# sentence sat there mangled or half-deleted.
+# ----------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GUIDE_PATH = _REPO_ROOT / "docs" / "guide.md"
+_README_PATH = _REPO_ROOT / "README.md"
+
+
+def _normalized(text: str) -> str:
+    """Collapse every run of whitespace, so a wrapped sentence still matches."""
+    return " ".join(text.split())
+
+
+# Each phrase is ONE contiguous fragment carrying a whole claim: a pin split
+# across two sentences would still pass with half the claim deleted.
+_CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "the reason vocabulary is add-only, never renamed",
+        "Reasons may be added; an existing one is never renamed or repurposed.",
+    ),
+    (
+        "an unrecognised reason is still a hold",
+        "treat a `hold` whose `reason` you do not recognise as a hold",
+    ),
+    (
+        "each reason names its establisher and its own recovery",
+        "Each reason names who established it — the **coordinator**, from state only it "
+        "can see, or the **caller**, from state only *it* can see — and each has its own "
+        "recovery.",
+    ),
+    (
+        "the vanished input is established from BOTH sides",
+        "**`input_vanished` has two establishers, and both are in the contract.**",
+    ),
+    (
+        "the coordinator's sense of the vanished input",
+        "**The coordinator** answers `input_vanished` over the wire when it holds no "
+        "record of the artifact",
+    ),
+    (
+        "the caller's sense of the vanished input, under the same identifier",
+        "**The caller** establishes it itself when its own input no longer exists. The "
+        "coordinator cannot see your workspace, so it will never report this for you; "
+        "detect it and treat it as a hold under this same identifier.",
+    ),
+    (
+        "the content hash is defined over exact bytes, unnormalized",
+        "`content_hash` is a lowercase sha-256 hex digest over the exact bytes the caller "
+        "holds, with no normalization",
+    ),
+    (
+        "the wrong hash convention is a silent permanent hold",
+        "it simply never matches what the coordinator recorded, and every call it makes "
+        "holds wearing the same reason a genuine conflict would",
+    ),
+    (
+        "anything that is not a verdict is a hold",
+        "every one of these is a hold and the effect does not fire: a connection failure "
+        "or a timeout; any status other than `200`; a `200` body with no `verdict`; a "
+        "`verdict` you do not recognise; and a `404`",
+    ),
+    (
+        "the sibling coordinator answers 404 for this route",
+        "the sibling Node coordinator backend does not implement `/hooks/effect-fence`",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "claim,phrase", _CONTRACT_STATEMENTS, ids=[name for name, _ in _CONTRACT_STATEMENTS]
+)
+def test_guide_publishes_the_fence_contract(claim: str, phrase: str) -> None:
+    """Each claim a client is built from survives in the published guide."""
+    guide = _normalized(_GUIDE_PATH.read_text(encoding="utf-8"))
+    assert _normalized(phrase) in guide, f"the guide no longer states: {claim}"
+
+
+def _documented_hold_reasons() -> frozenset[str]:
+    """The reasons the guide's published table lists, parsed from the prose.
+
+    Parsed rather than hand-listed so the test reads what a client implementer
+    reads. A section that loses its table, or a table whose first column stops
+    being the reason, yields an empty set — which fails the comparison below
+    rather than passing vacuously.
+    """
+    guide = _GUIDE_PATH.read_text(encoding="utf-8")
+    heading = "### Hold reasons — the published vocabulary"
+    assert heading in guide, "the published reason vocabulary has no section"
+    section = guide.split(heading, 1)[1].split("\n### ", 1)[0]
+    reasons: set[str] = set()
+    in_body = False
+    for line in section.splitlines():
+        if line.startswith("|---"):
+            # Everything above the rule is the header, whose first cell is the
+            # column name, not a reason.
+            in_body = True
+        elif in_body and line.startswith("| `"):
+            reasons.add(line.split("|")[1].strip().strip("`"))
+        elif in_body and not line.startswith("|"):
+            break
+    return frozenset(reasons)
+
+
+def test_documented_reasons_are_exactly_the_published_set() -> None:
+    """The guide's table and ``HOLD_REASONS`` are the SAME set.
+
+    One side is DERIVED from the code (``HOLD_REASONS`` itself, imported at the
+    top of this module) and the other is parsed out of the published prose, so
+    neither is hand-typed here. That direction is deliberate and is the
+    opposite of this suite's frozen name-set guards: those pin a protocol
+    surface against its own source, where a derived expectation would move its
+    own goalposts. This test is a DRIFT check between two artifacts that must
+    agree — a reason added to the code and not to the guide leaves a client
+    branching on a word nothing documents, and a reason documented but never
+    published leaves one branching on a word that never arrives.
+    """
+    documented = _documented_hold_reasons()
+    assert documented == HOLD_REASONS, (
+        "the guide's hold-reason table and the published HOLD_REASONS set have "
+        f"drifted; documented-only={sorted(documented - HOLD_REASONS)}, "
+        f"published-only={sorted(HOLD_REASONS - documented)}"
+    )
+
+
+def test_tool_tables_name_the_http_fence() -> None:
+    """Neither published tool table leaves the fence looking tool-only.
+
+    The MCP tool table is where a reader decides what surfaces exist. While it
+    listed ``swg_gate`` and nothing else, the reasonable conclusion was that an
+    agent needs MCP (or Python) to reach a fence verdict at all — which is
+    exactly the reader this route exists for.
+    """
+    for doc in (_GUIDE_PATH, _README_PATH):
+        rows = [
+            line for line in doc.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| `")
+        ]
+        # Control: the table this is about is still there to be read.
+        assert any(row.startswith("| `swg_gate`") for row in rows), (
+            f"{doc.name} no longer carries the tool table this guard is about"
+        )
+        assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
+            f"{doc.name} lists the fence tool without its HTTP sibling"
+        )
+
+
+# ----------------------------------------------------------------------
+# U3b — the pre-read handler ANSWERS FROM the verdict
+#
+# U3a extracted decide_tracked_read; U3b rewired _handle_pre_read's tracked
+# branch to call it. The risk that rewiring carries is cosmetic
+# de-duplication: a handler that calls the verdict and then quietly re-derives
+# the same answer beside it would keep every response byte-identical and every
+# existing assertion green, while leaving two copies of the safety rule to
+# drift apart. These tests close that by DOCTORING the verdict and asserting
+# the response follows it — a handler still computing its own gate answers the
+# old way and fails here. Each doctored arm is paired with an un-doctored
+# control, so a fixture that silently stopped reaching the arm cannot pass as a
+# derivation proof.
+# ----------------------------------------------------------------------
+
+_U3B_TARGET = "ccs.adapters.claude_code.coordinator_server.decide_tracked_read"
+
+
+def _u3b_doctor(monkeypatch, **changes) -> None:
+    """Replace the verdict with the real one plus ``changes``.
+
+    Wrapping rather than fabricating keeps every field the test does not name
+    at its true value, so a response that moves can only have moved because of
+    the field under test.
+    """
+    real = decide_tracked_read
+
+    def fake(*args, **kwargs) -> TrackedReadDecision:
+        return dataclasses.replace(real(*args, **kwargs), **changes)
+
+    monkeypatch.setattr(_U3B_TARGET, fake)
+
+
+def _u3b_seed_invalid(server, path: str, label: str):
+    """A session a peer commit INVALIDated on a warn-mode path: the plain
+    stale arm, which never denies on its own."""
+    peer = server.register_session(_sid(f"u3b-peer-{label}"))
+    return _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.INVALID,
+        label=f"u3b-{label}", version=4, last_writer=peer,
+    )
+
+
+def _u3b_reset(server, artifact_id, agent_id, state) -> None:
+    """Put the pair back in its seeded state so the doctored call sees exactly
+    the input the control saw — the stale arm re-grants SHARED, so without this
+    the second call would be measuring a different scenario."""
+    server.registry.set_agent_state(
+        artifact_id, agent_id, state,
+        trigger="u3b-reset", tick=1, content_hash=_hash("canonical"),
+    )
+
+
+def _u3b_read(client: _Client, sid: str, path: str, caller_hash: str) -> dict:
+    status, body = client.post("/hooks/pre-read", {
+        "session_id": sid, "path": path, "content_hash": caller_hash,
+    })
+    # Every protocol outcome — fresh, stale and deny alike — is an HTTP 200
+    # here; a non-200 would mean the hook client degraded and the assertion
+    # below would be about a fault, not a verdict.
+    assert status == 200, body
+    return body
+
+
+def _u3b_decision_kind(body: dict) -> str:
+    hook = body.get("hookSpecificOutput") or {}
+    if hook.get("permissionDecision") == "deny":
+        return "denied"
+    return body.get("status", "?")
+
+
+def test_pre_read_deny_follows_the_verdict_not_a_second_gate(
+    served_decider, monkeypatch
+) -> None:
+    """The strict-deny GATE lives in the verdict; only the EMISSION is the
+    handler's. Doctoring a warn-mode stale into ``denied`` must turn the
+    response into the byte-stable deny and bump ``strict_mode_denials_total``.
+
+    A handler that kept its own ``is_strict_mode(...) and (INVALID or ...)``
+    test alongside the call would answer ``stale`` here and the two copies
+    could then drift — which is the failure this unit exists to make
+    impossible.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-deny")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "derive-deny")
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "stale", (
+        "control: a warn-mode INVALID session must reach the stale arm, or the "
+        "doctored call below proves nothing"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    before = server.counters_snapshot()["strict_mode_denials_total"]
+    _u3b_doctor(monkeypatch, outcome="denied")
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "denied"
+    assert server.counters_snapshot()["strict_mode_denials_total"] == before + 1
+
+
+def test_pre_read_arm_selection_follows_the_verdict(
+    served_decider, monkeypatch
+) -> None:
+    """Which ARM runs — fresh payload or stale envelope — is
+    ``holds_valid_grant``, not a second reading of the MESI state.
+
+    The session below really does hold SHARED throughout; only the verdict
+    says otherwise. If the handler still branched on ``agent_state`` it would
+    answer fresh and this would fail.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-arm")
+    peer = server.register_session(_sid("u3b-peer-derive-arm"))
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-derive-arm", version=4, last_writer=peer,
+    )
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "fresh", "control: this is the fresh arm"
+
+    _u3b_doctor(monkeypatch, holds_valid_grant=False, outcome="stale",
+                prior_version_seen=3)
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "stale"
+    assert doctored["summary"]["prior_version_seen_by_session"] == 3, (
+        "the summary's prior version is the verdict's arm-resolved value, not "
+        "a second `artifact.version - 1` computed in the handler"
+    )
+    assert server.registry.get_agent_state(artifact_id, agent_id) == MESIState.SHARED
+
+
+def test_fresh_arm_reads_only_the_fresh_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The two hash predicates are NOT one predicate, and the fresh arm must
+    read its own.
+
+    ``stale_hash_differs`` keeps the no-claim recorded hashes IN (the
+    launch-gate denies reach their answer through the stale arm); the fresh arm
+    excludes them, because a still-SHARED holder must never be denied against
+    content the coordinator never claimed. A handler that folded them would
+    surface ``hash_differs`` and bump the mismatch counter here — on a read
+    whose hash MATCHES.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-fresh-pred")
+    peer = server.register_session(_sid("u3b-peer-fresh-pred"))
+    sid, _agent_id, _artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-fresh-pred", version=2, last_writer=peer,
+    )
+
+    before = server.counters_snapshot()["fresh_shared_hash_mismatch_total"]
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2}, (
+        "the fresh payload read the STALE arm's predicate"
+    )
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before
+
+    # Control for the assertion above: the fresh arm DOES follow its own
+    # predicate, so the silence just asserted is about which field was read and
+    # not about a branch that never fires.
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2, "hash_differs": True}
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before + 1
+
+
+def test_stale_arm_reads_only_the_stale_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The mirror of the test above: the stale summary's ``hash_differs`` is
+    ``stale_hash_differs``. Folding the two here would flip the no-prior-grant
+    deny gate, which is defined against exactly this field."""
+    server, client = served_decider
+    path = _u3a_warn_path("derive-stale-pred")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "stale-pred")
+
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(body) == "stale"
+    assert body["summary"]["hash_differs"] is False, (
+        "the stale summary read the FRESH arm's predicate"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert body["summary"]["hash_differs"] is True
+
+
+def test_the_verdict_runs_once_per_tracked_pre_read_on_the_handlers_clock(
+    served_decider, monkeypatch
+) -> None:
+    """One classification per request, on the handler's single clock read.
+
+    Two calls would mean two snapshots of a moving registry backing one
+    response; a clock read taken INSIDE the verdict would let the lag gate and
+    the deny summary's timestamps disagree within a single deny (KTD-P). The
+    untracked and first-observation arms are asserted NOT to reach the verdict
+    at all — each reaches its answer BY mutating, so neither has a
+    side-effect-free form for it to classify.
+    """
+    server, client = served_decider
+    calls: list[dict] = []
+    real = decide_tracked_read
+
+    def spy(*args, **kwargs) -> TrackedReadDecision:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_U3B_TARGET, spy)
+
+    untracked_sid = _sid("u3b-untracked")
+    assert not server.policy.is_tracked("vendor/blob.bin")
+    client.post("/hooks/pre-read", {
+        "session_id": untracked_sid, "path": "vendor/blob.bin",
+        "content_hash": _hash("x"),
+    })
+    assert calls == [], "the untracked fast path classified through the verdict"
+
+    first_obs_sid = _sid("u3b-first-obs")
+    client.post("/hooks/pre-read", {
+        "session_id": first_obs_sid, "path": _u3a_warn_path("derive-first-obs"),
+        "content_hash": _hash("seed"),
+    })
+    assert calls == [], "first observation classified through the verdict"
+
+    path = _u3a_warn_path("derive-clock")
+    sid, _agent_id, _artifact_id = _u3b_seed_invalid(server, path, "clock")
+    wall_before = time.time()
+    _u3b_read(client, sid, path, _hash("canonical"))
+    wall_after = time.time()
+
+    assert len(calls) == 1, "the tracked branch classified more than once"
+    now_unix = calls[0]["now_unix"]
+    # A real clock read, bracketed by the request — not 0, not None, and not a
+    # constant a later refactor could freeze without anyone noticing.
+    assert wall_before <= now_unix <= wall_after
+
+
+@pytest.mark.parametrize(
+    "bad_agent_id",
+    ["has a space", "way-too-long" * 12, 42, ["a"], {"a": 1}, True],
+)
+def test_fence_refuses_a_malformed_agent_id_instead_of_answering_as_the_parent(
+    served_decider, bad_agent_id
+) -> None:
+    """A present-but-malformed subagent id must be a 400, never a verdict.
+
+    ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    PARENT identity. On a read path that only changes attribution prose, which
+    is why the session-stop guard's comment scopes the allowance to read paths.
+    Here it changes WHOSE grant the verdict is about, and grant standing is the
+    one leg computed per agent: a subagent whose grant a peer preempted would
+    be answered about a parent that still holds SHARED, and told to PROCEED.
+    That is the fail-open this route exists to close, reached through an
+    identity field rather than a comparand.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("malformed-agent")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="malformed-agent-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    body = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+    body["agent_id"] = bad_agent_id
+
+    status, payload = client.post(_U4_ROUTE, body)
+
+    assert status == 400, f"malformed agent_id answered {status}, not a client error"
+    assert "agent_id" in payload["error"], payload
+    assert "verdict" not in payload, "a malformed identity produced a verdict"
+
+
+def test_fence_still_answers_for_an_absent_or_well_formed_agent_id(
+    served_decider,
+) -> None:
+    """The control for the refusal above. Rejecting a MALFORMED id must not
+    reject an ABSENT one -- omitting the field is the legitimate parent call
+    and every hook route accepts it -- nor a well-formed subagent id. Without
+    this, the guard could be tightened into refusing every caller and the
+    test above would still pass."""
+    server, client = served_decider
+    path = _u3a_warn_path("agent-id-controls")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="agent-id-controls-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    base = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+
+    absent_status, absent_payload = client.post(_U4_ROUTE, dict(base))
+    assert absent_status == 200, absent_payload
+    assert "verdict" in absent_payload
+
+    scoped = dict(base)
+    scoped["agent_id"] = "sub-agent_1"
+    scoped_status, scoped_payload = client.post(_U4_ROUTE, scoped)
+    assert scoped_status == 200, scoped_payload
+    assert "verdict" in scoped_payload

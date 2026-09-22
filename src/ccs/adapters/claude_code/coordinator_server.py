@@ -46,6 +46,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
@@ -69,6 +70,8 @@ from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
     CHECKPOINT_UNKNOWN_REASON,
+    HOLD_REASONS,
+    HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
@@ -81,11 +84,18 @@ from ccs.core.exceptions import (
     StaleReadGeneration,
     WatchdogAbandoned,
 )
+from ccs.core.fence import (
+    classify_hold,
+    confirmed_generation,
+    coordinator_holds_content_claim,
+)
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
+    Artifact,
     ConflictDetail,
     DataPlaneDeferredRead,
+    FenceComparands,
     MultiCommitConflict,
     SessionCommitRejection,
     SessionReadRejection,
@@ -550,6 +560,11 @@ class CoordinatorHTTPServer:
             "policy_track_total": 0,
             "policy_untrack_total": 0,
             "status_total": 0,
+            # Registered in _ENDPOINT_COUNTER_NAMES *and* here, in one edit:
+            # increment_endpoint_counter ignores an unknown name by contract,
+            # so a route named there but missing here is counted nowhere while
+            # still looking wired up at both call sites.
+            "effect_fence_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -603,6 +618,11 @@ class CoordinatorHTTPServer:
         # plugin path is fail-open); this counter sizes the
         # false-positive rate before any strict-mode deny knob is added.
         self._fresh_shared_hash_mismatch_total: int = 0
+        # effect_fence_holds_total: how often the /hooks/effect-fence verdict
+        # answered HOLD. The denominator is the endpoint counter
+        # ``effect_fence_total``; the ratio is what tells an operator whether
+        # their agents are gating on state the coordinator can confirm.
+        self._effect_fence_holds_total: int = 0
         # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
         # mismatch on a strict path was SUPPRESSED as the benign
         # commit→disk-write lag (this session's own recent commit) rather than
@@ -979,6 +999,20 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._fresh_shared_hash_mismatch_total += 1
 
+    def increment_effect_fence_hold(self) -> None:
+        """Bumped when ``/hooks/effect-fence`` answers HOLD rather than
+        proceed. Counts VERDICTS THE HANDLER REACHED: a watchdog-degraded hold
+        is returned by ``_run_or_degrade`` after the work body was abandoned
+        and is counted by ``watchdog_timeouts_total`` instead, and a 400 never
+        reached a verdict at all.
+
+        Paired with ``effect_fence_total`` it is the operator's hold RATE — how
+        often the fence actually stopped something. A counter that also ticked
+        on a proceed would report a healthy workspace and a wedged one
+        identically. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._effect_fence_holds_total += 1
+
     def increment_shared_foreign_lag_suppressed(self) -> None:
         """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
         strict path is suppressed as the benign commit→disk-write lag (this
@@ -1083,6 +1117,7 @@ class CoordinatorHTTPServer:
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
+            "effect_fence_holds_total": self._effect_fence_holds_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1619,11 +1654,35 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         owner_generation = artifact_pair[1] if artifact_pair else None
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
-        if agent_state is not None and agent_state != MESIState.INVALID:
+        # ONE clock read for the whole decision, handed IN rather than taken
+        # inside, so the lag gate and every timestamp stamped from this verdict
+        # share an instant — no intra-block skew, and the deny reason stays
+        # stable within the call (KTD-P).
+        _now = _payloads.now_unix()
+        # THE classification, not a second copy of it. Everything below keys off
+        # a field of this value; the mutations the handler owes each branch —
+        # the two hash-mismatch counters, the strict-deny emission, the SHARED
+        # re-grant, the stale-warned marker and the notice drain — stay here,
+        # because the verdict must stay a pure query for the surfaces that ask
+        # it WITHOUT granting anything (``/hooks/effect-fence``). The handler
+        # decides what to DO; the decision only says which way.
+        decision = decide_tracked_read(
+            coordinator,
+            path=path,
+            artifact_id=artifact_id,
+            agent_id=agent_id,
+            artifact=artifact,
+            owner_generation=owner_generation,
+            agent_state=agent_state,
+            caller_content_hash=content_hash,
+            now_unix=_now,
+        )
+
+        if decision.holds_valid_grant:
             # Reader has a valid grant on the current version. Unit 6:
             # include the version so an OCC writer can source
             # ``expected_version`` (additive — status clients ignore it).
-            fresh: dict[str, Any] = {"status": "fresh", "version": artifact.version}
+            fresh: dict[str, Any] = {"status": "fresh", "version": decision.version}
             # Defense-in-depth (PR #108 follow-up): a SHARED holder whose
             # supplied disk hash mismatches the recorded content is
             # anomalous — a peer commit would have left it INVALID — so a
@@ -1634,14 +1693,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # allow — the plugin path is fail-open by design; a
             # strict-mode deny knob waits on this counter proving a
             # ~zero false-positive rate. Sentinel recorded hashes carry
-            # no content claim and must not fire ("" seeds surface as
-            # None; the truthiness check covers them).
-            if (
-                content_hash
-                and artifact.content_hash
-                and artifact.content_hash != _F_SENTINEL_CONTENT_HASH
-                and content_hash != artifact.content_hash
-            ):
+            # no content claim and must not fire — ``fresh_hash_differs``
+            # is the arm-specific predicate that already excludes them
+            # (``None``, ``""`` and the all-``f`` launch-gate sentinel);
+            # the STALE arm's ``stale_hash_differs`` deliberately keeps
+            # them in, so reading either field on both arms would move the
+            # strict-deny gate.
+            if decision.fresh_hash_differs:
                 coordinator.increment_fresh_shared_hash_mismatch()
                 # Survivor #6 v1: promote the SHARED-holder mismatch from a
                 # fail-open allow to a strict-mode deny. A still-SHARED reader
@@ -1651,84 +1709,78 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # lag, R2 — suppress) or a foreign out-of-band edit (deny).
                 # reacquire() forces the fresh re-read; KTD-T leaves the grant
                 # untouched so retries re-deny byte-stably (no INVALID needed).
-                if coordinator.policy.is_strict_mode(path):
-                    # Capture one clock read for the whole deny decision so the
-                    # lag gate and every summary timestamp share an instant —
-                    # no intra-block skew, and the deny reason stays stable
-                    # within the call (KTD-P).
-                    _now = _payloads.now_unix()
-                    if _is_recent_self_commit_lag(
-                        coordinator, artifact_id, agent_id, now_unix=_now,
-                    ):
-                        # Benign commit→disk-write lag (R2): count the
-                        # suppression so operators can size the lag-window
-                        # false-negative rate, then fall through to the
-                        # warn-mode hash_differs allow.
-                        coordinator.increment_shared_foreign_lag_suppressed()
-                    else:
-                        shared_summary: _payloads.StaleSummary = {
-                            "path": path,
-                            "current_version": artifact.version,
-                            # A SHARED holder was granted on the current
-                            # version; that is the version it last saw.
-                            "prior_version_seen_by_session": artifact.version,
-                            "last_writer_session_id": (
-                                _last_writer_for(coordinator, artifact_id)
-                                or "<unknown>"
-                            ),
-                            "last_writer_at_unix_ts": (
-                                _last_writer_unix_ts(coordinator, artifact_id)
-                                or _now
-                            ),
-                            "warning_generated_at_unix_ts": _now,
-                            "hash_differs": True,
-                        }
-                        return _emit_pre_read_strict_deny(
-                            coordinator,
-                            agent_id=agent_id,
-                            session_id=session_id,
-                            artifact_id=artifact_id,
-                            path=path,
-                            summary=shared_summary,
-                            source="pre_read_shared_hash_deny",
-                        )
+                # Warn mode reaches neither field: the verdict consults the
+                # strict-mode gate before either can be set.
+                if decision.commit_lag_suppressed:
+                    # Benign commit→disk-write lag (R2): count the
+                    # suppression so operators can size the lag-window
+                    # false-negative rate, then fall through to the
+                    # warn-mode hash_differs allow.
+                    coordinator.increment_shared_foreign_lag_suppressed()
+                elif decision.outcome == "denied":
+                    shared_summary: _payloads.StaleSummary = {
+                        "path": path,
+                        "current_version": decision.version,
+                        # A SHARED holder was granted on the current
+                        # version; that is the version it last saw — the
+                        # verdict resolved that per-arm already.
+                        "prior_version_seen_by_session": decision.prior_version_seen,
+                        "last_writer_session_id": (
+                            _last_writer_for(coordinator, artifact_id)
+                            or "<unknown>"
+                        ),
+                        "last_writer_at_unix_ts": (
+                            _last_writer_unix_ts(coordinator, artifact_id)
+                            or _now
+                        ),
+                        "warning_generated_at_unix_ts": _now,
+                        # Flat True, not a re-read of the predicate: this arm
+                        # denies only ON a mismatch, so the enclosing branch
+                        # has already established it.
+                        "hash_differs": True,
+                    }
+                    return _emit_pre_read_strict_deny(
+                        coordinator,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        artifact_id=artifact_id,
+                        path=path,
+                        summary=shared_summary,
+                        source="pre_read_shared_hash_deny",
+                    )
                 fresh["hash_differs"] = True
-            if want_generation and owner_generation is not None:
-                fresh["owner_generation"] = owner_generation
+            if want_generation and decision.owner_generation is not None:
+                fresh["owner_generation"] = decision.owner_generation
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
-        # were invalidated by a peer commit.
-        prior_seen = None
-        if agent_state == MESIState.INVALID:
-            prior_seen = artifact.version - 1 if artifact.version > 0 else 0
-
-        # Compute hash_differs against the caller's last-observed hash, if any.
-        # Per KTD-9 we track filesystem-state; a content_hash from the caller's
-        # current Read attempt could differ from what's persisted.
-        hash_differs = bool(
-            content_hash
-            and artifact.content_hash
-            and content_hash != artifact.content_hash
-        )
-
-        last_writer_id = _last_writer_for(coordinator, artifact_id)
+        # were invalidated by a peer commit. ``prior_version_seen`` is the
+        # arm-resolved value (one below current for an INVALIDated session,
+        # ``None`` for one with no prior grant), and ``stale_hash_differs`` is
+        # this arm's predicate — the caller's bytes against whatever the
+        # registry recorded, no-claim seeds INCLUDED, which is exactly how the
+        # launch-gate scenarios reach their deny.
+        #
         # last_writer_at_unix_ts is REAL — from the artifact's updated_at
         # in the registry (semantically honest, A5). warning_generated_at
         # is now() to guarantee per-invocation variation (A5 + structural
         # defense for v0.2 strict-mode flip).
+        last_writer_id = _last_writer_for(coordinator, artifact_id)
         last_writer_ts = _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
         summary: _payloads.StaleSummary = {
             "path": path,
-            "current_version": artifact.version,
-            "prior_version_seen_by_session": prior_seen,
+            "current_version": decision.version,
+            "prior_version_seen_by_session": decision.prior_version_seen,
             "last_writer_session_id": last_writer_id or "<unknown>",
             "last_writer_at_unix_ts": last_writer_ts,
             "warning_generated_at_unix_ts": _payloads.now_unix(),
-            "hash_differs": hash_differs,
+            "hash_differs": decision.stale_hash_differs,
         }
 
-        # v0.2 KTD-O / KTD-P: strict-mode deny branch.
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch. The gate itself lives in
+        # ``decide_tracked_read`` (the fence route answers off the same rule);
+        # what stays here is the EMISSION, which records the deny, bumps the
+        # counter and writes the audit row.
         #
         # Gate (refined 2026-05-24 per launch-gate finding): strict-deny
         # fires when the artifact is in strict mode AND the session
@@ -1776,13 +1828,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # attempts and routes to alternative behavior; the deny IS the
         # signal. Re-granting would let the second retry get fresh and
         # silently downgrade the operator's hard guardrail.
-        if (
-            coordinator.policy.is_strict_mode(path)
-            and (
-                agent_state == MESIState.INVALID
-                or (agent_state is None and hash_differs)
-            )
-        ):
+        if decision.outcome == "denied":
             return _emit_pre_read_strict_deny(
                 coordinator,
                 agent_id=agent_id,
@@ -1807,13 +1853,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 trigger="post_stale_read", tick=now, content_hash=content_hash,
             )
         resp = _payloads.build_stale_response(summary)
-        if want_generation and owner_generation is not None:
+        if want_generation and decision.owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
             # reclaim (the zombie's re-read is warn-stale with the version
             # unchanged) — the attached generation is what lets it see the epoch
-            # moved even though the version did not. It shares the snapshot that
-            # produced summary.current_version, so the pair cannot disagree.
-            resp["owner_generation"] = owner_generation
+            # moved even though the version did not. It rides the SAME snapshot
+            # the verdict classified from, which is what produced
+            # summary.current_version, so the pair cannot disagree.
+            resp["owner_generation"] = decision.owner_generation
         if not verify_only:
             # KTD-J (Unit 8): bump the stale-warning emission counter +
             # mark the pair so a follow-up pre-read counts as a re-read. A
@@ -1889,6 +1936,439 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # claim the flag out from under the next live admit.
     abort = threading.Event()
     _run_or_degrade(req, coordinator, work_with_notice_surfacing, abort=abort)
+
+
+# ----------------------------------------------------------------------
+# The effect fence, as a route
+# ----------------------------------------------------------------------
+#
+# "May this irreversible effect still fire, and if not, WHY" asked over HTTP,
+# for ONE artifact, from the five things only the caller knows: which session
+# it is, which artifact it named, the version and the ownership generation it
+# captured at read time, and the content hash of the bytes it actually holds.
+#
+# ON A ROUTE OF ITS OWN, not a flag on ``/hooks/pre-read``: that response
+# already varies by freshness, and hanging a safety verdict off a shape with
+# two forms invites the same misreading that produced the problem. A fence
+# answer has exactly two forms and one vocabulary.
+#
+# THE LEG THIS SURFACE EXISTS FOR. The in-process wrapper
+# (``adapters.effect_gate``) passes ``content_claim_present=True``
+# unconditionally and says so at the site: the pre-read WIRE carries
+# ``hash_differs`` -- a comparison -- and never the coordinator's RECORDED
+# hash, so "the claim matches" and "there is no claim at all" arrive there as
+# one value. This route reads the registry, so it can tell them apart, and
+# ``coordinator_holds_content_claim`` is what it asks. Passing ``True`` here
+# would silently reproduce the very admit this route was built to close, on
+# the one surface able to close it.
+#
+# PURE QUERY (R7). Nothing below grants, re-grants, registers, heartbeats,
+# marks, pops or records. The pre-read path does all six around the same
+# decision -- it registers the session BEFORE its work body (and session-start
+# reads that map to decide whether a session was ever seen), records a
+# heartbeat as the work body's first statement (the sweep reclaims grants on
+# heartbeat staleness), re-grants SHARED on the stale arm, fires five
+# mutations on a strict deny, and consumes the pending re-grounding flag on
+# its untracked fast path. A verdict that did any of it would heal exactly the
+# grant loss it is being asked about, turning a level-triggered HOLD into an
+# edge-triggered one. This codebase has recorded three instances of a read on
+# the safety path healing what it checks; this comment is here so the fence
+# does not become the fourth.
+
+_EFFECT_FENCE_VERDICT_PROCEED = "proceed"
+"""The ONE affirmative answer: every leg of the fence confirmed."""
+
+_EFFECT_FENCE_VERDICT_HOLD = "hold"
+"""The other answer. Always carries ``reason``, drawn from
+:data:`~ccs.core.exceptions.HOLD_REASONS`."""
+
+_EFFECT_FENCE_VERSION_FIELD = "expected_version"
+_EFFECT_FENCE_GENERATION_FIELD = "expected_generation"
+_EFFECT_FENCE_HASH_FIELD = "content_hash"
+
+_EFFECT_FENCE_DEGRADED_RESPONSE: dict = {
+    "verdict": _EFFECT_FENCE_VERDICT_HOLD,
+    "reason": HOLD_VERSION_UNCONFIRMED,
+    "degraded": True,
+    "held_by": "watchdog_timeout",
+}
+"""Watchdog-timeout envelope for ``/hooks/effect-fence``.
+
+``_run_or_degrade``'s default is :data:`_DEFAULT_DEGRADED_RESPONSE` --
+``{"status": "fresh", "degraded": true, ...}``, a PROCEED shape. That is the
+right answer for a pre-read whose contract is fresh/stale and a catastrophic
+one for a safety verdict: a handler that timed out ran no comparison at all,
+so "fresh" would be a claim about state nothing looked at. The precedent is
+:data:`_OCC_DEGRADED_RESPONSE`, which reads as failure for the same reason.
+
+``version_unconfirmed`` is the honest reason rather than a new vocabulary
+entry: ``FenceComparands`` already documents version ``0`` as the "could not
+resolve" sentinel produced by *a degraded or pre-fence coordinator*, and a
+watchdog timeout is precisely a coordinator that resolved nothing."""
+
+_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE: dict = {
+    "verdict": _EFFECT_FENCE_VERDICT_HOLD,
+    "reason": HOLD_VERSION_UNCONFIRMED,
+    "degraded": True,
+    "held_by": "handler_error",
+}
+"""Handler-exception envelope for ``/hooks/effect-fence``.
+
+``_run_or_degrade``'s OTHER non-normal arm turns a handler exception into HTTP
+200 ``{"ok": false, "reason": "internal: <Type>"}`` -- a shape carrying no
+verdict and a ``reason`` from no published vocabulary, and one that NO
+``degraded_response`` argument overrides. A client branching on ``verdict``
+reads it as neither answer. The route therefore catches inside its own work
+body and returns this, so the exception arm is a hold like every other
+unconfirmed state. ``held_by`` is what distinguishes the two degraded arms for
+an operator; a client needs only ``verdict``."""
+
+
+def _read_expected_version(body: dict) -> tuple[int | None, str | None]:
+    """Parse ``expected_version``. Returns ``(value, error)``.
+
+    The comparand is parsed as an integer and NEVER coerced: no ``or 0``, no
+    ``int(x or 0)``. A string ``"2"`` silently becoming ``2`` is a comparand
+    the caller never captured being compared as though it had been, and ``0``
+    is the "could not resolve" sentinel -- manufacturing one turns "I do not
+    know" into a value the branch table then compares.
+
+    ``bool`` is excluded explicitly because it IS an ``int`` subclass:
+    ``isinstance(True, int)`` is ``True``, so a bare type check accepts
+    ``True`` as version 1.
+    """
+    if _EFFECT_FENCE_VERSION_FIELD not in body:
+        return None, f"missing {_EFFECT_FENCE_VERSION_FIELD}"
+    raw = body[_EFFECT_FENCE_VERSION_FIELD]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"{_EFFECT_FENCE_VERSION_FIELD} must be an integer"
+    return raw, None
+
+
+def _read_expected_generation(body: dict) -> tuple[int | None, str | None]:
+    """Parse ``expected_generation``. Returns ``(value, error)``.
+
+    OMITTED and NULL are deliberately different answers, and the distinction is
+    the whole point of the field:
+
+    - the key ABSENT is a client that never captured the comparand. A hold
+      would invite a retry, and no number of identical retries can supply a
+      value the caller does not have -- so it is a 400 naming the field.
+    - the key present as ``null`` is a captured FACT: "the coordinator I read
+      from confirmed no generation" (one too old to report them, a strict deny,
+      a degraded read). That is representable in the fence vocabulary, so it
+      flows through as the sentinel and lands on ``generation_unconfirmed``.
+
+    ``None`` is never coerced to ``0``, which is a REAL generation.
+    """
+    if _EFFECT_FENCE_GENERATION_FIELD not in body:
+        return None, f"missing {_EFFECT_FENCE_GENERATION_FIELD}"
+    raw = body[_EFFECT_FENCE_GENERATION_FIELD]
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"{_EFFECT_FENCE_GENERATION_FIELD} must be an integer or null"
+    return raw, None
+
+
+def _effect_fence_no_record(
+    expected_version: int, expected_generation: int | None,
+) -> FenceComparands:
+    """Comparands for "the coordinator holds no record of this artifact".
+
+    Three ways to get here, one answer: the path is not tracked, it is tracked
+    but was never observed, or the row vanished between the lookup and the
+    read. ``current_version=None`` is the VANISH sentinel, so the branch table
+    answers ``input_vanished`` on its first leg.
+
+    Reached through the same classification as every other state rather than by
+    returning a literal reason: the untracked case is exactly where pre-read
+    answers with a fresh SHAPE carrying no version -- which a client reads as
+    the zero sentinel -- and where the handler's first-observation branch
+    answers by MUTATING (registering the row, seeding v1, granting SHARED). A
+    verdict may do neither, so it holds on the absence instead of minting the
+    record it was asked to check.
+    """
+    return FenceComparands(
+        expected_version=expected_version,
+        current_version=None,
+        expected_generation=expected_generation,
+        # No row means no generation and no claim; the read was not refused
+        # (there was nothing to refuse) and no grant stood.
+        current_generation=None,
+        read_refused=False,
+        grant_did_not_stand=True,
+        content_claim_present=False,
+    )
+
+
+def _effect_fence_comparands(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    agent_id: UUID,
+    expected_version: int,
+    expected_generation: int | None,
+    caller_content_hash: str,
+    now_unix: float,
+) -> FenceComparands:
+    """Assemble the seven fence inputs from the registry and the request.
+
+    Every registry call here is a READ through a non-mutating accessor:
+    ``lookup_artifact_id_by_name`` (never ``resolve_or_register``, which mints
+    a row), the pair-atomic ``get_artifact_and_generation``, and
+    ``get_agent_state``. ``decide_tracked_read`` is the extracted pre-read
+    classification with the handler's mutations left behind.
+    """
+    # The untracked exit is HELD, not fast-pathed. pre-read's twin returns
+    # ``{"status": "fresh"}`` with no version here; copying that would turn
+    # "the coordinator knows nothing about this file" into "the coordinator
+    # agrees nothing moved".
+    if not coordinator.policy.is_tracked(path):
+        return _effect_fence_no_record(expected_version, expected_generation)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return _effect_fence_no_record(expected_version, expected_generation)
+    # ONE pair-atomic read backs the version, the canonical content hash and
+    # the generation reported beside them -- reading them separately is what
+    # lets a peer commit slip between the two and pair a fresh version with
+    # bytes it never described.
+    pair = coordinator.registry.get_artifact_and_generation(artifact_id)
+    if pair is None:
+        return _effect_fence_no_record(expected_version, expected_generation)
+    artifact, owner_generation = pair
+
+    decision = decide_tracked_read(
+        coordinator,
+        path=path,
+        artifact_id=artifact_id,
+        agent_id=agent_id,
+        artifact=artifact,
+        owner_generation=owner_generation,
+        agent_state=coordinator.registry.get_agent_state(artifact_id, agent_id),
+        caller_content_hash=caller_content_hash,
+        # ONE instant for the whole request: the lag gate inside the verdict
+        # and anything else stamped from it must share a clock read (KTD-P).
+        now_unix=now_unix,
+    )
+
+    # The mismatch the coordinator WOULD HAVE REPORTED on the wire for this
+    # read, which is what the demotion rule is defined against: the fresh shape
+    # carries ``fresh_hash_differs`` (no-claim recorded hashes excluded, so a
+    # still-SHARED holder is never denied against content the coordinator never
+    # claimed) and the stale shape carries ``stale_hash_differs`` (they are
+    # kept IN). THE TWO ARE NOT ONE PREDICATE -- picking either one for both
+    # arms moves the demotion in whichever direction the survivor points.
+    hash_differs = (
+        decision.fresh_hash_differs if decision.holds_valid_grant
+        else decision.stale_hash_differs
+    )
+
+    return FenceComparands(
+        expected_version=expected_version,
+        current_version=decision.version,
+        expected_generation=expected_generation,
+        # The demotion normaliser, not a local rule: a real integer generation
+        # is worth nothing as an AUTHORITY comparand when the coordinator
+        # cannot vouch that the bytes in hand are the content at that version.
+        current_generation=confirmed_generation(
+            decision.owner_generation, content_hash_differs=hash_differs,
+        ),
+        # A strict-mode deny is a REFUSED re-validate read. It holds on the
+        # refusal alone -- this route is precisely the caller the fence
+        # docstring warns about, one holding the registry's real generation,
+        # which would otherwise fall past that leg and either mislabel its hold
+        # or proceed on a view the coordinator had just refused to serve.
+        read_refused=decision.outcome == "denied",
+        # A peer's pessimistic write-acquire ends a holder's grant while moving
+        # NEITHER comparand, so this is the only leg that can see it.
+        grant_did_not_stand=not decision.holds_valid_grant,
+        # THE LEG ONLY THIS SURFACE CAN ANSWER. ``None``, ``""`` and the all-f
+        # launch-gate sentinel are three spellings of "nothing was recorded";
+        # the core normaliser owns which is which. Hard-coding ``True`` here
+        # (the honest in-process limit) would admit every no-claim artifact.
+        content_claim_present=coordinator_holds_content_claim(artifact.content_hash),
+    )
+
+
+def _effect_fence_verdict(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    agent_id: UUID,
+    expected_version: int,
+    expected_generation: int | None,
+    caller_content_hash: str,
+    now_unix: float,
+) -> dict:
+    """Classify, then serialise. ONE classification, shared with the in-process
+    wrapper -- a second implementation of a safety rule is what
+    ``ccs.core.fence`` exists to remove.
+
+    Raises:
+        AssertionError: ``classify_hold`` produced a reason outside the
+            published set. The vocabulary is declared protocol (R3), so an
+            unlisted reason is a drift fault, not a verdict; raising sends it
+            into this route's own hold envelope rather than teaching a client a
+            word no published set contains. Written as an explicit raise rather
+            than ``assert`` so ``python -O`` cannot strip the check.
+    """
+    comparands = _effect_fence_comparands(
+        coordinator,
+        path=path,
+        agent_id=agent_id,
+        expected_version=expected_version,
+        expected_generation=expected_generation,
+        caller_content_hash=caller_content_hash,
+        now_unix=now_unix,
+    )
+    reason = classify_hold(comparands)
+    if reason is None:
+        return {"verdict": _EFFECT_FENCE_VERDICT_PROCEED}
+    if reason not in HOLD_REASONS:
+        raise AssertionError(
+            f"internal: classify_hold() returned {reason!r}, which is not a "
+            f"member of HOLD_REASONS -- the published reason vocabulary and "
+            f"the branch table have drifted; refusing to put it on the wire"
+        )
+    return {"verdict": _EFFECT_FENCE_VERDICT_HOLD, "reason": reason}
+
+
+def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /hooks/effect-fence — may this irreversible effect still fire?
+
+    Request (every field required; one artifact per call)::
+
+        {"session_id": "<uuid>",          # grant standing is PER SESSION
+         "path": "<repo-relative path>",
+         "expected_version": <int>,       # the caller's captured comparands
+         "expected_generation": <int|null>,
+         "content_hash": "<64 hex>",      # the bytes the caller actually holds
+         "agent_id": "<subagent id>"}     # optional, as on every hook route
+
+    Response, always HTTP 200 for a protocol outcome::
+
+        {"verdict": "proceed"}
+        {"verdict": "hold", "reason": "<one of HOLD_REASONS>"}
+
+    and HTTP 400 ``{"error": "<what to send>"}`` for a request that never
+    reached a verdict. A MALFORMED REQUEST IS NEVER A HOLD: a hold invites a
+    retry, and no number of retries supplies a comparand the caller never
+    captured. The sharpest case is why it matters -- a caller resolving to an
+    agent the coordinator has never seen legitimately produces a hold that no
+    identical retry can clear, so if an incomplete request also answered
+    "hold", the fixable and the unfixable would be one answer on the wire.
+
+    THE PYTHON COORDINATOR ONLY. The sibling Node backend does not implement
+    this route and answers 404 for it -- an unimplemented route is a visible
+    gap, whereas two coordinators disagreeing about whether an effect may fire
+    is a silent one.
+
+    Stays OUT of ``_MIGRATION_REJECTED_ROUTES``: it initiates no write, and a
+    drained fence would degrade to a hold for readers that have nothing to do
+    with the migration.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+
+    session_id = body.get("session_id")
+    path = body.get("path", "")
+
+    # Validated in the order the sibling hook routes use, through the SAME
+    # server-side gates: identity, then path, then the comparands, then the
+    # hash. Skipping the path gate here would let an absolute or traversing
+    # path fall through to the policy check, which answers False and therefore
+    # HOLDS -- a 200 that looks like a safe answer while the boundary check
+    # never ran.
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        # Mirror the sibling routes' message shape for empty/missing.
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
+        return
+
+    expected_version, version_err = _read_expected_version(body)
+    if version_err:
+        req._json(400, {"error": version_err})
+        return
+    expected_generation, generation_err = _read_expected_generation(body)
+    if generation_err:
+        req._json(400, {"error": generation_err})
+        return
+
+    # REQUIRED here, unlike on pre-read where the caller may not have it yet.
+    # Without the caller's own content hash the generation demotion can never
+    # fire, and the fence silently loses the one leg that catches a decision
+    # derived from superseded bytes. Named as missing in its own words so a
+    # caller can tell WHICH field it forgot.
+    if body.get(_EFFECT_FENCE_HASH_FIELD) is None:
+        req._json(400, {"error": f"missing {_EFFECT_FENCE_HASH_FIELD}"})
+        return
+    hash_err = validate_content_hash(body[_EFFECT_FENCE_HASH_FIELD], required=True)
+    if hash_err:
+        req._json(400, {"error": hash_err})
+        return
+    content_hash: str = body[_EFFECT_FENCE_HASH_FIELD]
+
+    # DERIVED, never registered. ``register_session`` is a mutation the
+    # pre-read path performs before its work body, and session-start reads the
+    # resulting map to decide whether a session was ever seen -- so registering
+    # here would let a verdict answer a LATER question about its own caller.
+    # The derivation is deterministic, so an unknown session resolves to an
+    # agent with no grant and holds, which is the correct answer.
+    # A malformed subagent id is REFUSED here, not degraded to the parent.
+    # ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    # parent identity -- and the session-stop guard's comment scopes that
+    # allowance to "read paths (where degrading to parent attribution is
+    # benign)". This is not one: grant standing is the single leg computed
+    # PER AGENT, so answering about the parent would tell a preempted
+    # subagent to proceed while the parent still holds SHARED. Every other
+    # malformed field on this route answers 400; so does this one.
+    if read_subagent_id(body) is None and has_subagent_id_field(body):
+        req._json(400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
+        return
+    agent_id = session_to_agent_id(session_id, read_subagent_id(body))
+
+    def work() -> dict:
+        try:
+            verdict = _effect_fence_verdict(
+                coordinator,
+                path=path,
+                agent_id=agent_id,
+                expected_version=expected_version,
+                expected_generation=expected_generation,
+                caller_content_hash=content_hash,
+                # ONE clock read for the whole request.
+                now_unix=_payloads.now_unix(),
+            )
+        except Exception as exc:
+            # The wrapper's exception arm answers ``{"ok": false, "reason":
+            # "internal: ..."}`` and no parameter overrides it, so the route
+            # owns this arm itself. See _EFFECT_FENCE_INTERNAL_HOLD_RESPONSE.
+            logger.exception("effect fence verdict failed: %s", exc)
+            verdict = dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE)
+        if verdict["verdict"] == _EFFECT_FENCE_VERDICT_HOLD:
+            # Advisory, and the ONE thing a fence call moves. It counts
+            # verdicts the handler REACHED: a watchdog-degraded hold is
+            # returned by the wrapper after this body was abandoned, and is
+            # counted by ``watchdog_timeouts_total`` instead.
+            coordinator.increment_effect_fence_hold()
+        return verdict
+
+    # No abort Event: the work body performs no REGISTRY write, so a late
+    # completion cannot land coordinator state after the degraded response.
+    # It can still land the advisory hold counter above, which is deliberate
+    # -- that counter's contract is "verdicts the handler REACHED", and a
+    # late completion did reach one. The degraded hold the caller actually
+    # received is counted by ``watchdog_timeouts_total``.
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_EFFECT_FENCE_DEGRADED_RESPONSE,
+    )
 
 
 def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -4473,6 +4953,13 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
 
 _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-read"): _handle_pre_read,
+    # The effect fence: "may this irreversible effect still fire, and if not,
+    # WHY". A route of its own rather than a flag on pre-read, whose response
+    # already varies by freshness. Registered HERE so it rides the one
+    # dispatcher seam (Host -> Bearer -> migration gate -> endpoint counter ->
+    # handler) like every other route; read-only toward the registry, so it
+    # stays out of _MIGRATION_REJECTED_ROUTES.
+    ("POST", "/hooks/effect-fence"): _handle_effect_fence,
     ("POST", "/hooks/pre-edit"): _handle_pre_edit,
     ("POST", "/hooks/post-edit"): _handle_post_edit,
     # Unit 6: OCC commit. Version-checked CAS that bypasses the pre-edit
@@ -4556,6 +5043,7 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
 # exception still shows up in operator-visible /status output).
 _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/hooks/pre-read"): "pre_read_total",
+    ("POST", "/hooks/effect-fence"): "effect_fence_total",
     ("POST", "/hooks/pre-edit"): "pre_edit_total",
     ("POST", "/hooks/post-edit"): "post_edit_total",
     ("POST", "/hooks/post-edit-cas"): "post_edit_cas_total",
@@ -5273,6 +5761,196 @@ def _is_recent_self_commit_lag(
     if updated_at is None:
         return False
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+
+
+# ----------------------------------------------------------------------
+# The tracked-artifact pre-read decision, as a value
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrackedReadDecision:
+    """The fresh / stale / denied verdict for an ALREADY-TRACKED artifact.
+
+    ``_handle_pre_read`` answers this question today by interleaving the
+    decision with the mutations it triggers — the fresh arm bumps two counters
+    and can return a strict deny; the stale arm re-grants SHARED, marks the
+    session stale-warned and drains notices — so a surface that must answer
+    the SAME question WITHOUT granting anything cannot reach the answer by
+    calling the handler. This type is that answer with the mutations left
+    behind, so two surfaces branch off one classification rather than off two
+    copies of a safety rule.
+
+    Every field keys a branch a caller still has to take:
+
+    ``outcome``
+        which response to build: the fresh payload, the stale envelope, or
+        the byte-stable strict deny.
+    ``version``
+        the fresh payload's ``version`` and the stale summary's
+        ``current_version`` — both from the SAME pair-atomic snapshot the
+        caller read, never a second read a peer commit could overtake.
+    ``owner_generation``
+        the effect-gate opt-in pair member. ``None`` means the snapshot
+        carried none and the key is omitted rather than coerced to ``0``.
+    ``fresh_hash_differs``
+        the FRESH arm's mismatch: bumps ``fresh_shared_hash_mismatch_total``
+        and sets ``hash_differs`` on the fresh payload.
+    ``stale_hash_differs``
+        the STALE arm's mismatch: the summary's ``hash_differs``, and half
+        the no-prior-grant deny gate.
+    ``commit_lag_suppressed``
+        the fresh arm's deny was WITHHELD as the benign commit→disk-write lag
+        (Survivor #6 R2); bumps ``shared_foreign_lag_suppressed_total``.
+    ``holds_valid_grant``
+        which arm produced the verdict, and therefore which ``source`` a deny
+        carries (``pre_read_shared_hash_deny`` vs ``pre_read_strict_deny``) —
+        ``denied`` alone cannot tell the two deny arms apart.
+    ``prior_version_seen``
+        the summary's ``prior_version_seen_by_session``, already resolved for
+        the arm that ran: the current version for a still-granted holder, one
+        below it for an INVALIDated one, ``None`` for a session with no prior
+        grant.
+
+    THE TWO HASH PREDICATES ARE NOT ONE PREDICATE, and folding them into one
+    field silently moves the strict-deny gate in whichever direction the
+    survivor points. ``fresh_hash_differs`` excludes the no-claim recorded
+    hashes (``None``, ``""``, the all-``f`` launch-gate sentinel) because a
+    still-SHARED holder must never be denied against content the coordinator
+    never claimed. ``stale_hash_differs`` keeps them IN, because the
+    launch-gate scenarios reach their deny THROUGH the stale arm and the
+    sentinel is precisely what makes their hashes differ.
+    """
+
+    outcome: Literal["fresh", "stale", "denied"]
+    version: int
+    owner_generation: int | None
+    fresh_hash_differs: bool
+    stale_hash_differs: bool
+    commit_lag_suppressed: bool
+    holds_valid_grant: bool
+    prior_version_seen: int | None
+
+
+def decide_tracked_read(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    artifact_id: UUID,
+    agent_id: UUID,
+    artifact: Artifact,
+    owner_generation: int | None,
+    agent_state: MESIState | None,
+    caller_content_hash: str | None,
+    now_unix: float,
+) -> TrackedReadDecision:
+    """Classify a pre-read of an already-tracked artifact. PURE QUERY.
+
+    Takes the values the caller has ALREADY read — the pair-atomic
+    ``(artifact, owner_generation)`` snapshot, this agent's MESI state, the
+    hash the caller offered — and reads nothing further except
+    ``policy.is_strict_mode`` and, on the one arm that consults it, the lag
+    gate's two registry lookups. It grants nothing, re-grants nothing,
+    advances no observation baseline, bumps no counter, records no heartbeat,
+    marks no stale pair, records no deny and pops no notice. That is the whole
+    point: a read on the safety path must not mutate or heal what it checks,
+    so a verdict surface can ANSWER without also committing to the effects
+    ``_handle_pre_read`` performs around the same decision — a verdict that
+    healed a grant would turn a level-triggered HOLD into an edge-triggered
+    one.
+
+    ``now_unix`` is the CALLER's single clock read (KTD-P): the lag gate and
+    every summary timestamp stamped from this verdict must share one instant,
+    so the clock is an argument rather than a call inside.
+
+    The classification mirrors ``_handle_pre_read``'s tracked branch exactly.
+    The untracked and first-observation branches are deliberately NOT covered:
+    each reaches its answer BY mutating (registering the artifact, seeding v1,
+    granting SHARED), so neither has a side-effect-free form to extract.
+
+    Args:
+        artifact: the artifact from the caller's snapshot. Non-optional —
+            a vanished row is the caller's branch to take, as it is today.
+    """
+    # A grant that is present and not INVALID is the fresh arm's admission
+    # ticket: the holder was granted on the current version, and a peer commit
+    # would have invalidated it.
+    holds_valid_grant = agent_state is not None and agent_state != MESIState.INVALID
+
+    # The FRESH arm's mismatch predicate. ``coordinator_holds_content_claim``
+    # is the core fence's own no-claim normalisation — the same three spellings
+    # of "nothing was recorded" (``None``, ``""``, the all-``f`` sentinel) that
+    # the in-process fence refuses to treat as a content claim — so this
+    # surface asks the shared rule instead of restating it against a local copy
+    # of the sentinel literal.
+    fresh_hash_differs = bool(
+        caller_content_hash
+        and coordinator_holds_content_claim(artifact.content_hash)
+        and caller_content_hash != artifact.content_hash
+    )
+    # The STALE arm's mismatch predicate: the same comparison MINUS the
+    # no-claim exclusion. Kept separate on purpose (see TrackedReadDecision).
+    stale_hash_differs = bool(
+        caller_content_hash
+        and artifact.content_hash
+        and caller_content_hash != artifact.content_hash
+    )
+
+    if holds_valid_grant:
+        # Survivor #6 v1: a still-SHARED holder whose disk hash mismatches the
+        # canonical content is this session's own disk diverging — either its
+        # own un-flushed recent commit (benign lag, suppress) or a foreign
+        # out-of-band edit (deny). Warn mode never denies here.
+        commit_lag_suppressed = False
+        outcome: Literal["fresh", "stale", "denied"] = "fresh"
+        if fresh_hash_differs and coordinator.policy.is_strict_mode(path):
+            if _is_recent_self_commit_lag(
+                coordinator, artifact_id, agent_id, now_unix=now_unix,
+            ):
+                commit_lag_suppressed = True
+            else:
+                outcome = "denied"
+        return TrackedReadDecision(
+            outcome=outcome,
+            version=artifact.version,
+            owner_generation=owner_generation,
+            fresh_hash_differs=fresh_hash_differs,
+            stale_hash_differs=stale_hash_differs,
+            commit_lag_suppressed=commit_lag_suppressed,
+            holds_valid_grant=True,
+            # A SHARED holder was granted on the current version; that is the
+            # version it last saw.
+            prior_version_seen=artifact.version,
+        )
+
+    # No valid grant: either a peer commit INVALIDated this session, or it has
+    # never seen this artifact.
+    prior_version_seen = None
+    if agent_state == MESIState.INVALID:
+        prior_version_seen = artifact.version - 1 if artifact.version > 0 else 0
+
+    # v0.2 KTD-O / KTD-P deny gate, unchanged: strict mode AND the session
+    # demonstrably lacks a fresh view — a true preemption (INVALID), or no
+    # prior grant at all while the bytes it just hashed differ from the
+    # canonical. Matching hashes mean the session is observing what the
+    # registry recorded, so there is nothing stale to act on: warn-mode allow.
+    denied = coordinator.policy.is_strict_mode(path) and (
+        agent_state == MESIState.INVALID
+        or (agent_state is None and stale_hash_differs)
+    )
+    return TrackedReadDecision(
+        outcome="denied" if denied else "stale",
+        version=artifact.version,
+        owner_generation=owner_generation,
+        fresh_hash_differs=fresh_hash_differs,
+        stale_hash_differs=stale_hash_differs,
+        # The lag gate belongs to the fresh arm only: it answers "is this
+        # holder's OWN un-flushed commit", and a caller with no standing grant
+        # has no such commit to be waiting on.
+        commit_lag_suppressed=False,
+        holds_valid_grant=False,
+        prior_version_seen=prior_version_seen,
+    )
 
 
 def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:

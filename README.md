@@ -97,7 +97,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - ⏪ [Workspace versioning & restore](#workspace-versioning--restore) — `WorkspaceVersioner`, checkpoint a mixed file + S3 workspace and bring it back with per-member honesty
 - 🛡️ [Foreign-edit guards](#foreign-edit-guards-writes-that-bypass-the-coordinator) — catch out-of-band edits (a human, a formatter, a script) at the read/write boundary
 - 🔌 [MCP server](#mcp-server-stale-write-guard-fs) — `stale-write-guard-fs`, the same guarantee for any MCP client, no Python integration required
-- 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input state — value and grant — it decided from
+- 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input state — value and grant — it decided from; the same verdict over MCP (`swg_gate`) and over HTTP ([`POST /hooks/effect-fence`](docs/guide.md#effect-fence-over-http))
 - 📸 [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) — read several artifacts as one consistent cut; no torn reads
 - 📦 [Atomic multi-file publish](#atomic-multi-file-publish) — `atomic_publish`, land a set of files all-or-nothing; never a torn pair
 - 🧮 [Formal verification](formal/tla/README.md) — the TLA+ specs, invariant ↔ implementation map, mutant recipes
@@ -199,6 +199,7 @@ pip install "agent-coherence[mcp]"
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+| `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](docs/guide.md#effect-fence-over-http) |
 
 The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory; the whole workspace is guarded unless `SWG_MANAGED` — a comma-separated glob list — narrows it), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).
 
@@ -219,6 +220,8 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 ```
 
 It's plain Python, so the same call drops into a LangGraph node, a CrewAI task, or a raw script unchanged.
+
+**Three surfaces, one rule.** `gate()` is the Python spelling of the fence. `swg_gate` is the MCP one, and `POST /hooks/effect-fence` answers the identical verdict to any client that speaks neither — same question, same classification, same hold reasons. Those reasons are a wire vocabulary, published with each one's establisher and its own recovery in the [effect-fence contract](docs/guide.md#effect-fence-over-http). One leg is not the same everywhere: only the HTTP route can report `content_claim_absent`, the case where the coordinator records no content claim for the artifact at all — the Python and MCP surfaces read a hash *comparison* rather than the coordinator's own record, so "the claim matches" and "there is no claim" reach them as one value.
 
 **Scope, honestly.** The gate *orders* effects, it does not roll them back: it fires pre-effect and never undoes one, so for an escaping effect there's a residual re-read→fire window it narrows but can't close. It's single-host and cooperative — the agent opts in. Both comparands are fail-closed: an unconfirmed version (degraded read) or an unconfirmed generation (a strict-mode deny, or an older coordinator daemon from before this release's generation reporting) HOLDs rather than firing. For a pure *write* effect, use `vol.write_cas_at(path, expected_version, content)` directly, which is the atomic, no-window path. Gating several mutually-consistent inputs at once is a [snapshot-session](#multi-artifact-snapshot-sessions) operation on the coordinator, not this single-input wrapper. Run it: `python -m examples.effect_gate.main` (offline, deterministic, no keys), or add `--baseline` to see the stale fire it catches; `python -m examples.gate_effect_ordering.main` adds the reclaimed-lease act (version unchanged, authority revoked, deploy held).
 
