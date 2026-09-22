@@ -6718,3 +6718,167 @@ def test_the_fence_call_mutates_nothing(
     assert status == 200
     assert body["verdict"] == expect, f"the {arm} arm did not take its branch"
     assert _u4_observable(server, agent_id, artifact_id, sid) == before
+
+
+# ----------------------------------------------------------------------
+# U6 — the PUBLISHED contract for the verdict route
+#
+# The goal these guard is derivability: a client written from the published
+# documentation alone, without reading this repository's source, reaches the
+# same verdict. Four claims carry that, and each is one a reader ACTS on:
+#
+#   * the reason vocabulary is wire-stable — added to, never renamed;
+#   * each reason names WHO establishes it and has its OWN recovery, including
+#     both senses of the vanished-input case, under the identifier it holds by;
+#   * the content hash is defined, because the server validates only its SHAPE
+#     and a client that picks the other plausible convention holds forever
+#     wearing the same reason a genuine conflict would;
+#   * every answer that is not a recognised verdict is a hold on the client's
+#     side — which is the whole of the story for a coordinator that answers 404.
+#
+# Every search runs over WHITESPACE-NORMALIZED text. The guide wraps its prose,
+# so a line-wise search for any of these sentences would report clean while the
+# sentence sat there mangled or half-deleted.
+# ----------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GUIDE_PATH = _REPO_ROOT / "docs" / "guide.md"
+_README_PATH = _REPO_ROOT / "README.md"
+
+
+def _normalized(text: str) -> str:
+    """Collapse every run of whitespace, so a wrapped sentence still matches."""
+    return " ".join(text.split())
+
+
+# Each phrase is ONE contiguous fragment carrying a whole claim: a pin split
+# across two sentences would still pass with half the claim deleted.
+_CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "the reason vocabulary is add-only, never renamed",
+        "Reasons may be added; an existing one is never renamed or repurposed.",
+    ),
+    (
+        "an unrecognised reason is still a hold",
+        "treat a `hold` whose `reason` you do not recognise as a hold",
+    ),
+    (
+        "each reason names its establisher and its own recovery",
+        "Each reason names who established it — the **coordinator**, from state only it "
+        "can see, or the **caller**, from state only *it* can see — and each has its own "
+        "recovery.",
+    ),
+    (
+        "the vanished input is established from BOTH sides",
+        "**`input_vanished` has two establishers, and both are in the contract.**",
+    ),
+    (
+        "the coordinator's sense of the vanished input",
+        "**The coordinator** answers `input_vanished` over the wire when it holds no "
+        "record of the artifact",
+    ),
+    (
+        "the caller's sense of the vanished input, under the same identifier",
+        "**The caller** establishes it itself when its own input no longer exists. The "
+        "coordinator cannot see your workspace, so it will never report this for you; "
+        "detect it and treat it as a hold under this same identifier.",
+    ),
+    (
+        "the content hash is defined over exact bytes, unnormalized",
+        "`content_hash` is a lowercase sha-256 hex digest over the exact bytes the caller "
+        "holds, with no normalization",
+    ),
+    (
+        "the wrong hash convention is a silent permanent hold",
+        "it simply never matches what the coordinator recorded, and every call it makes "
+        "holds wearing the same reason a genuine conflict would",
+    ),
+    (
+        "anything that is not a verdict is a hold",
+        "every one of these is a hold and the effect does not fire: a connection failure "
+        "or a timeout; any status other than `200`; a `200` body with no `verdict`; a "
+        "`verdict` you do not recognise; and a `404`",
+    ),
+    (
+        "the sibling coordinator answers 404 for this route",
+        "the sibling Node coordinator backend does not implement `/hooks/effect-fence`",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "claim,phrase", _CONTRACT_STATEMENTS, ids=[name for name, _ in _CONTRACT_STATEMENTS]
+)
+def test_guide_publishes_the_fence_contract(claim: str, phrase: str) -> None:
+    """Each claim a client is built from survives in the published guide."""
+    guide = _normalized(_GUIDE_PATH.read_text(encoding="utf-8"))
+    assert _normalized(phrase) in guide, f"the guide no longer states: {claim}"
+
+
+def _documented_hold_reasons() -> frozenset[str]:
+    """The reasons the guide's published table lists, parsed from the prose.
+
+    Parsed rather than hand-listed so the test reads what a client implementer
+    reads. A section that loses its table, or a table whose first column stops
+    being the reason, yields an empty set — which fails the comparison below
+    rather than passing vacuously.
+    """
+    guide = _GUIDE_PATH.read_text(encoding="utf-8")
+    heading = "### Hold reasons — the published vocabulary"
+    assert heading in guide, "the published reason vocabulary has no section"
+    section = guide.split(heading, 1)[1].split("\n### ", 1)[0]
+    reasons: set[str] = set()
+    in_body = False
+    for line in section.splitlines():
+        if line.startswith("|---"):
+            # Everything above the rule is the header, whose first cell is the
+            # column name, not a reason.
+            in_body = True
+        elif in_body and line.startswith("| `"):
+            reasons.add(line.split("|")[1].strip().strip("`"))
+        elif in_body and not line.startswith("|"):
+            break
+    return frozenset(reasons)
+
+
+def test_documented_reasons_are_exactly_the_published_set() -> None:
+    """The guide's table and ``HOLD_REASONS`` are the SAME set.
+
+    One side is DERIVED from the code (``HOLD_REASONS`` itself, imported at the
+    top of this module) and the other is parsed out of the published prose, so
+    neither is hand-typed here. That direction is deliberate and is the
+    opposite of this suite's frozen name-set guards: those pin a protocol
+    surface against its own source, where a derived expectation would move its
+    own goalposts. This test is a DRIFT check between two artifacts that must
+    agree — a reason added to the code and not to the guide leaves a client
+    branching on a word nothing documents, and a reason documented but never
+    published leaves one branching on a word that never arrives.
+    """
+    documented = _documented_hold_reasons()
+    assert documented == HOLD_REASONS, (
+        "the guide's hold-reason table and the published HOLD_REASONS set have "
+        f"drifted; documented-only={sorted(documented - HOLD_REASONS)}, "
+        f"published-only={sorted(HOLD_REASONS - documented)}"
+    )
+
+
+def test_tool_tables_name_the_http_fence() -> None:
+    """Neither published tool table leaves the fence looking tool-only.
+
+    The MCP tool table is where a reader decides what surfaces exist. While it
+    listed ``swg_gate`` and nothing else, the reasonable conclusion was that an
+    agent needs MCP (or Python) to reach a fence verdict at all — which is
+    exactly the reader this route exists for.
+    """
+    for doc in (_GUIDE_PATH, _README_PATH):
+        rows = [
+            line for line in doc.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| `")
+        ]
+        # Control: the table this is about is still there to be read.
+        assert any(row.startswith("| `swg_gate`") for row in rows), (
+            f"{doc.name} no longer carries the tool table this guard is about"
+        )
+        assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
+            f"{doc.name} lists the fence tool without its HTTP sibling"
+        )

@@ -8,6 +8,35 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
+  "May this irreversible effect still fire, and if not, why?" was reachable
+  from Python (`gate()`) and from MCP (`swg_gate`); a client that speaks
+  neither had to assemble the verdict itself out of read responses that were
+  never designed to carry one. The coordinator now answers it directly, for one
+  artifact per call, from the five things only the caller knows: `session_id`
+  (grant standing is per session), `path`, the `expected_version` and
+  `expected_generation` it captured at read time, and the `content_hash` of the
+  bytes it actually holds — plus the optional `agent_id` every hook route
+  takes. The answer is HTTP 200 and one of two shapes: `{"verdict":
+  "proceed"}`, or `{"verdict": "hold", "reason": "<one of the published hold
+  reasons>"}`. Two degraded holds add `"degraded": true` and a `held_by` of
+  `watchdog_timeout` or `handler_error`, both reporting `version_unconfirmed`,
+  because a handler that compared nothing resolved no version. A request
+  missing a field is HTTP 400 naming that field, never a hold — a hold invites
+  a retry, and no retry supplies a comparand the caller never captured. An
+  *omitted* `expected_generation` is therefore a 400, while an explicit `null`
+  is a captured fact ("my read confirmed no generation") that flows through and
+  holds under `generation_unconfirmed`.
+  The route is a pure query: it grants, registers and heals nothing, so a hold
+  is level-triggered and asking again returns the same answer until you
+  recover. It is the Python coordinator only — the sibling Node backend answers
+  404 for it, and a client treats anything that is not a recognised verdict,
+  404 included, as a hold. The hold reasons are documented as a wire vocabulary
+  with each reason's establisher and its own recovery in the user guide
+  ("Effect fence over HTTP"), together with the definition of `content_hash`:
+  a lowercase sha-256 hex digest over the exact bytes the caller holds, with no
+  normalization.
+
 - **A restore now says what it put the captured bytes back over.**
   `WorkspaceVersioner.restore()` lands a checkpoint's captured bytes over
   whatever is live at that moment. Where a member's content had moved after
@@ -119,6 +148,52 @@ Alpha — APIs may change before `v1.0`.
   both honest outcomes of a rewind — clean when the handing-off session has
   stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
+
+### Changed
+
+- **BEHAVIOR CHANGE — `gate()` now refuses a volume that cannot report the
+  grant state of its last read.** The fence reads two flags a volume sets on
+  every read: whether the coordinator refused it, and whether it was served
+  without a standing grant. Those were read through a defaulting accessor, so
+  a volume that did not set them was treated as reporting "nothing was wrong".
+  That did not degrade the fence, it removed a leg — the one that catches a
+  peer taking a write claim, which moves neither the version nor the ownership
+  generation and is invisible to the pair. Such a volume is now refused, and a
+  half-equipped one reporting only one flag is refused too. The refusal raises
+  inside the coherence error hierarchy rather than as an `AttributeError`, so
+  a caller that already catches a hold keeps catching it instead of crashing;
+  it is deliberately not a stale-view error, because re-reading cannot supply
+  a flag a volume never declares. `CoherentVolume` declares both, so no
+  shipped caller is affected — only a hand-rolled stand-in would be.
+
+- **The coordinator's fence now HOLDS an effect against an artifact whose
+  content it has never recorded.** No surface that exists today starts
+  behaving differently: this case was never held anywhere, and the in-process
+  `gate()` and the MCP `swg_gate` still cannot see it. What is new is that a
+  caller fencing through the HTTP route gets a hold where every other surface
+  proceeds. A coordinator can hold a
+  version for an artifact whose content it has never recorded: a first
+  observation that carried no caller hash, or a row seeded with a placeholder
+  digest. Until now that state did not hold anything. The generation demotion
+  that catches a decision derived from superseded bytes compares two recorded
+  hashes and needs a real one on both sides, so where there was no claim it
+  never fired, the comparands re-validated clean, and the effect fired against
+  a value nothing backs. The coordinator's fence now refuses that case under
+  its own reason, **`content_claim_absent`** — the eighth member of the
+  published hold vocabulary.
+  Its recovery is deliberately not the one it used to share: re-read the
+  artifact through a coordinated read, which records a claim, and re-ask. It is
+  not an operator's problem, and splitting it out is what stops it arriving as
+  `generation_unconfirmed` — whose surviving advice *is* "check the daemon and
+  restart it".
+  Who sees the change: anything that fences an effect through the coordinator,
+  including a hand-rolled check built on `/hooks/pre-read` responses, which
+  cannot tell "the claim matches" from "there is no claim" and therefore
+  proceeds today. The in-process `gate()` and the MCP `swg_gate` are
+  *unchanged* — they read a hash comparison rather than the coordinator's
+  record, so they cannot see this leg at all; that limit is now stated in the
+  guide instead of being implied. Expect holds where a no-claim artifact
+  previously let an effect through. That is the fix, not a regression.
 
 ### Fixed
 

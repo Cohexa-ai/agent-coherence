@@ -31,21 +31,22 @@ full command-line toolset, and the API reference.
 11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-14. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-15. [Inline benchmark mode](#inline-benchmark-mode)
-16. [Telemetry](#telemetry)
-17. [Graceful degradation](#graceful-degradation)
-18. [Examples](#examples)
-19. [Real-workload benchmarks](#real-workload-benchmarks)
-20. [Benchmarking your own workload](#benchmarking-your-own-workload)
-21. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-22. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-23. [Replay (v0.8.2+)](#replay-v082)
-24. [Command-line tools](#command-line-tools)
-25. [API reference](#api-reference)
-26. [Low-level adapter API](#low-level-adapter-api)
-27. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-28. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+14. [Effect fence over HTTP](#effect-fence-over-http)
+15. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+16. [Inline benchmark mode](#inline-benchmark-mode)
+17. [Telemetry](#telemetry)
+18. [Graceful degradation](#graceful-degradation)
+19. [Examples](#examples)
+20. [Real-workload benchmarks](#real-workload-benchmarks)
+21. [Benchmarking your own workload](#benchmarking-your-own-workload)
+22. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+23. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+24. [Replay (v0.8.2+)](#replay-v082)
+25. [Command-line tools](#command-line-tools)
+26. [API reference](#api-reference)
+27. [Low-level adapter API](#low-level-adapter-api)
+28. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+29. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -1037,6 +1038,190 @@ artifacts. They do not add write-skew prevention: commits validate per-artifact
 against the pinned base, so two sessions that read one cut and write *different*
 artifacts can still interleave. Single coordinator, single host.
 
+## Effect fence over HTTP
+
+An agent reads a shared artifact, decides something from it, and then fires an
+effect that escapes the process — a deploy, a webhook, an opened PR, a charge.
+Between the read and the effect the input can move underneath it, or the
+authority it was read under can be taken away. The coordinator answers that
+question directly, for any client that can make an HTTP request:
+
+**`POST /hooks/effect-fence` — may this effect still fire, and if not, why?**
+
+One artifact per call, against a running coordinator (the same one
+`CoherentVolume` spawns). The route is a pure query: it grants nothing,
+registers nothing, and heals nothing it checks — so a hold is level-triggered.
+Asking again changes no state and gets the same answer until you actually
+recover.
+
+### Request
+
+| Field | Type | What it is |
+|---|---|---|
+| `session_id` | UUID string | Your client identity. Grant standing is **per session**, so the fence cannot answer without it. |
+| `path` | string | The workspace-relative artifact whose state gates the effect. |
+| `expected_version` | integer | The version you captured when you read the input. Sent as a JSON number, never a string — and never `0`, which is the "could not resolve" sentinel. |
+| `expected_generation` | integer **or** `null` | The ownership generation you captured beside the version. |
+| `content_hash` | 64-character lowercase hex | The digest of the bytes you actually hold. |
+| `agent_id` | string, optional | A subagent id, as on every hook route; it makes a subagent its own coherence peer rather than part of the parent session. |
+
+All five non-optional fields are required on every call. **Name them all**: a
+client that omits one gets a `400` telling it which, not a verdict — and a
+client that omits `session_id` in particular could otherwise spend a long time
+reading holds it can never clear, because the answer depends on which session
+holds the grant.
+
+**Omitted and `null` are different answers for `expected_generation`, and the
+difference is the point of the field.** Leaving the key out is a client that
+never captured the comparand; no number of identical retries supplies a value
+it does not have, so the route answers `400`. The key present as `null` is a
+captured *fact* — "the coordinator I read from confirmed no generation" —
+which is representable, flows through, and holds under
+`generation_unconfirmed`.
+
+**The content hash, exactly.** `content_hash` is a lowercase sha-256 hex digest
+over the exact bytes the caller holds, with no normalization — no re-encoding,
+no line-ending translation, no trailing-newline or whitespace fixup — so hash
+the byte sequence you read, exactly as you read it. The server checks only that
+it is 64 hex characters, so a client that hashes a decoded, re-encoded or
+tidied-up copy is not told it picked the wrong convention: it simply never
+matches what the coordinator recorded, and every call it makes holds wearing
+the same reason a genuine conflict would.
+
+### Response
+
+Always HTTP `200` for a protocol outcome, in one of exactly two shapes:
+
+```json
+{"verdict": "proceed"}
+{"verdict": "hold", "reason": "version_moved"}
+```
+
+`proceed` means every leg of the fence affirmatively cleared. `hold` always
+carries a `reason` drawn from the vocabulary below.
+
+Two degraded holds add `"degraded": true` and a `held_by` field naming which
+arm answered — `watchdog_timeout` (the handler was abandoned before it compared
+anything) or `handler_error` (the handler raised). Both report
+`version_unconfirmed`, because a handler that ran no comparison resolved no
+version. A client needs only `verdict`; `held_by` is for whoever is looking at
+the coordinator.
+
+A request that never reached a verdict is `400 {"error": "<what to send>"}`,
+naming each missing or malformed field in its own words (`missing
+expected_version`, `missing content_hash`, `content_hash must be 64 hex
+characters (sha-256)`, and so on). **A malformed request is never a hold.** A
+hold invites a retry, and a retry cannot supply a comparand the caller never
+captured — so the fixable and the unfixable stay different answers on the wire.
+
+### Anything that is not a verdict is a hold
+
+The fence is a safety property only because the *absence* of a `proceed` stops
+the effect. On the caller's side, every one of these is a hold and the effect
+does not fire: a connection failure or a timeout; any status other than `200`;
+a `200` body with no `verdict`; a `verdict` you do not recognise; and a `404`.
+
+A `404` is what a coordinator that does not implement this route answers, and
+one such coordinator ships today: **the sibling Node coordinator backend does
+not implement `/hooks/effect-fence`**. There is no handshake to ask first and
+none is coming — the `404` is the whole answer. An unimplemented route is a
+visible gap; two coordinators quietly disagreeing about whether an effect may
+fire would not be.
+
+### Hold reasons — the published vocabulary
+
+These strings are the wire contract, shared by every surface that answers this
+question. **Reasons may be added; an existing one is never renamed or
+repurposed.** Match on the whole value (`reason == "version_moved"`), never on
+a substring of a human-readable message, and treat a `hold` whose `reason` you
+do not recognise as a hold — a later coordinator may split a case out of the
+residual bucket, exactly as `read_denied` and `content_claim_absent` were split
+out of it.
+
+Each reason names who established it — the **coordinator**, from state only it
+can see, or the **caller**, from state only *it* can see — and each has its own
+recovery. They are not interchangeable: "re-read your bytes" and "call an
+operator" are different answers, and telling them apart is why some of these
+reasons exist.
+
+| `reason` | Established by | What it means | How you clear it |
+|---|---|---|---|
+| `version_moved` | the coordinator | a peer committed a newer version than the one the decision was derived from | re-read the input, re-decide, re-gate |
+| `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
+| `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
+| `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
+| `content_claim_absent` | the coordinator | it records no content claim for this artifact at all, so it cannot vouch that the bytes in hand are the content at the version it reports | re-read the artifact through a coordinated read; the coordinator records a claim on that observation. **Not an operator's problem** — this reason exists so this case stops arriving as `generation_unconfirmed` |
+| `input_vanished` | **the coordinator or the caller** — see below | there is no establishable current state for the input | re-establish the input, then re-gate |
+| `version_unconfirmed` | the coordinator | it resolved no version at all: a degraded read, or one of the two degraded arms above | restore the coordinator's health, then re-gate. A re-read will not clear it |
+| `generation_unconfirmed` | **the coordinator or the caller** — see below | the residual bucket: no confirmed ownership generation | reacquire and re-gate **first** — that clears the recoverable forms. A hold that survives a *successful* reacquire is the last one: check the coordinator's version and restart it |
+
+**`input_vanished` has two establishers, and both are in the contract.** They
+mean the same thing — there is no establishable current state for the input —
+and they are established from opposite sides:
+
+- **The coordinator** answers `input_vanished` over the wire when it holds no
+  record of the artifact: the path is not tracked, it is tracked but was never
+  observed, or its row vanished between the lookup and the read. Recovery is to
+  get the path tracked and read once through the coordinator, so a record
+  exists to compare against.
+- **The caller** establishes it itself when its own input no longer exists. The
+  coordinator cannot see your workspace, so it will never report this for you;
+  detect it and treat it as a hold under this same identifier. Recovery is to
+  recreate or re-point the input.
+
+**`generation_unconfirmed` likewise.** The caller establishes it by sending
+`expected_generation: null` — its own read confirmed no generation. The
+coordinator establishes it when it cannot confirm one now: a degraded read, an
+out-of-band edit it could not confirm, or a coordinator too old to report
+generations at all. The bucket is deliberately *not* a clean
+permanent-versus-transient signal, which is why the recovery is retry-first and
+persistence across a *successful* reacquire is the signal that a person is
+needed.
+
+**Which reason you get when several apply.** The legs are evaluated in a fixed
+order and the first match is the answer: `input_vanished`,
+`version_unconfirmed`, `version_moved`, `read_denied`, `content_claim_absent`,
+`generation_unconfirmed`, `grant_reclaimed`, `grant_preempted`. The order is
+part of the contract — a state that matches two legs has one right answer, and
+an implementation that reorders them answers a different question.
+
+### The same fence, three surfaces
+
+| Surface | Call | Reach |
+|---|---|---|
+| Python | `gate(volume, path, decide=…, effect=…)` | in-process; holds raise `StaleView` carrying `hold_cause` |
+| MCP | `swg_gate` | any MCP client; holds come back as a typed deny |
+| HTTP | `POST /hooks/effect-fence` | any client at all — no Python, no MCP |
+
+All three ask one classification, so a reason means the same thing on each. One
+leg is not the same on each, and it matters: **only the HTTP route can answer
+`content_claim_absent`.** The Python and MCP surfaces read a *comparison* from
+the coordinator rather than its recorded hash, so "the claim matches" and
+"there is no claim at all" arrive there as one value, and they assume a claim
+exists. If your effect matters enough to fence, that is the leg to ask for over
+HTTP.
+
+The coordinator keeps advisory counts of how many fence calls it answered and
+how many of those held, as instrumentation for whoever runs it. They are
+advisory rather than auditable, and nothing in a client's decision path should
+read them.
+
+### Scope, honestly
+
+The fence *orders* an effect; it never rolls one back. It answers before the
+effect fires and does not undo it afterwards, so for an escaping effect there
+is a residual check→fire window it narrows but cannot close. Single host,
+single coordinator, and cooperative — an effect that never asks is never held.
+
+**A narrower gate this vocabulary does not govern.** The coordinator also
+offers a session-based gate in Python — `CoordinatorService.effect_gate`, which
+pins a read-set and re-validates every member's *version* at the effect
+boundary. It checks versions only: it does not apply the grant-standing leg, so
+a peer's write-acquire that preempts the session's grant without moving any
+version lets that gate fire where this fence holds. It is in-process Python
+only — no HTTP route and no tool reaches it — and it answers in its own
+fired/held result types, not in the vocabulary above.
+
 ## `stale-write-guard-fs` MCP server
 
 The coherent-workspace guarantee for agents that speak
@@ -1073,6 +1258,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+| `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](#effect-fence-over-http) |
 
 Denials are machine-readable: an agent parses the typed payload (for example
 `reason: stale_view`, `recover: reacquire`) and self-heals instead of retrying
@@ -1848,19 +2034,19 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 
 Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version`, `expected_generation` / `current_generation`, and a typed `hold_cause` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed.
 
-Branch on `hold_cause` rather than the message:
+Branch on `hold_cause` rather than the message. It carries one of the
+published hold reasons — the same vocabulary, with the same meanings and the
+same recoveries, that the coordinator answers with over HTTP: see
+[Hold reasons](#hold-reasons--the-published-vocabulary). Reasons may be added
+and are never renamed, so match the whole value and treat one you do not
+recognise as a hold.
 
-| `hold_cause` | Meaning | Recovery |
-|---|---|---|
-| `version_moved` | a peer committed a newer version | `reacquire()`, re-decide, re-gate |
-| `grant_reclaimed` | the grant the decision was read under was reclaimed; the version never moved | `reacquire()`, re-decide, re-gate |
-| `grant_preempted` | a peer's write-claim acquire took the grant the decision was read under; **neither** the version nor the ownership generation moved (no commit yet, no epoch bump) — the gate saw the re-read itself come back without a standing grant | `reacquire()`, re-decide, re-gate |
-| `read_denied` | the coordinator refused the re-read (strict mode; this view is INVALID) — **on a strict-mode volume this is how a reclaim usually surfaces** | `reacquire()`, re-decide, re-gate |
-| `input_vanished` | the artifact is gone at the effect boundary | re-establish the input, then re-gate |
-| `version_unconfirmed` | a degraded read returned no confirmed version | restore coordinator health, then re-gate |
-| `generation_unconfirmed` | the residual bucket: no confirmed ownership generation, from a degraded read, an out-of-band edit the coordinator could not confirm, **or** a coordinator that does not report generations at all | `reacquire()` and re-gate **first** — that clears the first two. A HOLD that survives a *successful* reacquire is the third: check the daemon's version and restart it |
-
-**What the causes do and don't tell you.** All but the last are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
+One reason in that vocabulary this wrapper cannot raise: `content_claim_absent`.
+`gate()` reads a hash *comparison* from the coordinator rather than the hash it
+records, so "the claim matches" and "there is no claim at all" arrive here as
+one value and the wrapper assumes a claim exists. The
+[HTTP fence](#effect-fence-over-http) reads the coordinator's own record and is
+the surface that can answer that leg.
 
 **Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
