@@ -1293,8 +1293,10 @@ deny. The Claude Code adapter that wires this seam ships in
 `agent_id` alongside the parent `session_id`, the adapter folds both into the
 identity derivation, so each subagent becomes its own coherence peer rather
 than blending into the parent session. That buys two things: `last_writer`
-attribution names the subagent that actually wrote (visible in `/status` as
-`claude-session-<sid>:subagent-<aid>`), and two sibling subagents racing the
+attribution names the subagent that actually wrote (visible in the operator
+`/status` view, `?detail=full`, as `claude-session-<sid>:subagent-<aid>`; the
+default view omits the name because it embeds the raw session id), and two
+sibling subagents racing the
 same artifact are detected as a collision instead of passing as one writer.
 With no `agent_id` in the payload the derivation is unchanged, byte-for-byte —
 main-thread sessions behave exactly as before. On Claude Code's
