@@ -15,15 +15,22 @@ import builtins
 import io
 import logging
 import os
+import select
+import signal
 import subprocess
 import threading
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import ccs.adapters.coherent_volume as coherent_volume_module
+from ccs.adapters.claude_code.coordinator_server import (
+    read_subagent_id,
+    session_to_agent_id,
+)
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
@@ -38,8 +45,10 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
+from ccs.cli._coherence_client import CoordinatorUnavailable
 from ccs.core.exceptions import (
     CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
     StaleView,
@@ -243,6 +252,39 @@ def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
     CoherentVolume._merge_yaml_list(coherence_dir / "tracked.yaml", (glob,))
 
 
+def _agent_id(vol: CoherentVolume) -> str:
+    """The coordinator's grant-row key for the volume's CURRENT attempt: the
+    session id folded with the per-attempt incarnation, derived the way the
+    coordinator derives it from the request body."""
+    return str(session_to_agent_id(vol.session_id, vol._incarnation))
+
+
+def _held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
+    """What the COORDINATOR says ``agent_id`` holds, ``{path: state}``, read from
+    ``/status`` — which lists every non-INVALID row, so ``{}`` means the row holds
+    nothing (released, or never taken)."""
+    status = vol.coordinator_status()
+    assert status is not None, "the coordinator must be reachable to read its grant rows"
+    for session in status["sessions"]:
+        if session["agent_id"] == agent_id:
+            return dict(session["states"])
+    return {}
+
+
+def _end_turn(vol: CoherentVolume) -> None:
+    """Release the volume's grants the way an agent's turn end does: a
+    session-stop naming the CURRENT incarnation. A stop without it addresses the
+    session's parent row, which holds nothing, and releases nothing."""
+    from ccs.cli._coherence_client import post as _cpost
+
+    _cpost(
+        vol._endpoint,
+        "/hooks/session-stop",
+        {"session_id": vol.session_id, "agent_id": vol._incarnation},
+    )
+    assert _held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
+
+
 def test_sibling_volume_attaches_to_strict_coordinator(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -323,7 +365,12 @@ def test_reacquire_recovers_then_write_succeeds(
 ) -> None:
     """RECOVERY: reacquire() re-mints identity AND does a mandatory fresh read
     (atomically), clearing INVALID. A write from the returned fresh bytes then
-    succeeds — no lost update."""
+    succeeds — no lost update.
+
+    What sheds the sticky INVALID is a FRESH COORDINATOR ROW, and the row is keyed
+    on the session id folded with the per-attempt incarnation — so the row key
+    must change while the session id stays put. A reacquire that left the key
+    unchanged would land the read on the INVALID row and never clear it."""
     target = _seed(tmp_path, content=b"v1")
     vol_a, vol_b = _pair(tmp_path, fast_cfg)
     try:
@@ -335,9 +382,12 @@ def test_reacquire_recovers_then_write_succeeds(
             vol_b.write("data/shared.txt", b"stale")  # denied
 
         old_session = vol_b.session_id
+        old_row = _agent_id(vol_b)
         fresh = vol_b.reacquire("data/shared.txt")
         assert fresh == b"v2-from-A"  # mandatory fresh read returns current bytes
-        assert vol_b.session_id != old_session  # identity re-minted
+        assert _agent_id(vol_b) != old_row  # a fresh coordinator row ...
+        assert vol_b.session_id == old_session  # ... under the same session id
+        assert _held(vol_b, _agent_id(vol_b)) == {"data/shared.txt": "SHARED"}
 
         # Write rebased on the fresh bytes -> granted.
         vol_b.write("data/shared.txt", fresh + b"\nrebased-by-B")
@@ -578,8 +628,6 @@ def test_write_cas_conflict_reacquires_and_converges(
     holder yields ``other_holder`` until the grant is released or times out —
     the OCC-vs-pessimistic coexistence bound. Here A releases via session-stop.)
     """
-    from ccs.cli._coherence_client import post as _cpost
-
     target = _seed(tmp_path, content=b"v1")
     vol_a, vol_b = _pair(tmp_path, fast_cfg)
     try:
@@ -590,7 +638,7 @@ def test_write_cas_conflict_reacquires_and_converges(
         assert target.read_bytes() == b"v2-from-A"
         # A's turn ends — release its grant so the OCC writer is not blocked by
         # other_holder against A's lingering MODIFIED.
-        _cpost(vol_a._endpoint, "/hooks/session-stop", {"session_id": vol_a.session_id})
+        _end_turn(vol_a)
 
         seen: list[bytes] = []
 
@@ -899,8 +947,6 @@ def test_guard_released_after_op_allows_subsequent_ops(
     unaffected — back-to-back read/write/write_cas (and the internal
     reacquire-within-write_cas path) all succeed. Also asserts the guard owner is
     cleared after each op so the instance is reusable."""
-    from ccs.cli._coherence_client import post as _cpost
-
     target = _seed(tmp_path, content=b"v1")
     vol_a, vol_b = _pair(tmp_path, fast_cfg)
     try:
@@ -912,7 +958,7 @@ def test_guard_released_after_op_allows_subsequent_ops(
         assert vol_a._guard_owner_ident is None  # released after the op
         # A's turn ends — release its MODIFIED grant so B's OCC commit is not
         # blocked by other_holder (the OCC-vs-pessimistic coexistence bound).
-        _cpost(vol_a._endpoint, "/hooks/session-stop", {"session_id": vol_a.session_id})
+        _end_turn(vol_a)
 
         # The internal reacquire-within-write_cas path: B is INVALID, so
         # write_cas must reacquire() (which calls read()) on the SAME thread —
@@ -946,8 +992,6 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
     write_cas must re-mint identity (clears INVALID + the invalidation transient)
     and commit the rebased bytes — converge, NOT raise. No lost update: B's
     commit is rebased on A's v2."""
-    from ccs.cli._coherence_client import post as _cpost
-
     target = _seed(tmp_path, content=b"v1")
     vol_a, vol_b = _pair(tmp_path, fast_cfg)
     try:
@@ -956,7 +1000,7 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
         vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID (sticky deny)
         # A's turn ends — release its grant so B's OCC commit is not blocked by
         # other_holder against A's lingering MODIFIED.
-        _cpost(vol_a._endpoint, "/hooks/session-stop", {"session_id": vol_a.session_id})
+        _end_turn(vol_a)
 
         # Confirm B really is in the sticky-deny state BEFORE write_cas: a bare
         # version-aware read reports stale_denied=True (INVALID, not re-granted).
@@ -1185,7 +1229,12 @@ def test_fs_write_failure_releases_grant(
 ) -> None:
     """If the atomic FS write fails AFTER pre-edit granted EXCLUSIVE, the grant is
     released via a post-edit success:false (not orphaned until the sweep), and the
-    original OSError propagates."""
+    original OSError propagates.
+
+    Asserted on the COORDINATOR, not only on the request being sent: the release
+    must name the incarnation that holds the grant, and one that does not
+    addresses the session's parent row and releases nothing — an orphaned
+    EXCLUSIVE that still looks like a release on the wire."""
     import ccs.adapters.coherent_volume as cv_mod
 
     _seed(tmp_path)
@@ -1207,6 +1256,9 @@ def test_fs_write_failure_releases_grant(
         assert any(
             p == "/hooks/post-edit" and pay.get("success") is False for p, pay in posts
         ), "FS-write failure must release the grant via post-edit success=false"
+        assert _held(vol, _agent_id(vol)) == {}, (
+            "the failure release reached the coordinator but left the grant held"
+        )
     finally:
         stop_coordinator(tmp_path)
 
@@ -1886,3 +1938,572 @@ def test_write_cas_waits_between_denied_comparand_reads(
         f"write_cas wedged after {elapsed:.3f}s but its own backoff schedule is "
         f"{sum(schedule):.3f}s — the recorded waits did not actually elapse"
     )
+
+
+# ---------------------------------------------------------------------------
+# A stable session id across re-mints, and the release of an abandoned write
+# grant.
+#
+# A re-mint sheds the sticky INVALID, the invalidation transient and the read
+# generation by landing the next request on a FRESH coordinator row. The row key
+# is the session id folded with a per-attempt incarnation that every request
+# carries in the subagent field, so the session id stays put while the row moves.
+# The abandoned incarnation is a different agent to the coordinator: a grant it
+# still holds is foreign to this volume, and write() is the one path that leaves
+# one (EXCLUSIVE, then MODIFIED) — so the re-mint that abandons it releases it.
+# ---------------------------------------------------------------------------
+
+
+def _count_stops(
+    monkeypatch: pytest.MonkeyPatch, sent: list[tuple[str, dict, str]], vol: CoherentVolume
+) -> None:
+    """Record every coordinator request as ``(route, body, current incarnation at
+    send time)`` and forward it unchanged."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def spy(endpoint: object, path: str, payload: dict) -> object:
+        sent.append((path, dict(payload), vol._incarnation))
+        return real_post(endpoint, path, payload)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+
+
+def test_every_attempt_lands_on_its_own_coordinator_row(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The incarnation rides in the coordinator's subagent field, and the
+    coordinator reads a value outside that field's shape as "no subagent" —
+    silently, with no 400. Every attempt would then share the session's ONE parent
+    row, the INVALID a peer's commit leaves there would outlive every re-mint, and
+    recovery would wedge. Pinned two ways: the coordinator's own reader returns
+    each incarnation verbatim, and its grant rows show each attempt on a row of
+    its own while the parent row is never touched."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        parent_row = str(session_to_agent_id(vol.session_id))
+        session = vol.session_id
+        rows: list[str] = []
+        for attempt in range(3):
+            if attempt == 0:
+                vol.read(rel)
+            else:
+                vol.reacquire(rel)
+            assert read_subagent_id({"agent_id": vol._incarnation}) == vol._incarnation
+            rows.append(_agent_id(vol))
+            assert _held(vol, rows[-1]) == {rel: "SHARED"}
+        assert len(set(rows)) == 3, "a re-mint must move the next request to a new row"
+        assert parent_row not in rows
+        assert _held(vol, parent_row) == {}
+        assert vol.session_id == session
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_every_request_names_the_current_incarnation(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request the volume sends names its CURRENT incarnation; the one
+    exception is the release of an abandoned write grant, which names the
+    abandoned one. A request without it lands on the session's parent row: a read
+    there registers a view the next attempt does not own, and a release there
+    releases nothing."""
+    rel, other = "data/shared.txt", "data/other.txt"
+    _seed(tmp_path, content=b"v1")
+    _seed(tmp_path, rel=other, content=b"o1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        vol.read(rel)
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+        vol.write(rel, b"v3")
+        _data, version = vol.read_with_version(rel)
+        vol.write_cas_at(rel, version, b"v4")  # re-mints: releases write()'s grant
+        vol.reacquire(rel)
+        _data, version = vol.read_with_version(rel)
+        _data, other_version = vol.read_with_version(other)
+        vol.atomic_publish([(rel, version, "v5"), (other, other_version, "o2")])
+
+        routes = {route for route, _body, _current in sent}
+        assert routes >= {
+            "/hooks/pre-read",
+            "/hooks/pre-edit",
+            "/hooks/post-edit",
+            "/hooks/post-edit-cas",
+            "/hooks/session-stop",
+            "/session/begin",
+            "/session/commit_all",
+        }, routes
+        # write() ran once, so exactly one incarnation took a grant, and the one
+        # release must name THAT incarnation -- not merely some other one.
+        (write_incarnation,) = {
+            body["agent_id"] for route, body, _c in sent if route == "/hooks/pre-edit"
+        }
+        stops = [body for route, body, _c in sent if route == "/hooks/session-stop"]
+        assert [body["agent_id"] for body in stops] == [write_incarnation], (
+            "the release did not name the incarnation write() left holding the grant"
+        )
+        for route, body, current in sent:
+            assert body["session_id"] == vol.session_id, route
+            if route != "/hooks/session-stop":
+                assert body.get("agent_id") == current, route
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("lost", ["pre-edit answer", "post-edit"])
+def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, lost: str
+) -> None:
+    """A write() that took EXCLUSIVE and failed before committing leaves the grant
+    standing at the UNCHANGED version. A CAS at that version from the same volume
+    re-mints first, and the old incarnation is a different agent to the
+    coordinator, so the CAS met its own grant as ``other_holder`` with expected ==
+    current — and every retry re-minted into the same refusal (#196). Two ways to
+    strand the grant: the acquire landed but its answer was lost, or the commit
+    never reached the coordinator. The grant has to be recorded at the acquire,
+    not at the commit, or both are missed."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _data, version = vol.read_with_version(rel)
+        real_post = coherent_volume_module._coordinator_post
+
+        def strand_the_grant(endpoint: object, path: str, payload: dict) -> object:
+            if lost == "pre-edit answer" and path == "/hooks/pre-edit":
+                real_post(endpoint, path, payload)  # the acquire lands ...
+                raise CoordinatorUnavailable("simulated: the acquire's answer was lost")
+            if lost == "post-edit" and path == "/hooks/post-edit" and payload.get("success"):
+                raise CoordinatorUnavailable("simulated: the commit never arrived")
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", strand_the_grant)
+        # Same bytes as on disk, so the only thing left over is the grant.
+        with pytest.raises(CoherenceError):
+            vol.write(rel, b"v1")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        stranded = _agent_id(vol)
+        assert _held(vol, stranded) == {rel: "EXCLUSIVE"}, "precondition: the grant stands"
+
+        vol.write_cas_at(rel, version, b"v2-cas")
+
+        assert target.read_bytes() == b"v2-cas"
+        assert _held(vol, stranded) == {}, "the abandoned incarnation still holds a grant"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_at_after_a_committed_write_on_the_same_volume_commits(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A successful write() leaves this volume's incarnation MODIFIED — the grant
+    outlives the call — and a CAS at the NEW version from the same volume met it
+    as ``other_holder`` with expected == current (2 == 2): the volume refused by
+    its own finished write. The re-mint that abandons the incarnation releases
+    the grant, and afterwards the abandoned row holds nothing."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-pessimistic")
+        writer_row = _agent_id(vol)
+        assert _held(vol, writer_row) == {rel: "MODIFIED"}, "precondition: the grant stands"
+        _data, version = vol.read_with_version(rel)
+
+        vol.write_cas_at(rel, version, b"v3-cas")
+
+        assert target.read_bytes() == b"v3-cas"
+        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_directly_after_a_committed_write_on_the_same_volume_commits(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """write() then write_cas on the same file, with nothing in between. The
+    loop's first attempt used to run under the incarnation write() left
+    MODIFIED, so its comparand read was not the None-state, hash-checked read
+    the loop relies on, and the commit was refused outright
+    (``commit_cas_not_allowed ... occ_is_shared_or_invalid_only``) — write_cas_at
+    worked after a write() and write_cas did not. The loop now rotates first
+    when the current incarnation holds a write grant, and the grant is released."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-pessimistic")
+        writer_row = _agent_id(vol)
+        assert _held(vol, writer_row) == {rel: "MODIFIED"}, "precondition: the grant stands"
+
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"v2-pessimistic+cas"
+        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_uncontended_write_cas_without_a_prior_write_does_not_rotate(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rotation write_cas makes after a write() must not become a rotation on
+    every write_cas: an optimistic-only commit with no contention is one
+    comparand read and one CAS under the volume's current incarnation, with no
+    release. Counts the requests, so an unconditional rotate-first cannot pass."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        incarnation_before = vol._incarnation
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+
+        assert [route for route, _b, _c in sent] == ["/hooks/pre-read", "/hooks/post-edit-cas"]
+        # A rotation that sends no request is invisible to the route list, so
+        # compare against the incarnation the volume held before the call.
+        assert {body.get("agent_id") for _r, body, _c in sent} == {incarnation_before}, (
+            "an uncontended write_cas moved to a new incarnation")
+        assert target.read_bytes() == b"v1+cas"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_denied_write_on_another_path_keeps_the_grant_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """One incarnation can hold a write grant on one path and then be denied a
+    write on another. The deny proves no grant was taken on the SECOND path only;
+    if it dropped the incarnation's record, the grant on the first path would be
+    forgotten, and the next optimistic commit there would run under the
+    incarnation still holding it and be refused with no peer holding anything."""
+    p, q = "data/p.txt", "data/q.txt"
+    target = _seed(tmp_path, rel=p, content=b"p1")
+    _seed(tmp_path, rel=q, content=b"q1")
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        vol.read(q)
+        vol.write(p, b"p2")
+        writer_row = _agent_id(vol)
+        assert _held(vol, writer_row) == {p: "MODIFIED", q: "SHARED"}, "precondition"
+        peer.read(q)
+        peer.write(q, b"q2-peer")  # the volume's row goes INVALID on q
+        _end_turn(peer)
+        with pytest.raises(StaleView):
+            vol.write(q, b"stale")  # denied, on the same incarnation that holds p
+
+        vol.write_cas(p, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"p2+cas"
+        assert _held(vol, writer_row) == {}, "the grant on the first path was never released"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_degraded_release_answer_is_not_a_confirmed_release(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watchdog-degraded session-stop answers ``ok: true`` whether or not the
+    release ran. Treated as confirmed, it would drop the record while the grant
+    still stands, and every later commit would be refused by the volume's own
+    grant with nothing left to retry the release. It must stay recorded, and the
+    next attempt must release it."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol.write(rel, b"v2")
+        writer_row = _agent_id(vol)
+        _data, version = vol.read_with_version(rel)
+        real_post = coherent_volume_module._coordinator_post
+        degraded_left = [1]
+
+        def degrade_one_release(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop" and degraded_left[0]:
+                degraded_left[0] -= 1
+                return {"ok": True, "degraded": True}  # the release did not run
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degrade_one_release)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(CasVersionConflict):
+                vol.write_cas_at(rel, version, b"v3")
+        assert _held(vol, writer_row) == {rel: "MODIFIED"}, "precondition: the release never ran"
+
+        vol.write_cas_at(rel, version, b"v3")
+
+        assert target.read_bytes() == b"v3"
+        assert _held(vol, writer_row) == {}
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_failed_release_stops_the_pass_and_keeps_every_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When one release fails, the rest would meet the same coordinator, so the
+    pass stops: one re-mint spends at most one failed request, and every
+    incarnation it did not confirm stays recorded for the next re-mint."""
+    p, q, r = "data/p.txt", "data/q.txt", "data/r.txt"
+    for rel in (p, q, r):
+        _seed(tmp_path, rel=rel, content=b"1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        real_post = coherent_volume_module._coordinator_post
+        stops: list[str] = []
+        failing = [True]
+
+        def fail_releases(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop":
+                stops.append(payload["agent_id"])
+                if failing[0]:
+                    return {"ok": True, "degraded": True}
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", fail_releases)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            vol.write(p, b"2")
+            first_row = _agent_id(vol)
+            vol.reacquire(r)  # re-mint: its release of the first incarnation fails
+            vol.write(q, b"2")
+            second_row = _agent_id(vol)
+            stops.clear()
+            vol.reacquire(r)  # re-mint with two incarnations recorded
+
+        def write_grants(row: str) -> dict[str, str]:
+            # SHARED rows from the reacquire reads block nothing and are not released.
+            return {k: v for k, v in _held(vol, row).items() if v in ("MODIFIED", "EXCLUSIVE")}
+
+        assert len(stops) == 1, f"one re-mint sent {len(stops)} failing releases"
+        assert write_grants(first_row) == {p: "MODIFIED"}
+        assert write_grants(second_row) == {q: "MODIFIED"}
+
+        failing[0] = False
+        vol.reacquire(r)
+        assert write_grants(first_row) == {} and write_grants(second_row) == {}, (
+            "an incarnation the failed pass skipped was dropped from the record")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_after_write_and_reacquire_on_the_same_volume_commits(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The retry-loop form of the same self-refusal: after a write(), reacquire()
+    moved the volume to a fresh identity but left the write's MODIFIED grant with
+    the old one, so every write_cas attempt was refused as ``other_holder`` by the
+    volume's own grant, each retry re-minted into the same refusal, and the loop
+    exhausted its budget (``CasRetriesExhausted``) with no peer anywhere."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-pessimistic")
+        assert vol.reacquire(rel) == b"v2-pessimistic"
+
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"v2-pessimistic+cas"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_re_mint_spends_no_request_on_an_incarnation_without_a_write_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An incarnation that only read, committed optimistically, or had its write
+    DENIED holds at most SHARED/INVALID and blocks nothing; releasing it anyway
+    would add a round trip to every re-mint — every optimistic retry — for
+    nothing. The requests are COUNTED, so an unconditional release cannot pass.
+    The second half keeps the zero honest: a write() that takes a grant costs
+    exactly ONE release at the transition, however many re-mints follow it."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        vol.read(rel)
+        peer.read(rel)
+        peer.write(rel, b"v2-peer")  # vol -> INVALID
+        _end_turn(peer)
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        def stops() -> int:
+            return sum(1 for route, _b, _c in sent if route == "/hooks/session-stop")
+
+        with pytest.raises(StaleView):
+            vol.write(rel, b"stale")  # denied: no grant was taken
+        assert _held(vol, _agent_id(vol)) == {}  # the denied incarnation is INVALID
+        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 1 abandons an INVALID row
+        assert _held(vol, _agent_id(vol)) == {rel: "SHARED"}
+        _data, version = vol.read_with_version(rel)
+        vol.write_cas_at(rel, version, b"v3-cas")  # re-mint 2 abandons a SHARED row
+        vol.reacquire(rel)  # re-mint 3
+        rows = {body["agent_id"] for _r, body, _c in sent if "agent_id" in body}
+        assert len(rows) == 4, f"expected four incarnations across three re-mints, saw {len(rows)}"
+        assert stops() == 0, "a re-mint released an incarnation that held no write grant"
+
+        vol.write(rel, b"v4-pessimistic")
+        for _ in range(2):
+            _data, version = vol.read_with_version(rel)
+            vol.write_cas_at(rel, version, b"v5-cas")
+        assert stops() == 1, "a write() grant costs exactly one release at the transition"
+        assert target.read_bytes() == b"v5-cas"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """A release that does not reach the coordinator must not be forgotten: the
+    grant it was for still stands, and dropping the record would bring the
+    self-refusal back with nothing left to retry it. It fails like any other
+    coordinator request (strict raises, degrade warns and the CAS is refused as
+    ``other_holder`` — a typed signal, not a silent drop), and the next re-mint
+    releases it and commits.
+
+    The failing call runs on a worker with a bounded join, so a release made while
+    holding the volume's identity lock — which deadlocks as soon as degrade mode
+    records the failure, because that takes the same lock — fails here by name
+    instead of hanging the run."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-pessimistic")
+        writer_row = _agent_id(vol)
+        _data, version = vol.read_with_version(rel)
+        real_post = coherent_volume_module._coordinator_post
+        failures = {"left": 1}
+
+        def release_fails_once(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop" and failures["left"]:
+                failures["left"] -= 1
+                raise CoordinatorUnavailable("simulated: the release did not arrive")
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", release_fails_once)
+        outcome: dict[str, BaseException | None] = {}
+
+        def attempt() -> None:
+            try:
+                vol.write_cas_at(rel, version, b"v3-cas")
+                outcome["raised"] = None
+            except BaseException as exc:  # handed to the test thread below
+                outcome["raised"] = exc
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            worker = threading.Thread(target=attempt, daemon=True)
+            worker.start()
+            worker.join(timeout=30)
+        if worker.is_alive():
+            pytest.fail(
+                "write_cas_at never returned after its release failed: the release "
+                "is waiting on the volume's identity lock, which it already holds"
+            )
+        raised = outcome["raised"]
+        assert failures["left"] == 0, "the simulated failure never fired"
+        if on_error == "strict":
+            assert isinstance(raised, CoherenceError), raised
+            assert not isinstance(raised, CasVersionConflict), raised
+            assert "session-stop" in str(raised)
+        else:
+            assert isinstance(raised, CasVersionConflict), raised
+            assert raised.reason == "other_holder"
+            assert any(issubclass(w.category, CoherenceDegradedWarning) for w in caught)
+        assert target.read_bytes() == b"v2-pessimistic"
+        assert _held(vol, writer_row) == {rel: "MODIFIED"}
+
+        vol.write_cas_at(rel, version, b"v3-cas")
+
+        assert target.read_bytes() == b"v3-cas"
+        assert _held(vol, writer_row) == {}
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_after_fork_forgets_the_parents_write_grants(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forked child starts with a copy of the grants the parent's write()
+    recorded, but they belong to the parent's identity, which is still live in the
+    parent. The child must release nothing — not in the fork handler, not at its
+    first re-mint — and the parent's row must keep its grant. (Simulated in
+    process, as the other fork tests are: the handler runs on the same object.)"""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-parent")
+        parent_row = _agent_id(vol)
+        assert _held(vol, parent_row) == {rel: "MODIFIED"}, "precondition: the grant stands"
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        vol._after_fork()  # the child's fork handler
+        vol._ensure_attached()  # the child's first operation re-attaches ...
+        vol._remint()  # ... and re-mints
+
+        assert [r for r, _b, _c in sent if r == "/hooks/session-stop"] == []
+        assert _held(vol, parent_row) == {rel: "MODIFIED"}
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_real_fork_child_releases_nothing_and_the_parent_keeps_its_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same property across a real ``os.fork()``: the registered fork handler
+    runs in the child with the parent's endpoint still in hand, so a release there
+    would reach the coordinator and revoke the grant the parent's in-flight write
+    holds. The child reports how many releases it sent; the parent then checks its
+    own grant on the coordinator."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(rel, b"v2-parent")
+        parent_row = _agent_id(vol)
+        assert _held(vol, parent_row) == {rel: "MODIFIED"}, "precondition: the grant stands"
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child: the fork handler has already run
+            os.close(read_fd)
+            try:
+                vol._remint()  # the child's first re-mint
+                stops = sum(1 for r, _b, _c in sent if r == "/hooks/session-stop")
+                os.write(write_fd, f"{stops}|{len(vol._grant_incarnations)}".encode())
+            except BaseException as exc:  # report, never hang the parent
+                os.write(write_fd, f"child raised {exc!r}".encode())
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        ready, _w, _x = select.select([read_fd], [], [], 30)
+        if not ready:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("timed out waiting for the forked child's release count")
+        report = os.read(read_fd, 256).decode("utf-8")
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+
+        assert report == "0|0", f"child: releases sent | grants still recorded = {report}"
+        assert _held(vol, parent_row) == {rel: "MODIFIED"}
+    finally:
+        stop_coordinator(tmp_path)

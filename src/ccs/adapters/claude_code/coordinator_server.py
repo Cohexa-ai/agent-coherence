@@ -2536,14 +2536,23 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, work(), abort=abort
         )
 
-    # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
-    # On watchdog timeout, return the ok-shape degraded envelope so a
-    # client doing result.get("ok") sees True rather than None.
+    # On watchdog timeout this route ADMITS. _PRE_EDIT_DEGRADED_RESPONSE is
+    # {ok: true, degraded: true}: no hookSpecificOutput, so the hook client
+    # relays no deny and no advisory and the edit proceeds. The answer is
+    # chosen without the work body's decision, so it admits the strict-mode
+    # stale editor the body above would have denied. See the constant for the
+    # rule a future acquire-or-fail refusal must keep.
     # A6: abort threaded into service.write so a late acquire aborts at the
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
-    # invalidating peers) the agent never saw.
+    # invalidating peers) the agent never saw. The abort covers the acquire
+    # only: a late body that takes the strict-deny branch never reaches it,
+    # so it completes and records a deny (counter, route-around marker,
+    # audit line) for an edit the caller was already told to proceed with.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work_with_reground, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_reground,
+        degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, abort=abort,
+    )
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -5157,13 +5166,52 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
 because their wire contract uses ``{status: "fresh"|"stale"}``. A7: the envelope
 now carries a ``hookSpecificOutput`` advisory so a watchdog-degraded read is
 visible to the model rather than silently passing as a confirmed fresh read.
-Endpoints whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop)
-pass ``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
+Endpoints whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
+(:data:`_OK_DEGRADED_RESPONSE`; pre-edit its own
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`) so the client doesn't see ``None`` from
 ``result.get("ok")``."""
 
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
-"""AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
-post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+"""AC-05: degraded envelope for {ok: bool}-shape endpoints (post-edit,
+session-stop, and the snapshot-session begin/read/heartbeat routes). Pairs with
+``_DEFAULT_DEGRADED_RESPONSE``. Pre-edit has its own
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`, equal in value today."""
+
+_PRE_EDIT_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
+"""What ``/hooks/pre-edit`` answers when the watchdog times out: an ADMIT.
+
+The rule this constant carries: a timed-out acquire must not answer in a shape
+that admits an edit the route would refuse when it is not degraded. The
+acquire-or-fail refusal asked for in Cohexa-ai/agent-coherence#196 (an opt-in
+answering ``{"ok": false, "reason": "other_holder"}`` instead of displacing a
+live holder) is not built; :data:`_ACQUIRE_OR_FAIL_REFUSAL_REASONS` is where it
+will register its reasons, and a guard test fails while that set is non-empty
+and this envelope is still ``ok: true``. A timed-out request never looked for a
+holder: admitting it lets the caller edit over a holder the refusal would have
+reported, and answering ``other_holder`` would report a holder nobody observed.
+
+The rule is already broken by a refusal that exists today. Undegraded, a
+strict-mode editor whose grant a peer invalidated gets the strict deny; on a
+timeout it gets this envelope, which carries no ``hookSpecificOutput``, so the
+hook client relays no deny and no advisory -- unlike the read path's
+:data:`_DEFAULT_DEGRADED_RESPONSE`, which at least says freshness was not
+checked. That degrade-to-admit is shipped behaviour (a hook must not block a
+tool call on coordinator load) and this constant does not change it. Library
+callers are stricter: ``CoherentVolume`` with ``on_error="strict"`` (its
+default) raises on ``degraded: true``.
+
+Its own name, rather than a share of :data:`_OK_DEGRADED_RESPONSE`, so that
+changing what a timed-out acquire answers cannot silently change what a
+timed-out post-edit or session-stop answers."""
+
+_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset()
+"""Reasons an opted-in acquire-or-fail ``/hooks/pre-edit`` may refuse with.
+
+Empty: that refusal is not built (see :data:`_PRE_EDIT_DEGRADED_RESPONSE`). The
+change that builds it adds its reasons here -- ``other_holder`` first -- and
+that same change must give a timed-out opted-in request a non-admitting
+answer, or the guard test on this pair goes red. The strict-mode deny is not
+listed: it is not opt-in and its reason travels in ``hookSpecificOutput``."""
 
 _SESSION_START_DEGRADED_RESPONSE: dict = {}
 """SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
@@ -5203,11 +5251,12 @@ def _run_or_degrade(
     and return 200 with ``degraded_response`` (or the default fresh-shape
     envelope) so the user's tool call proceeds.
 
-    AC-05: callers from ``{ok: bool}``-shape endpoints (pre-edit,
-    post-edit, session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE``
-    so clients reading ``result.get("ok")`` see ``True`` rather than
-    ``None``. Callers from ``{status: ...}``-shape endpoints (pre-read,
-    pre-bash, pre-grep) accept the default fresh-shape envelope.
+    AC-05: callers from ``{ok: bool}``-shape endpoints (post-edit,
+    session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE`` -- and
+    pre-edit its own :data:`_PRE_EDIT_DEGRADED_RESPONSE` -- so clients
+    reading ``result.get("ok")`` see ``True`` rather than ``None``. Callers
+    from ``{status: ...}``-shape endpoints (pre-read, pre-bash, pre-grep)
+    accept the default fresh-shape envelope.
 
     v0.1.1 KTD-G:
       - Item 1: queue-depth gate. Reject with HTTP 503 if the watchdog

@@ -203,6 +203,32 @@ def test_publish_recovers_after_hold(tmp_path: Path, fast_cfg: LifecycleConfig) 
         stop_coordinator(tmp_path)
 
 
+def test_multi_publish_after_writing_a_member_on_the_same_volume_publishes(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A successful write() leaves the volume holding that member's MODIFIED grant,
+    and the publish starts as a fresh identity, to which that grant is foreign: the
+    batch was HELD as a peer conflict at the current versions with no peer
+    anywhere. The publish releases the grant its own write() left behind first."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/a.txt", b"a-v2")
+        _a_bytes, a_ver = vol.read_with_version("data/a.txt")
+        _b_bytes, b_ver = vol.read_with_version("data/b.txt")
+
+        versions = vol.atomic_publish(
+            [("data/a.txt", a_ver, b"a-v3"), ("data/b.txt", b_ver, b"b-v2")]
+        )
+
+        assert versions == {"data/a.txt": a_ver + 1, "data/b.txt": b_ver + 1}
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v3"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # ----------------------------------------------------------------------
 # Input validation — fail loud before any coordinator I/O
 # ----------------------------------------------------------------------
