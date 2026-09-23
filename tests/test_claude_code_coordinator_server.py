@@ -3436,6 +3436,201 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
 
 
 # ----------------------------------------------------------------------
+# Pre-edit's degraded disposition vs. the acquire-or-fail refusal (#196)
+#
+# A timed-out pre-edit is answered without its work body's decision, and the
+# body keeps running in the watchdog pool. These tests drive the REAL watchdog:
+# run_with_watchdog is not replaced. The registry's write lock is held from a
+# helper thread past a shortened deadline -- the contention that makes a
+# handler time out in production -- so the answer, and whatever the abandoned
+# body does once the lock frees, are the shipped code paths.
+# ----------------------------------------------------------------------
+
+# The held lock, not this value, is what makes the request time out; it only
+# needs to be short enough to keep the tests fast.
+_DEGRADE_DEADLINE_SEC = 0.25
+_ABANDONED_BODY_SETTLE_SEC = 5.0
+
+
+class _HeldRegistryLock:
+    """Hold the coordinator registry's write lock from a helper thread.
+
+    A pre-edit work body's first registry call blocks on this lock, so the
+    request outlives the watchdog deadline. ``release`` lets the abandoned body
+    run, which is the moment its late effects either land or abort."""
+
+    def __init__(self, coordinator: CoordinatorHTTPServer) -> None:
+        self._lock = coordinator.registry._lock
+        self._held = threading.Event()
+        self._release = threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        with self._lock:
+            self._held.set()
+            self._release.wait(timeout=30.0)
+
+    def __enter__(self) -> "_HeldRegistryLock":
+        self._thread.start()
+        if not self._held.wait(timeout=5.0):
+            pytest.fail("helper thread never acquired the registry write lock")
+        return self
+
+    def release(self) -> None:
+        self._release.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            pytest.fail("helper thread still holds the registry write lock after release")
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._release.set()
+        self._thread.join(timeout=5.0)
+
+
+def _await_abandoned_body_settled(
+    coordinator: CoordinatorHTTPServer, *, aborts_before: int, completions_before: int,
+) -> None:
+    """Wait until the timed-out body has finished one way or the other.
+
+    The watchdog's done-callback bumps ``watchdog_late_aborts_total`` when the
+    body aborted at the registry lock and ``watchdog_late_completion_total``
+    when it ran to the end, so either counter moving means the registry now
+    shows everything the body will ever do."""
+    deadline = time.monotonic() + _ABANDONED_BODY_SETTLE_SEC
+    while time.monotonic() < deadline:
+        if (coordinator._watchdog_late_aborts_total > aborts_before
+                or coordinator._watchdog_late_completion_total > completions_before):
+            return
+        time.sleep(0.010)
+    pytest.fail(
+        f"the timed-out pre-edit body never settled within {_ABANDONED_BODY_SETTLE_SEC}s: "
+        f"watchdog_late_aborts_total stayed {coordinator._watchdog_late_aborts_total} "
+        f"and watchdog_late_completion_total stayed "
+        f"{coordinator._watchdog_late_completion_total}"
+    )
+
+
+def _agent_state_on(coordinator: CoordinatorHTTPServer, path: str, sid: str) -> MESIState | None:
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} was never registered"
+    return coordinator.registry.get_agent_state(artifact_id, session_to_agent_id(sid, None))
+
+
+def test_pre_edit_watchdog_timeout_answers_the_named_degraded_disposition(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-edit that times out answers exactly ``_PRE_EDIT_DEGRADED_RESPONSE``.
+
+    Prevents the call site and the named constant drifting apart. The guard
+    test below holds the CONSTANT to the rule; this is the only test that ties
+    what the route actually sends to that constant, so a change that corrects
+    the constant but leaves the call site passing another envelope would ship
+    the old answer under a green guard. The AC-05 shape test cannot see that:
+    it pins ``ok: true`` itself rather than the constant, and it replaces
+    ``run_with_watchdog`` wholesale."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": _sid("u8-timed-out"), "path": "plan.md"})
+        held.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200
+    assert body == mod._PRE_EDIT_DEGRADED_RESPONSE, (
+        f"a timed-out pre-edit answered {body!r}, not the named disposition")
+
+
+def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once released, a timed-out pre-edit's abandoned body must not grant the
+    caller EXCLUSIVE, and must not invalidate the peer holding it.
+
+    Prevents a late acquire contradicting the answer already written. The
+    caller was answered before any grant decision; if the body then acquired,
+    the caller would hold an EXCLUSIVE it was never told about and the holder
+    would lose a grant nobody reported taking -- the #196 displacement,
+    landing after the fact. The A6 abort at the registry lock is what stops
+    it, and this pins that the abort reaches pre-edit's acquire, in the one
+    scenario an acquire-or-fail refusal exists for: a live holder. The closing
+    undegraded call is the control: it shows the same request, not timed out,
+    does displace that holder, so the scenario really reaches the acquire."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    path = "plan.md"
+    holder, caller = _sid("u8-holder"), _sid("u8-late-caller")
+    status, _ = client.post("/hooks/pre-edit", {"session_id": holder, "path": path})
+    assert status == 200
+    assert _agent_state_on(coordinator, path, holder) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, path, caller) is None
+
+    undegraded_deadline = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    with _HeldRegistryLock(coordinator) as held:
+        status, body = client.post("/hooks/pre-edit", {"session_id": caller, "path": path})
+        held.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert status == 200
+    assert body.get("degraded") is True, f"the request was not degraded: {body!r}"
+
+    assert _agent_state_on(coordinator, path, caller) is None, (
+        "the abandoned body granted the timed-out caller a grant it was never told about")
+    assert _agent_state_on(coordinator, path, holder) == MESIState.EXCLUSIVE, (
+        "the abandoned body invalidated the live holder after the caller was answered")
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", undegraded_deadline)
+    status, body = client.post("/hooks/pre-edit", {"session_id": caller, "path": path})
+    assert status == 200 and "degraded" not in body, body
+    assert _agent_state_on(coordinator, path, caller) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, path, holder) == MESIState.INVALID
+
+
+def test_pre_edit_degraded_disposition_refuses_once_acquire_or_fail_can_refuse() -> None:
+    """While any acquire-or-fail refusal reason exists, a timed-out pre-edit
+    must answer ``ok: false``, never the admit.
+
+    Prevents the refusal asked for in #196 landing with a hole at the watchdog
+    seam. The contention that makes displacing a holder worth refusing is the
+    same contention that times a handler out; if the degraded answer were
+    still ``ok: true``, an opted-in caller would be told to proceed over the
+    holder it asked not to displace. ``ok: false`` is the shape
+    ``CoherentVolume._check_grant`` refuses in both ``on_error`` modes;
+    ``ok: true`` it lets through under ``degrade``.
+
+    Today the reason set is empty, so nothing is asserted about the
+    disposition -- deliberately: adding the first reason turns this red until
+    the disposition changes in the same change. If the refusal lands with a
+    separate disposition for opted-in requests, point this test at that one,
+    in that change. The timeout test above ties the named disposition to what
+    the route sends, so this is not a check on a constant nobody reads."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    refusal_reasons = mod._ACQUIRE_OR_FAIL_REFUSAL_REASONS
+    disposition = mod._PRE_EDIT_DEGRADED_RESPONSE
+    assert isinstance(refusal_reasons, frozenset)
+    assert all(isinstance(reason, str) and reason for reason in refusal_reasons)
+    if refusal_reasons:
+        assert disposition.get("ok") is False, (
+            f"pre-edit can refuse with {sorted(refusal_reasons)} but a timed-out "
+            f"pre-edit still answers {disposition!r}, which admits the edit"
+        )
+
+
+# ----------------------------------------------------------------------
 # T-01 — pre-bash notices-only branch (no stale paths, non-empty notices)
 # ----------------------------------------------------------------------
 
