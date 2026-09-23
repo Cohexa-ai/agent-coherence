@@ -17,6 +17,7 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
+- ``POST /principal/claim``     — caller-principal mint (plan U4; Python-only)
 
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
@@ -65,7 +66,7 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import CoordinatorService, mint_nonce_problem
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
@@ -77,6 +78,7 @@ from ccs.core.exceptions import (
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CallerPrincipalRefused,
     CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
@@ -221,7 +223,7 @@ abuse vector (Adv #13)."""
 
 _CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 """SHA-256 hex shape. Rejecting malformed hashes closes the
-caller-supplied-hash abuse vector (Adv #6) where an authenticated client
+caller-supplied-hash abuse vector (Adv #6) where a bearer-holding client
 could mint v1 with attacker-chosen hash strings."""
 
 
@@ -259,6 +261,50 @@ def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> st
     if subagent_id:
         return f"claude-session-{session_id}:subagent-{subagent_id}"
     return f"claude-session-{session_id}"
+
+
+def caller_principal_identity(session_id: str) -> UUID:
+    """The identity a caller principal binds to: the SESSION component of the
+    acting identity, i.e. the parent session's agent id.
+
+    A subagent carries its parent's ``session_id``, so it presents its parent's
+    principal: the principal's unit of identity is the session, and it cannot
+    separate a subagent from its parent (the subagent component stays
+    caller-asserted and unverified — plan R3). Keyed by the uuid5 rather than
+    the raw ``session_id`` so the store holds no raw session identifier."""
+    return session_to_agent_id(session_id)
+
+
+@dataclass(frozen=True)
+class PresentedCaller:
+    """The acting identity as ONE request presents it.
+
+    ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only; the coordinator authenticates the workspace bearer, not the
+    caller. ``subagent_id`` is caller-asserted and unverified. ``principal`` is
+    the caller principal the request carries, or ``None``. This value is what
+    lets a route check the SESSION component of the acting identity against the
+    principal the coordinator minted for it (plan U4 / R1, R3)."""
+
+    session_id: str
+    subagent_id: str | None
+    principal: str | None
+
+    def attributed_agent_id(self, service: CoordinatorService) -> UUID:
+        """The composite agent id a write by this caller is attributed to
+        (``artifacts.last_writer_id``), with its SESSION component verified
+        against the caller principal first.
+
+        Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when the
+        principal is absent or does not match the session's binding, so a
+        refused caller never reaches a write. The composite over session and
+        subagent is unchanged — two subagents of one session keep distinct
+        writer ids, which the self-commit-lag comparison depends on."""
+        service.validate_caller_principal(
+            identity=caller_principal_identity(self.session_id),
+            principal=self.principal,
+        )
+        return session_to_agent_id(self.session_id, self.subagent_id)
 
 
 # ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
@@ -565,6 +611,9 @@ class CoordinatorHTTPServer:
             # so a route named there but missing here is counted nowhere while
             # still looking wired up at both call sites.
             "effect_fence_total": 0,
+            # Same rule as effect_fence_total above: registered in
+            # _ENDPOINT_COUNTER_NAMES too, or the mint is counted nowhere.
+            "principal_claim_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -3036,7 +3085,7 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     P2 ce-review fixes:
     - #4 (security YAML injection): every path passes validate_path() which
       rejects control chars (newlines), absolute paths, and ../ traversal
-      before being appended to tracked.yaml. Without this, an authenticated
+      before being appended to tracked.yaml. Without this, a bearer-holding
       caller could POST {"paths":["real.md\\n- injected.yaml"]} and inject
       additional patterns.
     - #11 (correctness 500→400): _append_policy_yaml's ValueError on YAML
@@ -3540,18 +3589,23 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 # Four ADDITIVE routes — registered in the central ``_ROUTES`` table so they
 # ride the SAME ``verify_bearer`` + ``verify_host`` seam every other endpoint
 # uses (the dispatcher applies auth before any handler runs; there is NO
-# parallel router). All four derive the CALLER/OWNER identity SERVER-SIDE from
-# the authenticated ``session_id`` via :func:`session_to_agent_id` — the same
-# agent-identity mechanism the hook endpoints use — and NEVER from a
-# client-supplied identity field. This is the R9 server-capture boundary lock:
+# parallel router). All four derive the CALLER/OWNER identity from the request
+# body's ``session_id`` via :func:`session_to_agent_id` — the same derivation the
+# hook endpoints use. That ``session_id`` is caller-asserted and validated for
+# UUID shape only: the dispatcher authenticates the workspace bearer, not the
+# caller, so the owner is whichever identity the request NAMES. (A caller
+# principal, minted by ``POST /principal/claim``, is what a route can check the
+# named identity against — plan U4; which routes require it is U6.) What the
+# lock guarantees is narrower: no OTHER client-supplied identity field sets the
+# owner. This is the R9 server-capture boundary lock:
 #
 #   * ``begin_session`` captures the cut SERVER-SIDE; the client cannot supply a
 #     cut / pinned versions.
 #   * ``/session/read`` and ``/session/commit`` carry ONLY the ``session_token``
 #     (+ artifact path / content). Any client-supplied ``cut`` / ``pinned_*`` /
 #     ``owner`` / ``caller`` field is IGNORED — the server reads the pinned cut
-#     from the registry by token and derives the owner from the authenticated
-#     session. A forged / replayed token CANNOT forge or bypass the server-side
+#     from the registry by token and derives the owner from the request's
+#     ``session_id``. A forged / replayed token CANNOT forge or bypass the server-side
 #     capture: a token with no live cut fails closed (``session_invalidated`` /
 #     ``session_not_found``), and a foreign caller raises ``SessionInvalidated``.
 #   * The day a client legitimately carries the cut is CROSS-HOST — out of scope
@@ -3561,13 +3615,18 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 def _session_owner_from_request(
     coordinator: CoordinatorHTTPServer, session_id: str
 ) -> UUID:
-    """Derive the session OWNER/CALLER identity SERVER-SIDE from the
-    authenticated ``session_id`` (R9 / R13). Reuses the SAME
-    :func:`session_to_agent_id` derivation the hook endpoints use via
-    ``register_session`` — the identity comes from AUTH (the validated
-    ``session_id``), NEVER a client-supplied ``owner``/``caller`` field. Also
-    registers the session so status/name lookups stay consistent with the hook
-    surface."""
+    """Derive the session OWNER/CALLER identity from the request's
+    ``session_id`` (R9 / R13), via the SAME :func:`session_to_agent_id`
+    derivation the hook endpoints use through ``register_session``.
+
+    The ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only, never authenticated: the bearer authenticates the workspace,
+    not the caller, so this returns whichever identity the request names. The
+    guarantee is narrower than "the identity comes from auth": no client-supplied
+    ``owner``/``caller`` field is ever consulted. Checking the named identity
+    against its caller principal is :meth:`PresentedCaller.attributed_agent_id`
+    (plan U4); which routes require that check is U6. Also registers the session
+    so status/name lookups stay consistent with the hook surface."""
     return coordinator.register_session(session_id)
 
 
@@ -3594,9 +3653,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     Request: ``{session_id, read_set: [<repo-rel path>, ...]}``.
 
-    The CALLER/OWNER is derived SERVER-SIDE from ``session_id`` (R9/R13) — the
-    client does NOT supply an owner. The server resolves each read-set PATH to
-    an artifact id (seeding first-observations like pre-read), captures the cut
+    The CALLER/OWNER is derived from the caller-asserted ``session_id``
+    (R9/R13) — the client does NOT supply a separate owner field. The server
+    resolves each read-set PATH to an artifact id (seeding first-observations
+    like pre-read), captures the cut
     via ``service.begin_session``, and returns the server-minted
     ``session_token`` plus the INSPECTABLE path-keyed cut. The bytes are never
     captured here (version-map only); ``retain_versions`` tells the client which
@@ -3628,7 +3688,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             req._json(400, {"error": path_err})
             return
 
-    # OWNER derived from AUTH, never a client field (R9/R13).
+    # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3695,7 +3755,7 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     R9 boundary lock: the request carries ONLY the ``session_token`` + ``path``
     — NO client-supplied cut / pinned version / owner. The server reads the
     pinned version from the registry by token and derives the caller from the
-    authenticated ``session_id``. A forged/replayed token or a foreign caller
+    caller-asserted ``session_id``. A forged/replayed token or a foreign caller
     cannot forge or bypass the server-side capture.
 
     Responses:
@@ -3788,7 +3848,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     owner. The pinned ``expected_version`` is read SERVER-SIDE from the cut
     (``service.session_commit`` sources it from ``cut[artifact_id]``); a client
     cannot drive the CAS with a forged comparand. The caller is derived from the
-    authenticated ``session_id``.
+    caller-asserted ``session_id``.
 
     Responses (preserving the shipped ``commit_cas`` taxonomy):
       - WIN → ``{ok: true, version: N+1, coordinator_epoch}``
@@ -3897,7 +3957,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     owner. Each member's ``expected_version`` is read SERVER-SIDE from the pinned
     cut (``service.session_commit_all`` sources it from ``cut[artifact_id]``), so
     a client cannot drive any member's CAS with a forged comparand. The caller is
-    derived from the authenticated ``session_id``.
+    derived from the caller-asserted ``session_id``.
 
     Responses (the batch generalization of ``/session/commit``):
       - WIN → ``{ok: true, versions: {path: N+1, ...}, coordinator_epoch}``
@@ -4034,10 +4094,11 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
     Request: ``{session_id, session_token}``.
 
-    The OWNER is derived from the authenticated ``session_id`` — a foreign
-    caller cannot keep another agent's session alive (the service enforces the
-    timing-safe owner-binding and returns False on mismatch; the response does
-    NOT reveal whether the token exists). ``{ok: true, refreshed: bool}``.
+    The OWNER is derived from the caller-asserted ``session_id`` — a request
+    naming a different session cannot keep another agent's session alive (the
+    service enforces the timing-safe owner-binding and returns False on
+    mismatch; the response does NOT reveal whether the token exists).
+    ``{ok: true, refreshed: bool}``.
     """
     body = req._read_json()
     if body is None:
@@ -4065,14 +4126,87 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
 
 # ----------------------------------------------------------------------
+# Caller-principal mint (coordinator caller principal plan, U4)
+# ----------------------------------------------------------------------
+#
+# The coordinator authenticates the WORKSPACE bearer, not the caller: the
+# acting identity every route reads is the body-supplied ``session_id``. The
+# mint binds a coordinator-issued caller principal to that identity on its
+# first claim, so a route can later check a request naming the identity
+# against it. Accident-resistance and attributability under same-OS-user
+# cooperative trust: a process that can read ``.coherence/`` can read whatever
+# a hook client stores there. Which routes REQUIRE the principal is U6's
+# posture table, not this route's concern.
+
+_PRINCIPAL_CLAIM_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "claim_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /principal/claim``: a timed-out claim
+must NOT read as success and carries no principal. The watchdog abort fails a
+late bind closed at the registry lock; if one lands anyway, the claimant
+recovers it by retrying with the SAME mint nonce (R20)."""
+
+
+def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /principal/claim — bind a caller principal to the acting identity
+    on its first claim, or hand it back to a retry of that claim (U4 / R1, R2,
+    R5, R20).
+
+    Request: ``{session_id, mint_nonce}``. ``mint_nonce`` is generated by the
+    claimant and persisted BEFORE this call (KTD11); it is the only thing that
+    tells a retry of a claim whose response was lost from a second claimant.
+
+    Responses:
+      - bound → ``{ok: true, principal}`` — the ONLY response a principal ever
+        crosses the wire in (R5). A retry presenting the same nonce gets the
+        same principal.
+      - identity already bound under a different nonce → ``{ok: false, reason:
+        "caller_principal_claimed", detail}`` — the claimant does not become
+        the identity (R2). Never a hold.
+      - malformed ``session_id`` / ``mint_nonce`` → HTTP 400 naming the field.
+      - watchdog degrade → :data:`_PRINCIPAL_CLAIM_DEGRADED_RESPONSE`.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    mint_nonce = body.get("mint_nonce")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    nonce_err = mint_nonce_problem(mint_nonce)
+    if nonce_err:
+        req._json(400, {"error": nonce_err})
+        return
+    identity = caller_principal_identity(session_id)
+
+    def work() -> dict:
+        try:
+            principal = coordinator.service.claim_caller_principal(
+                identity=identity, mint_nonce=mint_nonce, abort=abort,
+            )
+        except CallerPrincipalRefused as exc:
+            return _typed_reason_response(exc)
+        return {"ok": True, "principal": principal}
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+# ----------------------------------------------------------------------
 # Workspace-checkpoint endpoints (WV plan Unit 3 — R1/R2/R8)
 # ----------------------------------------------------------------------
 #
 # Registered in the central ``_ROUTES`` table so they ride the SAME
 # ``verify_bearer`` + ``verify_host`` seam as every other endpoint (no parallel
-# router). The OWNER is derived SERVER-SIDE from the authenticated
-# ``session_id`` (the R9/R13 boundary lock — a client-supplied ``owner`` field
-# is ignored), and the ``checkpoint_id`` is minted SERVER-SIDE by the service.
+# router). The OWNER is derived from the caller-asserted ``session_id`` (the
+# R9/R13 boundary lock — a client-supplied ``owner`` field is ignored), and the
+# ``checkpoint_id`` is minted SERVER-SIDE by the service.
 # The member rows themselves are CLIENT-captured facts (tokens, fingerprints,
 # timestamps — the capture engine runs client-side against ITS substrates, the
 # coordinator never sees the bytes); the boundary validates their SHAPE
@@ -4194,7 +4328,7 @@ def _handle_workspace_checkpoint(
     member_path, native_token?, fingerprint?, captured_at, absent?,
     dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
 
-    The OWNER is derived from the authenticated ``session_id`` (R9/R13); the
+    The OWNER is derived from the caller-asserted ``session_id`` (R9/R13); the
     ``checkpoint_id`` is minted server-side. The registration is ONE registry
     transaction (header + owner + every member — the Unit-2 API), so a typed
     failure means NO partial manifest.
@@ -4561,8 +4695,8 @@ def _handle_workspace_restore_register(
     Request: ``{session_id, checkpoint_id, writes: [{member_path,
     fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
     (fingerprints, never content bytes; the boundary enforces 64-hex). The
-    CONTROLLER identity derives from the authenticated ``session_id``
-    server-side (R9/R13), never a client field. One
+    CONTROLLER identity derives from the caller-asserted ``session_id``
+    (R9/R13), never a separate client field. One
     ``register_workspace_restore`` call → at most one all-or-nothing
     ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
     (``commit_all`` never called, by contract).
@@ -4628,7 +4762,7 @@ def _handle_workspace_restore_register(
             WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
         )
 
-    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    # CONTROLLER derived from the caller-asserted session_id, never a separate field (R9/R13).
     controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -5065,6 +5199,14 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/commit"): _handle_session_commit,
     ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
+    # Caller-principal plan U4 — the mint. Registered HERE so it rides the one
+    # dispatcher seam (Host -> Bearer -> migration gate -> counter -> handler).
+    # Out of _MIGRATION_REJECTED_ROUTES: a binding is durable metadata with no
+    # version bump and no grant (the checkpoint-create rationale), and a
+    # claimant that loses its response to a restart recovers it by nonce.
+    # Python-only: the sibling Node coordinator answers 404 here; U6 declares
+    # that asymmetry with a corpus fixture rather than leaving it silent.
+    ("POST", "/principal/claim"): _handle_principal_claim,
     # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
     # ride the central verify_bearer + verify_host seam like every route. The
     # POST threads a watchdog abort Event into the service's abort_guard (the
@@ -5132,6 +5274,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/policy/track"): "policy_track_total",
     ("POST", "/policy/untrack"): "policy_untrack_total",
     ("GET", "/status"): "status_total",
+    ("POST", "/principal/claim"): "principal_claim_total",
     # /admin/prepare-for-migration intentionally not counted — it
     # initiates shutdown, so counting it would never be observable via
     # subsequent /status calls (coordinator is already down).

@@ -265,13 +265,15 @@ EXEMPT_MEMBERS = frozenset({
 # enrolling it runs it through the lock check.
 INMEM_SURFACE = frozenset({
     "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
-    "artifact_ids", "capture_version_vector", "clear_agent_transient",
+    "artifact_ids", "bind_caller_principal", "capture_version_vector",
+    "clear_agent_transient",
     "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",
     "detection_uncoverable", "foreign_write_totals",
     "get_agent_state", "get_agent_transient", "get_artifact",
-    "get_artifact_and_generation", "get_checkpoint", "get_checkpoint_members",
+    "get_artifact_and_generation", "get_caller_principal", "get_checkpoint",
+    "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
     "get_owner_generation", "get_read_generation", "get_session_cut",
     "get_session_meta", "get_state_map", "get_transient_map",

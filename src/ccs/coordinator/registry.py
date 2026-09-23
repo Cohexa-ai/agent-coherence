@@ -222,6 +222,13 @@ class ArtifactRegistry:
         # critical section as the session-pin capture).
         self._checkpoints: dict[str, CheckpointRecord] = {}
         self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
+        # Caller-principal bindings (caller-principal plan, U4): ``{identity:
+        # (principal, mint_nonce)}``, first claim wins, never rebound. The
+        # in-memory mirror of the sqlite ``caller_principals`` table — its OWN
+        # store, never ``_session_meta``, so the session sweep, cap and release
+        # cannot see it. PROCESS-SCOPED like everything here (a fresh instance
+        # has no bindings — the declared restart loss). Guarded by ``_lock``.
+        self._caller_principals: dict[UUID, tuple[str, str]] = {}
         # Conflict-outcome instrumentation (guarantee-ladder U5 / R-4): counts
         # keyed by (artifact_id, agent_id, reason) for the three typed deny
         # reasons, incremented at the SAME branch that constructs the returned
@@ -1338,6 +1345,26 @@ class ArtifactRegistry:
         with self._lock:
             pins = self._session_pins.get(session_token)
             return dict(pins) if pins is not None else None
+
+    # ------------------------------------------------------------------
+    # Caller-principal bindings (caller-principal plan, U4)
+    # ------------------------------------------------------------------
+
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind; returns the BOUND ``(principal, mint_nonce)``
+        pair. Parity with :meth:`SqliteArtifactRegistry.bind_caller_principal`:
+        the check and the insert share one ``_lock`` hold, so two concurrent
+        first claims bind one principal."""
+        with self._lock:
+            return self._caller_principals.setdefault(identity, (principal, mint_nonce))
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when unclaimed."""
+        with self._lock:
+            bound = self._caller_principals.get(identity)
+        return bound[0] if bound is not None else None
 
     # ------------------------------------------------------------------
     # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)

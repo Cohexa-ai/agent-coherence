@@ -339,6 +339,44 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 
 # ---------------------------------------------------------------------------
+# caller-principal refusal reasons (coordinator caller principal, U4)
+# ---------------------------------------------------------------------------
+#
+# The coordinator authenticates the WORKSPACE (one bearer secret), not the
+# caller: a request's acting identity is a caller-asserted ``session_id``. A
+# caller principal is a coordinator-issued value bound to one acting identity on
+# the first claim of that identity, so a request naming the identity can be
+# checked against it. The point is accident-resistance and attributability under
+# the same-OS-user cooperative-trust model — bearer possession stays full
+# authority by design — never a boundary against a process that can read
+# ``.coherence/``.
+#
+# Wire-stable and ADDITIVE, matched by ``reason == CONSTANT`` (the
+# typed-signal-not-substring house rule). Deliberately DISJOINT from
+# :data:`HOLD_REASONS`: a principal refusal is a client error, never a hold — a
+# hold invites a retry, and no retry supplies a principal the caller never had.
+CALLER_PRINCIPAL_ABSENT_REASON = "caller_principal_absent"
+"""The request names an identity but presents no caller principal."""
+
+CALLER_PRINCIPAL_FOREIGN_REASON = "caller_principal_foreign"
+"""The request presents a caller principal that is not the one bound to the
+identity it names — minted for another identity, never minted, or presented
+for an identity nobody has claimed."""
+
+CALLER_PRINCIPAL_CLAIMED_REASON = "caller_principal_claimed"
+"""A mint claim named an identity that is already bound, and did not present
+the mint nonce the binding was made with. The first claim of an identity wins;
+only a retry of THAT claim (same nonce) re-obtains its principal."""
+
+CALLER_PRINCIPAL_REASONS: frozenset[str] = frozenset(
+    {
+        CALLER_PRINCIPAL_ABSENT_REASON,
+        CALLER_PRINCIPAL_FOREIGN_REASON,
+        CALLER_PRINCIPAL_CLAIMED_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # MCP-C deny vocabulary (stale-write-guard-fs, 2026-06-18 plan, Unit 1)
 # ---------------------------------------------------------------------------
 #
@@ -421,6 +459,21 @@ class SessionInvalidated(CoherenceError):
     place."""
 
     reason = SESSION_INVALIDATED_REASON
+
+
+class CallerPrincipalRefused(CoherenceError):
+    """A request's caller principal does not establish the identity it names,
+    or a mint claim does not become an already-bound identity.
+
+    ``reason`` is one of :data:`CALLER_PRINCIPAL_REASONS`; consumers branch on
+    it, never on the message. The message never carries a principal or a mint
+    nonce: it is written to logs and response ``detail`` fields, and a principal
+    appears on exactly one response — the mint response that issues it.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class CoherenceDegradedWarning(UserWarning):
