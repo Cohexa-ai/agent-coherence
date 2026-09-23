@@ -30,10 +30,18 @@ This module also owns the harness's own IDENTITY CAPABILITY (R15), under
 in a module of its own because the capability exists FOR this corpus: the
 effect fence is where a caller principal will have to be pinned, and KTD7 says
 a principal fixture written before the harness can carry a minted value and
-tell one identity from another would be a decorative assertion. The two
+tell one identity from another would be a decorative assertion. The three
 capability fixtures therefore drive routes that already ship — ``/session/begin``
-mints a token, and a stale read names the session that moved the bytes — so the
-capability is proven against real answers rather than against itself.
+mints a token, a stale read names the session that moved the bytes, and
+``/status`` names which session holds which artifact — so the capability is
+proven against real answers rather than against itself.
+
+The third fixture is the one that OBSERVES the identity opt-in. The stale-read
+attribution turned out to be spelled as 32-char hex, which the portability
+scrub (8-4-4-4-12 only) never matched, so that fixture passes identically with
+``preserve_identity`` deleted; ``sessions[].agent_id`` is the hyphenated form
+the scrub does collapse, and pinning which agent holds which artifact is
+vacuous there unless the opt-in is honoured.
 
 Marked ``protocol_corpus`` — opt-in via ``pytest -m protocol_corpus``."""
 
@@ -456,7 +464,7 @@ def test_degraded_arms_are_documented_as_unreachable_here() -> None:
 # same decorative assertion in a different costume.
 
 _IDENTITY_FIXTURE_DIR = "harness_identity"
-_EXPECTED_IDENTITY_FIXTURE_COUNT = 2
+_EXPECTED_IDENTITY_FIXTURE_COUNT = 3
 
 # The two sessions the capability fixtures use. A reads; B writes.
 _SESSION_A = "11111111-1111-4111-8111-111111111111"
@@ -464,14 +472,24 @@ _SESSION_B = "22222222-2222-4222-8222-222222222222"
 
 # The writer field names the AGENT, not the session: the coordinator stopped
 # reversing an agent id back to a session id. Both runtimes derive this the same
-# way (uuid5 over the session id), and the hex form is deliberate -- a hyphenated
-# UUID would be scrubbed by the portability default, which is what made an
-# attribution assertion decorative in the first place.
+# way (uuid5 over the session id), and the hex form is what the stale-read
+# summary emits.
 _AGENT_A = uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_A}").hex
 _AGENT_B = uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_B}").hex
 
+# The SAME two agents, in the hyphenated 8-4-4-4-12 form ``/status`` emits
+# (``str(session_to_agent_id(...))``). The spelling is the whole reason the
+# status fixture exists: the hex form above is invisible to ``_UUID_RE``, so it
+# survives the portability default untouched and an attribution asserting it
+# would read identically with the opt-in deleted. These are scrubbed to
+# ``UUID_SENTINEL`` by the default, on BOTH the key rule and the string-position
+# rule, so a fixture asserting them is vacuous unless the opt-in is honoured.
+_AGENT_A_UUID = str(uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_A}"))
+_AGENT_B_UUID = str(uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{_SESSION_B}"))
+
 _CAPTURE_FIXTURE = "harness-captured-token-reaches-the-coordinator"
 _IDENTITY_FIXTURE = "harness-stale-read-names-the-writing-session"
+_STATUS_IDENTITY_FIXTURE = "harness-status-names-which-session-holds-what"
 
 # Well-formed and never minted: the coordinator splits its refusal by SHAPE
 # (43 URL-safe base64 characters is a minted token's shape), so a control using
@@ -559,7 +577,11 @@ def test_identity_fixture_directory_is_actually_loaded() -> None:
         f"tests/protocol_corpus/fixtures/{_IDENTITY_FIXTURE_DIR}/, found "
         f"{len(fixtures)}: {[f.name for f in fixtures]}"
     )
-    assert {f.name for f in fixtures} == {_CAPTURE_FIXTURE, _IDENTITY_FIXTURE}
+    assert {f.name for f in fixtures} == {
+        _CAPTURE_FIXTURE,
+        _IDENTITY_FIXTURE,
+        _STATUS_IDENTITY_FIXTURE,
+    }
     assert len(_IDENTITY_ROWS) == len(fixtures)
 
 
@@ -753,6 +775,88 @@ def test_the_writer_field_is_portable_by_derivation_not_by_scrubbing(
     assert shaped["session_id"] == UUID_SENTINEL, (
         "the portability default must still collapse a UUID-shaped identity"
     )
+
+
+def test_status_identity_fixture_distinguishes_which_session_holds_what(
+    tmp_path: Path,
+) -> None:
+    """DISTINGUISH over a field the default actually collapses.
+
+    This is the test the opt-in is FOR. The fixture above asserts an attribution
+    whose value is 32-char hex, which ``_UUID_RE`` (8-4-4-4-12 only) never
+    matched, so that fixture reads identically with ``preserve_identity``
+    deleted and cannot observe the opt-in at all. ``sessions[].agent_id`` on
+    ``/status`` is the hyphenated form, which the default DOES collapse — so a
+    two-holder ``/status`` body is where "A holds docs/plan.md, B holds
+    docs/spec.md" is a claim rather than decoration.
+
+    Four steps, in the order that makes a failure readable: the rows are real,
+    the identities survive verbatim, the RIGHT pairing matches, the SWAPPED
+    pairing does not — and last, the reason all of that is load-bearing, namely
+    that under the portability default the right and swapped pairings are the
+    same bytes."""
+    fixture = _identity_fixture(_STATUS_IDENTITY_FIXTURE)
+    _, actual = run_scenario(
+        fixture=fixture, backend_id="python", workspace=tmp_path
+    )
+
+    # Control: the case this test claims to inspect is actually present. An
+    # empty or single-row sessions list would satisfy a swap assertion while
+    # observing nothing.
+    rows = actual["sessions"]
+    assert [r["states"] for r in rows] == [
+        {"docs/plan.md": "SHARED"},
+        {"docs/spec.md": "EXCLUSIVE"},
+    ], f"the two-holder workspace did not materialize: {rows!r}"
+
+    assert [r["agent_id"] for r in rows] == [_AGENT_A_UUID, _AGENT_B_UUID], (
+        "the declared key must survive normalization verbatim; "
+        f"got {[r['agent_id'] for r in rows]!r}"
+    )
+
+    right = normalize_response(
+        fixture.expected["body"],
+        ignore_keys=fixture.ignore_keys,
+        preserve_identity=fixture.preserve_identity,
+    )
+    assert actual == right, f"expected={right!r}\nactual=  {actual!r}"
+
+    swapped_body = copy.deepcopy(fixture.expected["body"])
+    swapped_body["sessions"][0]["agent_id"] = _AGENT_B_UUID
+    swapped_body["sessions"][1]["agent_id"] = _AGENT_A_UUID
+    swapped = normalize_response(
+        swapped_body,
+        ignore_keys=fixture.ignore_keys,
+        preserve_identity=fixture.preserve_identity,
+    )
+    assert actual != swapped, (
+        "a fixture crediting each artifact to the OTHER session still matched "
+        "— the opt-in is not preserving the identity and the assertion is "
+        "decorative"
+    )
+
+    # Why the swap above is a real distinction and not a tautology: strip the
+    # opt-in and the two pairings are byte-identical, because both rows'
+    # agent_id collapses to the sentinel. Passed explicitly rather than read
+    # from the fixture, so this arm keeps saying what the DEFAULT does even if
+    # the opt-in stops working.
+    assert normalize_response(
+        fixture.expected["body"], ignore_keys=fixture.ignore_keys
+    ) == normalize_response(swapped_body, ignore_keys=fixture.ignore_keys), (
+        "without the opt-in the right and swapped pairings must be the same "
+        "bytes — if they already differ, this fixture is not exercising the "
+        "opt-in and the corpus is back to shipping it unobserved"
+    )
+
+    # Both default rules reach this value, so neither alone explains the pass.
+    assert (
+        normalize_response({"agent_id": _AGENT_A_UUID})["agent_id"]
+        == UUID_SENTINEL
+    ), "the _UUID_KEYS rule must still collapse agent_id"
+    assert (
+        normalize_response({"note": f"held by {_AGENT_A_UUID}"})["note"]
+        == f"held by {UUID_SENTINEL}"
+    ), "the string-position rule must still collapse a hyphenated identity"
 
 
 def test_no_pre_existing_fixture_declares_an_identity_opt_in() -> None:
