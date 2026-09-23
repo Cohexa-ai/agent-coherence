@@ -626,7 +626,9 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 `vol.session_id` is the volume's session with the coordinator, and it stays the
 same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
 clear a stale view by starting a fresh attempt under that same session. A forked
-child gets a session of its own.
+child gets a session of its own. The fresh attempt travels in the request's
+`agent_id` field, so the volume needs a coordinator that reads it: this package's
+from 0.13.0, or the Claude Code plugin's from 0.3.0.
 
 ### Concurrent writers: `write_cas`
 

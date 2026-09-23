@@ -151,6 +151,17 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A `CoherentVolume`'s `session_id` is now stable for its lifetime.** The
+  fresh identity each attempt needs — it is what clears a stale view — is now
+  carried as the request's `agent_id` under the same session, instead of
+  replacing the session. A forked child still gets a session of its own. Code
+  that compared `session_id` before and after `reacquire()` will now see it
+  unchanged. This needs a coordinator that reads `agent_id`: this package's from
+  0.13.0, or the Claude Code plugin's from 0.3.0. Against an older one every
+  attempt lands on the same coordinator entry, so a volume a peer invalidated
+  stays refused — nothing is overwritten, but `reacquire()` no longer clears the
+  refusal and `write_cas` gives up with `ViewWedged`.
+
 - **`/status` no longer publishes a raw session identifier below the operator
   tier.** Each session row already carried `agent_id` — a uuid5 of the session
   id, non-reversible by construction — beside `agent_name`, which rendered the
@@ -263,12 +274,6 @@ Alpha — APIs may change before `v1.0`.
   request. This is the secondary report in #196; its main
   request, an acquire that can fail instead of displacing the holder, is not
   addressed here.
-
-  The volume's `session_id` is now stable for its lifetime. The fresh identity
-  each attempt needs — it is what clears a stale view — is now carried as the
-  request's `agent_id` under the same session, instead of replacing the
-  session. A forked child still gets a session of its own. Code that compared
-  `session_id` before and after `reacquire()` will now see it unchanged.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was

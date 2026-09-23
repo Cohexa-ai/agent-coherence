@@ -2037,11 +2037,18 @@ def test_every_request_names_the_current_incarnation(
             "/session/begin",
             "/session/commit_all",
         }, routes
+        # write() ran once, so exactly one incarnation took a grant, and the one
+        # release must name THAT incarnation -- not merely some other one.
+        (write_incarnation,) = {
+            body["agent_id"] for route, body, _c in sent if route == "/hooks/pre-edit"
+        }
+        stops = [body for route, body, _c in sent if route == "/hooks/session-stop"]
+        assert [body["agent_id"] for body in stops] == [write_incarnation], (
+            "the release did not name the incarnation write() left holding the grant"
+        )
         for route, body, current in sent:
             assert body["session_id"] == vol.session_id, route
-            if route == "/hooks/session-stop":
-                assert body["agent_id"] != current, "a release must name the ABANDONED incarnation"
-            else:
+            if route != "/hooks/session-stop":
                 assert body.get("agent_id") == current, route
     finally:
         stop_coordinator(tmp_path)
@@ -2165,6 +2172,125 @@ def test_uncontended_write_cas_without_a_prior_write_does_not_rotate(
         assert {body.get("agent_id") for _r, body, _c in sent} == {incarnation_before}, (
             "an uncontended write_cas moved to a new incarnation")
         assert target.read_bytes() == b"v1+cas"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_denied_write_on_another_path_keeps_the_grant_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """One incarnation can hold a write grant on one path and then be denied a
+    write on another. The deny proves no grant was taken on the SECOND path only;
+    if it dropped the incarnation's record, the grant on the first path would be
+    forgotten, and the next optimistic commit there would run under the
+    incarnation still holding it and be refused with no peer holding anything."""
+    p, q = "data/p.txt", "data/q.txt"
+    target = _seed(tmp_path, rel=p, content=b"p1")
+    _seed(tmp_path, rel=q, content=b"q1")
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        vol.read(q)
+        vol.write(p, b"p2")
+        writer_row = _agent_id(vol)
+        assert _held(vol, writer_row) == {p: "MODIFIED", q: "SHARED"}, "precondition"
+        peer.read(q)
+        peer.write(q, b"q2-peer")  # the volume's row goes INVALID on q
+        _end_turn(peer)
+        with pytest.raises(StaleView):
+            vol.write(q, b"stale")  # denied, on the same incarnation that holds p
+
+        vol.write_cas(p, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"p2+cas"
+        assert _held(vol, writer_row) == {}, "the grant on the first path was never released"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_degraded_release_answer_is_not_a_confirmed_release(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watchdog-degraded session-stop answers ``ok: true`` whether or not the
+    release ran. Treated as confirmed, it would drop the record while the grant
+    still stands, and every later commit would be refused by the volume's own
+    grant with nothing left to retry the release. It must stay recorded, and the
+    next attempt must release it."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol.write(rel, b"v2")
+        writer_row = _agent_id(vol)
+        _data, version = vol.read_with_version(rel)
+        real_post = coherent_volume_module._coordinator_post
+        degraded_left = [1]
+
+        def degrade_one_release(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop" and degraded_left[0]:
+                degraded_left[0] -= 1
+                return {"ok": True, "degraded": True}  # the release did not run
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degrade_one_release)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(CasVersionConflict):
+                vol.write_cas_at(rel, version, b"v3")
+        assert _held(vol, writer_row) == {rel: "MODIFIED"}, "precondition: the release never ran"
+
+        vol.write_cas_at(rel, version, b"v3")
+
+        assert target.read_bytes() == b"v3"
+        assert _held(vol, writer_row) == {}
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_failed_release_stops_the_pass_and_keeps_every_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When one release fails, the rest would meet the same coordinator, so the
+    pass stops: one re-mint spends at most one failed request, and every
+    incarnation it did not confirm stays recorded for the next re-mint."""
+    p, q, r = "data/p.txt", "data/q.txt", "data/r.txt"
+    for rel in (p, q, r):
+        _seed(tmp_path, rel=rel, content=b"1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        real_post = coherent_volume_module._coordinator_post
+        stops: list[str] = []
+        failing = [True]
+
+        def fail_releases(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop":
+                stops.append(payload["agent_id"])
+                if failing[0]:
+                    return {"ok": True, "degraded": True}
+            return real_post(endpoint, path, payload)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", fail_releases)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            vol.write(p, b"2")
+            first_row = _agent_id(vol)
+            vol.reacquire(r)  # re-mint: its release of the first incarnation fails
+            vol.write(q, b"2")
+            second_row = _agent_id(vol)
+            stops.clear()
+            vol.reacquire(r)  # re-mint with two incarnations recorded
+
+        def write_grants(row: str) -> dict[str, str]:
+            # SHARED rows from the reacquire reads block nothing and are not released.
+            return {k: v for k, v in _held(vol, row).items() if v in ("MODIFIED", "EXCLUSIVE")}
+
+        assert len(stops) == 1, f"one re-mint sent {len(stops)} failing releases"
+        assert write_grants(first_row) == {p: "MODIFIED"}
+        assert write_grants(second_row) == {q: "MODIFIED"}
+
+        failing[0] = False
+        vol.reacquire(r)
+        assert write_grants(first_row) == {} and write_grants(second_row) == {}, (
+            "an incarnation the failed pass skipped was dropped from the record")
     finally:
         stop_coordinator(tmp_path)
 
