@@ -236,6 +236,40 @@ Alpha — APIs may change before `v1.0`.
   coordinator changes identically, and the protocol corpus pins both
   directions on both backends.
 
+- **A volume is no longer refused by the write grant its own `write()` left
+  behind.** A successful `write()` leaves the volume holding the file's write
+  grant after it returns, and every fresh attempt — `write_cas_at`,
+  `atomic_publish`, `reacquire()` and each retry inside `write_cas` — starts as
+  a new coordinator identity, so the grant the same volume had just taken
+  counted as someone else's. A `write()` followed by `write_cas_at` at the new
+  version was refused as `other_holder` with the two versions equal
+  (`expected=2 current=2`); so was a CAS at the unchanged version after a
+  `write()` that took the grant but never committed (`expected=1 current=1`);
+  a `write_cas` after a `write()` and a `reacquire()` exhausted its retries;
+  and a multi-file `atomic_publish` over a member the volume had just written
+  was held as a conflict. Every retry started another fresh identity and met
+  the same refusal. The first fresh attempt after a `write()` now releases
+  that grant before it goes further, with one release request — reads and
+  optimistic commits never trigger one, so they cost no extra round trip. A
+  release that does not go through is kept and retried at the next attempt,
+  never dropped: under `on_error="strict"` the call that needed it raises, and
+  under `"degrade"` it warns and the commit is refused as `other_holder` until
+  a later attempt releases it. A forked child releases nothing — the grants it
+  inherited belong to the parent, which still holds them. A `write()` followed
+  directly by `write_cas` on the same file used to be refused outright
+  (`commit_cas_not_allowed`), because the loop's first attempt ran under the
+  identity still holding the grant; it now starts from a fresh one in that case
+  only, so a `write_cas` with no `write()` before it still makes no extra
+  request. This is the secondary report in #196; its main
+  request, an acquire that can fail instead of displacing the holder, is not
+  addressed here.
+
+  The volume's `session_id` is now stable for its lifetime. The fresh identity
+  each attempt needs — it is what clears a stale view — is now carried as the
+  request's `agent_id` under the same session, instead of replacing the
+  session. A forked child still gets a session of its own. Code that compared
+  `session_id` before and after `reacquire()` will now see it unchanged.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never

@@ -140,7 +140,7 @@ from ccs.adapters.coherent_volume import CoherentVolume
 vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")              # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))      # stale view? denied fail-closed
-data = vol.reacquire("plans/plan.md")         # recover: re-mint identity + mandatory fresh read
+data = vol.reacquire("plans/plan.md")         # recover: clear the stale view + mandatory fresh read
 ```
 
 The explicit `read` / `write` / `reacquire` / `write_cas` API is the **supported** primitive (`write_cas(path, make_content)` is the optimistic counterpart for same-key contention — the loser gets a typed conflict, never a silent drop). For code you'd rather not rewrite, an **opt-in, demo-grade** `open()` shim routes managed-path opens through the volume so existing `open()` / `pathlib` calls get coherence unchanged:
@@ -195,7 +195,7 @@ pip install "agent-coherence[mcp]"
 |---|---|
 | `swg_read` | Tracked read — registers the agent's view of the file |
 | `swg_write` | Guarded write — a stale view or a foreign edit gets a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
-| `swg_reacquire` | Recovery — fresh identity + mandatory fresh read after a deny |
+| `swg_reacquire` | Recovery — clears the stale view + mandatory fresh read after a deny |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |

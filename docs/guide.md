@@ -612,7 +612,7 @@ from ccs.adapters.coherent_volume import CoherentVolume
 vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
-data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh read
+data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fresh read
 ```
 
 | Parameter | Default | Meaning |
@@ -622,6 +622,11 @@ data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh re
 | `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+
+`vol.session_id` is the volume's session with the coordinator, and it stays the
+same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
+clear a stale view by starting a fresh attempt under that same session. A forked
+child gets a session of its own.
 
 ### Concurrent writers: `write_cas`
 
@@ -634,6 +639,13 @@ silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
 content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
+
+A volume can `write()` a file and then commit it through the optimistic lane. A
+successful `write()` leaves the volume holding that file's write grant after it
+returns; `write_cas`, `write_cas_at`, `atomic_publish` and `reacquire()` release
+it before they go further, so the volume is not refused by its own grant. The
+release is one extra request, made only after a `write()`: a volume that only
+reads and commits optimistically never pays for it.
 
 When a commit loses its race on the volume (or MCP) path, the raised
 `CommitPreempted` is **terminal for that attempt, not a transient to retry blindly**:
@@ -1265,7 +1277,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 |---|---|
 | `swg_read` | Tracked read — registers the agent's view of the file |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
-| `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
+| `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
