@@ -32,21 +32,22 @@ full command-line toolset, and the API reference.
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 14. [Effect fence over HTTP](#effect-fence-over-http)
-15. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-16. [Inline benchmark mode](#inline-benchmark-mode)
-17. [Telemetry](#telemetry)
-18. [Graceful degradation](#graceful-degradation)
-19. [Examples](#examples)
-20. [Real-workload benchmarks](#real-workload-benchmarks)
-21. [Benchmarking your own workload](#benchmarking-your-own-workload)
-22. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-23. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-24. [Replay (v0.8.2+)](#replay-v082)
-25. [Command-line tools](#command-line-tools)
-26. [API reference](#api-reference)
-27. [Low-level adapter API](#low-level-adapter-api)
-28. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-29. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+15. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+16. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+17. [Inline benchmark mode](#inline-benchmark-mode)
+18. [Telemetry](#telemetry)
+19. [Graceful degradation](#graceful-degradation)
+20. [Examples](#examples)
+21. [Real-workload benchmarks](#real-workload-benchmarks)
+22. [Benchmarking your own workload](#benchmarking-your-own-workload)
+23. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+24. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+25. [Replay (v0.8.2+)](#replay-v082)
+26. [Command-line tools](#command-line-tools)
+27. [API reference](#api-reference)
+28. [Low-level adapter API](#low-level-adapter-api)
+29. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+30. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -1246,6 +1247,57 @@ a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
 fired/held result types, not in the vocabulary above.
+
+## Acquire-or-fail on `pre-edit` (specified, not yet built)
+
+**Nothing in this section is implemented.** It fixes the shape of an opt-in
+refusal so the change that builds it does not have to re-decide it.
+
+Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks. A session already
+holding the grant is set to INVALID — nothing is committed — and finds out on its
+next request. There is no request that declines instead, so a real mutex cannot be
+built on this route: the second session to ask always wins.
+
+**Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
+caller principal. An opted-in request without a principal is refused as a
+malformed request (HTTP 400 naming the principal), because a refusal that a
+caller could step around by naming the holder's session is not a refusal.
+
+**Refusal.** HTTP 200 with
+`{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent id>"}` — the
+same reason string `post-edit-cas` already returns when a commit meets a live
+writer. The holder is named by agent id, never by session id. Nothing changes
+hands: the holder keeps its grant and the caller gains none.
+
+**What the refused caller does.** Back off and retry the acquire, or take the
+optimistic lane — read, then commit with `post-edit-cas`, which detects a
+conflict at commit and never displaces anyone. The refusal carries no retry
+hint because none exists: a grant ends when its holder commits or releases, or
+when the coordinator reclaims it from a silent holder (no heartbeat for
+`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
+with backoff rather than wait for a signal.
+
+**Under load.** A timed-out opted-in request must not answer in a shape that
+admits the edit: the contention that makes a holder worth respecting is the
+contention that times a handler out. It answers `ok: false` with
+`"degraded": true`, and the caller treats that as a refusal. Today a timed-out
+`pre-edit` answers `{"ok": true, "degraded": true}`; a test in the coordinator
+suite fails as soon as a refusal reason is registered while that is still the
+answer.
+
+**What it does not close.**
+
+- A refused agent can still write the file with a shell command. The Bash hook
+  looks for commands that read tracked files, not ones that write them, so a
+  write that goes around the Edit and Write tools is not refused;
+  [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+  reports it afterwards.
+- A new kind of deny on the edit path is shown to the model, and that changes
+  how it retries. The change that builds the refusal needs its own measurement
+  of that before it ships.
+- On the hook surface, any process that can read `.coherence/` can read another
+  session's principal. The refusal separates writers that follow the protocol;
+  it does not stop one that deliberately uses another's principal.
 
 ## `stale-write-guard-fs` MCP server
 
