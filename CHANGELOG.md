@@ -219,6 +219,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A Bash or Grep command denied in strict mode no longer counts as a read.**
+  When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
+  session SHARED. It does this in strict mode too: the deny fires once, and a
+  retry goes through. That grant also recorded the file's current version as
+  the one the session had last seen, even though a denied command never runs.
+  After a compaction, the re-grounding stale flag then stayed silent for a file
+  the session had never read at its current version. The same false baseline
+  would have made the grant-change denial described above tell a session that
+  nothing had been written since "the version you last saw", a version it had
+  been refused. The observation is now recorded only when the
+  command runs. That holds for every file the command named, including
+  warn-only ones in a denied command, and for a first-seen file registered by
+  a denied command. The grant itself is unchanged. An allowed command still
+  records the read, because it does read the current bytes. The Node
+  coordinator changes identically, and the protocol corpus pins both
+  directions on both backends.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never

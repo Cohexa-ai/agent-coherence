@@ -3118,6 +3118,37 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
+def _apply_bash_grep_regrants(
+    coordinator: CoordinatorHTTPServer,
+    agent_id: UUID,
+    regrants: list[tuple[UUID, str]],
+    *,
+    command_runs: bool,
+    tick: int,
+) -> None:
+    """Grant SHARED on every path a Bash / Grep command named, AFTER the deny
+    decision, and record an observation only if the command will run.
+
+    The grant is the same either way: strict pre-bash / pre-grep deny once and
+    re-arm the session (Node's ``pre_bash.ts`` pins the same contract), so a
+    retry of the command goes through. What depends on the decision is the
+    OBSERVATION. ``set_agent_state`` records the current version as the
+    agent's ``last_observed_version`` for any non-INVALID grant, and a denied
+    command never ran -- crediting it told a session that a later grant
+    handover left it at "the version you last saw", a version it was refused.
+    An allowed command does run and does read the current bytes, exactly like
+    pre-read's ``post_stale_read`` re-grant, so it must keep recording.
+
+    Keyed on the COMMAND's outcome, not the trigger and not the path's own
+    strictness: a warn-only path inside a denied command was not read either.
+    """
+    for artifact_id, trigger in regrants:
+        coordinator.registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED,
+            trigger=trigger, tick=tick, observed=command_runs,
+        )
+
+
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-bash — KTD-N H4 mitigation.
 
@@ -3183,18 +3214,20 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # stale match in the path set triggers deny per the plan's edge-case
         # contract (cat a.md b.md where a.md is strict → deny).
         strict_stale_first: dict | None = None
+        # The SHARED grants this command earns, applied only once the deny
+        # decision is known -- see _apply_bash_grep_regrants.
+        regrants: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
                 # First observation per KTD-9 — seed v1 + grant SHARED so
-                # subsequent reads see fresh.
+                # subsequent reads see fresh. ``detect_tracked_paths``
+                # deduplicates, so deferring the grant cannot make a later
+                # iteration read this path as stale.
                 artifact_id = coordinator.registry.resolve_or_register(
                     path, content_hash=""
                 )
-                coordinator.registry.set_agent_state(
-                    artifact_id, agent_id, MESIState.SHARED,
-                    trigger="first_bash_read", tick=now,
-                )
+                regrants.append((artifact_id, "first_bash_read"))
                 continue
             agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             if agent_state is not None and agent_state != MESIState.INVALID:
@@ -3226,10 +3259,12 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_bash", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_bash"))
+
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
         # the bash command is strict + stale, deny the whole command. The
@@ -3370,6 +3405,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # v0.2 KTD-Q: track the first strict + stale path encountered so we
         # can emit strict-mode deny on the whole grep command. Mirrors pre-bash.
         strict_stale_first: dict | None = None
+        regrants: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -3403,10 +3439,12 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_grep", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_grep"))
+
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
         if strict_stale_first is not None:
@@ -5751,11 +5789,16 @@ def _prior_version_observed(
     whose bytes the agent actually held. The Node backend keeps the same
     column and reads it the same way.
 
-    The old inference survives as the fallback for a row that predates the
-    column (a v5 database migrated forward leaves it NULL). That degrades to
-    today's behaviour rather than to a worse one, and it cannot silently
-    become the normal path: the fallback needs an INVALID agent whose grant
-    was written before the v6 migration.
+    The old inference survives as the fallback for a NULL value, which two
+    rows produce: a row that predates the column (a v5 database migrated
+    forward leaves it NULL), and a row whose only grant certified no read
+    (``observed=False``: the agent's first grant on the path came from a
+    DENIED Bash/Grep command, see ``_apply_bash_grep_regrants``). That
+    degrades to the old behaviour rather than to a worse one: ``current - 1``
+    is always below current, so the summary takes the write wording and asks
+    for a re-read.
+    It cannot silently become the normal path, because both cases need an
+    INVALID agent that never recorded an observation.
     """
     if agent_state != MESIState.INVALID:
         return None
