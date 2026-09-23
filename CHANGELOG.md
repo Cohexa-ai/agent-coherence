@@ -151,6 +151,28 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **`/status` no longer publishes a raw session identifier below the operator
+  tier.** Each session row already carried `agent_id` — a uuid5 of the session
+  id, non-reversible by construction — beside `agent_name`, which rendered the
+  raw identifier verbatim. `agent_name` is now `null` below the full-detail
+  tier, where an operator still sees it. `agent_id` and the per-artifact
+  states are unchanged at every tier, so anything reading those is
+  unaffected. The `--detail` help text no longer claims the process id is
+  redacted at the minimal tier; it is emitted at every tier, deliberately.
+
+- **A hook response names a peer by agent id, and a denial no longer reports a
+  write that did not happen.** Two corrections on the same surface. The
+  preemption notice, and the last-writer field on every stale response and
+  strict deny, carried a peer's raw session id — reversed back out of the
+  agent id by a helper that now no longer exists. They carry the agent id
+  itself. Separately, a denial issued when a peer merely took the grant
+  claimed the artifact "was updated by" that peer, naming a timestamp for a
+  write that never occurred; losing a grant and losing a race to a commit are
+  now distinct messages. The grant-change text states only what the summary
+  supports, and says nothing about worktree content: the flag such a claim
+  would rest on is false on three different states — no hash sent, no hash
+  recorded, or two hashes compared and equal — and only the third is a match.
+
 - **BEHAVIOR CHANGE — `gate()` now refuses a volume that cannot report the
   grant state of its last read.** The fence reads two flags a volume sets on
   every read: whether the coordinator refused it, and whether it was served

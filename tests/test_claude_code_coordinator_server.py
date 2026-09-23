@@ -7643,8 +7643,7 @@ def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
     assert text == (
         "⚠ Stale read [warning emitted 2023-11-14T22:13:21+00:00]: your "
         "grant on docs/plan.md was revoked and no new version was committed. "
-        "docs/plan.md is still at v1, the version you last saw, and your "
-        "worktree's content still matches the coordinator's last-recorded "
-        "hash. Re-acquire before writing to docs/plan.md."
+        "docs/plan.md is still at v1, the version you last saw. "
+        "Re-acquire before writing to docs/plan.md."
     )
     assert "was updated by" not in text

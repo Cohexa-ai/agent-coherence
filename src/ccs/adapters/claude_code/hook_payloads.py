@@ -487,11 +487,15 @@ def stale_read_warning(summary: StaleSummary) -> str:
 def _grant_change_warning(summary: StaleSummary) -> str:
     """The warn-mode counterpart of :data:`GRANT_CHANGE_DENY_REASON_TEMPLATE`.
 
-    Reached only when :func:`summary_reports_a_write` refuses, which fixes
-    both of the other two facts this prose states: ``hash_differs`` is False
-    there (so the worktree really does still match) and
-    ``prior_version_seen_by_session`` equals ``current_version`` (so "the
-    version you last saw" is exact, not an inference).
+    Reached only when :func:`summary_reports_a_write` refuses, which is what
+    makes "the version you last saw" exact rather than an inference:
+    ``prior_version_seen_by_session`` equals ``current_version`` there.
+
+    This prose deliberately says NOTHING about content. ``hash_differs`` is
+    False on three different states -- the caller sent no hash, the
+    coordinator holds none, or the two were compared and agreed -- and only
+    the third is a match, so a message asserting the worktree still matches
+    would be stating something never measured.
 
     The advice differs from the write arm on purpose. Nothing moved under the
     reader, so re-reading buys it nothing; what it lost is the grant, and the
@@ -504,9 +508,8 @@ def _grant_change_warning(summary: StaleSummary) -> str:
     return (
         f"⚠ Stale read [warning emitted {generated_ts}]: your grant on {path} "
         f"was revoked and no new version was committed. {path} is still at "
-        f"v{summary['current_version']}, the version you last saw, and your "
-        f"worktree's content still matches the coordinator's last-recorded "
-        f"hash. Re-acquire before writing to {path}."
+        f"v{summary['current_version']}, the version you last saw. "
+        f"Re-acquire before writing to {path}."
     )
 
 
