@@ -1480,6 +1480,77 @@ def test_reacquire_recovers_under_on_stale_read_raise(
         stop_coordinator(tmp_path)
 
 
+def test_refused_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A read refused with StaleView hands the caller no bytes, so it must not
+    advance the foreign-edit baseline: a write built from the pre-edit buffer is
+    still denied and the foreign bytes survive."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")              # FOREIGN edit (not via the volume)
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")                # refused: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails closed on a watchdog degrade (on_error='strict') also
+    hands the caller no bytes, so it must not advance the baseline either."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_after_refused_read_reseeds_then_write_succeeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """reacquire() returns the bytes it reads, so it DOES advance the baseline: a
+    write rebuilt from those bytes after a refused read is not false-denied."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")
+        fresh = vol.reacquire("data/x.txt")
+        assert fresh == b"HUMAN"
+        vol.write("data/x.txt", fresh + b"+agent")
+        assert target.read_bytes() == b"HUMAN+agent"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_on_stale_read_raise_does_not_fire_on_unmanaged_path(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

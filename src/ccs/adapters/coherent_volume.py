@@ -668,8 +668,6 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
-        # SB-23: seed the foreign-edit baseline with what we just observed on disk.
-        self._last_observed_hash[rel] = content_hash
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -701,6 +699,12 @@ class CoherentVolume:
                     and hook_output.get("permissionDecision") == "deny"
                 ):
                     raise StaleView(self._deny_reason(resp))
+        # SB-23: seed the foreign-edit baseline only once the caller is about to
+        # receive these bytes. A read refused above (StaleView, or a fail-closed
+        # CoherenceError) hands the caller nothing; seeding before the refusal
+        # would absolve a foreign edit the caller never saw, so a write from its
+        # pre-edit buffer would clobber it instead of being denied.
+        self._last_observed_hash[rel] = content_hash
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:

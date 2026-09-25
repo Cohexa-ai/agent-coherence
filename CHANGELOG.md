@@ -197,6 +197,17 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A refused `read()` no longer lets the next `write()` overwrite an
+  out-of-band edit.** With `on_stale_read="raise"`, a read of a file someone
+  edited outside the volume raises `StaleView` and returns no bytes. It still
+  recorded the edited bytes as seen, so the edit-detection check before a
+  write passed: a write built from the bytes read before the edit went
+  through and overwrote it. The same happened when a read failed closed on a
+  coordinator timeout under `on_error="strict"`. `read()` now records the
+  bytes as seen only when it returns them, so that write raises `StaleView`
+  and the edit stays on disk. `reacquire()` always returns the bytes it
+  reads, so a write rebuilt from them still succeeds.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
