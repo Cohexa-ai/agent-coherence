@@ -1265,7 +1265,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator, so `swg_write` the reacquired content to record it |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |

@@ -19,6 +19,7 @@ on an event the test releases, so every test below reads INSIDE the window.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ import pytest
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import gate
-from ccs.core.exceptions import StaleView
+from ccs.core.exceptions import CoherenceError, StaleView
 
 _PATH = "data/counter.txt"
 _WAIT_SEC = 10.0
@@ -102,6 +103,12 @@ class LaggingPeer:
         )
         assert not self._errors, f"peer CAS failed before its disk write: {self._errors!r}"
 
+    def release_after(self, seconds: float) -> None:
+        """Let the peer's disk write land after ``seconds``, from another thread."""
+        timer = threading.Timer(seconds, self._release.set)
+        timer.daemon = True
+        timer.start()
+
     def finish(self) -> None:
         """Let the peer's disk write land and wait for its write_cas_at to return."""
         self._release.set()
@@ -173,6 +180,111 @@ def test_read_modify_cas_through_the_window_loses_no_update(
     if pair is None:
         pair = reader.read_with_version(_PATH)
     data, version = pair
+    reader.write_cas_at(_PATH, version, _increment(data))
+    assert target.read_bytes() == b"2"
+
+
+@pytest.mark.parametrize("read", ["read_with_version", "read_with_version_generation"])
+def test_refused_read_does_not_absolve_an_out_of_band_edit(volumes, read: str) -> None:
+    """A refused read hands the caller no bytes, so it must not move the
+    foreign-edit baseline either. When it did, a write of the caller's older
+    buffer after an out-of-band edit passed the foreign-edit check and landed
+    over the edit the caller never saw."""
+    target, _peer, reader = volumes
+    buffered, _version = reader.read_with_version(_PATH)
+    target.write_bytes(b"HUMAN")
+    with pytest.raises(StaleView):
+        getattr(reader, read)(_PATH)
+    with pytest.raises(StaleView):
+        reader.write(_PATH, _increment(buffered))
+    assert target.read_bytes() == b"HUMAN"
+
+
+@pytest.mark.parametrize("read", ["read_with_version", "read_with_version_generation"])
+def test_fail_closed_read_does_not_absolve_an_out_of_band_edit(
+    volumes, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    """A read that fails closed (the coordinator answers degraded, so strict
+    mode raises) returns no bytes either. It must not advance the foreign-edit
+    baseline, or the caller's next write lands over an edit it never saw."""
+    target, _peer, reader = volumes
+    buffered, _version = reader.read_with_version(_PATH)
+    target.write_bytes(b"HUMAN")
+    real_post = reader._post
+
+    def degraded_pre_read(endpoint_path: str, payload: dict) -> dict | None:
+        if endpoint_path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}
+        return real_post(endpoint_path, payload)
+
+    monkeypatch.setattr(reader, "_post", degraded_pre_read)
+    with pytest.raises(CoherenceError):
+        getattr(reader, read)(_PATH)
+    monkeypatch.setattr(reader, "_post", real_post)
+    with pytest.raises(StaleView):
+        reader.write(_PATH, _increment(buffered))
+    assert target.read_bytes() == b"HUMAN"
+
+
+def test_refused_first_read_still_guards_a_later_write(
+    volumes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path's first read, refused inside a peer's commit window, still records
+    what the disk held then. Otherwise the instance has no baseline at all, and
+    a later write lands over the peer's commit once its bytes reach disk."""
+    target, peer_vol, reader = volumes
+    peer = LaggingPeer(peer_vol, monkeypatch)
+    peer.commit(b"1")
+    try:
+        with pytest.raises(StaleView):
+            reader.read_with_version(_PATH)
+    finally:
+        peer.finish()
+    with pytest.raises(StaleView):
+        reader.write(_PATH, b"blind")
+    assert target.read_bytes() == b"1"
+
+
+def _read_following_the_deny_guidance(
+    vol: CoherentVolume, patience_sec: float = 3.0
+) -> tuple[bytes, int] | bytes:
+    """Recover from a refused read the way the deny text says to: reacquire and
+    read again with backoff for a few seconds. Returns the pair once a read
+    answers, or the reacquired bytes if the refusal outlasts the patience (the
+    case the text says to write from)."""
+    deadline = time.monotonic() + patience_sec
+    wait = 0.01
+    while True:
+        try:
+            return vol.read_with_version(_PATH)
+        except StaleView:
+            reacquired = vol.reacquire(_PATH)
+            if time.monotonic() >= deadline:
+                return reacquired
+            time.sleep(wait)
+            wait = min(wait * 2, 0.5)
+
+
+def test_following_the_deny_guidance_through_a_slow_peer_commit_loses_nothing(
+    volumes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deny text tells a refused caller to retry for a few seconds before
+    concluding the file changed outside the coordinator. That rests on the
+    refusal clearing by itself once the peer's disk write lands, even after
+    reacquire() calls inside the window. A caller that instead wrote after one
+    refused retry landed its write inside the window, and the peer's disk write
+    then overwrote it."""
+    target, peer_vol, reader = volumes
+    peer = LaggingPeer(peer_vol, monkeypatch)
+    peer.commit(b"1")
+    peer.release_after(0.25)
+    try:
+        outcome = _read_following_the_deny_guidance(reader)
+    finally:
+        peer.finish()
+    assert isinstance(outcome, tuple), "a 250ms commit window must clear within the retries"
+    data, version = outcome
+    assert data == b"1"
     reader.write_cas_at(_PATH, version, _increment(data))
     assert target.read_bytes() == b"2"
 
