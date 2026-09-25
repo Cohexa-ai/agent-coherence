@@ -62,17 +62,26 @@ Exit code is always 0 on success — even if the coordinator returns
 Every request presents the session's caller principal in the
 ``Coherence-Caller-Principal`` header: once a session is claimed, the
 coordinator refuses a request naming it without that principal on the routes
-where an absent principal admits harm (post-edit, session-stop). One process
-per hook event means the principal lives on disk — mint nonce first, then
-principal, each created exclusively at 0600 in ``.coherence/`` and keyed by the
-parent session's derived id — and is claimed once per session (see
+where an absent principal admits harm (pre-edit, post-edit, session-stop). One
+process per hook event means the principal lives on disk — the mint nonce
+first, created exclusively at 0600 and never replaced, then the principal, at
+0600 in ``.coherence/``, both keyed by the parent session's derived id — and is
+claimed once per session (see
 :func:`~ccs.cli._coherence_client.obtain_stored_principal`). A coordinator
 whose pid file says ``backend=node`` is not asked at all (it issues none), and
 one that answers 404 on the claim (an older Python coordinator) gets no header
-either — as before. A refused claim or a refused principal is reported on
-stderr and never repaired by deleting and re-minting. Any process that can read
-``.coherence/`` can read these files, so this is convention-enforcement and a
-detectable unbound caller, not separation between callers.
+either — as before.
+
+A request refused for its principal (a typed ``caller_principal_foreign`` /
+``caller_principal_absent`` reason) is recovered by claiming again with the
+SAME stored nonce: a principal that differs from the one presented replaces the
+stored file and the request is retried once (R20 — this is what brings a
+session back after ``state.db`` was reset under it). Anything recovery cannot
+cure is reported on stderr and never repaired by deleting and re-minting (see
+:func:`~ccs.cli._coherence_client.post_with_stored_principal`). Nothing here
+prints a principal or a nonce. Any process that can read ``.coherence/`` can
+read these files, so this is convention-enforcement and a detectable unbound
+caller, not separation between callers.
 """
 
 from __future__ import annotations
@@ -87,18 +96,16 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from ccs.adapters.claude_code.auth import CALLER_PRINCIPAL_HEADER
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
-    caller_principal_headers,
     err,
-    http_status_from_error,
-    obtain_stored_principal,
     post,
+    post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.core.exceptions import CallerPrincipalRefused
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,28 +291,28 @@ def _call(
 ) -> Optional[dict[str, Any]]:
     """POST ``payload``, presenting the session's caller principal.
 
-    The principal is obtained per :func:`obtain_stored_principal` (stored under
-    ``.coherence/``; claimed once per session). A coordinator that issues none
-    (404 on the claim) gets no header and the hook proceeds exactly as before.
+    The principal is obtained, presented and — when refused — recovered per
+    :func:`~ccs.cli._coherence_client.post_with_stored_principal` (stored under
+    ``.coherence/``; claimed once per session; re-claimed with the SAME stored
+    nonce and retried once on a typed principal refusal). A coordinator that
+    issues none (404 on the claim) gets no header and the hook proceeds exactly
+    as before.
     """
-    principal = obtain_stored_principal(
-        endpoint, root, payload["session_id"], report=_report
-    )
     try:
-        return post(
-            endpoint, path, payload, extra_headers=caller_principal_headers(principal)
+        return post_with_stored_principal(
+            endpoint, root, path, payload, report=_report, send=post
         )
-    except urllib.error.HTTPError as exc:
+    except CallerPrincipalRefused as exc:
+        # The one rejection worth a stderr line: recovery could not cure it, so
+        # coherence is off for this session on the routes that require one.
+        # The message is built from the typed reason, never the coordinator's
+        # prose, and carries no principal or nonce (R5). Nothing was deleted
+        # or re-minted — that would reopen the first-claim gate.
+        _report(str(exc))
+        return None
+    except urllib.error.HTTPError:
         # Coordinator rejected the request (validation error). Degrade
-        # silently — the hook should NEVER block the user's tool call. A
-        # principal refusal is the one rejection worth a stderr line: it means
-        # coherence is off for this session on the routes that require one,
-        # and the stored principal is left in place — never deleted and
-        # re-minted, which would reopen the first-claim gate.
-        answer = http_status_from_error(exc) or {}
-        error = answer.get("error")
-        if isinstance(error, str) and CALLER_PRINCIPAL_HEADER in error:
-            _report(f"coordinator refused this hook's caller principal: {error}")
+        # silently — the hook should NEVER block the user's tool call.
         return None
 
 

@@ -35,6 +35,7 @@ from ccs.adapters.claude_code.auth import (
     MintNonceUnavailable,
     ensure_mint_nonce,
     load_caller_principal,
+    load_mint_nonce,
     store_caller_principal,
 )
 from ccs.adapters.claude_code.coordinator_server import (
@@ -44,6 +45,8 @@ from ccs.adapters.claude_code.coordinator_server import (
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
+    CALLER_PRINCIPAL_REFUSAL_REASONS,
+    CallerPrincipalRefused,
     InsecureTransportRefused,
     RedirectRefused,
     TlsConfigError,
@@ -601,7 +604,9 @@ class PrincipalClaim:
       closes (KTD11).
     - ``unconfirmed``: anything else — a watchdog-degraded claim, a transport
       failure, an unexpected answer. A claim that landed anyway is recovered by
-      the next claim presenting the SAME nonce.
+      the next claim presenting the SAME nonce: the one-shot client's next
+      invocation, or the long-lived client's claim before its next request
+      (R20).
 
     ``detail`` is diagnostic prose and never carries the principal or nonce."""
 
@@ -666,6 +671,169 @@ def caller_principal_headers(principal: str | None) -> dict[str, str] | None:
     return {CALLER_PRINCIPAL_HEADER: principal} if principal else None
 
 
+def claims_for_session(session_id: str) -> bool:
+    """Whether a client claims (or re-claims) a caller principal for
+    ``session_id``: the coordinator's session-id shape check, held to the
+    WHOLE string.
+
+    :func:`validate_session_id` matches with ``$``, which in Python also
+    admits one trailing newline; the Node client's check (a JS ``$``) does
+    not. A Python client claiming for ``"<uuid>\\n"`` would bind a session the
+    Node client never presents a principal for, so the two would stop sharing
+    one binding per session. The shape is fixed-width hex and hyphens, so a
+    trailing newline is the only string ``match`` admits that ``fullmatch``
+    refuses — the same gap ``read_subagent_id`` closes with ``fullmatch``."""
+    return validate_session_id(session_id) is None and not session_id.endswith("\n")
+
+
+def principal_refusal_reason(exc: urllib.error.HTTPError) -> str | None:
+    """The typed reason when ``exc`` is a caller-principal refusal — HTTP 400
+    whose body carries ``reason`` in
+    :data:`~ccs.core.exceptions.CALLER_PRINCIPAL_REFUSAL_REASONS`, matched by
+    exact membership, never by a substring of the prose — else ``None``.
+    Reads the error body (only for a 400)."""
+    if exc.code != 400:
+        return None
+    body = http_status_from_error(exc)
+    reason = body.get("reason") if isinstance(body, dict) else None
+    return reason if reason in CALLER_PRINCIPAL_REFUSAL_REASONS else None
+
+
+@dataclass(frozen=True)
+class PrincipalRecovery:
+    """What claiming again with the HELD mint nonce decided after a request was
+    refused for its caller principal — the recovery every client runs (R20).
+
+    - ``retry``: send the refused request ONCE more presenting ``principal``;
+      ``None`` when the claim answered 404 (the coordinator issues none now).
+      Safe because a refused request mutated nothing.
+    - ``stop``: report the refusal; claiming cannot cure it. ``claim`` says
+      why — it returned the very principal that was refused (the refusal is
+      not about staleness), the session is bound under ANOTHER nonce
+      (``refused``: never re-mint), or it did not confirm (``unconfirmed``);
+      ``None`` when no nonce was held, so nothing was claimed.
+
+    ``detail`` is diagnostic prose and never carries a principal or nonce."""
+
+    action: Literal["retry", "stop"]
+    claim: PrincipalClaim | None
+    principal: str | None = None
+    detail: str = ""
+
+
+def decide_principal_recovery(claim: PrincipalClaim, presented: str | None) -> PrincipalRecovery:
+    """Map the claim a refused client made with its held nonce to the next step:
+    a bound principal that differs from ``presented`` (or anything, when none
+    was presented) is retried; the same one, a first-claim refusal, or an
+    unconfirmed claim stops; a 404 retries without a header."""
+    if claim.outcome == "bound" and claim.principal != presented:
+        return PrincipalRecovery("retry", claim, principal=claim.principal)
+    if claim.outcome == "bound":
+        return PrincipalRecovery(
+            "stop", claim, detail="claiming with the held nonce returned the principal that was refused"
+        )
+    if claim.outcome == "unsupported":
+        return PrincipalRecovery("retry", claim, principal=None)
+    if claim.outcome == "refused":
+        return PrincipalRecovery(
+            "stop", claim,
+            detail=(
+                "the session is bound under a different mint nonce "
+                f"({CALLER_PRINCIPAL_CLAIMED_REASON}); not re-minting"
+            ),
+        )
+    return PrincipalRecovery("stop", claim, detail=f"the claim was not confirmed ({claim.detail})")
+
+
+PRINCIPAL_REFUSED_AGAIN = "refused again after claiming with the held nonce; not retrying"
+"""What a client reports when the one retry recovery allows is refused too."""
+
+
+def principal_refusal_message(reason: str, detail: str) -> str:
+    """The text of a caller-principal refusal a client reports: the typed
+    reason and what recovery found — built from constants, never from the
+    coordinator's prose, so no principal or nonce can reach it."""
+    return f"coordinator refused the caller principal ({reason}): {detail}"
+
+
+def recover_stored_principal(
+    endpoint: CoordinatorEndpoint,
+    coordinator_root: Path,
+    session_id: str,
+    presented: str | None,
+    report: Callable[[str], None] = err,
+) -> PrincipalRecovery:
+    """Run the recovery for a ONE-SHOT client whose request naming
+    ``session_id`` was refused for its principal: claim again with the nonce
+    STORED for the session — never a new one, and the nonce file is never
+    touched — and, when that yields a principal to retry with, replace the
+    stored principal with it (write-then-rename, ``0600``). Without a stored
+    nonce there is nothing to prove a retry with, so nothing is claimed."""
+    if not claims_for_session(session_id):
+        return PrincipalRecovery("stop", None, detail="the session id is malformed")
+    key = caller_principal_identity(session_id).hex
+    nonce = load_mint_nonce(coordinator_root, key)
+    if nonce is None:
+        return PrincipalRecovery("stop", None, detail="no stored mint nonce to claim again with")
+    recovery = decide_principal_recovery(
+        claim_caller_principal(endpoint, session_id, nonce), presented
+    )
+    if recovery.action == "retry" and recovery.principal is not None:
+        try:
+            store_caller_principal(coordinator_root, key, recovery.principal)
+        except OSError as exc:
+            # The retry still presents it; the next invocation recovers again.
+            report(f"caller principal not stored ({type(exc).__name__}); it will be re-obtained")
+    return recovery
+
+
+def post_with_stored_principal(
+    endpoint: CoordinatorEndpoint,
+    coordinator_root: Path,
+    path: str,
+    payload: dict[str, Any],
+    report: Callable[[str], None] = err,
+    *,
+    send: Callable[..., dict[str, Any]] = post,
+) -> dict[str, Any]:
+    """POST ``payload`` for a ONE-SHOT client, presenting the stored principal
+    of the session it names (:func:`obtain_stored_principal`).
+
+    A refusal carrying a typed principal reason runs
+    :func:`recover_stored_principal` and, when that says so, retries the
+    request exactly ONCE. A refusal recovery cannot cure — or a second refusal
+    of the retry — raises :class:`~ccs.core.exceptions.CallerPrincipalRefused`
+    carrying the wire reason. Any other non-2xx re-raises its ``HTTPError``
+    (its body already read); transport failures raise as from :func:`post`.
+    ``send`` is the transport (:func:`post`; a caller's own seam)."""
+    session_id = payload["session_id"]
+    principal = obtain_stored_principal(endpoint, coordinator_root, session_id, report=report)
+    try:
+        return send(endpoint, path, payload, extra_headers=caller_principal_headers(principal))
+    except urllib.error.HTTPError as exc:
+        reason = principal_refusal_reason(exc)
+        if reason is None:
+            raise
+        recovery = recover_stored_principal(
+            endpoint, coordinator_root, session_id, principal, report
+        )
+        if recovery.action == "stop":
+            raise CallerPrincipalRefused(
+                reason, principal_refusal_message(reason, recovery.detail)
+            ) from exc
+    try:
+        return send(
+            endpoint, path, payload, extra_headers=caller_principal_headers(recovery.principal)
+        )
+    except urllib.error.HTTPError as exc:
+        reason = principal_refusal_reason(exc)
+        if reason is None:
+            raise
+        raise CallerPrincipalRefused(
+            reason, principal_refusal_message(reason, PRINCIPAL_REFUSED_AGAIN)
+        ) from exc
+
+
 def obtain_stored_principal(
     endpoint: CoordinatorEndpoint,
     coordinator_root: Path,
@@ -681,9 +849,10 @@ def obtain_stored_principal(
     exclusively created FIRST, then claimed, then the bound principal stored.
     Two processes racing on a new session share one nonce and so receive one
     principal. Returns ``None`` — send no header — when the coordinator issues
-    none, when the claim is unconfirmed (a later invocation retries with the
-    same nonce), or when the claim is refused. A refusal is reported through
-    ``report`` and nothing is deleted or re-minted.
+    none, when the claim is unconfirmed (a later claim retries with the same
+    nonce), or when the claim is refused. A refusal is reported through
+    ``report`` and nothing is deleted or re-minted. A stored principal the
+    coordinator later refuses is recovered by :func:`post_with_stored_principal`.
 
     Against a coordinator whose pid file says ``backend=node`` nothing is
     claimed, read or created: the Node coordinator issues no principals, and a
@@ -695,7 +864,7 @@ def obtain_stored_principal(
     What this buys is convention-enforcement and a detectable unbound caller:
     the files are readable by any process that can read ``.coherence/``, so
     this is not separation between callers of the same OS user (KTD5)."""
-    if validate_session_id(session_id) is not None:
+    if not claims_for_session(session_id):
         return None
     if coordinator_backend(coordinator_root) == NODE_BACKEND:
         return None
@@ -706,7 +875,7 @@ def obtain_stored_principal(
     try:
         nonce = ensure_mint_nonce(coordinator_root, key)
     except (OSError, MintNonceUnavailable) as exc:
-        report(f"caller principal unavailable: could not persist a mint nonce ({exc})")
+        report(f"caller principal unavailable: no usable mint nonce ({exc})")
         return None
     claim = claim_caller_principal(endpoint, session_id, nonce)
     if claim.outcome == "bound" and claim.principal is not None:

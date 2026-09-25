@@ -57,11 +57,17 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.policy import matches_any
 from ccs.cli._coherence_client import (
+    PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    PrincipalClaim,
+    PrincipalRecovery,
     RemoteCoordinatorConfig,
     caller_principal_headers,
     claim_caller_principal,
+    decide_principal_recovery,
+    principal_refusal_message,
+    principal_refusal_reason,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
@@ -71,9 +77,11 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
+    CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
@@ -111,6 +119,17 @@ class _ReadResult(NamedTuple):
     #: owner_generation)`` pair is unchanged, because a peer's write-claim
     #: acquire preempts a holder while moving NEITHER comparand.
     stale_status: bool
+
+
+class _Sent(NamedTuple):
+    """What one POST from :meth:`CoherentVolume._send` yielded: the 2xx body,
+    or the typed reason of a caller-principal refusal left to the caller's
+    recovery (R20). Both ``None`` after any other failure, which already went
+    through ``on_error`` (degrade mode only — strict raised)."""
+
+    body: dict | None
+    principal_refusal: str | None
+
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -356,11 +375,21 @@ class CoherentVolume:
         # The caller principal is bound to the SESSION, so it is obtained once per
         # session — at attach, and in a forked child for the child's own session —
         # and never at _remint, which keeps the session (plan KTD14). A long-lived
-        # caller holds the nonce and the principal in memory only, never on disk:
-        # that is what makes this binding genuine (KTD5). ``None`` until the claim
-        # at attach, and for good against a coordinator that issues none.
+        # caller holds the nonce and the principal in memory and never looks a
+        # principal up by the identity it names, so it cannot present another
+        # identity's by accident (KTD5). That is accident-resistance, not
+        # unreadability: the coordinator keeps every principal it issued in
+        # ``.coherence/state.db``, which any process of the same OS user can read.
+        # The nonce lives as long as the session: it is what a later claim
+        # presents to re-obtain the binding after a lost answer or a refused
+        # principal (R20). ``_principal`` is ``None`` until the claim at attach,
+        # and for good against a coordinator that issues none.
         self._mint_nonce = secrets.token_urlsafe(32)
         self._principal: str | None = None
+        # The last claim's outcome (the PrincipalClaim vocabulary): "unconfirmed"
+        # is claimed again, same nonce, before the next request; "refused" (the
+        # session is bound under another nonce) is never claimed again.
+        self._claim_outcome: str | None = None
 
     @staticmethod
     def _new_incarnation() -> str:
@@ -589,20 +618,67 @@ class CoherentVolume:
 
         A coordinator that answers 404 issues none (the sibling Node coordinator,
         or an older Python one) and the volume proceeds without a header, as
-        before. A refused claim (the session already bound under another nonce)
-        or an unconfirmed one routes through ``on_error`` like every other
-        coordinator failure — strict raises at construction; degrade warns once
-        and proceeds without a principal, so the routes that require one refuse
-        this volume's writes and those degrade too. Nothing is re-minted."""
+        before. A claim REFUSED because the session is already bound under
+        another nonce routes through ``on_error`` as the typed
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` and is never made
+        again: a retry would present the same nonce and meet the same refusal,
+        and a new nonce would be a second claimant (KTD11). An UNCONFIRMED claim
+        may have bound anyway (R20): it routes through ``on_error`` too — strict
+        raises, degrade warns once — and the SAME nonce is claimed again before
+        this volume's next request (:meth:`_settle_unconfirmed_claim`). Nothing
+        is re-minted."""
         if self._endpoint is None:
             return
         claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        if claim.outcome == "refused":
+            self._refuse_principal(
+                CALLER_PRINCIPAL_CLAIMED_REASON,
+                f"coordinator caller principal not obtained (refused: {claim.detail})",
+            )
+        elif claim.outcome == "unconfirmed":
+            self._fail_closed_or_degrade(
+                f"coordinator caller principal not obtained (unconfirmed: {claim.detail}); "
+                "the same mint nonce is claimed again before the next request"
+            )
+
+    def _adopt_claim(self, claim: PrincipalClaim) -> None:
+        """Record ``claim``'s outcome, and the principal it settles: the bound
+        one, or none when the coordinator issues none."""
+        self._claim_outcome = claim.outcome
         if claim.outcome == "bound":
             self._principal = claim.principal
-        elif claim.outcome in ("refused", "unconfirmed"):
-            self._fail_closed_or_degrade(
-                f"coordinator caller principal not obtained ({claim.outcome}: {claim.detail})"
+        elif claim.outcome == "unsupported":
+            self._principal = None
+
+    def _settle_unconfirmed_claim(self) -> None:
+        """Claim again, presenting the SAME nonce, while this session's last
+        claim is unconfirmed — before every request, until an answer settles it.
+
+        A bind that landed while its answer was lost leaves the session bound
+        and this volume without the principal every require-class route now
+        demands; this is the recovery R20 promises, and it adds no binding (the
+        nonce is the first claim's). Still unconfirmed: the request goes out
+        without a principal and reports its own outcome. Refused now: routes
+        through ``on_error`` as at attach."""
+        if self._claim_outcome != "unconfirmed" or self._endpoint is None:
+            return
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        if claim.outcome == "refused":
+            self._refuse_principal(
+                CALLER_PRINCIPAL_CLAIMED_REASON,
+                f"coordinator caller principal not obtained (refused: {claim.detail})",
             )
+
+    def _refuse_principal(self, reason: str, message: str) -> None:
+        """A caller-principal refusal through ``on_error``: strict raises the
+        typed :class:`~ccs.core.exceptions.CallerPrincipalRefused` carrying
+        ``reason``; degrade warns once and counts, like every other failure.
+        ``message`` never carries a principal or a nonce."""
+        if self._on_error == "strict":
+            raise CallerPrincipalRefused(reason, message)
+        self._record_degraded(message)
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.
@@ -1827,10 +1903,56 @@ class CoherentVolume:
         body that already names one — the release of an abandoned incarnation —
         keeps its own. Every request presents the session's caller principal
         (header), which a require-class route checks the session against; an
-        incarnation is a subagent component, so it shares the session's."""
+        incarnation is a subagent component, so it shares the session's.
+
+        A request refused for its principal (a typed ``caller_principal_*``
+        reason) is recovered as R20 describes: the SAME nonce claims again, and
+        a principal that differs from the one presented is adopted and the
+        request retried exactly ONCE — safe, because a refused request mutated
+        nothing. A 404 on that claim retries once without the header. A refusal
+        the claim cannot cure routes through ``on_error`` as the typed
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused`."""
         payload = {"agent_id": self._incarnation, **payload}
+        self._settle_unconfirmed_claim()
+        sent = self._send(endpoint_path, payload)
+        if sent.principal_refusal is None:
+            return sent.body
+        reason = sent.principal_refusal
+        recovery = self._recover_principal()
+        detail = recovery.detail
+        if recovery.action == "retry":
+            sent = self._send(endpoint_path, payload)
+            if sent.principal_refusal is None:
+                return sent.body
+            reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
+        self._refuse_principal(reason, principal_refusal_message(reason, detail))
+        return None  # reached only in degrade mode
+
+    def _recover_principal(self) -> PrincipalRecovery:
+        """Claim again with the session's SAME nonce after a principal refusal
+        and adopt what that settles (:func:`decide_principal_recovery` says
+        whether to retry). Nothing is claimed once the session is known to be
+        bound under another nonce: that never changes, so a permanently refused
+        session costs no round trip per request."""
+        if self._claim_outcome == "refused" or self._endpoint is None:
+            return PrincipalRecovery(
+                "stop", None,
+                detail=(
+                    "the session is bound under a different mint nonce "
+                    f"({CALLER_PRINCIPAL_CLAIMED_REASON}); not claiming again"
+                ),
+            )
+        presented = self._principal
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        return decide_principal_recovery(claim, presented)
+
+    def _send(self, endpoint_path: str, payload: dict) -> _Sent:
+        """One POST presenting the current principal. A caller-principal
+        refusal is returned for :meth:`_post` to recover; every other failure
+        routes through ``on_error`` here."""
         try:
-            return _coordinator_post(
+            body = _coordinator_post(
                 self._endpoint,
                 endpoint_path,
                 payload,
@@ -1846,15 +1968,19 @@ class CoherentVolume:
                     "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
                     "hook.secret"
                 ) from exc
+            reason = principal_refusal_reason(exc)
+            if reason is not None:
+                return _Sent(None, reason)
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
-            return None  # reached only in degrade mode
+            return _Sent(None, None)  # reached only in degrade mode
         except CoordinatorUnavailable as exc:
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
-            return None  # reached only in degrade mode
+            return _Sent(None, None)  # reached only in degrade mode
+        return _Sent(body, None)
 
     def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
         """Read current bytes + the coordinator's authoritative version.

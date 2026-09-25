@@ -30,25 +30,31 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
 import yaml
 
 from ccs.cli._coherence_client import (
+    PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
     caller_principal_headers,
     claim_caller_principal,
+    decide_principal_recovery,
+    principal_refusal_message,
+    principal_refusal_reason,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
+    CallerPrincipalRefused,
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
@@ -458,6 +464,15 @@ def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
     raise CoherenceError(f"coordinator commit_cas rejected (fail-closed): {reason}")
 
 
+class _Sent(NamedTuple):
+    """What one POST from :meth:`SubstrateCoordinatorSession._send` yielded: the
+    2xx body, or the typed reason of a caller-principal refusal left to the
+    caller's recovery (R20). Every other failure raised."""
+
+    body: dict | None
+    principal_refusal: str | None
+
+
 class SubstrateCoordinatorSession:
     """A single agent's client to the SHIPPED coordinator, for a substrate binding.
 
@@ -470,8 +485,12 @@ class SubstrateCoordinatorSession:
 
     Every coordinator call is fail-closed: a transport error, a non-2xx, or a
     ``{degraded: true}`` body RAISES (deny AND degrade both map to a raise) — the
-    client never silently degrades open. Two sessions over one ``root`` are two
-    distinct agents; the first spawns, the rest attach.
+    client never silently degrades open. A request refused for its caller
+    principal is first recovered with the session's own mint nonce (R20); what
+    that cannot cure raises the typed
+    :class:`~ccs.core.exceptions.CallerPrincipalRefused` on either leg. Two
+    sessions over one ``root`` are two distinct agents; the first spawns, the
+    rest attach.
     """
 
     def __init__(
@@ -511,8 +530,9 @@ class SubstrateCoordinatorSession:
             raise CoherenceError(
                 f"substrate coordinator endpoint unresolved (fail-closed): {exc}"
             ) from exc
-        self._session_id = str(uuid.uuid4())
-        self._principal = self._claim_principal()
+        session_id, mint_nonce = str(uuid.uuid4()), secrets.token_urlsafe(32)
+        principal = self._claim_principal(session_id, mint_nonce)
+        self._session_id, self._mint_nonce, self._principal = session_id, mint_nonce, principal
 
     @property
     def session_id(self) -> str:
@@ -528,27 +548,38 @@ class SubstrateCoordinatorSession:
         """Mint a fresh identity, shedding a sticky INVALID. The ONLY place a new
         identity is minted — read and commit always share one identity between
         them. A new identity is a new session, so it claims its own caller
-        principal (the commit route requires one); the previous one is dropped."""
-        self._session_id = str(uuid.uuid4())
-        self._principal = self._claim_principal()
+        principal (the commit route requires one) under its own new nonce.
 
-    def _claim_principal(self) -> str | None:
-        """Claim the current session's caller principal, held in memory for
-        the session's life (a long-lived caller — KTD5). ``None`` when the
+        The claim runs for the NEW session id BEFORE anything is swapped: only a
+        claim that settles replaces the session id, nonce and principal
+        together. A claim that raises leaves the previous three exactly as they
+        were, so the session keeps working under its old identity rather than
+        naming a new session while presenting the old one's principal."""
+        session_id, mint_nonce = str(uuid.uuid4()), secrets.token_urlsafe(32)
+        principal = self._claim_principal(session_id, mint_nonce)
+        self._session_id, self._mint_nonce, self._principal = session_id, mint_nonce, principal
+
+    def _claim_principal(self, session_id: str, mint_nonce: str) -> str | None:
+        """Claim ``session_id``'s caller principal presenting ``mint_nonce``. The
+        principal and the nonce are held in memory for the session's life: a
+        long-lived caller never looks a principal up by the identity it names
+        (KTD5) — accident-resistance, not unreadability, since the coordinator
+        stores every principal in ``.coherence/state.db``. ``None`` when the
         coordinator issues none (404). A refused or unconfirmed claim RAISES,
         like every other coordinator failure here (fail-closed); nothing is
         re-minted."""
-        claim = claim_caller_principal(
-            self._endpoint, self._session_id, secrets.token_urlsafe(32)
-        )
+        claim = claim_caller_principal(self._endpoint, session_id, mint_nonce)
         if claim.outcome == "bound":
             return claim.principal
         if claim.outcome == "unsupported":
             return None
-        raise CoherenceError(
+        message = (
             f"coordinator caller principal not obtained ({claim.outcome}: "
             f"{claim.detail}; fail-closed)"
         )
+        if claim.outcome == "refused":
+            raise CallerPrincipalRefused(CALLER_PRINCIPAL_CLAIMED_REASON, message)
+        raise CoherenceError(message)
 
     def pre_read(self, artifact_ref: str, content_hash: str | None) -> PreReadResult:
         """Register a SHARED view and return the coordinator's version + deny
@@ -596,7 +627,40 @@ class SubstrateCoordinatorSession:
     ) -> dict:
         """POST with fail-closed classification. A transport error / non-2xx /
         non-dict body raises ``unknown`` (``CoherenceError`` for a read leg,
-        ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open."""
+        ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open.
+
+        A refusal of the caller principal is DEFINITE — the coordinator refused
+        before any mutation — so it is never ``unknown``. It is recovered as
+        R20 describes: the session's SAME nonce claims again, and a principal
+        that differs from the one presented is adopted and the request retried
+        exactly ONCE (a 404 on the claim retries once without the header).
+        What that cannot cure raises
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` with the wire
+        reason, on either leg."""
+        sent = self._send(endpoint_path, payload, unknown=unknown)
+        if sent.principal_refusal is None:
+            return sent.body  # type: ignore[return-value]
+        reason = sent.principal_refusal
+        recovery = decide_principal_recovery(
+            claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce),
+            self._principal,
+        )
+        if recovery.action == "retry":
+            self._principal = recovery.principal
+            sent = self._send(endpoint_path, payload, unknown=unknown)
+            if sent.principal_refusal is None:
+                return sent.body  # type: ignore[return-value]
+            reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
+        else:
+            detail = recovery.detail
+        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, detail))
+
+    def _send(
+        self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]
+    ) -> _Sent:
+        """One POST presenting the current principal. A caller-principal refusal
+        is returned for :meth:`_post` to recover; anything else that is not a
+        dict body raises ``unknown``."""
         try:
             resp = _coordinator_post(
                 self._endpoint,
@@ -604,13 +668,20 @@ class SubstrateCoordinatorSession:
                 payload,
                 extra_headers=caller_principal_headers(self._principal),
             )
-        except (urllib.error.HTTPError, CoordinatorUnavailable) as exc:
+        except urllib.error.HTTPError as exc:
+            reason = principal_refusal_reason(exc)
+            if reason is not None:
+                return _Sent(None, reason)
+            raise unknown(
+                f"coordinator {endpoint_path} failed (fail-closed): {exc}"
+            ) from exc
+        except CoordinatorUnavailable as exc:
             raise unknown(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"
             ) from exc
         if not isinstance(resp, dict):
             raise unknown(f"coordinator {endpoint_path} returned a non-dict body (fail-closed)")
-        return resp
+        return _Sent(resp, None)
 
 
 @dataclass(frozen=True)

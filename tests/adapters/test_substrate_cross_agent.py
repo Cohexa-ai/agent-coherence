@@ -935,3 +935,109 @@ def test_a_claim_that_does_not_bind_fails_closed(
             _session(tmp_path, fast_cfg)
     finally:
         stop_coordinator(tmp_path)
+
+
+def _record_claims(monkeypatch: pytest.MonkeyPatch, nonces: list[str]) -> None:
+    """Record the nonce every claim presents, forwarding it to the real claim."""
+    real = substrate_module.claim_caller_principal
+
+    def spy(endpoint, session_id, nonce):  # noqa: ANN001, ANN202
+        nonces.append(nonce)
+        return real(endpoint, session_id, nonce)
+
+    monkeypatch.setattr(substrate_module, "claim_caller_principal", spy)
+
+
+def test_a_reacquire_whose_claim_fails_keeps_the_previous_session_and_principal(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``reacquire`` claims for the NEW session id before adopting it: a claim
+    that fails (unconfirmed — a transport blip, a watchdog-degraded claim)
+    raises and leaves the previous session id, principal and nonce paired as
+    they were, so the session keeps working. Before, the id was swapped first
+    and the object was left naming the new session with the old session's
+    principal — every later call refused as foreign until another reacquire."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        before = (sa.session_id, sa._principal, getattr(sa, "_mint_nonce", None))
+        real = substrate_module.claim_caller_principal
+        monkeypatch.setattr(
+            substrate_module, "claim_caller_principal",
+            lambda *_a: PrincipalClaim("unconfirmed", detail="simulated"),
+        )
+        with pytest.raises(CoherenceError, match="caller principal"):
+            sa.reacquire()
+        monkeypatch.setattr(substrate_module, "claim_caller_principal", real)
+
+        assert (sa.session_id, sa._principal, getattr(sa, "_mint_nonce", None)) == before
+        result = a.commit(REF, expected_token=tok, new_bytes=b"v2")
+        assert result.version == 2 and store.get(REF)[0] == b"v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_refused_principal_is_re_claimed_with_the_retained_nonce_and_retried_once(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A principal the coordinator does not hold for this session (as after
+    its binding store was reset) is refused as foreign; the session claims
+    again with the nonce it RETAINED from its own claim — never a new one —
+    adopts the principal returned, and retries the refused request once. The
+    read and the commit both land; nothing logs the principal or the nonce."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    nonces: list[str] = []
+    _record_claims(monkeypatch, nonces)
+    caplog.set_level(logging.DEBUG)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        bound = sa._principal
+        sa._principal = "X" * 43
+
+        _bytes, tok = a.read(REF)
+        result = a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert result.version == 2
+        assert len(nonces) == 2 and len(set(nonces)) == 1
+        assert sa._principal == bound
+        assert bound and bound not in caplog.text and nonces[0] not in caplog.text
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_definite_principal_refusal_is_typed_on_both_legs_never_commit_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the claim with the held nonce cannot cure the refusal (the session
+    is bound under another nonce), the refusal surfaces as
+    :class:`CallerPrincipalRefused` with the wire reason — on the read leg
+    AND the commit leg. A principal refusal is definite (the coordinator
+    committed nothing), so the commit leg must not call it
+    ``CommitUnconfirmed``, which sends the caller into unknown-outcome
+    reconciliation. Neither message carries a principal or a nonce."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        bound = sa._principal
+        sa._mint_nonce, sa._principal = "Z" * 43, "X" * 43
+        with pytest.raises(CallerPrincipalRefused) as read_leg:
+            sa.pre_read(REF, None)
+        with pytest.raises(CallerPrincipalRefused) as commit_leg:
+            sa.commit_cas(REF, expected_version=1, content_hash="a" * 64)
+
+        for refusal in (read_leg.value, commit_leg.value):
+            assert refusal.reason == "caller_principal_foreign"
+            assert not isinstance(refusal, CommitUnconfirmed)
+            for secret in (bound, "Z" * 43, "X" * 43):
+                assert secret and secret not in str(refusal)
+    finally:
+        stop_coordinator(tmp_path)

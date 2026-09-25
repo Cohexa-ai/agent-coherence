@@ -1,7 +1,18 @@
 {
   "name": "caller-principal-node-session-stop-admits-an-absent-principal",
-  "description": "KTD12 -- the other side of fixture 03: the Node coordinator does not implement the principal and admits the identical request. Require-class enforcement is the Python coordinator's only; this row goes red the day Node starts refusing.",
-  "setup": {},
+  "description": "KTD12 -- the Node side of fixture 03, with the identical setup and request: a client claims session A (Node answers 404 -- it issues no principals) and then stops A without a principal. Node admits the stop that Python refuses. This is the asymmetry itself -- a stop naming a session a client tried to claim -- not the unbound-session admission both runtimes share (fixture 15). Goes red the day Node starts refusing, or grows the claim.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
   "request": {
     "method": "POST",
     "path": "/hooks/session-stop",

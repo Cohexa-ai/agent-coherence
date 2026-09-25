@@ -40,7 +40,8 @@
   "expected": {
     "status": 400,
     "body": {
-      "error": "the Coherence-Caller-Principal header is not the caller principal bound to the session_id this request names (caller_principal_foreign)"
+      "error": "the Coherence-Caller-Principal header is not the caller principal bound to the session_id this request names (caller_principal_foreign)",
+      "reason": "caller_principal_foreign"
     }
   },
   "backends": [

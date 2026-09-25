@@ -348,9 +348,10 @@ class PrincipalPosture(Enum):
     """How a route treats the caller principal of the identity it names."""
 
     #: Refuse a foreign principal, and an absent one for an identity that is
-    #: BOUND (HTTP 400 naming the header, never a hold — KTD9). An absent
-    #: principal for an identity nobody ever claimed is an older client's:
-    #: admitted and counted, as before the principal existed (R16).
+    #: BOUND (HTTP 400 naming the header, with a typed ``reason``; never a
+    #: hold — KTD9). An absent principal for an identity nobody ever claimed is
+    #: an older client's: admitted and counted, as before the principal
+    #: existed (R16, KTD15).
     REQUIRE = "require"
     #: Admit an absent principal, bound identity or not, and count it (a local
     #: diagnostic, not a flip trigger — KTD4); refuse a foreign one, so a
@@ -375,18 +376,28 @@ _ACCEPT = PrincipalPosture.ACCEPT
 _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
     # -- the nine hook routes ------------------------------------------------
     ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
-        "a read: registers or refreshes the named identity's SHARED view. It "
-        "records no attribution, and strict mode never re-grants on a stale "
-        "read, so the downstream write routes still catch a stale writer")),
+        "a read: registers or refreshes the named identity's SHARED view and "
+        "records no attribution; strict mode never re-grants on a stale read, "
+        "so a strict-mode write route still catches a stale writer. Accepted "
+        "behaviour for an absent principal, whether the identity is unbound or "
+        "bound: the read drains the named identity's pending notices into its "
+        "own response, and in warn mode a stale read re-grants the identity "
+        "SHARED and uses up its stale warning, so a caller naming a bound peer "
+        "without its principal takes the peer's notices and warning and the "
+        "peer never sees them")),
     ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
         "gates an escaping effect on the named identity's grant standing: a "
         "caller naming a claimed peer without its principal would be answered "
         "about the PEER's grant and told an irreversible effect may fire")),
-    ("POST", "/hooks/pre-edit"): RoutePrincipalPosture(_ACCEPT, (
-        "acquires EXCLUSIVE and preempts holders whatever identity it names — "
-        "a fresh, principal-bearing identity preempts identically, so a "
-        "principal adds nothing here until the acquire-or-fail contract lands; "
-        "the commit that follows (post-edit) is require-class")),
+    ("POST", "/hooks/pre-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "acquires EXCLUSIVE under the named identity, preempting its holders, "
+        "and drains its pending notices: a caller without a claimed identity's "
+        "principal could take a grant it can then neither commit nor release "
+        "(post-edit, either success value, and session-stop refuse it), so the "
+        "grant would stand until the max-hold sweep while optimistic peers are "
+        "refused other_holder. The class does not stop preemption itself: a "
+        "fresh, principal-bearing identity preempts identically until the "
+        "acquire-or-fail contract lands")),
     ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
         "commits a version and records artifacts.last_writer_id under the "
         "named identity (or, on success:false, releases its grant): a caller "
@@ -400,13 +411,24 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "drains its notices: a caller without a claimed peer's principal could "
         "end the peer's work")),
     ("POST", "/hooks/session-start"): RoutePrincipalPosture(_ACCEPT, (
-        "read-only re-grounding of the named session; names peers only by "
-        "agent id (R7) and writes nothing a later check depends on")),
+        "re-grounding of the named session; names peers only by agent id (R7). "
+        "It shows the named identity's pending notices without draining them "
+        "and writes only advisory state: the session's display name and, when "
+        "the re-grounding is non-empty, its compact-pending flag, which the "
+        "named identity's next admit delivers. Accepted behaviour for an "
+        "absent principal: a caller naming a bound peer without its principal "
+        "can arm that delivery; nothing a later check depends on changes")),
     ("POST", "/hooks/pre-bash"): RoutePrincipalPosture(_ACCEPT, (
         "a read, as pre-read: stale-read detection for paths a shell command "
-        "names")),
+        "names. Accepted behaviour for an absent principal, as pre-read's: it "
+        "drains the named identity's pending notices into its own response, so "
+        "a caller naming a bound peer without its principal takes the peer's "
+        "notices")),
     ("POST", "/hooks/pre-grep"): RoutePrincipalPosture(_ACCEPT, (
-        "a read, as pre-read: stale-read detection for a search root")),
+        "a read, as pre-read: stale-read detection for a search root. Accepted "
+        "behaviour for an absent principal, as pre-read's: it drains the named "
+        "identity's pending notices into its own response, so a caller naming "
+        "a bound peer without its principal takes the peer's notices")),
     # -- the five snapshot-session routes (KTD3's own exemption) -------------
     ("POST", "/session/begin"): RoutePrincipalPosture(_ACCEPT, (
         "opens a snapshot session owned by the named identity; the session "
@@ -451,16 +473,22 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
 ``session_id`` and no other. The require-class harm is what an absent
 principal admits for an identity a client has CLAIMED; a request naming an
 identity nobody claimed (a client predating the principal) is admitted and
-counted on every class, as it was before. The lookup in :func:`_admit_caller` has no
+counted on every class, as it was before. An accept-class entry states what an
+absent principal is nonetheless ALLOWED to do there — the accepted behaviour,
+not only the harm it rules out. The lookup in :func:`_admit_caller` has no
 default: a route missing here fails loudly (500) rather than falling to a
 residual class, and a test pins the key set to the routes that read one."""
 
+# Sent only for a session that IS bound; a session nobody claimed is admitted
+# without a principal (KTD15).
 _CALLER_PRINCIPAL_ABSENT_ERROR = (
     f"missing {CALLER_PRINCIPAL_HEADER} header: this route requires the caller "
     f"principal that POST /principal/claim bound to the session_id it names "
     f"({CALLER_PRINCIPAL_ABSENT_REASON})"
 )
-# Sent only for a session that IS bound; a session nobody claimed is admitted.
+# Sent on every class for a presented principal that is not the one bound to the
+# named session — including one presented for a session nobody claimed, where
+# nothing is bound and so no presented value can match.
 _CALLER_PRINCIPAL_FOREIGN_ERROR = (
     f"the {CALLER_PRINCIPAL_HEADER} header is not the caller principal bound to "
     f"the session_id this request names ({CALLER_PRINCIPAL_FOREIGN_REASON})"
@@ -469,10 +497,14 @@ _CALLER_PRINCIPAL_ERRORS: dict[str, str] = {
     CALLER_PRINCIPAL_ABSENT_REASON: _CALLER_PRINCIPAL_ABSENT_ERROR,
     CALLER_PRINCIPAL_FOREIGN_REASON: _CALLER_PRINCIPAL_FOREIGN_ERROR,
 }
-"""The 400 bodies of a principal refusal: the single-key ``{"error": ...}``
-shape every identity-validation failure on these routes uses, naming the header
-and ending with the typed reason, so an absent principal and a foreign one stay
-distinguishable (a phase is diagnosable from the refusal alone)."""
+"""The ``error`` text of a principal refusal, keyed by its reason. The 400 body
+is ``{"error": <text>, "reason": <reason>}``: ``error`` keeps the key every
+non-200 body carries (the CLI reads it), and ``reason`` is the typed key a
+client classifies the refusal by — by equality against
+:data:`~ccs.core.exceptions.CALLER_PRINCIPAL_REFUSAL_REASONS`, never by a
+substring of ``error``. Each text names the header and ends with its reason, so
+an absent principal and a foreign one stay distinguishable from either key (a
+phase is diagnosable from the refusal alone). Neither carries a principal."""
 
 
 def _admit_caller(
@@ -490,7 +522,13 @@ def _admit_caller(
     an identity nobody has claimed. An accept-class request presenting none is
     admitted under the unverified derivation. Every admission without a
     principal — accept-class, or require-class on an unbound identity — is
-    counted (a local diagnostic, KTD4)."""
+    counted (a local diagnostic, KTD4); every refusal is counted separately and
+    logged, by :func:`_refuse_caller`.
+
+    The gate runs BEFORE any handler mutation — the display-name registration,
+    the heartbeat, the re-grounding flag, a notice drain, a grant — so a
+    refused request has changed nothing, and a client may retry it once it
+    holds the right principal."""
     posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
     unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
     if posture is PrincipalPosture.MINT:
@@ -501,12 +539,28 @@ def _admit_caller(
     try:
         agent_id = presented.attributed_agent_id(coordinator.service)
     except CallerPrincipalRefused as exc:
-        req._json(400, {"error": _CALLER_PRINCIPAL_ERRORS[exc.reason]})
+        _refuse_caller(req, coordinator, exc.reason)
         return None
     if presented.principal is None:
         # Require-class, admitted without a principal: the identity is unbound.
         coordinator.increment_caller_principal_absent()
     return agent_id
+
+
+def _refuse_caller(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer, reason: str
+) -> None:
+    """Answer a principal refusal: HTTP 400 ``{"error", "reason"}``.
+
+    Counted and logged at INFO with the route and the reason BEFORE the answer
+    goes out, so an operator can see a session being refused — the hook client
+    exits 0 on a refusal and Claude Code shows no stderr, so nothing else
+    would. Only the reason is read: neither the presented principal nor the
+    bound one reaches the log, the counter or the body (R5)."""
+    coordinator.increment_caller_principal_refused()
+    method, path = req._route_key
+    logger.info("caller principal refused on %s %s (%s)", method, path, reason)
+    req._json(400, {"error": _CALLER_PRINCIPAL_ERRORS[reason], "reason": reason})
 
 
 def _presented_caller(
@@ -891,6 +945,13 @@ class CoordinatorHTTPServer:
         # every counter here it is process-local, resets on respawn and on idle
         # shutdown, so a zero proves nothing about the callers out there.
         self._caller_principal_absent_total: int = 0
+        # caller_principal_refused_total: requests a route REFUSED for their
+        # caller principal — an absent one naming a bound identity, or a
+        # foreign one on any class (plan U6). The operator-visible trace of a
+        # session being refused: the endpoint counters count attempts, so a
+        # refused request looks like any other there. Process-local like
+        # every counter here.
+        self._caller_principal_refused_total: int = 0
         # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
         # mismatch on a strict path was SUPPRESSED as the benign
         # commit→disk-write lag (this session's own recent commit) rather than
@@ -1286,10 +1347,19 @@ class CoordinatorHTTPServer:
         presents no caller principal (plan U6): any accept-class route, and a
         require-class route naming an identity nobody has claimed (a client
         that predates the principal). A refusal is not counted here (it
-        answered 400), nor is a foreign principal (refused on every class). A
-        local diagnostic, not a flip trigger (KTD4). Same GIL-atomicity
-        contract as :meth:`increment_strict_mode_denial`."""
+        answered 400 and is counted by :meth:`increment_caller_principal_refused`),
+        nor is a foreign principal (refused on every class). A local
+        diagnostic, not a flip trigger (KTD4). Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
         self._caller_principal_absent_total += 1
+
+    def increment_caller_principal_refused(self) -> None:
+        """Bumped when a route REFUSES a request for its caller principal:
+        absent for a bound identity, or foreign on any class (plan U6). Never
+        bumped by an admission. Surfaced at every /status tier beside
+        ``caller_principal_absent_total``. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_refused_total += 1
 
     def increment_shared_foreign_lag_suppressed(self) -> None:
         """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
@@ -1397,6 +1467,7 @@ class CoordinatorHTTPServer:
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
             "caller_principal_absent_total": self._caller_principal_absent_total,
+            "caller_principal_refused_total": self._caller_principal_refused_total,
             "auth_401_total": self._auth_401_total,
         }
 

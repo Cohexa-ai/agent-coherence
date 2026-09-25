@@ -25,7 +25,7 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
-from ccs.cli import coherence_hook_client
+from ccs.cli import _coherence_client, coherence_hook_client
 
 
 @pytest.fixture
@@ -682,11 +682,14 @@ def test_session_start_builder_exception_emits_empty(
 # Caller principal (caller-principal plan, U5)
 #
 # The hook client is one process per hook event, so the principal of a
-# session lives on disk: the mint nonce, then the principal, each created
-# exclusively at 0600 in the existing 0700 ``.coherence/``, keyed by the
-# PARENT session's derived id. What that buys on the hook surface is
+# session lives on disk: the mint nonce (created exclusively, never replaced),
+# then the principal (replaced only by what a claim with that nonce returns),
+# each at 0600 in the existing 0700 ``.coherence/``, keyed by the PARENT
+# session's derived id. What that buys on the hook surface is
 # convention-enforcement and a detectable unbound caller — any process that
 # can read ``.coherence/`` can read these files — never caller separation.
+# The recovery of a refused principal is pinned in
+# tests/test_caller_principal_client_recovery.py.
 # ----------------------------------------------------------------------
 
 import http.server  # noqa: E402
@@ -862,20 +865,23 @@ def test_ensure_mint_nonce_racers_adopt_one_nonce(tmp_path: Path) -> None:
         warnings.warn("no racer lost the exclusive create this run", RuntimeWarning, stacklevel=2)
 
 
-def test_a_foreign_stored_principal_is_reported_and_never_re_minted(
+def test_a_foreign_stored_principal_is_recovered_with_the_sessions_own_nonce(
     inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A stored principal the coordinator refuses as foreign is REPORTED
-    (stderr) and left exactly where it is: the client does not delete it and
-    claim again — that would reopen the first-claim gate the mint nonce
-    closes. The hook still exits 0 and prints ``{}`` (never blocks a tool)."""
+    """A stored principal the coordinator refuses as foreign (here: another
+    session's) is recovered by claiming again with THIS session's stored
+    nonce — never a new one, and the nonce file is left exactly as it was.
+    That claim returns this session's own binding, which replaces the stored
+    file, and the refused stop is retried once and admitted. One claim, no
+    re-mint, nothing printed — and no principal or nonce in the output."""
     workspace, server = inproc_coordinator
     sid, other = _sid(), _sid()
     for session in (sid, other):
         rc, _ = _drive("session-stop", {"session_id": session}, workspace, monkeypatch, capsys)
         assert rc == 0
     nonce_file, principal_file = _principal_files(workspace, sid)
+    own = principal_file.read_text().strip()
     foreign = _principal_files(workspace, other)[1].read_text()
     principal_file.write_text(foreign)
     nonce_before = nonce_file.read_text()
@@ -885,11 +891,14 @@ def test_a_foreign_stored_principal_is_reported_and_never_re_minted(
     rc = coherence_hook_client.main(["session-stop", "--root", str(workspace)])
     captured = capsys.readouterr()
 
-    assert rc == 0 and captured.out.strip() == "{}"
-    assert "caller_principal_foreign" in captured.err
-    assert principal_file.read_text() == foreign
+    assert rc == 0 and json.loads(captured.out).get("ok") is True, captured
+    assert captured.err == ""
+    assert principal_file.read_text().strip() == own
+    assert server.registry.get_caller_principal(caller_principal_identity(sid)) == own
     assert nonce_file.read_text() == nonce_before
-    assert _claims(server) == claims_before
+    assert _claims(server) == claims_before + 1
+    for secret in (own, foreign.strip(), nonce_before.strip()):
+        assert secret not in captured.out + captured.err
 
 
 def test_a_claimed_session_is_reported_and_never_re_minted(
@@ -1029,7 +1038,7 @@ def test_an_older_client_that_never_claims_is_admitted_and_its_write_recorded(
     (workspace / "plan.md").write_text("plan v1")
     sid = _sid()
     monkeypatch.setattr(
-        coherence_hook_client, "obtain_stored_principal", lambda *_a, **_k: None
+        _coherence_client, "obtain_stored_principal", lambda *_a, **_k: None
     )
     payload = _edit_payload(workspace, sid, agent_id="sub-1")
     rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
@@ -1073,9 +1082,13 @@ def test_a_request_without_a_principal_naming_a_claimed_session_is_refused(
     version = server.registry.get_artifact(artifact_id).version
     assert server.registry.get_state_map(artifact_id)[peer_agent].name == "EXCLUSIVE"
 
+    # The forger reads neither of the peer's stored files: not the principal,
+    # and not the mint nonce a stored-principal client re-claims with on a
+    # refusal (R20) — on this surface either is one read of .coherence/ away.
     monkeypatch.setattr(
-        coherence_hook_client, "obtain_stored_principal", lambda *_a, **_k: None
+        _coherence_client, "obtain_stored_principal", lambda *_a, **_k: None
     )
+    monkeypatch.setattr(_coherence_client, "load_mint_nonce", lambda *_a, **_k: None)
     (workspace / "plan.md").write_text("plan v3 by a forger")
     rc, commit = _drive("post-edit", payload, workspace, monkeypatch, capsys)
     rc, stop = _drive("session-stop", {"session_id": peer}, workspace, monkeypatch, capsys)

@@ -1,6 +1,6 @@
 {
   "name": "caller-principal-python-post-edit-refuses-an-absent-principal",
-  "description": "post-edit commits a version and records last_writer_id under the named session. The first preflight CLAIMS session A; its pre-edit (accept-class) is admitted without the principal, but the commit naming the now-bound A without it is refused. Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
+  "description": "post-edit commits a version and records last_writer_id under the named session. Session A pre-edits while it is still UNBOUND (admitted on both backends, as an older client's), then CLAIMS; the commit naming the now-bound A without its principal is refused with the typed absent reason. The pre-edit comes first on purpose: pre-edit is require-class too, so after the claim it would be refused as well, and a refused preflight is not an error the harness reports. Twin of the Node row with the identical setup and request (08). Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -11,21 +11,18 @@
     "preflight_requests": [
       {
         "method": "POST",
-        "path": "/principal/claim",
-        "body": {
-          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
-          "mint_nonce": "corpus-mint-nonce-a"
-        },
-        "capture": {
-          "principal_a": "principal"
-        }
-      },
-      {
-        "method": "POST",
         "path": "/hooks/pre-edit",
         "body": {
           "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
           "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
         }
       }
     ]
@@ -43,7 +40,8 @@
   "expected": {
     "status": 400,
     "body": {
-      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)"
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+      "reason": "caller_principal_absent"
     }
   },
   "backends": [

@@ -66,6 +66,7 @@ from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
     CALLER_PRINCIPAL_REASONS,
+    CALLER_PRINCIPAL_REFUSAL_REASONS,
     HOLD_REASONS,
     SESSION_CAP_EXCEEDED_REASON,
     CallerPrincipalRefused,
@@ -329,6 +330,23 @@ def test_refusal_reasons_are_distinct_and_never_a_hold() -> None:
     }
     assert len(CALLER_PRINCIPAL_REASONS) == 3
     assert CALLER_PRINCIPAL_REASONS.isdisjoint(HOLD_REASONS)
+
+
+def test_a_route_refusal_carries_exactly_the_two_route_reasons() -> None:
+    """The typed ``reason`` a route's 400 carries — what a client classifies a
+    refusal by, and what its recovery (re-claim with its own nonce, retry once)
+    keys on — is absent or foreign, never the mint's ``claimed``. Pinned against
+    a frozen literal AND against the coordinator's refusal table, so a refusal
+    the gate can send cannot fall outside the set a client matches."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_ERRORS
+
+    assert CALLER_PRINCIPAL_REFUSAL_REASONS == {
+        "caller_principal_absent", "caller_principal_foreign",
+    }
+    assert set(_CALLER_PRINCIPAL_ERRORS) == CALLER_PRINCIPAL_REFUSAL_REASONS
+    assert CALLER_PRINCIPAL_REFUSAL_REASONS < CALLER_PRINCIPAL_REASONS
+    assert CALLER_PRINCIPAL_CLAIMED_REASON not in CALLER_PRINCIPAL_REFUSAL_REASONS
+    assert CALLER_PRINCIPAL_REFUSAL_REASONS.isdisjoint(HOLD_REASONS)
 
 
 # ---------------------------------------------------------------------------

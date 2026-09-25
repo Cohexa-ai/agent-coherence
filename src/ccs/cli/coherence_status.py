@@ -167,11 +167,8 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     """
     import uuid as _uuid
 
-    from ccs.cli._coherence_client import (
-        caller_principal_headers,
-        obtain_stored_principal,
-    )
-    from ccs.cli._coherence_client import post as _post
+    from ccs.cli._coherence_client import post_with_stored_principal
+    from ccs.core.exceptions import CallerPrincipalRefused
 
     try:
         endpoint = resolve_endpoint(root)
@@ -190,18 +187,18 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     sid_b = str(_uuid.uuid5(ns, "self-test-B"))
     path = "plan.md"  # part of DEFAULT_TRACKED_PATTERNS
 
-    # Each synthetic session presents its caller principal as a hook would:
-    # stored under .coherence/ and claimed once, so a re-run against the same
-    # workspace re-presents the principal its first run obtained (the commit
-    # in step 3 is on a route that requires one).
-    principals = {
-        sid: obtain_stored_principal(endpoint, root, sid, report=err) for sid in (sid_a, sid_b)
-    }
-
+    # Each synthetic session presents its caller principal exactly as a hook
+    # does (the same client path): stored under .coherence/ and claimed once,
+    # so a re-run against the same workspace re-presents the principal its
+    # first run obtained (pre-edit and post-edit require one) — and a stored
+    # principal the coordinator no longer holds (state.db was reset) is
+    # recovered with the session's stored nonce rather than failing every run.
     def _step(name: str, body: dict[str, Any]) -> dict[str, Any] | None:
-        headers = caller_principal_headers(principals[body["session_id"]])
         try:
-            return _post(endpoint, name, body, extra_headers=headers)
+            return post_with_stored_principal(endpoint, root, name, body, report=err)
+        except CallerPrincipalRefused as exc:
+            err(f"--self-test: {name} refused: {exc}")
+            return None
         except urllib.error.HTTPError as exc:
             err(f"--self-test: {name} returned HTTP {exc.code}")
             return None

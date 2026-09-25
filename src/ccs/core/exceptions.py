@@ -356,7 +356,10 @@ CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 # :data:`HOLD_REASONS`: a principal refusal is a client error, never a hold — a
 # hold invites a retry, and no retry supplies a principal the caller never had.
 CALLER_PRINCIPAL_ABSENT_REASON = "caller_principal_absent"
-"""The request names an identity but presents no caller principal."""
+"""The request names an identity but presents no caller principal. On the wire
+a route sends it only for an identity that is BOUND: a request presenting none
+for an identity nobody has claimed is a client predating the principal, and is
+admitted (KTD15)."""
 
 CALLER_PRINCIPAL_FOREIGN_REASON = "caller_principal_foreign"
 """The request presents a caller principal that is not the one bound to the
@@ -375,6 +378,16 @@ CALLER_PRINCIPAL_REASONS: frozenset[str] = frozenset(
         CALLER_PRINCIPAL_CLAIMED_REASON,
     }
 )
+
+CALLER_PRINCIPAL_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {CALLER_PRINCIPAL_ABSENT_REASON, CALLER_PRINCIPAL_FOREIGN_REASON}
+)
+"""The ``reason`` a route's principal refusal carries: HTTP 400 with the body
+``{"error": <prose>, "reason": <one of these>}``. A client classifies the
+refusal by membership here, never by a substring of ``error``. A refused request
+changed nothing — the gate runs before any mutation — so a client may retry it
+once it holds the right principal. ``caller_principal_claimed`` is not one of
+these: it answers a mint claim, in an HTTP 200 ``{ok: false}`` body."""
 
 # ---------------------------------------------------------------------------
 # MCP-C deny vocabulary (stale-write-guard-fs, 2026-06-18 plan, Unit 1)

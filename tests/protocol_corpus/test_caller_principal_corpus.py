@@ -56,7 +56,7 @@ from tests.protocol_corpus.harness import (
 pytestmark = pytest.mark.protocol_corpus
 
 _FIXTURE_DIR = "caller_principal"
-_EXPECTED_FIXTURE_COUNT = 16
+_EXPECTED_FIXTURE_COUNT = 18
 _HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
 
 _NODE_DIST_PATH = resolve_node_dist_path()
@@ -112,23 +112,59 @@ def test_fixture_directory_is_actually_loaded() -> None:
 def test_the_asymmetry_is_recorded_on_both_sides() -> None:
     """KTD12 in the corpus, stated as pairs: for each require-class check the
     corpus pins, a Python row that REFUSES and a Node row that ADMITS the same
-    request — and a Node row pinning the 404 on the mint. A pair with one side
-    missing would let either runtime drift silently."""
+    request after the same setup — and a Node row pinning the 404 on the mint.
+    A pair with one side missing would let either runtime drift silently.
+
+    The pair is a control only while EVERYTHING before the answer matches:
+    the setup as well as the request. And the setup must claim the session the
+    request names, unscoped and capture-free, so it runs on Node too (where it
+    answers 404): without the claim the session is unbound, Python admits it
+    as well (KTD15), and the "Node" row records nothing Python does not also
+    do — which is what fixtures 04 and 08 once did, green on both runtimes."""
     by_name = {f.name: f for f in _fixtures()}
     pairs = [
         ("caller-principal-python-session-stop-refuses-an-absent-principal",
          "caller-principal-node-session-stop-admits-an-absent-principal"),
         ("caller-principal-python-post-edit-refuses-an-absent-principal",
          "caller-principal-node-post-edit-admits-an-absent-principal"),
+        ("caller-principal-python-pre-edit-refuses-an-absent-principal",
+         "caller-principal-node-pre-edit-admits-an-absent-principal"),
     ]
     for python_name, node_name in pairs:
         refuse, admit = by_name[python_name], by_name[node_name]
         assert refuse.backends == (BACKEND_PYTHON,) and admit.backends == (BACKEND_NODE,)
         assert refuse.request == admit.request, "the pair is a control only while the requests match"
+        assert refuse.setup == admit.setup, "…and only while the setups match"
+        assert _HEADER not in (refuse.request.get("headers") or {}), python_name
+        claims = [
+            req for req in refuse.setup.get("preflight_requests") or []
+            if req["path"] == "/principal/claim"
+        ]
+        assert [req["body"]["session_id"] for req in claims] == [
+            refuse.request["body"]["session_id"]
+        ], f"{python_name}: the setup must claim the session the request names"
+        assert all("backends" not in req and "capture" not in req for req in claims), (
+            f"{python_name}: a scoped or capturing claim never reaches Node"
+        )
         assert refuse.expected["status"] == 400 and admit.expected["status"] == 200
+        assert refuse.expected["body"].get("reason") == "caller_principal_absent"
     mint = by_name["caller-principal-node-sibling-does-not-implement-claim-404"]
     assert mint.backends == (BACKEND_NODE,) and mint.expected["status"] == 404
     assert "headers" not in mint.request, "the bearer must stay the harness's valid one"
+
+
+def test_every_principal_refusal_row_carries_its_typed_reason() -> None:
+    """The refusal's wire contract: HTTP 400 with ``error`` (the prose every
+    non-200 carries) AND a typed ``reason`` a client classifies by equality.
+    Every 400 row here pins both, and the two agree, so a Python refusal that
+    dropped the key — the one field the clients branch on — goes red."""
+    refusals = [f for f in _fixtures() if f.expected["status"] == 400]
+    assert len(refusals) == 5
+    for row in refusals:
+        body = row.expected["body"]
+        assert set(body) == {"error", "reason"}, row.name
+        assert body["reason"] in {"caller_principal_absent", "caller_principal_foreign"}
+        assert body["error"].endswith(f"({body['reason']})"), row.name
 
 
 def test_the_node_rows_cannot_be_satisfied_by_a_skip() -> None:
@@ -217,9 +253,9 @@ def test_a_python_refusal_row_binds_the_identity_it_refuses() -> None:
     clients."""
     absent_rows = [
         f for f in _fixtures()
-        if "caller_principal_absent" in str(f.expected["body"].get("error", ""))
+        if f.expected["body"].get("reason") == "caller_principal_absent"
     ]
-    assert len(absent_rows) == 2
+    assert len(absent_rows) == 3
     for row in absent_rows:
         claimed = {
             req["body"]["session_id"]

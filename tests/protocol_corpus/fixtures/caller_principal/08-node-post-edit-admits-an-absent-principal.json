@@ -1,6 +1,6 @@
 {
   "name": "caller-principal-node-post-edit-admits-an-absent-principal",
-  "description": "KTD12 -- the Node side of fixture 07: the identical commit is admitted.",
+  "description": "KTD12 -- the Node side of fixture 07, with the identical setup and request: pre-edit, a claim Node answers 404, then the commit without a principal. Node admits the commit Python refuses. Unlike fixture 15 (no claim, so unbound on both runtimes), the claim is what separates the two answers.",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -15,6 +15,14 @@
         "body": {
           "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
           "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
         }
       }
     ]

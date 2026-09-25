@@ -846,6 +846,92 @@ def test_a_principal_appears_only_on_the_mint_response(
         assert principal.encode() not in path.read_bytes(), path
 
 
+def test_a_refused_request_carries_no_principal_into_any_log_body_or_status_tier(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R5 on the REFUSAL path — the branch most likely to grow a diagnostic,
+    and one the admitted-traffic guard above never reaches. Every refusal shape
+    is driven: an absent principal naming a bound session, a caller presenting
+    its OWN valid principal against a peer's session (require and accept
+    class), the peer's principal against the caller's session, and a valid
+    principal presented for a session nobody claimed. Each answers 400 with its
+    typed reason, and neither principal appears in any response body, any
+    /status tier, any log record at any level — message, arguments or
+    traceback — or the state log.
+
+    Control: the capture sees the refusal path. Each refusal left a record
+    naming its reason, so "not in the log" is measured against a log that
+    recorded the refusals, not one that never saw them."""
+    caplog.set_level(logging.DEBUG)
+    state_log: list[dict] = []
+    server = CoordinatorHTTPServer(
+        tmp_path, port=0, instance_id="r5-refused", state_log=state_log.append
+    )
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        caller, peer, unclaimed = _sid("r5-refused-caller"), _sid("r5-refused-peer"), _sid("r5-none")
+        _, minted = _claim_wire(client, caller, secrets.token_urlsafe(32))
+        caller_principal = minted["principal"]
+        _, minted = _claim_wire(client, peer, secrets.token_urlsafe(32))
+        peer_principal = minted["principal"]
+        h = hashlib.sha256(b"refused").hexdigest()
+        absent, foreign = "caller_principal_absent", "caller_principal_foreign"
+        refusals = [
+            ("/hooks/session-stop", {"session_id": peer}, None, absent),
+            ("/hooks/pre-edit", {"session_id": peer, "path": "r5.md"}, None, absent),
+            ("/hooks/post-edit", {"session_id": peer, "path": "r5.md", "success": True,
+                                  "content_hash": h}, caller_principal, foreign),
+            ("/hooks/session-stop", {"session_id": peer}, caller_principal, foreign),
+            ("/hooks/effect-fence", {"session_id": peer, "path": "r5.md",
+                                     "expected_version": 1, "expected_generation": 0,
+                                     "content_hash": h}, caller_principal, foreign),
+            ("/hooks/pre-read", {"session_id": peer, "path": "r5.md"}, caller_principal, foreign),
+            ("/hooks/session-stop", {"session_id": caller}, peer_principal, foreign),
+            ("/hooks/post-edit-cas", {"session_id": unclaimed, "path": "r5.md",
+                                      "content_hash": h, "expected_version": 0},
+             caller_principal, foreign),
+        ]
+        bodies = []
+        for path, body, principal, reason in refusals:
+            status, answer = client.post(path, body, principal=principal)
+            assert (status, answer.get("reason")) == (400, reason), (path, answer)
+            bodies.append(json.dumps(answer))
+        for query, headers in (
+            ("/status", None),
+            ("/status?detail=metrics", None),
+            ("/status?detail=full", {"Coherence-Local-Operator": "true"}),
+        ):
+            status, answer = client.request("GET", query, headers_override=headers)
+            assert status == 200, (query, answer)
+            bodies.append(json.dumps(answer))
+    finally:
+        server.shutdown()
+
+    principals = (caller_principal, peer_principal)
+    assert len(set(principals)) == 2 and all(principals)
+    for body in bodies:
+        for principal in principals:
+            assert principal not in body
+    rendered = [
+        f"{r.levelname} {r.name} {r.getMessage()} {r.args!r} {r.exc_text or ''}"
+        for r in caplog.records
+    ]
+    for reason in (absent, foreign):
+        expected = sum(1 for *_rest, r in refusals if r == reason)
+        seen = sum(1 for line in rendered if reason in line)
+        assert seen >= expected, (
+            f"{seen} records name {reason} for {expected} refusals: the capture "
+            f"cannot see the refusal path, so its silence proves nothing"
+        )
+    for line in rendered:
+        for principal in principals:
+            assert principal not in line
+    for principal in principals:
+        assert principal not in json.dumps(state_log)
+
+
 def test_a_degraded_mint_reads_as_failure_and_carries_no_principal(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

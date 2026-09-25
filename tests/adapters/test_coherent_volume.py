@@ -2516,10 +2516,14 @@ def test_real_fork_child_releases_nothing_and_the_parent_keeps_its_grant(
 # Caller principal (caller-principal plan, U5 / KTD14)
 #
 # A volume is a LONG-LIVED caller: it claims its session's principal once, at
-# attach, holds it (and the mint nonce) in memory only, and presents it on
-# every request — so its binding is genuine, not a file any process could read
-# (KTD5). The session is stable across re-mints (U9), so a re-mint claims
-# nothing; a forked child is a new session and claims its own.
+# attach, holds it (and the mint nonce) in memory, and presents it on every
+# request — it never looks a principal up by the identity it names (KTD5). That
+# is accident-resistance, not unreadability: the coordinator stores every
+# principal it issued in ``.coherence/state.db``, which any process of the same
+# OS user can read. The session is stable across re-mints (U9), so a re-mint
+# claims nothing; a forked child is a new session and claims its own. A claim
+# whose answer was lost, and a principal the coordinator refuses, are recovered
+# by claiming again with the SAME nonce (R20) — never by minting a new one.
 # ---------------------------------------------------------------------------
 
 import json  # noqa: E402
@@ -2708,30 +2712,33 @@ def test_a_coordinator_that_issues_no_principals_leaves_the_volume_headerless(
         stop_coordinator(tmp_path)
 
 
-@pytest.mark.parametrize("outcome", ["refused", "unconfirmed"])
-def test_a_claim_not_bound_at_attach_fails_closed_and_is_never_re_minted(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, outcome: str
+def test_a_claim_refused_at_attach_fails_closed_and_is_never_claimed_again(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A claim that did not bind routes through ``on_error`` like any other
-    coordinator failure: strict raises at construction; degrade warns once
-    and runs without a principal. Either way nothing claims again — not the
-    re-mint, not a reacquire — because a second claim with a new nonce is
-    exactly what first-claim-wins refuses (KTD11)."""
+    """A claim refused because the session is already bound under ANOTHER
+    nonce routes through ``on_error``: strict raises (typed, reason
+    ``caller_principal_claimed``); degrade warns once and runs without a
+    principal. Nothing claims again for that session — not the re-mint, not a
+    reacquire, not a write — because every retry would present the same nonce
+    and meet the same first-claim refusal (KTD11); a new nonce would be a
+    second claimant."""
     from ccs.cli._coherence_client import PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
 
     calls: list[str] = []
 
-    def not_bound(_endpoint: object, session_id: str, _nonce: str) -> PrincipalClaim:
+    def refused(_endpoint: object, session_id: str, _nonce: str) -> PrincipalClaim:
         calls.append(session_id)
-        return PrincipalClaim(outcome, detail="simulated")  # type: ignore[arg-type]
+        return PrincipalClaim("refused", detail="caller_principal_claimed")
 
     monkeypatch.setattr(
-        coherent_volume_module, "claim_caller_principal", not_bound, raising=False
+        coherent_volume_module, "claim_caller_principal", refused, raising=False
     )
     _seed(tmp_path, content=b"v1")
     try:
-        with pytest.raises(CoherenceError, match="caller principal"):
+        with pytest.raises(CallerPrincipalRefused, match="caller principal") as raised:
             CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        assert raised.value.reason == "caller_principal_claimed"
         calls.clear()
         with pytest.warns(CoherenceDegradedWarning):
             vol = CoherentVolume(
@@ -2740,6 +2747,291 @@ def test_a_claim_not_bound_at_attach_fails_closed_and_is_never_re_minted(
         assert vol._principal is None
         vol._remint()
         vol.reacquire("data/shared.txt")
+        vol.write("data/shared.txt", b"v2")
         assert len(calls) == 1
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_an_unconfirmed_claim_is_re_presented_with_the_same_nonce_until_it_settles(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``unconfirmed`` claim may have bound (R20): strict still raises at
+    construction; degrade warns once — and before each later request the
+    volume claims AGAIN with the SAME nonce, never a new one, until an answer
+    settles it. A retry with the held nonce is the recovery R20 describes, not
+    a re-mint: it adds no binding. Here the answer never settles, so every
+    request is preceded by a claim, all presenting one nonce, and the volume
+    stays without a principal (the session is unbound, so KTD15 admits it)."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    nonces: list[str] = []
+
+    def unconfirmed(_endpoint: object, _session_id: str, nonce: str) -> PrincipalClaim:
+        nonces.append(nonce)
+        return PrincipalClaim("unconfirmed", detail="simulated")
+
+    monkeypatch.setattr(
+        coherent_volume_module, "claim_caller_principal", unconfirmed, raising=False
+    )
+    _seed(tmp_path, content=b"v1")
+    try:
+        with pytest.raises(CoherenceError, match="caller principal"):
+            CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        nonces.clear()
+        with pytest.warns(CoherenceDegradedWarning):
+            vol = CoherentVolume(
+                tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+            )
+        vol.reacquire("data/shared.txt")
+        vol.write("data/shared.txt", b"v2")
+        assert len(nonces) >= 3, nonces
+        assert set(nonces) == {vol._mint_nonce}
+        assert vol._principal is None
+        assert (tmp_path / "data/shared.txt").read_bytes() == b"v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- R20 on the long-lived surface: a lost answer, a refused principal -------
+
+
+def _lose_the_first_claims_answer(
+    monkeypatch: pytest.MonkeyPatch, nonces: list[str]
+) -> list[object]:
+    """The first claim REACHES the coordinator and binds; its answer is lost
+    (reported ``unconfirmed``, as a transport failure after the commit or a
+    late bind after the watchdog would be). Later claims pass through. Every
+    nonce presented is recorded; the real answers are returned for asserting."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    real = coherent_volume_module.claim_caller_principal
+    answers: list[object] = []
+
+    def lossy(endpoint: object, session_id: str, nonce: str) -> object:
+        nonces.append(nonce)
+        claim = real(endpoint, session_id, nonce)
+        answers.append(claim)
+        if len(nonces) == 1:
+            assert claim.outcome == "bound", "control: the lost claim really bound"
+            return PrincipalClaim("unconfirmed", detail="answer lost")
+        return claim
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", lossy)
+    return answers
+
+
+def _assert_no_secret_in(text: str, *secrets: object) -> None:
+    """R5 on the client: no principal and no mint nonce in anything the volume
+    logs, warns or raises."""
+    for secret in secrets:
+        assert isinstance(secret, str) and secret, "control: a real value to look for"
+        assert secret not in text, "a principal or nonce reached the volume's output"
+
+
+def test_a_claim_whose_answer_was_lost_is_recovered_before_the_next_request(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Degrade mode, the bind committed but its answer was lost: the volume
+    re-presents the SAME nonce before its next request, gets back the very
+    principal the lost claim bound, and its write is RECORDED (the version
+    advances). Before, it ran for its whole lifetime without the principal
+    its bound session requires: every commit refused, bytes on disk the
+    coordinator never recorded, one warning and then silence."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    nonces: list[str] = []
+    answers = _lose_the_first_claims_answer(monkeypatch, nonces)
+    caplog.set_level(logging.DEBUG)
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as warned:
+            vol = CoherentVolume(
+                tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+            )
+        assert vol._principal is None, "control: the answer was lost"
+        vol.read(rel)
+        vol.write(rel, b"v2")
+        _data, version = vol.read_with_version(rel)
+
+        assert version == 2, "the write was recorded"
+        assert len(nonces) == 2 and len(set(nonces)) == 1
+        assert vol._principal == answers[0].principal  # type: ignore[attr-defined]
+        assert vol.degradation_count == 1
+        _assert_no_secret_in(
+            caplog.text + " ".join(str(w.message) for w in warned),
+            vol._principal, vol._mint_nonce,
+        )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_forked_childs_lost_claim_answer_is_recovered_on_its_next_operation(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict mode, the post-fork child (the fork handler run directly): its
+    re-attach claim binds but the answer is lost, so that operation raises.
+    The next one re-presents the child's SAME nonce, obtains the principal
+    its session is bound to, and its write is recorded — it does not run on
+    for its lifetime with every require-class request refused."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        nonces: list[str] = []
+        answers = _lose_the_first_claims_answer(monkeypatch, nonces)
+        vol._after_fork()
+        with pytest.raises(CoherenceError, match="caller principal"):
+            vol.read(rel)
+        vol.read(rel)
+        vol.write(rel, b"v2-child")
+        _data, version = vol.read_with_version(rel)
+
+        assert version == 2
+        assert len(nonces) == 2 and len(set(nonces)) == 1
+        assert vol._principal == answers[0].principal  # type: ignore[attr-defined]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_refused_principal_is_re_claimed_with_the_same_nonce_and_retried_once(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The volume presents a principal the coordinator does not hold for its
+    session (as after its binding store was reset): the request is refused
+    as foreign, the volume claims with its SAME nonce, adopts the principal
+    that claim returns, and retries the refused request ONCE — the write
+    lands and is recorded, with one claim and no new nonce."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        bound, nonce = vol._principal, vol._mint_nonce
+        stale = "X" * 43
+        nonces: list[str] = []
+        real_claim = coherent_volume_module.claim_caller_principal
+        monkeypatch.setattr(
+            coherent_volume_module, "claim_caller_principal",
+            lambda ep, sid, n: (nonces.append(n), real_claim(ep, sid, n))[1],
+        )
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+        vol._principal = stale
+
+        vol.write(rel, b"v2")
+        _data, version = vol.read_with_version(rel)
+
+        assert version == 2
+        assert nonces == [nonce]
+        assert vol._principal == bound
+        refused = [route for route, p in sent if p == stale]
+        assert len(refused) == 1, sent
+        assert sent[1] == (refused[0], bound), "the refused request is retried once"
+        _assert_no_secret_in(caplog.text, bound, stale, nonce)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _refuse_route(
+    monkeypatch: pytest.MonkeyPatch, route: str, reason: str, sent: list[str]
+) -> None:
+    """Every request to ``route`` is refused with the typed principal refusal;
+    every other request is forwarded. Records each route sent."""
+    import io as _io
+    import urllib.error
+
+    real_post = coherent_volume_module._coordinator_post
+
+    def refusing(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        sent.append(path)
+        if path == route:
+            body = json.dumps({"error": f"refused ({reason})", "reason": reason}).encode()
+            raise urllib.error.HTTPError(path, 400, "Bad Request", {}, _io.BytesIO(body))  # type: ignore[arg-type]
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refusing)
+
+
+def test_a_refusal_the_same_nonce_cannot_cure_raises_the_typed_refusal(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the claim with the held nonce hands back the very principal the
+    coordinator refused, the refusal is not about staleness: strict raises
+    :class:`CallerPrincipalRefused` carrying the wire ``reason`` (never an
+    untyped 'HTTP Error 400'), after one claim and WITHOUT resending the
+    request. The message carries neither the principal nor the nonce."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        claims: list[str] = []
+        _count_claims(monkeypatch, claims)
+        sent: list[str] = []
+        _refuse_route(monkeypatch, "/hooks/pre-edit", "caller_principal_foreign", sent)
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+
+        assert raised.value.reason == "caller_principal_foreign"
+        assert sent.count("/hooks/pre-edit") == 1
+        assert claims == [vol.session_id]
+        assert (tmp_path / rel).read_bytes() == b"v1"
+        _assert_no_secret_in(
+            str(raised.value) + caplog.text, vol._principal, vol._mint_nonce
+        )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_session_bound_under_another_nonce_is_reported_and_never_re_claimed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, on_error: str,
+) -> None:
+    """The volume no longer holds the nonce its session was bound with, so its
+    claim is refused as ``caller_principal_claimed``: the refused request is
+    reported (strict: the typed refusal; degrade: warned once and counted)
+    and the volume stops — the next refusal does NOT claim again, so a
+    permanently refused session costs no round trip per request."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        bound = vol._principal
+        vol._mint_nonce, vol._principal = "Z" * 43, None
+        claims: list[str] = []
+        _count_claims(monkeypatch, claims)
+        raised_text = ""
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                if on_error == "strict":
+                    with pytest.raises(CallerPrincipalRefused) as raised:
+                        vol.write(rel, b"v2")
+                    assert raised.value.reason == "caller_principal_absent"
+                    raised_text += str(raised.value)
+                else:
+                    vol.write(rel, b"v2")
+        assert claims == [vol.session_id]
+        if on_error == "degrade":
+            degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+            assert len(degraded) == 1, "warned once"
+            assert vol.degradation_count >= 2, "every refusal is counted"
+        _assert_no_secret_in(
+            raised_text + caplog.text + " ".join(str(w.message) for w in warned),
+            bound, "Z" * 43,
+        )
     finally:
         stop_coordinator(tmp_path)

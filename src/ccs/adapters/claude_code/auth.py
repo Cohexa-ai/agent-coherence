@@ -27,6 +27,7 @@ Threat model:
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import ipaddress
 import logging
@@ -313,12 +314,23 @@ def load_secret(coordinator_root: Path) -> str | None:
 # caller (plan KTD5):
 #
 # - a LONG-LIVED caller (``CoherentVolume``, a direct client) mints once and
-#   holds the principal in memory for its lifetime, so the binding is genuine;
+#   holds the principal in memory for its lifetime: it never looks a principal
+#   up by the identity it names, so it cannot present another identity's by
+#   accident. That is accident-resistance, not unreadability — the coordinator
+#   stores every principal it issued in ``.coherence/state.db``, which any
+#   process of the same OS user can read;
 # - a ONE-SHOT caller (the hook client: one process per hook event) can keep it
 #   only on disk, in this ``0700`` directory, keyed by the identity it claims.
 #   Any process that can read ``.coherence/`` can read it for any identity.
 #   There the principal buys convention-enforcement and a detectable unbound
 #   caller — never separation between callers of the same OS user.
+#
+# The nonce file is created once, exclusively, and never replaced or removed:
+# it is what proves a later claim is a retry of the first (R20). The principal
+# file is a cache of what a claim presenting that nonce returned, so it IS
+# replaced — atomically, and only with such a claim's answer — when the
+# coordinator no longer holds the value it caches (its store was reset) or the
+# file was torn.
 
 CALLER_PRINCIPAL_HEADER = "Coherence-Caller-Principal"
 """Request header carrying the caller principal. Named in the style of
@@ -345,6 +357,29 @@ _PRINCIPAL_VALUE_ALPHABET = frozenset(
 _IDENTITY_KEY_ALPHABET = frozenset("0123456789abcdef")
 
 
+TORN_FILE_GRACE_SEC = 2.0
+"""How long an existing but incomplete nonce file is treated as a racer's write
+still in progress. The exclusive create and the write are two steps, so a
+reader can see the file between them; a YOUNG torn file is waited on (the
+bounded ``ENSURE_SECRET_*`` retry) so a loser adopts the winner's nonce instead
+of treating the half-written file as final. An OLDER one is treated as
+abandoned — its writer was killed, or ran out of space — and reported at once
+rather than charging every later hook of the session the whole bounded wait.
+The rule is safe whichever it really is: after the wait the outcome of an
+unreadable nonce is the same as without it (no principal this invocation, and
+the file is never overwritten), so the grace decides only whether to wait.
+Sized at 25 times the bounded wait (4 x 20 ms)."""
+
+
+_NONCE_REMEDIATION = (
+    "The session runs without a principal until it is fixed: remove {path} by "
+    "hand if no hook of this session is running."
+)
+"""The operator step a :class:`MintNonceUnavailable` names, as the
+``hook.secret`` error does: the file is never repaired automatically, and the
+Node client prints the same guidance (parity)."""
+
+
 class MintNonceUnavailable(RuntimeError):
     """The mint-nonce file exists but never became readable within the
     bounded wait — a racer that created it and never wrote it. Like
@@ -369,6 +404,17 @@ def _read_principal_value(path: Path) -> str | None:
     return value
 
 
+def _is_past_grace(path: Path) -> bool:
+    """Whether an existing ``path`` was last written longer ago than
+    :data:`TORN_FILE_GRACE_SEC`. A file that vanished, or whose clock reads in
+    the future, is not past it — waiting is the safe default."""
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age > TORN_FILE_GRACE_SEC
+
+
 def _create_exclusive(path: Path, value: str) -> bool:
     """Create ``path`` holding ``value`` with ``O_CREAT|O_EXCL`` at ``0600``
     (the ``hook.secret`` discipline). ``False`` if it already existed; an
@@ -391,7 +437,9 @@ def ensure_mint_nonce(coordinator_root: Path, identity_key: str) -> str:
     nonce and the coordinator hands both the same principal. Never creates
     ``.coherence/`` (a hook client never does; ``OSError`` propagates when it
     is missing). Raises :class:`MintNonceUnavailable` if an existing file stays
-    unreadable across the bounded retry."""
+    unreadable across the bounded retry — at once, without waiting, when the
+    file is older than :data:`TORN_FILE_GRACE_SEC` and so treated as an
+    abandoned write rather than one still in progress."""
     path = _principal_file(coordinator_root, identity_key, ".nonce")
     for attempt in range(ENSURE_SECRET_MAX_RETRIES):
         existing = _read_principal_value(path)
@@ -400,12 +448,26 @@ def ensure_mint_nonce(coordinator_root: Path, identity_key: str) -> str:
         candidate = secrets.token_urlsafe(32)
         if _create_exclusive(path, candidate):
             return candidate
+        if _is_past_grace(path):
+            raise MintNonceUnavailable(
+                f"{path} exists but holds no complete nonce (an interrupted "
+                f"write); not overwriting it. {_NONCE_REMEDIATION.format(path=path)}"
+            )
         if attempt + 1 < ENSURE_SECRET_MAX_RETRIES:
             time.sleep(ENSURE_SECRET_RETRY_SLEEP_SEC)
     raise MintNonceUnavailable(
-        f"{path.name} exists but stayed unreadable across "
-        f"{ENSURE_SECRET_MAX_RETRIES} attempts; not overwriting it"
+        f"{path} exists but stayed unreadable across "
+        f"{ENSURE_SECRET_MAX_RETRIES} attempts; not overwriting it. "
+        f"{_NONCE_REMEDIATION.format(path=path)}"
     )
+
+
+def load_mint_nonce(coordinator_root: Path, identity_key: str) -> str | None:
+    """The mint nonce stored for ``identity_key``, or ``None``. Never creates
+    one: recovering a refused principal re-claims only with the nonce the
+    session already persisted — a nonce generated at recovery time would be a
+    second claimant, which first-claim-wins refuses (KTD11)."""
+    return _read_principal_value(_principal_file(coordinator_root, identity_key, ".nonce"))
 
 
 def load_caller_principal(coordinator_root: Path, identity_key: str) -> str | None:
@@ -414,10 +476,29 @@ def load_caller_principal(coordinator_root: Path, identity_key: str) -> str | No
 
 
 def store_caller_principal(coordinator_root: Path, identity_key: str, principal: str) -> None:
-    """Persist ``principal`` for ``identity_key`` exclusively. A file that
-    already exists is left untouched: a stored principal is never replaced,
-    only ever read (a replacement would be a re-mint by another name)."""
-    _create_exclusive(_principal_file(coordinator_root, identity_key, ".principal"), principal)
+    """Persist ``principal`` for ``identity_key``: written to a private
+    temporary file in the same directory (``O_CREAT|O_EXCL``, ``0600``) and
+    renamed over the stored file, so a reader sees the old value or the new
+    one, never a torn one.
+
+    Callers pass only what a claim presenting the session's STORED nonce
+    returned — the value the coordinator binds to that nonce — so replacing
+    the file is never a re-mint: it repairs a torn file, and it follows a
+    binding store that was reset (R20). Concurrent writers hold the same value
+    (the binding for that nonce), so the order of their renames does not
+    matter; a value a reset made stale in between is replaced again by the
+    next recovery."""
+    path = _principal_file(coordinator_root, identity_key, ".principal")
+    temporary = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(str(temporary), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(principal + "\n")
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 def verify_bearer(authorization_header: str | None, expected_secret: str) -> bool:
