@@ -8,6 +8,28 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A caller principal: a session can prove a request is its own.** The
+  coordinator authenticates the workspace, not the caller — the session a
+  request acts as is a body field — so a copied request, a stale session id or a
+  wrong id in a retry could release another writer's grants or commit under its
+  name. `POST /principal/claim` now binds a principal to a session on its first
+  claim; the claimant sends a nonce it kept beforehand, so a retry after a lost
+  response gets the same principal back and any other claimant is refused.
+  Clients send it in the `Coherence-Caller-Principal` header. The Claude Code
+  hook client, `CoherentVolume`, the MCP server and the substrate session claim
+  and send one automatically; a coordinator that issues none (the plugin's Node
+  coordinator, or an older release) answers `404` and they proceed without it.
+  This is not a security boundary — the bearer secret still grants full
+  authority, and the hook client's principal sits in `.coherence/` where any
+  process of the same OS user can read it. See the guide's
+  [Caller principal](docs/guide.md#caller-principal) section.
+
+- **The acquire-or-fail refusal on `pre-edit` is specified.** The guide now
+  records the request, refusal shape, reason channel and timeout answer an
+  opt-in "acquire or fail" on `pre-edit` will use, and the gaps it will not
+  close. It is **not implemented**; `pre-edit` still grants EXCLUSIVE to
+  whoever asks.
+
 - **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
   "May this irreversible effect still fire, and if not, why?" was reachable
   from Python (`gate()`) and from MCP (`swg_gate`); a client that speaks
@@ -150,6 +172,25 @@ Alpha — APIs may change before `v1.0`.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
 ### Changed
+
+- **Requests naming a session that has claimed a principal must present it on
+  the routes that can change another writer's work.** `session-stop`,
+  `post-edit`, `post-edit-cas`, `effect-fence` and the four
+  `/workspace/checkpoint` and `/workspace/restore/*` routes answer HTTP `400`
+  (`caller_principal_absent` / `caller_principal_foreign`) when the named
+  session is bound and the header is missing or wrong. Every other route refuses
+  a principal that is not the one bound to the named session. A request naming a
+  session that never claimed one is admitted exactly as before, so clients that
+  predate this keep working; `/status` counts those requests as
+  `caller_principal_absent_total`. The Node coordinator enforces none of this.
+
+- **Registry schema version 8 (forward-only).** Principals get their own table,
+  which the grant sweep, the session-liveness sweep, the session cap and
+  session release never touch, so a principal outlives all three. As with
+  earlier steps, the migration runs on first open and there is no down step:
+  once a workspace's `state.db` is at version 8, an older release refuses it.
+  The v6→v7 step now stamps its own literal version, so a database migrating
+  from any earlier version lands each step at its correct stamp.
 
 - **A `CoherentVolume`'s `session_id` is now stable for its lifetime.** The
   fresh identity each attempt needs — it is what clears a stale view — is now

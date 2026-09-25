@@ -32,22 +32,23 @@ full command-line toolset, and the API reference.
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 14. [Effect fence over HTTP](#effect-fence-over-http)
-15. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
-16. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-17. [Inline benchmark mode](#inline-benchmark-mode)
-18. [Telemetry](#telemetry)
-19. [Graceful degradation](#graceful-degradation)
-20. [Examples](#examples)
-21. [Real-workload benchmarks](#real-workload-benchmarks)
-22. [Benchmarking your own workload](#benchmarking-your-own-workload)
-23. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-24. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-25. [Replay (v0.8.2+)](#replay-v082)
-26. [Command-line tools](#command-line-tools)
-27. [API reference](#api-reference)
-28. [Low-level adapter API](#low-level-adapter-api)
-29. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-30. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+15. [Caller principal](#caller-principal)
+16. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+17. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+18. [Inline benchmark mode](#inline-benchmark-mode)
+19. [Telemetry](#telemetry)
+20. [Graceful degradation](#graceful-degradation)
+21. [Examples](#examples)
+22. [Real-workload benchmarks](#real-workload-benchmarks)
+23. [Benchmarking your own workload](#benchmarking-your-own-workload)
+24. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+25. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+26. [Replay (v0.8.2+)](#replay-v082)
+27. [Command-line tools](#command-line-tools)
+28. [API reference](#api-reference)
+29. [Low-level adapter API](#low-level-adapter-api)
+30. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+31. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -1097,6 +1098,10 @@ client that omits `session_id` in particular could otherwise spend a long time
 reading holds it can never clear, because the answer depends on which session
 holds the grant.
 
+If your client has claimed a [caller principal](#caller-principal) for
+`session_id`, send it in the `Coherence-Caller-Principal` header: this route is
+require-class, so a request naming a claimed session without it answers `400`.
+
 **Omitted and `null` are different answers for `expected_generation`, and the
 difference is the point of the field.** Leaving the key out is a client that
 never captured the comparand; no number of identical retries supplies a value
@@ -1248,6 +1253,86 @@ version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
 fired/held result types, not in the vocabulary above.
 
+## Caller principal
+
+The coordinator authenticates the workspace, not the caller: one bearer secret
+covers every process, and the session a request acts as is the `session_id` in
+its body. A **caller principal** is a value the coordinator issues and binds to
+one session, so that a request naming that session can be checked against it.
+It turns "a writer typed the wrong session id" — a copied request, a stale id
+after a fork, a retry that picked up a peer's id — from a silent success into a
+refusal.
+
+It is not a security boundary. The bearer secret still gives full authority over
+the workspace, and the hook client stores its principal in `.coherence/`, which
+any process running as your OS user can read. What it separates is writers that
+follow the protocol. A long-lived client — `CoherentVolume`, the MCP server,
+the substrate session — keeps its principal in memory for its lifetime, so on
+those surfaces another process has no file to read it from.
+
+### You usually do nothing
+
+The Claude Code hook client, `CoherentVolume`, the MCP server and the substrate
+session claim a principal for their session and send it on every request. A
+client written before principals existed keeps working unchanged: its sessions
+never claim one, and a request naming a session that never claimed one is
+admitted exactly as before (and counted, see below).
+
+The Claude Code plugin's Node coordinator issues no principals. It answers
+`/principal/claim` with `404`, and clients proceed without one; the hook
+clients skip the request altogether when `.coherence/server.pid` names the Node
+backend.
+
+### What is checked, and where
+
+Every route that takes a `session_id` is in one of three classes:
+
+| Class | Routes | A request naming a session that has claimed a principal… |
+|---|---|---|
+| require | `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member` | …must present it. Without it, or with a different one, the answer is `400`. |
+| accept | `/hooks/pre-read`, `/hooks/pre-edit`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
+| mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
+
+The require class is the routes that release a session's grants, commit or
+record who wrote a version, answer the effect fence about a session's grant, or
+record workspace ownership — the things a caller naming the wrong session could
+do to someone else's work. The snapshot-session routes are accept-class because
+each is already gated by the server-issued session token.
+
+A refusal is HTTP `400` with one `error` field naming the header and ending in
+the reason: `caller_principal_absent` when a claimed session is named with no
+principal, `caller_principal_foreign` when the principal presented is not the
+one bound to the named session. It is never a hold: no retry can supply a
+principal the caller does not have.
+
+`GET /status` reports `caller_principal_absent_total` at every tier: how many
+requests this coordinator process admitted without a principal. It is a local
+diagnostic — a nonzero value means some client is not sending one yet — and it
+resets when the coordinator restarts.
+
+### Writing your own HTTP client
+
+1. Generate a mint nonce — 16 to 128 characters from `[A-Za-z0-9_-]`, for
+   example `secrets.token_urlsafe(32)` — and keep it **before** you call. It is
+   what lets you recover your principal if the response is lost.
+2. `POST /principal/claim` with `{"session_id": ..., "mint_nonce": ...}`. The
+   answer is `{"ok": true, "principal": "..."}`. A retry with the same nonce gets
+   the same principal back. If the session is already bound under a different
+   nonce, the answer is `{"ok": false, "reason": "caller_principal_claimed", "detail": ...}`
+   and you do not become that session; a malformed request is `400`.
+3. Send the principal in the `Coherence-Caller-Principal` header on every
+   request that names the session. The principal appears in the claim response
+   and nowhere else: never log it.
+
+A subagent shares its parent session's principal.
+
+### Upgrading
+
+Principals live in their own table, added by registry schema version 8. Like
+earlier schema steps it is forward-only: once a workspace's `state.db` has been
+opened by this version, an older release refuses it. Upgrade forward rather than
+rolling back.
+
 ## Acquire-or-fail on `pre-edit` (specified, not yet built)
 
 **Nothing in this section is implemented.** It fixes the shape of an opt-in
@@ -1259,7 +1344,7 @@ next request. There is no request that declines instead, so a real mutex cannot 
 built on this route: the second session to ask always wins.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
-caller principal. An opted-in request without a principal is refused as a
+[caller principal](#caller-principal). An opted-in request without a principal is refused as a
 malformed request (HTTP 400 naming the principal), because a refusal that a
 caller could step around by naming the holder's session is not a refusal.
 
