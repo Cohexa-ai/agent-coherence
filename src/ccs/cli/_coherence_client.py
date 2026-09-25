@@ -23,6 +23,7 @@ import logging
 import os
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -594,25 +595,73 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
     """A private opener whose redirect handler refuses every 3xx.
 
-    ``build_opener`` with our ``_NoRedirectHandler`` REPLACES the default
-    ``HTTPRedirectHandler`` (``build_opener`` de-dupes by handler class). For
-    https, the ``HTTPSHandler(context=...)`` carries the verified-TLS context.
+    Assembled by hand, not with ``urllib.request.build_opener``: that adds a
+    default ``HTTPSHandler`` to every opener, and on Python 3.12+ its constructor
+    builds a default SSL context, loading the whole system CA store (~13 ms of
+    CPU) even for plain ``http://`` to loopback. The handlers below are the
+    ``build_opener`` defaults an http(s) request reaches, with
+    ``_NoRedirectHandler`` in place of ``HTTPRedirectHandler``.
+    ``HTTPErrorProcessor`` is what routes a 3xx to that handler, so it must stay.
+    The ftp/file/data handlers are left out: every URL here is ``base_url + path``
+    and no redirect is followed.
+
+    An ``HTTPSHandler`` is added only for ``context``, the verified-TLS context
+    from :func:`build_tls_context`. Without one there is no https handler at all,
+    so an https request cannot fall back to a default context: it fails as an
+    unknown URL type.
     """
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+    handlers: list[urllib.request.BaseHandler] = [
+        urllib.request.ProxyHandler(),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        _NoRedirectHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ]
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers)
+    opener = urllib.request.OpenerDirector()
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
+_PLAIN_OPENER_LOCK = threading.Lock()
+_plain_opener: urllib.request.OpenerDirector | None = None
+
+
+def _get_plain_opener() -> urllib.request.OpenerDirector:
+    """The process-wide opener for plain-http requests, built on first use.
+
+    Shared across threads: each of its handlers keeps no per-request state
+    (``HTTPHandler`` opens a fresh connection per request, the rest only read or
+    annotate the request), which is also why the stdlib's ``urlopen`` shares one
+    module-level opener. Never add a stateful handler such as a cookie processor
+    here, because every endpoint and thread in the process would share its state.
+    ``ProxyHandler`` reads the proxy settings once, when this is built, as
+    ``urlopen``'s shared opener does.
+    """
+    global _plain_opener
+    opener = _plain_opener
+    if opener is None:
+        with _PLAIN_OPENER_LOCK:
+            opener = _plain_opener
+            if opener is None:
+                opener = _plain_opener = _build_opener(None)
+    return opener
 
 
 def _execute(req: urllib.request.Request) -> dict[str, Any]:
-    context: ssl.SSLContext | None = None
     if req.type == "https":
         # build_tls_context may raise TlsConfigError (typed, fail-closed) — that
         # is a config bug, not a transient network failure, so it propagates.
+        # Built per request, never cached: build_tls_context re-validates and
+        # re-reads the CA bundle each time, so a swapped, loosened or rotated
+        # trust anchor is caught by the very next request.
         ca_file = getattr(req, "_ccs_ca_file", None)
-        context = build_tls_context(ca_file)
-
-    opener = _build_opener(context)
+        opener = _build_opener(build_tls_context(ca_file))
+    else:
+        opener = _get_plain_opener()
     try:
         with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
             raw = resp.read()

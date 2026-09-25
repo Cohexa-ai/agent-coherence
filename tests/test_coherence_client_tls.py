@@ -29,10 +29,14 @@ because our endpoints are IP literals and OpenSSL matches IP SANs natively).
 from __future__ import annotations
 
 import http.server
+import json
 import shutil
 import ssl
 import subprocess
+import sys
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -355,6 +359,11 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (stdlib handler contract)
         self._record_and_respond()
 
+    def do_POST(self) -> None:  # noqa: N802 (stdlib handler contract)
+        # Drain the body before answering so the client never sees a reset.
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._record_and_respond()
+
     def log_message(self, *args: object) -> None:  # silence test noise
         pass
 
@@ -389,6 +398,13 @@ def _start_tls_server(
     sctx.load_cert_chain(str(bundle.server_cert), str(bundle.server_key))
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
+    port = srv.socket.getsockname()[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return _RunningServer(port=port, handler_cls=handler_cls, _server=srv)
+
+
+def _start_plain_server(handler_cls: type[_RecordingHandler]) -> _RunningServer:
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     port = srv.socket.getsockname()[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return _RunningServer(port=port, handler_cls=handler_cls, _server=srv)
@@ -658,3 +674,227 @@ class TestLoopbackHttpUnchanged:
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+# ===========================================================================
+# Opener construction. On Python 3.12+ a default urllib HTTPSHandler loads the
+# whole system CA store when it is constructed (~13 ms of CPU), and the
+# transport used to build one into a fresh opener on EVERY request, plain http
+# to loopback included. The plain-http path now builds no https handler and
+# reuses one opener; the https path still builds its verified context per
+# request, so the CA bundle is re-validated every time.
+# ===========================================================================
+
+
+@dataclass
+class _TlsSetupCounts:
+    https_handlers: int = 0
+    ca_store_loads: int = 0
+
+
+@pytest.fixture
+def tls_setup_counts(monkeypatch: pytest.MonkeyPatch) -> _TlsSetupCounts:
+    """Count ``HTTPSHandler`` constructions and default CA-store loads.
+
+    ``https_handlers`` catches the regression on every supported Python: the old
+    transport built a default ``HTTPSHandler`` per request on 3.11 too, where it
+    only happened to be cheap. ``ca_store_loads`` counts the cost itself, which
+    3.12+ pays. It patches ``SSLContext.set_default_verify_paths``, not
+    ``ssl.create_default_context``: the stdlib calls that function through a
+    second name, ``ssl._create_default_https_context``, which a patch on the
+    first name never sees.
+    """
+    counts = _TlsSetupCounts()
+    real_init = urllib.request.HTTPSHandler.__init__
+    real_load = ssl.SSLContext.set_default_verify_paths
+
+    def counting_init(
+        self: urllib.request.HTTPSHandler, *args: object, **kwargs: object
+    ) -> None:
+        counts.https_handlers += 1
+        real_init(self, *args, **kwargs)
+
+    def counting_load(self: ssl.SSLContext) -> None:
+        counts.ca_store_loads += 1
+        real_load(self)
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "__init__", counting_init)
+    monkeypatch.setattr(ssl.SSLContext, "set_default_verify_paths", counting_load)
+    return counts
+
+
+@pytest.fixture
+def fresh_plain_opener(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The plain-http opener is built once per process. Clear it so the request
+    # that builds it runs inside the test.
+    monkeypatch.setattr(cc, "_plain_opener", None)
+
+
+@pytest.fixture
+def opener_builds(
+    fresh_plain_opener: None, monkeypatch: pytest.MonkeyPatch
+) -> list[None]:
+    """One entry per ``OpenerDirector`` built during the test."""
+    builds: list[None] = []
+    real_init = urllib.request.OpenerDirector.__init__
+
+    def recording_init(self: urllib.request.OpenerDirector) -> None:
+        builds.append(None)
+        real_init(self)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "__init__", recording_init)
+    return builds
+
+
+class _EchoHandler(_RecordingHandler):
+    """Answers with the path and bearer it received, so a response that belongs
+    to another thread's request cannot pass for this one's."""
+
+    def _record_and_respond(self) -> None:
+        body = json.dumps(
+            {"path": self.path, "authorization": self.headers.get("Authorization")}
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class TestTlsSetupCountsSeeTheCost:
+    """Positive controls: the counters see what the old transport did.
+
+    Without these, a counter that stopped intercepting (say, a renamed stdlib
+    internal) would turn the zero-count assertions below green for the wrong
+    reason.
+    """
+
+    def test_the_old_per_request_opener_is_counted(
+        self, tls_setup_counts: _TlsSetupCounts
+    ) -> None:
+        # The body of the old _build_opener(None): build_opener with only the
+        # redirect handler, which adds a default HTTPSHandler on every Python.
+        urllib.request.build_opener(cc._NoRedirectHandler())
+        assert tls_setup_counts.https_handlers == 1
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 12),
+        reason="3.11's HTTPSHandler builds its SSL context lazily, at connect time",
+    )
+    def test_the_old_per_request_opener_loads_the_ca_store(
+        self, tls_setup_counts: _TlsSetupCounts
+    ) -> None:
+        urllib.request.build_opener(cc._NoRedirectHandler())
+        assert tls_setup_counts.ca_store_loads == 1
+
+    def test_a_default_context_is_counted(
+        self, tls_setup_counts: _TlsSetupCounts
+    ) -> None:
+        ssl.create_default_context()
+        assert tls_setup_counts.ca_store_loads == 1
+
+
+class TestPlainHttpOpener:
+    def test_http_requests_build_no_https_handler_and_load_no_ca_store(
+        self, tls_setup_counts: _TlsSetupCounts, fresh_plain_opener: None
+    ) -> None:
+        srv = _start_plain_server(_make_handler_class())
+        try:
+            ep = CoordinatorEndpoint(port=srv.port, bearer="s3cr3t", host="127.0.0.1")
+            for _ in range(3):
+                assert cc.get(ep, "/status") == {"ok": True}
+            assert cc.post(ep, "/hooks/pre-read", {"path": "a.md"}) == {"ok": True}
+            # All four requests really went out, the first one building the opener.
+            assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"] * 4
+            assert tls_setup_counts.https_handlers == 0
+            assert tls_setup_counts.ca_store_loads == 0
+        finally:
+            srv.shutdown()
+
+    def test_http_requests_reuse_one_opener(self, opener_builds: list[None]) -> None:
+        srv = _start_plain_server(_make_handler_class())
+        try:
+            ep = CoordinatorEndpoint(port=srv.port, bearer="s3cr3t", host="127.0.0.1")
+            cc.get(ep, "/status")
+            assert len(opener_builds) == 1  # the first request builds it
+            for _ in range(4):
+                cc.get(ep, "/status")
+            cc.post(ep, "/hooks/session-stop", {"session_id": "s1"})
+            assert len(opener_builds) == 1  # ...and every later one reuses it
+        finally:
+            srv.shutdown()
+
+    def test_the_shared_opener_cannot_open_https(self, fresh_plain_opener: None) -> None:
+        # It holds no https handler, so an https request routed to it fails
+        # closed instead of riding a default (possibly unverified) SSL context.
+        with pytest.raises(urllib.error.URLError, match="unknown url type: https"):
+            cc._get_plain_opener().open("https://127.0.0.1:1/status")
+
+    def test_one_opener_serves_concurrent_threads_without_crosstalk(
+        self, opener_builds: list[None]
+    ) -> None:
+        # CoherentVolume instances on different threads share this module and so
+        # this opener. All threads start at once on an unbuilt opener, then check
+        # that every response answers their own request (path and bearer).
+        n_threads, n_requests = 8, 20
+        srv = _start_plain_server(_EchoHandler)
+        barrier = threading.Barrier(n_threads)
+        errors: list[BaseException] = []
+
+        def worker(i: int) -> None:
+            ep = CoordinatorEndpoint(port=srv.port, bearer=f"b{i}", host="127.0.0.1")
+            try:
+                barrier.wait(timeout=10)
+                for j in range(n_requests):
+                    path = f"/echo/{i}/{j}"
+                    body = cc.get(ep, path)
+                    assert body == {"path": path, "authorization": f"Bearer b{i}"}
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,), name=f"opener-worker-{i}")
+            for i in range(n_threads)
+        ]
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # interleave threads inside the first-use build
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+                assert not thread.is_alive(), (
+                    f"{thread.name} did not finish {n_requests} requests within 60s"
+                )
+        finally:
+            sys.setswitchinterval(old_interval)
+            srv.shutdown()
+        assert errors == []
+        assert len(opener_builds) == 1
+
+
+@requires_openssl
+class TestHttpsContextIsPerRequest:
+    def test_ca_bundle_is_revalidated_on_every_request(
+        self, tls_bundle: _CertBundle
+    ) -> None:
+        # The https path deliberately does not cache its context: a trust anchor
+        # that turns group/world-writable after the first request must be refused
+        # by the second, not trusted for the life of the process.
+        srv = _start_tls_server(tls_bundle, _make_handler_class())
+        try:
+            ep = CoordinatorEndpoint(
+                port=srv.port,
+                bearer="s3cr3t",
+                host="127.0.0.1",
+                scheme="https",
+                ca_file=str(tls_bundle.ca_pem),
+            )
+            assert cc.get(ep, "/status") == {"ok": True}
+            tls_bundle.ca_pem.chmod(0o666)
+            with pytest.raises(TlsConfigError, match="group/world-writable"):
+                cc.get(ep, "/status")
+            # Refused before connecting: the bearer rode only the first request.
+            assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
+        finally:
+            srv.shutdown()
