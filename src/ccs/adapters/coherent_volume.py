@@ -356,7 +356,9 @@ class CoherentVolume:
         re-attach in the fork handler (the coordinator-client context is the
         parent's). The child's first ``read``/``write`` re-attaches here,
         sibling-attaching to the coordinator under the child's fresh identity.
-        A no-op outside the post-fork window.
+        A no-op outside the post-fork window. Under ``on_error="strict"`` a
+        failed attempt keeps that window open: every read and write retries
+        until one attaches.
         """
         if self._endpoint is None and self._needs_reattach:
             # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
@@ -366,11 +368,15 @@ class CoherentVolume:
             try:
                 self._attach()
             except BaseException:
-                # Strict re-arms, so the next op retries the re-attach instead of
-                # taking the unattached branch — which skips the coordinator and
-                # its invalidations for the child's whole life. Degrade keeps its
-                # one attempt, as at construction.
+                # Strict re-arms and detaches, so the next read or write retries
+                # the re-attach instead of taking the unattached branch — which
+                # skips the coordinator and its invalidations for the child's
+                # whole life. Detaching covers a failure that escapes after the
+                # endpoint was resolved (an interrupt during the strict check):
+                # the retry runs only while the endpoint is None. Degrade keeps
+                # its one attempt, as at construction.
                 if self._on_error == "strict":
+                    self._endpoint = None
                     self._needs_reattach = True
                 raise
 
@@ -535,10 +541,8 @@ class CoherentVolume:
             # a coordinator that does not enforce our paths — that would route
             # reads/writes through a non-strict coordinator while is_attached
             # reported True. Degrade falls through detached, mirroring the other
-            # two degrade branches. Strict raises; detaching first matters for a
-            # forked child's lazy re-attach, whose next op retries only while the
-            # endpoint is None — a raise that left it set let every later op run
-            # through this coordinator unenforced.
+            # two degrade branches; strict raises detached rather than relying
+            # on the caller to drop the endpoint.
             self._endpoint = None
             self._fail_closed_or_degrade(
                 "attached to a coordinator that does not enforce strict mode for the "

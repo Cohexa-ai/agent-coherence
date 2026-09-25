@@ -213,7 +213,8 @@ Alpha — APIs may change before `v1.0`.
   A second path had the same effect: a re-attach that reached a coordinator
   *not* enforcing strict mode for the managed paths raised once but kept its
   connection, so later operations ran through that coordinator unenforced.
-  The refusal now drops the connection before raising.
+  A failed strict re-attach now always leaves the child detached, whatever
+  it raised and wherever, so the next read or write retries.
 
   `on_error="degrade"` is unchanged: one attempt, then best-effort, the same
   as a failed attach at construction.
