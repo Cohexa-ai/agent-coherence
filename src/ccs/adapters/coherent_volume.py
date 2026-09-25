@@ -367,19 +367,32 @@ class CoherentVolume:
             # under the install() shim with a managed glob that matches them each
             # of those reads re-enters here. The cleared flag stops the recursion.
             self._needs_reattach = False
+            degradations_before = self._degradation_count
             try:
                 self._attach()
-            except BaseException:
-                # Strict re-arms and detaches, so the next read or write retries
-                # the re-attach instead of taking the unattached branch — which
-                # skips the coordinator and its invalidations for the child's
-                # whole life. Detaching covers a failure that escapes after the
-                # endpoint was resolved (an interrupt during the strict check):
-                # the retry runs only while the endpoint is None. Degrade keeps
-                # its one attempt, as at construction.
+            except BaseException as exc:
+                # Detach in both modes: a failure can escape after the endpoint
+                # was resolved (an interrupt during the strict check), and an
+                # endpoint left set would route later ops through a coordinator
+                # never confirmed to enforce our paths. Strict re-arms, so the
+                # next read or write retries the re-attach instead of taking the
+                # unattached branch — which skips the coordinator and its
+                # invalidations for the child's whole life (the retry runs only
+                # while the endpoint is None). Degrade keeps its one attempt, as
+                # at construction, and so runs best-effort from here on: record
+                # that, since an error _attach did not route through
+                # _fail_closed_or_degrade would otherwise leave is_degraded False.
+                self._endpoint = None
                 if self._on_error == "strict":
-                    self._endpoint = None
                     self._needs_reattach = True
+                elif self._degradation_count == degradations_before:
+                    # Unchanged count: _attach did not record this failure itself
+                    # (a handled one whose warning a caller escalated to an error
+                    # escapes here already counted). Suppress our own escalated
+                    # warning so the failure propagates as itself — an interrupt
+                    # must not come back as an Exception.
+                    with contextlib.suppress(CoherenceDegradedWarning):
+                        self._record_degraded(f"re-attach after fork failed: {exc!r}")
                 raise
 
     @property
