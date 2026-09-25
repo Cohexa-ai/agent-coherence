@@ -105,6 +105,17 @@ it does **not** itself encrypt anything. Set the ack **narrowly** (per-invocatio
 per-compose-service), never in a persistent global shell profile — a forgotten
 global ack would blanket-acknowledge every future non-loopback host.
 
+**Proxy settings are ignored (all coordinator traffic).** The client never sends a
+coordinator request through a forward proxy: `http_proxy`, `https_proxy` and the
+macOS system proxy settings are ignored for every coordinator endpoint, loopback
+included. Otherwise, on a machine with a proxy configured, the bearer would go to
+the proxy instead of the coordinator, in plaintext over http. The two guarantees
+above cover the one host you configured and nothing in between: the plaintext ack
+acknowledges the link to that host, and verified https checks that host's
+certificate. A TLS-terminating front is unaffected, because you point the client
+*at* it as the endpoint. A remote coordinator reachable only through a forward
+proxy needs a direct route instead (a tunnel or VPN).
+
 **Coordinator-side bind guard (fail-closed).** Symmetrically, a coordinator that
 binds **beyond loopback** now refuses to serve unless the operator makes one of two
 explicit assertions:
