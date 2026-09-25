@@ -593,7 +593,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    """A private opener whose redirect handler refuses every 3xx.
+    """A private opener that goes straight to the endpoint and refuses every 3xx.
 
     Assembled by hand, not with ``urllib.request.build_opener``: that adds a
     default ``HTTPSHandler`` to every opener, and on Python 3.12+ its constructor
@@ -605,13 +605,20 @@ def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirect
     The ftp/file/data handlers are left out: every URL here is ``base_url + path``
     and no redirect is followed.
 
+    There is deliberately no ``ProxyHandler``: no coordinator request goes
+    through a proxy, loopback or remote. The default one reads ``http_proxy``
+    and ``https_proxy`` (on macOS and Windows, the system settings when those are
+    unset) and, with ``no_proxy`` unset, proxies loopback too, sending the bearer
+    to the proxy. A remote endpoint is the one host the operator configured and
+    secured the link to; a proxy is a hop that neither ``CCS_REMOTE_INSECURE``
+    nor https verification covers.
+
     An ``HTTPSHandler`` is added only for ``context``, the verified-TLS context
     from :func:`build_tls_context`. Without one there is no https handler at all,
     so an https request cannot fall back to a default context: it fails as an
     unknown URL type.
     """
     handlers: list[urllib.request.BaseHandler] = [
-        urllib.request.ProxyHandler(),
         urllib.request.UnknownHandler(),
         urllib.request.HTTPHandler(),
         urllib.request.HTTPDefaultErrorHandler(),
@@ -653,8 +660,6 @@ def _get_shared_opener(*, system_tls: bool) -> urllib.request.OpenerDirector:
     annotate the request), which is also why the stdlib's ``urlopen`` shares one
     module-level opener. Never add a stateful handler such as a cookie processor
     here, because every endpoint and thread in the process would share its state.
-    ``ProxyHandler`` reads the proxy settings once, when this is built, as
-    ``urlopen``'s shared opener does.
 
     The system-trust context is shared too (an OpenSSL client context caches no
     TLS sessions, so none carries over between connections), so the trust store

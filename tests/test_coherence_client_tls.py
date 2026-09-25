@@ -33,6 +33,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -40,6 +41,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -894,6 +896,119 @@ class TestPlainHttpOpener:
         assert len(opener_builds) == 1
 
 
+@dataclass
+class _ProxyRecorder:
+    port: int
+    connections: list[None]
+
+
+@pytest.fixture
+def proxy_recorder(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ProxyRecorder]:
+    """A listener standing in for a proxy: it records every connection made to it.
+
+    Any connection counts, whether an absolute-URI GET or a CONNECT, so it sees a
+    proxied request of either kind. ``no_proxy`` is cleared so nothing exempts a
+    host from a proxy that is set.
+    """
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    listener = socket.create_server(("127.0.0.1", 0))
+    # close() from another thread does not wake a blocked accept() on Linux, so
+    # poll with a short timeout and stop on a flag.
+    listener.settimeout(0.05)
+    stop = threading.Event()
+    recorded = _ProxyRecorder(port=listener.getsockname()[1], connections=[])
+
+    def record_connections() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:  # includes socket.timeout
+                continue
+            recorded.connections.append(None)
+            conn.close()
+
+    thread = threading.Thread(target=record_connections, daemon=True)
+    thread.start()
+    yield recorded
+    stop.set()
+    thread.join(timeout=5)
+    listener.close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint_scheme", "proxy_scheme"),
+    [
+        ("http", "http"),
+        ("http", "https"),
+        pytest.param("https", "http", marks=requires_openssl),
+    ],
+)
+def test_requests_ignore_proxy_settings(
+    endpoint_scheme: str,
+    proxy_scheme: str,
+    proxy_recorder: _ProxyRecorder,
+    fresh_shared_openers: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No coordinator request goes through a proxy. A shared opener that honoured
+    # one would send the bearer there, keep using a proxy captured at first use
+    # after it went away, and fail outright on an https:// proxy for plain http.
+    monkeypatch.setenv(
+        f"{endpoint_scheme}_proxy",
+        f"{proxy_scheme}://127.0.0.1:{proxy_recorder.port}",
+    )
+    if endpoint_scheme == "https":
+        bundle: _CertBundle = request.getfixturevalue("tls_bundle")
+        monkeypatch.setenv("SSL_CERT_FILE", str(bundle.ca_pem))
+        srv = _start_tls_server(bundle, _make_handler_class())
+    else:
+        srv = _start_plain_server(_make_handler_class())
+    try:
+        ep = CoordinatorEndpoint(
+            port=srv.port, bearer="s3cr3t", host="127.0.0.1", scheme=endpoint_scheme
+        )
+        assert cc.get(ep, "/status") == {"ok": True}
+        assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
+        assert proxy_recorder.connections == []
+    finally:
+        srv.shutdown()
+
+
+def test_a_routed_host_ignores_proxy_settings(
+    proxy_recorder: _ProxyRecorder,
+    fresh_shared_openers: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The no-proxy rule covers remote endpoints too, not only loopback: a proxy
+    # that exempted loopback would still receive the bearer for a routed host.
+    # 192.0.2.1 (TEST-NET-1) is never routed, so the direct attempt times out.
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_recorder.port}")
+    monkeypatch.setattr(cc, "CLI_HTTP_TIMEOUT_SEC", 0.5)
+    ep = CoordinatorEndpoint(port=8080, bearer="s3cr3t", host="192.0.2.1")
+    with pytest.raises(cc.CoordinatorUnavailable):
+        cc.get(ep, "/status")
+    assert proxy_recorder.connections == []
+
+
+def test_the_shared_system_trust_context_is_the_hardened_one(
+    fresh_shared_openers: None,
+) -> None:
+    # The shared https opener must carry build_tls_context()'s context (whose
+    # properties TestTlsContextFactory pins), not a bare default or unverified
+    # one. The CN fallback tells them apart: both of those allow it, and the
+    # shared context lasts for the whole process.
+    opener = cc._get_shared_opener(system_tls=True)
+    (handler,) = [
+        h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    # On 3.11 a handler built without a context holds None, which has no CN
+    # fallback attribute either, so check the type first.
+    assert isinstance(handler._context, ssl.SSLContext)
+    assert getattr(handler._context, "hostname_checks_common_name", False) is False
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_a_fork_during_a_first_build_does_not_hang_the_child(
     fresh_shared_openers: None, monkeypatch: pytest.MonkeyPatch
@@ -912,11 +1027,6 @@ def test_a_fork_during_a_first_build_does_not_hang_the_child(
         return real_build(context)
 
     monkeypatch.setattr(cc, "_build_opener", held_open_build)
-    # On macOS, a child forked from a threaded parent aborts if it initializes an
-    # Objective-C class the parent never did, and proxy lookup goes through
-    # SystemConfiguration. Look proxies up once here, as any parent that has
-    # already made a coordinator request has.
-    urllib.request.getproxies()
     builder = threading.Thread(
         target=cc._get_shared_opener, kwargs={"system_tls": False}, name="builder"
     )

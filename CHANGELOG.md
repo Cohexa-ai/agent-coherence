@@ -216,11 +216,13 @@ Alpha — APIs may change before `v1.0`.
   and 3.13, a request's median drops from about 20–22 ms to about 3.5 ms.
   Certificate verification is unchanged, every 3xx is still refused (308
   included), and with `CCS_REMOTE_CA_FILE` set the context is still built on
-  every request, so that bundle is still checked and re-read each time. Two
-  things are now read once, when a shared opener is built, instead of on every
-  request: the system trust store (including `SSL_CERT_FILE`), so a certificate
-  removed from it stays trusted until the process restarts, and the proxy
-  settings from the environment.
+  every request, so that bundle is still checked and re-read each time. The
+  system trust store (including `SSL_CERT_FILE`) is now read once, when the
+  shared opener is built, instead of on every request, so a certificate removed
+  from it stays trusted until the process restarts. The rebuilt openers also go
+  straight to the coordinator and ignore proxy settings (`http_proxy`,
+  `https_proxy`, and on macOS and Windows the system proxy), for loopback and
+  remote endpoints alike.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
