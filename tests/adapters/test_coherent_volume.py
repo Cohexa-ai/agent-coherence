@@ -199,10 +199,10 @@ def test_failed_reattach_after_fork_is_retried_in_strict_mode(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A forked child whose first re-attach fails transiently must retry it on
-    the next op. Dropping the pending re-attach before the attempt left a strict
-    child detached for life: every later op took the unattached best-effort
-    branch, so writes landed on disk with the coordinator recording nothing,
-    peers never invalidated, and no error raised."""
+    the next op. Dropping the pending re-attach when the attempt failed left a
+    strict child detached for life: every later op took the unattached branch,
+    so an ordinary write landed on disk without an error while the coordinator
+    recorded nothing and peers were never invalidated."""
     _seed(tmp_path)
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     try:
@@ -267,6 +267,28 @@ def test_failed_reattach_after_fork_stays_best_effort_in_degrade_mode(
         vol.write("data/shared.txt", b"child")
         assert target.read_bytes() == b"child"
         assert vol.is_degraded
+        assert not vol.is_attached  # one attempt: the write did not re-attach
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_unexpected_reattach_error_after_fork_is_not_retried_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Degrade keeps its one attempt even when the re-attach fails with an error
+    the degrade path does not handle: that op raises it, and later ops run
+    best-effort instead of retrying (and re-raising) on every call."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", _raise_oserror)
+
+        with pytest.raises(OSError):
+            vol.read("data/shared.txt")
+        vol.write("data/shared.txt", b"child")
+        assert target.read_bytes() == b"child"
+        assert not vol.is_attached
     finally:
         stop_coordinator(tmp_path)
 
@@ -1248,13 +1270,18 @@ def test_shim_lost_update_is_denied_through_open(
         stop_coordinator(tmp_path)
 
 
-def test_shim_reattaches_after_fork(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+@pytest.mark.parametrize("managed", [("data/**",), ("**",)])
+def test_shim_reattaches_after_fork(
+    tmp_path: Path, fast_cfg: LifecycleConfig, managed: tuple[str, ...]
+) -> None:
     """After a fork drops the endpoint, the next shim'd open lazily re-attaches
     under the child's fresh identity (simulated via a direct _after_fork call to
-    avoid forking the coordinator's threads)."""
+    avoid forking the coordinator's threads). Under ``**`` the re-attach's own
+    reads of ``.coherence/`` files are shim'd opens of managed paths too — they
+    must not re-enter the re-attach and recurse."""
     _seed(tmp_path, content=b"v1")
     try:
-        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+        with coherent_workspace(tmp_path, managed=managed, config=fast_cfg) as vol:
             assert vol.is_attached
             old_sid = vol.session_id
             vol._after_fork()  # simulate the child-side fork handler

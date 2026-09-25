@@ -359,13 +359,20 @@ class CoherentVolume:
         A no-op outside the post-fork window.
         """
         if self._endpoint is None and self._needs_reattach:
-            self._attach()
-            # Cleared only once _attach returns. A strict failure raises out of
-            # it with the flag still set, so the next op retries the re-attach;
-            # clearing first sent every later op down the unattached best-effort
-            # branch, silently switching enforcement off for the child's life.
-            # Degrade returns detached — one attempt, as at construction.
+            # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
+            # under the install() shim with a managed glob that matches them each
+            # of those reads re-enters here. The cleared flag stops the recursion.
             self._needs_reattach = False
+            try:
+                self._attach()
+            except BaseException:
+                # Strict re-arms, so the next op retries the re-attach instead of
+                # taking the unattached branch — which skips the coordinator and
+                # its invalidations for the child's whole life. Degrade keeps its
+                # one attempt, as at construction.
+                if self._on_error == "strict":
+                    self._needs_reattach = True
+                raise
 
     @property
     def session_id(self) -> str:

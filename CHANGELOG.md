@@ -199,23 +199,24 @@ Alpha — APIs may change before `v1.0`.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the
-  parent's coordinator connection and re-attaches on its first `read` or
-  `write`. The pending re-attach was marked done *before* the attempt, so when
-  that attempt failed transiently — the coordinator mid-restart, its
-  `server.pid` or `hook.secret` briefly missing — `on_error="strict"` raised
-  from that one operation and then never tried again. Every later operation
-  took the unattached best-effort path without raising: the child's writes
-  landed on disk, the coordinator recorded none of them, and peers holding the
-  old bytes were never invalidated. Enforcement was off for the rest of the
-  child's life with no error to show it. The re-attach is now marked done
-  only after the attempt returns, so a strict child keeps failing closed until
-  it attaches again. A second path reached the same state: a re-attach that
-  reached a coordinator *not* enforcing strict mode for the managed paths
-  raised once but kept its connection to that coordinator, so later
-  operations skipped the re-attach and ran through it unenforced. That refusal
-  now drops the connection before raising, and the next operation retries.
-  `on_error="degrade"` is unchanged: one attempt, then best-effort with a
-  `CoherenceDegradedWarning`, the same as a failed attach at construction.
+  parent's coordinator connection and re-attaches on its next operation. When
+  that attempt failed — the coordinator mid-restart, its `server.pid` or
+  `hook.secret` briefly missing — `on_error="strict"` raised from that one
+  operation and never tried again. Every later `read`, `write` and
+  `write_cas` then skipped the coordinator: the child's writes were neither
+  recorded nor versioned there, peers holding the old bytes were never
+  invalidated, and `is_degraded` stayed `False`. The adapter-local
+  foreign-edit check (`on_stale_write="raise"`) still ran and `write_cas_at` /
+  `atomic_publish` still refused without a coordinator, but an ordinary write
+  landed with no error. A strict child now retries the re-attach on each
+  operation, failing closed, until it attaches.
+  A second path had the same effect: a re-attach that reached a coordinator
+  *not* enforcing strict mode for the managed paths raised once but kept its
+  connection, so later operations ran through that coordinator unenforced.
+  The refusal now drops the connection before raising.
+
+  `on_error="degrade"` is unchanged: one attempt, then best-effort, the same
+  as a failed attach at construction.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
