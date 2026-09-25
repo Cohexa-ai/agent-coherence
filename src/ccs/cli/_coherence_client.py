@@ -592,13 +592,29 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    """A private opener whose redirect handler refuses every 3xx.
+    """A private opener that goes straight to the endpoint: no proxy, no redirect.
 
-    ``build_opener`` with our ``_NoRedirectHandler`` REPLACES the default
-    ``HTTPRedirectHandler`` (``build_opener`` de-dupes by handler class). For
-    https, the ``HTTPSHandler(context=...)`` carries the verified-TLS context.
+    ``build_opener`` de-dupes by handler class, so each handler below REPLACES a
+    default. ``_NoRedirectHandler`` replaces ``HTTPRedirectHandler``. For https,
+    ``HTTPSHandler(context=...)`` carries the verified-TLS context.
+
+    ``ProxyHandler({})`` replaces the default ``ProxyHandler()``, which reads
+    ``http_proxy``/``https_proxy`` (on macOS, the system proxy settings when those
+    are unset) and, with ``no_proxy`` unset, proxies loopback too. That sends the
+    request with its bearer to the proxy, in plaintext on http. An explicit empty
+    mapping reads no proxy settings at all.
+
+    Policy: no coordinator request is ever proxied, loopback or remote. Loopback
+    never needs a proxy. A remote endpoint is one host the operator configured
+    and secured the link to: ``CCS_REMOTE_INSECURE`` acknowledges that link and
+    https verifies that host. A proxy from the environment is a hop neither
+    covers. Over https it could not read the bearer (the CONNECT tunnel is TLS end
+    to end), but the connection would still go somewhere the operator never set.
     """
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+    handlers: list[urllib.request.BaseHandler] = [
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    ]
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
     return urllib.request.build_opener(*handlers)

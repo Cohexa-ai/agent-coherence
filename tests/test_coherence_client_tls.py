@@ -33,8 +33,12 @@ import shutil
 import ssl
 import subprocess
 import threading
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -658,3 +662,182 @@ class TestLoopbackHttpUnchanged:
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+# ===========================================================================
+# Proxy bypass: a coordinator request never goes to a configured proxy.
+#
+# urllib's default opener sends a request to whatever proxy http_proxy /
+# https_proxy name, and with no_proxy unset that includes loopback, so the
+# bearer reaches the proxy and the coordinator receives nothing. Each test first
+# shows a bare opener DOES go to the recording proxy under the same environment,
+# so a pass means the client skipped the proxy, not that no proxy was set.
+# ===========================================================================
+
+
+class _ProxyRecorder(http.server.BaseHTTPRequestHandler):
+    """A stand-in forward proxy that records and forwards nothing.
+
+    Each item of ``seen`` is (request line, Authorization header). A GET is
+    answered 200, so a proxied request ends without error and only ``seen``
+    shows where it went. A CONNECT is answered 502, so a tunnelled https request
+    fails.
+    """
+
+    seen: list[tuple[str, str | None]] = []
+
+    def _record(self) -> None:
+        type(self).seen.append((self.requestline, self.headers.get("Authorization")))
+        if self.command == "CONNECT":
+            self.send_response(502)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"via": "proxy"}')
+
+    def do_GET(self) -> None:  # noqa: N802 (stdlib handler contract)
+        self._record()
+
+    def do_CONNECT(self) -> None:  # noqa: N802 (stdlib handler contract)
+        self._record()
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def _serve_plain(
+    handler_cls: type[http.server.BaseHTTPRequestHandler],
+) -> http.server.ThreadingHTTPServer:
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _stop_plain(srv: http.server.ThreadingHTTPServer) -> None:
+    srv.shutdown()
+    srv.server_close()
+
+
+def _get_or_error(endpoint: CoordinatorEndpoint) -> dict[str, Any] | Exception:
+    """The response body, or the exception the client raised.
+
+    Lets a test assert where the request went before asserting how it ended, so a
+    leak fails on the proxy's recording rather than on a side effect of it.
+    """
+    try:
+        return cc.get(endpoint, "/status")
+    except (cc.CoordinatorUnavailable, TlsVerificationFailed) as exc:
+        return exc
+
+
+@pytest.fixture
+def recording_proxy(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_ProxyRecorder]]:
+    """Point http_proxy and https_proxy at a recording proxy, with no_proxy unset."""
+    recorder = type("_ScopedProxy", (_ProxyRecorder,), {"seen": []})
+    srv = _serve_plain(recorder)
+    for name in ("no_proxy", "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    proxy_url = f"http://127.0.0.1:{srv.server_address[1]}"
+    monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.setenv("https_proxy", proxy_url)
+    # An opener the client cached before this point read the proxy settings
+    # without the recorder in them and would pass for that reason alone.
+    monkeypatch.setattr(cc, "_plain_opener", None, raising=False)
+    try:
+        yield recorder
+    finally:
+        _stop_plain(srv)
+
+
+class TestCoordinatorRequestsSkipProxies:
+    def test_loopback_http_request_skips_env_proxy(
+        self, recording_proxy: type[_ProxyRecorder]
+    ) -> None:
+        coordinator = _make_handler_class()
+        srv = _serve_plain(coordinator)
+        port = srv.server_address[1]
+        try:
+            # Control: under this environment a default opener sends the same
+            # request to the proxy and never reaches the coordinator.
+            urllib.request.build_opener().open(
+                f"http://127.0.0.1:{port}/status", timeout=5
+            ).read()
+            assert len(recording_proxy.seen) == 1
+            assert recording_proxy.seen[0][0].startswith(
+                f"GET http://127.0.0.1:{port}/status "
+            )
+            assert coordinator.seen_authorizations == []
+            recording_proxy.seen.clear()
+
+            outcome = _get_or_error(CoordinatorEndpoint(port=port, bearer="s3cr3t"))
+
+            assert recording_proxy.seen == []
+            assert coordinator.seen_authorizations == ["Bearer s3cr3t"]
+            assert outcome == {"ok": True}
+        finally:
+            _stop_plain(srv)
+
+    def test_remote_http_request_skips_env_proxy(
+        self,
+        recording_proxy: type[_ProxyRecorder],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The CCS_REMOTE_INSECURE path, to a routed host. 192.0.2.1 (TEST-NET-1,
+        # RFC 5737) is never routed, so going direct fails within the short
+        # timeout, while going through the proxy would get the recorder's 200.
+        monkeypatch.setattr(cc, "CLI_HTTP_TIMEOUT_SEC", 0.5)
+        endpoint = resolve_remote_endpoint(
+            "192.0.2.1", 8080, "s3cr3t", env={"CCS_REMOTE_INSECURE": "1"}
+        )
+
+        # Control: a default opener sends a routed-host request to the proxy too.
+        urllib.request.build_opener().open(
+            "http://192.0.2.1:8080/status", timeout=5
+        ).read()
+        assert len(recording_proxy.seen) == 1
+        assert recording_proxy.seen[0][0].startswith("GET http://192.0.2.1:8080/status ")
+        recording_proxy.seen.clear()
+
+        outcome = _get_or_error(endpoint)
+
+        assert recording_proxy.seen == []
+        assert isinstance(outcome, cc.CoordinatorUnavailable)
+
+    @requires_openssl
+    def test_https_request_opens_no_connect_tunnel(
+        self, recording_proxy: type[_ProxyRecorder], tls_bundle: _CertBundle
+    ) -> None:
+        coordinator = _make_handler_class()
+        srv = _start_tls_server(tls_bundle, coordinator)
+        try:
+            # Control: a default opener with the same verified context asks the
+            # proxy for a CONNECT tunnel (refused here) instead of going direct.
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(
+                    context=build_tls_context(str(tls_bundle.ca_pem))
+                )
+            )
+            with pytest.raises(urllib.error.URLError):
+                opener.open(f"https://127.0.0.1:{srv.port}/status", timeout=5)
+            assert len(recording_proxy.seen) == 1
+            assert recording_proxy.seen[0][0].startswith(
+                f"CONNECT 127.0.0.1:{srv.port} "
+            )
+            recording_proxy.seen.clear()
+
+            outcome = _get_or_error(
+                CoordinatorEndpoint(
+                    port=srv.port,
+                    bearer="s3cr3t",
+                    scheme="https",
+                    ca_file=str(tls_bundle.ca_pem),
+                )
+            )
+
+            assert recording_proxy.seen == []
+            assert coordinator.seen_authorizations == ["Bearer s3cr3t"]
+            assert outcome == {"ok": True}
+        finally:
+            srv.shutdown()

@@ -197,6 +197,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Coordinator requests no longer go through an HTTP proxy.** The coordinator
+  client, which the console scripts, the hook client and `CoherentVolume` all
+  use, honoured `http_proxy` and `https_proxy` (and, on macOS, the system proxy
+  settings when those are unset). With `no_proxy` unset that included loopback.
+  On a machine with a proxy configured, which is common on corporate networks,
+  every request went to the proxy instead of the coordinator, carrying the
+  coordinator's bearer token in plaintext in its `Authorization` header, and the
+  coordinator received nothing. The client now ignores proxy settings for every
+  coordinator endpoint. Loopback never needs a proxy. A remote endpoint is the
+  one host you configured and secured the link to: `CCS_REMOTE_INSECURE`
+  acknowledges that link and `CCS_REMOTE_TLS` verifies that host, and neither
+  covers a proxy in between. Over verified https a proxy could not read the
+  token, since the tunnel is TLS end to end, but the connection still went
+  through a host you never configured for it. A remote coordinator that was
+  reachable only through a proxy is now connected to directly, so such a setup
+  needs a direct route (a tunnel or VPN).
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
