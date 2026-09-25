@@ -1792,6 +1792,7 @@ class CoherentVolume:
         when the coordinator did not confirm one (older coordinator, deny,
         degraded), which generation-aware callers treat as UNCONFIRMED.
         """
+        self._ensure_attached()
         abs_path, _rel = self._to_relative(rel)
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {_rel}")

@@ -210,10 +210,15 @@ Alpha — APIs may change before `v1.0`.
   `atomic_publish` still refused without a coordinator, but an ordinary write
   landed with no error. A strict child now retries the re-attach on each
   operation, failing closed, until it attaches.
-  A second path had the same effect: a re-attach that reached a coordinator
-  *not* enforcing strict mode for the managed paths raised once but kept its
-  connection, so later operations ran through that coordinator unenforced.
-  The refusal now drops the connection before raising.
+  Two neighbouring paths had the same effect and are fixed with it:
+  - A re-attach that reached a coordinator *not* enforcing strict mode for
+    the managed paths raised once but kept its connection, so later
+    operations ran through that coordinator unenforced. The refusal now drops
+    the connection before raising.
+  - `read_with_version` and `read_with_version_generation` never triggered
+    the re-attach: in a forked child they returned version `0` without asking
+    the coordinator and without raising. They now re-attach first, like
+    `read`.
 
   `on_error="degrade"` is unchanged: one attempt, then best-effort, the same
   as a failed attach at construction.
