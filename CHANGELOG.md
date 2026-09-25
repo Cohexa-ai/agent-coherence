@@ -197,6 +197,22 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A forked `CoherentVolume` whose first re-attach fails now retries it
+  instead of running unenforced.** After `os.fork` the child drops the
+  parent's coordinator connection and re-attaches on its first `read` or
+  `write`. The pending re-attach was marked done *before* the attempt, so when
+  that attempt failed transiently — the coordinator mid-restart, its
+  `server.pid` or `hook.secret` briefly missing — `on_error="strict"` raised
+  from that one operation and then never tried again. Every later operation
+  took the unattached best-effort path without raising: the child's writes
+  landed on disk, the coordinator recorded none of them, and peers holding the
+  old bytes were never invalidated. Enforcement was off for the rest of the
+  child's life with no error to show it. The re-attach is now marked done
+  only after the attempt returns, so a strict child keeps failing closed until
+  it attaches again. `on_error="degrade"` is unchanged: one attempt, then
+  best-effort with a `CoherenceDegradedWarning`, the same as a failed attach at
+  construction.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never

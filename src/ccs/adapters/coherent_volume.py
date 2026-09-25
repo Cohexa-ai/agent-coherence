@@ -359,8 +359,13 @@ class CoherentVolume:
         A no-op outside the post-fork window.
         """
         if self._endpoint is None and self._needs_reattach:
-            self._needs_reattach = False
             self._attach()
+            # Cleared only once _attach returns. A strict failure raises out of
+            # it with the flag still set, so the next op retries the re-attach;
+            # clearing first sent every later op down the unattached best-effort
+            # branch, silently switching enforcement off for the child's life.
+            # Degrade returns detached — one attempt, as at construction.
+            self._needs_reattach = False
 
     @property
     def session_id(self) -> str:

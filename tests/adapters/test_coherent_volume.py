@@ -38,6 +38,7 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
+from ccs.cli._coherence_client import CoordinatorUnavailable
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CoherenceDegradedWarning,
@@ -169,6 +170,78 @@ def test_real_fork_child_has_distinct_identity(
         os.waitpid(pid, 0)
         assert child_id != parent_id
         assert len(child_id) == 36
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _fail_first_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the next ``resolve_endpoint`` raise once, as when ``server.pid`` or
+    ``hook.secret`` is briefly missing during a coordinator restart."""
+    real_resolve_endpoint = coherent_volume_module.resolve_endpoint
+    pending_failures = [CoordinatorUnavailable("server.pid missing (coordinator restarting)")]
+
+    def flaky_resolve_endpoint(root: Path) -> object:
+        if pending_failures:
+            raise pending_failures.pop()
+        return real_resolve_endpoint(root)
+
+    monkeypatch.setattr(coherent_volume_module, "resolve_endpoint", flaky_resolve_endpoint)
+
+
+def _coordinator_version(vol: CoherentVolume, rel: str) -> int | None:
+    """The coordinator's recorded version of ``rel`` (None if untracked)."""
+    status = vol.coordinator_status() or {}
+    versions = {a.get("path"): a.get("version") for a in status.get("tracked_artifacts", [])}
+    return versions.get(rel)
+
+
+def test_failed_reattach_after_fork_is_retried_in_strict_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forked child whose first re-attach fails transiently must retry it on
+    the next op. Dropping the pending re-attach before the attempt left a strict
+    child detached for life: every later op took the unattached best-effort
+    branch, so writes landed on disk with the coordinator recording nothing,
+    peers never invalidated, and no error raised."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol.write("data/shared.txt", b"parent")
+        version_before = _coordinator_version(vol, "data/shared.txt")
+        assert version_before is not None
+
+        vol._after_fork()  # simulate the child-side fork handler
+        _fail_first_resolve(monkeypatch)
+
+        with pytest.raises(CoherenceError):
+            vol.read("data/shared.txt")  # re-attach fails -> strict raises
+        assert not vol.is_attached
+
+        assert vol.read("data/shared.txt") == b"parent"  # retries the re-attach
+        assert vol.is_attached
+
+        vol.write("data/shared.txt", b"child")
+        assert _coordinator_version(vol, "data/shared.txt") > version_before
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_failed_reattach_after_fork_stays_best_effort_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under on_error='degrade' the same failed re-attach warns and the op runs
+    best-effort, as a failed attach at construction does — it does not raise."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        _fail_first_resolve(monkeypatch)
+
+        with pytest.warns(CoherenceDegradedWarning):
+            assert vol.read("data/shared.txt") == b"v1"
+        vol.write("data/shared.txt", b"child")
+        assert target.read_bytes() == b"child"
+        assert vol.is_degraded
     finally:
         stop_coordinator(tmp_path)
 
