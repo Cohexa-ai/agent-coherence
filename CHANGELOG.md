@@ -199,8 +199,8 @@ Alpha — APIs may change before `v1.0`.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the
-  parent's coordinator connection and re-attaches on its next operation. When
-  that attempt failed — the coordinator mid-restart, its `server.pid` or
+  parent's coordinator connection and re-attaches on its next `read` or write.
+  When that attempt failed — the coordinator mid-restart, its `server.pid` or
   `hook.secret` briefly missing — `on_error="strict"` raised from that one
   operation and never tried again. Every later `read`, `write` and
   `write_cas` then skipped the coordinator: the child's writes were neither
@@ -208,17 +208,12 @@ Alpha — APIs may change before `v1.0`.
   invalidated, and `is_degraded` stayed `False`. The adapter-local
   foreign-edit check (`on_stale_write="raise"`) still ran and `write_cas_at` /
   `atomic_publish` still refused without a coordinator, but an ordinary write
-  landed with no error. A strict child now retries the re-attach on each
-  operation, failing closed, until it attaches.
-  Two neighbouring paths had the same effect and are fixed with it:
-  - A re-attach that reached a coordinator *not* enforcing strict mode for
-    the managed paths raised once but kept its connection, so later
-    operations ran through that coordinator unenforced. The refusal now drops
-    the connection before raising.
-  - `read_with_version` and `read_with_version_generation` never triggered
-    the re-attach: in a forked child they returned version `0` without asking
-    the coordinator and without raising. They now re-attach first, like
-    `read`.
+  landed with no error. A strict child now retries the re-attach on every
+  such operation, failing closed, until it attaches.
+  A second path had the same effect: a re-attach that reached a coordinator
+  *not* enforcing strict mode for the managed paths raised once but kept its
+  connection, so later operations ran through that coordinator unenforced.
+  The refusal now drops the connection before raising.
 
   `on_error="degrade"` is unchanged: one attempt, then best-effort, the same
   as a failed attach at construction.

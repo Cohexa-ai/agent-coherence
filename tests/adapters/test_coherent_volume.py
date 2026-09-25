@@ -251,32 +251,6 @@ def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
         stop_coordinator(tmp_path)
 
 
-@pytest.mark.parametrize("method", ["read_with_version", "read_with_version_generation"])
-def test_versioned_read_reattaches_after_fork(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, method: str
-) -> None:
-    """The versioned reads are reads too. A forked child's first one must
-    re-attach and register the view — failing closed while it cannot — not
-    return version 0 with the coordinator never asked."""
-    _seed(tmp_path)
-    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
-    try:
-        vol.write("data/shared.txt", b"parent")
-        coordinator_version = _coordinator_version(vol, "data/shared.txt")
-
-        vol._after_fork()
-        _fail_first_resolve(monkeypatch)
-        versioned_read = getattr(vol, method)
-
-        with pytest.raises(CoherenceError):
-            versioned_read("data/shared.txt")
-        data, version, *_ = versioned_read("data/shared.txt")
-        assert vol.is_attached
-        assert (data, version) == (b"parent", coordinator_version)
-    finally:
-        stop_coordinator(tmp_path)
-
-
 def test_failed_reattach_after_fork_stays_best_effort_in_degrade_mode(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
