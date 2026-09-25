@@ -8,6 +8,20 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **`GET /status?detail=full` now says who last wrote each tracked
+  artifact (#199 §2).** Every `tracked_artifacts` entry at the operator tier
+  carries `last_writer_agent_id` (the committing agent's UUID, joinable against
+  `sessions[].agent_id` and durable across a coordinator restart),
+  `last_writer_session_id` (the same session-id form the stale deny/warn arms
+  emit, null when the writer has no name in this coordinator process), and
+  `last_writer_at_unix_ts`. All three are null until a commit lands. Before
+  this, writer identity was only reachable by tripping a stale read or opening
+  `.coherence/state.db`. The fields come from the existing batched
+  `status_snapshot` query (now selecting `last_writer_id` and `updated_at`),
+  so `/status` stays two SELECTs. The minimal and metrics tiers are unchanged:
+  writer attribution is workspace-state disclosure, and whether any of it
+  belongs at the default tier is left to #198.
+
 - **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
   "May this irreversible effect still fire, and if not, why?" was reachable
   from Python (`gate()`) and from MCP (`swg_gate`); a client that speaks

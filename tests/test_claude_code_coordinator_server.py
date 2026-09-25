@@ -4914,6 +4914,97 @@ def test_post_restart_holder_is_listed_at_the_default_tier(tmp_path: Path) -> No
         second.shutdown()
 
 
+# ======================================================================
+# /status tracked_artifacts carries the last writer (#199 §2)
+# ======================================================================
+#
+# Writer identity reached callers only on the stale deny/warn arms; nothing a
+# caller could *ask* returned it. It now rides ``tracked_artifacts`` at the
+# operator-gated full tier, read from the same batched snapshot row.
+
+
+def _operator_status(client: _Client) -> dict:
+    s, b = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert s == 200
+    return b
+
+
+def test_status_full_tier_reports_last_writer(client: _Client) -> None:
+    writer = _sid("writer")
+    client.post("/hooks/pre-read", {"session_id": _sid("reader"), "path": "plan.md", "content_hash": _hash("h1")})
+    client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": writer, "path": "plan.md",
+                 "content_hash": _hash("h2"), "success": True})
+
+    before = time.time()
+    [entry] = _operator_status(client)["tracked_artifacts"]
+    assert entry["version"] == 2
+    assert entry["last_writer_agent_id"] == str(session_to_agent_id(writer))
+    assert entry["last_writer_session_id"] == writer
+    assert isinstance(entry["last_writer_at_unix_ts"], float)
+    assert entry["last_writer_at_unix_ts"] <= before
+
+
+def test_status_full_tier_writer_is_null_before_any_commit(client: _Client) -> None:
+    """A first-observed artifact has no writer; its ``updated_at`` stamps the
+    observation, so it must not be reported as a write time."""
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    [entry] = _operator_status(client)["tracked_artifacts"]
+    assert entry["last_writer_agent_id"] is None
+    assert entry["last_writer_session_id"] is None
+    assert entry["last_writer_at_unix_ts"] is None
+
+
+def test_status_minimal_tier_omits_last_writer(client: _Client) -> None:
+    """Writer attribution names which session wrote what; below the operator
+    tier it stays out until #198 settles the default tier's disclosure."""
+    writer = _sid("writer")
+    client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": writer, "path": "plan.md",
+                 "content_hash": _hash("h2"), "success": True})
+    _, minimal = client.get("/status")
+    [entry] = minimal["tracked_artifacts"]
+    assert set(entry) == {"path", "version", "id"}
+
+
+def test_status_last_writer_survives_a_restart(tmp_path: Path) -> None:
+    """The agent id comes from the durable row, so it outlives the process;
+    the session id needs the in-memory name and is honestly null after it."""
+    first = _restart_on(tmp_path, "writer-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("writer-survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+        client.post("/hooks/post-edit",
+                    {"session_id": sid, "path": "docs/plan.md",
+                     "content_hash": _hash("h2"), "success": True})
+        [entry] = _operator_status(client)["tracked_artifacts"]
+        written_at = entry["last_writer_at_unix_ts"]
+        assert entry["last_writer_session_id"] == sid
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "writer-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        [entry] = _operator_status(client)["tracked_artifacts"]
+        assert entry["last_writer_agent_id"] == str(session_to_agent_id(sid))
+        assert entry["last_writer_session_id"] is None
+        assert entry["last_writer_at_unix_ts"] == written_at
+    finally:
+        second.shutdown()
+
+
 def test_status_omits_invalidated_holders_after_a_restart(tmp_path: Path) -> None:
     """Only non-INVALID states count as holding. A session whose grant was
     taken away must not reappear as a holder just because its row survives."""
