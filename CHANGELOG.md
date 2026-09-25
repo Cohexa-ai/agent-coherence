@@ -214,6 +214,21 @@ Alpha — APIs may change before `v1.0`.
   read after a peer's commit — is returned as before, and the effect fence's
   verification read (`observe=False`) still reports rather than raises.
 
+  A refused read returns no bytes, so it also leaves the foreign-edit baseline
+  where it was: a `write()` / `swg_write` built from an earlier read is still
+  denied after an out-of-band edit, instead of landing over it. A refusal
+  caused by a peer's commit still reaching disk clears on its own, so retry
+  `reacquire()` and the read for a few seconds first. When the refusal outlasts
+  that (an out-of-band edit, or a commit whose disk write failed), the
+  coordinator has never recorded the bytes on disk and re-reading will not clear
+  it: `write()` the bytes `reacquire()` returned, or a merge of them, to record
+  them. A write made sooner can be overwritten by the peer's commit when it
+  lands. The deny text and the `swg_read` description now say so.
+  `WorkspaceVersioner` handles the refusal from a `CoherentVolume` file member:
+  a checkpoint records that member as an unconfirmed pointer (`forward_only`,
+  flagged `dirty_during_window`) instead of raising, and a restore leg re-drives
+  and then concludes `conflict` without writing, so the restore still finishes.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
