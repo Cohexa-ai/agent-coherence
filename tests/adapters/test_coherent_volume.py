@@ -226,6 +226,31 @@ def test_failed_reattach_after_fork_is_retried_in_strict_mode(
         stop_coordinator(tmp_path)
 
 
+def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forked child that re-attaches to a coordinator not enforcing its managed
+    paths must fail closed on every op, not just the first. The strict check
+    raised with the endpoint to that coordinator still set, so the next op saw
+    an endpoint, skipped the re-attach, and ran through it unenforced."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+        monkeypatch.setattr(vol, "strict_mode_active", lambda: False)
+
+        for _ in range(2):
+            with pytest.raises(CoherenceError):
+                vol.read("data/shared.txt")
+            assert not vol.is_attached
+
+        monkeypatch.undo()  # the coordinator enforces the managed paths again
+        assert vol.read("data/shared.txt") == b"v1"
+        assert vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_failed_reattach_after_fork_stays_best_effort_in_degrade_mode(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

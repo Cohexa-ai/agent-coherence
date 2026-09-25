@@ -524,6 +524,15 @@ class CoherentVolume:
         # stays False). A precise per-glob check needs coordinator support; until
         # then a heterogeneous-globs fleet is unsupported (v1.1).
         if self._managed and not self.strict_mode_active():
+            # Detach BEFORE failing, in both modes. Do NOT keep a live endpoint to
+            # a coordinator that does not enforce our paths — that would route
+            # reads/writes through a non-strict coordinator while is_attached
+            # reported True. Degrade falls through detached, mirroring the other
+            # two degrade branches. Strict raises; detaching first matters for a
+            # forked child's lazy re-attach, whose next op retries only while the
+            # endpoint is None — a raise that left it set let every later op run
+            # through this coordinator unenforced.
+            self._endpoint = None
             self._fail_closed_or_degrade(
                 "attached to a coordinator that does not enforce strict mode for the "
                 "managed paths. CoherentVolume v1 can enable strict mode only on a "
@@ -533,11 +542,6 @@ class CoherentVolume:
                 "(v1.1). In degrade mode the volume operates best-effort with coherence "
                 "enforcement off."
             )
-            # Degrade mode fell through (strict raised above). Do NOT keep a live
-            # endpoint to a coordinator that does not enforce our paths — that
-            # would route reads/writes through a non-strict coordinator while
-            # is_attached reported True. Mirror the other two degrade branches.
-            self._endpoint = None
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.

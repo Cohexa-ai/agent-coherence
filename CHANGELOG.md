@@ -209,9 +209,13 @@ Alpha — APIs may change before `v1.0`.
   old bytes were never invalidated. Enforcement was off for the rest of the
   child's life with no error to show it. The re-attach is now marked done
   only after the attempt returns, so a strict child keeps failing closed until
-  it attaches again. `on_error="degrade"` is unchanged: one attempt, then
-  best-effort with a `CoherenceDegradedWarning`, the same as a failed attach at
-  construction.
+  it attaches again. A second path reached the same state: a re-attach that
+  reached a coordinator *not* enforcing strict mode for the managed paths
+  raised once but kept its connection to that coordinator, so later
+  operations skipped the re-attach and ran through it unenforced. That refusal
+  now drops the connection before raising, and the next operation retries.
+  `on_error="degrade"` is unchanged: one attempt, then best-effort with a
+  `CoherenceDegradedWarning`, the same as a failed attach at construction.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
