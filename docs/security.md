@@ -57,7 +57,12 @@ an insecure-https mode simply does not exist in the client's configuration. To
 trust a private certificate authority instead of the system trust store, point
 `CCS_REMOTE_CA_FILE` at a CA-bundle file; it is loaded fail-closed — a symlinked
 bundle is refused, and a group- or world-writable bundle is refused (a trust
-anchor an attacker can rewrite is not a trust anchor). The client also **refuses
+anchor an attacker can rewrite is not a trust anchor). That bundle is re-read on
+every request, so replacing it takes effect on the next one. Without it, the
+client loads the system trust store once per process, on its first https
+request. Until the process restarts, a certificate removed from that store stays
+trusted, and if the store was missing at that moment, every https request fails
+verification. The client also **refuses
 to follow redirects**: it talks to the one coordinator endpoint you configured, so
 any redirect response is rejected rather than followed with the bearer attached.
 The loopback path is unchanged — a plain `http://` loopback endpoint behaves

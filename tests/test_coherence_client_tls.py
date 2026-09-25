@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -680,9 +683,10 @@ class TestLoopbackHttpUnchanged:
 # Opener construction. On Python 3.12+ a default urllib HTTPSHandler loads the
 # whole system CA store when it is constructed (~13 ms of CPU), and the
 # transport used to build one into a fresh opener on EVERY request, plain http
-# to loopback included. The plain-http path now builds no https handler and
-# reuses one opener; the https path still builds its verified context per
-# request, so the CA bundle is re-validated every time.
+# to loopback included. Plain http now reuses one opener with no https handler;
+# https with no CA file reuses one whose system-trust context is built once per
+# process; https with CCS_REMOTE_CA_FILE still builds its verified context per
+# request, so that bundle is re-validated every time.
 # ===========================================================================
 
 
@@ -724,15 +728,15 @@ def tls_setup_counts(monkeypatch: pytest.MonkeyPatch) -> _TlsSetupCounts:
 
 
 @pytest.fixture
-def fresh_plain_opener(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The plain-http opener is built once per process. Clear it so the request
-    # that builds it runs inside the test.
-    monkeypatch.setattr(cc, "_plain_opener", None)
+def fresh_shared_openers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Shared openers are built once per process. Clear them so the request
+    # that builds one runs inside the test.
+    monkeypatch.setattr(cc, "_shared_openers", {})
 
 
 @pytest.fixture
 def opener_builds(
-    fresh_plain_opener: None, monkeypatch: pytest.MonkeyPatch
+    fresh_shared_openers: None, monkeypatch: pytest.MonkeyPatch
 ) -> list[None]:
     """One entry per ``OpenerDirector`` built during the test."""
     builds: list[None] = []
@@ -796,7 +800,7 @@ class TestTlsSetupCountsSeeTheCost:
 
 class TestPlainHttpOpener:
     def test_http_requests_build_no_https_handler_and_load_no_ca_store(
-        self, tls_setup_counts: _TlsSetupCounts, fresh_plain_opener: None
+        self, tls_setup_counts: _TlsSetupCounts, fresh_shared_openers: None
     ) -> None:
         srv = _start_plain_server(_make_handler_class())
         try:
@@ -824,25 +828,42 @@ class TestPlainHttpOpener:
         finally:
             srv.shutdown()
 
-    def test_the_shared_opener_cannot_open_https(self, fresh_plain_opener: None) -> None:
+    def test_the_shared_opener_cannot_open_https(
+        self, fresh_shared_openers: None
+    ) -> None:
         # It holds no https handler, so an https request routed to it fails
         # closed instead of riding a default (possibly unverified) SSL context.
         with pytest.raises(urllib.error.URLError, match="unknown url type: https"):
-            cc._get_plain_opener().open("https://127.0.0.1:1/status")
+            cc._get_shared_opener(system_tls=False).open("https://127.0.0.1:1/status")
 
+    @pytest.mark.parametrize(
+        "scheme", ["http", pytest.param("https", marks=requires_openssl)]
+    )
     def test_one_opener_serves_concurrent_threads_without_crosstalk(
-        self, opener_builds: list[None]
+        self,
+        scheme: str,
+        opener_builds: list[None],
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # CoherentVolume instances on different threads share this module and so
-        # this opener. All threads start at once on an unbuilt opener, then check
-        # that every response answers their own request (path and bearer).
+        # its openers: plain http, and https verified against the system trust
+        # store. All threads start at once on an unbuilt opener, then check that
+        # every response answers their own request (path and bearer).
         n_threads, n_requests = 8, 20
-        srv = _start_plain_server(_EchoHandler)
+        if scheme == "https":
+            bundle: _CertBundle = request.getfixturevalue("tls_bundle")
+            monkeypatch.setenv("SSL_CERT_FILE", str(bundle.ca_pem))
+            srv = _start_tls_server(bundle, _EchoHandler)
+        else:
+            srv = _start_plain_server(_EchoHandler)
         barrier = threading.Barrier(n_threads)
         errors: list[BaseException] = []
 
         def worker(i: int) -> None:
-            ep = CoordinatorEndpoint(port=srv.port, bearer=f"b{i}", host="127.0.0.1")
+            ep = CoordinatorEndpoint(
+                port=srv.port, bearer=f"b{i}", host="127.0.0.1", scheme=scheme
+            )
             try:
                 barrier.wait(timeout=10)
                 for j in range(n_requests):
@@ -871,6 +892,136 @@ class TestPlainHttpOpener:
             srv.shutdown()
         assert errors == []
         assert len(opener_builds) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_fork_during_a_first_build_does_not_hang_the_child(
+    fresh_shared_openers: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A forked CoherentVolume child talks to the coordinator through this module.
+    # Fork while another thread holds the shared-opener lock mid-build: the child
+    # inherits that lock held, with no thread left to release it.
+    building, release = threading.Event(), threading.Event()
+    real_build = cc._build_opener
+
+    def held_open_build(
+        context: ssl.SSLContext | None,
+    ) -> urllib.request.OpenerDirector:
+        building.set()
+        release.wait(timeout=30)
+        return real_build(context)
+
+    monkeypatch.setattr(cc, "_build_opener", held_open_build)
+    # On macOS, a child forked from a threaded parent aborts if it initializes an
+    # Objective-C class the parent never did, and proxy lookup goes through
+    # SystemConfiguration. Look proxies up once here, as any parent that has
+    # already made a coordinator request has.
+    urllib.request.getproxies()
+    builder = threading.Thread(
+        target=cc._get_shared_opener, kwargs={"system_tls": False}, name="builder"
+    )
+    builder.start()
+    try:
+        assert building.wait(timeout=10), "builder thread never started building"
+        pid = os.fork()
+        if pid == 0:  # child: only os._exit, never return into pytest
+            exit_code = 1
+            try:
+                cc._build_opener = real_build
+                cc._get_shared_opener(system_tls=False)
+                cc._get_shared_opener(system_tls=True)
+                exit_code = 0
+            finally:
+                os._exit(exit_code)
+        deadline = time.monotonic() + 10
+        while (reaped := os.waitpid(pid, os.WNOHANG))[0] == 0:
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("forked child still blocked on the shared-opener lock after 10s")
+            time.sleep(0.02)
+        assert os.waitstatus_to_exitcode(reaped[1]) == 0
+    finally:
+        release.set()
+        builder.join(timeout=10)
+
+
+@requires_openssl
+class TestSystemTrustHttpsOpener:
+    """https with no CA file verifies against the system trust store. Here
+    ``SSL_CERT_FILE`` points that store at a throwaway CA, so a local server can
+    pass (or, pointed at an unrelated CA, fail) verification."""
+
+    def test_system_trust_https_loads_the_trust_store_once(
+        self,
+        tls_bundle: _CertBundle,
+        tls_setup_counts: _TlsSetupCounts,
+        fresh_shared_openers: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_bundle.ca_pem))
+        srv = _start_tls_server(tls_bundle, _make_handler_class())
+        try:
+            ep = CoordinatorEndpoint(
+                port=srv.port, bearer="s3cr3t", host="127.0.0.1", scheme="https"
+            )
+            for _ in range(3):
+                assert cc.get(ep, "/status") == {"ok": True}
+            # All three were verified against the store and reached the server.
+            assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"] * 3
+            assert tls_setup_counts.ca_store_loads == 1
+            assert tls_setup_counts.https_handlers == 1
+        finally:
+            srv.shutdown()
+
+    def test_http_and_system_trust_https_keep_separate_openers(
+        self,
+        tls_bundle: _CertBundle,
+        fresh_shared_openers: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # One process can talk to a loopback http coordinator and a remote https
+        # one. Each kind must get its own shared opener whichever is built first:
+        # the plain one cannot open https, and must not gain an https handler.
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_bundle.ca_pem))
+        plain = _start_plain_server(_make_handler_class())
+        tls = _start_tls_server(tls_bundle, _make_handler_class())
+        try:
+            http_ep = CoordinatorEndpoint(port=plain.port, bearer="h", host="127.0.0.1")
+            https_ep = CoordinatorEndpoint(
+                port=tls.port, bearer="t", host="127.0.0.1", scheme="https"
+            )
+            assert cc.get(http_ep, "/status") == {"ok": True}
+            assert cc.get(https_ep, "/status") == {"ok": True}
+            assert cc.get(http_ep, "/status") == {"ok": True}
+            assert plain.handler_cls.seen_authorizations == ["Bearer h"] * 2
+            assert tls.handler_cls.seen_authorizations == ["Bearer t"]
+        finally:
+            plain.shutdown()
+            tls.shutdown()
+
+    def test_system_trust_https_refuses_a_server_the_store_does_not_vouch_for(
+        self,
+        tmp_path: Path,
+        tls_bundle: _CertBundle,
+        fresh_shared_openers: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The shared context must still verify: with the store pointed at an
+        # unrelated CA, the server's certificate is refused before any request.
+        other_ca = _make_ca_pem(tmp_path / "other")
+        assert other_ca is not None
+        monkeypatch.setenv("SSL_CERT_FILE", str(other_ca))
+        srv = _start_tls_server(tls_bundle, _make_handler_class())
+        try:
+            ep = CoordinatorEndpoint(
+                port=srv.port, bearer="s3cr3t", host="127.0.0.1", scheme="https"
+            )
+            with pytest.raises(TlsVerificationFailed):
+                cc.get(ep, "/status")
+            assert srv.handler_cls.seen_authorizations == []
+        finally:
+            srv.shutdown()
 
 
 @requires_openssl

@@ -626,12 +626,27 @@ def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirect
     return opener
 
 
-_PLAIN_OPENER_LOCK = threading.Lock()
-_plain_opener: urllib.request.OpenerDirector | None = None
+_SHARED_OPENERS_LOCK = threading.Lock()
+#: Keyed by ``system_tls`` (see :func:`_get_shared_opener`).
+_shared_openers: dict[bool, urllib.request.OpenerDirector] = {}
 
 
-def _get_plain_opener() -> urllib.request.OpenerDirector:
-    """The process-wide opener for plain-http requests, built on first use.
+def _reset_shared_openers_lock_in_child() -> None:
+    # A fork while another thread is building an opener copies this lock held,
+    # and no thread in the child will ever release it: the child's first request
+    # would block forever. Openers are stored only once fully built, so the child
+    # keeps them and builds any that were still in flight.
+    global _SHARED_OPENERS_LOCK
+    _SHARED_OPENERS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_shared_openers_lock_in_child)
+
+
+def _get_shared_opener(*, system_tls: bool) -> urllib.request.OpenerDirector:
+    """A process-wide opener, built on first use: plain http, or with
+    ``system_tls`` https verified against the system trust store.
 
     Shared across threads: each of its handlers keeps no per-request state
     (``HTTPHandler`` opens a fresh connection per request, the rest only read or
@@ -640,14 +655,21 @@ def _get_plain_opener() -> urllib.request.OpenerDirector:
     here, because every endpoint and thread in the process would share its state.
     ``ProxyHandler`` reads the proxy settings once, when this is built, as
     ``urlopen``'s shared opener does.
+
+    The system-trust context is shared too (an OpenSSL client context caches no
+    TLS sessions, so none carries over between connections), so the trust store
+    is not parsed again on every request. It is loaded when this opener is
+    built. Until the process restarts, a certificate later removed from the
+    system bundle (or from ``SSL_CERT_FILE``) stays trusted, and a bundle that
+    was missing at that moment stays missing.
     """
-    global _plain_opener
-    opener = _plain_opener
+    opener = _shared_openers.get(system_tls)
     if opener is None:
-        with _PLAIN_OPENER_LOCK:
-            opener = _plain_opener
+        with _SHARED_OPENERS_LOCK:
+            opener = _shared_openers.get(system_tls)
             if opener is None:
-                opener = _plain_opener = _build_opener(None)
+                context = build_tls_context() if system_tls else None
+                opener = _shared_openers[system_tls] = _build_opener(context)
     return opener
 
 
@@ -655,13 +677,16 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
     if req.type == "https":
         # build_tls_context may raise TlsConfigError (typed, fail-closed) — that
         # is a config bug, not a transient network failure, so it propagates.
-        # Built per request, never cached: build_tls_context re-validates and
-        # re-reads the CA bundle each time, so a swapped, loosened or rotated
-        # trust anchor is caught by the very next request.
         ca_file = getattr(req, "_ccs_ca_file", None)
-        opener = _build_opener(build_tls_context(ca_file))
+        if ca_file:
+            # Built per request, never shared: build_tls_context re-validates
+            # and re-reads the CA bundle each time, so a swapped, loosened or
+            # rotated trust anchor is caught by the very next request.
+            opener = _build_opener(build_tls_context(ca_file))
+        else:
+            opener = _get_shared_opener(system_tls=True)
     else:
-        opener = _get_plain_opener()
+        opener = _get_shared_opener(system_tls=False)
     try:
         with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
             raw = resp.read()
