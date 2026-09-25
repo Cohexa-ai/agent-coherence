@@ -1270,9 +1270,11 @@ class CoherentVolume:
         which members landed. This shrinks — but a process crash between two
         renames cannot fully eliminate — the multi-file disk window (no POSIX
         multi-file atomic rename exists). On a ``PublishMaterializationError`` the
-        coordinator is ahead of disk; recover by re-reading each member at its
-        current version and re-materializing (never retry the publish — it would
-        version-mismatch).
+        coordinator is ahead of disk; recover by re-materializing each
+        ``not_landed`` member with :meth:`write` of the bytes this publish
+        committed for it (until then :meth:`read_with_version` refuses that
+        member, since its disk bytes are not the content at the current
+        version). Never retry the publish — it would version-mismatch.
 
         **Foreign-edit boundary (read this too).** The staleness this API
         detects is VERSION drift at the coordinator — and only volume-mediated
