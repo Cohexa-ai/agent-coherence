@@ -37,6 +37,7 @@ import hashlib
 import io
 import logging
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -59,6 +60,8 @@ from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
     RemoteCoordinatorConfig,
+    caller_principal_headers,
+    claim_caller_principal,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
@@ -347,6 +350,17 @@ class CoherentVolume:
         # per attempt while the session id is not.
         self._session_id = str(uuid.uuid4())
         self._incarnation = self._new_incarnation()
+        self._new_principal_claim()
+
+    def _new_principal_claim(self) -> None:
+        # The caller principal is bound to the SESSION, so it is obtained once per
+        # session — at attach, and in a forked child for the child's own session —
+        # and never at _remint, which keeps the session (plan KTD14). A long-lived
+        # caller holds the nonce and the principal in memory only, never on disk:
+        # that is what makes this binding genuine (KTD5). ``None`` until the claim
+        # at attach, and for good against a coordinator that issues none.
+        self._mint_nonce = secrets.token_urlsafe(32)
+        self._principal: str | None = None
 
     @staticmethod
     def _new_incarnation() -> str:
@@ -367,6 +381,10 @@ class CoherentVolume:
         with self._lock:
             self._session_id = str(uuid.uuid4())
             self._incarnation = self._new_incarnation()
+            # The parent's principal is bound to the parent's session: discard
+            # it (and its nonce); the child claims for its own session when it
+            # re-attaches.
+            self._new_principal_claim()
             self._grant_incarnations.clear()
             self._endpoint = None
             self._needs_reattach = True
@@ -495,6 +513,7 @@ class CoherentVolume:
             self._endpoint = None
             return
         self._endpoint = endpoint
+        self._claim_principal()
 
     # --- spawn-with-strict --------------------------------------------------
 
@@ -562,6 +581,28 @@ class CoherentVolume:
             # would route reads/writes through a non-strict coordinator while
             # is_attached reported True. Mirror the other two degrade branches.
             self._endpoint = None
+            return
+        self._claim_principal()
+
+    def _claim_principal(self) -> None:
+        """Obtain this session's caller principal: once per session, at attach.
+
+        A coordinator that answers 404 issues none (the sibling Node coordinator,
+        or an older Python one) and the volume proceeds without a header, as
+        before. A refused claim (the session already bound under another nonce)
+        or an unconfirmed one routes through ``on_error`` like every other
+        coordinator failure — strict raises at construction; degrade warns once
+        and proceeds without a principal, so the routes that require one refuse
+        this volume's writes and those degrade too. Nothing is re-minted."""
+        if self._endpoint is None:
+            return
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        if claim.outcome == "bound":
+            self._principal = claim.principal
+        elif claim.outcome in ("refused", "unconfirmed"):
+            self._fail_closed_or_degrade(
+                f"coordinator caller principal not obtained ({claim.outcome}: {claim.detail})"
+            )
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.
@@ -849,6 +890,7 @@ class CoherentVolume:
                         "path": rel,
                         "success": False,
                     },
+                    extra_headers=caller_principal_headers(self._principal),
                 )
             raise
 
@@ -1783,10 +1825,17 @@ class CoherentVolume:
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
         body that already names one — the release of an abandoned incarnation —
-        keeps its own."""
+        keeps its own. Every request presents the session's caller principal
+        (header), which a require-class route checks the session against; an
+        incarnation is a subagent component, so it shares the session's."""
         payload = {"agent_id": self._incarnation, **payload}
         try:
-            return _coordinator_post(self._endpoint, endpoint_path, payload)
+            return _coordinator_post(
+                self._endpoint,
+                endpoint_path,
+                payload,
+                extra_headers=caller_principal_headers(self._principal),
+            )
         except urllib.error.HTTPError as exc:
             # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
             # with a distinct type, never the generic degrade path (which a

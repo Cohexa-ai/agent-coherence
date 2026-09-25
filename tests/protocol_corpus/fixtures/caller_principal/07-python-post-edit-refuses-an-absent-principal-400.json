@@ -1,0 +1,52 @@
+{
+  "name": "caller-principal-python-post-edit-refuses-an-absent-principal",
+  "description": "post-edit commits a version and records last_writer_id under the named session. The first preflight CLAIMS session A; its pre-edit (accept-class) is admitted without the principal, but the commit naming the now-bound A without it is refused. Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md",
+      "success": true,
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

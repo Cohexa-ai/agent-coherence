@@ -274,13 +274,16 @@ def _held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
 def _end_turn(vol: CoherentVolume) -> None:
     """Release the volume's grants the way an agent's turn end does: a
     session-stop naming the CURRENT incarnation. A stop without it addresses the
-    session's parent row, which holds nothing, and releases nothing."""
+    session's parent row, which holds nothing, and releases nothing. The stop is
+    require-class, so it presents the volume's session principal."""
+    from ccs.cli._coherence_client import caller_principal_headers
     from ccs.cli._coherence_client import post as _cpost
 
     _cpost(
         vol._endpoint,
         "/hooks/session-stop",
         {"session_id": vol.session_id, "agent_id": vol._incarnation},
+        extra_headers=caller_principal_headers(vol._principal),
     )
     assert _held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
 
@@ -1243,9 +1246,9 @@ def test_fs_write_failure_releases_grant(
         posts: list[tuple[str, dict]] = []
         real_post = cv_mod._coordinator_post
 
-        def spy(endpoint: object, path: str, payload: dict) -> object:
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             posts.append((path, dict(payload)))
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
         monkeypatch.setattr(vol, "_atomic_write", _raise_oserror)
@@ -1285,9 +1288,9 @@ def test_non_oserror_in_write_window_releases_grant(
         posts: list[tuple[str, dict]] = []
         real_post = cv_mod._coordinator_post
 
-        def spy(endpoint: object, path: str, payload: dict) -> object:
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             posts.append((path, dict(payload)))
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
         monkeypatch.setattr(vol, "_disk_hash", _raise_runtime)  # non-OSError in the window
@@ -1318,9 +1321,9 @@ def test_no_op_skip_still_finalizes_grant(
         posts: list[str] = []
         real_post = cv_mod._coordinator_post
 
-        def spy(endpoint: object, path: str, payload: dict) -> object:
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             posts.append(path)
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(cv_mod, "_coordinator_post", spy)
         vol.write("data/x.txt", b"same")  # identical -> no-op skip
@@ -1340,7 +1343,7 @@ def test_write_fails_closed_on_watchdog_degrade(
     _seed(tmp_path)
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
     try:
-        def fake_post(endpoint: object, path: str, payload: dict) -> dict:
+        def fake_post(endpoint: object, path: str, payload: dict, **kwargs: object) -> dict:
             if path == "/hooks/pre-edit":
                 return {"ok": True, "degraded": True}  # watchdog-timeout envelope
             return {"ok": True}
@@ -1961,9 +1964,9 @@ def _count_stops(
     send time)`` and forward it unchanged."""
     real_post = coherent_volume_module._coordinator_post
 
-    def spy(endpoint: object, path: str, payload: dict) -> object:
+    def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
         sent.append((path, dict(payload), vol._incarnation))
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
 
@@ -2073,13 +2076,13 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
         _data, version = vol.read_with_version(rel)
         real_post = coherent_volume_module._coordinator_post
 
-        def strand_the_grant(endpoint: object, path: str, payload: dict) -> object:
+        def strand_the_grant(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if lost == "pre-edit answer" and path == "/hooks/pre-edit":
-                real_post(endpoint, path, payload)  # the acquire lands ...
+                real_post(endpoint, path, payload, **kwargs)  # the acquire lands ...
                 raise CoordinatorUnavailable("simulated: the acquire's answer was lost")
             if lost == "post-edit" and path == "/hooks/post-edit" and payload.get("success"):
                 raise CoordinatorUnavailable("simulated: the commit never arrived")
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", strand_the_grant)
         # Same bytes as on disk, so the only thing left over is the grant.
@@ -2225,11 +2228,11 @@ def test_a_degraded_release_answer_is_not_a_confirmed_release(
         real_post = coherent_volume_module._coordinator_post
         degraded_left = [1]
 
-        def degrade_one_release(endpoint: object, path: str, payload: dict) -> object:
+        def degrade_one_release(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop" and degraded_left[0]:
                 degraded_left[0] -= 1
                 return {"ok": True, "degraded": True}  # the release did not run
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degrade_one_release)
         with warnings.catch_warnings():
@@ -2261,12 +2264,12 @@ def test_a_failed_release_stops_the_pass_and_keeps_every_record(
         stops: list[str] = []
         failing = [True]
 
-        def fail_releases(endpoint: object, path: str, payload: dict) -> object:
+        def fail_releases(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop":
                 stops.append(payload["agent_id"])
                 if failing[0]:
                     return {"ok": True, "degraded": True}
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", fail_releases)
         with warnings.catch_warnings():
@@ -2387,11 +2390,11 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         real_post = coherent_volume_module._coordinator_post
         failures = {"left": 1}
 
-        def release_fails_once(endpoint: object, path: str, payload: dict) -> object:
+        def release_fails_once(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop" and failures["left"]:
                 failures["left"] -= 1
                 raise CoordinatorUnavailable("simulated: the release did not arrive")
-            return real_post(endpoint, path, payload)
+            return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", release_fails_once)
         outcome: dict[str, BaseException | None] = {}
@@ -2505,5 +2508,238 @@ def test_real_fork_child_releases_nothing_and_the_parent_keeps_its_grant(
 
         assert report == "0|0", f"child: releases sent | grants still recorded = {report}"
         assert _held(vol, parent_row) == {rel: "MODIFIED"}
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Caller principal (caller-principal plan, U5 / KTD14)
+#
+# A volume is a LONG-LIVED caller: it claims its session's principal once, at
+# attach, holds it (and the mint nonce) in memory only, and presents it on
+# every request — so its binding is genuine, not a file any process could read
+# (KTD5). The session is stable across re-mints (U9), so a re-mint claims
+# nothing; a forked child is a new session and claims its own.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
+    caller_principal_identity,
+)
+
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
+
+
+def _count_claims(monkeypatch: pytest.MonkeyPatch, claims: list[str]) -> None:
+    """Record the session of every claim a volume sends, forwarding it."""
+    real = getattr(coherent_volume_module, "claim_caller_principal", None)
+
+    def spy(endpoint: object, session_id: str, nonce: str) -> object:
+        claims.append(session_id)
+        return real(endpoint, session_id, nonce)
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", spy, raising=False)
+
+
+def _record_principals(
+    monkeypatch: pytest.MonkeyPatch, sent: list[tuple[str, str | None]]
+) -> None:
+    """Record ``(route, presented principal)`` for every request, forwarding it."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        headers = kwargs.get("extra_headers") or {}
+        sent.append((path, headers.get(_PRINCIPAL_HEADER)))  # type: ignore[union-attr]
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+
+
+def test_a_volume_claims_once_and_presents_one_principal_across_every_re_mint(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many optimistic writes — uncontended, contended (a peer commits inside
+    the retry window, forcing re-mints), a reacquire, and a pessimistic write
+    followed by an optimistic commit (whose re-mint releases the stranded grant
+    through the require-class stop) — and each volume holds exactly ONE
+    binding: claimed once at construction, never at a re-mint, the same
+    principal on every request. Prevents claiming at ``_remint`` (a principal
+    row and two round trips per attempt, KTD14) and a re-mint that drops the
+    principal and gets its writes refused."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"0")
+    claims: list[str] = []
+    _count_claims(monkeypatch, claims)
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        assert sorted(claims) == sorted([vol_a.session_id, vol_b.session_id])
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+        incarnations = {vol_b._incarnation}
+
+        for _ in range(3):
+            vol_a.write_cas(rel, lambda cur: str(int(cur) + 1).encode())
+        interfered = {"done": False}
+
+        def bump_racing_peer(cur: bytes) -> bytes:
+            if not interfered["done"]:
+                interfered["done"] = True
+                vol_a.write_cas(rel, lambda c: str(int(c) + 10).encode())
+            incarnations.add(vol_b._incarnation)
+            return str(int(cur) + 1).encode()
+
+        vol_b.write_cas(rel, bump_racing_peer)
+        incarnations.add(vol_b._incarnation)
+        vol_b.reacquire(rel)
+        incarnations.add(vol_b._incarnation)
+        vol_b.write(rel, b"100")
+        _data, version = vol_b.read_with_version(rel)
+        vol_b.write_cas_at(rel, version, b"101")
+        incarnations.add(vol_b._incarnation)
+
+        assert len(incarnations) >= 3, "control: the scenario really re-minted"
+        assert (tmp_path / rel).read_bytes() == b"101"
+        assert sorted(claims) == sorted([vol_a.session_id, vol_b.session_id]), (
+            "a re-mint claimed a principal"
+        )
+        assert {p for _r, p in sent} == {vol_a._principal, vol_b._principal}
+        assert None not in {p for _r, p in sent}
+        assert "/hooks/session-stop" in {r for r, _p in sent}, "control: a release was sent"
+        assert vol_a._principal is not None and vol_b._principal is not None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_the_volume_binding_is_the_coordinators_and_distinct_per_volume(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The principal a volume holds is the one the coordinator bound to the
+    volume's session (read back from the durable store after the volumes
+    stop), and two volumes hold different ones."""
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    held = {vol.session_id: vol._principal for vol in (vol_a, vol_b)}
+    stop_coordinator(tmp_path)
+    registry = SqliteArtifactRegistry(tmp_path / ".coherence" / "state.db")
+    try:
+        for sid, principal in held.items():
+            assert principal is not None
+            assert registry.get_caller_principal(caller_principal_identity(sid)) == principal
+    finally:
+        registry.close()
+    assert len(set(held.values())) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_a_forked_child_claims_its_own_principal_and_writes_under_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A forked child is a new session: it discards the principal it inherited
+    in memory, claims its own on re-attach, and its require-class commit is
+    admitted under it. The parent keeps its own and still writes."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        parent_principal = vol._principal
+        assert parent_principal is not None
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            os.close(read_fd)
+            try:
+                inherited = vol._principal
+                vol.write(rel, b"v2-child")
+                report = {
+                    "inherited_dropped": inherited is None,
+                    "session": vol.session_id,
+                    "principal": vol._principal,
+                }
+                os.write(write_fd, json.dumps(report).encode())
+            except BaseException as exc:  # report, never hang the parent
+                os.write(write_fd, json.dumps({"error": repr(exc)}).encode())
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        ready, _w, _x = select.select([read_fd], [], [], 30)
+        if not ready:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("timed out waiting for the forked child's report")
+        report = json.loads(os.read(read_fd, 4096).decode("utf-8"))
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+
+        assert "error" not in report, report
+        assert report["inherited_dropped"] is True
+        assert report["session"] != vol.session_id
+        assert report["principal"] not in (None, parent_principal)
+        assert (tmp_path / rel).read_bytes() == b"v2-child"
+        vol.write(rel, b"v3-parent")
+        assert vol._principal == parent_principal
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_coordinator_that_issues_no_principals_leaves_the_volume_headerless(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 404 on the claim (the sibling Node coordinator, an older Python one)
+    is not a failure: the volume attaches, is not degraded, and sends no
+    principal header — exactly what it sent before principals existed."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    monkeypatch.setattr(
+        coherent_volume_module, "claim_caller_principal",
+        lambda *_a: PrincipalClaim("unsupported"), raising=False,
+    )
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+        assert vol.read("data/shared.txt") == b"v1"
+        assert vol.is_attached and not vol.is_degraded
+        assert sent and all(p is None for _r, p in sent)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("outcome", ["refused", "unconfirmed"])
+def test_a_claim_not_bound_at_attach_fails_closed_and_is_never_re_minted(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """A claim that did not bind routes through ``on_error`` like any other
+    coordinator failure: strict raises at construction; degrade warns once
+    and runs without a principal. Either way nothing claims again — not the
+    re-mint, not a reacquire — because a second claim with a new nonce is
+    exactly what first-claim-wins refuses (KTD11)."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    calls: list[str] = []
+
+    def not_bound(_endpoint: object, session_id: str, _nonce: str) -> PrincipalClaim:
+        calls.append(session_id)
+        return PrincipalClaim(outcome, detail="simulated")  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        coherent_volume_module, "claim_caller_principal", not_bound, raising=False
+    )
+    _seed(tmp_path, content=b"v1")
+    try:
+        with pytest.raises(CoherenceError, match="caller principal"):
+            CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        calls.clear()
+        with pytest.warns(CoherenceDegradedWarning):
+            vol = CoherentVolume(
+                tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg
+            )
+        assert vol._principal is None
+        vol._remint()
+        vol.reacquire("data/shared.txt")
+        assert len(calls) == 1
     finally:
         stop_coordinator(tmp_path)

@@ -19,6 +19,12 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``GET  /status``              — Unit 6 status CLI
 - ``POST /principal/claim``     — caller-principal mint (plan U4; Python-only)
 
+Every route that names an acting identity (``session_id``) has a caller-
+principal posture in :data:`_CALLER_PRINCIPAL_POSTURE` (plan U6): require-class
+routes refuse a request naming a CLAIMED identity without the principal minted
+for it, accept-class routes admit and count one, every class refuses a foreign
+principal, the mint is neither.
+
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
 - Verifies ``Host`` header is localhost / 127.0.0.1 (DNS-rebind guard)
@@ -49,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -57,6 +64,7 @@ from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
+    CALLER_PRINCIPAL_HEADER,
     assert_serve_transport_acknowledged,
     build_host_allowlist,
     ensure_secret,
@@ -70,6 +78,8 @@ from ccs.coordinator.service import CoordinatorService, mint_nonce_problem
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_ABSENT_REASON,
+    CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
@@ -121,6 +131,9 @@ class _RequestProtocol(Protocol):
 
     headers: Any  # http.client.HTTPMessage (Mapping-like)
     path: str
+    #: ``(method, route path)`` the dispatcher matched in ``_ROUTES``, set
+    #: before the handler runs; keys the caller-principal posture lookup.
+    _route_key: tuple[str, str]
 
     def _read_json(self) -> dict | None:
         """Read + parse the request body as JSON. Returns None on error."""
@@ -295,16 +308,214 @@ class PresentedCaller:
         (``artifacts.last_writer_id``), with its SESSION component verified
         against the caller principal first.
 
-        Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when the
-        principal is absent or does not match the session's binding, so a
-        refused caller never reaches a write. The composite over session and
-        subagent is unchanged — two subagents of one session keep distinct
+        Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when a
+        principal is presented and does not match the session's binding
+        (``caller_principal_foreign`` — including one presented for a session
+        nobody claimed), or when none is presented for a session that IS bound
+        (``caller_principal_absent``), so a refused caller never reaches a
+        write. A caller presenting none for a session nobody ever claimed is a
+        client that predates the principal: it is attributed under the plain
+        composite, as before the principal existed (plan U6 / R16) — refusing
+        it would only turn its writes silently unrecorded, since the shipped
+        hook client reads any non-2xx as an allow. The composite over session
+        and subagent is unchanged — two subagents of one session keep distinct
         writer ids, which the self-commit-lag comparison depends on."""
-        service.validate_caller_principal(
-            identity=caller_principal_identity(self.session_id),
-            principal=self.principal,
-        )
+        identity = caller_principal_identity(self.session_id)
+        if self.principal is None and not service.is_caller_principal_bound(identity):
+            return session_to_agent_id(self.session_id, self.subagent_id)
+        service.validate_caller_principal(identity=identity, principal=self.principal)
         return session_to_agent_id(self.session_id, self.subagent_id)
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that reads a ``session_id`` is classified by the harm an ABSENT
+# principal admits on it (KTD3) — not by retryability: a principal is an
+# authorization operand, and no downstream invariant catches a request that
+# acted as someone else. What the principal buys is accident-resistance and
+# attributability under the same-OS-user cooperative trust model; on the hook
+# surface it is stored under ``.coherence/``, so there it is convention-
+# enforcement and a detectable unbound caller, never caller separation (KTD5).
+#
+# Enforcement is THIS coordinator's only: the sibling Node coordinator issues
+# no principals, answers 404 on ``/principal/claim`` and ignores the header
+# (KTD12). The protocol corpus pins that asymmetry.
+
+
+class PrincipalPosture(Enum):
+    """How a route treats the caller principal of the identity it names."""
+
+    #: Refuse a foreign principal, and an absent one for an identity that is
+    #: BOUND (HTTP 400 naming the header, never a hold — KTD9). An absent
+    #: principal for an identity nobody ever claimed is an older client's:
+    #: admitted and counted, as before the principal existed (R16).
+    REQUIRE = "require"
+    #: Admit an absent principal, bound identity or not, and count it (a local
+    #: diagnostic, not a flip trigger — KTD4); refuse a foreign one, so a
+    #: presented principal is always CHECKED, never ignored.
+    ACCEPT = "accept"
+    #: The route that issues principals. It cannot require one (that would be
+    #: circular); its gate is the mint nonce (KTD11). The header is not read.
+    MINT = "mint"
+
+
+@dataclass(frozen=True)
+class RoutePrincipalPosture:
+    """One route's posture and the harm that places it there."""
+
+    posture: PrincipalPosture
+    harm: str
+
+
+_REQUIRE = PrincipalPosture.REQUIRE
+_ACCEPT = PrincipalPosture.ACCEPT
+
+_CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
+    # -- the nine hook routes ------------------------------------------------
+    ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
+        "a read: registers or refreshes the named identity's SHARED view. It "
+        "records no attribution, and strict mode never re-grants on a stale "
+        "read, so the downstream write routes still catch a stale writer")),
+    ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
+        "gates an escaping effect on the named identity's grant standing: a "
+        "caller naming a claimed peer without its principal would be answered "
+        "about the PEER's grant and told an irreversible effect may fire")),
+    ("POST", "/hooks/pre-edit"): RoutePrincipalPosture(_ACCEPT, (
+        "acquires EXCLUSIVE and preempts holders whatever identity it names — "
+        "a fresh, principal-bearing identity preempts identically, so a "
+        "principal adds nothing here until the acquire-or-fail contract lands; "
+        "the commit that follows (post-edit) is require-class")),
+    ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "commits a version and records artifacts.last_writer_id under the "
+        "named identity (or, on success:false, releases its grant): a caller "
+        "without a claimed peer's principal could write under the peer's name "
+        "or drop the peer's grant")),
+    ("POST", "/hooks/post-edit-cas"): RoutePrincipalPosture(_REQUIRE, (
+        "the optimistic commit: bumps a version and records last_writer_id "
+        "under the named identity")),
+    ("POST", "/hooks/session-stop"): RoutePrincipalPosture(_REQUIRE, (
+        "releases every EXCLUSIVE/MODIFIED grant the named identity holds and "
+        "drains its notices: a caller without a claimed peer's principal could "
+        "end the peer's work")),
+    ("POST", "/hooks/session-start"): RoutePrincipalPosture(_ACCEPT, (
+        "read-only re-grounding of the named session; names peers only by "
+        "agent id (R7) and writes nothing a later check depends on")),
+    ("POST", "/hooks/pre-bash"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for paths a shell command "
+        "names")),
+    ("POST", "/hooks/pre-grep"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for a search root")),
+    # -- the five snapshot-session routes (KTD3's own exemption) -------------
+    ("POST", "/session/begin"): RoutePrincipalPosture(_ACCEPT, (
+        "opens a snapshot session owned by the named identity; the session "
+        "token it returns is server-minted and reaches only this caller, and "
+        "every later session route is gated by that token's owner binding")),
+    ("POST", "/session/read"): RoutePrincipalPosture(_ACCEPT, (
+        "gated by the server-minted session token's owner binding, which the "
+        "caller cannot assert; an absent principal admits nothing more")),
+    ("POST", "/session/commit"): RoutePrincipalPosture(_ACCEPT, (
+        "writes attribution, but only through a server-minted session token "
+        "bound to its owner; an absent principal admits nothing more")),
+    ("POST", "/session/commit_all"): RoutePrincipalPosture(_ACCEPT, (
+        "as /session/commit, over a write-set")),
+    ("POST", "/session/heartbeat"): RoutePrincipalPosture(_ACCEPT, (
+        "keeps a snapshot session alive; the token's owner binding already "
+        "refuses a request naming another session")),
+    # -- the four workspace checkpoint-and-restore routes --------------------
+    ("POST", "/workspace/checkpoint"): RoutePrincipalPosture(_REQUIRE, (
+        "records durable checkpoint-manifest ownership under the named "
+        "identity: a caller without a claimed identity's principal could "
+        "record a manifest as that identity's")),
+    ("POST", "/workspace/restore/status"): RoutePrincipalPosture(_REQUIRE, (
+        "writes durable restore progress that crash-resume acts on. The route "
+        "validates the identity and never consults it, so the check refuses "
+        "only a request naming a CLAIMED identity without its principal; a "
+        "caller naming an unclaimed identity is admitted, so this class does "
+        "not limit who moves a restore's state. Kept require (not the field "
+        "dropped) to match its register sibling; see the plan's U6 choice")),
+    ("POST", "/workspace/restore/member"): RoutePrincipalPosture(_REQUIRE, (
+        "writes a member's durable restore terminal; as /workspace/restore/"
+        "status, the identity is validated but not consulted")),
+    ("POST", "/workspace/restore/register"): RoutePrincipalPosture(_REQUIRE, (
+        "a version-bumping write registered under a controller identity "
+        "derived from the named session: a caller without a claimed session's "
+        "principal could register a restore as that session's")),
+    # -- the mint itself -----------------------------------------------------
+    ("POST", "/principal/claim"): RoutePrincipalPosture(PrincipalPosture.MINT, (
+        "issues principals; requiring one would be circular, and its gate is "
+        "the mint nonce (first claim wins, a retry must present the same nonce)")),
+}
+"""Route -> caller-principal posture, over EVERY route that reads a
+``session_id`` and no other. The require-class harm is what an absent
+principal admits for an identity a client has CLAIMED; a request naming an
+identity nobody claimed (a client predating the principal) is admitted and
+counted on every class, as it was before. The lookup in :func:`_admit_caller` has no
+default: a route missing here fails loudly (500) rather than falling to a
+residual class, and a test pins the key set to the routes that read one."""
+
+_CALLER_PRINCIPAL_ABSENT_ERROR = (
+    f"missing {CALLER_PRINCIPAL_HEADER} header: this route requires the caller "
+    f"principal that POST /principal/claim bound to the session_id it names "
+    f"({CALLER_PRINCIPAL_ABSENT_REASON})"
+)
+# Sent only for a session that IS bound; a session nobody claimed is admitted.
+_CALLER_PRINCIPAL_FOREIGN_ERROR = (
+    f"the {CALLER_PRINCIPAL_HEADER} header is not the caller principal bound to "
+    f"the session_id this request names ({CALLER_PRINCIPAL_FOREIGN_REASON})"
+)
+_CALLER_PRINCIPAL_ERRORS: dict[str, str] = {
+    CALLER_PRINCIPAL_ABSENT_REASON: _CALLER_PRINCIPAL_ABSENT_ERROR,
+    CALLER_PRINCIPAL_FOREIGN_REASON: _CALLER_PRINCIPAL_FOREIGN_ERROR,
+}
+"""The 400 bodies of a principal refusal: the single-key ``{"error": ...}``
+shape every identity-validation failure on these routes uses, naming the header
+and ending with the typed reason, so an absent principal and a foreign one stay
+distinguishable (a phase is diagnosable from the refusal alone)."""
+
+
+def _admit_caller(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """Apply the dispatched route's posture to ``presented``.
+
+    Returns the composite agent id the request acts as, or ``None`` after
+    writing the HTTP 400 refusal. On a require-class route, and whenever a
+    principal IS presented, the id comes from
+    :meth:`PresentedCaller.attributed_agent_id`, which owns the rule: a
+    presented principal must be the bound one; none may be presented only for
+    an identity nobody has claimed. An accept-class request presenting none is
+    admitted under the unverified derivation. Every admission without a
+    principal — accept-class, or require-class on an unbound identity — is
+    counted (a local diagnostic, KTD4)."""
+    posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
+    unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
+    if posture is PrincipalPosture.MINT:
+        return unverified
+    if posture is PrincipalPosture.ACCEPT and presented.principal is None:
+        coordinator.increment_caller_principal_absent()
+        return unverified
+    try:
+        agent_id = presented.attributed_agent_id(coordinator.service)
+    except CallerPrincipalRefused as exc:
+        req._json(400, {"error": _CALLER_PRINCIPAL_ERRORS[exc.reason]})
+        return None
+    if presented.principal is None:
+        # Require-class, admitted without a principal: the identity is unbound.
+        coordinator.increment_caller_principal_absent()
+    return agent_id
+
+
+def _presented_caller(
+    req: _RequestProtocol, session_id: str, subagent_id: str | None = None
+) -> PresentedCaller:
+    """The acting identity this request presents: the body's ``session_id``
+    and subagent id, and the header's principal (an empty header is absent)."""
+    principal = req.headers.get(CALLER_PRINCIPAL_HEADER) or None
+    return PresentedCaller(session_id=session_id, subagent_id=subagent_id, principal=principal)
 
 
 # ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
@@ -672,6 +883,14 @@ class CoordinatorHTTPServer:
         # ``effect_fence_total``; the ratio is what tells an operator whether
         # their agents are gating on state the coordinator can confirm.
         self._effect_fence_holds_total: int = 0
+        # caller_principal_absent_total: requests admitted without a caller
+        # principal — on an accept-class route, or on a require-class route for
+        # an identity nobody claimed (plan U6 / KTD4). A LOCAL diagnostic an
+        # operator reads on one workspace — "some caller here is not yet sending
+        # a principal". Never a trigger for making a route require one: like
+        # every counter here it is process-local, resets on respawn and on idle
+        # shutdown, so a zero proves nothing about the callers out there.
+        self._caller_principal_absent_total: int = 0
         # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
         # mismatch on a strict path was SUPPRESSED as the benign
         # commit→disk-write lag (this session's own recent commit) rather than
@@ -1062,6 +1281,16 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._effect_fence_holds_total += 1
 
+    def increment_caller_principal_absent(self) -> None:
+        """Bumped when a route ADMITS a request that names an identity but
+        presents no caller principal (plan U6): any accept-class route, and a
+        require-class route naming an identity nobody has claimed (a client
+        that predates the principal). A refusal is not counted here (it
+        answered 400), nor is a foreign principal (refused on every class). A
+        local diagnostic, not a flip trigger (KTD4). Same GIL-atomicity
+        contract as :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_absent_total += 1
+
     def increment_shared_foreign_lag_suppressed(self) -> None:
         """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
         strict path is suppressed as the benign commit→disk-write lag (this
@@ -1167,6 +1396,7 @@ class CoordinatorHTTPServer:
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
+            "caller_principal_absent_total": self._caller_principal_absent_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1495,6 +1725,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     counter_name = _ENDPOINT_COUNTER_NAMES.get((method, route_path))
                     if counter_name is not None:
                         coordinator.increment_endpoint_counter(counter_name)
+                    # The route this request dispatched to, for the handler's
+                    # caller-principal posture lookup (_admit_caller).
+                    self._route_key = (method, route_path)
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -1636,6 +1869,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(400, {"error": err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
     # touching SQLite (R8 false-positive budget protection). SB-10 U4
     # (KTD6): the advisory compact-pending peek — a process-local dict
@@ -2381,6 +2616,8 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if read_subagent_id(body) is None and has_subagent_id_field(body):
         req._json(400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     agent_id = session_to_agent_id(session_id, read_subagent_id(body))
 
     def work() -> dict:
@@ -2435,6 +2672,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     if path_err:
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.
@@ -2628,11 +2867,20 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     if err:
         req._json(400, {"error": err})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2800,11 +3048,20 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
         req._json(400, {"error": "expected_version must be a non-negative integer"})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2890,6 +3147,8 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
 
     subagent_id = read_subagent_id(body)
@@ -3027,6 +3286,8 @@ def _handle_session_start(
         req._json(400, {"error": sid_err[1]})
         return
     subagent_id = read_subagent_id(body)
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, subagent_id)) is None:
+        return
 
     # R8 breadcrumb precondition: sample seen-ness BEFORE registration
     # erases it — registration below makes this session "seen" for every
@@ -3252,6 +3513,8 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(413, {"error": "command too long"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
@@ -3446,6 +3709,8 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             req._json(400, {"error": v})
             return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
@@ -3689,6 +3954,8 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             return
 
     # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3786,6 +4053,8 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": path_err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
@@ -3879,6 +4148,8 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         req._json(400, {"error": "content must be a string"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4008,6 +4279,8 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         req._json(400, {"error": "writes contains duplicate paths"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4113,6 +4386,8 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
         req._json(400, {"error": "missing or invalid session_token"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4180,6 +4455,8 @@ def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPS
     nonce_err = mint_nonce_problem(mint_nonce)
     if nonce_err:
         req._json(400, {"error": nonce_err})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
     identity = caller_principal_identity(session_id)
 
@@ -4393,6 +4670,8 @@ def _handle_workspace_checkpoint(
         req._json(400, {"error": "members contains duplicate member_path values"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4570,6 +4849,8 @@ def _handle_workspace_restore_status(
     if status not in RESTORE_STATUSES:
         req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -4650,6 +4931,8 @@ def _handle_workspace_restore_member(
         or not isinstance(deleted_at_restore, (int, float))
     ):
         req._json(400, {"error": "deleted_at_restore must be null or a number"})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
 
     def work() -> dict:
@@ -4763,6 +5046,8 @@ def _handle_workspace_restore_register(
         )
 
     # CONTROLLER derived from the caller-asserted session_id, never a separate field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 

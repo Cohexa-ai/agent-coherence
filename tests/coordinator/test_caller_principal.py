@@ -384,6 +384,57 @@ def test_a_caller_naming_a_peer_session_gets_no_attributed_identity(
     assert refused.value.reason == CALLER_PRINCIPAL_FOREIGN_REASON
 
 
+def test_the_binding_is_readable_through_a_public_predicate(
+    svc: CoordinatorService,
+) -> None:
+    """``is_caller_principal_bound`` answers whether an identity has EVER been
+    claimed — the fact the require-class routes branch on (plan U6). A miss is
+    not cached: an identity bound after a False answer reads True at once."""
+    identity = caller_principal_identity(_sid())
+    assert svc.is_caller_principal_bound(identity) is False
+    _claim(svc, identity, _nonce())
+    assert svc.is_caller_principal_bound(identity) is True
+    assert svc.is_caller_principal_bound(caller_principal_identity(_sid())) is False
+
+
+def test_the_bound_predicate_reads_the_durable_store_after_a_restart(tmp_path: Path) -> None:
+    """A binding made before a coordinator restart is still bound after it, so
+    an identity a client claimed cannot become open to an unbound caller by the
+    coordinator process going away (sqlite)."""
+    identity = caller_principal_identity(_sid())
+    with SqliteArtifactRegistry(tmp_path / "state.db") as first:
+        _claim(CoordinatorService(first), identity, _nonce())
+    with SqliteArtifactRegistry(tmp_path / "state.db") as second:
+        assert CoordinatorService(second).is_caller_principal_bound(identity) is True
+
+
+def test_attribution_admits_no_principal_only_while_the_identity_is_unbound(
+    svc: CoordinatorService, registry
+) -> None:
+    """The version-skew rule (plan U6 / R16). A caller that has never claimed
+    — an older client that predates the principal — presents none and names an
+    identity nobody bound: it is attributed under the plain composite id, as
+    before the principal existed. Once the identity is bound, the same
+    request without a principal is refused as ABSENT (the #188 case: naming a
+    newer client's session without its principal), and a principal presented
+    for an unbound identity is FOREIGN, never ignored."""
+    sid = _sid()
+    unbound = PresentedCaller(session_id=sid, subagent_id="sub", principal=None)
+    assert unbound.attributed_agent_id(svc) == session_to_agent_id(sid, "sub")
+    written = _write_attributed(svc, unbound, "old-client.md")
+    assert _last_writer(registry, written) == session_to_agent_id(sid, "sub")
+
+    stray = _claim(svc, caller_principal_identity(_sid()), _nonce())
+    with pytest.raises(CallerPrincipalRefused) as foreign:
+        PresentedCaller(session_id=_sid(), subagent_id=None, principal=stray).attributed_agent_id(svc)
+    assert foreign.value.reason == CALLER_PRINCIPAL_FOREIGN_REASON
+
+    _claim(svc, caller_principal_identity(sid), _nonce())
+    with pytest.raises(CallerPrincipalRefused) as absent:
+        unbound.attributed_agent_id(svc)
+    assert absent.value.reason == CALLER_PRINCIPAL_ABSENT_REASON
+
+
 def test_two_subagents_of_one_session_keep_distinct_writers(
     svc: CoordinatorService, registry
 ) -> None:

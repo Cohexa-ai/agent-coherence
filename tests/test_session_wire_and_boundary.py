@@ -72,12 +72,17 @@ class _Client:
         body: Optional[dict] = None,
         *,
         headers_override: Optional[dict] = None,
+        principal: Optional[str] = None,
     ) -> tuple[int, dict]:
         url = self.base + path
         data = json.dumps(body).encode("utf-8") if body is not None else b""
         headers = dict(self.headers)
         if headers_override:
             headers.update(headers_override)
+        if principal is not None:
+            # The caller principal header (caller-principal plan U5); a frozen
+            # literal rather than the code's constant.
+            headers["Coherence-Caller-Principal"] = principal
         req = urlrequest.Request(
             url, data=data if method == "POST" else None, method=method, headers=headers
         )
@@ -805,7 +810,10 @@ def test_a_principal_appears_only_on_the_mint_response(
         ]
         bodies = []
         for method, path, body in others:
-            status, answer = client.request(method, path, body)
+            # The request PRESENTS the principal (the commit and stop are
+            # require-class): R5 is about what comes back, and the principal
+            # must still appear in none of it.
+            status, answer = client.request(method, path, body, principal=principal)
             assert status == 200, (path, answer)
             bodies.append(json.dumps(answer))
         status, full = client.request(

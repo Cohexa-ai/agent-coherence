@@ -24,6 +24,7 @@ drift apart on what a win, a conflict, or an unknown outcome means.
 from __future__ import annotations
 
 import os
+import secrets
 import urllib.error
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ import yaml
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
@@ -509,6 +512,7 @@ class SubstrateCoordinatorSession:
                 f"substrate coordinator endpoint unresolved (fail-closed): {exc}"
             ) from exc
         self._session_id = str(uuid.uuid4())
+        self._principal = self._claim_principal()
 
     @property
     def session_id(self) -> str:
@@ -523,8 +527,28 @@ class SubstrateCoordinatorSession:
     def reacquire(self) -> None:
         """Mint a fresh identity, shedding a sticky INVALID. The ONLY place a new
         identity is minted — read and commit always share one identity between
-        them."""
+        them. A new identity is a new session, so it claims its own caller
+        principal (the commit route requires one); the previous one is dropped."""
         self._session_id = str(uuid.uuid4())
+        self._principal = self._claim_principal()
+
+    def _claim_principal(self) -> str | None:
+        """Claim the current session's caller principal, held in memory for
+        the session's life (a long-lived caller — KTD5). ``None`` when the
+        coordinator issues none (404). A refused or unconfirmed claim RAISES,
+        like every other coordinator failure here (fail-closed); nothing is
+        re-minted."""
+        claim = claim_caller_principal(
+            self._endpoint, self._session_id, secrets.token_urlsafe(32)
+        )
+        if claim.outcome == "bound":
+            return claim.principal
+        if claim.outcome == "unsupported":
+            return None
+        raise CoherenceError(
+            f"coordinator caller principal not obtained ({claim.outcome}: "
+            f"{claim.detail}; fail-closed)"
+        )
 
     def pre_read(self, artifact_ref: str, content_hash: str | None) -> PreReadResult:
         """Register a SHARED view and return the coordinator's version + deny
@@ -574,7 +598,12 @@ class SubstrateCoordinatorSession:
         non-dict body raises ``unknown`` (``CoherenceError`` for a read leg,
         ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open."""
         try:
-            resp = _coordinator_post(self._endpoint, endpoint_path, payload)
+            resp = _coordinator_post(
+                self._endpoint,
+                endpoint_path,
+                payload,
+                extra_headers=caller_principal_headers(self._principal),
+            )
         except (urllib.error.HTTPError, CoordinatorUnavailable) as exc:
             raise unknown(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"

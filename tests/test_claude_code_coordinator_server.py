@@ -56,6 +56,12 @@ def _hash(label: str) -> str:
 # ----------------------------------------------------------------------
 
 
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"
+"""The caller-principal request header: a FROZEN duplicate of the wire name,
+never imported from the code under test (a derived name moves with a rename
+instead of catching it)."""
+
+
 class _Client:
     """Tiny urllib-based client. Returns (status, body_dict)."""
 
@@ -74,12 +80,15 @@ class _Client:
         body: Optional[dict] = None,
         *,
         headers_override: Optional[dict] = None,
+        principal: Optional[str] = None,
     ) -> tuple[int, dict]:
         url = self.base + path
         data = json.dumps(body).encode("utf-8") if body is not None else b""
         headers = dict(self.headers)
         if headers_override:
             headers.update(headers_override)
+        if principal is not None:
+            headers[_PRINCIPAL_HEADER] = principal
         req = urlrequest.Request(url, data=data if method == "POST" else None,
                                  method=method, headers=headers)
         try:
@@ -7127,6 +7136,12 @@ def test_the_fence_call_mutates_nothing(
     )
     version, generation = _u4_captured(server, artifact_id)
     _u4_seed_every_dimension(server, client, agent_id, artifact_id, sid, _U3A_WARN_PATH)
+    # A credentialed fence call (the route is require-class): claimed BEFORE the
+    # snapshot, so neither the claim nor an uncredentialed-request count is
+    # charged to the call under test — the guard stays over every other counter.
+    status, minted = client.post(
+        "/principal/claim", {"session_id": sid, "mint_nonce": uuid.uuid4().hex})
+    assert status == 200 and minted["ok"] is True, minted
 
     before = _u4_observable(server, agent_id, artifact_id, sid)
     # Controls for the seeding: a guard whose dimensions are all at their
@@ -7144,7 +7159,7 @@ def test_the_fence_call_mutates_nothing(
     status, body = client.post(_U4_ROUTE, _u4_body(
         sid, _U3A_WARN_PATH, version=version + sent_version_delta,
         generation=generation, content_hash=_hash("canonical"),
-    ))
+    ), principal=minted["principal"])
 
     assert status == 200
     assert body["verdict"] == expect, f"the {arm} arm did not take its branch"
@@ -7842,3 +7857,471 @@ def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
         "Re-acquire before writing to docs/plan.md."
     )
     assert "was updated by" not in text
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that takes a ``session_id`` is classified by the harm an ABSENT
+# principal admits there (KTD3): require-class routes refuse a request naming
+# a BOUND session without the principal ``POST /principal/claim`` bound to it
+# (a session nobody ever claimed — an older client's — is admitted and
+# counted, as before the principal existed: R16); accept-class routes admit an
+# absent principal and count it; every class refuses a foreign one; the mint
+# itself is neither. The
+# guarantee is accident-resistance and attributability under the same-OS-user
+# cooperative trust model — a caller that presents no principal, or one bound
+# to a different session, cannot end another writer's grant or have a write
+# recorded under another writer's name by mistake. It is not a boundary
+# against a process that can read ``.coherence/``: on the hook surface a
+# principal is stored there, so any process that can read it can present it.
+#
+# These tests drive the coordinator routes directly. A test that "forges" a
+# peer's identity deliberately does NOT present that peer's principal; that
+# abstention is the whole content of what the route can check.
+
+#: FROZEN duplicates of the wire refusals. Byte-stable on purpose: a client
+#: that branches on the text, and the two cases, must stay distinguishable.
+_PRINCIPAL_ABSENT_ERROR = (
+    "missing Coherence-Caller-Principal header: this route requires the caller "
+    "principal that POST /principal/claim bound to the session_id it names "
+    "(caller_principal_absent)"
+)
+_PRINCIPAL_FOREIGN_ERROR = (
+    "the Coherence-Caller-Principal header is not the caller principal bound to "
+    "the session_id this request names (caller_principal_foreign)"
+)
+_PRINCIPAL_REFUSALS = (
+    {"error": _PRINCIPAL_ABSENT_ERROR},
+    {"error": _PRINCIPAL_FOREIGN_ERROR},
+)
+
+#: FROZEN duplicate of the posture table (route -> class). Never derived from
+#: ``_CALLER_PRINCIPAL_POSTURE``: a derived expectation moves with the edit that
+#: breaks it. Nineteen routes: the eighteen the plan enumerates plus the mint.
+_EXPECTED_ROUTE_POSTURE: dict[tuple[str, str], str] = {
+    ("POST", "/hooks/pre-read"): "accept",
+    ("POST", "/hooks/effect-fence"): "require",
+    ("POST", "/hooks/pre-edit"): "accept",
+    ("POST", "/hooks/post-edit"): "require",
+    ("POST", "/hooks/post-edit-cas"): "require",
+    ("POST", "/hooks/session-stop"): "require",
+    ("POST", "/hooks/session-start"): "accept",
+    ("POST", "/hooks/pre-bash"): "accept",
+    ("POST", "/hooks/pre-grep"): "accept",
+    ("POST", "/session/begin"): "accept",
+    ("POST", "/session/read"): "accept",
+    ("POST", "/session/commit"): "accept",
+    ("POST", "/session/commit_all"): "accept",
+    ("POST", "/session/heartbeat"): "accept",
+    ("POST", "/workspace/checkpoint"): "require",
+    ("POST", "/workspace/restore/status"): "require",
+    ("POST", "/workspace/restore/member"): "require",
+    ("POST", "/workspace/restore/register"): "require",
+    ("POST", "/principal/claim"): "mint",
+}
+_EXPECTED_POSTURE_ROUTE_COUNT = 19
+
+_NEVER_MINTED_TOKEN = "A" * 43  # in session-token shape, never issued
+
+
+def _posture_body(route: tuple[str, str], sid: str) -> dict:
+    """A request body that passes every shape check on ``route`` for ``sid``,
+    so the request reaches the principal gate. Ordinary answers past the gate
+    (an untracked path, an unknown checkpoint, a never-minted token) are all
+    fine: the tests below only ask whether the GATE refused."""
+    _, path = route
+    h = _hash(f"posture:{path}")
+    member = {
+        "member_path": "posture.md", "native_token": "v1", "fingerprint": h,
+        "captured_at": 1.0, "absent": False, "dirty_during_window": False,
+        "arbitration_tier": "no-arbiter", "restore_tier": "forward_only",
+    }
+    bodies: dict[str, dict] = {
+        "/hooks/pre-read": {"path": "posture.md"},
+        "/hooks/effect-fence": {
+            "path": "posture.md", "expected_version": 1,
+            "expected_generation": 0, "content_hash": h,
+        },
+        "/hooks/pre-edit": {"path": "posture.md"},
+        "/hooks/post-edit": {"path": "posture.md", "success": False},
+        "/hooks/post-edit-cas": {
+            "path": "posture.md", "content_hash": h, "expected_version": 0,
+        },
+        "/hooks/session-stop": {},
+        "/hooks/session-start": {},
+        "/hooks/pre-bash": {"command": "cat posture.md"},
+        "/hooks/pre-grep": {"search_root": ""},
+        "/session/begin": {"read_set": ["posture.md"]},
+        "/session/read": {"session_token": _NEVER_MINTED_TOKEN, "path": "posture.md"},
+        "/session/commit": {
+            "session_token": _NEVER_MINTED_TOKEN, "path": "posture.md", "content": "x",
+        },
+        "/session/commit_all": {
+            "session_token": _NEVER_MINTED_TOKEN,
+            "writes": [{"path": "posture.md", "content": "x"}],
+        },
+        "/session/heartbeat": {"session_token": _NEVER_MINTED_TOKEN},
+        "/workspace/checkpoint": {
+            "name": "posture", "window_min": 1.0, "window_max": 1.0, "members": [member],
+        },
+        "/workspace/restore/status": {"checkpoint_id": "cp-unknown", "status": "in_progress"},
+        "/workspace/restore/member": {
+            "checkpoint_id": "cp-unknown", "member_path": "posture.md",
+            "restore_outcome": None,
+        },
+        "/workspace/restore/register": {
+            "checkpoint_id": "cp-unknown",
+            "writes": [{"member_path": "posture.md", "fingerprint": h}],
+        },
+        "/principal/claim": {"mint_nonce": uuid.uuid4().hex},
+    }
+    return {"session_id": sid, **bodies[path]}
+
+
+def _explicit_claim(client: _Client, sid: str) -> str:
+    """Claim ``sid`` with a fresh random nonce, outside the auto client."""
+    status, body = client.post(
+        "/principal/claim",
+        {"session_id": sid, "mint_nonce": uuid.uuid4().hex},
+        principal=None,
+    )
+    assert status == 200 and body["ok"] is True, body
+    return body["principal"]
+
+
+def _absent_count(coordinator) -> int | None:
+    """The accept-class absent-principal counter (``None`` if it is missing,
+    so a test reports its response assertions before the counter's)."""
+    return coordinator.counters_snapshot().get("caller_principal_absent_total")
+
+
+@pytest.mark.parametrize(
+    "route", sorted(_EXPECTED_ROUTE_POSTURE), ids=lambda r: r[1].strip("/"),
+)
+def test_each_session_id_route_answers_its_posture_class(
+    route: tuple[str, str], coordinator, client: _Client
+) -> None:
+    """Every route in the table, in all four principal states: absent on a
+    BOUND identity, absent on an UNBOUND one, foreign, and matching.
+
+    Prevents a route being left out of enforcement, a require-class route
+    admitting an absent principal for a claimed session (a stray caller
+    ending a claimed peer's grant), a require-class route refusing a session
+    nobody claimed (an older client's writes silently dropped, because the
+    shipped hook client turns every non-2xx into an allow), absent collapsing
+    into foreign (a phase no longer diagnosable), and an accept-class route
+    either not counting the absent case or treating a foreign principal as
+    absent — the case that separates OPTIONAL from IGNORED."""
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    _, path = route
+    owner, other = str(uuid.uuid4()), str(uuid.uuid4())
+    owner_principal = _explicit_claim(client, owner)
+    foreign_principal = _explicit_claim(client, other)
+
+    def send(principal: str | None, sid: str = owner) -> tuple[int, dict]:
+        # The mint route needs an unclaimed session per request.
+        sid = str(uuid.uuid4()) if posture == "mint" else sid
+        return client.post(path, _posture_body(route, sid), principal=principal)
+
+    before = _absent_count(coordinator)
+    absent = send(None)
+    after_absent = _absent_count(coordinator)
+    foreign = send(foreign_principal)
+    after_foreign = _absent_count(coordinator)
+    valid = send(owner_principal)
+    after_valid = _absent_count(coordinator)
+    unbound = send(None, sid=str(uuid.uuid4()))
+    after_unbound = _absent_count(coordinator)
+
+    if posture == "require":
+        assert absent == (400, {"error": _PRINCIPAL_ABSENT_ERROR})
+        assert foreign == (400, {"error": _PRINCIPAL_FOREIGN_ERROR})
+        assert valid[1] not in _PRINCIPAL_REFUSALS, valid
+        assert unbound[1] not in _PRINCIPAL_REFUSALS, (
+            "a session nobody claimed is an older client's: admitted, as before", unbound)
+        assert before is not None and after_valid == before, "a refusal or a match counts nothing"
+        assert after_unbound == before + 1, "the admitted unbound request is counted"
+    elif posture == "accept":
+        assert absent[1] not in _PRINCIPAL_REFUSALS, absent
+        assert foreign == (400, {"error": _PRINCIPAL_FOREIGN_ERROR})
+        assert valid[1] not in _PRINCIPAL_REFUSALS, valid
+        assert unbound[1] not in _PRINCIPAL_REFUSALS, unbound
+        assert before is not None and after_absent == before + 1, (
+            "an admitted absent principal is counted"
+        )
+        assert after_valid == after_foreign == after_absent, "only the absent case is counted"
+        assert after_unbound == after_valid + 1
+    else:
+        assert posture == "mint"
+        for status, body in (absent, foreign, valid, unbound):
+            assert status == 200 and body["ok"] is True, body
+        assert before is not None and after_unbound == before, (
+            "the mint is not an uncredentialed request"
+        )
+
+
+def test_an_older_client_that_never_claims_still_commits_and_stops(
+    coordinator, client: _Client
+) -> None:
+    """R16, the version-skew direction this coordinator can observe: a client
+    that predates the principal sends no header and never claims, so the
+    session it names stays UNBOUND — and its require-class commit and stop are
+    admitted exactly as before: the version advances, ``last_writer_id`` is
+    its composite id, its grant is released, and each admission is counted
+    as uncredentialed. Refusing it would not surface anywhere: the shipped
+    hook client turns every non-2xx into ``{}``, an allow, so the edit would
+    proceed with coherence silently off."""
+    old = str(uuid.uuid4())
+    before = _absent_count(coordinator)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": old, "agent_id": "sub-1", "path": "plan.md"})
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": old, "agent_id": "sub-1", "path": "plan.md",
+        "success": True, "content_hash": _hash("old-client"),
+    })
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(old, "sub-1")
+
+    status, _ = client.post("/hooks/pre-edit", {"session_id": old, "path": "plan.md"})
+    status, body = client.post("/hooks/session-stop", {"session_id": old})
+    assert status == 200 and body["released_artifacts"] == ["plan.md"], body
+    assert _absent_count(coordinator) == before + 4
+
+
+def test_posture_table_classifies_every_session_id_route_with_no_residual() -> None:
+    """R13: one explicit table over every route that reads a ``session_id``,
+    and nothing else — no route falls to a default. A route added to
+    ``_ROUTES`` that reads a session id without a table entry fails here, and
+    so does an entry for a route that no longer exists.
+
+    ``/workspace/restore/status`` and ``/workspace/restore/member`` validate
+    the session id and then never consult it; they are DECIDED require-class
+    rather than dropped (see the table's harm text), and the frozen
+    expectation pins that decision."""
+    import inspect
+
+    from ccs.adapters.claude_code.coordinator_server import (
+        _CALLER_PRINCIPAL_POSTURE,
+        _ROUTES,
+    )
+
+    reads_session_id = {
+        route for route, handler in _ROUTES.items()
+        if 'body.get("session_id")' in inspect.getsource(handler)
+    }
+    assert set(_CALLER_PRINCIPAL_POSTURE) == reads_session_id
+    assert {
+        route: entry.posture.value for route, entry in _CALLER_PRINCIPAL_POSTURE.items()
+    } == _EXPECTED_ROUTE_POSTURE
+    assert len(_CALLER_PRINCIPAL_POSTURE) == _EXPECTED_POSTURE_ROUTE_COUNT
+    for route, entry in _CALLER_PRINCIPAL_POSTURE.items():
+        assert entry.harm.strip(), f"{route} states no harm for its class"
+
+
+def _pre_edit_with(client: _Client, sid: str, principal: str, path: str) -> None:
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": path}, principal=principal
+    )
+    assert status == 200 and body.get("ok") is not False, body
+
+
+def test_session_stop_without_a_principal_leaves_a_peers_grant_standing(
+    coordinator, client: _Client
+) -> None:
+    """The #188 reproduction on the route surface: a stop naming a peer's
+    session with no principal does not release the peer's EXCLUSIVE grant.
+    The forger deliberately does not present the peer's principal — on the
+    hook surface a principal is readable from ``.coherence/``, so that
+    abstention is exactly what this check can enforce. Asserts the grant
+    STANDS afterwards, not merely that an error came back; the control shows
+    the same stop with the peer's own principal does release it."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    peer_agent = session_to_agent_id(peer)
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=None
+    )
+    assert (status, body) == (400, {"error": _PRINCIPAL_ABSENT_ERROR})
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=peer_principal
+    )
+    assert status == 200 and body["released_artifacts"] == ["plan.md"]
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] != MESIState.EXCLUSIVE
+
+
+def test_session_stop_naming_a_peer_under_the_callers_own_principal_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """A caller holding a principal of its OWN cannot spend it on a peer's
+    session: the principal is bound to one identity, so naming another is
+    foreign, and the peer's grant stands."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=caller_principal
+    )
+    assert (status, body) == (400, {"error": _PRINCIPAL_FOREIGN_ERROR})
+    assert (
+        coordinator.registry.get_state_map(artifact_id)[session_to_agent_id(peer)]
+        == MESIState.EXCLUSIVE
+    )
+
+
+def test_post_edit_under_a_forged_identity_records_no_attribution(
+    coordinator, client: _Client
+) -> None:
+    """A commit naming a peer's session without the peer's principal bumps
+    nothing and records no ``last_writer_id`` — neither with no principal nor
+    with the caller's own. The control commits with the peer's principal and
+    records the peer's composite writer id, so the negative assertions are
+    measured against a route that does record attribution."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    before = coordinator.registry.get_artifact(artifact_id).version
+    writer_before = coordinator.registry.last_writer_for(artifact_id)
+    commit = {"session_id": peer, "path": "plan.md", "success": True,
+              "content_hash": _hash("forged")}
+
+    for principal, error in ((None, _PRINCIPAL_ABSENT_ERROR),
+                             (caller_principal, _PRINCIPAL_FOREIGN_ERROR)):
+        status, body = client.post("/hooks/post-edit", commit, principal=principal)
+        assert (status, body) == (400, {"error": error})
+        assert coordinator.registry.get_artifact(artifact_id).version == before
+        assert coordinator.registry.last_writer_for(artifact_id) == writer_before
+
+    status, body = client.post("/hooks/post-edit", commit, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == before + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(peer)
+
+
+def test_post_edit_attributes_the_composite_writer_through_the_principal(
+    coordinator, client: _Client
+) -> None:
+    """Attribution on post-edit goes through the presented caller: a
+    subagent presents its PARENT session's principal (the principal's unit of
+    identity is the session) and is recorded under the COMPOSITE id (session
+    + caller-asserted subagent); the same subagent commit with no principal
+    records nothing; and a second session's commit records a different
+    writer — so the positive assertion cannot pass on a constant."""
+    sid_a, sid_b = str(uuid.uuid4()), str(uuid.uuid4())
+    principal_a = _explicit_claim(client, sid_a)
+    principal_b = _explicit_claim(client, sid_b)
+    reg = coordinator.registry
+
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md"},
+        principal=principal_a,
+    )
+    assert status == 200
+    sub_commit = {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md",
+                  "success": True, "content_hash": _hash("a2")}
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=None)
+    assert (status, body) == (400, {"error": _PRINCIPAL_ABSENT_ERROR})
+    assert reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md")) is None
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=principal_a)
+    assert status == 200 and body["ok"] is True, body
+    _pre_edit_with(client, sid_b, principal_b, "b/plan.md")
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": sid_b, "path": "b/plan.md", "success": True,
+         "content_hash": _hash("b2")},
+        principal=principal_b,
+    )
+    assert status == 200 and body["ok"] is True, body
+
+    writer_a = reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md"))
+    writer_b = reg.last_writer_for(reg.lookup_artifact_id_by_name("b/plan.md"))
+    assert writer_a == session_to_agent_id(sid_a, "sub-1")
+    assert writer_a != session_to_agent_id(sid_a)
+    assert writer_b == session_to_agent_id(sid_b)
+    assert writer_a != writer_b
+
+
+def test_post_edit_cas_under_a_forged_identity_bumps_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The optimistic commit is require-class too: a CAS naming a peer's
+    session with no principal does not advance the version it names."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    status, read = client.post(
+        "/hooks/pre-read",
+        {"session_id": peer, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=peer_principal,
+    )
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+    cas = {"session_id": peer, "path": "plan.md", "success": True,
+           "content_hash": _hash("forged"), "expected_version": version}
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=None)
+    assert (status, body) == (400, {"error": _PRINCIPAL_ABSENT_ERROR})
+    assert coordinator.registry.get_artifact(artifact_id).version == version
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+
+
+def test_a_principal_refusal_is_a_client_error_never_a_hold(
+    coordinator, client: _Client
+) -> None:
+    """KTD9: a hold invites a retry, and no retry supplies a principal the
+    caller never had. The effect fence — the route whose protocol answer IS
+    the hold vocabulary — refuses an absent or foreign principal with HTTP
+    400 and no ``verdict``, and neither refusal reason is a hold reason."""
+    from ccs.core.exceptions import (
+        CALLER_PRINCIPAL_ABSENT_REASON,
+        CALLER_PRINCIPAL_FOREIGN_REASON,
+    )
+
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    _explicit_claim(client, sid)
+    foreign = _explicit_claim(client, other)
+    fence = _posture_body(("POST", "/hooks/effect-fence"), sid)
+
+    for principal in (None, foreign):
+        status, body = client.post("/hooks/effect-fence", fence, principal=principal)
+        assert status == 400
+        assert "verdict" not in body and set(body) == {"error"}
+    assert CALLER_PRINCIPAL_ABSENT_REASON not in HOLD_REASONS
+    assert CALLER_PRINCIPAL_FOREIGN_REASON not in HOLD_REASONS
+
+
+def test_the_absent_principal_counter_is_a_status_counter(
+    coordinator, client: _Client
+) -> None:
+    """KTD4: the count of admitted uncredentialed requests is a local
+    diagnostic an operator reads on /status — present at the metrics tier
+    beside the other product counters, moved by an accept-class request that
+    presents no principal and by nothing else."""
+    status, before = client.get("/status?detail=metrics")
+    assert status == 200 and before["caller_principal_absent_total"] == 0
+    sid = str(uuid.uuid4())
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "x.md"}, principal=None)
+    status, after = client.get("/status?detail=metrics")
+    assert after["caller_principal_absent_total"] == 1
+    status, minimal = client.get("/status")
+    assert minimal["caller_principal_absent_total"] == 1

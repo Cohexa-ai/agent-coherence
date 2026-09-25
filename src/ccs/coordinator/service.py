@@ -1449,6 +1449,18 @@ class CoordinatorService:
                 "identity the request names",
             )
 
+    def is_caller_principal_bound(self, identity: UUID) -> bool:
+        """Whether ``identity`` has ever been claimed — a principal is bound to
+        it, in the cache or the durable store.
+
+        The fact the require-class routes branch on when a request presents NO
+        principal (caller-principal plan, U6 / R16): an identity nobody has
+        claimed belongs to a caller that predates the principal and is admitted
+        as before, while a bound one is refused as absent. Never cached on a
+        miss, so an identity bound after a False answer reads True at once. The
+        principal itself never leaves the service through here."""
+        return self._bound_caller_principal(identity) is not None
+
     def _bound_caller_principal(self, identity: UUID) -> str | None:
         """The principal bound to ``identity``: the cache, else the durable
         store (a hit is cached — bindings are never rebound; a miss is not)."""

@@ -25,13 +25,25 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from ccs.adapters.claude_code.auth import (
+    CALLER_PRINCIPAL_HEADER,
+    MintNonceUnavailable,
+    ensure_mint_nonce,
+    load_caller_principal,
+    store_caller_principal,
+)
+from ccs.adapters.claude_code.coordinator_server import (
+    caller_principal_identity,
+    validate_session_id,
+)
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_CLAIMED_REASON,
     InsecureTransportRefused,
     RedirectRefused,
     TlsConfigError,
@@ -565,6 +577,152 @@ def post(
     # Carry the CA bundle to _execute (only consulted for https requests).
     req._ccs_ca_file = endpoint.ca_file  # type: ignore[attr-defined]
     return _execute(req)
+
+
+# ---------------------------------------------------------------------------
+# Caller principal — obtaining one and presenting it (caller-principal plan, U5)
+# ---------------------------------------------------------------------------
+
+PRINCIPAL_CLAIM_ROUTE = "/principal/claim"
+
+
+@dataclass(frozen=True)
+class PrincipalClaim:
+    """What one ``POST /principal/claim`` established.
+
+    - ``bound``: ``principal`` is the value bound to the session — minted now,
+      or handed back to a retry presenting the binding's own nonce (R20).
+    - ``unsupported``: the coordinator answered 404 — it issues no principals
+      (the sibling Node coordinator, or an older Python one). Proceed without
+      one; there is nothing to present.
+    - ``refused``: the session is already bound under a DIFFERENT mint nonce.
+      The caller does not become that identity and must not try to: deleting a
+      stored nonce and claiming again would reopen the gate first-claim-wins
+      closes (KTD11).
+    - ``unconfirmed``: anything else — a watchdog-degraded claim, a transport
+      failure, an unexpected answer. A claim that landed anyway is recovered by
+      the next claim presenting the SAME nonce.
+
+    ``detail`` is diagnostic prose and never carries the principal or nonce."""
+
+    outcome: Literal["bound", "unsupported", "refused", "unconfirmed"]
+    principal: str | None = None
+    detail: str = ""
+
+
+def claim_caller_principal(
+    endpoint: CoordinatorEndpoint, session_id: str, mint_nonce: str
+) -> PrincipalClaim:
+    """Claim ``session_id``'s caller principal, presenting ``mint_nonce``.
+
+    Transport-shaped failures come back as ``unconfirmed`` rather than raising;
+    a typed trust refusal (TLS verification, a redirect) still raises, exactly
+    as it does from :func:`post`."""
+    try:
+        body = post(
+            endpoint,
+            PRINCIPAL_CLAIM_ROUTE,
+            {"session_id": session_id, "mint_nonce": mint_nonce},
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return PrincipalClaim("unsupported", detail="the coordinator issues no caller principals")
+        return PrincipalClaim("unconfirmed", detail=f"claim answered HTTP {exc.code}")
+    except CoordinatorUnavailable as exc:
+        return PrincipalClaim("unconfirmed", detail=str(exc))
+    principal = body.get("principal") if isinstance(body, dict) else None
+    if isinstance(body, dict) and body.get("ok") is True and isinstance(principal, str) and principal:
+        return PrincipalClaim("bound", principal=principal)
+    reason = body.get("reason") if isinstance(body, dict) else None
+    if reason == CALLER_PRINCIPAL_CLAIMED_REASON:
+        return PrincipalClaim("refused", detail=CALLER_PRINCIPAL_CLAIMED_REASON)
+    return PrincipalClaim("unconfirmed", detail=f"claim not confirmed (reason={reason!r})")
+
+
+NODE_BACKEND = "node"
+
+
+def coordinator_backend(coordinator_root: Path) -> str | None:
+    """The ``backend=<name>`` a coordinator recorded on the third line of
+    ``.coherence/server.pid``, or ``None`` when there is none.
+
+    The Node coordinator writes ``<pid>\\n<port>\\nbackend=node\\n``; the
+    Python coordinator writes ``<pid>\\n<port>\\n`` with no backend line. Only
+    the port line is load-bearing for reaching a coordinator — this is read
+    solely to skip work a Node coordinator could never answer."""
+    try:
+        lines = (coordinator_root / ".coherence" / "server.pid").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(lines) < 3 or not lines[2].startswith("backend="):
+        return None
+    return lines[2][len("backend="):].strip() or None
+
+
+def caller_principal_headers(principal: str | None) -> dict[str, str] | None:
+    """The extra header presenting ``principal``, or ``None`` for none."""
+    return {CALLER_PRINCIPAL_HEADER: principal} if principal else None
+
+
+def obtain_stored_principal(
+    endpoint: CoordinatorEndpoint,
+    coordinator_root: Path,
+    session_id: str,
+    report: Callable[[str], None] = err,
+) -> str | None:
+    """The caller principal a ONE-SHOT client (one process per invocation)
+    presents for ``session_id``, persisted under ``.coherence/``.
+
+    Keyed by the PARENT session's derived id, so a subagent's hook presents its
+    parent's principal (the principal's unit of identity is the session). The
+    stored principal is used if present; otherwise the mint nonce is read or
+    exclusively created FIRST, then claimed, then the bound principal stored.
+    Two processes racing on a new session share one nonce and so receive one
+    principal. Returns ``None`` — send no header — when the coordinator issues
+    none, when the claim is unconfirmed (a later invocation retries with the
+    same nonce), or when the claim is refused. A refusal is reported through
+    ``report`` and nothing is deleted or re-minted.
+
+    Against a coordinator whose pid file says ``backend=node`` nothing is
+    claimed, read or created: the Node coordinator issues no principals, and a
+    one-shot client would otherwise pay a 404 round trip on every hook event.
+    A pid file without that line (the Python coordinator's own format) is
+    claimed against, and an older Python coordinator's 404 still means "send
+    no header".
+
+    What this buys is convention-enforcement and a detectable unbound caller:
+    the files are readable by any process that can read ``.coherence/``, so
+    this is not separation between callers of the same OS user (KTD5)."""
+    if validate_session_id(session_id) is not None:
+        return None
+    if coordinator_backend(coordinator_root) == NODE_BACKEND:
+        return None
+    key = caller_principal_identity(session_id).hex
+    stored = load_caller_principal(coordinator_root, key)
+    if stored is not None:
+        return stored
+    try:
+        nonce = ensure_mint_nonce(coordinator_root, key)
+    except (OSError, MintNonceUnavailable) as exc:
+        report(f"caller principal unavailable: could not persist a mint nonce ({exc})")
+        return None
+    claim = claim_caller_principal(endpoint, session_id, nonce)
+    if claim.outcome == "bound" and claim.principal is not None:
+        try:
+            store_caller_principal(coordinator_root, key, claim.principal)
+        except OSError as exc:
+            # The claim stands; the next invocation re-obtains it by its nonce.
+            report(f"caller principal not stored ({exc}); it will be re-obtained")
+        return claim.principal
+    if claim.outcome == "refused":
+        report(
+            "caller principal refused: this session is already bound under a "
+            "different mint nonce; proceeding without a principal and NOT "
+            "re-minting (routes that require one will refuse this session)"
+        )
+    return None
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):

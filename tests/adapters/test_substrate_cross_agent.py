@@ -300,10 +300,10 @@ def test_identity_stable_across_read_and_commit_fresh_after_reacquire(
     seen: list[str] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if path in ("/hooks/pre-read", "/hooks/post-edit-cas"):
             seen.append(payload["session_id"])
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa = _session(tmp_path, fast_cfg)
@@ -331,10 +331,10 @@ def test_divergence1_coordinator_leg_unknown_no_re_drive(
     store.seed(REF, b"v1")
     real_post = substrate_module._coordinator_post
 
-    def failing_commit(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def failing_commit(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if path == "/hooks/post-edit-cas":
             raise substrate_module.CoordinatorUnavailable("simulated commit timeout")
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", failing_commit)
     sa = _session(tmp_path, fast_cfg)
@@ -467,10 +467,10 @@ def test_commit_wire_payload_carries_hash_not_content(
     captured: list[dict] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if path == "/hooks/post-edit-cas":
             captured.append(dict(payload))
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa = _session(tmp_path, fast_cfg)
@@ -500,9 +500,9 @@ def test_coordinator_bump_first_is_forbidden(
     posts: list[str] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         posts.append(path)
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
@@ -616,9 +616,9 @@ def test_noop_commit_touches_neither_leg(
     posts: list[str] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         posts.append(path)
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa = _session(tmp_path, fast_cfg)
@@ -670,9 +670,9 @@ def test_re_drive_retry_second_unknown_is_unconfirmed(
     posts: list[str] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         posts.append(path)
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa = _session(tmp_path, fast_cfg)
@@ -728,9 +728,9 @@ def test_hold_verdict_wedges_without_bump(
     posts: list[str] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         posts.append(path)
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     sa = _session(tmp_path, fast_cfg)
@@ -789,7 +789,7 @@ def test_clean_win_bump_conflict_raises(
     injected = {"done": False}
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         # Just before A's bump, let a peer bump the coordinator once (v1 → v2), so
         # A's clean-win bump at expected_version=1 conflicts. The guard keeps the
         # peer's own post-edit-cas from re-triggering the injection.
@@ -800,7 +800,7 @@ def test_clean_win_bump_conflict_raises(
         ):
             injected["done"] = True
             sb.commit_cas(REF, expected_version=1, content_hash=_sha256(b"peer"))
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
     try:
@@ -861,3 +861,77 @@ def test_classify_commit_retryable_reason_is_conflict() -> None:
 def test_classify_commit_unknown_reason_fails_closed() -> None:
     with pytest.raises(CoherenceError):
         substrate_module._classify_commit({"ok": False, "reason": "mystery"}, expected_version=4)
+
+
+# --- caller principal (caller-principal plan, U5) ----------------------------
+#
+# The substrate session is a long-lived caller holding its principal in memory.
+# Unlike CoherentVolume (whose re-mint keeps the session, KTD14), its
+# reacquire() mints a NEW session id — so a reacquire is a new identity and
+# claims its own principal; the commit route requires it.
+
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
+
+
+def test_the_session_presents_its_principal_and_a_reacquire_claims_a_new_one(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request presents the principal bound to the CURRENT session id —
+    the commit route refuses one that does not — and a reacquire, which mints
+    a new session, claims a new principal rather than reusing the old one
+    (which would be foreign to the new session and refused). Commits land
+    before and after the reacquire."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    seen: list[tuple[str, str, object]] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        headers = kwargs.get("extra_headers") or {}
+        seen.append((path, payload["session_id"], headers.get(_PRINCIPAL_HEADER)))
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        a.commit(REF, expected_token=tok, new_bytes=b"v2")
+        first = sa._principal
+        a.reacquire(REF)
+        _bytes, tok = a.read(REF)
+        a.commit(REF, expected_token=tok, new_bytes=b"v3")
+        second = sa._principal
+
+        assert first and second and first != second
+        by_session: dict[str, set] = {}
+        for _path, sid, principal in seen:
+            by_session.setdefault(sid, set()).add(principal)
+        assert len(by_session) == 2
+        assert sorted(map(frozenset, by_session.values()), key=str) == sorted(
+            [frozenset({first}), frozenset({second})], key=str
+        )
+        assert store.get(REF)[0] == b"v3"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("outcome", ["refused", "unconfirmed"])
+def test_a_claim_that_does_not_bind_fails_closed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Fail-closed like every other coordinator failure on this client: a claim
+    that did not bind raises at construction instead of running a session
+    whose commits the coordinator would refuse."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    monkeypatch.setattr(
+        substrate_module, "claim_caller_principal",
+        lambda *_a: PrincipalClaim(outcome, detail="simulated"),  # type: ignore[arg-type]
+        raising=False,
+    )
+    try:
+        with pytest.raises(CoherenceError, match="caller principal"):
+            _session(tmp_path, fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)

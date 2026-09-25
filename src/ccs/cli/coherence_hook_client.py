@@ -56,6 +56,23 @@ Claude Code ignores.
 Exit code is always 0 on success — even if the coordinator returns
 ``ok: False``, that's a logical outcome surfaced to the model via
 ``additionalContext``, not a hook failure.
+
+## Caller principal
+
+Every request presents the session's caller principal in the
+``Coherence-Caller-Principal`` header: once a session is claimed, the
+coordinator refuses a request naming it without that principal on the routes
+where an absent principal admits harm (post-edit, session-stop). One process
+per hook event means the principal lives on disk — mint nonce first, then
+principal, each created exclusively at 0600 in ``.coherence/`` and keyed by the
+parent session's derived id — and is claimed once per session (see
+:func:`~ccs.cli._coherence_client.obtain_stored_principal`). A coordinator
+whose pid file says ``backend=node`` is not asked at all (it issues none), and
+one that answers 404 on the claim (an older Python coordinator) gets no header
+either — as before. A refused claim or a refused principal is reported on
+stderr and never repaired by deleting and re-minting. Any process that can read
+``.coherence/`` can read these files, so this is convention-enforcement and a
+detectable unbound caller, not separation between callers.
 """
 
 from __future__ import annotations
@@ -70,10 +87,15 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from ccs.adapters.claude_code.auth import CALLER_PRINCIPAL_HEADER
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    err,
+    http_status_from_error,
+    obtain_stored_principal,
     post,
     resolve_endpoint,
 )
@@ -189,35 +211,35 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
     try:
         if args.subcommand == "pre-read":
             payload = _build_pre_read(cc_payload, root_path)
-            response = _call(endpoint, "/hooks/pre-read", payload)
+            response = _call(endpoint, "/hooks/pre-read", payload, root_path)
         elif args.subcommand == "pre-edit":
             payload = _build_pre_edit(cc_payload, root_path)
-            response = _call(endpoint, "/hooks/pre-edit", payload)
+            response = _call(endpoint, "/hooks/pre-edit", payload, root_path)
         elif args.subcommand == "post-edit":
             payload = _build_post_edit(cc_payload, root_path)
-            response = _call(endpoint, "/hooks/post-edit", payload)
+            response = _call(endpoint, "/hooks/post-edit", payload, root_path)
         elif args.subcommand == "session-stop":
             payload = _build_session_stop(cc_payload)
-            response = _call(endpoint, "/hooks/session-stop", payload)
+            response = _call(endpoint, "/hooks/session-stop", payload, root_path)
         elif args.subcommand == "subagent-stop":
             # SB-25 Unit 4: CC's SubagentStop event → release the SUBAGENT
             # identity's grants via the existing session-stop verb. agent_id
             # is REQUIRED — without it the release would strip the PARENT's
             # grants mid-session, so absence skips (fail-open {}).
             payload = _build_subagent_stop(cc_payload)
-            response = _call(endpoint, "/hooks/session-stop", payload)
+            response = _call(endpoint, "/hooks/session-stop", payload, root_path)
         elif args.subcommand == "pre-bash":
             payload = _build_pre_bash(cc_payload)
-            response = _call(endpoint, "/hooks/pre-bash", payload)
+            response = _call(endpoint, "/hooks/pre-bash", payload, root_path)
         elif args.subcommand == "pre-grep":
             payload = _build_pre_grep(cc_payload, root_path)
-            response = _call(endpoint, "/hooks/pre-grep", payload)
+            response = _call(endpoint, "/hooks/pre-grep", payload, root_path)
         elif args.subcommand == "session-start":
             # SB-10 U3: CC's SessionStart event → post-compaction
             # re-grounding. The builder gates on source == "compact", so
             # startup/resume/clear never reach the coordinator.
             payload = _build_session_start(cc_payload)
-            response = _call(endpoint, "/hooks/session-start", payload)
+            response = _call(endpoint, "/hooks/session-start", payload, root_path)
         else:  # pragma: no cover — argparse already validates
             _emit_empty()
             return 0
@@ -258,14 +280,39 @@ def _emit_empty() -> None:
 
 
 def _call(
-    endpoint: CoordinatorEndpoint, path: str, payload: dict[str, Any]
+    endpoint: CoordinatorEndpoint, path: str, payload: dict[str, Any], root: Path
 ) -> Optional[dict[str, Any]]:
+    """POST ``payload``, presenting the session's caller principal.
+
+    The principal is obtained per :func:`obtain_stored_principal` (stored under
+    ``.coherence/``; claimed once per session). A coordinator that issues none
+    (404 on the claim) gets no header and the hook proceeds exactly as before.
+    """
+    principal = obtain_stored_principal(
+        endpoint, root, payload["session_id"], report=_report
+    )
     try:
-        return post(endpoint, path, payload)
-    except urllib.error.HTTPError:
+        return post(
+            endpoint, path, payload, extra_headers=caller_principal_headers(principal)
+        )
+    except urllib.error.HTTPError as exc:
         # Coordinator rejected the request (validation error). Degrade
-        # silently — the hook should NEVER block the user's tool call.
+        # silently — the hook should NEVER block the user's tool call. A
+        # principal refusal is the one rejection worth a stderr line: it means
+        # coherence is off for this session on the routes that require one,
+        # and the stored principal is left in place — never deleted and
+        # re-minted, which would reopen the first-claim gate.
+        answer = http_status_from_error(exc) or {}
+        error = answer.get("error")
+        if isinstance(error, str) and CALLER_PRINCIPAL_HEADER in error:
+            _report(f"coordinator refused this hook's caller principal: {error}")
         return None
+
+
+def _report(message: str) -> None:
+    """One diagnostic line on stderr. Exit code and stdout are unaffected, so
+    the always-exit-0 hook contract holds."""
+    err(f"agent-coherence-hook-client: {message}")
 
 
 # ----------------------------------------------------------------------

@@ -1,0 +1,22 @@
+{
+  "name": "caller-principal-node-session-stop-admits-an-absent-principal",
+  "description": "KTD12 -- the other side of fixture 03: the Node coordinator does not implement the principal and admits the identical request. Require-class enforcement is the Python coordinator's only; this row goes red the day Node starts refusing.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": []
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

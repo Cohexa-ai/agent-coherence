@@ -35,6 +35,7 @@
     "body": {
       "audit_log_mode_drift_total": 0,
       "auth_401_total": 0,
+      "caller_principal_absent_total": 2,
       "cold_start_duration_ms": 0,
       "coordinator_backend": "python",
       "coordinator_pid": "<PID>",
@@ -105,6 +106,6 @@
   },
   "ignore_keys": ["policy_summary", "coordinator_version"],
   "preserve_identity": ["agent_id"],
-  "_comment": "The two agent ids are uuid5(NAMESPACE_URL, 'ccs-agent:claude-session-<session id>') over the two session ids this fixture supplies, so they are derived rather than observed and the same two values are recomputed in test_effect_fence_corpus.py rather than pasted. Row ORDER is the adapter's _agent_names insertion order, i.e. the preflight order: A registers on pre-read, B on pre-edit. tracked_artifacts[].id IS scrubbed -- an artifact id is minted per run and is not an identity this fixture asserts -- which doubles as the in-body control that the opt-in is scoped to the declared key and did not disable the default wholesale. python-only for the same reason fixture warn_mode/08 is: the Node /status envelope is a different shape (see warn_mode/09).",
+  "_comment": "The two agent ids are uuid5(NAMESPACE_URL, 'ccs-agent:claude-session-<session id>') over the two session ids this fixture supplies, so they are derived rather than observed and the same two values are recomputed in test_effect_fence_corpus.py rather than pasted. Row ORDER is the adapter's _agent_names insertion order, i.e. the preflight order: A registers on pre-read, B on pre-edit. tracked_artifacts[].id IS scrubbed -- an artifact id is minted per run and is not an identity this fixture asserts -- which doubles as the in-body control that the opt-in is scoped to the declared key and did not disable the default wholesale. python-only for the same reason fixture warn_mode/08 is: the Node /status envelope is a different shape (see warn_mode/09). caller_principal_absent_total is 2 because both preflights (pre-read, pre-edit) are accept-class requests sent without a caller principal: each is admitted and counted (plan U6), and nothing else in the fixture moves it.",
   "backends": ["python"]
 }

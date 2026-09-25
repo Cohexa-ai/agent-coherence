@@ -301,6 +301,125 @@ def load_secret(coordinator_root: Path) -> str | None:
     return token or None
 
 
+# ---------------------------------------------------------------------------
+# Caller principal — the wire header and the one-shot client's stored values
+# (coordinator caller principal plan, U5)
+# ---------------------------------------------------------------------------
+#
+# The bearer above authenticates the WORKSPACE. A caller principal is a value
+# the coordinator mints and binds to ONE acting identity on that identity's
+# first claim (``POST /principal/claim``); a request naming the identity
+# presents it in :data:`CALLER_PRINCIPAL_HEADER`. What it buys depends on the
+# caller (plan KTD5):
+#
+# - a LONG-LIVED caller (``CoherentVolume``, a direct client) mints once and
+#   holds the principal in memory for its lifetime, so the binding is genuine;
+# - a ONE-SHOT caller (the hook client: one process per hook event) can keep it
+#   only on disk, in this ``0700`` directory, keyed by the identity it claims.
+#   Any process that can read ``.coherence/`` can read it for any identity.
+#   There the principal buys convention-enforcement and a detectable unbound
+#   caller — never separation between callers of the same OS user.
+
+CALLER_PRINCIPAL_HEADER = "Coherence-Caller-Principal"
+"""Request header carrying the caller principal. Named in the style of
+``Coherence-Local-Operator``; ignored by a coordinator that issues none (the
+sibling Node coordinator ignores any header it does not read)."""
+
+CALLER_PRINCIPAL_FILE_PREFIX = "caller-principal-"
+"""Stored-value files are ``<prefix><identity hex>.nonce`` and
+``<prefix><identity hex>.principal`` inside ``.coherence/``. The identity is
+the PARENT session's derived agent id (32 lowercase hex), never the raw session
+id — the same key the sibling Node hook client uses, so both clients share one
+binding per session."""
+
+_PRINCIPAL_VALUE_LEN = 43
+"""``secrets.token_urlsafe(32)`` length — the shape of both a mint nonce this
+module generates and a principal the coordinator mints. A read that is not
+exactly this shape is a file another process has created but not finished
+writing, and is treated as not-yet-there, never as a value."""
+
+_PRINCIPAL_VALUE_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+_IDENTITY_KEY_ALPHABET = frozenset("0123456789abcdef")
+
+
+class MintNonceUnavailable(RuntimeError):
+    """The mint-nonce file exists but never became readable within the
+    bounded wait — a racer that created it and never wrote it. Like
+    :class:`EnsureSecretError`, never repaired by truncating it: truncating
+    could replace a nonce another process already claimed with."""
+
+
+def _principal_file(coordinator_root: Path, identity_key: str, suffix: str) -> Path:
+    if len(identity_key) != 32 or not set(identity_key) <= _IDENTITY_KEY_ALPHABET:
+        raise ValueError("identity_key must be 32 lowercase hex characters")
+    return coordinator_root / ".coherence" / f"{CALLER_PRINCIPAL_FILE_PREFIX}{identity_key}{suffix}"
+
+
+def _read_principal_value(path: Path) -> str | None:
+    """The stored value, or ``None`` when absent or not (yet) well-formed."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return None
+    if len(value) != _PRINCIPAL_VALUE_LEN or not set(value) <= _PRINCIPAL_VALUE_ALPHABET:
+        return None
+    return value
+
+
+def _create_exclusive(path: Path, value: str) -> bool:
+    """Create ``path`` holding ``value`` with ``O_CREAT|O_EXCL`` at ``0600``
+    (the ``hook.secret`` discipline). ``False`` if it already existed; an
+    existing file is never truncated or rewritten."""
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as handle:
+        handle.write(value + "\n")
+    return True
+
+
+def ensure_mint_nonce(coordinator_root: Path, identity_key: str) -> str:
+    """The mint nonce for ``identity_key``, generating and persisting it first
+    if no process has (plan KTD11: persisted BEFORE the claim is sent).
+
+    Two hook processes racing on a new session get ONE nonce: the loser of the
+    exclusive create adopts the winner's value, so both claims present the same
+    nonce and the coordinator hands both the same principal. Never creates
+    ``.coherence/`` (a hook client never does; ``OSError`` propagates when it
+    is missing). Raises :class:`MintNonceUnavailable` if an existing file stays
+    unreadable across the bounded retry."""
+    path = _principal_file(coordinator_root, identity_key, ".nonce")
+    for attempt in range(ENSURE_SECRET_MAX_RETRIES):
+        existing = _read_principal_value(path)
+        if existing is not None:
+            return existing
+        candidate = secrets.token_urlsafe(32)
+        if _create_exclusive(path, candidate):
+            return candidate
+        if attempt + 1 < ENSURE_SECRET_MAX_RETRIES:
+            time.sleep(ENSURE_SECRET_RETRY_SLEEP_SEC)
+    raise MintNonceUnavailable(
+        f"{path.name} exists but stayed unreadable across "
+        f"{ENSURE_SECRET_MAX_RETRIES} attempts; not overwriting it"
+    )
+
+
+def load_caller_principal(coordinator_root: Path, identity_key: str) -> str | None:
+    """The principal stored for ``identity_key``, or ``None``."""
+    return _read_principal_value(_principal_file(coordinator_root, identity_key, ".principal"))
+
+
+def store_caller_principal(coordinator_root: Path, identity_key: str, principal: str) -> None:
+    """Persist ``principal`` for ``identity_key`` exclusively. A file that
+    already exists is left untouched: a stored principal is never replaced,
+    only ever read (a replacement would be a re-mint by another name)."""
+    _create_exclusive(_principal_file(coordinator_root, identity_key, ".principal"), principal)
+
+
 def verify_bearer(authorization_header: str | None, expected_secret: str) -> bool:
     """Constant-time comparison of an Authorization header against the
     expected secret. Returns True only when the header is present, well-
