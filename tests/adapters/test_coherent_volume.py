@@ -1529,6 +1529,86 @@ def test_fail_closed_read_does_not_absolve_foreign_edit_for_write(
         stop_coordinator(tmp_path)
 
 
+def test_refused_first_read_still_guards_a_peer_commit_landing_after_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused FIRST read returns no bytes, but it must still leave a baseline:
+    without one, a write built from no read overwrites a peer's commit that reached
+    disk after the refusal."""
+    target = _seed_file(tmp_path, content=b"0")
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    reader = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    committed, release = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    real_write = peer._atomic_write
+
+    def lagging_write(abs_path: Path, data: bytes) -> None:
+        committed.set()                           # CAS confirmed at the coordinator,
+        if not release.wait(10):                  # held off disk until released
+            raise AssertionError("peer disk write was never released")
+        real_write(abs_path, data)
+
+    monkeypatch.setattr(peer, "_atomic_write", lagging_write)
+
+    def peer_commit(version: int) -> None:
+        try:
+            peer.write_cas_at("data/x.txt", version, b"1")
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+            committed.set()
+
+    thread: threading.Thread | None = None
+    try:
+        _data, version = peer.read_with_version("data/x.txt")
+        thread = threading.Thread(target=peer_commit, args=(version,))
+        thread.start()
+        assert committed.wait(10) and not errors, errors
+        with pytest.raises(StaleView):
+            reader.read("data/x.txt")             # first read, inside the window
+        release.set()
+        thread.join(10)
+        assert not errors, errors
+        assert target.read_bytes() == b"1"        # the peer's commit is on disk
+        with pytest.raises(StaleView):
+            reader.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"1"        # ... and NOT overwritten
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(10)
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_first_read_still_guards_a_later_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FIRST read that fails closed on a watchdog degrade returns no bytes but
+    still leaves a baseline, so a write built from no read cannot overwrite an
+    out-of-band edit made after it."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload)
+
+    try:
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # first read fails closed
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        target.write_bytes(b"HUMAN")              # FOREIGN edit after the refusal
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_reacquire_after_refused_read_reseeds_then_write_succeeds(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

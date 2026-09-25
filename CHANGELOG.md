@@ -203,10 +203,13 @@ Alpha — APIs may change before `v1.0`.
   recorded the edited bytes as seen, so the edit-detection check before a
   write passed: a write built from the bytes read before the edit went
   through and overwrote it. The same happened when a read failed closed on a
-  coordinator timeout under `on_error="strict"`. `read()` now records the
-  bytes as seen only when it returns them, so that write raises `StaleView`
-  and the edit stays on disk. `reacquire()` always returns the bytes it
-  reads, so a write rebuilt from them still succeeds.
+  coordinator timeout under `on_error="strict"`. A refused `read()` no longer
+  replaces what the volume last recorded as seen, so that write raises
+  `StaleView` and the edit stays on disk. A refused first read of a file still
+  records what it found, so a write that follows it is still checked: if a
+  peer's commit reaches disk in between, the write raises `StaleView` instead
+  of overwriting it. `reacquire()` always returns the bytes it reads, so a
+  write rebuilt from them still succeeds.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
