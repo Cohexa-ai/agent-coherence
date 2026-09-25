@@ -18,11 +18,13 @@ from ccs.core.exceptions import CasVersionConflict
 from ccs.mcp.server import (
     _WRITE_CAS_DESC,
     MAX_CAS_CONFLICTS,
+    _do_reacquire,
     _do_read,
     _do_write,
     _do_write_cas,
 )
 from ccs.mcp.session import SessionConfig
+from tests.adapters.test_coherent_volume_split_read import LaggingPeer
 
 
 @pytest.fixture
@@ -321,5 +323,64 @@ def test_adapter_reports_other_holder_not_version_mismatch(
 
         assert exc.value.reason == "other_holder"
         assert exc.value.expected_version == exc.value.current_version == version
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- swg_read inside a peer's commit→disk window ------------------------------
+
+
+def test_swg_read_in_a_peer_commit_window_returns_no_version(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that lands after a peer's CAS is confirmed but before its bytes
+    reach disk sees the old content under the new version. swg_read must refuse
+    it as a recoverable stale_view and carry no version an agent could CAS at."""
+    _seed(tmp_path, b"0")
+    config = _config(tmp_path)
+    peer = LaggingPeer(_vol(tmp_path, fast_cfg), monkeypatch, _PATH)
+    agent = _vol(tmp_path, fast_cfg)
+    try:
+        peer.commit(b"1")
+        try:
+            read = _do_read(agent, config, _PATH)
+        finally:
+            peer.finish()
+        assert read.isError is True
+        sc = read.structuredContent
+        assert sc["reason"] == "stale_view"
+        assert sc["recover"] == "reacquire"
+        assert sc["retryable"] is True
+        assert "version" not in sc
+        assert "content" not in sc
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_swg_read_then_write_cas_through_a_peer_commit_window_loses_no_update(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """swg_read → merge → swg_write_cas, run the way a cooperating agent runs it
+    (a stale_view read is recovered by swg_reacquire, then read again). When
+    swg_read answered inside the window, the agent merged "1" from the old "0"
+    at the peer's version and the CAS won, so the file ended at "1"."""
+    target = _seed(tmp_path, b"0")
+    config = _config(tmp_path)
+    peer = LaggingPeer(_vol(tmp_path, fast_cfg), monkeypatch, _PATH)
+    agent = _vol(tmp_path, fast_cfg)
+    try:
+        peer.commit(b"1")
+        read = _do_read(agent, config, _PATH)
+        peer.finish()
+        if read.isError:
+            assert read.structuredContent["recover"] == "reacquire"
+            assert _do_reacquire(agent, config, _PATH).isError is False
+            read = _do_read(agent, config, _PATH)
+        assert read.isError is False
+        sc = read.structuredContent
+        merged = str(int(sc["content"]) + 1)
+        result = _do_write_cas(agent, config, {}, _PATH, sc["version"], merged)
+        assert result.isError is False
+        assert target.read_bytes() == b"2"
     finally:
         stop_coordinator(tmp_path)

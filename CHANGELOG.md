@@ -197,6 +197,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A read inside a peer's commit→disk window no longer hands out a comparand
+  that loses that peer's update.** A peer's `write_cas_at` confirms its CAS at
+  the coordinator and only then writes its bytes to disk. A read landing between
+  the two sees the old bytes while the coordinator already reports the new
+  version; strict mode denies that read with `hash_differs`, but
+  `read_with_version()` and `read_with_version_generation()` returned the pair
+  anyway, and so did `swg_read`. A caller that derived from those bytes and
+  passed that version to `write_cas_at` / `swg_write_cas` won the CAS once the
+  peer's disk write landed (the CAS compares versions, and by then the version
+  matched), overwriting the peer's update. Those reads now raise `StaleView`
+  (`swg_read`: `reason=stale_view`, `recover=reacquire`, no `version` returned)
+  when the coordinator both denied the read and reported that the bytes are not
+  its content at that version; re-reading once the peer's write has landed
+  returns a sound pair. A denied read whose bytes do match — the sticky-INVALID
+  read after a peer's commit — is returned as before, and the effect fence's
+  verification read (`observe=False`) still reports rather than raises.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
