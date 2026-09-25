@@ -669,9 +669,10 @@ class TestLoopbackHttpUnchanged:
 #
 # urllib's default opener sends a request to whatever proxy http_proxy /
 # https_proxy name, and with no_proxy unset that includes loopback, so the
-# bearer reaches the proxy and the coordinator receives nothing. Each test first
-# shows a bare opener DOES go to the recording proxy under the same environment,
-# so a pass means the client skipped the proxy, not that no proxy was set.
+# bearer reaches the proxy and the coordinator receives nothing. Each proxy test
+# first shows a bare opener DOES go to the recording proxy under the same
+# environment, so a pass means the client skipped the proxy, not that no proxy
+# was set.
 # ===========================================================================
 
 
@@ -732,6 +733,24 @@ def _get_or_error(endpoint: CoordinatorEndpoint) -> dict[str, Any] | Exception:
         return exc
 
 
+def _drop_cached_openers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop every opener the client module holds, whatever it is named.
+
+    ``ProxyHandler`` reads the proxy settings when its opener is built, so an
+    opener cached before a test sets ``http_proxy`` never sees the recorder, and
+    a proxy test passes against a client that leaks. Openers are found by type,
+    held directly or as values of a dict, because a reset by name goes silently
+    stale when the cache is renamed.
+    """
+    for name, value in list(vars(cc).items()):
+        if isinstance(value, urllib.request.OpenerDirector):
+            monkeypatch.setattr(cc, name, None)
+        elif isinstance(value, dict) and any(
+            isinstance(item, urllib.request.OpenerDirector) for item in value.values()
+        ):
+            monkeypatch.setattr(cc, name, {})
+
+
 @pytest.fixture
 def recording_proxy(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_ProxyRecorder]]:
     """Point http_proxy and https_proxy at a recording proxy, with no_proxy unset."""
@@ -742,16 +761,34 @@ def recording_proxy(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_ProxyReco
     proxy_url = f"http://127.0.0.1:{srv.server_address[1]}"
     monkeypatch.setenv("http_proxy", proxy_url)
     monkeypatch.setenv("https_proxy", proxy_url)
-    # An opener the client cached before this point read the proxy settings
-    # without the recorder in them and would pass for that reason alone.
-    monkeypatch.setattr(cc, "_plain_opener", None, raising=False)
+    _drop_cached_openers(monkeypatch)
     try:
         yield recorder
     finally:
         _stop_plain(srv)
 
 
+@pytest.fixture
+def planted_openers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cache openers on the client under names it has never used."""
+    monkeypatch.setattr(
+        cc, "_planted_opener", urllib.request.build_opener(), raising=False
+    )
+    monkeypatch.setattr(
+        cc, "_planted_openers", {True: urllib.request.build_opener()}, raising=False
+    )
+
+
 class TestCoordinatorRequestsSkipProxies:
+    def test_recording_proxy_drops_cached_openers_whatever_their_name(
+        self, planted_openers: None, recording_proxy: type[_ProxyRecorder]
+    ) -> None:
+        # The proxy tests are blind to a leak if a cached opener survives, and the
+        # cache's name is the client's choice. planted_openers is requested first,
+        # so pytest sets it up before recording_proxy looks for openers.
+        assert cc._planted_opener is None
+        assert cc._planted_openers == {}
+
     def test_loopback_http_request_skips_env_proxy(
         self, recording_proxy: type[_ProxyRecorder]
     ) -> None:
