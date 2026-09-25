@@ -12,12 +12,14 @@ separately.
 from __future__ import annotations
 
 import builtins
+import gc
 import io
 import logging
 import os
 import subprocess
 import threading
 import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,6 +196,75 @@ def test_foreign_coordinator_degrade_warns(tmp_path: Path, fast_cfg: LifecycleCo
         with pytest.warns(CoherenceDegradedWarning):
             vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
         assert vol.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _fail_strict_construction(root: Path, cfg: LifecycleConfig) -> list[CoherentVolume]:
+    """Construct a strict volume over a coordinator it did not spawn, so ``_attach``
+    raises, and return the half-built instance captured just before it did."""
+    half_built: list[CoherentVolume] = []
+
+    class _CapturingVolume(CoherentVolume):
+        def _attach(self) -> None:
+            half_built.append(self)
+            super()._attach()
+
+    with pytest.raises(CoherenceError):
+        _CapturingVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    return half_built
+
+
+def test_volume_is_collected_once_unreferenced(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """The fork handler must not own the volume: os.register_at_fork cannot be
+    undone, so registering a bound method there kept every volume alive (and
+    reset in every forked child) for the life of the process."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(vol)
+        del vol
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_failed_construction_is_collected(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A constructor that raised hands the caller nothing, so nothing may keep
+    the half-built instance alive either."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(_fail_strict_construction(tmp_path, fast_cfg).pop())
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_failed_construction_is_not_reset_in_fork_child(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A construction that raised leaves nothing registered for fork: even while
+    something still references the half-built instance, a forked child does not
+    re-mint its identity. Being collectable alone would not show this — a weak
+    registration made before ``_attach`` and never withdrawn still resets it."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        (half_built,) = _fail_strict_construction(tmp_path, fast_cfg)
+        parent_id = half_built.session_id
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            os.close(read_fd)
+            try:
+                os.write(write_fd, half_built.session_id.encode("utf-8"))
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        child_id = os.read(read_fd, 64).decode("utf-8")
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert child_id == parent_id
     finally:
         stop_coordinator(tmp_path)
 

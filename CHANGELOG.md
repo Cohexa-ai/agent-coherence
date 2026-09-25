@@ -197,6 +197,25 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A `CoherentVolume` you drop is now garbage-collected, and a constructor that
+  raises leaves nothing behind.** Each volume registered its own fork handler
+  with `os.register_at_fork`, which cannot unregister and holds a strong
+  reference to the handler it is given. So every volume a process ever built
+  stayed alive until the process exited, and its handler ran in every forked
+  child, re-minting the identity of a volume nothing used any more. The
+  registration also came before the volume attached to its coordinator, so a
+  construction that raised (strict mode against a coordinator the volume did
+  not spawn, for example) still pinned the half-built instance. One
+  process-wide handler now walks a weak set of live volumes, and a volume
+  joins that set only after its constructor succeeds. What a forked child does
+  to a live volume is unchanged: it re-mints the identity, drops the inherited
+  coordinator endpoint, clears the per-path baselines, and re-attaches on the
+  next read or write, never inside the fork handler. Three regression tests pin
+  this. Two check that a dropped volume and a failed construction are
+  collected. The third keeps a failed construction alive across a real fork
+  and checks that the child leaves it untouched: collection alone would not
+  catch a weak registration made before attach and never withdrawn.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
