@@ -313,6 +313,39 @@ def test_failed_write_cas_at_read_on_a_never_read_path_still_guards_a_later_writ
         agent.write(_PATH, b"agent")
     assert target.read_bytes() == b"HUMAN"
 
+
+def test_write_after_a_cas_lost_to_a_commit_still_reaching_disk_is_denied(
+    volumes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer's CAS is confirmed between write_cas_at's comparand read and its
+    own CAS, and the peer's bytes have not reached disk. The disk still matches
+    this volume's baseline, so only the coordinator can refuse the write() that
+    follows the lost CAS: the comparand read registered this volume there, and
+    the peer's commit invalidated it."""
+    target, peer_vol, agent = volumes
+    _data, version = agent.read_with_version(_PATH)
+    peer = LaggingPeer(peer_vol, monkeypatch)
+    real_post = agent._post
+    raced = threading.Event()
+
+    def post_with_a_peer_commit_first(endpoint_path: str, payload: dict) -> dict | None:
+        if endpoint_path == "/hooks/post-edit-cas" and not raced.is_set():
+            raced.set()
+            peer.commit(b"1")
+        return real_post(endpoint_path, payload)
+
+    monkeypatch.setattr(agent, "_post", post_with_a_peer_commit_first)
+    try:
+        with pytest.raises(CasVersionConflict):
+            agent.write_cas_at(_PATH, version, b"agent")
+        with pytest.raises(StaleView):
+            agent.write(_PATH, b"older")
+    finally:
+        peer.finish()
+    assert raced.is_set()
+    assert target.read_bytes() == b"1"
+    assert agent.reacquire(_PATH) == b"1"
+
 def _read_following_the_deny_guidance(
     vol: CoherentVolume, patience_sec: float = 3.0
 ) -> tuple[bytes, int] | bytes:

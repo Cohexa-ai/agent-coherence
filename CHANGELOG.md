@@ -232,10 +232,12 @@ Alpha — APIs may change before `v1.0`.
   read still records what it found, even when refused, so a write that follows
   it is still checked. `write_cas_at` / `swg_write_cas` discards the bytes its
   own read returns, so a CAS that loses no longer counts the peer's bytes as
-  seen: a `write()` / `swg_write` of older content after a lost CAS is denied
-  instead of overwriting the peer's commit. On a file the volume never read,
-  that read still records what it found, even when the CAS loses or the read
-  fails, so a later write is still checked. A refusal
+  seen: after reading a file and then losing a CAS on it, a `write()` /
+  `swg_write` of the older content is denied instead of overwriting the peer's
+  commit, including while that commit is still reaching disk. On a file the
+  volume never read, that read still records what it found, even when the CAS
+  loses or the read fails, so an edit made outside the coordinator afterwards
+  is still caught. A refusal
   caused by a peer's commit still reaching disk clears on its own, so retry
   `reacquire()` and the read for a few seconds first. When the refusal outlasts
   that (an out-of-band edit, or a commit whose disk write failed), the

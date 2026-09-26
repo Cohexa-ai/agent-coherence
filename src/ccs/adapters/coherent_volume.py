@@ -1202,21 +1202,20 @@ class CoherentVolume:
         # Re-mint first / read second: a hash-checked None-state read establishes
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU). The read's bytes are
-        # discarded (the caller already holds new_content), so it is not an
-        # observation: advancing the foreign-edit baseline from it let a caller
-        # whose CAS lost fall back to write() with older content and land it
-        # over the peer's commit. A win records its own bytes below.
-        # observe=False also asks the coordinator for a verify-only read: the
-        # fresh identity takes no SHARED grant (commit_cas admits a caller with
-        # none; the version check arbitrates), and the stale markers and notices
-        # it skips are keyed to that fresh identity, which has none yet.
-        # A path this instance never read still gets a FIRST baseline from this
-        # read, recorded before its request (seed_first_baseline): without it a
-        # CAS that loses, is refused, or whose read fails closed leaves no
-        # baseline, and a later write() lands over an out-of-band edit unchecked.
+        # discarded (the caller already holds new_content), so they must not
+        # ADVANCE the foreign-edit baseline: that let a caller whose CAS lost
+        # fall back to write() with older content and land it over the peer's
+        # commit. It stays an observing read otherwise, and both halves matter:
+        # on a path never read it records the first baseline before its request
+        # (so a lost, refused or failed CAS still leaves write() one to check),
+        # and it registers the fresh identity SHARED, so a peer commit that wins
+        # before our CAS invalidates it and the write() fallback is refused at
+        # the coordinator even while the peer's bytes are still reaching disk,
+        # when the disk alone still matches the baseline. A win records its own
+        # bytes below.
         self._remint()
         _current_bytes, current_version, stale_denied, _gen, _stale, _differs = (
-            self._read_with_version(rel, observe=False, seed_first_baseline=True)
+            self._read_with_version(rel, advance_baseline=False)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1839,7 +1838,7 @@ class CoherentVolume:
             return result.data, result.version, result.owner_generation
 
     def _read_with_version(
-        self, rel: str, *, observe: bool = True, seed_first_baseline: bool = False
+        self, rel: str, *, observe: bool = True, advance_baseline: bool = True
     ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation, stale_status,
@@ -1879,11 +1878,7 @@ class CoherentVolume:
         # cannot absolve an edit made after an earlier read; it only keeps a
         # path whose first read was refused from having no baseline at all, which
         # would let a later write land over a peer commit unchecked.
-        # ``seed_first_baseline`` applies the same first-read rule to a
-        # verification read that is still a path's first contact
-        # (write_cas_at's comparand read); the effect fence's re-check leaves it
-        # off.
-        if observe or seed_first_baseline:
+        if observe:
             self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
@@ -1950,7 +1945,10 @@ class CoherentVolume:
         # OCC loops discard it), so it is decided AFTER the response, not
         # before: seeding first let a refused read of an out-of-band edit
         # clear the way for a write over that edit.
-        if observe and not result.split_pair:
+        # ``advance_baseline=False`` (write_cas_at's comparand read, whose bytes
+        # the caller discards) keeps the first-read seed above but never moves
+        # an existing baseline.
+        if observe and advance_baseline and not result.split_pair:
             self._last_observed_hash[_rel] = content_hash
         return result
 
