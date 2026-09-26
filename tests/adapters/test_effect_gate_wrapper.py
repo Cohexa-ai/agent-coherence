@@ -594,9 +594,11 @@ def test_forked_child_check_fence_holds_on_the_parents_comparands(
     """A forked child pulling the verdict with comparands its parent captured
     must HOLD: the child re-mints its identity, so the grant the decision was
     read under is the parent's, never the child's. The fence's verification
-    read re-attaches the child and is answered stale under the fresh identity.
-    If the coordinator ever answered it fresh, the child would fire an effect
-    decided under a grant it does not hold."""
+    read re-attaches the child and is answered stale under the fresh identity
+    -- on every retry, not just the first: a verify-only read must not grant
+    that identity anything, or the child's next pull would be admitted. If the
+    coordinator ever answered it fresh, the child would fire an effect decided
+    under a grant it does not hold."""
     _seed(tmp_path)
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
     try:
@@ -607,12 +609,15 @@ def test_forked_child_check_fence_holds_on_the_parents_comparands(
 
         vol._after_fork()  # simulate the child-side fork handler
 
-        with pytest.raises(StaleView) as exc_info:
-            check_fence(vol, REL, expected_version=version, expected_generation=generation)
+        # Pull the verdict repeatedly with the same comparands and no
+        # reacquire() between: every pull must HOLD, not only the first.
+        for attempt in range(3):
+            with pytest.raises(StaleView) as exc_info:
+                check_fence(vol, REL, expected_version=version, expected_generation=generation)
+            exc = exc_info.value
+            assert exc.hold_cause == HOLD_GRANT_PREEMPTED, f"pull {attempt + 1}"
+            assert (exc.current_version, exc.current_generation) == (version, generation)
         assert vol.is_attached  # the verification read re-attached the child
-        exc = exc_info.value
-        assert exc.hold_cause == HOLD_GRANT_PREEMPTED
-        assert (exc.current_version, exc.current_generation) == (version, generation)
     finally:
         stop_coordinator(tmp_path)
 
