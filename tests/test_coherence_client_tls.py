@@ -767,6 +767,19 @@ class _EchoHandler(_RecordingHandler):
         self.wfile.write(body)
 
 
+class _NotFoundHandler(_RecordingHandler):
+    """Answers every request with a 404 and a JSON error body."""
+
+    def _record_and_respond(self) -> None:
+        type(self).seen_authorizations.append(self.headers.get("Authorization"))
+        body = b'{"error": "no such route"}'
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class TestTlsSetupCountsSeeTheCost:
     """Positive controls: the counters see what the old transport did.
 
@@ -837,6 +850,26 @@ class TestPlainHttpOpener:
         # closed instead of riding a default (possibly unverified) SSL context.
         with pytest.raises(urllib.error.URLError, match="unknown url type: https"):
             cc._get_shared_opener(system_tls=False).open("https://127.0.0.1:1/status")
+
+    def test_an_error_status_raises_http_error_with_its_body(
+        self, fresh_shared_openers: None
+    ) -> None:
+        # The handler list is hand-built, so HTTPDefaultErrorHandler is one entry
+        # an edit can drop. Without it a 404 comes back as a None response, and
+        # ``with opener.open(...)`` raises a TypeError that no except clause in
+        # _execute catches: the console scripts would print a traceback instead
+        # of the HTTPError they handle. Every other test here answers 2xx or 3xx.
+        handler = type("_Scoped404", (_NotFoundHandler,), {"seen_authorizations": []})
+        srv = _start_plain_server(handler)
+        try:
+            ep = CoordinatorEndpoint(port=srv.port, bearer="s3cr3t", host="127.0.0.1")
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                cc.get(ep, "/missing")
+            assert exc.value.code == 404
+            assert cc.http_status_from_error(exc.value) == {"error": "no such route"}
+            assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
+        finally:
+            srv.shutdown()
 
     @pytest.mark.parametrize(
         "scheme", ["http", pytest.param("https", marks=requires_openssl)]
