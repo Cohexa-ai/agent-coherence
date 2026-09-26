@@ -233,6 +233,20 @@ Alpha — APIs may change before `v1.0`.
   for not enforcing strict mode now drops the connection before it warns,
   not after.
 
+- **A forked `CoherentVolume`'s `read_with_version` and
+  `read_with_version_generation` now re-attach first, like `read`.** They were
+  the only operations that skipped the post-fork re-attach: in a child that had
+  not re-attached yet they returned version `0` (and generation `None`)
+  without asking the coordinator and without raising, even under
+  `on_error="strict"`. The child's view was never registered, so a peer's
+  later write did not invalidate it, and a caller such as the effect gate or
+  the workspace versioner got an unconfirmed comparand instead of an error.
+  They now return the coordinator's version, which a following `write_cas_at`
+  can use directly, without a `reacquire()` first. While the re-attach fails,
+  a strict child's versioned read raises `CoherenceError` like every other
+  operation. Code that relied on getting `(bytes, 0)` back from a forked child
+  should expect that error instead.
+
 - **A read inside a peer's commit→disk window no longer hands out a comparand
   that loses that peer's update.** A peer's `write_cas_at` confirms its CAS at
   the coordinator and only then writes its bytes to disk. A read landing between
