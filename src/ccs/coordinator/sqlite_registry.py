@@ -3002,6 +3002,7 @@ class SqliteArtifactRegistry:
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
         """Set MESI state for one agent/artifact pair.
 
@@ -3009,6 +3010,9 @@ class SqliteArtifactRegistry:
         contract (registry.py:115-173). On state_log exception, the SQL is
         rolled back AND _seq is decremented so the next successful emission
         does not create a phantom gap.
+
+        ``observed=False``: the grant certifies no read, so the recorded
+        ``last_observed_version`` is left as it was (see the Protocol).
         """
         self._guard_writable()
         with self._lock:
@@ -3072,8 +3076,9 @@ class SqliteArtifactRegistry:
                 # this agent now holds -- the post-compaction staleness
                 # comparand), a transition TO INVALID preserves the prior
                 # recorded value via the CASE guard, and a never-observed row
-                # keeps NULL (never a 0-sentinel).
-                observe = state != MESIState.INVALID
+                # keeps NULL (never a 0-sentinel). ``observed=False`` (a grant
+                # that certifies no read) takes the same preserving branch.
+                observe = state != MESIState.INVALID and observed
                 if prior_row is None:
                     self._conn.execute(
                         """

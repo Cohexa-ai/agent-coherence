@@ -39,12 +39,16 @@ from urllib import request as urlrequest
 import pytest
 
 from ccs.adapters.claude_code.auth import load_secret
-from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.coordinator_server import (
+    CoordinatorHTTPServer,
+    session_to_agent_id,
+)
 from ccs.adapters.claude_code.hook_payloads import (
     STRICT_MODE_DENY_REASON_TEMPLATE,
     TERMINAL_DENIAL_CLASSES,
     emit_allow,
 )
+from ccs.core.states import MESIState
 
 # ----------------------------------------------------------------------
 # Test plumbing — mirrors tests/test_claude_code_coordinator_server.py
@@ -761,3 +765,378 @@ def test_pre_read_strict_deny_ignores_want_owner_generation(
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "owner_generation" not in body
     assert "version" not in body
+
+
+# ----------------------------------------------------------------------
+# A grant handover is not a write (R8) -- Cohexa-ai/agent-coherence#196
+# ----------------------------------------------------------------------
+#
+# The reported sequence: A holds the artifact, B calls pre-edit and takes the
+# grant, nothing is committed, and A's next read is denied with "was updated
+# by session <unknown> at <t>". No commit happened, the version never moved,
+# and the deny named a writer that does not exist. This is the end-to-end
+# form of the two renderer tests in
+# ``tests/test_claude_code_coordinator_server.py``.
+
+
+def _setup_grant_handover(client: _Client, path: str) -> None:
+    """A reads (SHARED on v1), B takes the grant via pre-edit, B never commits.
+
+    A is INVALID afterwards with its last-observed version still v1, which is
+    also the artifact's current version -- nothing was written.
+    """
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("A"), "path": path, "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": path})
+
+
+def test_grant_handover_deny_reports_no_write_and_an_unchanged_version(
+    strict_client: _Client,
+) -> None:
+    """Both halves, because either alone passes while the other is wrong.
+
+    The prose alone would pass with a version the response got wrong, and the
+    version alone would pass with prose still claiming a write.
+    """
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "was updated by" not in reason, (
+        f"no write happened, so the deny must not report one; got: {reason}"
+    )
+    assert "your grant on CLAUDE.md was revoked and no new version was committed" in reason, reason
+    assert "CLAUDE.md is still at v1" in reason, reason
+
+    summary = body["summary"]
+    assert summary["current_version"] == 1, summary
+    assert summary["prior_version_seen_by_session"] == 1, (
+        f"A observed v1 and v1 is still current; reporting v0 invents a "
+        f"version A never saw: {summary}"
+    )
+
+
+def test_a_real_commit_still_denies_with_the_write_wording(
+    strict_client: _Client,
+) -> None:
+    """The control for the test above: when a peer really did commit, the
+    deny keeps naming the write and the version it moved to."""
+    _setup_stale(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    assert status == 200
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "CLAUDE.md was updated by agent " in reason, reason
+    assert "was revoked" not in reason, reason
+    assert body["summary"]["current_version"] == 2, body["summary"]
+    assert body["summary"]["prior_version_seen_by_session"] == 1, body["summary"]
+
+
+def test_grant_handover_deny_is_byte_stable_across_retries(
+    strict_client: _Client,
+) -> None:
+    """KTD-T still holds on the new arm: retrying reproduces the same bytes.
+
+    The grant-change reason interpolates only the path and the current
+    version, so unlike the write arm it carries no timestamp at all.
+    """
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    reasons = set()
+    for _ in range(4):
+        _, body = strict_client.post(
+            "/hooks/pre-read",
+            {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+        )
+        reasons.add(body["hookSpecificOutput"]["permissionDecisionReason"])
+    assert len(reasons) == 1, reasons
+
+
+def test_pre_edit_deny_after_a_grant_handover_reports_no_write(
+    strict_client: _Client,
+) -> None:
+    """The Edit surface takes the same arm: A's pre-edit after losing the
+    grant must not be told the artifact was updated."""
+    _setup_grant_handover(strict_client, "CLAUDE.md")
+    status, body = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "CLAUDE.md"},
+    )
+    assert status == 200
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "was updated by" not in reason, reason
+    assert "CLAUDE.md is still at v1" in reason, reason
+    assert body["summary"]["prior_version_seen_by_session"] == 1, body["summary"]
+
+
+# ----------------------------------------------------------------------
+# A denied read is not an observation
+# ----------------------------------------------------------------------
+#
+# pre-bash and pre-grep re-grant SHARED to every stale path they name, and
+# they do it on the strict path too: the deny fires once and the retry goes
+# through (Node's pre_bash.ts documents the same contract). A SHARED grant
+# used to be an observation, full stop -- ``set_agent_state`` recorded the
+# current version as the agent's ``last_observed_version`` for any
+# non-INVALID target. So a DENIED ``cat plan.md``, which never ran, credited
+# the session with having seen the version it was refused. When a peer then
+# took the grant without committing, the stale summary compared that invented
+# baseline against an unchanged version and told the session nothing had been
+# written since "the version you last saw" -- a version it never saw.
+#
+# The allowed twin is NOT a bug and must stay: in warn mode the command runs
+# and the session does read the current bytes, exactly like the pre-read
+# warn path's ``post_stale_read`` re-grant. What decides the observation is
+# whether the command was DENIED -- not the trigger's name, and not whether
+# the individual path is strict (a warn-only path inside a denied command was
+# not read either). The grant itself is unchanged in both directions.
+
+
+def _agent(label: str) -> uuid.UUID:
+    return session_to_agent_id(_sid(label))
+
+
+def _observed(coordinator: CoordinatorHTTPServer, path: str, label: str) -> Optional[int]:
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} is not registered"
+    return coordinator.registry.last_observed_version_for(artifact_id, _agent(label))
+
+
+def _mesi(coordinator: CoordinatorHTTPServer, path: str, label: str) -> Optional[MESIState]:
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} is not registered"
+    return coordinator.registry.get_agent_state(artifact_id, _agent(label))
+
+
+def _take_grant_without_committing(
+    coordinator: CoordinatorHTTPServer, client: _Client, path: str,
+) -> None:
+    """B takes the grant again and writes nothing, which leaves A INVALID at
+    an UNCHANGED version -- the state in which the prose has to choose between
+    "someone committed" and "only the grant moved". Asserted, not assumed: if
+    A were not invalidated the read below would take the fresh arm and every
+    wording assertion after it would be vacuous."""
+    version_before = coordinator.registry.get_artifact(
+        coordinator.registry.lookup_artifact_id_by_name(path)
+    ).version
+    status, body = client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": path})
+    assert status == 200 and body.get("ok") is True, body
+    assert _mesi(coordinator, path, "A") == MESIState.INVALID
+    assert coordinator.registry.get_artifact(
+        coordinator.registry.lookup_artifact_id_by_name(path)
+    ).version == version_before, "a pre-edit must not move the version"
+
+
+def test_denied_pre_bash_does_not_advance_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    _setup_stale(strict_client, "plan.md")
+    assert _observed(strict_coordinator, "plan.md", "A") == 1  # A read v1, then B committed v2
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+    assert _observed(strict_coordinator, "plan.md", "A") == 1, (
+        "the command was denied, so A never read v2; crediting it as observed "
+        "is what later makes an unchanged version look like the one A last saw"
+    )
+    # The grant is deliberately unchanged: the strict bash deny still fires
+    # once and re-arms the session. Only the observation claim moved.
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED
+
+
+def test_denied_pre_bash_then_a_grant_handover_still_reports_the_write(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The probe's sequence end to end: the prose and the version, both,
+    because either alone passes while the other is wrong."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "plan.md was updated by agent " in reason, reason
+    assert "no new version was committed" not in reason, reason
+    assert body["summary"]["current_version"] == 2, body["summary"]
+    assert body["summary"]["prior_version_seen_by_session"] == 1, body["summary"]
+
+
+def test_allowed_pre_bash_advances_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The warn twin: the command runs, A reads v2, and the baseline says so.
+    A fix that stopped advancing on the bash trigger would re-break this in
+    the old direction -- "you previously saw v1" about bytes A just read."""
+    _setup_stale(strict_client, "docs/plans/x.md")
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 1
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat docs/plans/x.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "allow", body
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 2
+    assert _mesi(strict_coordinator, "docs/plans/x.md", "A") == MESIState.SHARED
+
+    _take_grant_without_committing(strict_coordinator, strict_client, "docs/plans/x.md")
+    status, body = strict_client.post(
+        "/hooks/pre-read", {"session_id": _sid("A"), "path": "docs/plans/x.md"},
+    )
+    assert status == 200
+    out = body["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow", body
+    text = out["additionalContext"]
+    assert (
+        "your grant on docs/plans/x.md was revoked and no new version was committed"
+        in text
+    ), text
+    assert "the version you last saw" in text, text
+    assert "was updated by" not in text, text
+    assert body["summary"]["prior_version_seen_by_session"] == 2, body["summary"]
+
+
+def test_a_warn_path_inside_a_denied_bash_command_is_not_observed_either(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The deny is per COMMAND, so the key is the command's outcome, not the
+    path's strictness: ``cat plan.md docs/plans/x.md`` never ran, and x.md --
+    warn-only on its own -- was not read by it."""
+    _setup_stale(strict_client, "plan.md")
+    _setup_stale(strict_client, "docs/plans/x.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat plan.md docs/plans/x.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 1
+    assert _mesi(strict_coordinator, "docs/plans/x.md", "A") == MESIState.SHARED
+
+
+def test_first_observation_inside_a_denied_bash_command_records_no_observation(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """KTD-9 seeding registers a never-seen path and grants it SHARED. Inside
+    a denied command that grant is not a read: the pair stays never-observed
+    (None, never a 0-sentinel)."""
+    _setup_stale(strict_client, "plan.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md CLAUDE.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert _mesi(strict_coordinator, "CLAUDE.md", "A") == MESIState.SHARED
+    assert _observed(strict_coordinator, "CLAUDE.md", "A") is None
+
+
+def test_first_observation_inside_an_allowed_bash_command_is_observed(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The allowed twin of the test above: the command runs, so the seed is a
+    read of v1."""
+    _setup_stale(strict_client, "docs/plans/x.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash",
+        {"session_id": _sid("A"), "command": "cat docs/plans/x.md CLAUDE.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "allow", body
+    assert _mesi(strict_coordinator, "CLAUDE.md", "A") == MESIState.SHARED
+    assert _observed(strict_coordinator, "CLAUDE.md", "A") == 1
+
+
+def test_denied_pre_grep_does_not_advance_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    _setup_stale(strict_client, "plan.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-grep", {"session_id": _sid("A"), "search_root": ""},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED
+
+
+def test_allowed_pre_grep_advances_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    _setup_stale(strict_client, "docs/plans/x.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-grep", {"session_id": _sid("A"), "search_root": "docs/plans"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "allow", body
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 2
+
+
+def test_an_allowed_stale_read_still_advances_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """Control: the ordinary warn-mode read path is untouched by the fix."""
+    _setup_stale(strict_client, "docs/plans/x.md")
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 1
+
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "docs/plans/x.md", "content_hash": _hash("v2")},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "allow", body
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 2
+
+
+def _reground_text(client: _Client) -> str:
+    status, body = client.post("/hooks/session-start", {"session_id": _sid("A")})
+    assert status == 200, body
+    return body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_denied_pre_bash_keeps_the_post_compaction_stale_flag(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The baseline's other reader. After a compaction the re-grounding flags a
+    file whose version moved past the one the session last observed. Crediting
+    the denied ``cat`` as an observation of v2 silenced that flag for a file
+    the session never read at v2 -- the payload said only "is at v2"."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
+
+    text = _reground_text(strict_client)
+    assert "plan.md advanced to v2 past your last-observed v1" in text, text
+
+
+def test_allowed_pre_bash_does_not_raise_a_false_post_compaction_stale_flag(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The allowed twin: A read v2 through the command, so there is nothing to
+    flag -- a fix that stopped recording allowed reads would raise one."""
+    _setup_stale(strict_client, "docs/plans/x.md")
+    strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat docs/plans/x.md"},
+    )
+    _take_grant_without_committing(strict_coordinator, strict_client, "docs/plans/x.md")
+
+    text = _reground_text(strict_client)
+    assert "docs/plans/x.md is at v2." in text, text
+    assert "advanced to" not in text, text

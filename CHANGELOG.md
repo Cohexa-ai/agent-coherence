@@ -163,6 +163,28 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **`/status` no longer publishes a raw session identifier below the operator
+  tier.** Each session row already carried `agent_id` — a uuid5 of the session
+  id, non-reversible by construction — beside `agent_name`, which rendered the
+  raw identifier verbatim. `agent_name` is now `null` below the full-detail
+  tier, where an operator still sees it. `agent_id` and the per-artifact
+  states are unchanged at every tier, so anything reading those is
+  unaffected. The `--detail` help text no longer claims the process id is
+  redacted at the minimal tier; it is emitted at every tier, deliberately.
+
+- **A hook response names a peer by agent id, and a denial no longer reports a
+  write that did not happen.** Two corrections on the same surface. The
+  preemption notice, and the last-writer field on every stale response and
+  strict deny, carried a peer's raw session id — reversed back out of the
+  agent id by a helper that now no longer exists. They carry the agent id
+  itself. Separately, a denial issued when a peer merely took the grant
+  claimed the artifact "was updated by" that peer, naming a timestamp for a
+  write that never occurred; losing a grant and losing a race to a commit are
+  now distinct messages. The grant-change text states only what the summary
+  supports, and says nothing about worktree content: the flag such a claim
+  would rest on is false on three different states — no hash sent, no hash
+  recorded, or two hashes compared and equal — and only the third is a match.
+
 - **BEHAVIOR CHANGE — `gate()` now refuses a volume that cannot report the
   grant state of its last read.** The fence reads two flags a volume sets on
   every read: whether the coordinator refused it, and whether it was served
@@ -208,6 +230,23 @@ Alpha — APIs may change before `v1.0`.
   previously let an effect through. That is the fix, not a regression.
 
 ### Fixed
+
+- **A Bash or Grep command denied in strict mode no longer counts as a read.**
+  When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
+  session SHARED. It does this in strict mode too: the deny fires once, and a
+  retry goes through. That grant also recorded the file's current version as
+  the one the session had last seen, even though a denied command never runs.
+  After a compaction, the re-grounding stale flag then stayed silent for a file
+  the session had never read at its current version. The same false baseline
+  would have made the grant-change denial described above tell a session that
+  nothing had been written since "the version you last saw", a version it had
+  been refused. The observation is now recorded only when the
+  command runs. That holds for every file the command named, including
+  warn-only ones in a denied command, and for a first-seen file registered by
+  a denied command. The grant itself is unchanged. An allowed command still
+  records the read, because it does read the current bytes. The Node
+  coordinator changes identically, and the protocol corpus pins both
+  directions on both backends.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was

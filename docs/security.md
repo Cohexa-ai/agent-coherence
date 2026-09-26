@@ -1,10 +1,10 @@
 # Security & supply chain
 
 This document covers what end users need to know to install, configure, and run
-`agent-coherence` safely: the outbound-traffic posture, the kill switches that
-disable telemetry-shaped behavior, the local files the package writes, how to
-install with hash pinning, and how to verify the cryptographic provenance of a
-published wheel.
+`agent-coherence` safely: the outbound-traffic posture, which callers the local
+coordinator can tell apart, the kill switches that disable telemetry-shaped
+behavior, the local files the package writes, how to install with hash pinning,
+and how to verify the cryptographic provenance of a published wheel.
 
 ## Outbound network destinations
 
@@ -136,6 +136,40 @@ and no endpoint to configure on this path. See the MCP sections of the
 [README](../README.md#mcp-server-stale-write-guard-fs) and the
 [guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the five `swg_*`
 tools.
+
+## Who the coordinator can tell apart
+
+The local coordinator authenticates the **workspace**, not the individual caller.
+Every request carries the one bearer secret in `.coherence/hook.secret` (mode
+`0600`, readable only by your OS user), and every process in the workspace uses
+the same secret. The session a request acts as is a `session_id` field in the
+request body, which the coordinator checks for shape and nothing else.
+
+What follows from that:
+
+- Any process that can read the secret can act as any session: release that
+  session's grants, or commit a version recorded as written by it. This is the
+  intended trust model — every process running as your OS user is trusted alike,
+  the same boundary as your shell history or SSH agent socket.
+- `last_writer_id`, and the sessions listed by `/status`, record which session a
+  caller *said* it was. Treat them as a record of cooperating writers' claims —
+  useful for debugging and display — not as proof of who wrote.
+- The snapshot-session routes (`/session/read`, `/session/commit`,
+  `/session/commit_all`, `/session/heartbeat`) also require the token that
+  `/session/begin` returns, and attribute a commit to the session that token was
+  issued for. That stops one snapshot session committing through another's
+  token; it does not verify the `session_id` named at `/session/begin`.
+
+What the coordinator does not publish: `/status` shows session names — which
+embed the raw session id — only in the operator view (`?detail=full` plus the
+`Coherence-Local-Operator: true` header, which `agent-coherence-status` sends by
+default). The default `minimal` view reports
+`agent_name` as `null`, and the `metrics` view carries no sessions at all. Hook
+responses identify another session by its agent id, a one-way hash of the
+session id. This keeps session ids out of status output that gets pasted into bug
+reports or scraped into dashboards. It is disclosure hygiene rather than a
+boundary: under the model above, knowing a session id grants nothing the secret
+does not already grant.
 
 ## Env-var kill switches
 

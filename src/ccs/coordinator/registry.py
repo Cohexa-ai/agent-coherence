@@ -582,8 +582,12 @@ class ArtifactRegistry:
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
-        """Set MESI state for one agent/artifact pair."""
+        """Set MESI state for one agent/artifact pair.
+
+        ``observed=False``: the grant certifies no read, so the recorded
+        ``last_observed_version`` is left as it was (see the Protocol)."""
         with self._lock:
             record = self._records[artifact_id]
             from_state = record.state_by_agent.get(agent_id, MESIState.INVALID)
@@ -649,8 +653,11 @@ class ArtifactRegistry:
             # targets only -- a transition TO INVALID preserves the prior recorded
             # value (the last version actually observed, the post-compaction
             # staleness comparand) and a never-observed agent keeps no key (absent
-            # == None, never a 0-sentinel).
-            if state != MESIState.INVALID:
+            # == None, never a 0-sentinel). A grant the caller says certifies no
+            # read (``observed=False``: a denied command's re-grant) preserves
+            # the same way -- a SHARED holder can then sit BELOW the current
+            # version, which every reader treats as "behind", the safe side.
+            if state != MESIState.INVALID and observed:
                 record.last_observed_version_by_agent[agent_id] = record.artifact.version
 
             if self._state_log is not None:

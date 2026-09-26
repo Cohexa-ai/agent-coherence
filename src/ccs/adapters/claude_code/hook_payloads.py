@@ -61,19 +61,45 @@ an entry without a security review."""
 
 
 STRICT_MODE_DENY_REASON_TEMPLATE: str = (
-    "Stale read denied: {path} was updated by session {last_writer_short} "
+    "Stale read denied: {path} was updated by agent {last_writer_short} "
     "at {last_writer_ts_iso}. Re-read {path} via the Read tool before "
     "proceeding. This denial is structural (v0.2 strict mode); retrying "
     "the same operation will produce the same denial."
 )
-"""KTD-P static deny text. Byte-stable across retries of the same
-(session, artifact) staleness event because every substitution is
-deterministic per-artifact (path), per-preempter (last_writer_short), or
-per-commit-tick (last_writer_ts_iso). The Phase 0 H1 falsification proved
-varied deny text WORSENS opus behavior (5 retries vs 2 with static text);
-this template guards against accidental re-introduction of per-invocation
-fields. The format-string placeholder set is locked by
-``test_strict_mode_deny_reason_template_is_static``."""
+"""KTD-P static deny text for the arm where a peer really did commit.
+Byte-stable across retries of the same (session, artifact) staleness event
+because every substitution is deterministic per-artifact (path),
+per-preempter (last_writer_short), or per-commit-tick (last_writer_ts_iso).
+The Phase 0 H1 falsification proved varied deny text WORSENS opus behavior
+(5 retries vs 2 with static text); this template guards against accidental
+re-introduction of per-invocation fields. The format-string placeholder set
+is locked by ``test_strict_mode_deny_reason_template_is_static``.
+
+``last_writer_short`` shortens an AGENT id (R7): the registry stores
+``artifacts.last_writer_id`` as an agent id and the response now renders it
+as-is instead of mapping it back to the session id it was derived from."""
+
+
+GRANT_CHANGE_DENY_REASON_TEMPLATE: str = (
+    "Stale read denied: your grant on {path} was revoked and no new version "
+    "was committed — {path} is still at v{current_version}. Re-read "
+    "{path} via the Read tool before proceeding. This denial is structural "
+    "(v0.2 strict mode); retrying the same operation will produce the same "
+    "denial."
+)
+"""The deny text for the arm where nothing was written (R8).
+
+Cohexa-ai/agent-coherence#196: a peer's ``pre-edit`` invalidates a live
+holder WITHOUT committing. The holder's next read was denied with "was
+updated by session <unknown> at <t>" — a write that never happened, named
+against a writer that does not exist, at a timestamp when nothing was
+written. :func:`summary_reports_a_write` picks between the two templates.
+
+Carries no timestamp at all: a revocation the summary can see has no
+event tick of its own (``last_writer_at_unix_ts`` is the last real commit,
+which is not what happened here), and the version is the honest thing to
+report. That makes this arm byte-stable for the same reason the other one
+is — every substitution is per-artifact."""
 
 
 def emit_allow(
@@ -116,20 +142,56 @@ def emit_allow(
     return out
 
 
-def short_session_id(session_id: str) -> str:
-    """The 8-char short form of a session id, EXCEPT for a ``<...>`` sentinel.
+def short_session_id(identity_id: str) -> str:
+    """The 8-char short form of an identity handle, EXCEPT for a ``<...>``
+    sentinel.
 
     A placeholder like ``"<unknown>"`` is prose, not an identifier: slicing it
     to 8 chars drops the closing angle bracket and ships malformed text
-    ("<unknown"). Real session ids are 36-char UUIDs, so an 8-char prefix is
-    unambiguous whenever one is present. Every renderer that shortens a
-    session id for prose goes through here — the guard used to live in
-    :func:`emit_strict_deny` alone, and the two warn-mode renderers sliced
-    the sentinel.
+    ("<unknown"). Real handles are 36-char session UUIDs or 32-char agent-id
+    hex, so an 8-char prefix is unambiguous whenever one is present. Every
+    renderer that shortens an identity handle for prose goes through here —
+    the guard used to live in :func:`emit_strict_deny` alone, and the two
+    warn-mode renderers sliced the sentinel.
+
+    The argument is named for what it is rather than for what it was: since
+    R7 the hook responses feed this AGENT ids, not session ids. The function
+    name is kept because it is the cross-backend pair of Node's
+    ``shortSessionId`` and renaming it would move bytes in neither runtime's
+    output while touching both.
     """
-    if session_id.startswith("<") and session_id.endswith(">"):
-        return session_id
-    return session_id[:8]
+    if identity_id.startswith("<") and identity_id.endswith(">"):
+        return identity_id
+    return identity_id[:8]
+
+
+def summary_reports_a_write(summary: "StaleSummary") -> bool:
+    """Does this summary support the claim that the artifact was WRITTEN?
+
+    R8. Three admitting cases, one refusing one:
+
+    - ``prior_version_seen_by_session is None`` — the session never observed
+      this artifact, so there is no grant of its own that could have changed
+      hands and no baseline to call unchanged. Whatever is recorded is the
+      only story available.
+    - ``hash_differs`` — the bytes the caller just hashed differ from the
+      coordinator's recorded content. Something was written, in-band or out.
+    - ``current_version > prior_version_seen_by_session`` — a version landed
+      past the one this session last saw. That is a commit.
+
+    Otherwise the version this session observed is still the current one and
+    its bytes still match: nothing was written, and the only thing that moved
+    is the grant (Cohexa-ai/agent-coherence#196). Both branches are pinned by
+    tests, because a predicate asserted only in the admitting direction is
+    indistinguishable from one that always admits — which is what the single
+    template this replaces effectively was.
+    """
+    prior = summary.get("prior_version_seen_by_session")
+    if prior is None:
+        return True
+    if summary["hash_differs"]:
+        return True
+    return summary["current_version"] > prior
 
 
 def emit_strict_deny(
@@ -141,10 +203,22 @@ def emit_strict_deny(
     deny response.
 
     The ``permissionDecisionReason`` is rendered via
-    :data:`STRICT_MODE_DENY_REASON_TEMPLATE` — static, byte-stable across
-    retries per KTD-P. The ``source`` argument is preserved for telemetry
-    (Unit 4 audit-log append) and parameter-list parity with :func:`emit_allow`.
+    :data:`STRICT_MODE_DENY_REASON_TEMPLATE` or, when the summary cannot
+    support a write claim, :data:`GRANT_CHANGE_DENY_REASON_TEMPLATE` (R8).
+    Both are static and byte-stable across retries per KTD-P. The ``source``
+    argument is preserved for telemetry (Unit 4 audit-log append) and
+    parameter-list parity with :func:`emit_allow`.
     """
+    if not summary_reports_a_write(summary):
+        reason = GRANT_CHANGE_DENY_REASON_TEMPLATE.format(
+            path=summary["path"],
+            current_version=summary["current_version"],
+        )
+        return {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
     last_writer_full = summary.get("last_writer_session_id") or "<unknown>"
     last_writer_short = short_session_id(last_writer_full)
     last_writer_ts_iso = datetime.fromtimestamp(
@@ -215,7 +289,17 @@ class StaleSummary(TypedDict):
     """
     path: str
     current_version: int
+    #: The version this session last actually OBSERVED, read from the
+    #: registry's per-agent ``last_observed_version`` rather than inferred as
+    #: ``current_version - 1``. The inference assumed the invalidation came
+    #: from a commit; when a peer merely took the grant, it reported a
+    #: version the session never saw and made an unchanged version look
+    #: changed (Cohexa-ai/agent-coherence#196). ``None`` = never observed.
     prior_version_seen_by_session: int | None
+    #: The writer's AGENT id (``artifacts.last_writer_id``), or the literal
+    #: ``<unknown>`` when nothing has been committed. Named for the session
+    #: id it used to carry; the wire key is kept so hook scripts, the CLI and
+    #: the recorded corpus keep parsing by exact shape.
     last_writer_session_id: str
     last_writer_at_unix_ts: float
     warning_generated_at_unix_ts: float
@@ -355,8 +439,16 @@ def stale_read_warning(summary: StaleSummary) -> str:
     F1 fix: distinguishes "first observation of this artifact" from
     "previously-seen-but-now-invalidated" cases with accurate prose.
 
+    R8: when :func:`summary_reports_a_write` refuses, the artifact was NOT
+    written and the session's grant is simply gone — the warn arm says that
+    instead of naming a writer and a commit tick that describe a different
+    event. ``warning_generated_at_unix_ts`` still renders on both arms, so
+    the per-invocation variation above is unaffected.
+
     Constraint: no content bytes, no content hashes, no diff text.
     """
+    if not summary_reports_a_write(summary):
+        return _grant_change_warning(summary)
     last_writer_short = short_session_id(summary["last_writer_session_id"])
     last_writer_ts = datetime.fromtimestamp(
         summary["last_writer_at_unix_ts"], tz=timezone.utc
@@ -385,10 +477,39 @@ def stale_read_warning(summary: StaleSummary) -> str:
         )
     return (
         f"⚠ Stale read [warning emitted {generated_ts}]: {summary['path']} was "
-        f"updated by session {last_writer_short} at {last_writer_ts}. "
+        f"updated by agent {last_writer_short} at {last_writer_ts}. "
         f"Current version is v{summary['current_version']}; {prior_clause}. "
         f"{divergence} "
         f"Consider re-reading {summary['path']} before acting on stale assumptions."
+    )
+
+
+def _grant_change_warning(summary: StaleSummary) -> str:
+    """The warn-mode counterpart of :data:`GRANT_CHANGE_DENY_REASON_TEMPLATE`.
+
+    Reached only when :func:`summary_reports_a_write` refuses, which is what
+    makes "the version you last saw" exact rather than an inference:
+    ``prior_version_seen_by_session`` equals ``current_version`` there.
+
+    This prose deliberately says NOTHING about content. ``hash_differs`` is
+    False on three different states -- the caller sent no hash, the
+    coordinator holds none, or the two were compared and agreed -- and only
+    the third is a match, so a message asserting the worktree still matches
+    would be stating something never measured.
+
+    The advice differs from the write arm on purpose. Nothing moved under the
+    reader, so re-reading buys it nothing; what it lost is the grant, and the
+    next thing that will fail is a write.
+    """
+    generated_ts = datetime.fromtimestamp(
+        summary["warning_generated_at_unix_ts"], tz=timezone.utc
+    ).isoformat()
+    path = summary["path"]
+    return (
+        f"⚠ Stale read [warning emitted {generated_ts}]: your grant on {path} "
+        f"was revoked and no new version was committed. {path} is still at "
+        f"v{summary['current_version']}, the version you last saw. "
+        f"Re-acquire before writing to {path}."
     )
 
 
@@ -410,7 +531,7 @@ def edit_collision_warning(
     ).isoformat()
     detected_ts = datetime.now(tz=timezone.utc).isoformat()
     return (
-        f"⚠ Concurrent edit detected at {detected_ts} (UTC): another session "
+        f"⚠ Concurrent edit detected at {detected_ts} (UTC): another agent "
         f"({holder_short}) has been editing {path} since {holder_ts}. "
         f"Your edit will land in your own worktree, but only one session's "
         f"commit will be accepted by the coordinator. Consider waiting for the "

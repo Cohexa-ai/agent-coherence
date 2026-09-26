@@ -436,6 +436,43 @@ def test_parity_refetch_after_version_move_records_new_version(registry) -> None
     assert reg.last_observed_version_for(art.id, a) == 2
 
 
+def test_parity_unobserved_grant_preserves_the_prior_value(registry) -> None:
+    """``observed=False`` grants the state but certifies no read: the reader
+    that last saw v1 stays at v1 while holding SHARED on v2. Both directions
+    are pinned -- the default on the very same transition still records v2 --
+    because asserting only the preserve side cannot tell a working flag from
+    a registry that stopped recording altogether."""
+    reg = registry
+    art = _register(reg)
+    a, writer = uuid4(), uuid4()
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=1)
+    res = reg.commit_cas(art.id, writer, expected_version=1, content_hash="h2")
+    assert not isinstance(res, ConflictDetail)  # WIN -> version 2, a INVALID
+    assert reg.get_agent_state(art.id, a) == MESIState.INVALID
+
+    reg.set_agent_state(
+        art.id, a, MESIState.SHARED, trigger="post_stale_bash", tick=2, observed=False,
+    )
+    assert reg.get_agent_state(art.id, a) == MESIState.SHARED
+    assert reg.last_observed_version_for(art.id, a) == 1
+
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="post_stale_bash", tick=3)
+    assert reg.last_observed_version_for(art.id, a) == 2
+
+
+def test_parity_unobserved_grant_on_a_fresh_pair_records_nothing(registry) -> None:
+    """A never-observed pair granted without a read stays never-observed --
+    None, never a 0-sentinel and never the current version."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(
+        art.id, a, MESIState.SHARED, trigger="first_bash_read", tick=1, observed=False,
+    )
+    assert reg.get_agent_state(art.id, a) == MESIState.SHARED
+    assert reg.last_observed_version_for(art.id, a) is None
+
+
 def test_parity_commit_cas_advances_writer_same_transaction(registry) -> None:
     """KTD4 first layer: the WIN that bumps the version also advances the
     committing agent's comparand to the NEW version — atomically (sqlite: the
