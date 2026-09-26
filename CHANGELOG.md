@@ -209,6 +209,20 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A refused `read()` no longer lets the next `write()` overwrite an
+  out-of-band edit.** With `on_stale_read="raise"`, a read of a file someone
+  edited outside the volume raises `StaleView` and returns no bytes. It still
+  recorded the edited bytes as seen, so the edit-detection check before a
+  write passed: a write built from the bytes read before the edit went
+  through and overwrote it. The same happened when a read failed closed on a
+  coordinator timeout under `on_error="strict"`. A refused `read()` no longer
+  replaces what the volume last recorded as seen, so that write raises
+  `StaleView` and the edit stays on disk. A refused first read of a file still
+  records what it found, so a write that follows it is still checked: if a
+  peer's commit reaches disk in between, the write raises `StaleView` instead
+  of overwriting it. `reacquire()` always returns the bytes it reads, so a
+  write rebuilt from them still succeeds.
+
 - **Coordinator requests no longer go through an HTTP proxy.** The coordinator
   client, which the console scripts, the hook client and `CoherentVolume` all
   use, honoured `http_proxy` and `https_proxy` (and, on macOS and Windows, the
