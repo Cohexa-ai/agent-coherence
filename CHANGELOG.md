@@ -8,6 +8,18 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **`GET /status?detail=full` now says who last wrote each tracked
+  artifact (#199 §2).** Every `tracked_artifacts` entry at the operator tier
+  carries `last_writer_agent_id` (the committing agent's UUID, joinable against
+  `sessions[].agent_id` and durable across a coordinator restart) and
+  `last_writer_at_unix_ts`. Both are null until a commit lands. Before
+  this, writer identity was only reachable by tripping a stale read or opening
+  `.coherence/state.db`. The fields come from the existing batched
+  `status_snapshot` query (now selecting `last_writer_id` and `updated_at`),
+  so `/status` stays two SELECTs. The minimal and metrics tiers are unchanged:
+  writer attribution is workspace-state disclosure, and whether any of it
+  belongs at the default tier is left to #198.
+
 - **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
   "May this irreversible effect still fire, and if not, why?" was reachable
   from Python (`gate()`) and from MCP (`swg_gate`); a client that speaks
@@ -239,6 +251,110 @@ Alpha — APIs may change before `v1.0`.
   into an error, an unexpected error or interrupt still propagates as
   itself, and each failure is counted once. `on_error="strict"` is
   unchanged.
+
+- **A read inside a peer's commit→disk window no longer hands out a comparand
+  that loses that peer's update.** A peer's `write_cas_at` confirms its CAS at
+  the coordinator and only then writes its bytes to disk. A read landing between
+  the two sees the old bytes while the coordinator already reports the new
+  version; strict mode denies that read with `hash_differs`, but
+  `read_with_version()` and `read_with_version_generation()` returned the pair
+  anyway, and so did `swg_read`. A caller that derived from those bytes and
+  passed that version to `write_cas_at` / `swg_write_cas` won the CAS once the
+  peer's disk write landed (the CAS compares versions, and by then the version
+  matched), overwriting the peer's update. Those reads now raise `StaleView`
+  (`swg_read`: `reason=stale_view`, `recover=reacquire`, no `version` returned)
+  when the coordinator both denied the read and reported that the bytes are not
+  its content at that version; re-reading once the peer's write has landed
+  returns a sound pair. A denied read whose bytes do match — the sticky-INVALID
+  read after a peer's commit — is returned as before, and the effect fence's
+  verification read (`observe=False`) still reports rather than raises.
+
+  A refused read returns no bytes, so it also leaves the foreign-edit baseline
+  where it was: a `write()` / `swg_write` built from an earlier read is still
+  denied after an out-of-band edit, instead of landing over it. A file's first
+  read still records what it found, even when refused, so a write that follows
+  it is still checked. `write_cas_at` / `swg_write_cas` discards the bytes its
+  own read returns, so a CAS that loses no longer counts the peer's bytes as
+  seen: after reading a file and then losing a CAS on it, a `write()` /
+  `swg_write` of the older content is denied instead of overwriting the peer's
+  commit, including while that commit is still reaching disk. On a file the
+  volume never read, that read still records what it found, even when the CAS
+  loses or the read fails, so an edit made outside the coordinator afterwards
+  is still caught. A refusal
+  caused by a peer's commit still reaching disk clears on its own, so retry
+  `reacquire()` and the read for a few seconds first. When the refusal outlasts
+  that (an out-of-band edit, or a commit whose disk write failed), the
+  coordinator has never recorded the bytes on disk and re-reading will not clear
+  it: `write()` the bytes `reacquire()` returned, or a merge of them, to record
+  them. A write made sooner can be overwritten by the peer's commit when it
+  lands. The deny text and the `swg_read` description now say so.
+  `WorkspaceVersioner` handles the refusal from a `CoherentVolume` file member:
+  a checkpoint records that member as an unconfirmed pointer (`forward_only`,
+  flagged `dirty_during_window`) instead of raising, and a restore leg re-drives
+  and then concludes `conflict` without writing, so the restore still finishes.
+
+- **A refused `read()` no longer lets the next `write()` overwrite an
+  out-of-band edit.** With `on_stale_read="raise"`, a read of a file someone
+  edited outside the volume raises `StaleView` and returns no bytes. It still
+  recorded the edited bytes as seen, so the edit-detection check before a
+  write passed: a write built from the bytes read before the edit went
+  through and overwrote it. The same happened when a read failed closed on a
+  coordinator timeout under `on_error="strict"`. A refused `read()` no longer
+  replaces what the volume last recorded as seen, so that write raises
+  `StaleView` and the edit stays on disk. A refused first read of a file still
+  records what it found, so a write that follows it is still checked: if a
+  peer's commit reaches disk in between, the write raises `StaleView` instead
+  of overwriting it. `reacquire()` always returns the bytes it reads, so a
+  write rebuilt from them still succeeds.
+
+- **Coordinator requests no longer go through an HTTP proxy.** The coordinator
+  client, which the console scripts, the hook client and `CoherentVolume` all
+  use, honoured `http_proxy` and `https_proxy` (and, on macOS and Windows, the
+  system proxy settings when those are unset). With `no_proxy` unset that
+  included loopback. On a machine with a proxy configured, which is common on
+  corporate networks, every request went to the proxy instead of the
+  coordinator, carrying the coordinator's bearer token in plaintext in its
+  `Authorization` header, and the coordinator received nothing. The client now
+  ignores proxy settings for every coordinator endpoint. Loopback never needs a
+  proxy. A remote endpoint is the one host you configured and secured the link
+  to: `CCS_REMOTE_INSECURE` acknowledges that link and `CCS_REMOTE_TLS` verifies
+  that host, and neither covers a proxy in between. Over verified https a proxy
+  could not read the token, since the tunnel is TLS end to end, but the
+  connection still went through a host you never configured for it. A remote
+  coordinator that was reachable only through a proxy is now connected to
+  directly, so such a setup needs a direct route (a tunnel or VPN). If a proxy
+  was configured on a machine that ran an earlier version, treat that
+  workspace's bearer as exposed and replace it: stop the coordinator (it exits
+  on `SIGTERM`; its process id is the first line of `.coherence/server.pid`),
+  delete `.coherence/hook.secret` so the next start mints a new one, and restart
+  any long-running process that uses `CoherentVolume`, which keeps the bearer it
+  read when it attached. Hook calls and the console scripts read the file on
+  every call. For a remote coordinator, do this on its host, then replace the
+  copy that `CCS_REMOTE_SECRET_FILE` points to on every client.
+
+- **Coordinator requests no longer reload the system CA store on every call.**
+  The client built a fresh `urllib` opener for every request, and the stdlib's
+  `build_opener()` always adds a default HTTPS handler. On Python 3.12 and
+  later, that handler's constructor creates an SSL context and loads every
+  certificate in the system trust store, even for plain `http://` to loopback:
+  13 ms or more of CPU per request, twice per `CoherentVolume.write_cas`, and at
+  least once for every CLI or hook call. Plain-http requests now share one
+  opener, built on first use with no HTTPS handler and safe to use from many
+  threads. Measured over loopback on Python 3.13, a request's median latency
+  drops from about 16–22 ms to under 1 ms, and the first request of a fresh
+  process from about 33 ms to about 10 ms. Python 3.11 creates that context
+  lazily, so it gains less (about 1.2 ms to 0.6–0.7 ms).
+  `https://` without `CCS_REMOTE_CA_FILE` paid the same kind of cost on every
+  Python version: it built its verified context, and so reloaded the system
+  trust store, for each request. That context is now built once per process
+  and shared. Measured against a 192-certificate system store on Python 3.11
+  and 3.13, a request's median drops from about 20–22 ms to about 3.5 ms.
+  Certificate verification is unchanged, every 3xx is still refused (308
+  included), and with `CCS_REMOTE_CA_FILE` set the context is still built on
+  every request, so that bundle is still checked and re-read each time. The
+  system trust store (including `SSL_CERT_FILE`) is now read once, when the
+  shared opener is built, instead of on every request, so a certificate removed
+  from it stays trusted until the process restarts.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was

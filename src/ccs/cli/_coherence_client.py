@@ -23,6 +23,7 @@ import logging
 import os
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -592,27 +593,105 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    """A private opener whose redirect handler refuses every 3xx.
+    """A private opener that goes straight to the endpoint and refuses every 3xx.
 
-    ``build_opener`` with our ``_NoRedirectHandler`` REPLACES the default
-    ``HTTPRedirectHandler`` (``build_opener`` de-dupes by handler class). For
-    https, the ``HTTPSHandler(context=...)`` carries the verified-TLS context.
+    Assembled by hand, not with ``urllib.request.build_opener``: that adds a
+    default ``HTTPSHandler`` to every opener, and on Python 3.12+ its constructor
+    builds a default SSL context, loading the whole system CA store (~13 ms of
+    CPU) even for plain ``http://`` to loopback. The handlers below are the
+    ``build_opener`` defaults an http(s) request reaches, with
+    ``_NoRedirectHandler`` in place of ``HTTPRedirectHandler``.
+    ``HTTPErrorProcessor`` is what routes a 3xx to that handler, so it must stay.
+    The ftp/file/data handlers are left out: every URL here is ``base_url + path``
+    and no redirect is followed.
+
+    There is deliberately no ``ProxyHandler``: no coordinator request goes
+    through a proxy, loopback or remote. The default one reads ``http_proxy``
+    and ``https_proxy`` (on macOS and Windows, the system settings when those are
+    unset) and, with ``no_proxy`` unset, proxies loopback too, sending the bearer
+    to the proxy. A remote endpoint is the one host the operator configured and
+    secured the link to; a proxy is a hop that neither ``CCS_REMOTE_INSECURE``
+    nor https verification covers.
+
+    An ``HTTPSHandler`` is added only for ``context``, the verified-TLS context
+    from :func:`build_tls_context`. Without one there is no https handler at all,
+    so an https request cannot fall back to a default context: it fails as an
+    unknown URL type.
     """
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+    handlers: list[urllib.request.BaseHandler] = [
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        _NoRedirectHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ]
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers)
+    opener = urllib.request.OpenerDirector()
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
+_SHARED_OPENERS_LOCK = threading.Lock()
+#: Keyed by ``system_tls`` (see :func:`_get_shared_opener`).
+_shared_openers: dict[bool, urllib.request.OpenerDirector] = {}
+
+
+def _reset_shared_openers_lock_in_child() -> None:
+    # A fork while another thread is building an opener copies this lock held,
+    # and no thread in the child will ever release it: the child's first request
+    # would block forever. Openers are stored only once fully built, so the child
+    # keeps them and builds any that were still in flight.
+    global _SHARED_OPENERS_LOCK
+    _SHARED_OPENERS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_shared_openers_lock_in_child)
+
+
+def _get_shared_opener(*, system_tls: bool) -> urllib.request.OpenerDirector:
+    """A process-wide opener, built on first use: plain http, or with
+    ``system_tls`` https verified against the system trust store.
+
+    Shared across threads: each of its handlers keeps no per-request state
+    (``HTTPHandler`` opens a fresh connection per request, the rest only read or
+    annotate the request), which is also why the stdlib's ``urlopen`` shares one
+    module-level opener. Never add a stateful handler such as a cookie processor
+    here, because every endpoint and thread in the process would share its state.
+
+    The system-trust context is shared too (an OpenSSL client context caches no
+    TLS sessions, so none carries over between connections), so the trust store
+    is not parsed again on every request. It is loaded when this opener is
+    built. Until the process restarts, a certificate later removed from the
+    system bundle (or from ``SSL_CERT_FILE``) stays trusted, and a bundle that
+    was missing at that moment stays missing.
+    """
+    opener = _shared_openers.get(system_tls)
+    if opener is None:
+        with _SHARED_OPENERS_LOCK:
+            opener = _shared_openers.get(system_tls)
+            if opener is None:
+                context = build_tls_context() if system_tls else None
+                opener = _shared_openers[system_tls] = _build_opener(context)
+    return opener
 
 
 def _execute(req: urllib.request.Request) -> dict[str, Any]:
-    context: ssl.SSLContext | None = None
     if req.type == "https":
         # build_tls_context may raise TlsConfigError (typed, fail-closed) — that
         # is a config bug, not a transient network failure, so it propagates.
         ca_file = getattr(req, "_ccs_ca_file", None)
-        context = build_tls_context(ca_file)
-
-    opener = _build_opener(context)
+        if ca_file:
+            # Built per request, never shared: build_tls_context re-validates
+            # and re-reads the CA bundle each time, so a swapped, loosened or
+            # rotated trust anchor is caught by the very next request.
+            opener = _build_opener(build_tls_context(ca_file))
+        else:
+            opener = _get_shared_opener(system_tls=True)
+    else:
+        opener = _get_shared_opener(system_tls=False)
     try:
         with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
             raw = resp.read()
