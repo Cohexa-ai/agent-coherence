@@ -211,20 +211,28 @@ Alpha — APIs may change before `v1.0`.
 
 - **Coordinator requests no longer go through an HTTP proxy.** The coordinator
   client, which the console scripts, the hook client and `CoherentVolume` all
-  use, honoured `http_proxy` and `https_proxy` (and, on macOS, the system proxy
-  settings when those are unset). With `no_proxy` unset that included loopback.
-  On a machine with a proxy configured, which is common on corporate networks,
-  every request went to the proxy instead of the coordinator, carrying the
-  coordinator's bearer token in plaintext in its `Authorization` header, and the
-  coordinator received nothing. The client now ignores proxy settings for every
-  coordinator endpoint. Loopback never needs a proxy. A remote endpoint is the
-  one host you configured and secured the link to: `CCS_REMOTE_INSECURE`
-  acknowledges that link and `CCS_REMOTE_TLS` verifies that host, and neither
-  covers a proxy in between. Over verified https a proxy could not read the
-  token, since the tunnel is TLS end to end, but the connection still went
-  through a host you never configured for it. A remote coordinator that was
-  reachable only through a proxy is now connected to directly, so such a setup
-  needs a direct route (a tunnel or VPN).
+  use, honoured `http_proxy` and `https_proxy` (and, on macOS and Windows, the
+  system proxy settings when those are unset). With `no_proxy` unset that
+  included loopback. On a machine with a proxy configured, which is common on
+  corporate networks, every request went to the proxy instead of the
+  coordinator, carrying the coordinator's bearer token in plaintext in its
+  `Authorization` header, and the coordinator received nothing. The client now
+  ignores proxy settings for every coordinator endpoint. Loopback never needs a
+  proxy. A remote endpoint is the one host you configured and secured the link
+  to: `CCS_REMOTE_INSECURE` acknowledges that link and `CCS_REMOTE_TLS` verifies
+  that host, and neither covers a proxy in between. Over verified https a proxy
+  could not read the token, since the tunnel is TLS end to end, but the
+  connection still went through a host you never configured for it. A remote
+  coordinator that was reachable only through a proxy is now connected to
+  directly, so such a setup needs a direct route (a tunnel or VPN). If a proxy
+  was configured on a machine that ran an earlier version, treat that
+  workspace's bearer as exposed and replace it: stop the coordinator (it exits
+  on `SIGTERM`; its process id is the first line of `.coherence/server.pid`),
+  delete `.coherence/hook.secret` so the next start mints a new one, and restart
+  any long-running process that uses `CoherentVolume`, which keeps the bearer it
+  read when it attached. Hook calls and the console scripts read the file on
+  every call. For a remote coordinator, do this on its host, then replace the
+  copy that `CCS_REMOTE_SECRET_FILE` points to on every client.
 
 - **Coordinator requests no longer reload the system CA store on every call.**
   The client built a fresh `urllib` opener for every request, and the stdlib's
@@ -248,10 +256,7 @@ Alpha — APIs may change before `v1.0`.
   every request, so that bundle is still checked and re-read each time. The
   system trust store (including `SSL_CERT_FILE`) is now read once, when the
   shared opener is built, instead of on every request, so a certificate removed
-  from it stays trusted until the process restarts. The rebuilt openers also go
-  straight to the coordinator and ignore proxy settings (`http_proxy`,
-  `https_proxy`, and on macOS and Windows the system proxy), for loopback and
-  remote endpoints alike.
+  from it stays trusted until the process restarts.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
