@@ -1041,3 +1041,167 @@ def test_a_definite_principal_refusal_is_typed_on_both_legs_never_commit_unconfi
                 assert secret and secret not in str(refusal)
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a principal refusal of the bump, after the substrate write landed ---------
+
+
+def test_a_bump_refused_for_its_principal_after_the_substrate_write_is_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The substrate CAS lands; then the coordinator refuses the bump for its
+    caller principal and recovery cannot cure it (the session is bound under
+    a nonce this client no longer holds). The refusal itself is definite —
+    the coordinator recorded NOTHING of this write — but the commit is not:
+    the substrate holds the new bytes while the coordinator is behind them,
+    the very state an unconfirmed bump leaves. So it goes through the bump
+    leg's existing handling and surfaces as ``CommitUnconfirmed`` (re-read;
+    retry only if absent; never re-drive), whose message says the substrate
+    write landed and the coordinator recorded nothing, with the typed refusal
+    as its cause.
+
+    Raised bare, the refusal would invite its own recovery — a refused request
+    changed nothing, so resend it once the principal is right — and that
+    re-drives a commit whose substrate write already landed: the last arm
+    shows the resend reporting this writer's own write as a conflict."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        bound, nonce = sa._principal, sa._mint_nonce
+        # No principal, and a nonce the session was not bound with: the read
+        # leg (accept class) is admitted, the bump (require class) is refused
+        # as absent, and claiming again with this nonce is refused as claimed.
+        sa._principal, sa._mint_nonce = None, "Z" * 43
+
+        with pytest.raises(CommitUnconfirmed) as raised:
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert not isinstance(raised.value, CallerPrincipalRefused)
+        cause = raised.value.__cause__
+        assert isinstance(cause, CallerPrincipalRefused)
+        assert cause.reason == "caller_principal_absent"
+        message = str(raised.value)
+        assert "caller_principal_absent" in message
+        assert "landed" in message and "recorded nothing" in message
+        for secret in (bound, nonce, "Z" * 43):
+            assert secret and secret not in message
+        assert store.get(REF)[0] == b"v2", "the substrate write is durable"
+        assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+        observer = _session(tmp_path, fast_cfg)
+        assert observer.pre_read(REF, None).version == 1, "the coordinator recorded nothing"
+
+        sa._principal, sa._mint_nonce = bound, nonce
+        with pytest.raises(CasVersionConflict):
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_reacquire_adopts_the_nonce_its_claim_presented_with_the_session_id(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful reacquire adopts the new session id, its principal AND the
+    nonce its claim presented — together. The nonce is what recovery claims
+    again with: one kept from the previous session would be presented for a
+    session it never bound, refused as ``caller_principal_claimed``, and the
+    session would stay refused for good once its store was reset. Here the
+    principal is made stale after the reacquire (as a reset leaves it) and the
+    next request recovers with the reacquire's nonce and lands."""
+    claims: list[tuple[str, str]] = []
+    real = substrate_module.claim_caller_principal
+
+    def spy(endpoint, session_id, nonce):  # noqa: ANN001, ANN202
+        claims.append((session_id, nonce))
+        return real(endpoint, session_id, nonce)
+
+    monkeypatch.setattr(substrate_module, "claim_caller_principal", spy)
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        _first_session, first_nonce = claims[0]
+        a.reacquire(REF)
+        new_session, new_nonce = claims[1]
+        assert new_nonce != first_nonce
+        assert (sa.session_id, sa._mint_nonce) == (new_session, new_nonce)
+
+        sa._principal = "X" * 43
+        _bytes, tok = a.read(REF)
+        result = a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert result.version == 2 and store.get(REF)[0] == b"v2"
+        assert claims[2:] == [(new_session, new_nonce)]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("scenario", ["the_claim_echoes", "the_retry_echoes"])
+def test_no_coordinator_supplied_text_reaches_what_the_session_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """A coordinator that echoes the nonce and principal it was sent in every
+    free-text field — a claim's ``reason``/``detail``/``error``, a refusal's
+    ``error``/``detail``, the status line's reason phrase — cannot get either
+    into what the session raises on its claim and recovery paths: only a
+    reason from the frozen vocabulary is repeated (anything else reads
+    ``unrecognised``), and a failed request is reported by its status code."""
+    import io
+    import json
+    import urllib.error
+
+    from ccs.cli import _coherence_client
+
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        adopted = "Q" * 43
+        held = (sa._principal, sa._mint_nonce, adopted)
+        echo = " ".join(held)  # type: ignore[arg-type]
+        real_claim_post = _coherence_client.post
+
+        def claim_echoes(endpoint, path, body, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path != "/principal/claim":
+                return real_claim_post(endpoint, path, body, **kwargs)
+            if scenario == "the_retry_echoes":
+                return {"ok": True, "principal": adopted}
+            return {"ok": False, "reason": echo, "detail": echo, "error": echo}
+
+        monkeypatch.setattr(_coherence_client, "post", claim_echoes)
+
+        def error(status: int, body: dict) -> urllib.error.HTTPError:
+            raw = io.BytesIO(json.dumps(body).encode())
+            return urllib.error.HTTPError("/hooks/pre-read", status, echo, {}, raw)  # type: ignore[arg-type]
+
+        answers = [
+            error(400, {"error": echo, "detail": echo, "reason": "caller_principal_foreign"}),
+            error(500, {"error": echo, "detail": echo}),
+        ]
+        real_post = substrate_module._coordinator_post
+
+        def answering(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path == "/hooks/pre-read":
+                raise answers.pop(0)
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", answering)
+
+        reported: list[str] = []
+        with pytest.raises(CoherenceError) as raised:
+            sa.pre_read(REF, None)
+        reported.append(f"{type(raised.value).__name__}: {raised.value}")
+        if scenario == "the_claim_echoes":
+            with pytest.raises(CoherenceError) as raised_again:
+                sa.reacquire()
+            reported.append(f"{type(raised_again.value).__name__}: {raised_again.value}")
+            assert all("unrecognised" in r for r in reported), reported
+        else:
+            assert "HTTP 500" in reported[0], reported
+        for secret in held:
+            assert secret and secret not in " ".join(reported)
+    finally:
+        stop_coordinator(tmp_path)

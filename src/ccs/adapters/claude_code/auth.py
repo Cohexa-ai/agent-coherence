@@ -375,9 +375,20 @@ _NONCE_REMEDIATION = (
     "The session runs without a principal until it is fixed: remove {path} by "
     "hand if no hook of this session is running."
 )
-"""The operator step a :class:`MintNonceUnavailable` names, as the
-``hook.secret`` error does: the file is never repaired automatically, and the
-Node client prints the same guidance (parity)."""
+"""The operator step a :class:`MintNonceUnavailable` for an ABANDONED write
+names, as the ``hook.secret`` error does: the file is never repaired
+automatically, and the Node client prints the same guidance (parity)."""
+
+_NONCE_STILL_BEING_WRITTEN = (
+    "This invocation proceeds without a principal; a later one adopts the nonce "
+    "if that write lands, or reports {path} as an interrupted write once it has "
+    "stayed incomplete for {grace:g} s."
+)
+"""What a :class:`MintNonceUnavailable` for a YOUNG file says instead: its writer
+may still be alive and finish, so it names no remedy and does not say the
+session runs without a principal until someone acts. Once the file is older
+than :data:`TORN_FILE_GRACE_SEC` the next invocation reports it as abandoned,
+with :data:`_NONCE_REMEDIATION`."""
 
 
 class MintNonceUnavailable(RuntimeError):
@@ -456,9 +467,9 @@ def ensure_mint_nonce(coordinator_root: Path, identity_key: str) -> str:
         if attempt + 1 < ENSURE_SECRET_MAX_RETRIES:
             time.sleep(ENSURE_SECRET_RETRY_SLEEP_SEC)
     raise MintNonceUnavailable(
-        f"{path} exists but stayed unreadable across "
+        f"{path} exists but its write was still in progress across "
         f"{ENSURE_SECRET_MAX_RETRIES} attempts; not overwriting it. "
-        f"{_NONCE_REMEDIATION.format(path=path)}"
+        f"{_NONCE_STILL_BEING_WRITTEN.format(path=path, grace=TORN_FILE_GRACE_SEC)}"
     )
 
 

@@ -672,9 +672,11 @@ class CoherentVolume:
             )
 
     def _refuse_principal(self, reason: str, message: str) -> None:
-        """A caller-principal refusal through ``on_error``: strict raises the
+        """A CLAIM that did not bind, through ``on_error``: strict raises the
         typed :class:`~ccs.core.exceptions.CallerPrincipalRefused` carrying
-        ``reason``; degrade warns once and counts, like every other failure.
+        ``reason``; degrade warns once and counts, and the volume goes on
+        without a principal — the routes that admit none still serve it, and a
+        request one of them refuses raises from :meth:`_post` in both modes.
         ``message`` never carries a principal or a nonce."""
         if self._on_error == "strict":
             raise CallerPrincipalRefused(reason, message)
@@ -914,8 +916,15 @@ class CoherentVolume:
         # incarnation may still hold a grant from an earlier write() on another path.
         recorded_before = self._incarnation in self._grant_incarnations
         self._grant_incarnations.add(self._incarnation)
-        # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
-        resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+        # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID. A
+        # principal refusal proves no grant was taken too — the coordinator
+        # refuses before any mutation — so it withdraws the record like a deny.
+        try:
+            resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+        except CallerPrincipalRefused:
+            if not recorded_before:
+                self._grant_incarnations.discard(self._incarnation)
+            raise
         if isinstance(resp, dict) and resp.get("ok") is False and not recorded_before:
             self._grant_incarnations.discard(self._incarnation)
         if resp is not None:
@@ -1910,8 +1919,12 @@ class CoherentVolume:
         a principal that differs from the one presented is adopted and the
         request retried exactly ONCE — safe, because a refused request mutated
         nothing. A 404 on that claim retries once without the header. A refusal
-        the claim cannot cure routes through ``on_error`` as the typed
-        :class:`~ccs.core.exceptions.CallerPrincipalRefused`."""
+        the claim cannot cure raises the typed
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` in BOTH ``on_error``
+        modes: it is the coordinator's definite answer, not an infrastructure
+        failure, so degrade mode does not soften it into a ``None`` that the
+        caller would read as an unanswered request (a degraded read, a
+        ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
         payload = {"agent_id": self._incarnation, **payload}
         self._settle_unconfirmed_claim()
         sent = self._send(endpoint_path, payload)
@@ -1925,8 +1938,7 @@ class CoherentVolume:
             if sent.principal_refusal is None:
                 return sent.body
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
-        self._refuse_principal(reason, principal_refusal_message(reason, detail))
-        return None  # reached only in degrade mode
+        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, detail))
 
     def _recover_principal(self) -> PrincipalRecovery:
         """Claim again with the session's SAME nonce after a principal refusal
@@ -1971,8 +1983,10 @@ class CoherentVolume:
             reason = principal_refusal_reason(exc)
             if reason is not None:
                 return _Sent(None, reason)
+            # The status code only: the reason phrase and the body are the
+            # coordinator's text, which this client never repeats.
             self._fail_closed_or_degrade(
-                f"coordinator request to {endpoint_path} failed: {exc}"
+                f"coordinator request to {endpoint_path} failed: HTTP {exc.code}"
             )
             return _Sent(None, None)  # reached only in degrade mode
         except CoordinatorUnavailable as exc:

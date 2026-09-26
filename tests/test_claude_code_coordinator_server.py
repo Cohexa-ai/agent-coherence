@@ -3336,7 +3336,7 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     result.get('ok') don't see None. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3358,7 +3358,7 @@ def test_ac05_post_edit_degraded_response_returns_ok_shape(
     include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3383,7 +3383,7 @@ def test_ac05_session_stop_degraded_response_returns_ok_shape(
     must include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3403,7 +3403,7 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     don't see ok=None. AC-05 contract preservation."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3427,7 +3427,7 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
     timeout cannot masquerade as a confirmed fresh read."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3460,11 +3460,14 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
 # needs to be short enough to keep the tests fast.
 #
 # Every session below CLAIMS and presents its caller principal. pre-edit is
-# require-class, and its gate runs on the handler thread BEFORE the watchdog
-# starts: a presented principal resolves from the service's in-process cache,
-# but an absent one on an unclaimed session is looked up in the durable store
-# under the very registry lock these tests hold — the gate, not the work body,
-# would block, and the watchdog these tests measure would never start.
+# require-class, and its gate runs BEFORE the work body: a presented principal
+# resolves from the service's in-process cache on the handler thread, but an
+# absent one on a never-claimed session is first looked up in the durable store
+# under the very registry lock these tests hold. That lookup is bounded by the
+# same watchdog deadline, so it would time out in the GATE and answer degraded
+# before the work body ever ran -- and these tests measure the work body. The
+# gate's own timeout is pinned in the caller-principal section below ("the gate
+# under registry contention").
 _DEGRADE_DEADLINE_SEC = 0.25
 _ABANDONED_BODY_SETTLE_SEC = 5.0
 
@@ -8185,6 +8188,382 @@ def test_posture_table_classifies_every_session_id_route_with_no_residual() -> N
         assert entry.harm.strip(), f"{route} states no harm for its class"
 
 
+# --- the gate under registry contention: bounded by the handler watchdog ------
+#
+# A require-class gate asks whether the named session is BOUND; for a session
+# nobody claimed (an older client's, admitted as before -- KTD15) the first
+# answer lives in the durable store, behind the registry lock. These tests hold
+# that lock the way the pre-edit degraded tests above do (_HeldRegistryLock)
+# and drive the REAL watchdog with a shortened HANDLER_TIMEOUT_SEC.
+
+#: How long a test waits for an answer while the registry lock is held -- eight
+#: times the shortened deadline, so only a request that is NOT bounded by the
+#: watchdog misses it.
+_GATE_ANSWER_BOUND_SEC = 2.0
+#: A value in principal shape that no coordinator minted.
+_NEVER_MINTED_PRINCIPAL = "B" * 43
+
+
+class _Background:
+    """One request sent from a helper thread, so a test can bound its own wait
+    for the answer and still release the lock the request is blocked on."""
+
+    def __init__(self, client: _Client, path: str, body: dict, principal: str | None = None):
+        self._done = threading.Event()
+        self._response: tuple[int, dict] | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._send, args=(client, path, body, principal), daemon=True)
+        self._thread.start()
+
+    def _send(self, client: _Client, path: str, body: dict, principal: str | None) -> None:
+        try:
+            self._response = client.post(path, body, principal=principal)
+        except BaseException as exc:  # re-raised on the test thread by result()
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def answered_within(self, seconds: float) -> bool:
+        return self._done.wait(seconds)
+
+    def result(self) -> tuple[int, dict]:
+        if not self._done.wait(10.0):
+            pytest.fail("the request never answered, even with the registry lock released")
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+def _count_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every durable-store read of a caller-principal binding: one entry
+    per ``registry.get_caller_principal`` call, naming the thread that made it."""
+    reads: list[str] = []
+    real = coordinator.registry.get_caller_principal
+
+    def recording(identity):
+        reads.append(threading.current_thread().name)
+        return real(identity)
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", recording)
+    return reads
+
+
+def test_a_never_claimed_pre_edit_answers_degraded_in_time_while_its_gate_cannot_read(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-edit from a session nobody claimed answers pre-edit's degraded
+    envelope within the handler watchdog while the registry lock is held, and
+    changes nothing.
+
+    Prevents the regression making pre-edit require-class introduced: its gate
+    asked the durable store whether the session was bound on the request
+    thread, under the registry lock and BEFORE the watchdog started, so a
+    client that never claims -- which must keep working (KTD15) -- waited on
+    registry contention with no deadline, past the hook's own budget, where it
+    used to get the degraded answer. The gate cannot decide in time here, and
+    it answers exactly what a timed-out work body answers: not a refusal
+    (nothing was refused) and not an admission (nothing was checked)."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    principal_counts_before = _principal_counts(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+    response = answer.result()
+
+    assert answered, (
+        f"a pre-edit from a never-claimed session got no answer for {waited:.2f}s while "
+        f"the registry lock was held: its caller-principal gate is not bounded by the "
+        f"{_DEGRADE_DEADLINE_SEC}s handler watchdog")
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert _principal_counts(coordinator) == principal_counts_before, (
+        "an undecided gate neither admitted nor refused the request")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran: it seeded the artifact")
+    assert session_to_agent_id(sid) not in dict(coordinator.agent_names_snapshot()), (
+        "the handler registered the session past an undecided gate")
+
+
+def test_the_gate_degraded_table_covers_every_route_whose_gate_reads_the_registry() -> None:
+    """Every route but the mint can reach the store lookup (require-class
+    always, accept-class when a principal is presented), so each needs an
+    answer for a gate that times out. The table has no default: a route missing
+    from it would answer a 500 under exactly the contention the watchdog exists
+    for, so the key set is pinned against the FROZEN posture table here."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_GATE_DEGRADED_RESPONSE
+
+    assert set(_CALLER_GATE_DEGRADED_RESPONSE) == {
+        route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+    }
+
+
+def test_the_gate_store_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, a request whose gate
+    would have to read the store answers the queue-overflow 503 at once, as a
+    work body does (A7), and reads nothing.
+
+    Prevents the gate's lookup becoming a way around the queue-depth gate:
+    queued behind an overloaded pool it would sit until the deadline and answer
+    degraded, where the route answers 503 immediately today."""
+    from unittest.mock import patch
+
+    class _OverflowingQueue:
+        @staticmethod
+        def qsize() -> int:
+            return 100  # well above the limit
+
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingQueue()):
+        response = client.post(
+            "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert reads == [], f"the gate read the store past a full queue: {reads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+_GATED_ROUTES = sorted(
+    route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+)
+
+
+def _degrade_body(route: tuple[str, str], sid: str) -> dict:
+    """:func:`_posture_body`, with a TRACKED path wherever the posture body's
+    untracked one would let the handler answer before its work body runs."""
+    body = _posture_body(route, sid)
+    if body.get("path") == "posture.md":
+        body["path"] = "plan.md"
+    if body.get("command") == "cat posture.md":
+        body["command"] = "cat plan.md"
+    return body
+
+
+@pytest.mark.parametrize("route", _GATED_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
+    route: tuple[str, str], coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every route whose gate can read the registry, a gate that cannot
+    decide within the watchdog answers byte-for-byte what the same route
+    answers when its WORK BODY times out, and counts one watchdog timeout.
+
+    Prevents two things. A route whose gate waits on registry contention with
+    no deadline: the lookup runs for an identity the cache does not know -- a
+    never-claimed session presenting no principal on a require-class route, or
+    presenting one on an accept-class route. And a gate that times out
+    answering something else than the route's own degraded answer (a
+    refusal, an admission, another route's envelope): hook clients and the
+    library branch on that answer's shape. The second half is the control:
+    it times the work body out instead (``run_with_watchdog`` raising, as the
+    AC-05 tests do) for a claimed session the gate decides from the cache."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _, path = route
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    never_claimed = str(uuid.uuid4())
+    presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, path, _degrade_body(route, never_claimed), presented)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    gate_timed_out = answer.result()
+    assert answered, f"{path}: no answer while the registry lock was held"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
+    # pre-grep answers "fresh" before its work body when the store knows no
+    # tracked artifact under the search root.
+    coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
+
+    def work_times_out(fn, abort=None, deadline=None):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", work_times_out)
+    work_timed_out = client.post(path, _degrade_body(route, claimed), principal=principal)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 2, (
+        f"{path}: the control never reached its work body, so it compares nothing")
+    assert gate_timed_out == work_timed_out, (
+        f"{path}: a timed-out gate answered {gate_timed_out!r}, "
+        f"a timed-out work body {work_timed_out!r}")
+
+
+def test_a_never_claimed_session_is_answered_without_touching_the_registry(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the durable store has said a session is unbound, the service keeps
+    that answer: later requests naming the session read no registry at all in
+    the gate, so registry contention neither slows nor degrades an answer the
+    route itself gives without the registry -- here the untracked fast path,
+    registry-free by design (R8).
+
+    Prevents every request of a client that never claims (KTD15) paying a
+    store read in the gate: bounded by the watchdog, that read still turns the
+    fast path's own answer into a degraded one whenever the lock is busy."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    untracked = {"session_id": sid, "path": "notes/untracked.txt"}
+    assert client.post("/hooks/pre-edit", untracked) == (200, {"ok": True})
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-edit", untracked)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    assert answered, "the second request waited on the registry lock"
+    assert answer.result() == (200, {"ok": True}), (
+        "the untracked fast path's own answer, not a degraded one")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+    for body in (untracked, {**untracked, "success": False}):
+        route = "/hooks/pre-edit" if "success" not in body else "/hooks/post-edit"
+        assert client.post(route, body) == (200, {"ok": True})
+    assert reads == [], f"the gate read the store for a session it already knew: {reads}"
+
+
+def test_a_claim_replaces_the_cached_unbound_answer_for_its_session(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cached UNBOUND answer lasts only until the session is claimed: from
+    the first request after the claim, the same request without the principal
+    is refused as absent, and the principal is admitted.
+
+    Prevents the negative cache outliving the bind. The session's own client
+    claims it -- through this coordinator, the only writer of bindings -- and a
+    stale UNBOUND answer would keep admitting absent-principal requests naming
+    it as an older client's, the #188 case the require class exists to refuse,
+    while refusing the claimed client's own principal as foreign. The first
+    half proves the answer really was cached (a second absent request reads no
+    store), so the second half tests the replacement of a real cache entry."""
+    sid = str(uuid.uuid4())
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    for _ in range(2):
+        status, body = client.post("/hooks/session-stop", {"session_id": sid})
+        assert status == 200 and body["ok"] is True, body
+    assert len(reads) == 1, f"the UNBOUND answer was not cached: {len(reads)} store reads"
+
+    principal = _explicit_claim(client, sid)
+    assert client.post("/hooks/session-stop", {"session_id": sid}) == (
+        400, _PRINCIPAL_ABSENT_REFUSAL)
+    status, body = client.post("/hooks/session-stop", {"session_id": sid}, principal=principal)
+    assert status == 200 and body["ok"] is True, body
+
+
+def test_a_refusal_the_store_lookup_decides_is_still_a_400_that_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """After a restart the service's cache is empty, so a request naming a
+    session claimed before it is decided by the store lookup -- which runs in
+    the watchdog pool, off the request thread. A refusal decided there is the
+    same HTTP 400 with its typed reason, never a hold and never degraded; the
+    refused pre-edit seeds nothing, registers nothing and times nothing out;
+    and the session's principal is then admitted.
+
+    Prevents the bounded lookup changing what it decides: a refusal turned
+    into the degraded envelope would ADMIT the edit (pre-edit degrades to
+    ``ok: true``) for the claimed session whose principal is absent -- the
+    #188 case again -- and a lookup made back on the request thread would
+    reopen the unbounded wait."""
+    sid = str(uuid.uuid4())
+    before = _restart_on(tmp_path, "gate-before-restart")
+    try:
+        secret = load_secret(before.coordinator_root)
+        assert secret is not None
+        principal = _explicit_claim(_Client("127.0.0.1", before.port, secret), sid)
+    finally:
+        before.shutdown()
+
+    after = _restart_on(tmp_path, "gate-after-restart")
+    try:
+        secret = load_secret(after.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", after.port, secret)
+        reads: list[str] = []
+        real = after.registry.get_caller_principal
+
+        def recording(identity):
+            reads.append(threading.current_thread().name)
+            return real(identity)
+
+        after.registry.get_caller_principal = recording
+        timeouts_before = after._watchdog_timeouts_total
+        body = {"session_id": sid, "path": "plan.md"}
+
+        assert client.post("/hooks/pre-edit", body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+        assert reads and all(name.startswith("coord-wd") for name in reads), (
+            f"the gate read the store on the request thread: {reads}")
+        assert after._watchdog_timeouts_total == timeouts_before
+        assert after.registry.lookup_artifact_id_by_name("plan.md") is None
+        assert session_to_agent_id(sid) not in dict(after.agent_names_snapshot())
+
+        status, admitted = client.post("/hooks/pre-edit", body, principal=principal)
+        assert (status, admitted) == (200, {"ok": True}), admitted
+    finally:
+        after.shutdown()
+
+
+def test_the_gate_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request whose gate spent part of the watchdog budget reading the
+    store gives its work body only what is left: a work body that then blocks
+    is answered at the ONE deadline, not at the lookup's time plus a fresh one.
+
+    Prevents bounding the gate by turning a request into one that waits up to
+    twice the watchdog -- past the hook's own 5s budget, where the hook client
+    gives up on its own and a work body not yet aborted can still land state
+    the caller was never told about. The store read is made slow by a stand-in
+    that answers "unbound" after a delay WITHOUT the registry lock, so the lock
+    this test holds blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
 def _pre_edit_with(client: _Client, sid: str, principal: str, path: str) -> None:
     status, body = client.post(
         "/hooks/pre-edit", {"session_id": sid, "path": path}, principal=principal
@@ -8518,6 +8897,59 @@ def test_pre_edit_without_its_principal_cannot_take_a_grant_it_could_not_release
     assert status == 200 and body["ok"] is True, body
     assert reg.get_agent_state(artifact_id, a_agent) not in (
         MESIState.EXCLUSIVE, MESIState.MODIFIED)
+
+
+def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decider) -> None:
+    """The other side of the test above, which the posture table must state
+    rather than leave out: refusing a claimed session's pre-edit that carries
+    no principal also withholds everything pre-edit does FOR that session. On a
+    strict-mode path where the session was preempted, the refused request gets
+    no strict-mode deny, no grant, and invalidates no peer -- and the hook
+    clients read a 400 like any other refusal, so the edit then proceeds
+    uncoordinated. Control: the same request presenting the principal IS
+    denied.
+
+    Prevents the table describing only what the refusal rules out. The
+    trade-off was chosen -- over admitting an acquire the caller could neither
+    commit nor release -- and its cost is pinned here with the words that
+    state it."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    server, client = served_decider
+    reg = server.registry
+    path = _U3A_STRICT_PATH
+    editor, peer = str(uuid.uuid4()), str(uuid.uuid4())
+    editor_principal = _explicit_claim(client, editor)
+    peer_principal = _explicit_claim(client, peer)
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": editor, "path": path, "content_hash": _hash("v1")},
+        principal=editor_principal)
+    assert status == 200
+    _pre_edit_with(client, peer, peer_principal, path)
+    artifact_id = reg.lookup_artifact_id_by_name(path)
+    editor_agent, peer_agent = session_to_agent_id(editor), session_to_agent_id(peer)
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
+    denials_before = server.counters_snapshot()["strict_mode_denials_total"]
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert "hookSpecificOutput" not in refused[1], "a refusal relays no deny"
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID, "no grant"
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE, (
+        "no peer invalidated")
+
+    status, denied = client.post(
+        "/hooks/pre-edit", {"session_id": editor, "path": path}, principal=editor_principal)
+    assert status == 200 and denied["ok"] is False, denied
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before + 1
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-edit")].harm
+    for stated in ("proceeds uncoordinated", "no grant", "no strict-mode deny",
+                   "no invalidation of its peers", "neither commit nor release"):
+        assert stated in harm, f"pre-edit's harm text does not state {stated!r}: {harm}"
 
 
 # --- a REFUSED require-class request leaves every piece of state as it was ---

@@ -3,9 +3,10 @@
 
 """The one-shot clients' caller-principal recovery (caller-principal plan R20).
 
-The hook client and ``agent-coherence-status --self-test`` keep a session's
-mint nonce and principal on disk under ``.coherence/`` — one process per
-invocation leaves them no other place. A request the coordinator refuses with
+The hook client keeps a session's mint nonce and principal on disk under
+``.coherence/`` — one process per invocation leaves it no other place.
+(``agent-coherence-status --self-test`` does not: it runs as one process and
+holds fresh sessions' principals in memory.) A request the coordinator refuses with
 a typed ``caller_principal_foreign`` / ``caller_principal_absent`` reason is
 recovered by re-claiming with the SAME stored nonce: a principal that differs
 from the one presented replaces the stored file (write-then-rename, 0600) and
@@ -27,6 +28,7 @@ import json
 import os
 import threading
 import time
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     CoordinatorHTTPServer,
     caller_principal_identity,
 )
-from ccs.cli import coherence_hook_client, coherence_status
+from ccs.cli import _coherence_client, coherence_hook_client, coherence_status
 
 _PRINCIPAL_HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
 _FOREIGN = "caller_principal_foreign"  # frozen duplicates of the wire reasons
@@ -89,6 +91,7 @@ class _Scripted(http.server.BaseHTTPRequestHandler):
     seen: list[tuple[str, str | None]] = []
     claims: list[tuple[int, dict[str, Any]]] = []
     route: Any = None
+    phrase: str | None = None  # the status line's reason phrase; None = the standard one
 
     def do_POST(self) -> None:  # noqa: N802 — stdlib name
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
@@ -100,7 +103,7 @@ class _Scripted(http.server.BaseHTTPRequestHandler):
             self.seen.append((self.path, header))
             status, answer = type(self).route(header)
         raw = json.dumps(answer).encode()
-        self.send_response(status)
+        self.send_response(status, type(self).phrase)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -130,6 +133,7 @@ def scripted(tmp_path: Path):
     nonce_file.write_text(_value("N") + "\n")
     principal_file.write_text(_value("P") + "\n")
     _Scripted.seen, _Scripted.claims, _Scripted.route = [], [], None
+    _Scripted.phrase = None
     try:
         yield tmp_path, sid
     finally:
@@ -380,6 +384,171 @@ def test_a_refusal_without_a_typed_reason_is_not_recovered(
     assert err == ""
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [["caller_principal_foreign"], {"reason": "caller_principal_absent"}, 7, 1.5, True, None, ""],
+    ids=["list", "object", "int", "float", "bool", "null", "empty"],
+)
+def test_a_refusal_reason_that_is_not_a_known_string_classifies_as_no_refusal(
+    reason: object,
+) -> None:
+    """A 400 body's ``reason`` is classified by exact membership in the typed
+    refusal vocabulary — and only a string can be a member. A list or an
+    object (a proxy, a gateway, a coordinator bug) used to raise
+    ``TypeError`` from the membership test itself, escaping every client's
+    handling of an ordinary rejected request."""
+    body = io.BytesIO(json.dumps({"error": "bad request", "reason": reason}).encode())
+    exc = urllib.error.HTTPError("/hooks/pre-edit", 400, "Bad Request", {}, body)  # type: ignore[arg-type]
+
+    assert _coherence_client.principal_refusal_reason(exc) is None
+
+
+@pytest.mark.parametrize("reason", [_FOREIGN, _ABSENT])
+def test_a_typed_refusal_reason_is_classified(reason: str) -> None:
+    """Control for the test above: the two typed refusal reasons ARE
+    classified, on a 400 only."""
+    def error(status: int) -> urllib.error.HTTPError:
+        body = io.BytesIO(json.dumps({"error": "refused", "reason": reason}).encode())
+        return urllib.error.HTTPError("/hooks/pre-edit", status, "x", {}, body)  # type: ignore[arg-type]
+
+    assert _coherence_client.principal_refusal_reason(error(400)) == reason
+    assert _coherence_client.principal_refusal_reason(error(403)) is None
+
+
+def test_no_coordinator_supplied_text_reaches_the_hook_clients_stderr(
+    scripted, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A coordinator that echoes the nonce and the principals back in every
+    free-text field — the claim's ``reason``, ``detail`` and ``error``, a
+    refusal's ``error`` and ``detail``, the status line's reason phrase —
+    cannot get any of them onto the hook client's stderr. What the client
+    reports on the claim and recovery paths is built from the frozen
+    vocabulary: a known reason by name, anything else as ``unrecognised``, an
+    HTTP failure by its status code.
+
+    The session has a stored nonce and no stored principal: the first claim is
+    answered 500, the request is refused as absent, and the recovery claim
+    (the stored nonce, as always) is answered with the echo as its reason."""
+    workspace, sid = scripted
+    _, principal_file = _files(workspace, sid)
+    principal_file.unlink()
+    echo = " ".join((_value("N"), _value("P"), _value("Q")))
+    garbled = {"ok": False, "reason": echo, "detail": echo, "error": echo}
+    _Scripted.claims = [(500, garbled), (200, garbled)]
+    _Scripted.route = staticmethod(
+        lambda _h: (400, {"error": echo, "detail": echo, "reason": _ABSENT})
+    )
+    _Scripted.phrase = echo
+
+    out, err = _drive("session-stop", {"session_id": sid}, workspace, monkeypatch, capsys)
+
+    assert _Scripted.seen == [
+        ("/principal/claim", _value("N")),
+        ("/hooks/session-stop", None),
+        ("/principal/claim", _value("N")),
+    ]
+    assert out.strip() == "{}"
+    assert f"({_ABSENT})" in err and "unrecognised" in err
+    _assert_nothing_leaks(out + err, _value("N"), _value("P"), _value("Q"))
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"ok": False, "degraded": True, "reason": "claim_unconfirmed"}, "reason=claim_unconfirmed"),
+        ({"ok": False, "reason": _value("N")}, "reason=unrecognised"),
+        ({"ok": False, "reason": [_value("N")]}, "reason=unrecognised"),
+        ({"ok": True, "principal": ""}, "reason=unrecognised"),
+    ],
+    ids=["watchdog", "echoed-nonce", "non-string", "no-principal"],
+)
+def test_an_unconfirmed_claim_names_only_a_known_reason(
+    scripted, answer: dict[str, Any], expected: str,
+) -> None:
+    """The detail of a claim that did not confirm repeats the coordinator's
+    ``reason`` only when it is a known token — the watchdog's
+    ``claim_unconfirmed`` — and reads ``unrecognised`` for anything else."""
+    workspace, sid = scripted
+    _Scripted.claims = [(200, answer)]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    claim = _coherence_client.claim_caller_principal(endpoint, sid, _value("N"))
+
+    assert claim.outcome == "unconfirmed"
+    assert expected in claim.detail
+    assert _value("N") not in claim.detail
+
+
+@pytest.mark.parametrize(
+    ("status", "answer", "token"),
+    [
+        (503, {"error": "watchdog queue overloaded"}, "unrecognised"),
+        (503, {"ok": False, "reason": "claim_unconfirmed"}, "claim_unconfirmed"),
+        (500, {"reason": _value("N"), "error": _value("N")}, "unrecognised"),
+        (500, {"reason": [_value("N")], "detail": _value("N")}, "unrecognised"),
+        (500, _value("N"), "unrecognised"),
+        (409, {"ok": False, "reason": _CLAIMED, "detail": _value("N")}, _CLAIMED),
+    ],
+    ids=["queue-overflow", "known-reason", "echoed-reason", "non-string", "not-an-object",
+         "claimed-off-contract"],
+)
+def test_a_claim_answered_with_an_error_status_names_its_status_and_only_a_known_reason(
+    scripted, status: int, answer: Any, token: str,
+) -> None:
+    """A claim answered with an error status (not 404) did not confirm: its
+    detail names the status and the answer's ``reason`` as a known token, or
+    ``unrecognised``, and nothing else of the answer. A
+    ``caller_principal_claimed`` reason on such a status is reported, not taken
+    for the claim contract's refusal, which is a 200 body.
+
+    The Node client decides and reports these answers the same way (status and
+    token), so the two clients cannot tell an operator different things about
+    one coordinator answer."""
+    workspace, sid = scripted
+    _Scripted.claims = [(status, answer)]
+    _Scripted.phrase = _value("N")
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    claim = _coherence_client.claim_caller_principal(endpoint, sid, _value("N"))
+
+    assert claim.outcome == "unconfirmed"
+    assert claim.detail == f"claim answered HTTP {status}, reason={token}"
+
+
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        ({"ok": True, "principal": _value("P")}, "bound"),
+        ({"ok": False, "reason": _CLAIMED, "detail": _value("N")}, "refused"),
+    ],
+    ids=["bound", "claimed"],
+)
+def test_any_2xx_claim_answer_is_the_claim_contract(
+    scripted, answer: dict[str, Any], outcome: str,
+) -> None:
+    """A 201 carries the claim contract like a 200: a principal binds, a
+    ``caller_principal_claimed`` refuses. The Node client applies the same
+    2xx rule, so a coordinator answering 201 binds one session identically
+    under both clients."""
+    workspace, sid = scripted
+    _Scripted.claims = [(201, answer)]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    claim = _coherence_client.claim_caller_principal(endpoint, sid, _value("N"))
+
+    assert claim.outcome == outcome
+    assert claim.principal == (_value("P") if outcome == "bound" else None)
+
+
+def test_the_watchdog_claim_reason_is_the_coordinators() -> None:
+    """The client's copy of the watchdog-degraded claim reason is a twin of
+    the coordinator's envelope; the two must not drift apart."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    assert coordinator_server._PRINCIPAL_CLAIM_DEGRADED_RESPONSE["reason"] == "claim_unconfirmed"
+    assert "claim_unconfirmed" in _coherence_client.REPORTABLE_CLAIM_REASONS
+
+
 # --- against a real coordinator: the binding store is reset under a session ---
 
 
@@ -451,26 +620,44 @@ def test_a_stored_principal_that_outlived_its_binding_store_is_recovered(
         server.shutdown()
 
 
-def test_the_self_test_survives_a_reset_of_the_binding_store(
-    workspace: Path, capsys: pytest.CaptureFixture[str],
+def test_the_self_test_claims_fresh_sessions_and_never_depends_on_stored_principals(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--self-test`` uses FIXED synthetic session ids and persists their
-    principals like a hook does. After ``state.db`` is reset it must still
-    pass — it used to fail at step 1 (``/hooks/pre-read returned HTTP 400``)
-    on every run in that workspace — and it prints no principal or nonce."""
+    """``--self-test`` drives two synthetic sessions that are FRESH on every
+    run and holds their principals in memory for the run, so it does not
+    depend on anything a previous run left in ``.coherence/``: deleting the
+    ``caller-principal-*`` files, or resetting ``state.db``, never breaks a
+    later run (with fixed session ids, a run after the files were deleted
+    claimed with a new nonce, was refused as ``caller_principal_claimed``, and
+    failed at pre-edit). It stores no principal file and prints no principal
+    or nonce."""
+    claimed: list[tuple[str, str, str | None]] = []
+    real_claim = _coherence_client.claim_caller_principal
+
+    def spy(endpoint: Any, session_id: str, nonce: str) -> Any:
+        claim = real_claim(endpoint, session_id, nonce)
+        claimed.append((session_id, nonce, claim.principal))
+        return claim
+
+    monkeypatch.setattr(coherence_status, "claim_caller_principal", spy, raising=False)
     server = _start(workspace)
     try:
-        assert coherence_status._run_self_test(workspace) == 0
+        assert coherence_status._run_self_test(workspace) == 0, capsys.readouterr().err
+        # What a hook of some real session left behind, deleted with the rest.
+        _drive("session-stop", {"session_id": _sid()}, workspace, monkeypatch, capsys)
+        for stored in (workspace / ".coherence").glob("caller-principal-*"):
+            stored.unlink()
+        assert coherence_status._run_self_test(workspace) == 0, capsys.readouterr().err
         server = _reset_store(server, workspace)
         assert coherence_status._run_self_test(workspace) == 0, capsys.readouterr().err
-        assert coherence_status._run_self_test(workspace) == 0, capsys.readouterr().err
         captured = capsys.readouterr()
-        stored = [
-            p.read_text().strip()
-            for p in (workspace / ".coherence").glob("caller-principal-*")
-        ]
-        assert len(stored) == 4
-        _assert_nothing_leaks(captured.out + captured.err, *stored)
+
+        sessions = [sid for sid, _n, _p in claimed]
+        assert len(sessions) == 6 and len(set(sessions)) == 6, "two fresh sessions per run"
+        assert all(p for _s, _n, p in claimed), "every run's sessions were bound"
+        assert list((workspace / ".coherence").glob("caller-principal-*")) == []
+        values = [v for _s, n, p in claimed for v in (n, p) if v]
+        _assert_nothing_leaks(captured.out + captured.err, *values)
     finally:
         server.shutdown()
 
@@ -511,7 +698,14 @@ def test_a_torn_stored_principal_is_repaired_by_one_claim(
 # --- the mint-nonce file: an interrupted write is never overwritten ---------
 
 
-@pytest.mark.parametrize(("age_sec", "waits"), [(0.0, True), (3600.0, False)], ids=["young", "old"])
+# Ages are literals on BOTH sides of the 2 s grace (never derived from the
+# constant): an age just past it pins that the grace is not ten times longer,
+# an age just inside it that it is not ten times shorter.
+@pytest.mark.parametrize(
+    ("age_sec", "waits"),
+    [(0.0, True), (1.0, True), (3.0, False), (3600.0, False)],
+    ids=["young-0s", "young-1s", "old-3s", "old-3600s"],
+)
 def test_a_torn_nonce_file_is_waited_on_only_while_it_could_still_be_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_sec: float, waits: bool,
 ) -> None:
@@ -521,7 +715,14 @@ def test_a_torn_nonce_file_is_waited_on_only_while_it_could_still_be_written(
     final); an old one is treated as abandoned and reported at once instead of
     charging every later hook of the session the whole bounded wait — the
     outcome after the wait would be the same. Either way the file is never
-    overwritten or removed."""
+    overwritten or removed.
+
+    The two reports say different things. An abandoned write stays broken
+    until someone acts, so its report names the file and the step. A young
+    one may still be completed by its live writer, so its report must not
+    tell the operator the session runs without a principal until the file is
+    fixed: only this invocation proceeds without one, and the next either
+    adopts the nonce or reports an interrupted write."""
     (tmp_path / ".coherence").mkdir(mode=0o700)
     key = caller_principal_identity(_sid()).hex
     nonce_file = tmp_path / ".coherence" / f"caller-principal-{key}.nonce"
@@ -534,9 +735,17 @@ def test_a_torn_nonce_file_is_waited_on_only_while_it_could_still_be_written(
     with pytest.raises(auth.MintNonceUnavailable) as caught:
         auth.ensure_mint_nonce(tmp_path, key)
 
+    message = str(caught.value)
     assert bool(sleeps) is waits
     assert nonce_file.read_text() == ""
-    # Named in full, with the operator's step, as the hook.secret error is and
-    # as the Node client prints it: nothing repairs the file automatically.
-    assert str(nonce_file) in str(caught.value)
-    assert "remove" in str(caught.value)
+    # Named in full, as the hook.secret error is and as the Node client prints
+    # it: nothing repairs the file automatically.
+    assert str(nonce_file) in message
+    assert "not overwriting it" in message
+    if waits:
+        assert "runs without a principal until" not in message
+        assert "this invocation proceeds without a principal" in message.lower()
+    else:
+        assert "interrupted write" in message
+        assert "runs without a principal until it is fixed" in message
+        assert "remove" in message and "by hand" in message

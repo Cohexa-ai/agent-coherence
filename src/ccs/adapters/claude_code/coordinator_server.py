@@ -31,7 +31,8 @@ Every handler:
 - Records the calling session's heartbeat (KTD-2)
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
-  SQLite contention exceeds busy_timeout=2000)
+  SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
+  must read the registry runs under the same deadline, before the call
 - Converts ``CoherenceError`` to 200 ``{ok: false, reason}`` (NOT 500 — we
   want hooks to proceed gracefully on protocol violations, not block)
 - Logs request/response at DEBUG, errors at WARNING
@@ -74,7 +75,11 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember
-from ccs.coordinator.service import CoordinatorService, mint_nonce_problem
+from ccs.coordinator.service import (
+    CallerPrincipalUncached,
+    CoordinatorService,
+    mint_nonce_problem,
+)
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
@@ -134,6 +139,11 @@ class _RequestProtocol(Protocol):
     #: ``(method, route path)`` the dispatcher matched in ``_ROUTES``, set
     #: before the handler runs; keys the caller-principal posture lookup.
     _route_key: tuple[str, str]
+    #: ``time.monotonic()`` instant this request's handler watchdog expires, or
+    #: ``None`` while nothing has started it. The dispatcher resets it; the
+    #: caller-principal gate starts it when it must read the registry, and the
+    #: work body then waits only for what is left (:func:`_watchdog_deadline`).
+    _watchdog_deadline: float | None
 
     def _read_json(self) -> dict | None:
         """Read + parse the request body as JSON. Returns None on error."""
@@ -303,10 +313,17 @@ class PresentedCaller:
     subagent_id: str | None
     principal: str | None
 
-    def attributed_agent_id(self, service: CoordinatorService) -> UUID:
+    def attributed_agent_id(
+        self, service: CoordinatorService, *, cached_only: bool = False
+    ) -> UUID:
         """The composite agent id a write by this caller is attributed to
         (``artifacts.last_writer_id``), with its SESSION component verified
         against the caller principal first.
+
+        ``cached_only`` decides from the service's in-process binding cache and
+        raises :class:`~ccs.coordinator.service.CallerPrincipalUncached` where
+        the durable store would have to be read — the admission gate's way of
+        keeping that read off the request thread (:func:`_admit_caller`).
 
         Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when a
         principal is presented and does not match the session's binding
@@ -321,9 +338,13 @@ class PresentedCaller:
         and subagent is unchanged — two subagents of one session keep distinct
         writer ids, which the self-commit-lag comparison depends on."""
         identity = caller_principal_identity(self.session_id)
-        if self.principal is None and not service.is_caller_principal_bound(identity):
+        if self.principal is None and not service.is_caller_principal_bound(
+            identity, cached_only=cached_only
+        ):
             return session_to_agent_id(self.session_id, self.subagent_id)
-        service.validate_caller_principal(identity=identity, principal=self.principal)
+        service.validate_caller_principal(
+            identity=identity, principal=self.principal, cached_only=cached_only
+        )
         return session_to_agent_id(self.session_id, self.subagent_id)
 
 
@@ -395,9 +416,15 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "principal could take a grant it can then neither commit nor release "
         "(post-edit, either success value, and session-stop refuse it), so the "
         "grant would stand until the max-hold sweep while optimistic peers are "
-        "refused other_holder. The class does not stop preemption itself: a "
-        "fresh, principal-bearing identity preempts identically until the "
-        "acquire-or-fail contract lands")),
+        "refused other_holder. The trade-off, accepted: a claimed session whose "
+        "client cannot present its principal (and cannot recover it by "
+        "re-claiming with its stored nonce) has its pre-edit refused, and a "
+        "hook client then proceeds uncoordinated, as on any other refusal: the "
+        "edit gets no grant, no strict-mode deny and no invalidation of its "
+        "peers. That was chosen over admitting an acquire the caller could "
+        "neither commit nor release. The class does not stop preemption "
+        "itself: a fresh, principal-bearing identity preempts identically "
+        "until the acquire-or-fail contract lands")),
     ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
         "commits a version and records artifacts.last_writer_id under the "
         "named identity (or, on success:false, releases its grant): a caller "
@@ -528,7 +555,13 @@ def _admit_caller(
     The gate runs BEFORE any handler mutation — the display-name registration,
     the heartbeat, the re-grounding flag, a notice drain, a grant — so a
     refused request has changed nothing, and a client may retry it once it
-    holds the right principal."""
+    holds the right principal.
+
+    It never waits longer than the handler watchdog: see
+    :func:`_attributed_within_deadline`. A gate that cannot decide in time
+    writes the route's degraded envelope (past a full watchdog queue, the 503)
+    and returns ``None`` too — neither admitted nor refused, so it is counted
+    by neither principal counter."""
     posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
     unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
     if posture is PrincipalPosture.MINT:
@@ -537,14 +570,65 @@ def _admit_caller(
         coordinator.increment_caller_principal_absent()
         return unverified
     try:
-        agent_id = presented.attributed_agent_id(coordinator.service)
+        agent_id = _attributed_within_deadline(req, coordinator, presented)
     except CallerPrincipalRefused as exc:
         _refuse_caller(req, coordinator, exc.reason)
+        return None
+    if agent_id is None:
         return None
     if presented.principal is None:
         # Require-class, admitted without a principal: the identity is unbound.
         coordinator.increment_caller_principal_absent()
     return agent_id
+
+
+def _attributed_within_deadline(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """:meth:`PresentedCaller.attributed_agent_id`, decided without waiting
+    past the handler watchdog.
+
+    The service's binding cache answers on this thread, touching no registry:
+    a bound identity, and — after one read of the store — an unbound one
+    (the negative tier, so a client that never claims stops costing a registry
+    read per request). Only a cache miss reads the durable store, and that read
+    waits on the registry lock, so it runs in the watchdog pool and STARTS this
+    request's watchdog deadline: the work body later gets only what the lookup
+    left of it (:func:`_watchdog_deadline`), and gate plus body stay inside one
+    ``HANDLER_TIMEOUT_SEC``. Were the read made here instead, a client that
+    never claims (KTD15) would wait on registry contention with no deadline on
+    every require-class route — pre-edit included.
+
+    Returns the agent id, or ``None`` after writing the answer itself: the
+    watchdog pool's queue-overflow 503, or — the lookup not done by the
+    deadline — exactly the route's degraded envelope
+    (:data:`_CALLER_GATE_DEGRADED_RESPONSE`), counted as a watchdog timeout
+    like a timed-out work body. Raises :class:`CallerPrincipalRefused` for a
+    refusal decided within the deadline, which stays an HTTP 400."""
+    service = coordinator.service
+    try:
+        return presented.attributed_agent_id(service, cached_only=True)
+    except CallerPrincipalUncached:
+        pass
+    if _watchdog_queue_overflowed(req, coordinator):
+        return None
+    deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
+    req._watchdog_deadline = deadline
+    try:
+        return coordinator.run_admission_lookup(
+            lambda: presented.attributed_agent_id(service), deadline=deadline
+        )
+    except FuturesTimeout:
+        coordinator.increment_watchdog_timeout()
+        method, path = req._route_key
+        logger.warning(
+            "caller-principal lookup on %s %s timed out after %ss; degrading",
+            method, path, HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _CALLER_GATE_DEGRADED_RESPONSE[req._route_key])
+        return None
 
 
 def _refuse_caller(
@@ -1532,10 +1616,20 @@ class CoordinatorHTTPServer:
             self._compact_pending.discard(session_id)
 
     def run_with_watchdog(
-        self, fn: Callable[[], Any], abort: threading.Event | None = None
+        self,
+        fn: Callable[[], Any],
+        abort: threading.Event | None = None,
+        *,
+        deadline: float | None = None,
     ) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
         :class:`FuturesTimeout` on timeout (caller decides degradation).
+
+        ``deadline`` is the request's watchdog deadline when something earlier
+        in the request already started it (a ``time.monotonic()`` instant, see
+        :func:`_watchdog_deadline`): ``fn`` then gets only the time left, and
+        none at all — it is not submitted — once the deadline has passed.
+        ``None`` gives ``fn`` the whole ``HANDLER_TIMEOUT_SEC``.
 
         A6 mitigation: when the future times out, ``cancel_futures`` is not
         set so the underlying work keeps running in the pool. If the caller
@@ -1552,14 +1646,30 @@ class CoordinatorHTTPServer:
         cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
         mitigation working.
         """
+        timeout = HANDLER_TIMEOUT_SEC if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            raise FuturesTimeout()
         future = self._watchdog.submit(fn)
         try:
-            return future.result(timeout=HANDLER_TIMEOUT_SEC)
+            return future.result(timeout=timeout)
         except FuturesTimeout:
             if abort is not None:
                 abort.set()
             future.add_done_callback(self._on_watchdog_future_done_after_timeout)
             raise
+
+    def run_admission_lookup(self, fn: Callable[[], Any], *, deadline: float) -> Any:
+        """Run the caller-principal gate's durable-store lookup in the watchdog
+        pool, waiting until ``deadline`` (a ``time.monotonic()`` instant) at
+        most. Raises :class:`FuturesTimeout` when it is not done by then, and
+        re-raises whatever ``fn`` raised — a refusal included.
+
+        Unlike :meth:`run_with_watchdog` there is no abort and no late-completion
+        accounting: the lookup only READS, so a late one lands no coordinator
+        state (it can only fill the service's binding cache), and counting it as
+        a late completion would report a phantom mutation that never happened."""
+        future = self._watchdog.submit(fn)
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
     def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
@@ -1799,6 +1909,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     # The route this request dispatched to, for the handler's
                     # caller-principal posture lookup (_admit_caller).
                     self._route_key = (method, route_path)
+                    # No watchdog deadline yet: the caller-principal gate starts
+                    # one only when it has to read the registry.
+                    self._watchdog_deadline = None
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -5737,6 +5850,66 @@ fail-closed client to raise. The residual is a phantom version bump, NOT a
 lost update — full fencing is deferred to the cross-host follow-on (see
 ``_handle_post_edit_cas``)."""
 
+_CALLER_GATE_DEGRADED_RESPONSE: dict[tuple[str, str], dict] = {
+    ("POST", "/hooks/pre-read"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/effect-fence"): _EFFECT_FENCE_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-edit"): _PRE_EDIT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit-cas"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-stop"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-start"): _SESSION_START_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-bash"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-grep"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/session/begin"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/read"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/commit"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/commit_all"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/heartbeat"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/workspace/checkpoint"): _CHECKPOINT_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/status"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/member"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/register"): _RESTORE_REGISTER_DEGRADED_RESPONSE,
+}
+"""What a route answers when its caller-principal gate cannot decide within the
+handler watchdog: exactly what its handler passes ``_run_or_degrade`` for a
+timed-out work body. The request was neither admitted nor refused, so it gets
+the route's ordinary degraded answer — never a principal refusal (nothing was
+refused) and never an admission (nothing was checked). Keyed like
+:data:`_CALLER_PRINCIPAL_POSTURE`, over every route whose gate can read the
+registry, i.e. all but the mint; no default, so a missing route fails loudly. A
+test compares each entry with the route's own timed-out work body, so the two
+cannot drift."""
+
+
+def _watchdog_deadline(req: _RequestProtocol) -> float | None:
+    """The request's watchdog deadline, if its caller-principal gate started
+    one (``None`` — the full ``HANDLER_TIMEOUT_SEC`` — otherwise)."""
+    return getattr(req, "_watchdog_deadline", None)
+
+
+def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> bool:
+    """KTD-G item 1: the queue-depth gate in front of the watchdog pool. When
+    the pool's work queue is past :data:`WATCHDOG_QUEUE_LIMIT`, count it, write
+    the 503 and return True — the caller submits nothing. Shared by
+    :func:`_run_or_degrade` and the caller-principal gate's registry lookup, so
+    neither path queues work the other would have refused."""
+    # A defensive try because ThreadPoolExecutor's _work_queue attribute is
+    # technically private — guard against future stdlib changes.
+    try:
+        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
+    except AttributeError:
+        qsize = 0
+    if qsize <= WATCHDOG_QUEUE_LIMIT:
+        return False
+    coordinator.increment_watchdog_queue_overflow()  # finding #31
+    logger.warning(
+        "watchdog queue at %d items (limit %d); rejecting with 503",
+        qsize,
+        WATCHDOG_QUEUE_LIMIT,
+    )
+    req._json(503, {"error": "watchdog queue overloaded"})
+    return True
+
 
 def _run_or_degrade(
     req: _RequestProtocol,
@@ -5770,26 +5943,18 @@ def _run_or_degrade(
     Item 2 (handler concurrency semaphore) lives in
     _ThreadingHTTPServer.process_request — gates BEFORE this function
     is reached.
+
+    The watchdog deadline is the REQUEST's: when the caller-principal gate
+    already started it with a registry lookup, ``work`` gets only what is left
+    (:func:`_watchdog_deadline`).
     """
-    # KTD-G item 1: queue-depth gate. Use a defensive try because
-    # ThreadPoolExecutor's _work_queue attribute is technically private
-    # — guard against future stdlib changes that would break this.
-    try:
-        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
-    except AttributeError:
-        qsize = 0
-    if qsize > WATCHDOG_QUEUE_LIMIT:
-        coordinator.increment_watchdog_queue_overflow()  # finding #31
-        logger.warning(
-            "watchdog queue at %d items (limit %d); rejecting with 503",
-            qsize,
-            WATCHDOG_QUEUE_LIMIT,
-        )
-        req._json(503, {"error": "watchdog queue overloaded"})
+    if _watchdog_queue_overflowed(req, coordinator):
         return
 
     try:
-        result = coordinator.run_with_watchdog(work, abort=abort)
+        result = coordinator.run_with_watchdog(
+            work, abort=abort, deadline=_watchdog_deadline(req)
+        )
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
         coordinator.increment_watchdog_timeout()  # finding #31
@@ -6229,7 +6394,9 @@ def _fast_path_json(
             )
 
         try:
-            base = coordinator.run_with_watchdog(deliver, abort=abort)
+            base = coordinator.run_with_watchdog(
+                deliver, abort=abort, deadline=_watchdog_deadline(req)
+            )
         except FuturesTimeout:
             # KTD-G item 3 mirror of _run_or_degrade: surface the
             # degradation via the /status counter, then fall through to

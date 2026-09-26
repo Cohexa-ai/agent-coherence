@@ -45,6 +45,7 @@ from ccs.adapters.claude_code.coordinator_server import (
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
+    CALLER_PRINCIPAL_REASONS,
     CALLER_PRINCIPAL_REFUSAL_REASONS,
     CallerPrincipalRefused,
     InsecureTransportRefused,
@@ -588,6 +589,31 @@ def post(
 
 PRINCIPAL_CLAIM_ROUTE = "/principal/claim"
 
+CLAIM_UNCONFIRMED_REASON = "claim_unconfirmed"
+"""The ``reason`` of the coordinator's watchdog-degraded claim envelope — a
+twin of ``coordinator_server._PRINCIPAL_CLAIM_DEGRADED_RESPONSE``, pinned equal
+by a test."""
+
+REPORTABLE_CLAIM_REASONS: frozenset[str] = frozenset(
+    {*CALLER_PRINCIPAL_REASONS, CLAIM_UNCONFIRMED_REASON}
+)
+"""The claim and refusal reasons a client repeats in what it reports. Anything
+else the coordinator put in a reason field is reported as
+:data:`UNRECOGNISED_REASON`."""
+
+UNRECOGNISED_REASON = "unrecognised"
+
+
+def reportable_reason(value: object) -> str:
+    """``value`` when it is a reason in :data:`REPORTABLE_CLAIM_REASONS`, else
+    :data:`UNRECOGNISED_REASON`. What a client reports on its claim and
+    recovery paths is built from constants and these tokens, never from
+    coordinator-supplied text, so a coordinator that echoed a nonce or a
+    principal into a reason field cannot get it into a message."""
+    if isinstance(value, str) and value in REPORTABLE_CLAIM_REASONS:
+        return value
+    return UNRECOGNISED_REASON
+
 
 @dataclass(frozen=True)
 class PrincipalClaim:
@@ -608,7 +634,9 @@ class PrincipalClaim:
       invocation, or the long-lived client's claim before its next request
       (R20).
 
-    ``detail`` is diagnostic prose and never carries the principal or nonce."""
+    ``detail`` is diagnostic prose built from constants, known reason tokens,
+    an HTTP status code or this client's own transport message — never from
+    the coordinator's answer — so it carries no principal or nonce."""
 
     outcome: Literal["bound", "unsupported", "refused", "unconfirmed"]
     principal: str | None = None
@@ -622,7 +650,8 @@ def claim_caller_principal(
 
     Transport-shaped failures come back as ``unconfirmed`` rather than raising;
     a typed trust refusal (TLS verification, a redirect) still raises, exactly
-    as it does from :func:`post`."""
+    as it does from :func:`post`. The coordinator's ``reason`` is repeated in
+    ``detail`` only when it is a known token (:func:`reportable_reason`)."""
     try:
         body = post(
             endpoint,
@@ -632,16 +661,22 @@ def claim_caller_principal(
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return PrincipalClaim("unsupported", detail="the coordinator issues no caller principals")
-        return PrincipalClaim("unconfirmed", detail=f"claim answered HTTP {exc.code}")
+        # The status and the reason as a known token, as for a 2xx answer and
+        # as the Node client reports it. Only a 2xx body carries the claim
+        # contract, so a ``caller_principal_claimed`` here is reported, not
+        # taken for a refusal (the Node client decides it the same way).
+        error_body = http_status_from_error(exc)
+        reason = reportable_reason(error_body.get("reason") if isinstance(error_body, dict) else None)
+        return PrincipalClaim("unconfirmed", detail=f"claim answered HTTP {exc.code}, reason={reason}")
     except CoordinatorUnavailable as exc:
         return PrincipalClaim("unconfirmed", detail=str(exc))
     principal = body.get("principal") if isinstance(body, dict) else None
     if isinstance(body, dict) and body.get("ok") is True and isinstance(principal, str) and principal:
         return PrincipalClaim("bound", principal=principal)
-    reason = body.get("reason") if isinstance(body, dict) else None
+    reason = reportable_reason(body.get("reason") if isinstance(body, dict) else None)
     if reason == CALLER_PRINCIPAL_CLAIMED_REASON:
         return PrincipalClaim("refused", detail=CALLER_PRINCIPAL_CLAIMED_REASON)
-    return PrincipalClaim("unconfirmed", detail=f"claim not confirmed (reason={reason!r})")
+    return PrincipalClaim("unconfirmed", detail=f"claim not confirmed (reason={reason})")
 
 
 NODE_BACKEND = "node"
@@ -691,12 +726,17 @@ def principal_refusal_reason(exc: urllib.error.HTTPError) -> str | None:
     whose body carries ``reason`` in
     :data:`~ccs.core.exceptions.CALLER_PRINCIPAL_REFUSAL_REASONS`, matched by
     exact membership, never by a substring of the prose — else ``None``.
-    Reads the error body (only for a 400)."""
+    Only a string can be a member: a list or an object in that field (a proxy
+    or gateway in front of the coordinator) is an ordinary rejected request,
+    not a ``TypeError`` from the membership test. Reads the error body (only
+    for a 400)."""
     if exc.code != 400:
         return None
     body = http_status_from_error(exc)
     reason = body.get("reason") if isinstance(body, dict) else None
-    return reason if reason in CALLER_PRINCIPAL_REFUSAL_REASONS else None
+    if isinstance(reason, str) and reason in CALLER_PRINCIPAL_REFUSAL_REASONS:
+        return reason
+    return None
 
 
 @dataclass(frozen=True)

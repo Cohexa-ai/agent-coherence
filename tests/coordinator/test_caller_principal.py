@@ -31,6 +31,8 @@ Scenarios:
   agent id and its caller-asserted subagent component are unchanged (R3);
 - the principal outlives a grant reclamation AND a session-liveness sweep, and
   never occupies a snapshot-session slot (R4, KTD1, KTD13);
+- the binding cache keeps the store's UNBOUND answer until this service binds
+  the identity, and a ``cached_only`` lookup never reads the store (U6);
 - the store is a versioned schema step landing as the final chain step, with
   the previous step stamping its own literal (KTD1).
 """
@@ -52,6 +54,7 @@ from ccs.adapters.claude_code.coordinator_server import (
 )
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import (
+    CallerPrincipalUncached,
     CoordinatorService,
     SessionCapsConfig,
     mint_nonce_problem,
@@ -407,7 +410,8 @@ def test_the_binding_is_readable_through_a_public_predicate(
 ) -> None:
     """``is_caller_principal_bound`` answers whether an identity has EVER been
     claimed — the fact the require-class routes branch on (plan U6). A miss is
-    not cached: an identity bound after a False answer reads True at once."""
+    cached, and this service's own claim replaces it: an identity bound after a
+    False answer reads True at once."""
     identity = caller_principal_identity(_sid())
     assert svc.is_caller_principal_bound(identity) is False
     _claim(svc, identity, _nonce())
@@ -630,18 +634,131 @@ def test_sqlite_binding_survives_a_restart_through_the_durable_tier(tmp_path: Pa
         assert fresh.claim_caller_principal(identity=identity, mint_nonce=nonce) == principal
 
 
-def test_a_miss_is_not_cached_so_a_later_binding_is_found(registry) -> None:
-    """Two services over one store: the first looks the identity up before
-    anyone has claimed it, the second then claims it. The first must now find
-    the binding — the cache holds positive answers only, since a binding is
-    never rebound but an unclaimed identity can be claimed at any moment."""
-    reader, claimer = CoordinatorService(registry), CoordinatorService(registry)
-    identity = uuid4()
-    assert _refusal(reader, identity, "never-minted") == CALLER_PRINCIPAL_FOREIGN_REASON
+def _record_store_reads(registry, monkeypatch: pytest.MonkeyPatch) -> list[UUID]:
+    """Record every durable-store read of a binding (``get_caller_principal``)."""
+    reads: list[UUID] = []
+    real = registry.get_caller_principal
 
-    principal = _claim(claimer, identity, _nonce())
+    def recording(identity: UUID) -> str | None:
+        reads.append(identity)
+        return real(identity)
 
-    reader.validate_caller_principal(identity=identity, principal=principal)
+    monkeypatch.setattr(registry, "get_caller_principal", recording)
+    return reads
+
+
+def test_a_miss_is_cached_and_this_services_own_claim_replaces_it(
+    svc: CoordinatorService, registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's UNBOUND answer is cached (the negative tier): a second
+    lookup reads nothing, so a client that never claims (KTD15) stops costing a
+    store read per request. It holds only until THIS service binds the
+    identity — the one writer of bindings in a coordinator process — and the
+    claim replaces it: from the next lookup on, the identity is bound, an
+    absent principal is refused as absent, and the bound one is admitted.
+
+    Two services binding into one store is outside that model and is not what
+    this cache is for: the coordinator holds the workspace lock and is the only
+    process that claims."""
+    identity = caller_principal_identity(_sid())
+    reads = _record_store_reads(registry, monkeypatch)
+    assert svc.is_caller_principal_bound(identity) is False
+    assert svc.is_caller_principal_bound(identity) is False
+    assert reads == [identity], "the UNBOUND answer was not cached"
+    assert svc.is_caller_principal_bound(identity, cached_only=True) is False
+    assert reads == [identity]
+
+    principal = _claim(svc, identity, _nonce())
+    assert svc.is_caller_principal_bound(identity) is True
+    assert _refusal(svc, identity, None) == CALLER_PRINCIPAL_ABSENT_REASON
+    svc.validate_caller_principal(identity=identity, principal=principal)
+    assert reads == [identity], "the claim, not a re-read, replaced the cached answer"
+
+
+def test_cached_only_never_reads_the_store(
+    svc: CoordinatorService, registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``cached_only`` is how the coordinator's admission gate keeps the store
+    read off the request thread: where the cache cannot answer it raises
+    :class:`CallerPrincipalUncached` — for the bound predicate and for a
+    presented principal alike — and reads nothing; an absent principal on a
+    known-bound identity is still refused, since that needs no read."""
+    identity = caller_principal_identity(_sid())
+    reads = _record_store_reads(registry, monkeypatch)
+    with pytest.raises(CallerPrincipalUncached):
+        svc.is_caller_principal_bound(identity, cached_only=True)
+    with pytest.raises(CallerPrincipalUncached):
+        svc.validate_caller_principal(identity=identity, principal="p" * 43, cached_only=True)
+    assert reads == []
+
+    _claim(svc, identity, _nonce())
+    assert svc.is_caller_principal_bound(identity, cached_only=True) is True
+    with pytest.raises(CallerPrincipalRefused) as refused:
+        svc.validate_caller_principal(identity=identity, principal=None, cached_only=True)
+    assert refused.value.reason == CALLER_PRINCIPAL_ABSENT_REASON
+    assert reads == []
+
+
+def _bind_that_lands_then_raises(registry, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store's bind commit and THEN raise — the one bind outcome the
+    service cannot read back, so the claim cannot write the principal it bound
+    into its cache."""
+    real = registry.bind_caller_principal
+
+    def lands_then_raises(identity: UUID, principal: str, mint_nonce: str):
+        real(identity, principal, mint_nonce)
+        raise RuntimeError("injected: the bind landed, then the call failed")
+
+    monkeypatch.setattr(registry, "bind_caller_principal", lands_then_raises)
+
+
+def test_a_bind_attempt_that_raises_drops_a_cached_unbound_answer(
+    svc: CoordinatorService, registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raised bind does not prove nothing landed, so the cached UNBOUND
+    answer is dropped and the next lookup reads the store. Kept, it would admit
+    the claimed identity's absent-principal requests as an older client's."""
+    identity = caller_principal_identity(_sid())
+    assert svc.is_caller_principal_bound(identity) is False
+    _bind_that_lands_then_raises(registry, monkeypatch)
+    with pytest.raises(RuntimeError, match="injected"):
+        _claim(svc, identity, _nonce())
+
+    assert svc.is_caller_principal_bound(identity) is True
+    assert _refusal(svc, identity, None) == CALLER_PRINCIPAL_ABSENT_REASON
+
+
+def test_an_unbound_answer_read_before_a_bind_is_not_cached_after_it(
+    svc: CoordinatorService, registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store read happens outside the service's lock, so a bind can finish
+    between a lookup's read and its caching. A lookup does not cache the
+    UNBOUND answer it read once a bind attempt has finished since it began. The
+    interleaving is forced deterministically: the lookup's read returns
+    "unbound", then a bind lands (and raises, so the claim cannot correct the
+    cache itself), then the lookup resumes. The next lookup must see the
+    binding; a cached stale answer would admit the claimed identity's absent-
+    principal requests from then on."""
+    identity = caller_principal_identity(_sid())
+    real_read = registry.get_caller_principal
+    raced: list[bool] = []
+
+    def read_then_race_a_bind(read_identity: UUID) -> str | None:
+        answer = real_read(read_identity)
+        if not raced:
+            raced.append(True)
+            assert answer is None
+            _bind_that_lands_then_raises(registry, monkeypatch)
+            with pytest.raises(RuntimeError, match="injected"):
+                _claim(svc, identity, _nonce())
+        return answer
+
+    monkeypatch.setattr(registry, "get_caller_principal", read_then_race_a_bind)
+    svc.is_caller_principal_bound(identity)  # the raced lookup; its own answer is concurrent
+    assert raced == [True], "the race was never forced"
+
+    assert svc.is_caller_principal_bound(identity) is True, (
+        "the UNBOUND answer read before the bind was cached after it")
 
 
 def test_in_memory_binding_is_process_scoped_as_declared() -> None:

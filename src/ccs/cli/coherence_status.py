@@ -24,17 +24,26 @@ they reach a real agent session.
 from __future__ import annotations
 
 import argparse
+import secrets
 import shutil
 import urllib.error
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
+    NODE_BACKEND,
+    CoordinatorEndpoint,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
+    coordinator_backend,
     err,
     get,
     http_status_from_error,
+    post,
+    principal_refusal_reason,
     resolve_endpoint,
 )
 
@@ -150,9 +159,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     """KTD-J (Unit 8): end-to-end smoke against a live coordinator.
 
-    Two synthetic sessions A and B drive the stale-read warning path:
+    Two synthetic sessions A and B, fresh on every run, drive the stale-read
+    warning path:
 
-    1. A pre-reads ``plan.md`` (tracked by default policy) — fresh, seeds v1.
+    1. A pre-reads ``plan.md`` (tracked by default policy) — fresh. In a new
+       workspace this read seeds v1; on a later run A is a first observer of
+       the artifact an earlier run registered, which is answered stale and
+       grants A a view, so A reads once more and that read must be fresh.
     2. B pre-edits ``plan.md`` — acquires EXCLUSIVE.
     3. B post-edits — commits v2, releases EXCLUSIVE.
     4. A pre-reads ``plan.md`` again — stale warning fires.
@@ -165,11 +178,6 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     ``agent-coherence-status --self-test``") gives the operator an
     actionable error rather than a stack trace.
     """
-    import uuid as _uuid
-
-    from ccs.cli._coherence_client import post_with_stored_principal
-    from ccs.core.exceptions import CallerPrincipalRefused
-
     try:
         endpoint = resolve_endpoint(root)
     except CoordinatorUnavailable as exc:
@@ -180,34 +188,42 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         )
         return 3
 
-    # Deterministic-but-distinct UUIDs so re-runs against the same
-    # workspace produce predictable agent-name surfaces.
-    ns = _uuid.UUID("11111111-2222-4333-8444-555555555555")
-    sid_a = str(_uuid.uuid5(ns, "self-test-A"))
-    sid_b = str(_uuid.uuid5(ns, "self-test-B"))
+    # Two FRESH synthetic sessions per run. One process drives both from start
+    # to finish, so each claims its caller principal once, with a nonce
+    # generated here, and holds both in memory for the run (a long-lived
+    # caller, plan KTD5): nothing is stored under .coherence/, so a run never
+    # depends on what an earlier run left there — deleting the
+    # caller-principal-* files or resetting state.db cannot break a later run
+    # — and neither value is ever printed. pre-edit and post-edit require the
+    # principal once a session is bound.
+    sid_a, sid_b = str(uuid.uuid4()), str(uuid.uuid4())
     path = "plan.md"  # part of DEFAULT_TRACKED_PATTERNS
+    principals: dict[str, str | None] = {}
+    for sid in (sid_a, sid_b):
+        claimed, principals[sid] = _claim_self_test_principal(endpoint, root, sid)
+        if not claimed:
+            return 3
 
-    # Each synthetic session presents its caller principal exactly as a hook
-    # does (the same client path): stored under .coherence/ and claimed once,
-    # so a re-run against the same workspace re-presents the principal its
-    # first run obtained (pre-edit and post-edit require one) — and a stored
-    # principal the coordinator no longer holds (state.db was reset) is
-    # recovered with the session's stored nonce rather than failing every run.
     def _step(name: str, body: dict[str, Any]) -> dict[str, Any] | None:
+        headers = caller_principal_headers(principals[body["session_id"]])
         try:
-            return post_with_stored_principal(endpoint, root, name, body, report=err)
-        except CallerPrincipalRefused as exc:
-            err(f"--self-test: {name} refused: {exc}")
-            return None
+            return post(endpoint, name, body, extra_headers=headers)
         except urllib.error.HTTPError as exc:
-            err(f"--self-test: {name} returned HTTP {exc.code}")
+            reason = principal_refusal_reason(exc)
+            if reason is not None:
+                err(f"--self-test: {name} refused the caller principal ({reason})")
+            else:
+                err(f"--self-test: {name} returned HTTP {exc.code}")
             return None
 
-    # Step 1 — A's first read seeds the artifact.
+    # Step 1 — A's first read seeds the artifact, or (a later run) observes
+    # the one an earlier run seeded; either way A then holds a current view.
     r1 = _step("/hooks/pre-read", {
         "session_id": sid_a, "path": path,
         "content_hash": "a" * 64,
     })
+    if r1 is not None and r1.get("status") != "fresh":
+        r1 = _step("/hooks/pre-read", {"session_id": sid_a, "path": path})
     if r1 is None or r1.get("status") != "fresh":
         err(f"--self-test: expected fresh on first pre-read, got {r1!r}")
         return 3
@@ -288,6 +304,26 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
             flush=True,
         )
     return 0
+
+
+def _claim_self_test_principal(
+    endpoint: CoordinatorEndpoint, root: Path, session_id: str
+) -> tuple[bool, str | None]:
+    """Claim ``session_id``'s caller principal for the self-test, presenting a
+    nonce generated for this claim alone: ``(True, principal)`` when bound,
+    ``(True, None)`` when the coordinator issues none (a 404, or a Node
+    coordinator, which is not asked — as the hook client does not ask it), and
+    ``(False, None)`` after reporting a claim that did not bind. The session
+    is fresh, so a refusal means something else claimed it first."""
+    if coordinator_backend(root) == NODE_BACKEND:
+        return True, None
+    claim = claim_caller_principal(endpoint, session_id, secrets.token_urlsafe(32))
+    if claim.outcome == "bound":
+        return True, claim.principal
+    if claim.outcome == "unsupported":
+        return True, None
+    err(f"--self-test: caller principal not obtained ({claim.outcome}: {claim.detail})")
+    return False, None
 
 
 def _terminal_columns() -> int:

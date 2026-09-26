@@ -2935,24 +2935,43 @@ def test_a_refused_principal_is_re_claimed_with_the_same_nonce_and_retried_once(
         stop_coordinator(tmp_path)
 
 
+def _http_error(path: str, status: int, body: object, phrase: str = "Bad Request") -> Exception:
+    """An ``HTTPError`` for ``path`` carrying ``body`` as its JSON answer and
+    ``phrase`` as the status line's reason phrase."""
+    import urllib.error
+
+    raw = io.BytesIO(json.dumps(body).encode())
+    return urllib.error.HTTPError(path, status, phrase, {}, raw)  # type: ignore[arg-type]
+
+
+def _answer_route(
+    monkeypatch: pytest.MonkeyPatch, route: str, sent: list[str], answer: object
+) -> None:
+    """The n-th request to ``route`` (counting from 0) raises ``answer(n)``, or
+    is forwarded when that is ``None``; every other request is forwarded.
+    Records each route sent."""
+    real_post = coherent_volume_module._coordinator_post
+    count = {"n": 0}
+
+    def answering(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        sent.append(path)
+        if path == route:
+            error = answer(count["n"])  # type: ignore[operator]
+            count["n"] += 1
+            if error is not None:
+                raise error
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", answering)
+
+
 def _refuse_route(
     monkeypatch: pytest.MonkeyPatch, route: str, reason: str, sent: list[str]
 ) -> None:
     """Every request to ``route`` is refused with the typed principal refusal;
     every other request is forwarded. Records each route sent."""
-    import io as _io
-    import urllib.error
-
-    real_post = coherent_volume_module._coordinator_post
-
-    def refusing(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
-        sent.append(path)
-        if path == route:
-            body = json.dumps({"error": f"refused ({reason})", "reason": reason}).encode()
-            raise urllib.error.HTTPError(path, 400, "Bad Request", {}, _io.BytesIO(body))  # type: ignore[arg-type]
-        return real_post(endpoint, path, payload, **kwargs)
-
-    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refusing)
+    body = {"error": f"refused ({reason})", "reason": reason}
+    _answer_route(monkeypatch, route, sent, lambda _n: _http_error(route, 400, body))
 
 
 def test_a_refusal_the_same_nonce_cannot_cure_raises_the_typed_refusal(
@@ -2996,10 +3015,13 @@ def test_a_session_bound_under_another_nonce_is_reported_and_never_re_claimed(
     caplog: pytest.LogCaptureFixture, on_error: str,
 ) -> None:
     """The volume no longer holds the nonce its session was bound with, so its
-    claim is refused as ``caller_principal_claimed``: the refused request is
-    reported (strict: the typed refusal; degrade: warned once and counted)
-    and the volume stops — the next refusal does NOT claim again, so a
-    permanently refused session costs no round trip per request."""
+    claim is refused as ``caller_principal_claimed``: the refused request
+    raises the typed refusal in BOTH ``on_error`` modes — a principal refusal
+    is the coordinator's definite answer, not an infrastructure failure, so
+    degrade mode does not write the bytes to disk unrecorded as it would
+    around an unreachable coordinator — and the volume stops: the next
+    refusal does NOT claim again, so a permanently refused session costs no
+    round trip per request."""
     from ccs.core.exceptions import CallerPrincipalRefused
 
     rel = "data/shared.txt"
@@ -3017,21 +3039,288 @@ def test_a_session_bound_under_another_nonce_is_reported_and_never_re_claimed(
         with warnings.catch_warnings(record=True) as warned:
             warnings.simplefilter("always")
             for _ in range(2):
-                if on_error == "strict":
-                    with pytest.raises(CallerPrincipalRefused) as raised:
-                        vol.write(rel, b"v2")
-                    assert raised.value.reason == "caller_principal_absent"
-                    raised_text += str(raised.value)
-                else:
+                with pytest.raises(CallerPrincipalRefused) as raised:
                     vol.write(rel, b"v2")
+                assert raised.value.reason == "caller_principal_absent"
+                raised_text += str(raised.value)
         assert claims == [vol.session_id]
-        if on_error == "degrade":
-            degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
-            assert len(degraded) == 1, "warned once"
-            assert vol.degradation_count >= 2, "every refusal is counted"
+        assert (tmp_path / rel).read_bytes() == b"v1", "nothing was written unrecorded"
+        assert not [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert vol.degradation_count == 0, "a refusal is an answer, not a degradation"
         _assert_no_secret_in(
             raised_text + caplog.text + " ".join(str(w.message) for w in warned),
             bound, "Z" * 43,
         )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a principal refusal is an answer, in both on_error modes -----------------
+
+_REFUSED_OPERATIONS = {
+    "read": lambda vol, rel, version: vol.read(rel),
+    "write": lambda vol, rel, version: vol.write(rel, b"v2"),
+    "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda _cur: b"v2"),
+    "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"v2"),
+    "atomic_publish": lambda vol, rel, version: vol.atomic_publish([(rel, version, b"v2")]),
+}
+
+
+@pytest.mark.parametrize(
+    ("presented", "operation"),
+    [
+        ("foreign", "read"),
+        ("foreign", "write"),
+        ("foreign", "write_cas"),
+        ("foreign", "write_cas_at"),
+        ("foreign", "atomic_publish"),
+        # An absent principal is refused only on the require class; the read
+        # routes admit it, so the refusal lands on the commit.
+        ("absent", "write"),
+        ("absent", "write_cas"),
+        ("absent", "write_cas_at"),
+        ("absent", "atomic_publish"),
+    ],
+)
+def test_a_refusal_recovery_cannot_cure_raises_the_typed_refusal_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, presented: str, operation: str
+) -> None:
+    """Degrade mode, a session bound under a nonce this volume no longer
+    holds: every operation that meets the refusal raises
+    :class:`CallerPrincipalRefused` with the wire reason. Degrade governs an
+    unreachable or timed-out coordinator; a refusal is the coordinator's
+    definite answer, so it is never softened into one — not a
+    ``CommitUnconfirmed`` (which sends the caller into unknown-outcome
+    reconciliation for a request that changed nothing), not a
+    ``CasVersionConflict`` against a degraded version 0, not a degraded read,
+    and never bytes written to disk unrecorded."""
+    from ccs.core.exceptions import CallerPrincipalRefused, CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        _data, version = vol.read_with_version(rel)
+        vol._mint_nonce = "Z" * 43  # not the nonce the session was bound with
+        vol._principal = "X" * 43 if presented == "foreign" else None
+
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            with pytest.raises(CallerPrincipalRefused) as raised:
+                _REFUSED_OPERATIONS[operation](vol, rel, version)
+
+        assert raised.value.reason == f"caller_principal_{presented}"
+        assert not isinstance(raised.value, (CommitUnconfirmed, CasVersionConflict))
+        assert (tmp_path / rel).read_bytes() == b"v1"
+        assert vol.degradation_count == 0
+        assert not [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_refused_acquire_leaves_no_grant_for_a_re_mint_to_release(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A principal refusal of ``pre-edit`` proves no grant was taken — the
+    coordinator refuses before any mutation — exactly as an explicit deny
+    does, so the incarnation is not recorded as holding one. Otherwise the
+    next re-mint spends a ``session-stop`` releasing a grant that never
+    existed. Control: an acquire the coordinator ADMITS is released by it."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        bound, nonce = vol._principal, vol._mint_nonce
+        vol._mint_nonce, vol._principal = "Z" * 43, None
+        with pytest.raises(CallerPrincipalRefused):
+            vol.write(rel, b"v2")
+        vol._mint_nonce, vol._principal = nonce, bound
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+
+        vol.reacquire(rel)
+        assert "/hooks/session-stop" not in {r for r, _p in sent}
+
+        vol.write(rel, b"v2")
+        sent.clear()
+        vol.reacquire(rel)
+        assert "/hooks/session-stop" in {r for r, _p in sent}, "control: a real grant is released"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_request_refused_again_after_recovery_is_retried_exactly_once(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """Refused, recovered (the claim with the held nonce returns a principal
+    that differs from the one presented), and refused AGAIN: the volume
+    retries the request exactly ONCE and makes exactly ONE claim, then raises
+    the typed refusal saying it was refused again — in both ``on_error``
+    modes. A client that kept re-claiming would turn one refused request
+    into an unbounded claim/request loop."""
+    from ccs.cli._coherence_client import PRINCIPAL_REFUSED_AGAIN, PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        claims: list[str] = []
+
+        def always_a_new_principal(_endpoint: object, _sid: str, nonce: str) -> PrincipalClaim:
+            claims.append(nonce)
+            return PrincipalClaim("bound", principal=f"{len(claims):043d}")
+
+        monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", always_a_new_principal)
+        sent: list[str] = []
+        _refuse_route(monkeypatch, "/hooks/pre-edit", "caller_principal_foreign", sent)
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+
+        assert sent.count("/hooks/pre-edit") == 2, sent
+        assert claims == [vol._mint_nonce]
+        assert raised.value.reason == "caller_principal_foreign"
+        assert PRINCIPAL_REFUSED_AGAIN in str(raised.value)
+        assert (tmp_path / rel).read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a reason that is not a string is not a principal refusal -----------------
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize(
+    "reason",
+    [["caller_principal_foreign"], {"reason": "caller_principal_absent"}],
+    ids=["list", "object"],
+)
+def test_a_400_whose_reason_is_not_a_string_is_an_ordinary_failed_request(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    on_error: str, reason: object,
+) -> None:
+    """A 400 whose JSON ``reason`` is not a string — a list or an object, as a
+    proxy or gateway in front of the coordinator might send — is not a
+    caller-principal refusal. Classifying it used to raise ``TypeError`` out
+    of the volume (an unhashable value reached a set-membership test), past
+    degrade mode entirely. It is an ordinary rejected request, routed through
+    ``on_error``: strict raises ``CoherenceError``; degrade warns and carries
+    on as it does for any other rejected acquire. No recovery claim is made."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        claims: list[str] = []
+        _count_claims(monkeypatch, claims)
+        sent: list[str] = []
+        body = {"error": "bad request", "reason": reason}
+        _answer_route(
+            monkeypatch, "/hooks/pre-edit", sent,
+            lambda _n: _http_error("/hooks/pre-edit", 400, body),
+        )
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            try:
+                vol.write(rel, b"v2")
+            except CoherenceError as exc:
+                raised: CoherenceError | None = exc
+            else:
+                raised = None
+
+        assert sent.count("/hooks/pre-edit") == 1
+        assert claims == []
+        if on_error == "strict":
+            assert raised is not None and not isinstance(raised, CallerPrincipalRefused)
+            assert (tmp_path / rel).read_bytes() == b"v1"
+        else:
+            assert [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+            assert not isinstance(raised, CallerPrincipalRefused)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- no coordinator-supplied text reaches what the volume reports -------------
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("scenario", ["the_claim_echoes", "the_retry_echoes"])
+def test_no_coordinator_supplied_text_reaches_what_a_volume_raises_warns_or_logs(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, on_error: str, scenario: str,
+) -> None:
+    """A coordinator that echoes the nonce and principal it was sent in every
+    free-text field — a refusal's ``error`` and ``detail``, a claim's
+    ``reason``, ``detail`` and ``error``, and the status line's reason phrase
+    — cannot get either into what the volume raises, warns or logs on the
+    claim and recovery paths. Only a reason from the frozen vocabulary is
+    repeated (anything else is reported as ``unrecognised``), and a failed
+    HTTP request is reported by its status code.
+
+    - ``the_claim_echoes``: the read is refused, and the recovery claim's
+      answer is not a confirmation: its reason is the echo.
+    - ``the_retry_echoes``: the recovery claim binds a new principal, and the
+      retried read is answered 500 with the echo."""
+    from ccs.cli import _coherence_client
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        adopted = "Q" * 43
+        held = (vol._principal, vol._mint_nonce, adopted)
+        echo = " ".join(held)  # type: ignore[arg-type]
+        real_post = _coherence_client.post
+
+        def claim_echoes(endpoint: object, path: str, body: dict, **kwargs: object) -> object:
+            if path != "/principal/claim":
+                return real_post(endpoint, path, body, **kwargs)  # type: ignore[arg-type]
+            if scenario == "the_retry_echoes":
+                return {"ok": True, "principal": adopted}
+            return {"ok": False, "reason": echo, "detail": echo, "error": echo}
+
+        monkeypatch.setattr(_coherence_client, "post", claim_echoes)
+        refusal = {"error": echo, "detail": echo, "reason": "caller_principal_foreign"}
+        answers = [
+            _http_error("/hooks/pre-read", 400, refusal, phrase=echo),
+            _http_error("/hooks/pre-read", 500, {"error": echo, "detail": echo}, phrase=echo),
+        ]
+        sent: list[str] = []
+        _answer_route(monkeypatch, "/hooks/pre-read", sent, lambda n: answers[n])
+
+        reported: list[str] = []
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            try:
+                vol.read(rel)
+            except CoherenceError as exc:
+                reported.append(f"{type(exc).__name__}: {exc}")
+        reported += [str(w.message) for w in warned]
+        text = " ".join(reported) + caplog.text
+
+        assert reported, "control: the scenario reported something"
+        if scenario == "the_claim_echoes":
+            assert "unrecognised" in text
+            assert sent.count("/hooks/pre-read") == 1
+        else:
+            assert "HTTP 500" in text
+            assert sent.count("/hooks/pre-read") == 2
+        assert not (scenario == "the_retry_echoes" and "CallerPrincipalRefused" in text)
+        if scenario == "the_claim_echoes":
+            assert any(r.startswith(CallerPrincipalRefused.__name__) for r in reported)
+        _assert_no_secret_in(text, *held)
     finally:
         stop_coordinator(tmp_path)

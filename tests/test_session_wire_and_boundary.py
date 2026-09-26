@@ -940,7 +940,7 @@ def test_a_degraded_mint_reads_as_failure_and_carries_no_principal(
     with its persisted nonce (R20), never from a degraded body."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def _timeout(fn, abort=None):
+    def _timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", _timeout)

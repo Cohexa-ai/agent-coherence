@@ -672,8 +672,10 @@ class SubstrateCoordinatorSession:
             reason = principal_refusal_reason(exc)
             if reason is not None:
                 return _Sent(None, reason)
+            # The status code only: the reason phrase and the body are the
+            # coordinator's text, which this client never repeats.
             raise unknown(
-                f"coordinator {endpoint_path} failed (fail-closed): {exc}"
+                f"coordinator {endpoint_path} failed (fail-closed): HTTP {exc.code}"
             ) from exc
         except CoordinatorUnavailable as exc:
             raise unknown(
@@ -875,6 +877,27 @@ class CoordinatedSubstrate:
         return self._reconcile_unknown(pending)
 
     def _drive_bump(self, pending: _PendingCommit, *, converged: bool = False) -> CommitResult:
+        """The coordinator leg, reached only after the substrate write landed.
+
+        A caller-principal refusal here is reported through the bump leg's
+        unknown, not raised bare: the refusal is definite (the coordinator
+        recorded nothing of this write), but the substrate already holds the
+        new bytes, so the commit is in exactly the state Case 1 leaves — and
+        the refusal's own recovery, resending a request that "changed nothing",
+        would re-drive a landed write. ``CommitUnconfirmed`` carries the
+        recovery that is right (re-read; retry only if absent; never re-drive),
+        its message says what happened, and the typed refusal is its cause."""
+        try:
+            return self._bump(pending, converged=converged)
+        except CallerPrincipalRefused as refusal:
+            raise CommitUnconfirmed(
+                f"the substrate write to {pending.artifact_ref!r} landed, but the "
+                "coordinator recorded nothing of it: it refused the caller principal "
+                f"({refusal.reason}), so no version was bumped and no peer invalidated. "
+                "Not re-driven; re-read before retrying."
+            ) from refusal
+
+    def _bump(self, pending: _PendingCommit, *, converged: bool) -> CommitResult:
         try:
             result = self._coordinator.commit_cas(
                 pending.artifact_ref,

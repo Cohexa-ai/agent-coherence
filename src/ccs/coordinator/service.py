@@ -364,6 +364,17 @@ def _same_secret(expected: str, presented: str) -> bool:
     return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
 
 
+class CallerPrincipalUncached(Exception):
+    """A ``cached_only`` caller-principal lookup that the service's in-process
+    cache cannot answer.
+
+    Not a refusal, and never on the wire: it tells the caller that the answer
+    needs a read of the registry's durable store, so the coordinator's
+    admission gate can make that read under its handler watchdog instead of on
+    the request thread (caller-principal plan, U6). Repeating the same call
+    without ``cached_only`` resolves it. Carries no principal."""
+
+
 class SessionView:
     """A read-only view of a live snapshot session's PINNED cut, handed to the
     ``effect_gate`` ``decide`` callback (SB-17 / TX-1, Unit 6 / EO-5).
@@ -504,16 +515,28 @@ class CoordinatorService:
         # service), and this lock is never held together with
         # ``_session_lock``.
         self._workspace_mint_lock = threading.Lock()
-        # Caller-principal FAST tier (caller-principal plan, U4): ``{identity:
-        # principal}``, a POSITIVE-ONLY cache in front of the registry's
-        # ``caller_principals`` store (the durable tier). Safe to cache because a
-        # binding is never rebound; a miss is never cached, so an identity bound
-        # after a miss is still found. Deliberately separate from every session
-        # map above and from ``_session_lock``: a principal's lifetime is
-        # independent of any snapshot session (R4). Its own lock, never held
-        # across a registry call (lock order unchanged: service → registry).
+        # Caller-principal FAST tier (caller-principal plan, U4 and U6), in front
+        # of the registry's ``caller_principals`` store (the durable tier):
+        # ``{identity: principal}`` for a BOUND identity, and ``{identity: None}``
+        # for one the durable store answered UNBOUND — the negative tier, which
+        # is what lets a client that never claims (an older one, KTD15) be
+        # admitted by the require-class routes without a registry read on every
+        # request. Both are safe to keep because a binding is never rebound and
+        # this service is the only writer of bindings in a coordinator process
+        # (it binds only in :meth:`claim_caller_principal`): a bound entry never
+        # goes stale, and an UNBOUND one goes stale only when this service binds
+        # the identity — which replaces it (see :meth:`_record_bind_attempt`).
+        # A second writer of bindings into the same store would not be seen
+        # here; there is none. ``_caller_principal_binds`` counts finished bind
+        # attempts, so a lookup whose durable read raced one never caches the
+        # UNBOUND answer it read before that bind. Deliberately separate from
+        # every session map above and from ``_session_lock``: a principal's
+        # lifetime is independent of any snapshot session (R4). Its own lock,
+        # never held across a registry call (lock order unchanged: service →
+        # registry).
         self._caller_principal_lock = threading.Lock()
-        self._caller_principals: dict[UUID, str] = {}
+        self._caller_principals: dict[UUID, str | None] = {}
+        self._caller_principal_binds = 0
 
     def register_artifact(
         self,
@@ -1406,10 +1429,15 @@ class CoordinatorService:
         if problem is not None:
             raise ValueError(problem)
         candidate = secrets.token_urlsafe(_CALLER_PRINCIPAL_BYTES)
-        with self.registry.abort_guard(abort):
-            principal, bound_nonce = self.registry.bind_caller_principal(
-                identity, candidate, mint_nonce
-            )
+        try:
+            with self.registry.abort_guard(abort):
+                principal, bound_nonce = self.registry.bind_caller_principal(
+                    identity, candidate, mint_nonce
+                )
+        except BaseException:
+            self._record_bind_attempt(identity, None)
+            raise
+        self._record_bind_attempt(identity, principal)
         if not _same_secret(bound_nonce, mint_nonce):
             raise CallerPrincipalRefused(
                 CALLER_PRINCIPAL_CLAIMED_REASON,
@@ -1417,11 +1445,29 @@ class CoordinatorService:
                 "different mint nonce; a claim never rebinds it, and only a retry "
                 "of the original claim (presenting its nonce) re-obtains it",
             )
-        with self._caller_principal_lock:
-            self._caller_principals[identity] = principal
         return principal
 
-    def validate_caller_principal(self, *, identity: UUID, principal: object) -> None:
+    def _record_bind_attempt(self, identity: UUID, bound_principal: str | None) -> None:
+        """Bring the cache up to date with a finished bind attempt on
+        ``identity`` — the negative tier's one way to go stale.
+
+        ``bound_principal`` is what the store now binds to ``identity`` (this
+        claim's or an earlier one's); it REPLACES whatever is cached, above all
+        a cached UNBOUND answer, so a claimed identity's absent-principal
+        request is refused from the first request after the claim. ``None``
+        means the attempt raised, which does not prove nothing landed: a cached
+        UNBOUND answer is dropped, and the next lookup reads the store. The
+        attempt is counted either way (see ``_caller_principal_binds``)."""
+        with self._caller_principal_lock:
+            self._caller_principal_binds += 1
+            if bound_principal is not None:
+                self._caller_principals[identity] = bound_principal
+            elif identity in self._caller_principals and self._caller_principals[identity] is None:
+                del self._caller_principals[identity]
+
+    def validate_caller_principal(
+        self, *, identity: UUID, principal: object, cached_only: bool = False
+    ) -> None:
         """Check that ``principal`` is the one bound to ``identity`` (R1).
 
         Returns on a match. Raises :class:`CallerPrincipalRefused` with
@@ -1433,13 +1479,15 @@ class CoordinatorService:
 
         Resolution has two tiers, like :meth:`_validate_session_owner`: the
         in-process cache, then the registry's durable store — so a binding made
-        before a coordinator restart still validates after it (sqlite)."""
+        before a coordinator restart still validates after it (sqlite).
+        ``cached_only`` stops at the first tier: when the cache cannot answer it
+        raises :class:`CallerPrincipalUncached` instead of reading the store."""
         if principal is None or principal == "":
             raise CallerPrincipalRefused(
                 CALLER_PRINCIPAL_ABSENT_REASON,
                 "the request names an identity but presents no caller principal",
             )
-        bound = self._bound_caller_principal(identity)
+        bound = self._bound_caller_principal(identity, cached_only=cached_only)
         if bound is None or not isinstance(principal, str) or not _same_secret(
             bound, principal
         ):
@@ -1449,30 +1497,46 @@ class CoordinatorService:
                 "identity the request names",
             )
 
-    def is_caller_principal_bound(self, identity: UUID) -> bool:
+    def is_caller_principal_bound(self, identity: UUID, *, cached_only: bool = False) -> bool:
         """Whether ``identity`` has ever been claimed — a principal is bound to
         it, in the cache or the durable store.
 
         The fact the require-class routes branch on when a request presents NO
         principal (caller-principal plan, U6 / R16): an identity nobody has
         claimed belongs to a caller that predates the principal and is admitted
-        as before, while a bound one is refused as absent. Never cached on a
-        miss, so an identity bound after a False answer reads True at once. The
+        as before, while a bound one is refused as absent. A False answer from
+        the store is cached (the negative tier), and this service's own claim of
+        the identity replaces it, so an identity bound after a False answer
+        reads True at once. ``cached_only`` raises
+        :class:`CallerPrincipalUncached` where the store would be read. The
         principal itself never leaves the service through here."""
-        return self._bound_caller_principal(identity) is not None
+        return self._bound_caller_principal(identity, cached_only=cached_only) is not None
 
-    def _bound_caller_principal(self, identity: UUID) -> str | None:
-        """The principal bound to ``identity``: the cache, else the durable
-        store (a hit is cached — bindings are never rebound; a miss is not)."""
+    def _bound_caller_principal(
+        self, identity: UUID, *, cached_only: bool = False
+    ) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when it is unbound:
+        the cache, else the durable store, whose answer is cached either way —
+        a bound one because bindings are never rebound, an UNBOUND one until
+        this service binds the identity (:meth:`_record_bind_attempt`)."""
         with self._caller_principal_lock:
-            cached = self._caller_principals.get(identity)
-        if cached is not None:
-            return cached
+            if identity in self._caller_principals:
+                return self._caller_principals[identity]
+            if cached_only:
+                raise CallerPrincipalUncached(
+                    "the caller-principal cache holds no answer for this identity"
+                )
+            binds_before = self._caller_principal_binds
         durable = self.registry.get_caller_principal(identity)
-        if durable is not None:
-            with self._caller_principal_lock:
+        with self._caller_principal_lock:
+            if durable is not None:
                 self._caller_principals[identity] = durable
-        return durable
+            elif self._caller_principal_binds == binds_before:
+                # setdefault, not assignment: a lookup that read the store after
+                # a bind may already have cached the bound principal, and this
+                # older UNBOUND answer must not replace it.
+                self._caller_principals.setdefault(identity, None)
+            return self._caller_principals.get(identity, durable)
 
     @staticmethod
     def _session_committer_id(session_token: str) -> UUID:
