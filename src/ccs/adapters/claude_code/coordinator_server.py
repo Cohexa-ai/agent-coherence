@@ -601,12 +601,19 @@ def _attributed_within_deadline(
     never claims (KTD15) would wait on registry contention with no deadline on
     every require-class route — pre-edit included.
 
-    Returns the agent id, or ``None`` after writing the answer itself: the
-    watchdog pool's queue-overflow 503, or — the lookup not done by the
-    deadline — exactly the route's degraded envelope
+    Returns the agent id, or ``None`` after writing the answer itself, one of
+    three: the watchdog pool's queue-overflow 503; when the lookup is not done
+    by the deadline, exactly the route's degraded envelope
     (:data:`_CALLER_GATE_DEGRADED_RESPONSE`), counted as a watchdog timeout
-    like a timed-out work body. Raises :class:`CallerPrincipalRefused` for a
-    refusal decided within the deadline, which stays an HTTP 400."""
+    like a timed-out work body; and when the lookup RAISED anything but a
+    refusal — the registry read failing once ``busy_timeout`` elapsed, say —
+    exactly the route's internal-error envelope, logged as a failed work body
+    is (:func:`_answer_handler_error`). That last arm is what keeps the gate
+    and the body on one error contract: were the raise left to the
+    dispatcher's 500, a degrade-mode ``CoherentVolume`` would read the answer
+    as "no coordinator" and write with no grant, where the typed 200 raises in
+    both of its modes. Raises :class:`CallerPrincipalRefused` for a refusal
+    decided within the deadline, which stays an HTTP 400."""
     service = coordinator.service
     try:
         return presented.attributed_agent_id(service, cached_only=True)
@@ -616,18 +623,29 @@ def _attributed_within_deadline(
         return None
     deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
     req._watchdog_deadline = deadline
+    method, path = req._route_key
     try:
         return coordinator.run_admission_lookup(
             lambda: presented.attributed_agent_id(service), deadline=deadline
         )
+    except CallerPrincipalRefused:
+        raise
     except FuturesTimeout:
         coordinator.increment_watchdog_timeout()
-        method, path = req._route_key
         logger.warning(
             "caller-principal lookup on %s %s timed out after %ss; degrading",
             method, path, HANDLER_TIMEOUT_SEC,
         )
         req._json(200, _CALLER_GATE_DEGRADED_RESPONSE[req._route_key])
+        return None
+    except Exception as exc:
+        # Ordered after the refusal and the timeout: both are Exceptions too
+        # (the futures timeout is the builtin TimeoutError since 3.11). The
+        # lookup only reads, so nothing landed; the request was neither
+        # admitted nor refused, so neither principal counter moves.
+        _answer_handler_error(
+            req, coordinator, exc, failed=f"caller-principal lookup on {method} {path}"
+        )
         return None
 
 
@@ -5962,10 +5980,50 @@ def _run_or_degrade(
         req._json(200, degraded_response if degraded_response is not None else _DEFAULT_DEGRADED_RESPONSE)
         return
     except Exception as exc:
-        logger.exception("handler work failed: %s", exc)
-        req._json(200, {"ok": False, "reason": f"internal: {type(exc).__name__}"})
+        _answer_handler_error(req, coordinator, exc, failed="handler work")
         return
     req._json(200, result)
+
+
+_EFFECT_FENCE_ROUTE: tuple[str, str] = ("POST", "/hooks/effect-fence")
+"""The one route whose work body owns its own exception arm (a hold, see
+:data:`_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE`), keyed as ``_ROUTES`` keys it."""
+
+
+def _answer_handler_error(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    exc: BaseException,
+    *,
+    failed: str,
+) -> None:
+    """The ONE exception arm for a request's work, whether the caller-principal
+    gate's registry lookup raised or the handler's work body did: log the
+    failure with its traceback and answer HTTP 200 with the route's
+    internal-error envelope — ``{"ok": false, "reason": "internal: <Type>"}``,
+    a shape the library types as a refused request (``StaleView`` on pre-edit)
+    and no client reads as an absent coordinator.
+
+    Why one arm and not two: every client reads a non-200 as "no coordinator
+    available" and degrades, so a raise the gate let reach the dispatcher's
+    500 would have a degrade-mode ``CoherentVolume`` write with no grant and
+    no peer invalidation, while the same raise inside the work body answered
+    the typed 200 it raises ``StaleView`` on. The effect fence is the one
+    route whose body catches inside itself and answers a HOLD rather than
+    this shape (a client branching on ``verdict`` must read an answer), so on
+    that route the gate answers, and counts, the same hold the body would.
+    Nothing else is counted: a raise is not a watchdog timeout, and a gate
+    that decided nothing is neither an admission nor a refusal.
+
+    ``failed`` names what raised, for the log. Only the exception's own text
+    reaches the log and only its TYPE reaches the body; the lookup's operands
+    (a presented principal) are in neither."""
+    logger.exception("%s failed: %s", failed, exc)
+    if req._route_key == _EFFECT_FENCE_ROUTE:
+        coordinator.increment_effect_fence_hold()
+        req._json(200, dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE))
+        return
+    req._json(200, {"ok": False, "reason": f"internal: {type(exc).__name__}"})
 
 
 def _exclusive_holder(

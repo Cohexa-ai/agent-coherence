@@ -8405,6 +8405,151 @@ def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
         f"a timed-out work body {work_timed_out!r}")
 
 
+# --- the gate's store read RAISES: the route's own internal-error answer ------
+#
+# The lookup can raise something that is neither a refusal nor the watchdog's
+# timeout -- a registry read failing (``sqlite3.OperationalError`` once
+# ``busy_timeout`` elapses, a closed store). Inside a work body that exception
+# is turned into the route's HTTP 200 internal-error envelope; the gate must
+# answer the SAME thing, because a degrade-mode CoherentVolume reads a 500 as
+# an unanswered request and writes with no grant, where the typed 200 raises.
+
+#: FROZEN duplicate of the internal-error envelope every route but the effect
+#: fence answers when its work raised (the type name is the exception's).
+_INTERNAL_ERROR_ENVELOPE = {"ok": False, "reason": "internal: OperationalError"}
+#: FROZEN duplicate of the effect fence's own answer for a raise: a HOLD, so a
+#: client branching on ``verdict`` reads an answer, never a shape with none.
+_FENCE_INTERNAL_HOLD_ENVELOPE = {
+    "verdict": "hold", "reason": "version_unconfirmed", "degraded": True,
+    "held_by": "handler_error",
+}
+_FENCE_ROUTE = ("POST", "/hooks/effect-fence")
+
+
+def _fail_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every durable-store read of a caller-principal binding raises the
+    registry's own transient error -- what a ``busy_timeout`` overrun raises."""
+    import sqlite3
+
+    def failing(identity):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", failing)
+
+
+def _fail_work_body(
+    route: tuple[str, str], coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make ``route``'s WORK BODY raise the same registry error the gate's
+    lookup raises in the tests below. The effect fence catches inside its own
+    body (it owns that arm), so its verdict is what raises; every other route
+    lets the exception reach the wrapper, so the watchdog call is what raises."""
+    import sqlite3
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def raising(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    if route == _FENCE_ROUTE:
+        monkeypatch.setattr(mod, "_effect_fence_verdict", raising)
+    else:
+        monkeypatch.setattr(coordinator, "run_with_watchdog", raising)
+
+
+@pytest.mark.parametrize("route", _GATED_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_gate_whose_store_read_raises_answers_exactly_its_routes_failed_work_body(
+    route: tuple[str, str], coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every route whose gate can read the registry, a lookup that RAISES a
+    non-refusal, non-timeout error answers byte-for-byte what the same route
+    answers when its WORK BODY raises that error: HTTP 200 and the route's
+    internal-error envelope, never the dispatcher's 500.
+
+    Prevents the gate and the body answering one failure in two shapes. The
+    hook client and the library read any non-200 as "no coordinator" and
+    degrade: a degrade-mode ``CoherentVolume`` answered 500 on pre-edit skips
+    its grant check and writes with no grant and no peer invalidation, where
+    the typed 200 raises ``StaleView`` in both modes. The first half drives
+    the gate: a never-claimed session on a require-class route, a never-minted
+    principal on an accept-class one, each a cold-cache lookup. The control
+    drives the body instead, for a claimed session the gate decides from the
+    cache, so the two answers come from the two arms."""
+    _, path = route
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    never_claimed = str(uuid.uuid4())
+    presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with monkeypatch.context() as gate_only:
+        _fail_binding_reads(coordinator, gate_only)
+        gate_raised = client.post(path, _degrade_body(route, never_claimed), principal=presented)
+    assert gate_raised[0] == 200, f"{path}: the gate's raise reached the dispatcher: {gate_raised}"
+
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
+    # pre-grep answers "fresh" before its work body when the store knows no
+    # tracked artifact under the search root.
+    coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
+    _fail_work_body(route, coordinator, monkeypatch)
+    body_raised = client.post(path, _degrade_body(route, claimed), principal=principal)
+    assert body_raised[0] == 200 and body_raised[1] != {"ok": True}, (
+        f"{path}: the control never reached its work body, so it compares nothing")
+    assert gate_raised == body_raised, (
+        f"{path}: a raising gate answered {gate_raised!r}, "
+        f"a raising work body {body_raised!r}")
+    assert coordinator._watchdog_timeouts_total == timeouts_before, "a raise is not a timeout"
+
+
+@pytest.mark.parametrize(
+    ("route", "presented", "envelope"),
+    [
+        (("POST", "/hooks/pre-edit"), None, _INTERNAL_ERROR_ENVELOPE),
+        (("POST", "/hooks/pre-read"), _NEVER_MINTED_PRINCIPAL, _INTERNAL_ERROR_ENVELOPE),
+        (_FENCE_ROUTE, None, _FENCE_INTERNAL_HOLD_ENVELOPE),
+    ],
+    ids=["pre-edit", "pre-read-with-a-principal", "effect-fence"],
+)
+def test_a_gate_whose_store_read_raises_answers_the_typed_envelope_and_changes_nothing(
+    route: tuple[str, str], presented: str | None, envelope: dict,
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The envelope a raising gate answers, pinned as a frozen literal -- the
+    ``{ok: false, reason: "internal: <Type>"}`` a client raises on, and the
+    fence's hold -- and what it leaves behind: no artifact row, no session,
+    no grant (the request was neither admitted nor refused, so neither
+    principal counter moves), one ERROR log record carrying the traceback,
+    and no principal in the log or the body (R5). A fence hold reached this
+    way is counted as a hold, as the body's own internal hold is."""
+    import logging
+
+    _, path = route
+    sid = str(uuid.uuid4())
+    caplog.set_level(logging.ERROR, logger="ccs.adapters.claude_code.coordinator_server")
+    counts_before = _principal_counts(coordinator)
+    holds_before = coordinator.counters_snapshot()["effect_fence_holds_total"]
+    _fail_binding_reads(coordinator, monkeypatch)
+
+    response = client.post(path, _degrade_body(route, sid), principal=presented)
+
+    assert response == (200, envelope)
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran: it seeded the artifact")
+    assert session_to_agent_id(sid) not in dict(coordinator.agent_names_snapshot()), (
+        "the handler registered the session past a failed gate")
+    assert _principal_counts(coordinator) == counts_before, (
+        "a gate that decided nothing counted an admission or a refusal")
+    expected_holds = holds_before + (1 if route == _FENCE_ROUTE else 0)
+    assert coordinator.counters_snapshot()["effect_fence_holds_total"] == expected_holds
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and errors[0].exc_info is not None, (
+        "the failure was not logged with its traceback")
+    assert path in errors[0].getMessage(), "the log does not name the route"
+    if presented is not None:
+        assert presented not in caplog.text and presented not in json.dumps(response[1]), (
+            "a presented principal reached the log or the body")
+
+
 def test_a_never_claimed_session_is_answered_without_touching_the_registry(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

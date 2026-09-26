@@ -194,7 +194,11 @@ Alpha — APIs may change before `v1.0`.
   one is admitted exactly as before, so clients that predate this keep working.
   `/status` counts admissions without a principal as
   `caller_principal_absent_total` and refusals as
-  `caller_principal_refused_total`. The Node coordinator enforces none of this.
+  `caller_principal_refused_total`. A registry error while the principal is
+  being checked is answered exactly as a failure inside that route's handler
+  is — HTTP `200` with the route's own error shape, never a `500` — so a client
+  never reads it as an absent coordinator. The Node coordinator enforces none
+  of this.
 
 - **Registry schema version 8 (forward-only).** Principals get their own table,
   which the grant sweep, the session-liveness sweep, the session cap and

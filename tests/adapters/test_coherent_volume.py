@@ -3175,6 +3175,83 @@ def test_a_refusal_recovery_cannot_cure_raises_the_typed_refusal_in_degrade_mode
         stop_coordinator(tmp_path)
 
 
+def _serve_in_process(tmp_path: Path, instance_id: str):
+    """A strict coordinator for ``data/**`` running in THIS process, reachable
+    through the usual pid file, so a test can reach into its registry. Policy
+    is loaded once at construction, so the YAML is written first."""
+    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    for name in ("tracked.yaml", "strict_mode.yaml"):
+        (coherence / name).write_text("- data/**\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    return server
+
+
+def test_a_degrade_mode_write_lands_no_bytes_when_the_gates_store_read_fails(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a session's first require-class request the coordinator's
+    caller-principal gate reads the durable store — for a client that never
+    claimed (KTD15), a cold-cache read on pre-edit — and that read can fail
+    (``sqlite3.OperationalError`` once ``busy_timeout`` elapses). The
+    coordinator answers it as its work body answers a raise: HTTP 200
+    ``{ok: false, reason: "internal: ..."}``, which ``write()`` raises on in
+    BOTH modes, landing nothing and recording no grant.
+
+    Prevents the answer being the dispatcher's 500: a degrade-mode volume
+    reads a non-200 as an unanswered request, skips its grant check, and
+    writes with no grant and no peer invalidation — the lost update the
+    volume exists to refuse. The coordinator runs in this process so its
+    registry can be made to fail; the volume attaches to it as to any
+    sibling-spawned strict coordinator."""
+    import sqlite3
+
+    from ccs.cli._coherence_client import PrincipalClaim
+    from ccs.core.states import MESIState
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    server = _serve_in_process(tmp_path, "gate-store-fault")
+    # A client that never claims: a coordinator that issues no principal
+    # leaves the session unbound, so its pre-edit is the gate's store read.
+    monkeypatch.setattr(
+        coherent_volume_module, "claim_caller_principal",
+        lambda *_a: PrincipalClaim("unsupported"),
+    )
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        assert vol.is_attached and vol.strict_mode_active(), "control: attached, strict"
+        assert vol.read(rel) == b"v1"  # accept-class, no principal: no store read
+
+        def failing(identity):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(server.registry, "get_caller_principal", failing)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            with pytest.raises(StaleView) as raised:
+                vol.write(rel, b"v2")
+
+        assert str(raised.value) == "internal: OperationalError", "the typed answer, verbatim"
+        assert target.read_bytes() == b"v1", "bytes landed with no grant"
+        assert vol._incarnation not in vol._grant_incarnations, "a grant was recorded"
+        artifact_id = server.registry.lookup_artifact_id_by_name(rel)
+        assert artifact_id is not None, "control: the read registered the artifact"
+        assert not {
+            state for state in server.registry.get_state_map(artifact_id).values()
+            if state in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
+        }, "the coordinator granted a write the caller was never told about"
+        assert vol.degradation_count == 0, "the answer was read as an unanswered request"
+        assert not [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+    finally:
+        server.shutdown()
+
+
 def test_a_refused_acquire_leaves_no_grant_for_a_re_mint_to_release(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
