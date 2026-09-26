@@ -1631,6 +1631,35 @@ def test_reacquire_after_refused_read_reseeds_then_write_succeeds(
         stop_coordinator(tmp_path)
 
 
+def test_fail_closed_reacquire_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reacquire() takes a fresh identity before it reads, so the coordinator
+    grants the next write. When that read fails closed (on_error='strict') the
+    caller gets no bytes, and the baseline is the only guard left: it must not
+    advance, or a write from the pre-edit buffer clobbers the foreign edit."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.reacquire("data/x.txt")           # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_on_stale_read_raise_does_not_fire_on_unmanaged_path(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
