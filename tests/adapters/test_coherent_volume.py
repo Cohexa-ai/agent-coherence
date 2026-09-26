@@ -257,10 +257,12 @@ def test_failed_reattach_after_fork_is_retried_in_strict_mode(
     "operation",
     [
         lambda vol: vol.read("data/shared.txt"),
+        lambda vol: vol.read_with_version("data/shared.txt"),
+        lambda vol: vol.read_with_version_generation("data/shared.txt"),
         lambda vol: vol.write("data/shared.txt", b"child"),
         lambda vol: vol.write_cas("data/shared.txt", lambda current: current + b"+child"),
     ],
-    ids=["read", "write", "write_cas"],
+    ids=["read", "read_with_version", "read_with_version_generation", "write", "write_cas"],
 )
 def test_strict_child_fails_closed_on_every_op_while_reattach_fails(
     tmp_path: Path,
@@ -268,9 +270,10 @@ def test_strict_child_fails_closed_on_every_op_while_reattach_fails(
     monkeypatch: pytest.MonkeyPatch,
     operation: Callable[[CoherentVolume], object],
 ) -> None:
-    """While the re-attach keeps failing, each read, write and write_cas of a
-    strict forked child raises and nothing lands on disk — none of them may
-    fall through to the unattached branch, first call or retry."""
+    """While the re-attach keeps failing, each read (plain or versioned), write
+    and write_cas of a strict forked child raises and nothing lands on disk —
+    none of them may fall through to the unattached branch, first call or
+    retry."""
     target = _seed(tmp_path)
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     try:
@@ -286,6 +289,33 @@ def test_strict_child_fails_closed_on_every_op_while_reattach_fails(
                 operation(vol)
         assert target.read_bytes() == b"v1"
         assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("method", ["read_with_version", "read_with_version_generation"])
+def test_versioned_read_reattaches_after_fork(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """The versioned reads are reads too. A forked child's first one must
+    re-attach and register the view — failing closed while it cannot — not
+    return version 0 with the coordinator never asked."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol.write("data/shared.txt", b"parent")
+        coordinator_version = _coordinator_version(vol, "data/shared.txt")
+        assert coordinator_version  # non-zero, so the version-0 fallback cannot pass
+
+        vol._after_fork()
+        _fail_first_resolve(monkeypatch)
+        versioned_read = getattr(vol, method)
+
+        with pytest.raises(CoherenceError):
+            versioned_read("data/shared.txt")
+        data, version, *_ = versioned_read("data/shared.txt")
+        assert vol.is_attached
+        assert (data, version) == (b"parent", coordinator_version)
     finally:
         stop_coordinator(tmp_path)
 
