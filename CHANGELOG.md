@@ -24,8 +24,14 @@ Alpha — APIs may change before `v1.0`.
   from them naming another session is refused. The hook client finds its
   principal by the session id in each hook event, so a wrong id there is not
   caught; on that surface the principal exposes a client that never claimed or
-  presents the wrong one. A client whose claim answer is lost, or whose binding
-  disappears with a deleted `state.db`, claims again with the nonce it kept. A
+  presents the wrong one. A client whose binding disappears with a deleted
+  `state.db` claims again with the nonce it kept when a request is refused. A
+  claim whose answer is lost is an unanswered coordinator request: the hook
+  client and a degrade-mode `CoherentVolume` claim again with the same nonce
+  before their next request, while a strict `CoherentVolume` and the substrate
+  session fail closed at construction, and a later attempt is a new session
+  (a strict volume's forked child attaches on its first request instead: that
+  request raises, and its next one claims again with the same nonce). A
   coordinator that issues no principals (the plugin's Node coordinator, or an
   older release) answers `404`, and clients proceed without one. The MCP server
   answers a refusal it cannot recover from as a typed deny — `reason:

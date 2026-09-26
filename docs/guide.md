@@ -1280,17 +1280,31 @@ the client:
 ### You usually do nothing
 
 The Claude Code hook client, `CoherentVolume`, the MCP server and the substrate
-session claim a principal for their session and send it on every request. If a
-claim's answer is lost, or the binding disappears because `state.db` was
-deleted, they claim again with the nonce they kept and carry on. A
-client written before principals existed keeps working unchanged: its sessions
-never claim one, and a request naming a session that never claimed one is
-admitted exactly as before (and counted, see below).
+session claim a principal for their session and send it on every request. If
+the binding disappears because `state.db` was deleted, the next request the
+coordinator refuses makes each of them claim again with the nonce it kept, and
+the request is sent once more with the principal that comes back. A claim whose
+*answer* is lost is handled the way each client handles any unanswered
+coordinator request: the hook client, and a `CoherentVolume` built with
+`on_error="degrade"`, carry on and claim again with the same nonce before their
+next request; a strict `CoherentVolume` (the MCP server's is strict) and the
+substrate session fail closed at construction, so the object is never built,
+and a later attempt is a new session with a new nonce — the first binding is
+left unused. (A strict volume's forked child attaches on its first request
+instead: that request raises, and its next one claims again with the same
+nonce.) A client written before principals existed keeps working
+unchanged: its sessions never claim one, and a request naming a session that
+never claimed one is admitted exactly as before (and counted, see below).
 
 The Claude Code plugin's Node coordinator issues no principals. It answers
 `/principal/claim` with `404`, and clients proceed without one; the hook
 clients skip the request altogether when `.coherence/server.pid` names the Node
 backend.
+
+The hook client keeps a session's nonce and principal in two files under
+`.coherence/`; they are listed, with what to do about them, among the
+coordinator's other local files in
+[security.md](security.md#local-config-and-data-files).
 
 ### What is checked, and where
 

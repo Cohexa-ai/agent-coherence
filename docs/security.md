@@ -245,6 +245,29 @@ exists (`SessionDirectoryNotEmptyError`) to prevent silent multi-instance
 trace interleave. No content is read by `agent-coherence-replay` from any
 location other than the explicit `session_dir` argument.
 
+### Caller-principal files (Claude Code hook client)
+
+The Claude Code hook client runs one process per hook event, so it keeps each
+session's [caller principal](guide.md#caller-principal) on disk beside
+`hook.secret`, keyed by the session's agent id — the one-way hash of the session
+id that `/status` shows, never the raw session id. `CoherentVolume`, the MCP
+server and the substrate session hold theirs in memory and write neither file.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Mint nonce | `<workspace>/.coherence/caller-principal-<agent-id>.nonce` | `0600` | The session's first hook event with no stored principal, unless `server.pid` names the plugin's Node backend — *before* the claim is sent, so an older Python coordinator that then answers `404` leaves the file behind too. Created exclusively (`O_CREAT` with `O_EXCL`) and never rewritten; two hook processes racing on a new session share the winner's nonce |
+| Caller principal | `<workspace>/.coherence/caller-principal-<agent-id>.principal` | `0600` | When the claim binds. Written to a private temporary file (`O_CREAT` with `O_EXCL`, `0600`) and renamed over the stored file, and replaced the same way when a refused request is recovered by claiming again |
+
+The nonce is what lets the session re-obtain its principal after a lost claim
+answer or a reset `state.db`; the principal is what every hook of the session
+presents. Treat both like `hook.secret`: any process running as your OS user can
+read them, and one that holds them together with `hook.secret` can act as that
+session on every route. The client never deletes them. Remove them only when no
+hook of that session can still run: a session whose nonce file is gone claims
+again under a new nonce, which the coordinator refuses
+(`caller_principal_claimed`), and from then on the routes that require a
+principal refuse that session.
+
 ### Durable version retention (opt-in)
 
 `SqliteArtifactRegistry` can durably retain a bounded history of committed
