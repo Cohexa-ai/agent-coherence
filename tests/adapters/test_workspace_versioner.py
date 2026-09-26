@@ -35,7 +35,9 @@ from typing import Any
 
 import pytest
 
+from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_object import CoherentObject
+from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.workspace import (
     BINARY_FILE_MEMBER_REASON,
     CHECKPOINT_NOT_PERSISTED_REASON,
@@ -83,6 +85,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CommitUnconfirmed,
     OccCallerTransientError,
+    StaleView,
     ViewWedged,
     WatchdogAbandoned,
 )
@@ -409,6 +412,44 @@ def test_file_pointer_unconfirmed_version_is_forward_only(
     assert member.native_token is None
     assert member.restore_tier == "forward_only"
     assert member.fingerprint == sha256_hex(b"body")
+
+
+def test_file_member_refused_at_capture_is_forward_only_not_a_raise(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    """A CoherentVolume source refuses a versioned read whose disk bytes are not
+    the content at the coordinator's version (a peer's commit still reaching
+    disk, or an out-of-band edit). There is then no pointer to manifest, which
+    is the unconfirmed-pointer case: the member is described, never above
+    forward_only, and the checkpoint still completes."""
+    files = _ScriptedFileSource()
+    files.program("busy.md", StaleView("refused: bytes are not the content at the version"))
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "busy.md")
+    result = versioner.checkpoint("busy")
+    (member,) = registry.get_checkpoint_members(result.record.checkpoint_id)
+    assert member.absent is False
+    assert member.native_token is None
+    assert member.fingerprint is None
+    assert member.restore_tier == "forward_only"
+    # Neither pass could confirm the member, so it was not verified quiescent.
+    assert member.dirty_during_window is True
+
+
+def test_file_member_refused_at_verify_flags_dirty(
+    registry: ArtifactRegistry, service: CoordinatorService
+) -> None:
+    files = _ScriptedFileSource()
+    files.program(
+        "doc.md", (b"body", 3), StaleView("refused: bytes are not the content at the version")
+    )
+    versioner = _versioner(service)
+    versioner.add_file_member(files, "doc.md")
+    result = versioner.checkpoint("verify-refused")
+    (member,) = registry.get_checkpoint_members(result.record.checkpoint_id)
+    assert member.native_token == "3"
+    assert member.fingerprint == sha256_hex(b"body")
+    assert member.dirty_during_window is True
 
 
 def test_forward_only_members_enumerated_never_token_captured(
@@ -1102,6 +1143,161 @@ def test_file_member_sustained_foreign_edits_conflict_no_arbiter(
     assert member.attempts == MAX_RESTORE_LEG_REDRIVES + 1
     assert "no-arbiter" in member.detail
     assert files.cas_calls["doc.md"] == MAX_RESTORE_LEG_REDRIVES + 1  # bounded, no livelock
+
+
+class _RefusingFileStore(_FakeFileStore):
+    """A file store whose live reads a CoherentVolume source would refuse.
+
+    ``refuse(times)`` makes the next ``times`` reads raise ``StaleView`` (every
+    read when ``times`` is ``None``): the disk bytes are not the content at the
+    coordinator's version, as during a peer's commit->disk window (transient)
+    or after an out-of-band edit (lasting)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._refusals: int | None = 0
+        self._refuse_until = 0.0
+
+    def refuse(self, times: int | None) -> None:
+        self._refusals = times
+
+    def refuse_for(self, seconds: float) -> None:
+        """Refuse every read until ``seconds`` of wall-clock time have passed,
+        as a peer's commit does until its disk write lands."""
+        self._refuse_until = time.monotonic() + seconds
+
+    def read_with_version(self, path: str) -> tuple[bytes, int]:
+        if time.monotonic() < self._refuse_until:
+            raise StaleView("refused: bytes are not the content at the version")
+        if self._refusals is None or self._refusals > 0:
+            if self._refusals is not None:
+                self._refusals -= 1
+            raise StaleView("refused: bytes are not the content at the version")
+        return super().read_with_version(path)
+
+
+def _checkpoint_refusing_file(
+    service: CoordinatorService, *, absent: bool = False
+) -> tuple[_RefusingFileStore, _FakeResolver, str]:
+    files = _RefusingFileStore()
+    resolver = _FakeResolver()
+    if not absent:
+        files.put("doc.md", b"captured", 3)
+        resolver.keep("doc.md", 3, b"captured")
+    versioner = _versioner(service, resolver=resolver)
+    versioner.add_file_member(files, "doc.md")
+    return files, resolver, versioner.checkpoint("refusing").record.checkpoint_id
+
+
+def _restore_refusing_file(
+    service: CoordinatorService, files: _RefusingFileStore, resolver: _FakeResolver, checkpoint_id: str
+) -> Any:
+    restorer = _versioner(service, resolver=resolver)
+    restorer.add_file_member(files, "doc.md")
+    return restorer.restore(checkpoint_id)
+
+
+def test_file_leg_lasting_refusal_concludes_conflict_without_a_write(
+    service: CoordinatorService,
+) -> None:
+    """A restore leg whose live read keeps being refused cannot establish a
+    comparand to CAS from. It must still conclude, as conflict with no write,
+    rather than raise and leave the restore in_progress for every resume."""
+    files, resolver, checkpoint_id = _checkpoint_refusing_file(service)
+    files.put("doc.md", b"edited", 5)
+    files.refuse(None)
+    report = _restore_refusing_file(service, files, resolver, checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_CONFLICT
+    assert member.observation.state == RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert "doc.md" not in files.cas_calls
+    assert files.state("doc.md")[0] == b"edited"
+
+
+def test_file_leg_transient_refusal_redrives_and_lands(service: CoordinatorService) -> None:
+    files, resolver, checkpoint_id = _checkpoint_refusing_file(service)
+    files.put("doc.md", b"edited", 5)
+    files.refuse(1)
+    report = _restore_refusing_file(service, files, resolver, checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert member.attempts == 2
+    assert files.state("doc.md")[0] == b"captured"
+
+
+def test_file_leg_waits_out_a_refusal_that_clears_with_time(
+    service: CoordinatorService,
+) -> None:
+    """A peer's commit reaches disk after some wall-clock time, not after some
+    number of reads. Re-driving without waiting spends the whole budget on
+    back-to-back reads inside the window and ends in a conflict the same
+    restore would have landed a moment later."""
+    files, resolver, checkpoint_id = _checkpoint_refusing_file(service)
+    files.put("doc.md", b"edited", 5)
+    files.refuse_for(0.04)
+    report = _restore_refusing_file(service, files, resolver, checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_RESTORED
+    assert files.state("doc.md")[0] == b"captured"
+
+
+def test_absent_leg_refused_read_means_the_file_exists(service: CoordinatorService) -> None:
+    """A refusal is about a file that exists (its bytes cannot be paired with a
+    version), so a member the manifest records ABSENT is a live divergence."""
+    files, resolver, checkpoint_id = _checkpoint_refusing_file(service, absent=True)
+    files.put("doc.md", b"appeared later", 2)
+    files.refuse(None)
+    report = _restore_refusing_file(service, files, resolver, checkpoint_id)
+    (member,) = report.members
+    assert member.outcome == RESTORE_OUTCOME_CONFLICT
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert files.state("doc.md")[0] == b"appeared later"
+
+
+def test_coherent_volume_member_edited_out_of_band_captures_and_restores_to_a_terminal(
+    tmp_path: Path,
+) -> None:
+    """The same two paths with a real CoherentVolume as the file member: after
+    an out-of-band edit, a checkpoint records the member as forward_only, and a
+    restore of an earlier checkpoint concludes instead of raising StaleView."""
+    target = tmp_path / "data" / "f.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"H0")
+    cfg = LifecycleConfig(
+        idle_shutdown_sec=0,
+        sweep_interval_sec=0.1,
+        notice_evict_max_age_sec=1.0,
+        port_file_retry_attempts=20,
+        port_file_retry_interval_sec=0.05,
+        connect_retry_attempts=10,
+        connect_retry_interval_sec=0.05,
+    )
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=cfg)
+    try:
+        registry = ArtifactRegistry()
+        service = CoordinatorService(registry)
+        resolver = _FakeResolver()
+        versioner = _versioner(service, resolver=resolver)
+        versioner.add_file_member(vol, "data/f.txt")
+        before = versioner.checkpoint("before", pin=False).record.checkpoint_id
+        (captured,) = registry.get_checkpoint_members(before)
+        assert captured.native_token is not None
+        resolver.keep("data/f.txt", int(captured.native_token), b"H0")
+
+        target.write_bytes(b"HUMAN")
+        after = versioner.checkpoint("after", pin=False).record.checkpoint_id
+        (edited,) = registry.get_checkpoint_members(after)
+        assert edited.restore_tier == "forward_only"
+        assert edited.native_token is None
+
+        report = versioner.restore(before)
+        (member,) = report.members
+        assert member.outcome == RESTORE_OUTCOME_CONFLICT
+        assert report.status == RESTORE_STATUS_CONCLUDED
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
 
 
 # ---------------------------------------------------------------------------

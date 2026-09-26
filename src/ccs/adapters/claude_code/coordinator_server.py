@@ -4702,10 +4702,31 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
     named_agents = coordinator.agent_names_snapshot()
 
-    tracked: list[dict] = [
-        {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
-        for artifact_id, meta in artifact_by_id.items()
-    ]
+    tracked: list[dict] = []
+    for artifact_id, meta in artifact_by_id.items():
+        entry: dict[str, Any] = {
+            "path": meta["name"],
+            "version": meta["version"],
+            "id": str(artifact_id),
+        }
+        if detail == "full":
+            # #199 §2: writer attribution is workspace-state disclosure (it
+            # names which session wrote what), so it rides the operator-gated
+            # tier only — the minimal-tier question is #198's to settle.
+            # Read from the same status_snapshot row, not per-artifact
+            # last_writer_for calls, which would reopen the PERF-1 N+1.
+            # ``last_writer_agent_id`` is the registry's own handle: it joins
+            # against ``sessions[].agent_id`` (whose ``agent_name`` this tier
+            # already shows) and survives a restart. No session id is derived
+            # from it: the only way back from an agent id to a session is the
+            # process-local name map, which the ``sessions[]`` join already
+            # consults, and which is empty for a writer from before a restart.
+            # The timestamp is null when nothing has committed: ``updated_at``
+            # then stamps the first observation, not a write.
+            writer = meta.get("last_writer_id")
+            entry["last_writer_agent_id"] = str(writer) if writer else None
+            entry["last_writer_at_unix_ts"] = meta.get("updated_at") if writer else None
+        tracked.append(entry)
 
     # The HOLDER set comes from the registry; a NAME comes from the adapter.
     # They are not the same set. ``_agent_names`` is process-local, seeded
