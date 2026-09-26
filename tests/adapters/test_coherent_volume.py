@@ -666,9 +666,15 @@ def test_write_cas_deny_raises_in_both_on_error_modes(
             assert vol.read("data/shared.txt") == b"v1"
             # Force expected_version far above current → corruption body
             # ({ok:false, reason:commit_cas_corruption...}) which must raise.
-            # (bytes, version, stale_denied, generation, stale_status,
-            # content_differs) — not stale, so no reacquire.
-            vol._read_with_version = lambda rel: (b"v1", 999, False, 0, False, False)  # type: ignore[assignment]
+            # Not stale, so no reacquire.
+            vol._read_with_version = lambda rel: coherent_volume_module._ReadResult(  # type: ignore[assignment]
+                data=b"v1",
+                version=999,
+                stale_denied=False,
+                owner_generation=0,
+                stale_status=False,
+                content_differs=False,
+            )
             with pytest.raises(CoherenceError):
                 vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
             assert not vol.is_degraded, (
@@ -1004,11 +1010,17 @@ def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
         calls = {"n": 0}
 
         def always_denied(rel: str):
-            # (bytes, version, stale_denied, generation, stale_status,
-            # content_differs) — every comparand read is a deny (a deny carries
-            # no confirmed generation and is a stale-status read).
+            # Every comparand read is a deny (a deny carries no confirmed
+            # generation and is a stale-status read).
             calls["n"] += 1
-            return (b"v1", 1, True, None, True, False)
+            return coherent_volume_module._ReadResult(
+                data=b"v1",
+                version=1,
+                stale_denied=True,
+                owner_generation=None,
+                stale_status=True,
+                content_differs=False,
+            )
 
         vol._read_with_version = always_denied  # type: ignore[assignment]
 

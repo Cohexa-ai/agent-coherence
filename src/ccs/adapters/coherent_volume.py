@@ -1038,9 +1038,10 @@ class CoherentVolume:
             # SHARED and route the next comparand read through the coordinator's
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
-            current_bytes, expected_version, stale_denied, _gen, _stale, _differs = (
-                self._read_with_version(rel)
-            )
+            result = self._read_with_version(rel)
+            current_bytes = result.data
+            expected_version = result.version
+            stale_denied = result.stale_denied
             if stale_denied:
                 # Cannot CAS from this view: INVALID, or the disk lags a just-
                 # committed version whose peer write has not landed yet
@@ -1214,9 +1215,9 @@ class CoherentVolume:
         # when the disk alone still matches the baseline. A win records its own
         # bytes below.
         self._remint()
-        _current_bytes, current_version, stale_denied, _gen, _stale, _differs = (
-            self._read_with_version(rel, advance_baseline=False)
-        )
+        result = self._read_with_version(rel, advance_baseline=False)
+        current_version = result.version
+        stale_denied = result.stale_denied
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
             # the agent must reacquire / re-read before it can CAS.
