@@ -3668,6 +3668,99 @@ def test_a_cas_that_never_hands_its_comparand_bytes_on_never_seeds_the_baseline(
         stop_coordinator(tmp_path)
 
 
+def _cas_at_loses_on_version(
+    vol: CoherentVolume, rel: str, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean comparand read, then a stale ``expected_version``."""
+    with pytest.raises(CasVersionConflict):
+        vol.write_cas_at(rel, 0, b"mine")
+
+
+def _cas_at_denied(
+    vol: CoherentVolume, rel: str, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk no longer matches the coordinator's record: the read is denied."""
+    target.write_bytes(b"FIRST-FOREIGN")
+    with pytest.raises(ViewWedged):
+        vol.write_cas_at(rel, 1, b"mine")
+
+
+def _cas_denied(
+    vol: CoherentVolume, rel: str, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every comparand read denied, so make_content never runs."""
+    target.write_bytes(b"FIRST-FOREIGN")
+    with pytest.raises(ViewWedged):
+        vol.write_cas(rel, lambda current: current + b"+mine")
+
+
+def _cas_at_read_raises(
+    vol: CoherentVolume, rel: str, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The comparand read's request fails (a watchdog-degraded answer in
+    strict mode), so the read raises before any answer is used: the first
+    observation is recorded before the request, as for a refused read()."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_once(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+            return {"ok": True, "degraded": True}
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_once)
+    with pytest.raises(CoherenceError):
+        vol.write_cas_at(rel, 1, b"mine")
+
+
+_FAILED_CAS_ON_AN_UNREAD_PATH = {
+    "write_cas_at-version": _cas_at_loses_on_version,
+    "write_cas_at-denied": _cas_at_denied,
+    "write_cas-denied": _cas_denied,
+    "write_cas_at-read-raises": _cas_at_read_raises,
+}
+
+
+@pytest.mark.parametrize("first_step", ["none", *_FAILED_CAS_ON_AN_UNREAD_PATH])
+def test_a_failed_cas_on_a_path_never_read_still_guards_the_next_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    first_step: str,
+) -> None:
+    """A CAS's comparand read never MOVES a baseline the caller already has
+    (the three tests above). On a path this volume has never observed there
+    is no baseline to move, so the read is the volume's first observation and
+    records one, the way a refused first read() does. Without it, a CAS that
+    fails and an out-of-band edit that lands after it leave write() nothing to
+    compare against, and write() overwrites the edit. ``none`` is the control:
+    a volume that never looked at the path has no baseline, so the same
+    write() is admitted; the guard comes from the CAS's read and nothing
+    else."""
+    monkeypatch.setattr(coherent_volume_module, "DENIED_READ_BACKOFF_CAP_SEC", 0.002)
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v0")
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        peer.read(rel)
+        peer.write(rel, b"v1")  # the coordinator now records v1 at version >= 1
+        if first_step != "none":
+            _FAILED_CAS_ON_AN_UNREAD_PATH[first_step](vol, rel, target, monkeypatch)
+            assert rel in vol._last_observed_hash, "the failed CAS left no baseline"
+        target.write_bytes(b"LATER-FOREIGN")
+
+        if first_step == "none":
+            vol.write(rel, b"mine")
+            assert target.read_bytes() == b"mine", "control: no baseline, no guard"
+            return
+        with pytest.raises(StaleView) as denied:
+            vol.write(rel, b"mine")
+
+        assert str(denied.value) == coherent_volume_module._STALE_WRITE_DENY_REASON
+        assert target.read_bytes() == b"LATER-FOREIGN", "the out-of-band edit was clobbered"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- a commit refused after the bytes landed: what the error says -----------------
 #
 # FROZEN duplicates of the text write() raises when its commit is refused for

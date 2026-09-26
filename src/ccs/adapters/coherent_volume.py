@@ -2234,7 +2234,9 @@ class CoherentVolume:
         not handed to the caller as such: :meth:`write_cas` seeds the
         foreign-edit baseline itself, only once a clean read's bytes reach
         ``make_content``, and :meth:`write_cas_at` never does (its caller
-        supplies the content). It changes nothing on the wire, unlike
+        supplies the content). The one exception is a path this instance has
+        never observed: there the comparand read records the first baseline,
+        and it never replaces one. It changes nothing on the wire, unlike
         ``observe=False``.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
@@ -2262,6 +2264,15 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
+        if observe and not seed_baseline:
+            # A CAS comparand read never MOVES a baseline the caller already
+            # has (see the seeding note below). On a path this instance has
+            # never observed there is none to move: this read is its first
+            # observation and records one, before the request, as a refused
+            # first read() does. Without it a CAS that fails, followed by an
+            # out-of-band edit, leaves write() nothing to compare against, and
+            # write() overwrites the edit.
+            self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
         stale_status = False
