@@ -2880,8 +2880,13 @@ class SqliteArtifactRegistry:
     ]:
         """PERF-1 single-query batch for /status. Returns:
 
-        - ``artifact_by_id``: ``{artifact_id: {"name", "version"}}`` — every
-          known artifact, one entry per row.
+        - ``artifact_by_id``: ``{artifact_id: {"name", "version",
+          "last_writer_id", "updated_at"}}`` — every known artifact, one
+          entry per row. ``last_writer_id`` is the committing agent's UUID
+          (None until a commit lands); ``updated_at`` is the row's
+          wall-clock stamp. Both ride the same SELECT so /status can
+          attribute writers without re-opening the per-artifact N+1
+          (``last_writer_for`` + ``get_artifact_updated_at`` per row).
         - ``state_by_artifact``: ``{artifact_id: {agent_id: MESIState}}`` —
           the per-artifact state map for every artifact (empty inner dict
           for artifacts no agent has ever held).
@@ -2946,10 +2951,15 @@ class SqliteArtifactRegistry:
         scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
-                "SELECT id, name, version FROM artifacts"
+                "SELECT id, name, version, last_writer_id, updated_at FROM artifacts"
             ).fetchall():
                 aid = UUID(hex=row[0])
-                artifact_by_id[aid] = {"name": row[1], "version": row[2]}
+                artifact_by_id[aid] = {
+                    "name": row[1],
+                    "version": row[2],
+                    "last_writer_id": UUID(hex=row[3]) if row[3] else None,
+                    "updated_at": float(row[4]),
+                }
                 state_by_artifact[aid] = {}
             if scoped_hexes is None:
                 state_rows = self._conn.execute(
