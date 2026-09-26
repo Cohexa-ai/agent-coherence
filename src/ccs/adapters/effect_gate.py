@@ -124,8 +124,10 @@ def gate(
 
     Raises:
         StaleView: the input moved, vanished, or lost its grant between capture
-            and fire; the effect did not run. Recover via
-            ``volume.reacquire(path)`` then re-decide.
+            and fire, or the capture read was refused before ``decide`` ran
+            because the bytes on disk are not the content at the coordinator's
+            version (a peer's commit still reaching disk). The effect did not
+            run. Recover via ``volume.reacquire(path)`` then re-decide.
         InvariantViolationError: ``volume`` cannot report the grant state of
             its reads, so the fence cannot answer its third leg for it (see
             :func:`_require_grant_state`). A ``CoherentVolume`` always can; a
