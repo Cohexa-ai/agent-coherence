@@ -42,6 +42,7 @@ import time
 import urllib.error
 import uuid
 import warnings
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -167,6 +168,24 @@ _PUBLISH_HELD_REASON = (
     "was read, so the batch was NOT published (all-or-nothing — no file was "
     "written). reacquire() and rebuild the publish from the fresh versions."
 )
+
+# Live volumes a forked child must reset (CoherentVolume._after_fork). One
+# process-wide handler walks this set because os.register_at_fork cannot
+# unregister: a per-instance registration holds its volume, even one whose
+# constructor raised, for the life of the process. Weak, so a volume its caller
+# drops is collected and a later fork no longer touches it.
+_FORK_RESET_VOLUMES: weakref.WeakSet[CoherentVolume] = weakref.WeakSet()
+
+
+def _reset_volumes_after_fork() -> None:
+    for volume in _FORK_RESET_VOLUMES:
+        volume._after_fork()
+
+
+# Guarded like lifecycle's fcntl import: registering at import on a platform
+# without fork would make merely importing the adapter fail.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_volumes_after_fork)
 
 
 class CoherentVolume:
@@ -323,11 +342,12 @@ class CoherentVolume:
         self._last_observed_hash: dict[str, str] = {}
 
         self._mint_identity()
-        # A forked child must not share the parent's identity (single-writer
-        # would conflate them) or its cached endpoint/connection.
-        os.register_at_fork(after_in_child=self._after_fork)
-
         self._attach()
+        # A forked child must not share the parent's identity (single-writer
+        # would conflate them) or its cached endpoint/connection. Joined only
+        # once construction succeeded, so a constructor that raised leaves
+        # nothing behind for a forked child to reset.
+        _FORK_RESET_VOLUMES.add(self)
 
     # --- identity -----------------------------------------------------------
 
