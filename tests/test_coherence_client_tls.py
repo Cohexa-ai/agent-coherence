@@ -44,7 +44,6 @@ import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -970,6 +969,17 @@ def proxy_recorder(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ProxyRecorder]:
     listener.close()
 
 
+def _assert_a_stock_opener_uses_the_proxy(recorder: _ProxyRecorder, url: str) -> None:
+    """Positive control: under the test's proxy settings, urllib's own opener
+    does connect to the recorder. Without it, ``connections == []`` after the
+    client call could mean the proxy was never set, not that the client skipped
+    it. The recorder hangs up, so the stock request fails."""
+    with pytest.raises(OSError):
+        urllib.request.build_opener().open(url, timeout=5)
+    assert recorder.connections == [None]
+    recorder.connections.clear()
+
+
 @pytest.mark.parametrize(
     ("endpoint_scheme", "proxy_scheme"),
     [
@@ -1000,6 +1010,9 @@ def test_requests_ignore_proxy_settings(
     else:
         srv = _start_plain_server(_make_handler_class())
     try:
+        _assert_a_stock_opener_uses_the_proxy(
+            proxy_recorder, f"{endpoint_scheme}://127.0.0.1:{srv.port}/status"
+        )
         ep = CoordinatorEndpoint(
             port=srv.port, bearer="s3cr3t", host="127.0.0.1", scheme=endpoint_scheme
         )
@@ -1020,10 +1033,41 @@ def test_a_routed_host_ignores_proxy_settings(
     # 192.0.2.1 (TEST-NET-1) is never routed, so the direct attempt times out.
     monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_recorder.port}")
     monkeypatch.setattr(cc, "CLI_HTTP_TIMEOUT_SEC", 0.5)
+    _assert_a_stock_opener_uses_the_proxy(proxy_recorder, "http://192.0.2.1:8080/status")
     ep = CoordinatorEndpoint(port=8080, bearer="s3cr3t", host="192.0.2.1")
     with pytest.raises(cc.CoordinatorUnavailable):
         cc.get(ep, "/status")
     assert proxy_recorder.connections == []
+
+
+@requires_openssl
+def test_a_ca_file_https_request_ignores_proxy_settings(
+    proxy_recorder: _ProxyRecorder,
+    tls_bundle: _CertBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With CCS_REMOTE_CA_FILE the client builds its opener per request instead of
+    # taking a shared one, so the cases above never reach this path: a proxy
+    # handler added only here would send the tunnel request to the proxy and
+    # leave every other test green.
+    monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{proxy_recorder.port}")
+    srv = _start_tls_server(tls_bundle, _make_handler_class())
+    try:
+        _assert_a_stock_opener_uses_the_proxy(
+            proxy_recorder, f"https://127.0.0.1:{srv.port}/status"
+        )
+        ep = CoordinatorEndpoint(
+            port=srv.port,
+            bearer="s3cr3t",
+            host="127.0.0.1",
+            scheme="https",
+            ca_file=str(tls_bundle.ca_pem),
+        )
+        assert cc.get(ep, "/status") == {"ok": True}
+        assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
+        assert proxy_recorder.connections == []
+    finally:
+        srv.shutdown()
 
 
 def test_the_shared_system_trust_context_is_the_hardened_one(
@@ -1191,221 +1235,5 @@ class TestHttpsContextIsPerRequest:
                 cc.get(ep, "/status")
             # Refused before connecting: the bearer rode only the first request.
             assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
-        finally:
-            srv.shutdown()
-
-
-# ===========================================================================
-# Proxy bypass: a coordinator request never goes to a configured proxy.
-#
-# urllib's default opener sends a request to whatever proxy http_proxy /
-# https_proxy name, and with no_proxy unset that includes loopback, so the
-# bearer reaches the proxy and the coordinator receives nothing. Each proxy test
-# first shows a bare opener DOES go to the recording proxy under the same
-# environment, so a pass means the client skipped the proxy, not that no proxy
-# was set.
-# ===========================================================================
-
-
-class _RecordingProxyHandler(http.server.BaseHTTPRequestHandler):
-    """A stand-in forward proxy that records and forwards nothing.
-
-    Each item of ``seen`` is (request line, Authorization header). A GET is
-    answered 200, so a proxied request ends without error and only ``seen``
-    shows where it went. A CONNECT is answered 502, so a tunnelled https request
-    fails.
-    """
-
-    seen: list[tuple[str, str | None]] = []
-
-    def _record(self) -> None:
-        type(self).seen.append((self.requestline, self.headers.get("Authorization")))
-        if self.command == "CONNECT":
-            self.send_response(502)
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"via": "proxy"}')
-
-    def do_GET(self) -> None:  # noqa: N802 (stdlib handler contract)
-        self._record()
-
-    def do_CONNECT(self) -> None:  # noqa: N802 (stdlib handler contract)
-        self._record()
-
-    def log_message(self, *args: object) -> None:
-        pass
-
-
-def _serve_plain(
-    handler_cls: type[http.server.BaseHTTPRequestHandler],
-) -> http.server.ThreadingHTTPServer:
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv
-
-
-def _stop_plain(srv: http.server.ThreadingHTTPServer) -> None:
-    srv.shutdown()
-    srv.server_close()
-
-
-def _get_or_error(endpoint: CoordinatorEndpoint) -> dict[str, Any] | Exception:
-    """The response body, or the exception the client raised.
-
-    Lets a test assert where the request went before asserting how it ended, so a
-    leak fails on the proxy's recording rather than on a side effect of it.
-    """
-    try:
-        return cc.get(endpoint, "/status")
-    except (cc.CoordinatorUnavailable, TlsVerificationFailed) as exc:
-        return exc
-
-
-def _drop_cached_openers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drop every opener the client module holds, whatever it is named.
-
-    ``ProxyHandler`` reads the proxy settings when its opener is built, so an
-    opener cached before a test sets ``http_proxy`` never sees the recorder, and
-    a proxy test passes against a client that leaks. Openers are found by type,
-    held directly or as values of a dict, because a reset by name goes silently
-    stale when the cache is renamed.
-    """
-    for name, value in list(vars(cc).items()):
-        if isinstance(value, urllib.request.OpenerDirector):
-            monkeypatch.setattr(cc, name, None)
-        elif isinstance(value, dict) and any(
-            isinstance(item, urllib.request.OpenerDirector) for item in value.values()
-        ):
-            monkeypatch.setattr(cc, name, {})
-
-
-@pytest.fixture
-def recording_proxy(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_RecordingProxyHandler]]:
-    """Point http_proxy and https_proxy at a recording proxy, with no_proxy unset."""
-    recorder = type("_ScopedProxy", (_RecordingProxyHandler,), {"seen": []})
-    srv = _serve_plain(recorder)
-    for name in ("no_proxy", "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
-        monkeypatch.delenv(name, raising=False)
-    proxy_url = f"http://127.0.0.1:{srv.server_address[1]}"
-    monkeypatch.setenv("http_proxy", proxy_url)
-    monkeypatch.setenv("https_proxy", proxy_url)
-    _drop_cached_openers(monkeypatch)
-    try:
-        yield recorder
-    finally:
-        _stop_plain(srv)
-
-
-@pytest.fixture
-def planted_openers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cache openers on the client under names it has never used."""
-    monkeypatch.setattr(
-        cc, "_planted_opener", urllib.request.build_opener(), raising=False
-    )
-    monkeypatch.setattr(
-        cc, "_planted_openers", {True: urllib.request.build_opener()}, raising=False
-    )
-
-
-class TestCoordinatorRequestsSkipProxies:
-    def test_recording_proxy_drops_cached_openers_whatever_their_name(
-        self, planted_openers: None, recording_proxy: type[_RecordingProxyHandler]
-    ) -> None:
-        # The proxy tests are blind to a leak if a cached opener survives, and the
-        # cache's name is the client's choice. planted_openers is requested first,
-        # so pytest sets it up before recording_proxy looks for openers.
-        assert cc._planted_opener is None
-        assert cc._planted_openers == {}
-
-    def test_loopback_http_request_skips_env_proxy(
-        self, recording_proxy: type[_RecordingProxyHandler]
-    ) -> None:
-        coordinator = _make_handler_class()
-        srv = _serve_plain(coordinator)
-        port = srv.server_address[1]
-        try:
-            # Control: under this environment a default opener sends the same
-            # request to the proxy and never reaches the coordinator.
-            urllib.request.build_opener().open(
-                f"http://127.0.0.1:{port}/status", timeout=5
-            ).read()
-            assert len(recording_proxy.seen) == 1
-            assert recording_proxy.seen[0][0].startswith(
-                f"GET http://127.0.0.1:{port}/status "
-            )
-            assert coordinator.seen_authorizations == []
-            recording_proxy.seen.clear()
-
-            outcome = _get_or_error(CoordinatorEndpoint(port=port, bearer="s3cr3t"))
-
-            assert recording_proxy.seen == []
-            assert coordinator.seen_authorizations == ["Bearer s3cr3t"]
-            assert outcome == {"ok": True}
-        finally:
-            _stop_plain(srv)
-
-    def test_remote_http_request_skips_env_proxy(
-        self,
-        recording_proxy: type[_RecordingProxyHandler],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # The CCS_REMOTE_INSECURE path, to a routed host. 192.0.2.1 (TEST-NET-1,
-        # RFC 5737) is never routed, so going direct fails within the short
-        # timeout, while going through the proxy would get the recorder's 200.
-        monkeypatch.setattr(cc, "CLI_HTTP_TIMEOUT_SEC", 0.5)
-        endpoint = resolve_remote_endpoint(
-            "192.0.2.1", 8080, "s3cr3t", env={"CCS_REMOTE_INSECURE": "1"}
-        )
-
-        # Control: a default opener sends a routed-host request to the proxy too.
-        urllib.request.build_opener().open(
-            "http://192.0.2.1:8080/status", timeout=5
-        ).read()
-        assert len(recording_proxy.seen) == 1
-        assert recording_proxy.seen[0][0].startswith("GET http://192.0.2.1:8080/status ")
-        recording_proxy.seen.clear()
-
-        outcome = _get_or_error(endpoint)
-
-        assert recording_proxy.seen == []
-        assert isinstance(outcome, cc.CoordinatorUnavailable)
-
-    @requires_openssl
-    def test_https_request_opens_no_connect_tunnel(
-        self, recording_proxy: type[_RecordingProxyHandler], tls_bundle: _CertBundle
-    ) -> None:
-        coordinator = _make_handler_class()
-        srv = _start_tls_server(tls_bundle, coordinator)
-        try:
-            # Control: a default opener with the same verified context asks the
-            # proxy for a CONNECT tunnel (refused here) instead of going direct.
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(
-                    context=build_tls_context(str(tls_bundle.ca_pem))
-                )
-            )
-            with pytest.raises(urllib.error.URLError):
-                opener.open(f"https://127.0.0.1:{srv.port}/status", timeout=5)
-            assert len(recording_proxy.seen) == 1
-            assert recording_proxy.seen[0][0].startswith(
-                f"CONNECT 127.0.0.1:{srv.port} "
-            )
-            recording_proxy.seen.clear()
-
-            outcome = _get_or_error(
-                CoordinatorEndpoint(
-                    port=srv.port,
-                    bearer="s3cr3t",
-                    scheme="https",
-                    ca_file=str(tls_bundle.ca_pem),
-                )
-            )
-
-            assert recording_proxy.seen == []
-            assert coordinator.seen_authorizations == ["Bearer s3cr3t"]
-            assert outcome == {"ok": True}
         finally:
             srv.shutdown()
