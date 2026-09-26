@@ -2177,12 +2177,14 @@ class CoherentVolume:
             first = self._degradation_count == 0
             self._degradation_count += 1
         if first:
+            # Log before warning: a caller that escalates the warning to an error
+            # makes warn() raise, and the log line must not depend on it.
+            logger.warning("CoherentVolume degraded under on_error='degrade': %s", message)
             warnings.warn(
                 f"CoherentVolume degraded: {message}",
                 CoherenceDegradedWarning,
                 stacklevel=3,
             )
-            logger.warning("CoherentVolume degraded under on_error='degrade': %s", message)
 
 
 # ----------------------------------------------------------------------

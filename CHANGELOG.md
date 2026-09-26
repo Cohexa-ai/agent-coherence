@@ -252,6 +252,19 @@ Alpha — APIs may change before `v1.0`.
   itself, and each failure is counted once. `on_error="strict"` is
   unchanged.
 
+- **A degraded `CoherentVolume` now logs the degradation even when
+  `CoherenceDegradedWarning` is turned into an error.** On its first
+  degradation, `on_error="degrade"` emits the warning and logs a
+  "CoherentVolume degraded" line at `WARNING`. The warning came first, so with
+  warnings escalated to errors (`python -W error`, pytest's
+  `filterwarnings = error`, or `warnings.simplefilter("error", ...)`) it
+  raised before the line was logged. A forked child whose re-attach failed
+  with an unexpected error or an interrupt raises that error in place of the
+  warning, so there the degradation was counted in `degradation_count` but
+  neither warned nor logged. The line is now logged first, so every first
+  degradation reaches the logs whatever the warnings filter does. The warning
+  itself is unchanged.
+
 - **A forked `CoherentVolume`'s `read_with_version` and
   `read_with_version_generation` now re-attach first, like `read`.** They were
   the only operations that skipped the post-fork re-attach: in a child that had
