@@ -1511,10 +1511,10 @@ def test_fail_closed_read_does_not_absolve_foreign_edit_for_write(
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
     real_post = coherent_volume_module._coordinator_post
 
-    def degraded_pre_read(endpoint: object, path: str, payload: dict) -> object:
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
         if path == "/hooks/pre-read":
             return {"ok": True, "degraded": True}  # watchdog-timeout envelope
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     try:
         buf = vol.read("data/x.txt")
@@ -1591,10 +1591,10 @@ def test_fail_closed_first_read_still_guards_a_later_write(
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
     real_post = coherent_volume_module._coordinator_post
 
-    def degraded_pre_read(endpoint: object, path: str, payload: dict) -> object:
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
         if path == "/hooks/pre-read":
             return {"ok": True, "degraded": True}  # watchdog-timeout envelope
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     try:
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
