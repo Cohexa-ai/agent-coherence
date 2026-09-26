@@ -191,16 +191,51 @@ _PUBLISH_HELD_REASON = (
 )
 
 
-def _unrecorded_write_message(rel: str, refusal: CallerPrincipalRefused) -> str:
+# What write()'s grant request (pre-edit) had already done when its commit is
+# refused for the caller principal after the bytes reached disk. An admitted
+# EXCLUSIVE acquire invalidates every peer holding a copy (KTD-1) BEFORE the
+# bytes are written, so the refusal of the commit cannot un-invalidate them;
+# a degraded or lost answer leaves both the grant and the peers unknown.
+_GRANT_REQUEST_ADMITTED = (
+    "Any peer that held a copy was invalidated when this write's grant request "
+    "was admitted, before the bytes were written, and must re-read the file; "
+    "this volume has not released any grant that request took."
+)
+_GRANT_REQUEST_UNCONFIRMED = (
+    "The answer to this write's grant request was not confirmed, so whether it "
+    "invalidated any peer, and whether it took a grant this volume now holds, "
+    "is not known."
+)
+
+
+def _unclassifiable_cas_message(rel: str) -> str:
+    """What an OCC commit reports when its answer is not a win and carries no
+    string reason. The coordinator's own non-win answers always carry one, so
+    this is what a proxy or gateway in front of it could send; nothing says
+    whether the commit landed, so it is the unknown outcome
+    (:class:`~ccs.core.exceptions.CommitUnconfirmed`) — and CAS-first means the
+    bytes never touched disk. Built from constants: no coordinator text."""
+    return (
+        f"OCC commit of {rel} was answered with no outcome this client can "
+        "classify (not a win, and no reason); whether it landed at the "
+        "coordinator is unknown, and the write did not touch disk. Re-read, "
+        "and retry only if it is absent."
+    )
+
+
+def _unrecorded_write_message(
+    rel: str, refusal: CallerPrincipalRefused, *, grant_confirmed: bool
+) -> str:
     """What :meth:`CoherentVolume.write` reports when its commit (post-edit)
     is refused for the caller principal AFTER the bytes reached disk: the
-    state the refusal left, then the refusal's own text (built from the typed
-    reason and constants — never the coordinator's prose, so no principal or
-    nonce)."""
+    state the write left — the file, the coordinator's record and version,
+    the peers and the grant, each as far as this client knows it — then the
+    refusal's own text (built from the typed reason and constants — never the
+    coordinator's prose, so no principal or nonce)."""
+    grant = _GRANT_REQUEST_ADMITTED if grant_confirmed else _GRANT_REQUEST_UNCONFIRMED
     return (
         f"{rel} holds the new bytes on disk, but the coordinator did not record "
-        "the write: its version did not advance, no peer was invalidated, and "
-        f"this volume still holds the write grant. {refusal}"
+        f"the write: its version did not advance. {grant} {refusal}"
     )
 
 
@@ -948,6 +983,10 @@ class CoherentVolume:
             self._grant_incarnations.discard(self._incarnation)
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
+        # Past the deny check, a dict answer that is not watchdog-degraded is
+        # an admitted acquire; a degraded or lost one (degrade mode only) may
+        # or may not have taken the grant.
+        grant_confirmed = isinstance(resp, dict) and not resp.get("degraded")
 
         # EXCLUSIVE grant is now held. ANY failure before the post-edit commit
         # must release it via the coordinator's tool-failure path (success:false),
@@ -1010,13 +1049,15 @@ class CoherentVolume:
             )
         except CallerPrincipalRefused as refusal:
             # Refused AFTER the bytes reached disk: the refusal itself changed
-            # nothing at the coordinator, but this write() did change the file,
-            # so the error says so rather than reading like a request that had
-            # no effect. The grant stays recorded (the coordinator still holds
-            # it for this incarnation); the observed baseline already names the
-            # bytes on disk, which are this instance's own.
+            # nothing at the coordinator, but this write() had already changed
+            # the file — and, through its admitted grant request, invalidated
+            # the peers — so the error says so rather than reading like a
+            # request that had no effect. The grant stays recorded (nothing
+            # released it for this incarnation); the observed baseline already
+            # names the bytes on disk, which are this instance's own.
             raise CallerPrincipalRefused(
-                refusal.reason, _unrecorded_write_message(rel, refusal)
+                refusal.reason,
+                _unrecorded_write_message(rel, refusal, grant_confirmed=grant_confirmed),
             ) from None
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
@@ -1103,9 +1144,9 @@ class CoherentVolume:
             # last read/wrote a path), not identity-scoped — a re-mint changes the
             # coordinator identity but not the disk. Clearing them would blind the
             # foreign-edit guard on every OTHER path after a write_cas conflict
-            # remint (the CAS path is re-seeded by the loop's next _read_with_version
-            # anyway). _after_fork still clears them — a forked child is a new
-            # process that must re-establish its own view.
+            # remint (the CAS path is re-seeded once the loop's next clean read
+            # reaches make_content anyway). _after_fork still clears them — a
+            # forked child is a new process that must re-establish its own view.
         # The release runs OUTSIDE self._lock. That lock is a plain (non-
         # reentrant) threading.Lock guarding identity mutation, and a failed
         # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
@@ -1280,7 +1321,7 @@ class CoherentVolume:
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
             current_bytes, expected_version, stale_denied, _gen, _stale = (
-                self._read_with_version(rel)
+                self._read_with_version(rel, seed_baseline=False)
             )
             if stale_denied:
                 # Cannot CAS from this view: INVALID, or the disk lags a just-
@@ -1318,6 +1359,11 @@ class CoherentVolume:
                 continue
             denied_streak = 0
 
+            # SB-23: a clean read's bytes reach the caller HERE, through
+            # make_content, so they become the foreign-edit baseline — and only
+            # here: a denied read (above) was never handed to it, and seeding
+            # from one would absolve the out-of-band edit that got it denied.
+            self._last_observed_hash[rel] = self._sha256_bytes(current_bytes)
             data = bytes(make_content(current_bytes))
             new_hash = self._sha256_bytes(data)
 
@@ -1392,9 +1438,12 @@ class CoherentVolume:
             #    only if absent — the false-negative-ack window);
             #  - a permission-style deny → StaleView (recoverable by reacquire);
             #  - anything else (corruption: commit_cas_corruption / expected>current)
-            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            #    → plain CoherenceError → the mapper fails it closed as internal_error;
+            #  - no string reason at all → the outcome is unknown → CommitUnconfirmed.
             if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
                 raise CommitUnconfirmed(self._deny_reason(resp))
+            if not isinstance(resp.get("reason"), str):
+                raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
             hook_output = resp.get("hookSpecificOutput")
             if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
                 raise StaleView(self._deny_reason(resp))
@@ -1444,8 +1493,13 @@ class CoherentVolume:
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU).
         self._remint()
+        # The comparand read's bytes reach no one — the caller supplies the
+        # content, merged against the version IT read — so they never seed the
+        # foreign-edit baseline: seeded, a denied or a conflicting CAS would
+        # absolve bytes the caller never saw, and its next write() would
+        # overwrite them. A win records the bytes it wrote.
         _current_bytes, current_version, stale_denied, _gen, _stale = (
-            self._read_with_version(rel)
+            self._read_with_version(rel, seed_baseline=False)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1492,9 +1546,12 @@ class CoherentVolume:
                 self._cas_current_version(resp, current_version),
                 reason=resp.get("reason"),
             )
-        # outcome == "raise": corruption or the commit_unconfirmed degrade body.
+        # outcome == "raise": corruption or the commit_unconfirmed degrade body,
+        # or an answer with no string reason, whose outcome is unknown.
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
             raise CommitUnconfirmed(self._deny_reason(resp))
+        if not isinstance(resp.get("reason"), str):
+            raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
         raise CoherenceError(self._deny_reason(resp))
 
     def atomic_publish(
@@ -1546,7 +1603,7 @@ class CoherentVolume:
         never re-reads disk between the caller's read and materialization, the
         batch commits, and the foreign bytes are silently overwritten. The
         SB-23 content-CAS (``on_stale_write``) does NOT run on this path —
-        :meth:`_read_with_version` seeds the foreign-edit baseline, but no
+        the caller's own read seeds the foreign-edit baseline, but no
         publish step consults it. This is a deliberate, regression-pinned
         boundary (see test_atomic_publish.py's foreign-edit-boundary section),
         not a gap in the version check. Contrast: plain :meth:`write` denies
@@ -2101,13 +2158,22 @@ class CoherentVolume:
             self._last_read_stale = stale_status
             return data, version, generation
 
-    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
+    def _read_with_version(
+        self, rel: str, *, observe: bool = True, seed_baseline: bool = True
+    ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation, stale_status)``
         (a :class:`_ReadResult`); ``stale_status`` is True when the coordinator
         classified this read as stale (a warn re-grant or a deny), the
         standing-grant signal the effect fence keys the ``grant_preempted``
         HOLD on.
+
+        ``seed_baseline=False`` is for a CAS comparand read, whose bytes are
+        not handed to the caller as such: :meth:`write_cas` seeds the
+        foreign-edit baseline itself, only once a clean read's bytes reach
+        ``make_content``, and :meth:`write_cas_at` never does (its caller
+        supplies the content). It changes nothing on the wire, unlike
+        ``observe=False``.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
         handling) but also surfaces the coordinator's authoritative ``version``
@@ -2185,15 +2251,16 @@ class CoherentVolume:
                 stale_status = resp.get("status") == "stale"
         # SB-23: the OCC read path also seeds the foreign-edit baseline — but
         # ONLY when the caller actually OBSERVES these bytes: here, where they
-        # are returned (a raise above — a request refused for its caller
+        # are returned to it (a raise above — a request refused for its caller
         # principal, a strict-mode transport or watchdog failure — leaves the
         # caller without them). A verification read (``observe=False``, used
         # by the effect fence) reads the file to compare comparands and then
-        # DISCARDS the bytes. Advancing the baseline in either case would
-        # silently absolve a foreign edit the caller never saw, so the next
-        # write would clobber it instead of denying. A fail-closed check must
-        # not have a fail-open side effect.
-        if observe:
+        # DISCARDS the bytes, and a CAS comparand read (``seed_baseline=False``)
+        # hands them on only if it is clean, and then itself. Advancing the
+        # baseline in any of these cases would silently absolve a foreign edit
+        # the caller never saw, so the next write would clobber it instead of
+        # denying. A fail-closed check must not have a fail-open side effect.
+        if observe and seed_baseline:
             self._last_observed_hash[_rel] = content_hash
         return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
 
@@ -2301,7 +2368,10 @@ class CoherentVolume:
         if resp.get("ok") is True:
             return "win"
         reason = resp.get("reason")
-        if reason in self._CAS_RETRY_REASONS:
+        # Only a string can be a member: a list or an object here (never the
+        # coordinator's own answer) is not retry-eligible, not a TypeError
+        # from the frozenset membership test.
+        if isinstance(reason, str) and reason in self._CAS_RETRY_REASONS:
             return "conflict"
         return "raise"
 

@@ -720,7 +720,7 @@ def test_write_cas_deny_raises_in_both_on_error_modes(
             # ({ok:false, reason:commit_cas_corruption...}) which must raise.
             # (bytes, version, stale_denied, generation, stale_status) — not
             # stale, so no reacquire.
-            vol._read_with_version = lambda rel: (b"v1", 999, False, 0, False)  # type: ignore[assignment]
+            vol._read_with_version = lambda rel, **_kw: (b"v1", 999, False, 0, False)  # type: ignore[assignment]
             with pytest.raises(CoherenceError):
                 vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
             assert not vol.is_degraded, (
@@ -1051,7 +1051,7 @@ def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
         assert vol.read("data/shared.txt") == b"v1"
         calls = {"n": 0}
 
-        def always_denied(rel: str):
+        def always_denied(rel: str, **_kw: object):
             # (bytes, version, stale_denied, generation, stale_status) — every
             # comparand read is a deny (a deny carries no confirmed generation
             # and is a stale-status read).
@@ -1463,6 +1463,61 @@ def test_stale_read_generation_is_cas_retry_eligible() -> None:
     assert classify(stub, {"ok": False, "reason": STALE_READ_GENERATION_REASON}) == "conflict"
     assert classify(stub, {"ok": True}) == "win"
     assert classify(stub, {"ok": False, "reason": "commit_cas_corruption"}) == "raise"
+
+
+_CAS_ONCE = {
+    "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+mine"),
+    "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"mine"),
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "reason": ["version_mismatch"]},
+        {"ok": False, "reason": {"reason": "version_mismatch"}},
+        {"ok": False, "reason": 7},
+        {"ok": False},
+    ],
+    ids=["list", "object", "number", "absent"],
+)
+@pytest.mark.parametrize("surface", list(_CAS_ONCE))
+def test_a_cas_answer_whose_reason_is_not_a_string_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    surface: str, body: dict,
+) -> None:
+    """A 200 answer to the commit that is not a win and whose reason is not a
+    string — what a proxy in front of the coordinator could send; the
+    coordinator itself always sends one — cannot be classified: not a
+    retryable conflict (so no retry), not a deny or a rejection this client
+    can name. Whether the commit landed at the coordinator is unknown, so it
+    is ``CommitUnconfirmed`` (re-read; retry only if absent), and CAS-first
+    means the bytes never touched disk. Before, a list or an object reason
+    raised ``TypeError`` from the membership test."""
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _data, version = vol.read_with_version(rel)
+        real_post = coherent_volume_module._coordinator_post
+        commits: list[str] = []
+
+        def unrecognisable(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == "/hooks/post-edit-cas":
+                commits.append(path)
+                return dict(body)
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", unrecognisable)
+        with pytest.raises(CommitUnconfirmed):
+            _CAS_ONCE[surface](vol, rel, version)
+
+        assert commits == ["/hooks/post-edit-cas"], "sent once, never retried"
+        assert target.read_bytes() == b"v1", "unconfirmed bytes never touch disk"
+    finally:
+        stop_coordinator(tmp_path)
 
 
 # ----------------------------------------------------------------------
@@ -3413,15 +3468,29 @@ def test_a_read_refused_for_its_principal_does_not_absolve_a_foreign_edit(
         stop_coordinator(tmp_path)
 
 
-@pytest.mark.parametrize("cause", ["stale_view", "watchdog"])
+_READS_THAT_RAISE = {
+    "read": lambda vol, rel: vol.read(rel),
+    "read_with_version": lambda vol, rel: vol.read_with_version(rel),
+    # The comparand read raises; make_content never runs.
+    "write_cas": lambda vol, rel: vol.write_cas(rel, lambda cur: cur + b"+mine"),
+}
+
+
+@pytest.mark.parametrize(
+    ("cause", "how"),
+    [("stale_view", "read"), ("watchdog", "read"), ("watchdog", "read_with_version"),
+     ("watchdog", "write_cas")],
+)
 def test_a_read_that_raises_leaves_the_foreign_edit_baseline_where_it_was(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, cause: str,
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    cause: str, how: str,
 ) -> None:
     """The same rule for the other reads that raise without returning their
     bytes: under ``on_stale_read="raise"`` the strict deny surfaces as
     ``StaleView``; in strict mode a watchdog-degraded pre-read answer raises
-    ``CoherenceError``. Neither hands the caller the foreign bytes, so neither
-    may advance the baseline to them: a write() that ignores the raise is
+    ``CoherenceError`` — from read, from read_with_version, and from
+    write_cas's comparand read. None hands the caller the foreign bytes, so
+    none may advance the baseline to them: a write() that ignores the raise is
     still denied as a foreign edit rather than clobbering it."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
@@ -3443,7 +3512,7 @@ def test_a_read_that_raises_leaves_the_foreign_edit_baseline_where_it_was(
 
             monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_once)
         with pytest.raises(StaleView if cause == "stale_view" else CoherenceError):
-            vol.read(rel)
+            _READS_THAT_RAISE[how](vol, rel)
         assert vol._last_observed_hash[rel] == _sha(b"v1")
 
         with pytest.raises(StaleView) as denied:
@@ -3486,6 +3555,156 @@ def test_a_read_that_returns_still_seeds_the_baseline(
         stop_coordinator(tmp_path)
 
 
+# A CAS's comparand read hands its bytes on only when they are clean: write_cas
+# gives them to make_content; write_cas_at (and a single-member publish, which
+# takes its path) never gives them to anyone — the caller supplies the content.
+_CAS_AFTER_A_READ = {
+    "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+cas"),
+    "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"cas"),
+    "atomic_publish": lambda vol, rel, version: vol.atomic_publish([(rel, version, b"cas")]),
+}
+
+
+@pytest.mark.parametrize("cas", [*_CAS_AFTER_A_READ, "none"])
+def test_a_cas_whose_comparand_read_is_denied_leaves_the_foreign_edit_baseline_where_it_was(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, cas: str,
+) -> None:
+    """The volume writes v1 and reads it back; the file is then rewritten out
+    of band. A CAS's comparand read hash-checks the disk against the
+    coordinator's record, so it is strict-DENIED and the CAS fails closed
+    (``ViewWedged``) without handing anyone the foreign bytes — make_content
+    never runs. So the baseline stays at v1 and the next write() is denied as
+    a foreign edit, not admitted over it. Before, the denied read seeded the
+    baseline with the foreign bytes and that write() clobbered the edit.
+    ``none`` is the control: with no CAS the same write is denied."""
+    monkeypatch.setattr(coherent_volume_module, "DENIED_READ_BACKOFF_CAP_SEC", 0.002)
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v0")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        vol.write(rel, b"v1")  # the coordinator now records v1's hash
+        _data, version = vol.read_with_version(rel)
+        target.write_bytes(b"FOREIGN")
+        if cas != "none":
+            with pytest.raises(ViewWedged):
+                _CAS_AFTER_A_READ[cas](vol, rel, version)
+        assert vol._last_observed_hash[rel] == _sha(b"v1"), "a denied read moved the baseline"
+
+        with pytest.raises(StaleView) as denied:
+            vol.write(rel, b"mine-derived-from-v1")
+
+        assert str(denied.value) == coherent_volume_module._STALE_WRITE_DENY_REASON
+        assert target.read_bytes() == b"FOREIGN", "the out-of-band edit was clobbered"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_seeds_the_baseline_with_the_bytes_it_hands_make_content(
+    tmp_path: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """The other direction: a CLEAN comparand read's bytes reach make_content,
+    so the caller has seen them and they become the baseline — even when
+    make_content then gives up. Here a peer commits v2 after the volume read
+    v1; write_cas's first read is denied (this instance is INVALID), the
+    re-minted read is clean and hands v2 to make_content, which raises. A
+    write() derived from v2 then replaces v2 rather than being denied as a
+    foreign edit."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        peer.read(rel)
+        peer.write(rel, b"v2")
+        handed: list[bytes] = []
+
+        def give_up(current: bytes) -> bytes:
+            handed.append(current)
+            raise LookupError("the caller gave up")
+
+        with pytest.raises(LookupError):
+            vol.write_cas(rel, give_up)
+
+        assert handed == [b"v2"], "control: make_content saw exactly the clean read"
+        assert vol._last_observed_hash[rel] == _sha(b"v2")
+        vol.write(rel, b"mine-derived-from-v2")
+        assert target.read_bytes() == b"mine-derived-from-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("cas", ["write_cas_at", "atomic_publish"])
+def test_a_cas_that_never_hands_its_comparand_bytes_on_never_seeds_the_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig, cas: str,
+) -> None:
+    """write_cas_at's comparand read is clean but its bytes reach no one: the
+    caller supplies the content, merged against the version IT read. When a
+    peer's commit makes that version stale the CAS is refused
+    (``CasVersionConflict``), and the baseline must stay at what the caller
+    read — v1 — so a write() of content merged against v1 is denied rather
+    than replacing the peer's v2. Before, the unseen read seeded the baseline
+    with v2 and re-registered the instance, so that write() was admitted: a
+    lost update of the peer's commit."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _data, version = vol.read_with_version(rel)
+        peer.read(rel)
+        peer.write(rel, b"v2")
+        with pytest.raises(CasVersionConflict):
+            _CAS_AFTER_A_READ[cas](vol, rel, version)
+        assert vol._last_observed_hash[rel] == _sha(b"v1"), "an unseen read moved the baseline"
+
+        with pytest.raises(StaleView):
+            vol.write(rel, b"mine-merged-against-v1")
+
+        assert target.read_bytes() == b"v2", "the peer's commit was overwritten"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a commit refused after the bytes landed: what the error says -----------------
+#
+# FROZEN duplicates of the text write() raises when its commit is refused for
+# the caller principal after the bytes reached disk — never built from the
+# constants under test. Each clause is a claim about state (the disk, the
+# coordinator's record, its version, the peers, the grant) and a test below
+# observes that state.
+
+_UNRECORDED_WRITE = (
+    "{rel} holds the new bytes on disk, but the coordinator did not record the "
+    "write: its version did not advance. {grant} "
+)
+_GRANT_TAKEN = (
+    "Any peer that held a copy was invalidated when this write's grant request "
+    "was admitted, before the bytes were written, and must re-read the file; "
+    "this volume has not released any grant that request took."
+)
+_GRANT_UNCONFIRMED = (
+    "The answer to this write's grant request was not confirmed, so whether it "
+    "invalidated any peer, and whether it took a grant this volume now holds, "
+    "is not known."
+)
+
+
+def _coordinator_state(peer: CoherentVolume, rel: str) -> str | None:
+    """The coordinator's own record of ``peer``'s current incarnation for
+    ``rel``, read from ``/status`` — which changes nothing, and lists no
+    INVALID row, so an invalidated holder reads ``None``. Read from the
+    coordinator rather than through a read of the file, whose hash check
+    would also deny a live copy once the disk moved."""
+    status = coherent_volume_module._coordinator_get(peer._endpoint, "/status")
+    agent = str(session_to_agent_id(peer.session_id, peer._incarnation))
+    for session in status.get("sessions", []):
+        if session.get("agent_id") == agent:
+            return session.get("states", {}).get(rel)
+    return None
+
+
 @pytest.mark.parametrize("on_error", ["strict", "degrade"])
 def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
@@ -3494,11 +3713,16 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
     """write() holds the grant and has put the bytes on disk when its commit
     (post-edit) is refused for the caller principal, and recovery cannot cure
     it. The refusal itself changed nothing at the coordinator — the version
-    did not advance, no peer was invalidated, the grant is still held — but
-    the file DID change, so the typed refusal says so: it must not read like
-    a request that had no effect. The grant stays recorded for the next
-    re-mint to release; a peer's write is still refused while it is held; no
-    principal or nonce reaches the message."""
+    did not advance — but the write had changed two things before it: the
+    file, and every peer that held a copy, which the grant request
+    invalidated (KTD-1) before the bytes were written. So the typed refusal
+    says both, and that the grant was not released: it must not read like a
+    request that had no effect, nor tell a peer it may keep its copy.
+
+    The peer's state is observed, not assumed: a verification read finds it
+    holding a live copy before the write and invalidated after; its own
+    write is then refused as revoked. The grant stays recorded for the next
+    re-mint to release; no principal or nonce reaches the message."""
     import traceback
 
     from ccs.core.exceptions import CallerPrincipalRefused
@@ -3513,6 +3737,7 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
     try:
         vol.read(rel)
         peer.read(rel)
+        assert _coordinator_state(peer, rel) == "SHARED", "control: the peer holds a live copy"
         bound, nonce = vol._principal, vol._mint_nonce
         real_post = coherent_volume_module._coordinator_post
 
@@ -3533,19 +3758,71 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
         message = str(raised.value)
         assert raised.value.reason == "caller_principal_foreign"
         assert target.read_bytes() == b"v2"
-        assert "on disk" in message and "did not record the write" in message
-        assert "still holds the write grant" in message
+        assert message.startswith(_UNRECORDED_WRITE.format(rel=rel, grant=_GRANT_TAKEN))
         assert "(caller_principal_foreign)" in message
         assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
-        _data, version = peer.read_with_version(rel)
+        assert _coordinator_state(vol, rel) == "EXCLUSIVE", "and was not released"
+        _data, version, _generation = peer.read_with_version_generation(rel, observe=False)
         assert version == 1, "the coordinator recorded nothing"
-        with pytest.raises(StaleView):
+        assert _coordinator_state(peer, rel) is None, "the peer was invalidated, as the message says"
+        # The pre-edit deny fires only for an INVALID editor, so this is the
+        # invalidation itself, not the moved disk.
+        with pytest.raises(StaleView, match="revoked"):
             peer.write(rel, b"peer")
         rendered = "".join(traceback.format_exception(raised.value))
         _assert_no_secret_in(
             rendered + caplog.text + " ".join(str(w.message) for w in warned),
             bound, nonce, "Z" * 43, "X" * 43,
         )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("answer", ["degraded", "lost"])
+def test_a_commit_refused_after_an_unconfirmed_grant_request_does_not_say_peers_were_invalidated(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, answer: str,
+) -> None:
+    """Degrade mode: the answer to write()'s grant request is watchdog-degraded
+    or lost, so the write goes ahead best-effort without knowing whether the
+    coordinator took the grant — and so whether it invalidated anyone. Here
+    the request never reached it: the peer still holds a live copy. When the
+    commit is then refused for the principal, the message says the grant and
+    the peers' state are not known; saying peers were invalidated would be
+    false here, and saying they were not would be false when the request did
+    land."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        peer.read(rel)
+        bound, nonce = vol._principal, vol._mint_nonce
+        real_post = coherent_volume_module._coordinator_post
+
+        def unanswered_grant_request(
+            endpoint: object, path: str, payload: dict, **kwargs: object
+        ) -> object:
+            if path == "/hooks/pre-edit" and payload.get("session_id") == vol.session_id:
+                vol._mint_nonce, vol._principal = "Z" * 43, "X" * 43
+                if answer == "degraded":
+                    return {"ok": True, "degraded": True}
+                raise CoordinatorUnavailable("simulated: the answer was lost")
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", unanswered_grant_request)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(CallerPrincipalRefused) as raised:
+                vol.write(rel, b"v2")
+
+        message = str(raised.value)
+        assert target.read_bytes() == b"v2"
+        assert message.startswith(_UNRECORDED_WRITE.format(rel=rel, grant=_GRANT_UNCONFIRMED))
+        assert _coordinator_state(peer, rel) == "SHARED", "the grant request never reached the coordinator"
+        _assert_no_secret_in(message, bound, nonce, "Z" * 43, "X" * 43)
     finally:
         stop_coordinator(tmp_path)
 

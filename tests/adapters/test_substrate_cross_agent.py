@@ -863,6 +863,66 @@ def test_classify_commit_unknown_reason_fails_closed() -> None:
         substrate_module._classify_commit({"ok": False, "reason": "mystery"}, expected_version=4)
 
 
+# A non-win answer whose reason is not a string says nothing this client can
+# act on — it is not a retryable conflict and not a rejection it can name — so
+# its outcome is unknown. The real coordinator always sends a string reason;
+# these are what a proxy or a gateway in front of it could send.
+_UNRECOGNISABLE_REASONS = pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "reason": [VERSION_MISMATCH_REASON]},
+        {"ok": False, "reason": {"reason": VERSION_MISMATCH_REASON}},
+        {"ok": False, "reason": 7},
+        {"ok": False},
+    ],
+    ids=["list", "object", "number", "absent"],
+)
+
+
+@_UNRECOGNISABLE_REASONS
+def test_classify_commit_an_unrecognisable_reason_is_unconfirmed(body: dict) -> None:
+    """Classified defensively: an unhashable reason is not a ``TypeError``
+    from the membership test, and no reason that is not a string reads as a
+    conflict or as a named rejection."""
+    with pytest.raises(CommitUnconfirmed) as raised:
+        substrate_module._classify_commit(body, expected_version=4)
+
+    assert VERSION_MISMATCH_REASON not in str(raised.value)
+
+
+@_UNRECOGNISABLE_REASONS
+def test_an_unrecognisable_bump_answer_after_the_substrate_write_is_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, body: dict,
+) -> None:
+    """The substrate CAS lands; the coordinator's answer to the bump is not a
+    win and carries no reason this client can classify. The bump's outcome
+    is unknown, so it takes the existing unknown path — ``CommitUnconfirmed``
+    (re-read; retry only if absent) — and is never re-driven. Before, a list
+    or object reason escaped as a ``TypeError`` after the write had landed."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    real_post = substrate_module._coordinator_post
+
+    def unrecognisable_bump(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if path == "/hooks/post-edit-cas":
+            return dict(body)
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", unrecognisable_bump)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+
+        with pytest.raises(CommitUnconfirmed):
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+        assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- caller principal (caller-principal plan, U5) ----------------------------
 #
 # The substrate session is a long-lived caller holding its principal in memory.

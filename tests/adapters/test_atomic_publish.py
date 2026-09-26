@@ -404,7 +404,7 @@ def test_corruption_reason_is_non_retryable_not_staleview(
 # writes advance versions. The multi-member session path never re-reads disk
 # between the caller's read and materialization, so an out-of-band edit in that
 # window cannot version-mismatch and is NOT content-checked — the SB-23 predicate
-# (_check_foreign_edit) does not run there, even though _read_with_version seeds
+# (_check_foreign_edit) does not run there, even though the caller's read seeds
 # its baseline. This is the DOCUMENTED boundary (the API is for volume-mediated
 # writer sets only — see the docstring's foreign-edit paragraph and the guide's
 # scope note), not an accident. These tests pin both publish surfaces so any

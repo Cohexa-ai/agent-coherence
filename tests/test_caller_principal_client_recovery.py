@@ -348,6 +348,32 @@ def test_a_loser_that_gave_up_on_a_stalled_winners_nonce_recovers_once_it_lands(
     _assert_nothing_leaks(out + err, _value("N"), _value("Q"))
 
 
+def test_a_one_shot_request_refused_again_reports_the_second_refusals_reason(scripted) -> None:
+    """Refused as ``caller_principal_absent``, recovered with the stored
+    nonce, and refused AGAIN as ``caller_principal_foreign``: the typed
+    refusal — whose text the hook client prints — carries the retry's reason,
+    not the first one's. (Two equal reasons cannot tell which is carried.)"""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    workspace, sid = scripted
+    reasons = iter([_ABSENT, _FOREIGN])
+    _Scripted.claims = [(200, {"ok": True, "principal": _value("Q")})]
+    _Scripted.route = staticmethod(lambda _h: _refusal(next(reasons)))
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(CallerPrincipalRefused) as raised:
+        _coherence_client.post_with_stored_principal(
+            endpoint, workspace, "/hooks/session-stop", {"session_id": sid}, report=lambda _m: None
+        )
+
+    assert [path for path, _h in _Scripted.seen] == [
+        "/hooks/session-stop", "/principal/claim", "/hooks/session-stop",
+    ]
+    assert raised.value.reason == _FOREIGN
+    assert f"({_FOREIGN})" in str(raised.value) and f"({_ABSENT})" not in str(raised.value)
+    assert _coherence_client.PRINCIPAL_REFUSED_AGAIN in str(raised.value)
+
+
 def test_a_refusal_without_a_stored_nonce_is_reported_and_claims_nothing(
     scripted, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -880,6 +906,124 @@ def test_the_torn_nonce_age_is_the_time_since_it_was_last_written(
         assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
 
 
+def _reported_young(message: str, waits: list[float], nonce_file: Path) -> bool:
+    """Whether ``ensure_mint_nonce`` treated the torn file as young: the whole
+    bounded wait, then the young report."""
+    return len(waits) == _BOUNDED_WAITS and message == _YOUNG_NONCE_REPORT.format(path=nonce_file)
+
+
+# The Node client's rows for the next four tests say they hold "as in the Python
+# rule"; these are that rule's own pins, so the two cannot drift apart unseen.
+
+
+@pytest.mark.parametrize(
+    ("mtime_fraction", "age_sec", "young"),
+    [(0.75, 1.5, True), (0.6, 2.1, False)],
+    ids=["fraction-1.5s-young", "fraction-2.1s-old"],
+)
+def test_the_torn_nonce_age_is_read_from_the_mtime_at_full_precision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    mtime_fraction: float, age_sec: float, young: bool,
+) -> None:
+    """Every other test stamps a whole second; here the mtime has a fraction,
+    and the age is measured from it exactly. Stamped S+0.75 and read 1.5 s
+    later the file is young — truncated to S it would read 2.25 s and be
+    reported abandoned, telling the operator to remove a file whose writer
+    may still be alive. Stamped S+0.6 and read 2.1 s later it is abandoned —
+    rounded up to S+1 it would read 1.7 s and be waited on."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    mtime = stamp + mtime_fraction
+    os.utime(nonce_file, (mtime, mtime))
+    # Within a microsecond: 0.6 has no exact binary form, and a filesystem
+    # keeping whole seconds fails here loudly rather than passing silently.
+    assert abs(nonce_file.stat().st_mtime - mtime) < 1e-6, "precondition: the fraction is stored"
+    waits = _pin_clock(monkeypatch, mtime + age_sec)
+
+    message = _ensure_fails(tmp_path, key)
+
+    if young:
+        assert _reported_young(message, waits, nonce_file)
+    else:
+        assert waits == []
+        assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
+
+
+def test_a_symlinked_torn_nonce_is_aged_by_the_file_it_points_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The age is the linked file's — stat, not lstat: a young, still-empty
+    target behind a link stamped a minute ago is waited on, and neither the
+    link nor its target is touched."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    target = nonce_file.with_name(nonce_file.name + ".target")
+    nonce_file.rename(target)
+    os.utime(target, (stamp + 59, stamp + 59))
+    nonce_file.symlink_to(target)
+    os.utime(nonce_file, (stamp, stamp), follow_symlinks=False)
+    assert nonce_file.lstat().st_mtime == stamp, "precondition: the link itself is a minute old"
+    waits = _pin_clock(monkeypatch, stamp + 60)
+
+    message = _ensure_fails(tmp_path, key)
+
+    assert _reported_young(message, waits, nonce_file)
+    assert nonce_file.is_symlink() and target.read_text() == ""
+
+
+def test_a_torn_nonce_whose_age_cannot_be_read_is_waited_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dangling link: the file exists as a name, but there is no age to
+    read. Waiting is the safe default — the file is not reported abandoned
+    on an age the rule never saw — and nothing is created at the target."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    missing = nonce_file.with_name("missing")
+    nonce_file.unlink()
+    nonce_file.symlink_to(missing)
+    waits = _pin_clock(monkeypatch, stamp + 3600)
+
+    message = _ensure_fails(tmp_path, key)
+
+    assert _reported_young(message, waits, nonce_file)
+    assert not missing.exists()
+
+
+def test_a_torn_nonce_stamped_in_the_future_is_waited_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An mtime ten minutes ahead of the clock (the clock stepped back): a
+    negative age is not past the grace, so it is waited on — never read as
+    ten minutes old."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    os.utime(nonce_file, (stamp, stamp))
+    waits = _pin_clock(monkeypatch, stamp - 600)
+
+    message = _ensure_fails(tmp_path, key)
+
+    assert _reported_young(message, waits, nonce_file)
+
+
+def test_the_torn_nonce_age_is_not_the_files_creation_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mtime is stamped an hour AFTER the file was created and the clock
+    pinned 1 s after that: the mtime reads young, the creation time an hour
+    old. Every other test stamps the mtime before creation, which on macOS
+    also lowers the birthtime to it, so a birthtime rule would pass them.
+    Where the platform reports no birthtime there is nothing to confuse, and
+    the young outcome is asserted all the same."""
+    nonce_file, key, _stamp = _torn_nonce(tmp_path)
+    ahead = float(int(time.time()) + 3600)
+    os.utime(nonce_file, (ahead, ahead))
+    birth = getattr(nonce_file.stat(), "st_birthtime", None)
+    if birth is not None:
+        assert ahead + 1 - birth > 2.0, "precondition: the birthtime reads past the grace"
+    waits = _pin_clock(monkeypatch, ahead + 1)
+
+    message = _ensure_fails(tmp_path, key)
+
+    assert _reported_young(message, waits, nonce_file)
+
+
 _UNAVAILABLE_REPORT = "caller principal unavailable: no usable mint nonce ({message})"
 """FROZEN duplicate of the line the Node client's tests pin around either
 report (``unavailableReport`` in the sibling's
@@ -993,6 +1137,22 @@ def _cut_short(echo: str) -> bytes:
     )
 
 
+def _redirect(echo: str, code: int = 302) -> bytes:
+    """A redirect whose well-formed ``Location`` carries ``echo``."""
+    return _http_answer(code, {}, {"Location": f"http://127.0.0.1:1/{echo}"})
+
+
+def _bad_location(echo: str, code: int = 302) -> bytes:
+    """A redirect whose ``Location`` does not parse and carries ``echo``: the
+    bracketed host is not an IP address, and the stdlib's ``ValueError`` for
+    it quotes the host — ``echo`` included."""
+    return _http_answer(code, {}, {"Location": _bad_url(echo)})
+
+
+def _bad_url(echo: str) -> str:
+    return f"http://[x{echo}]/"
+
+
 @pytest.fixture
 def raw_workspace(tmp_path: Path):
     """A git workspace whose ``server.pid`` points at a :class:`_RawCoordinator`
@@ -1058,16 +1218,21 @@ def test_a_malformed_answer_to_a_request_names_only_its_type_down_its_whole_chai
     _assert_nothing_leaks(rendered, _value("P"))
 
 
-@pytest.mark.parametrize("answer", [_not_http, _cut_short], ids=["not-http", "cut-short"])
+@pytest.mark.parametrize(
+    "answer", [_not_http, _cut_short, _redirect, _bad_location],
+    ids=["not-http", "cut-short", "redirect", "redirect-bad-location"],
+)
 def test_a_hook_whose_claim_answer_is_malformed_still_sends_its_request_without_a_principal(
     raw_workspace, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     answer: Any,
 ) -> None:
-    """The first hook of a session claims; the claim's answer is malformed
-    (echoing the nonce). The claim is unconfirmed, so the hook goes on WITHOUT
-    a principal — the request is sent and its answer printed, as the Node
-    client does — instead of the hook dropping its request. The nonce stays
-    on disk for the next hook's claim, and nothing prints it."""
+    """The first hook of a session claims; the claim's answer is malformed or
+    a redirect (echoing the nonce). The claim is unconfirmed — a redirect is
+    never followed, and only a 2xx carries the claim contract, as the Node
+    client decides it — so the hook goes on WITHOUT a principal: the request
+    is sent and its answer printed, as the Node client does, instead of the
+    hook dropping its request. The nonce stays on disk for the next hook's
+    claim, and nothing prints it."""
     workspace, raw = raw_workspace
     sid = _sid()
     nonce_file, _principal = _files(workspace, sid)
@@ -1084,12 +1249,18 @@ def test_a_hook_whose_claim_answer_is_malformed_still_sends_its_request_without_
     _assert_nothing_leaks(out + err, nonce)
 
 
+@pytest.mark.parametrize(
+    ("answer", "kind"),
+    [(_not_http, "BadStatusLine"), (_redirect, "HTTP 302"), (_bad_location, "HTTP 302")],
+    ids=["not-http", "redirect", "redirect-bad-location"],
+)
 def test_the_self_test_reports_a_malformed_claim_answer_as_unconfirmed(
-    raw_workspace, capsys: pytest.CaptureFixture[str],
+    raw_workspace, capsys: pytest.CaptureFixture[str], answer: Any, kind: str,
 ) -> None:
-    """``--self-test`` against a coordinator whose claim answer is malformed:
-    it reports the claim as unconfirmed and exits 3 — no traceback, and
-    nothing the answer carried (the nonce the self-test sent, echoed)."""
+    """``--self-test`` against a coordinator whose claim answer is malformed,
+    or a redirect: it reports the claim as unconfirmed and exits 3 — no
+    traceback, and nothing the answer carried (the nonce the self-test sent,
+    echoed into the status line or the ``Location``)."""
     workspace, raw = raw_workspace
     sent: list[str] = []
     real_token = coherence_status.secrets.token_urlsafe
@@ -1098,50 +1269,51 @@ def test_the_self_test_reports_a_malformed_claim_answer_as_unconfirmed(
         sent.append(real_token(n))
         return sent[-1]
 
-    raw.responses = [_not_http("ECHO")]
+    raw.responses = [answer("ECHO")]
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(coherence_status.secrets, "token_urlsafe", recorded_token)
         rc = coherence_status._run_self_test(workspace)
     captured = capsys.readouterr()
 
     assert rc == 3
-    assert "unconfirmed" in captured.err and "BadStatusLine" in captured.err
+    assert "unconfirmed" in captured.err and kind in captured.err
+    assert "Traceback" not in captured.err
     assert raw.seen[0][2] == sent[0]
-    _assert_nothing_leaks(captured.out + captured.err, *sent)
+    _assert_nothing_leaks(captured.out + captured.err, *sent, "ECHO")
 
 
-def test_a_redirected_claim_names_no_location(raw_workspace) -> None:
+@pytest.mark.parametrize("answer", [_redirect, _bad_location], ids=["redirect", "bad-location"])
+def test_a_redirected_claim_is_unconfirmed_and_names_no_location(raw_workspace, answer: Any) -> None:
     """A claim answered 302 with a ``Location`` that echoes the nonce it
-    carried is refused as a redirect — the typed trust refusal, never
-    followed — but the refusal does not repeat the ``Location``: not in its
-    message, its chain, its ``location``, nor the MCP tool result built from
-    it. Control: a request that carried no principal material keeps the
-    ``Location`` (the echo really was sent)."""
+    carried is never followed, and — as the Node client decides any answer
+    outside 2xx — it is an ``unconfirmed`` claim, which the next claim with
+    the SAME nonce settles; it does not raise. Its detail names the status,
+    never the ``Location``. Control: a request that carried no principal
+    material is still refused as a redirect naming the ``Location`` (the
+    echo really was sent)."""
     from ccs.core.exceptions import RedirectRefused
-    from ccs.mcp.deny import deny_result
 
     workspace, raw = raw_workspace
-    echo = f"http://127.0.0.1:1/{_value('N')}"
-    raw.responses = [_http_answer(302, {}, {"Location": echo}), _http_answer(302, {}, {"Location": echo})]
+    raw.responses = [answer(_value("N")), _redirect(_value("N"))]
     endpoint = _coherence_client.resolve_endpoint(workspace)
 
-    with pytest.raises(RedirectRefused) as raised:
-        _coherence_client.claim_caller_principal(endpoint, _sid(), _value("N"))
+    claim = _coherence_client.claim_caller_principal(endpoint, _sid(), _value("N"))
     with pytest.raises(RedirectRefused) as control:
         _coherence_client.get(endpoint, "/status")
 
-    refused = raised.value
-    tool_result = deny_result(refused)
-    text = _rendered(refused) + str(refused.location) + json.dumps(tool_result.structuredContent)
-    _assert_nothing_leaks(text, _value("N"))
-    assert refused.status == 302
+    assert claim.outcome == "unconfirmed" and claim.principal is None
+    assert "HTTP 302" in claim.detail
+    _assert_nothing_leaks(claim.detail, _value("N"))
     assert _value("N") in str(control.value.location), "control: the Location echoed the nonce"
 
 
 def test_a_redirected_request_presenting_a_principal_names_no_location(raw_workspace) -> None:
-    """The same for any request that presented a caller principal: a
-    ``Location`` echoing the header never reaches the refusal."""
+    """A request that presented a caller principal is refused as a redirect —
+    the typed trust refusal, never followed — but a ``Location`` echoing the
+    header never reaches the refusal: not its message, its chain, its
+    ``location``, nor the MCP tool result built from it."""
     from ccs.core.exceptions import RedirectRefused
+    from ccs.mcp.deny import deny_result
 
     workspace, raw = raw_workspace
     raw.responses = [_http_answer(307, {}, {"Location": f"http://127.0.0.1:1/{_value('P')}"})]
@@ -1153,8 +1325,114 @@ def test_a_redirected_request_presenting_a_principal_names_no_location(raw_works
             extra_headers={_PRINCIPAL_HEADER: _value("P")},
         )
 
+    refused = raised.value
+    tool_result = deny_result(refused)
     assert raw.seen[0][1] == _value("P"), "control: the principal was presented"
-    _assert_nothing_leaks(_rendered(raised.value) + str(raised.value.location), _value("P"))
+    assert refused.status == 307
+    _assert_nothing_leaks(
+        _rendered(refused) + str(refused.location) + json.dumps(tool_result.structuredContent),
+        _value("P"),
+    )
+
+
+_REDIRECT_CODES = [301, 302, 303, 307, 308]
+
+
+@pytest.mark.parametrize("code", _REDIRECT_CODES)
+@pytest.mark.parametrize("material", ["principal-header", "claim-route"])
+def test_a_location_that_does_not_parse_is_withheld_before_it_is_parsed(
+    raw_workspace, monkeypatch: pytest.MonkeyPatch, code: int, material: str,
+) -> None:
+    """A redirect answering a request that carried a principal (header) or a
+    mint nonce (the claim) is refused naming no ``Location`` — BEFORE
+    anything parses it. A ``Location`` whose bracketed host is not an address
+    makes the stdlib's redirect handling raise a ``ValueError`` quoting the
+    host (precondition, below): parsed first, the echoed value escaped
+    untyped, in the message and down the chain, from every principal path.
+    Now it is the typed refusal, with the status only, and the stdlib's
+    redirect handling never saw the ``Location`` at all."""
+    import urllib.parse
+    import urllib.request
+
+    from ccs.core.exceptions import RedirectRefused
+
+    workspace, raw = raw_workspace
+    echo = _value("P")
+    with pytest.raises(ValueError, match=echo):  # precondition: parsing it quotes the echo
+        urllib.parse.urlsplit(_bad_url(echo))
+    parsed: list[str] = []
+    real_urlparse = urllib.request.urlparse
+
+    def recorded_urlparse(url: str, *args: Any, **kwargs: Any) -> Any:
+        parsed.append(url)
+        return real_urlparse(url, *args, **kwargs)
+
+    # The name the stdlib's http_error_30x resolves the Location with.
+    monkeypatch.setattr(urllib.request, "urlparse", recorded_urlparse)
+    raw.responses = [_bad_location(echo, code)]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(RedirectRefused) as raised:
+        if material == "principal-header":
+            _coherence_client.post(
+                endpoint, "/hooks/pre-edit", {"session_id": _sid()},
+                extra_headers={_PRINCIPAL_HEADER: echo},
+            )
+        else:
+            _coherence_client.post(
+                endpoint, _coherence_client.PRINCIPAL_CLAIM_ROUTE,
+                {"session_id": _sid(), "mint_nonce": echo},
+            )
+
+    assert raised.value.status == code
+    assert raised.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
+    assert len(raw.seen) == 1, "control: the request was answered"
+    assert not [url for url in parsed if echo in url], "the Location was parsed"
+    _assert_nothing_leaks(_rendered(raised.value), echo)
+
+
+def test_a_location_that_does_not_parse_is_a_typed_refusal_on_any_request(raw_workspace) -> None:
+    """Without principal material the same answer is still the typed refusal
+    — never a ``ValueError`` out of the transport — and since the
+    ``Location`` names no URL it could follow, none is named."""
+    from ccs.core.exceptions import RedirectRefused
+
+    workspace, raw = raw_workspace
+    raw.responses = [_bad_location("ECHO")]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(RedirectRefused) as raised:
+        _coherence_client.get(endpoint, "/status")
+
+    assert raised.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
+    _assert_nothing_leaks(_rendered(raised.value), "ECHO")
+
+
+def test_a_claim_sent_through_a_proxy_still_withholds_the_location(
+    raw_workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sent through an HTTP proxy, the request line carries the absolute URL
+    (urllib rewrites the selector to it), so a check keyed on the selector no
+    longer sees the claim route and quoted the nonce the ``Location`` echoed.
+    The route is read from the request's URL, which a proxy leaves alone."""
+    from ccs.core.exceptions import RedirectRefused
+
+    workspace, raw = raw_workspace
+    for name in ("no_proxy", "NO_PROXY", "https_proxy", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{raw.port}")
+    raw.responses = [_redirect(_value("N"))]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(RedirectRefused) as raised:
+        _coherence_client.post(
+            endpoint, _coherence_client.PRINCIPAL_CLAIM_ROUTE,
+            {"session_id": _sid(), "mint_nonce": _value("N")},
+        )
+
+    assert raw.seen[0][0].startswith("http://"), "control: it went through the proxy"
+    assert raised.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
+    _assert_nothing_leaks(_rendered(raised.value), _value("N"))
 
 
 # --- what a one-shot client's refusal carries on its chain ---------------------
@@ -1218,6 +1496,14 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
     def _echo(self) -> str:
         return " ".join([self.headers.get(_PRINCIPAL_HEADER) or "", *type(self).nonces])
 
+    def _redirect(self, at: str, echo: str) -> None:
+        self.send_response(302)
+        self.send_header(
+            "Location", _bad_url(echo) if at.endswith("bad-location") else f"http://127.0.0.1:1/{echo}"
+        )
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self) -> None:  # noqa: N802 — stdlib name
         cls = type(self)
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
@@ -1240,7 +1526,9 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
             else:
                 self._send({"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}})
         elif self.path == "/hooks/pre-edit":
-            if at == "pre-edit":
+            if at in ("pre-edit-redirect", "pre-edit-bad-location"):
+                self._redirect(at, echo.replace(" ", ""))
+            elif at == "pre-edit":
                 self._send({"ok": False, "reason": echo, "error": echo})
             elif at == "pre-edit-list":
                 self._send([echo])
@@ -1266,6 +1554,8 @@ _SELF_TEST_FAILURES = {
     "pre-read-1": "expected fresh on first pre-read",
     "pre-edit": "pre-edit failed",
     "pre-edit-list": "/hooks/pre-edit answered with a non-object answer",
+    "pre-edit-redirect": "/hooks/pre-edit was redirected (HTTP 302)",
+    "pre-edit-bad-location": "/hooks/pre-edit was redirected (HTTP 302)",
     "post-edit": "post-edit failed",
     "pre-read-2": "expected stale warning",
     "stale-prose": "stale-warning prose did not mention plan.md",
@@ -1298,6 +1588,7 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     captured = capsys.readouterr()
 
     assert rc == (0 if echo_at is None else 3), captured.err
+    assert "Traceback" not in captured.err
     assert len(_EchoCoordinator.principals) == 2, "control: both sessions were bound"
     failure = _SELF_TEST_FAILURES[echo_at]
     assert failure is None or failure in captured.err, "control: it failed at the echoing step"

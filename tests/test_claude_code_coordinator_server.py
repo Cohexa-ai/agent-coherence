@@ -9071,17 +9071,25 @@ def test_pre_edit_without_its_principal_cannot_take_a_grant_it_could_not_release
 def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decider) -> None:
     """The other side of the test above, which the posture table must state
     rather than leave out: refusing a claimed session's pre-edit that carries
-    no principal also withholds everything pre-edit does FOR that session. On a
-    strict-mode path where the session was preempted, the refused request gets
-    no strict-mode deny, no grant, and invalidates no peer -- and the hook
-    clients read a 400 like any other refusal, so the edit then proceeds
-    uncoordinated. Control: the same request presenting the principal IS
-    denied.
+    no principal also withholds everything pre-edit does FOR that session --
+    the strict-mode deny, the grant and the invalidation of its peers -- and
+    the hook clients read a 400 like any other refusal, so the edit then
+    proceeds uncoordinated.
+
+    Each cost is shown against a control that GETS it, in a setup where
+    admission and refusal differ in that cost. A refused request that changed
+    nothing looks exactly like an admitted one that happened to change
+    nothing, and on a strict-mode path where the session was preempted an
+    admitted pre-edit is denied: it takes no grant and invalidates no peer
+    either, so there only the deny separates the two. The grant and the
+    invalidation are shown on an unpreempted path instead, where the same
+    request presenting the principal takes EXCLUSIVE and invalidates the
+    SHARED peer.
 
     Prevents the table describing only what the refusal rules out. The
     trade-off was chosen -- over admitting an acquire the caller could neither
     commit nor release -- and its cost is pinned here with the words that
-    state it."""
+    state it, the sentence stating the choice included."""
     from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
 
     server, client = served_decider
@@ -9090,13 +9098,15 @@ def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decide
     editor, peer = str(uuid.uuid4()), str(uuid.uuid4())
     editor_principal = _explicit_claim(client, editor)
     peer_principal = _explicit_claim(client, peer)
+    editor_agent, peer_agent = session_to_agent_id(editor), session_to_agent_id(peer)
+
+    # The deny: a strict-mode path where the peer's edit preempted the editor.
     status, _ = client.post(
         "/hooks/pre-read", {"session_id": editor, "path": path, "content_hash": _hash("v1")},
         principal=editor_principal)
     assert status == 200
     _pre_edit_with(client, peer, peer_principal, path)
     artifact_id = reg.lookup_artifact_id_by_name(path)
-    editor_agent, peer_agent = session_to_agent_id(editor), session_to_agent_id(peer)
     assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
     assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
     denials_before = server.counters_snapshot()["strict_mode_denials_total"]
@@ -9104,10 +9114,15 @@ def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decide
     refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
     assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
     assert "hookSpecificOutput" not in refused[1], "a refusal relays no deny"
-    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before
-    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID, "no grant"
-    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE, (
-        "no peer invalidated")
+    # The 400 is written before the handler returns; a side effect after it
+    # would land after this read unless the handler is waited out first.
+    _await_in_flight_drain(server)
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before, (
+        "no strict-mode deny")
+    # Not costs of the refusal on this path (the admitted control below is
+    # denied and changes neither): only that the refused request changed nothing.
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
 
     status, denied = client.post(
         "/hooks/pre-edit", {"session_id": editor, "path": path}, principal=editor_principal)
@@ -9115,9 +9130,35 @@ def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decide
     assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
     assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before + 1
 
+    # The grant and the invalidation: an unpreempted path, both sessions SHARED.
+    open_path = _U3A_WARN_PATH
+    for sid, principal in ((editor, editor_principal), (peer, peer_principal)):
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": open_path, "content_hash": _hash("v1")},
+            principal=principal)
+        assert status == 200
+    open_id = reg.lookup_artifact_id_by_name(open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": open_path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    _await_in_flight_drain(server)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED, "no grant"
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED, (
+        "no peer invalidated")
+
+    _pre_edit_with(client, editor, editor_principal, open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.EXCLUSIVE, (
+        "control: the same pre-edit, admitted, takes the grant")
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.INVALID, (
+        "control: the same pre-edit, admitted, invalidates the SHARED peer")
+
     harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-edit")].harm
     for stated in ("proceeds uncoordinated", "no grant", "no strict-mode deny",
-                   "no invalidation of its peers", "neither commit nor release"):
+                   "no invalidation of its peers", "neither commit nor release",
+                   "chosen over admitting an acquire"):
         assert stated in harm, f"pre-edit's harm text does not state {stated!r}: {harm}"
 
 

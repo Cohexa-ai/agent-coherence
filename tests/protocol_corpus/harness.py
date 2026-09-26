@@ -71,9 +71,12 @@ as ``node <plugin-dist>/coordinator.js`` with ``AGENT_COHERENCE_WORKSPACE``
 pointing at the tmp workspace. Both coordinators bind ephemeral ports.
 
 Plugin coordinator discovery: ``AGENT_COHERENCE_PLUGIN_DIST_PATH`` env var
-(absolute path to ``dist/coordinator.js``); fallback ``../agent-coherence-plugin/dist/coordinator.js``
-relative to the library repo root; fallback ``~/projects/agent-coherence-plugin/dist/coordinator.js``.
-If none resolve, Node backend scenarios xfail with a clear reason."""
+(absolute path to ``dist/coordinator.js``); only while it is UNSET, fallback
+``../agent-coherence-plugin/dist/coordinator.js`` relative to the library repo root, then
+``~/projects/agent-coherence-plugin/dist/coordinator.js``. Set to a path that does not exist, it
+raises instead of falling back. If it is unset and neither fallback exists, the resolver returns
+``None``: the parity corpora xfail their Node rows with a clear reason, and the asymmetry corpora
+(caller principal, effect fence) fail them."""
 
 from __future__ import annotations
 
@@ -95,6 +98,8 @@ FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
 HARNESS_TIMEOUT_SEC = 10.0
 NODE_SPAWN_TIMEOUT_SEC = 8.0
 NODE_SHUTDOWN_TIMEOUT_SEC = 5.0
+#: Names the Node coordinator entry point to run; see :func:`resolve_node_dist_path`.
+NODE_DIST_PATH_ENV = "AGENT_COHERENCE_PLUGIN_DIST_PATH"
 
 
 # ----------------------------------------------------------------------
@@ -978,13 +983,29 @@ def resolve_node_dist_path() -> Optional[Path]:
     2. ``../agent-coherence-plugin/dist/coordinator.js`` relative to library repo root
     3. ``~/projects/agent-coherence-plugin/dist/coordinator.js``
 
-    Returns ``None`` if nothing resolves — the harness then xfails Node backend
-    scenarios with a clear reason rather than hanging."""
-    explicit = os.environ.get("AGENT_COHERENCE_PLUGIN_DIST_PATH")
-    if explicit:
-        p = Path(explicit).expanduser().resolve()
-        if p.exists():
-            return p
+    The fallbacks apply only while the variable is UNSET. Set to a path that
+    does not exist (or set empty), it raises ``FileNotFoundError`` naming the
+    variable: an explicit path is the one a run was asked to test, and falling
+    back from a mistyped one would run the Node rows against whatever dist the
+    fallback checkout holds and report green. Every corpus module resolves at
+    import, so the raise is a collection error in each of them and none of
+    their rows is collected -- not a failure in only the rows that remembered
+    to check.
+
+    Returns ``None`` if the variable is unset and no fallback exists — the
+    parity corpora then xfail their Node rows with a clear reason, and the
+    asymmetry corpora fail them, rather than hanging."""
+    explicit = os.environ.get(NODE_DIST_PATH_ENV)
+    if explicit is not None:
+        p = Path(explicit).expanduser().resolve() if explicit else None
+        if p is None or not p.exists():
+            raise FileNotFoundError(
+                f"{NODE_DIST_PATH_ENV} is set to {explicit!r}, which is not an "
+                f"existing path. An explicit dist is never replaced by a fallback "
+                f"checkout: point it at a built dist/coordinator.js, or unset it "
+                f"to use ../agent-coherence-plugin or ~/projects/agent-coherence-plugin."
+            )
+        return p
     sibling = (REPO_ROOT.parent / "agent-coherence-plugin" / "dist" / "coordinator.js").resolve()
     if sibling.exists():
         return sibling

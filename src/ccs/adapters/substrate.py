@@ -450,7 +450,15 @@ _RETRYABLE_COMMIT_REASONS: frozenset[str] = frozenset(
 def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
     """Map a ``/hooks/post-edit-cas`` 200 body to win / conflict, raising the
     typed unknown on the fail-closed degrade body (deny AND degrade both raise —
-    an unconfirmed CAS must never read as success)."""
+    an unconfirmed CAS must never read as success).
+
+    A non-win answer with no string ``reason`` is the unknown too. The
+    coordinator's own non-win answers always carry one, so it is what a proxy
+    or gateway in front of it could send, and it says nothing about whether
+    the bump landed. This is the commit leg, reached only after the substrate
+    write landed, so it must take the existing unknown path — reconcile by
+    re-reading, never re-drive — and never escape as a ``TypeError`` from the
+    membership test (an unhashable reason) or read as a rejection."""
     if resp.get("ok") is True:
         return CoordinatorWin(version=_as_int(resp.get("version"), expected_version + 1))
     reason = resp.get("reason")
@@ -458,6 +466,12 @@ def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
         raise CommitUnconfirmed(
             "coordinator commit_cas was unconfirmed (degraded); reconcile by "
             "re-reading before retrying — never blind re-drive"
+        )
+    if not isinstance(reason, str):
+        raise CommitUnconfirmed(
+            "coordinator commit_cas was answered with no outcome this client can "
+            "classify (not a win, and no reason); reconcile by re-reading before "
+            "retrying — never blind re-drive"
         )
     if reason in _RETRYABLE_COMMIT_REASONS:
         return CoordinatorConflict(current_version=_maybe_int(resp.get("current_version")))

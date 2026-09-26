@@ -47,6 +47,7 @@ from ccs.cli._coherence_client import (
     reportable_reason,
     resolve_endpoint,
 )
+from ccs.core.exceptions import RedirectRefused
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -223,6 +224,11 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         except CoordinatorUnavailable as exc:
             err(f"--self-test: {name} failed: {exc}")
             return None
+        except RedirectRefused as exc:
+            # Refused, never followed; reported by its status alone, since
+            # the Location is the coordinator's text.
+            err(f"--self-test: {name} was redirected (HTTP {exc.status}); not followed")
+            return None
         if not isinstance(answer, dict):
             err(f"--self-test: {name} answered with {_answer_summary(answer)}")
             return None
@@ -294,6 +300,9 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         return 3
     except CoordinatorUnavailable as exc:
         err(f"--self-test: /status failed: {exc}")
+        return 3
+    except RedirectRefused as exc:
+        err(f"--self-test: /status was redirected (HTTP {exc.status}); not followed")
         return 3
     if not isinstance(status, dict):
         err(f"--self-test: /status answered with {_answer_summary(status)}")
