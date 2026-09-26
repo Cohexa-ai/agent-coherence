@@ -76,7 +76,8 @@ endpoint is the one host you configured and secured the link to, and a proxy is 
 hop that neither `CCS_REMOTE_INSECURE` nor https verification covers. A remote
 coordinator must therefore be reachable directly, for example over a tunnel or a
 VPN; one reachable only through a forward proxy fails with
-`CoordinatorUnavailable`.
+`CoordinatorUnavailable`. A TLS-terminating front is unaffected, because you point
+the client *at* it as the endpoint.
 
 **CA-profile requirements for the terminating proxy (read this before you
 provision a certificate).** Coordinator endpoints are almost always IP literals

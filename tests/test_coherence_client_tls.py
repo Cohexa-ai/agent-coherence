@@ -969,6 +969,17 @@ def proxy_recorder(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ProxyRecorder]:
     listener.close()
 
 
+def _assert_a_stock_opener_uses_the_proxy(recorder: _ProxyRecorder, url: str) -> None:
+    """Positive control: under the test's proxy settings, urllib's own opener
+    does connect to the recorder. Without it, ``connections == []`` after the
+    client call could mean the proxy was never set, not that the client skipped
+    it. The recorder hangs up, so the stock request fails."""
+    with pytest.raises(OSError):
+        urllib.request.build_opener().open(url, timeout=5)
+    assert recorder.connections == [None]
+    recorder.connections.clear()
+
+
 @pytest.mark.parametrize(
     ("endpoint_scheme", "proxy_scheme"),
     [
@@ -999,6 +1010,9 @@ def test_requests_ignore_proxy_settings(
     else:
         srv = _start_plain_server(_make_handler_class())
     try:
+        _assert_a_stock_opener_uses_the_proxy(
+            proxy_recorder, f"{endpoint_scheme}://127.0.0.1:{srv.port}/status"
+        )
         ep = CoordinatorEndpoint(
             port=srv.port, bearer="s3cr3t", host="127.0.0.1", scheme=endpoint_scheme
         )
@@ -1019,10 +1033,41 @@ def test_a_routed_host_ignores_proxy_settings(
     # 192.0.2.1 (TEST-NET-1) is never routed, so the direct attempt times out.
     monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_recorder.port}")
     monkeypatch.setattr(cc, "CLI_HTTP_TIMEOUT_SEC", 0.5)
+    _assert_a_stock_opener_uses_the_proxy(proxy_recorder, "http://192.0.2.1:8080/status")
     ep = CoordinatorEndpoint(port=8080, bearer="s3cr3t", host="192.0.2.1")
     with pytest.raises(cc.CoordinatorUnavailable):
         cc.get(ep, "/status")
     assert proxy_recorder.connections == []
+
+
+@requires_openssl
+def test_a_ca_file_https_request_ignores_proxy_settings(
+    proxy_recorder: _ProxyRecorder,
+    tls_bundle: _CertBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With CCS_REMOTE_CA_FILE the client builds its opener per request instead of
+    # taking a shared one, so the cases above never reach this path: a proxy
+    # handler added only here would send the tunnel request to the proxy and
+    # leave every other test green.
+    monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{proxy_recorder.port}")
+    srv = _start_tls_server(tls_bundle, _make_handler_class())
+    try:
+        _assert_a_stock_opener_uses_the_proxy(
+            proxy_recorder, f"https://127.0.0.1:{srv.port}/status"
+        )
+        ep = CoordinatorEndpoint(
+            port=srv.port,
+            bearer="s3cr3t",
+            host="127.0.0.1",
+            scheme="https",
+            ca_file=str(tls_bundle.ca_pem),
+        )
+        assert cc.get(ep, "/status") == {"ok": True}
+        assert srv.handler_cls.seen_authorizations == ["Bearer s3cr3t"]
+        assert proxy_recorder.connections == []
+    finally:
+        srv.shutdown()
 
 
 def test_the_shared_system_trust_context_is_the_hardened_one(
