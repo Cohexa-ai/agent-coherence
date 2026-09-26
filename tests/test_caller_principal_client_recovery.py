@@ -26,11 +26,13 @@ import http.server
 import io
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.error
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -739,13 +741,566 @@ def test_a_torn_nonce_file_is_waited_on_only_while_it_could_still_be_written(
     assert bool(sleeps) is waits
     assert nonce_file.read_text() == ""
     # Named in full, as the hook.secret error is and as the Node client prints
-    # it: nothing repairs the file automatically.
-    assert str(nonce_file) in message
-    assert "not overwriting it" in message
+    # it (byte for byte: the frozen reports below): nothing repairs the file
+    # automatically, and only the abandoned report names the removal step.
     if waits:
-        assert "runs without a principal until" not in message
-        assert "this invocation proceeds without a principal" in message.lower()
+        assert message == _YOUNG_NONCE_REPORT.format(path=nonce_file)
     else:
-        assert "interrupted write" in message
-        assert "runs without a principal until it is fixed" in message
-        assert "remove" in message and "by hand" in message
+        assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
+
+
+# --- the mint-nonce file: the grace window, pinned on both sides of its edge ---
+#
+# FROZEN duplicates of the reports the Node client's own tests pin byte for byte
+# (``youngMessage`` / ``abandonedMessage`` in the sibling's
+# ``src/test/caller_principal.test.ts``) — never built from the constants under
+# test. The two clients print the same text for the same file.
+
+_YOUNG_NONCE_REPORT = (
+    "{path} exists but its write was still in progress across 5 attempts; not overwriting it. "
+    "This invocation proceeds without a principal; a later one adopts the nonce if that write "
+    "lands, or reports {path} as an interrupted write once it has stayed incomplete for 2 s."
+)
+_ABANDONED_NONCE_REPORT = (
+    "{path} exists but holds no complete nonce (an interrupted write); not overwriting it. "
+    "The session runs without a principal until it is fixed: remove {path} by hand if no "
+    "hook of this session is running."
+)
+_BOUNDED_WAITS = 4  # 5 attempts, a wait between each (frozen, like the text above)
+
+
+def _torn_nonce(tmp_path: Path) -> tuple[Path, str, float]:
+    """An empty nonce file — an exclusive create whose write has not landed —
+    and a whole second a minute ago to stamp it with, so a pinned clock gives
+    an exact age."""
+    (tmp_path / ".coherence").mkdir(mode=0o700)
+    key = caller_principal_identity(_sid()).hex
+    nonce_file = tmp_path / ".coherence" / f"caller-principal-{key}.nonce"
+    nonce_file.touch(mode=0o600)
+    return nonce_file, key, float(int(time.time()) - 60)
+
+
+def _pin_clock(
+    monkeypatch: pytest.MonkeyPatch, now: float, *, each_wait_advances: float = 0.0
+) -> list[float]:
+    """Pin the clock ``auth`` reads to ``now``; each bounded wait is recorded
+    (and returned) and advances the pinned clock by ``each_wait_advances``."""
+    clock = [now]
+    waits: list[float] = []
+
+    def wait(seconds: float) -> None:
+        waits.append(seconds)
+        clock[0] += each_wait_advances
+
+    monkeypatch.setattr(auth, "time", SimpleNamespace(time=lambda: clock[0], sleep=wait))
+    return waits
+
+
+def _ensure_fails(tmp_path: Path, key: str) -> str:
+    with pytest.raises(auth.MintNonceUnavailable) as caught:
+        auth.ensure_mint_nonce(tmp_path, key)
+    return str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("age_sec", "young"),
+    [(1.999, True), (2.0, True), (2.001, False), (2.1, False)],
+    ids=["1.999s-young", "2.000s-young", "2.001s-old", "2.100s-old"],
+)
+def test_the_torn_nonce_grace_edge_is_two_seconds_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_sec: float, young: bool,
+) -> None:
+    """The grace is 2 s and exclusive, to the millisecond, as the Node
+    client's is: a torn file aged 1.999 s or exactly 2 s is young — the whole
+    bounded wait, then the young report — and one aged 2.001 s or 2.1 s is
+    abandoned — reported at once, with the removal step. The clock is pinned,
+    so the age the rule computes is exactly the one named. An inclusive edge,
+    or a grace moved anywhere off 2 s by more than a millisecond, turns an arm
+    red; so does either report's text drifting from the Node client's."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    os.utime(nonce_file, (stamp, stamp))
+    assert nonce_file.stat().st_mtime == stamp, "precondition: the stamp is exact"
+    waits = _pin_clock(monkeypatch, stamp + age_sec)
+
+    message = _ensure_fails(tmp_path, key)
+
+    if young:
+        assert len(waits) == _BOUNDED_WAITS
+        assert message == _YOUNG_NONCE_REPORT.format(path=nonce_file)
+    else:
+        assert waits == []
+        assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
+    assert nonce_file.read_text() == "", "left exactly as it was"
+
+
+def test_the_torn_nonce_age_is_re_read_at_every_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file 1.99 s old at the first attempt is young and waited on; the wait
+    takes 20 ms, so at the second attempt it is 2.01 s old and is reported as
+    abandoned THEN — one wait, not the whole bounded wait. A rule that judged
+    the age once, at the first attempt, would wait four times and call it
+    young."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    os.utime(nonce_file, (stamp, stamp))
+    waits = _pin_clock(monkeypatch, stamp + 1.99, each_wait_advances=0.02)
+
+    message = _ensure_fails(tmp_path, key)
+
+    assert len(waits) == 1
+    assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
+
+
+@pytest.mark.parametrize(
+    ("atime_offset", "mtime_offset", "young"),
+    [(59.5, 0.0, False), (0.0, 59.5, True)],
+    ids=["written-a-minute-ago-read-just-now", "written-just-now-read-a-minute-ago"],
+)
+def test_the_torn_nonce_age_is_the_time_since_it_was_last_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    atime_offset: float, mtime_offset: float, young: bool,
+) -> None:
+    """The age is measured from the file's last WRITE (mtime) — not its last
+    access (atime) and not its last metadata change (ctime, which is "now"
+    here). Every other test stamps atime equal to mtime, which cannot tell
+    them apart; here they differ by almost a minute, with the clock pinned a
+    minute after the whole-second stamp."""
+    nonce_file, key, stamp = _torn_nonce(tmp_path)
+    os.utime(nonce_file, (stamp + atime_offset, stamp + mtime_offset))
+    assert nonce_file.stat().st_mtime == stamp + mtime_offset, "precondition"
+    waits = _pin_clock(monkeypatch, stamp + 60.0)
+
+    message = _ensure_fails(tmp_path, key)
+
+    if young:
+        assert len(waits) == _BOUNDED_WAITS
+        assert message == _YOUNG_NONCE_REPORT.format(path=nonce_file)
+    else:
+        assert waits == []
+        assert message == _ABANDONED_NONCE_REPORT.format(path=nonce_file)
+
+
+_UNAVAILABLE_REPORT = "caller principal unavailable: no usable mint nonce ({message})"
+"""FROZEN duplicate of the line the Node client's tests pin around either
+report (``unavailableReport`` in the sibling's
+``src/test/caller_principal.test.ts``) — never built from the client's own
+f-string."""
+
+
+@pytest.mark.parametrize(
+    ("age_sec", "report"),
+    [(0.0, _YOUNG_NONCE_REPORT), (60.0, _ABANDONED_NONCE_REPORT)],
+    ids=["young", "old"],
+)
+def test_a_torn_nonce_file_reaches_the_hook_report_as_the_node_client_words_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_sec: float, report: str,
+) -> None:
+    """The one line a hook prints when no mint nonce is usable, byte for byte:
+    the Node client pins the same frozen line, so a rewording of the wrapper
+    on either side alone turns that side red. Nothing is claimed (no principal
+    is presented) and the file is left exactly as it was."""
+    session_id = _sid()
+    (tmp_path / ".coherence").mkdir(mode=0o700)
+    key = caller_principal_identity(session_id).hex
+    nonce_file = tmp_path / ".coherence" / f"caller-principal-{key}.nonce"
+    nonce_file.touch(mode=0o600)
+    stamp = float(int(time.time()) - 60)
+    os.utime(nonce_file, (stamp, stamp))
+    _pin_clock(monkeypatch, stamp + age_sec)
+    reports: list[str] = []
+
+    principal = _coherence_client.obtain_stored_principal(
+        _coherence_client.CoordinatorEndpoint(port=9, bearer="s" * 32),
+        tmp_path, session_id, reports.append,
+    )
+
+    assert principal is None
+    assert reports == [_UNAVAILABLE_REPORT.format(message=report.format(path=nonce_file))]
+    assert nonce_file.read_text() == ""
+    assert sorted(p.name for p in (tmp_path / ".coherence").iterdir()) == [nonce_file.name]
+
+
+# --- malformed answers, redirects: a transport failure names only its type -----
+
+
+class _RawCoordinator:
+    """A loopback listener that answers each request with the next canned RAW
+    response — bytes sent verbatim, then the connection closed — so it can send
+    what no HTTP server library would: a status line that is not HTTP, a body
+    shorter than its Content-Length. Records ``(path, principal header, mint
+    nonce)`` for every request."""
+
+    def __init__(self, responses: list[bytes]) -> None:
+        import socket
+
+        self.responses = list(responses)
+        self.seen: list[tuple[str, str | None, str | None]] = []
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _addr = self._sock.accept()
+            except OSError:
+                return
+            with conn:
+                self._answer(conn)
+
+    def _answer(self, conn: Any) -> None:
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            raw += chunk
+        head, _sep, body = raw.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.strip().lower(): v.strip() for k, _s, v in (h.partition(":") for h in lines[1:])}
+        while len(body) < int(headers.get("content-length", "0")):
+            body += conn.recv(65536)
+        nonce = json.loads(body).get("mint_nonce") if body else None
+        self.seen.append((lines[0].split(" ")[1], headers.get(_PRINCIPAL_HEADER.lower()), nonce))
+        conn.sendall(self.responses.pop(0))
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _http_answer(status: int, body: object, headers: dict[str, str] | None = None) -> bytes:
+    raw = json.dumps(body).encode()
+    lines = [f"HTTP/1.1 {status} X", "Content-Type: application/json",
+             f"Content-Length: {len(raw)}", "Connection: close"]
+    lines += [f"{k}: {v}" for k, v in (headers or {}).items()]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode() + raw
+
+
+def _not_http(echo: str) -> bytes:
+    """A status line that is not HTTP, carrying ``echo`` (http.client's
+    ``BadStatusLine`` text IS this line)."""
+    return f"NOTHTTP 200 {echo}\r\n\r\n".encode()
+
+
+def _cut_short(echo: str) -> bytes:
+    """A 200 whose body stops long before its Content-Length (``IncompleteRead``
+    holds the partial body)."""
+    return (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+        + f'{{"ok": true, "principal": "{echo}'.encode()
+    )
+
+
+@pytest.fixture
+def raw_workspace(tmp_path: Path):
+    """A git workspace whose ``server.pid`` points at a :class:`_RawCoordinator`
+    (its responses set by the test via ``raw.responses``)."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".coherence").mkdir(mode=0o700)
+    raw = _RawCoordinator([])
+    (tmp_path / ".coherence" / "server.pid").write_text(f"12345\n{raw.port}\n")
+    (tmp_path / ".coherence" / "hook.secret").write_text("test-secret")
+    try:
+        yield tmp_path, raw
+    finally:
+        raw.close()
+
+
+def _rendered(exc: BaseException) -> str:
+    """What a traceback or ``logger.exception`` prints for ``exc``: its whole
+    chain, as Python renders it."""
+    import traceback
+
+    return "".join(traceback.format_exception(exc))
+
+
+@pytest.mark.parametrize(("answer", "kind"), [(_not_http, "BadStatusLine"), (_cut_short, "IncompleteRead")])
+def test_a_malformed_claim_answer_is_unconfirmed_and_names_only_its_type(
+    raw_workspace, answer: Any, kind: str,
+) -> None:
+    """``claim_caller_principal`` promises that transport-shaped failures come
+    back as ``unconfirmed``. A status line that is not HTTP, or a body cut
+    short, is one — urllib does not wrap it, and it used to escape as the raw
+    ``http.client`` exception, whose text is the very line the coordinator
+    sent (here, the nonce echoed back). The detail names the failure's type."""
+    workspace, raw = raw_workspace
+    raw.responses = [answer(_value("N"))]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    claim = _coherence_client.claim_caller_principal(endpoint, _sid(), _value("N"))
+
+    assert claim.outcome == "unconfirmed"
+    assert kind in claim.detail
+    assert _value("N") not in claim.detail
+
+
+def test_a_malformed_answer_to_a_request_names_only_its_type_down_its_whole_chain(
+    raw_workspace,
+) -> None:
+    """A request presenting a principal is answered with a status line that
+    echoes it: :func:`post` raises ``CoordinatorUnavailable`` — the transport
+    failure type every caller already handles — naming the malformed answer by
+    type, and neither its message nor its chain carries the line."""
+    workspace, raw = raw_workspace
+    raw.responses = [_not_http(_value("P"))]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(_coherence_client.CoordinatorUnavailable) as raised:
+        _coherence_client.post(
+            endpoint, "/hooks/pre-edit", {"session_id": _sid()},
+            extra_headers={_PRINCIPAL_HEADER: _value("P")},
+        )
+
+    rendered = _rendered(raised.value)
+    assert "BadStatusLine" in rendered
+    _assert_nothing_leaks(rendered, _value("P"))
+
+
+@pytest.mark.parametrize("answer", [_not_http, _cut_short], ids=["not-http", "cut-short"])
+def test_a_hook_whose_claim_answer_is_malformed_still_sends_its_request_without_a_principal(
+    raw_workspace, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    answer: Any,
+) -> None:
+    """The first hook of a session claims; the claim's answer is malformed
+    (echoing the nonce). The claim is unconfirmed, so the hook goes on WITHOUT
+    a principal — the request is sent and its answer printed, as the Node
+    client does — instead of the hook dropping its request. The nonce stays
+    on disk for the next hook's claim, and nothing prints it."""
+    workspace, raw = raw_workspace
+    sid = _sid()
+    nonce_file, _principal = _files(workspace, sid)
+    raw.responses = [answer("NONCE-ECHO"), _http_answer(200, {"ok": True})]
+
+    out, err = _drive("session-stop", {"session_id": sid}, workspace, monkeypatch, capsys)
+
+    nonce = nonce_file.read_text().strip()
+    assert [(path, header) for path, header, _n in raw.seen] == [
+        ("/principal/claim", None), ("/hooks/session-stop", None),
+    ]
+    assert raw.seen[0][2] == nonce, "the claim presented the stored nonce"
+    assert json.loads(out) == {"ok": True}
+    _assert_nothing_leaks(out + err, nonce)
+
+
+def test_the_self_test_reports_a_malformed_claim_answer_as_unconfirmed(
+    raw_workspace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` against a coordinator whose claim answer is malformed:
+    it reports the claim as unconfirmed and exits 3 — no traceback, and
+    nothing the answer carried (the nonce the self-test sent, echoed)."""
+    workspace, raw = raw_workspace
+    sent: list[str] = []
+    real_token = coherence_status.secrets.token_urlsafe
+
+    def recorded_token(n: int) -> str:
+        sent.append(real_token(n))
+        return sent[-1]
+
+    raw.responses = [_not_http("ECHO")]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(coherence_status.secrets, "token_urlsafe", recorded_token)
+        rc = coherence_status._run_self_test(workspace)
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert "unconfirmed" in captured.err and "BadStatusLine" in captured.err
+    assert raw.seen[0][2] == sent[0]
+    _assert_nothing_leaks(captured.out + captured.err, *sent)
+
+
+def test_a_redirected_claim_names_no_location(raw_workspace) -> None:
+    """A claim answered 302 with a ``Location`` that echoes the nonce it
+    carried is refused as a redirect — the typed trust refusal, never
+    followed — but the refusal does not repeat the ``Location``: not in its
+    message, its chain, its ``location``, nor the MCP tool result built from
+    it. Control: a request that carried no principal material keeps the
+    ``Location`` (the echo really was sent)."""
+    from ccs.core.exceptions import RedirectRefused
+    from ccs.mcp.deny import deny_result
+
+    workspace, raw = raw_workspace
+    echo = f"http://127.0.0.1:1/{_value('N')}"
+    raw.responses = [_http_answer(302, {}, {"Location": echo}), _http_answer(302, {}, {"Location": echo})]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(RedirectRefused) as raised:
+        _coherence_client.claim_caller_principal(endpoint, _sid(), _value("N"))
+    with pytest.raises(RedirectRefused) as control:
+        _coherence_client.get(endpoint, "/status")
+
+    refused = raised.value
+    tool_result = deny_result(refused)
+    text = _rendered(refused) + str(refused.location) + json.dumps(tool_result.structuredContent)
+    _assert_nothing_leaks(text, _value("N"))
+    assert refused.status == 302
+    assert _value("N") in str(control.value.location), "control: the Location echoed the nonce"
+
+
+def test_a_redirected_request_presenting_a_principal_names_no_location(raw_workspace) -> None:
+    """The same for any request that presented a caller principal: a
+    ``Location`` echoing the header never reaches the refusal."""
+    from ccs.core.exceptions import RedirectRefused
+
+    workspace, raw = raw_workspace
+    raw.responses = [_http_answer(307, {}, {"Location": f"http://127.0.0.1:1/{_value('P')}"})]
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(RedirectRefused) as raised:
+        _coherence_client.post(
+            endpoint, "/hooks/pre-edit", {"session_id": _sid()},
+            extra_headers={_PRINCIPAL_HEADER: _value("P")},
+        )
+
+    assert raw.seen[0][1] == _value("P"), "control: the principal was presented"
+    _assert_nothing_leaks(_rendered(raised.value) + str(raised.value.location), _value("P"))
+
+
+# --- what a one-shot client's refusal carries on its chain ---------------------
+
+
+@pytest.mark.parametrize("recovery", ["stops", "refused_again"])
+def test_no_coordinator_supplied_text_rides_the_chain_of_a_one_shot_refusal(
+    scripted, recovery: str,
+) -> None:
+    """The refused request's status line carries the stored principal, the
+    nonce and the re-claimed principal as its reason phrase. The
+    ``CallerPrincipalRefused`` a one-shot client raises — whether recovery
+    stops (the session is bound under another nonce) or the retry is refused
+    again — names the typed reason, and the ``HTTPError`` carrying the phrase
+    is not on its chain, so a caller's traceback prints none of them."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    workspace, sid = scripted
+    _Scripted.phrase = " ".join((_value("P"), _value("N"), _value("Q")))
+    _Scripted.claims = (
+        [(200, {"ok": False, "reason": _CLAIMED})]
+        if recovery == "stops"
+        else [(200, {"ok": True, "principal": _value("Q")})]
+    )
+    _Scripted.route = staticmethod(lambda _h: _refusal(_FOREIGN))
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+
+    with pytest.raises(CallerPrincipalRefused) as raised:
+        _coherence_client.post_with_stored_principal(
+            endpoint, workspace, "/hooks/session-stop", {"session_id": sid}, report=lambda _m: None
+        )
+
+    rendered = _rendered(raised.value)
+    assert raised.value.reason == _FOREIGN
+    assert len(_Scripted.seen) == (2 if recovery == "stops" else 3), "control: the scenario ran"
+    _assert_nothing_leaks(rendered, _value("P"), _value("N"), _value("Q"))
+
+
+# --- the self-test reports status and known tokens, never an answer -----------
+
+
+class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
+    """Answers the self-test's four steps and its ``/status`` read as a healthy
+    coordinator does — binding a fresh principal per claim — except at
+    ``echo_at``, where it answers so the step FAILS, with the principal the
+    request presented and every nonce claimed so far in every field."""
+
+    echo_at: str | None = None
+    nonces: list[str] = []
+    principals: list[str] = []
+    pre_reads = 0
+
+    def _send(self, answer: object) -> None:
+        raw = json.dumps(answer).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _echo(self) -> str:
+        return " ".join([self.headers.get(_PRINCIPAL_HEADER) or "", *type(self).nonces])
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        cls = type(self)
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        at, echo = cls.echo_at, self._echo()
+        if self.path == "/principal/claim":
+            cls.nonces.append(body["mint_nonce"])
+            cls.principals.append(secrets.token_urlsafe(32))
+            self._send({"ok": True, "principal": cls.principals[-1]})
+        elif self.path == "/hooks/pre-read":
+            cls.pre_reads += 1
+            first = cls.pre_reads == 1
+            if at == "pre-read-1":
+                self._send({"status": echo, "error": echo, "detail": echo})
+            elif first:
+                self._send({"status": "fresh", "version": 1})
+            elif at == "pre-read-2":
+                self._send({"status": echo, "version": echo})
+            elif at == "stale-prose":
+                self._send({"status": "stale", "hookSpecificOutput": {"additionalContext": echo}})
+            else:
+                self._send({"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}})
+        elif self.path == "/hooks/pre-edit":
+            if at == "pre-edit":
+                self._send({"ok": False, "reason": echo, "error": echo})
+            elif at == "pre-edit-list":
+                self._send([echo])
+            else:
+                self._send({"ok": True})
+        else:  # /hooks/post-edit
+            self._send({"ok": False, "reason": echo} if at == "post-edit" else {"ok": True})
+
+    def do_GET(self) -> None:  # noqa: N802 — stdlib name
+        counters: dict[str, object] = {"pre_read_total": 2, "post_edit_total": 1}
+        if type(self).echo_at == "counters":
+            # Too few, and a field carrying the echo beside them.
+            counters = {"pre_read_total": 1, "post_edit_total": 0, "note": self._echo()}
+        self._send({"stale_warning_emitted_total": 1, "endpoint_counters": counters})
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+
+# Where each echo makes the self-test fail: the step its report names.
+_SELF_TEST_FAILURES = {
+    None: None,
+    "pre-read-1": "expected fresh on first pre-read",
+    "pre-edit": "pre-edit failed",
+    "pre-edit-list": "/hooks/pre-edit answered with a non-object answer",
+    "post-edit": "post-edit failed",
+    "pre-read-2": "expected stale warning",
+    "stale-prose": "stale-warning prose did not mention plan.md",
+    "counters": "endpoint counters did not reflect",
+}
+
+
+@pytest.mark.parametrize("echo_at", list(_SELF_TEST_FAILURES), ids=lambda at: at or "control")
+def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
+    workspace: Path, capsys: pytest.CaptureFixture[str], echo_at: str | None,
+) -> None:
+    """A coordinator (or anything in front of it) that echoes the principal
+    header and the claimed nonces into the answer that fails a step cannot get
+    either onto the self-test's output: each failure is reported by the step,
+    the answer's status, ok flag and known reason token, the prose's length,
+    or the counters as numbers — never the answer itself. Every failing step
+    exits 3; the control run, with no echo, passes."""
+    _EchoCoordinator.echo_at, _EchoCoordinator.pre_reads = echo_at, 0
+    _EchoCoordinator.nonces, _EchoCoordinator.principals = [], []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoCoordinator)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    (workspace / ".coherence").mkdir(mode=0o700)
+    (workspace / ".coherence" / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+    (workspace / ".coherence" / "hook.secret").write_text("test-secret")
+    try:
+        rc = coherence_status._run_self_test(workspace)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    captured = capsys.readouterr()
+
+    assert rc == (0 if echo_at is None else 3), captured.err
+    assert len(_EchoCoordinator.principals) == 2, "control: both sessions were bound"
+    failure = _SELF_TEST_FAILURES[echo_at]
+    assert failure is None or failure in captured.err, "control: it failed at the echoing step"
+    _assert_nothing_leaks(
+        captured.out + captured.err, *_EchoCoordinator.principals, *_EchoCoordinator.nonces
+    )

@@ -8564,6 +8564,175 @@ def test_the_gate_and_the_work_body_share_one_watchdog_deadline(
         f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
 
 
+def test_the_fast_path_delivery_gets_only_what_the_gate_left_of_the_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The untracked fast path runs work under the watchdog too -- the deferred
+    re-grounding delivery, when the session has compact-pending armed -- and
+    that delivery also gets only what the gate's store lookup left of the ONE
+    deadline.
+
+    Prevents the fast path's call site starting a fresh deadline after the
+    gate, which the test above cannot see: it pins the tracked work body's call
+    site only. The path is reachable by a client that never claims (KTD15): its
+    session-start after a compaction arms compact-pending, and its pre-edit on
+    an untracked path then has the gate read the store and the delivery walk
+    the registry -- with two budgets, up to twice the watchdog, past the hook's
+    own 5s budget. The store read is the same lock-free slow stand-in as
+    above, so the lock this test holds blocks only the delivery."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    sid = str(uuid.uuid4())
+    coordinator.mark_compact_pending(sid)
+    assert coordinator.has_compact_pending(sid)
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"ok": True}), (
+        "the gate admitted the session and the fast path answered its bare body")
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the delivery never timed out, so this measured nothing about its deadline")
+    # One deadline answers at ~1.0s; a fresh one for the delivery at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the fast-path delivery got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
+def test_a_work_body_whose_deadline_has_already_passed_is_never_submitted(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the request's watchdog deadline has passed by the time its work
+    body would start, the body is not submitted at all: the request answers the
+    route's degraded envelope, counts one watchdog timeout, and nothing runs
+    afterwards.
+
+    Prevents ``run_with_watchdog`` submitting the body anyway with a token
+    wait. The caller is told "degraded" at once while the body runs with nobody
+    waiting for it -- for pre-edit it seeds the artifact and can land an
+    EXCLUSIVE grant the agent never learns of, the late completion the A6 abort
+    exists to prevent. The gate's store lookup starts the deadline (a session
+    nobody claimed, which the cache cannot answer), and a registration made
+    slow on the request thread spends the rest of it before the body."""
+    from concurrent.futures import Future
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 0.5
+    real_register = coordinator.register_session
+
+    def register_past_the_deadline(*args, **kwargs):
+        time.sleep(deadline + 0.2)
+        return real_register(*args, **kwargs)
+
+    submitted: list[Future] = []
+    real_submit = coordinator._watchdog.submit
+
+    def recording_submit(fn, *args, **kwargs):
+        future = real_submit(fn, *args, **kwargs)
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(coordinator, "register_session", register_past_the_deadline)
+    monkeypatch.setattr(coordinator._watchdog, "submit", recording_submit)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    response = client.post(
+        "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    _, still_running = futures_wait(submitted, timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert not still_running, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the work submitted "
+        f"to the watchdog pool to finish")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran after its deadline had passed: it seeded plan.md")
+    assert len(submitted) == 1, (
+        f"{len(submitted)} submissions to the watchdog pool: the gate's store lookup, "
+        f"then a work body submitted after its deadline had passed")
+
+
+def test_a_cached_identity_is_admitted_on_the_request_thread_not_in_the_watchdog_pool(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session the service's binding cache knows is decided on the request
+    thread: with every watchdog worker stuck on the registry lock, a claimed
+    session's untracked pre-edit still answers the fast path's own
+    ``{ok: true}`` at once and counts no timeout.
+
+    Prevents the gate taking every lookup through the watchdog pool. The cache
+    would still decide, but only once a worker came free, so while work bodies
+    blocked on registry contention fill the pool, a request the route answers
+    without the registry at all (the untracked fast path, R8) waits out the
+    deadline and degrades. The pool is shown to be full before the request is
+    sent -- every worker started and none free to run a no-op -- because with a
+    free worker the lookup would get through at once and this would measure
+    nothing."""
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    free_worker_grace_sec = 0.2
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    workers = mod._WATCHDOG_POOL_SIZE
+    blockers = [(s, _explicit_claim(client, s)) for s in (str(uuid.uuid4()) for _ in range(workers))]
+    sid = str(uuid.uuid4())
+    principal = _explicit_claim(client, sid)
+
+    with _HeldRegistryLock(coordinator) as held:
+        stuck = [
+            _Background(client, "/hooks/pre-edit", {"session_id": s, "path": "plan.md"}, p)
+            for s, p in blockers
+        ]
+        for request in stuck:
+            assert request.answered_within(_GATE_ANSWER_BOUND_SEC), (
+                f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for a blocker's "
+                f"degraded answer")
+            assert request.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), (
+                "a blocker's work body did not time out on the registry lock")
+        no_op = coordinator._watchdog.submit(lambda: None)
+        ran, _ = futures_wait([no_op], timeout=free_worker_grace_sec)
+        assert not ran and len(coordinator._watchdog._threads) == workers, (
+            "a watchdog worker was still free, so a lookup sent through the pool "
+            "would not have waited: this measures nothing")
+        timeouts_before = coordinator._watchdog_timeouts_total
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"},
+            principal)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for the answer"
+    assert answer.result() == (200, {"ok": True}), (
+        f"after {waited:.2f}s, the fast path's own answer, not a degraded one: the gate "
+        f"queued a cached identity's decision behind the stuck watchdog workers")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+    drained, _ = futures_wait([no_op], timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert drained, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the watchdog pool "
+        f"to drain once the registry lock was released")
+
+
 def _pre_edit_with(client: _Client, sid: str, principal: str, path: str) -> None:
     status, body = client.post(
         "/hooks/pre-edit", {"session_id": sid, "path": path}, principal=principal

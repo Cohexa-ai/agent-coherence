@@ -191,6 +191,19 @@ _PUBLISH_HELD_REASON = (
 )
 
 
+def _unrecorded_write_message(rel: str, refusal: CallerPrincipalRefused) -> str:
+    """What :meth:`CoherentVolume.write` reports when its commit (post-edit)
+    is refused for the caller principal AFTER the bytes reached disk: the
+    state the refusal left, then the refusal's own text (built from the typed
+    reason and constants — never the coordinator's prose, so no principal or
+    nonce)."""
+    return (
+        f"{rel} holds the new bytes on disk, but the coordinator did not record "
+        "the write: its version did not advance, no peer was invalidated, and "
+        f"this volume still holds the write grant. {refusal}"
+    )
+
+
 class CoherentVolume:
     """Coherent shared workspace for a single-host agent fleet (v1).
 
@@ -816,8 +829,6 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
-        # SB-23: seed the foreign-edit baseline with what we just observed on disk.
-        self._last_observed_hash[rel] = content_hash
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -849,6 +860,14 @@ class CoherentVolume:
                     and hook_output.get("permissionDecision") == "deny"
                 ):
                     raise StaleView(self._deny_reason(resp))
+        # SB-23: seed the foreign-edit baseline with what we observed on disk —
+        # only HERE, where the bytes reach the caller. Every raise above leaves
+        # the caller without them: a request refused for its caller principal
+        # (raised out of _post in both on_error modes), a strict-mode transport
+        # or watchdog failure, a StaleView. A baseline advanced on any of those
+        # would absolve an out-of-band edit the caller never saw, and its next
+        # write() would clobber it instead of being denied.
+        self._last_observed_hash[rel] = content_hash
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
@@ -979,15 +998,26 @@ class CoherentVolume:
                 )
             raise
 
-        post_resp = self._post(
-            "/hooks/post-edit",
-            {
-                "session_id": self._session_id,
-                "path": rel,
-                "success": True,
-                "content_hash": new_hash,
-            },
-        )
+        try:
+            post_resp = self._post(
+                "/hooks/post-edit",
+                {
+                    "session_id": self._session_id,
+                    "path": rel,
+                    "success": True,
+                    "content_hash": new_hash,
+                },
+            )
+        except CallerPrincipalRefused as refusal:
+            # Refused AFTER the bytes reached disk: the refusal itself changed
+            # nothing at the coordinator, but this write() did change the file,
+            # so the error says so rather than reading like a request that had
+            # no effect. The grant stays recorded (the coordinator still holds
+            # it for this incarnation); the observed baseline already names the
+            # bytes on disk, which are this instance's own.
+            raise CallerPrincipalRefused(
+                refusal.reason, _unrecorded_write_message(rel, refusal)
+            ) from None
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);
@@ -1962,7 +1992,13 @@ class CoherentVolume:
     def _send(self, endpoint_path: str, payload: dict) -> _Sent:
         """One POST presenting the current principal. A caller-principal
         refusal is returned for :meth:`_post` to recover; every other failure
-        routes through ``on_error`` here."""
+        routes through ``on_error`` here.
+
+        Every raise for a rejected request happens OUTSIDE the ``except``
+        block, so the ``HTTPError`` never rides the raised error's chain: its
+        text is the status line's reason phrase, which is the coordinator's,
+        and a traceback or ``logger.exception`` would print it. What this
+        client reports of a rejected request is its status code."""
         try:
             body = _coordinator_post(
                 self._endpoint,
@@ -1971,30 +2007,29 @@ class CoherentVolume:
                 extra_headers=caller_principal_headers(self._principal),
             )
         except urllib.error.HTTPError as exc:
-            # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
-            # with a distinct type, never the generic degrade path (which a
-            # degrade-mode local client could swallow).
-            if self._remote_endpoint is not None and exc.code == 401:
-                raise RemoteAuthFailed(
-                    "remote coordinator rejected the bearer token (401); the remote "
-                    "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
-                    "hook.secret"
-                ) from exc
-            reason = principal_refusal_reason(exc)
-            if reason is not None:
-                return _Sent(None, reason)
-            # The status code only: the reason phrase and the body are the
-            # coordinator's text, which this client never repeats.
-            self._fail_closed_or_degrade(
-                f"coordinator request to {endpoint_path} failed: HTTP {exc.code}"
-            )
-            return _Sent(None, None)  # reached only in degrade mode
+            status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
             return _Sent(None, None)  # reached only in degrade mode
-        return _Sent(body, None)
+        else:
+            return _Sent(body, None)
+        # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
+        # with a distinct type, never the generic degrade path (which a
+        # degrade-mode local client could swallow).
+        if self._remote_endpoint is not None and status == 401:
+            raise RemoteAuthFailed(
+                "remote coordinator rejected the bearer token (401); the remote "
+                "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
+                "hook.secret"
+            )
+        if reason is not None:
+            return _Sent(None, reason)
+        self._fail_closed_or_degrade(
+            f"coordinator request to {endpoint_path} failed: HTTP {status}"
+        )
+        return _Sent(None, None)  # reached only in degrade mode
 
     def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
         """Read current bytes + the coordinator's authoritative version.
@@ -2099,15 +2134,6 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
-        # ONLY when the caller actually OBSERVES these bytes. A verification
-        # read (``observe=False``, used by the effect fence) reads the file to
-        # compare comparands and then DISCARDS the bytes; advancing the
-        # baseline there would silently absolve a foreign edit the caller never
-        # saw, so the next write would clobber it instead of denying. A
-        # fail-closed check must not have a fail-open side effect.
-        if observe:
-            self._last_observed_hash[_rel] = content_hash
         version = 0
         stale_denied = False
         stale_status = False
@@ -2157,6 +2183,18 @@ class CoherentVolume:
                 # Any stale-status response — warn re-grant or deny alike —
                 # means this instance's prior grant did not stand at this read.
                 stale_status = resp.get("status") == "stale"
+        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
+        # ONLY when the caller actually OBSERVES these bytes: here, where they
+        # are returned (a raise above — a request refused for its caller
+        # principal, a strict-mode transport or watchdog failure — leaves the
+        # caller without them). A verification read (``observe=False``, used
+        # by the effect fence) reads the file to compare comparands and then
+        # DISCARDS the bytes. Advancing the baseline in either case would
+        # silently absolve a foreign edit the caller never saw, so the next
+        # write would clobber it instead of denying. A fail-closed check must
+        # not have a fail-open side effect.
+        if observe:
+            self._last_observed_hash[_rel] = content_hash
         return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
 
     @staticmethod

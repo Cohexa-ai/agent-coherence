@@ -1205,3 +1205,119 @@ def test_no_coordinator_supplied_text_reaches_what_the_session_raises(
             assert secret and secret not in " ".join(reported)
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- the retry bound and the reason a second refusal carries -------------------
+
+
+def _refuse_pre_read(
+    monkeypatch: pytest.MonkeyPatch, reasons: list[str], sent: list[str | None]
+) -> None:
+    """Every ``/hooks/pre-read`` is refused for its principal, the n-th with
+    ``reasons[n % len(reasons)]``; records the principal each one presented.
+    Every other request goes to the coordinator."""
+    import io
+    import json
+    import urllib.error
+
+    real_post = substrate_module._coordinator_post
+
+    def refusing(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if path != "/hooks/pre-read":
+            return real_post(endpoint, path, payload, **kwargs)
+        sent.append((kwargs.get("extra_headers") or {}).get(_PRINCIPAL_HEADER))
+        reason = reasons[(len(sent) - 1) % len(reasons)]
+        body = io.BytesIO(json.dumps({"error": "refused", "reason": reason}).encode())
+        raise urllib.error.HTTPError(path, 400, "Bad Request", {}, body)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", refusing)
+
+
+def test_a_request_refused_again_after_recovery_is_retried_exactly_once(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The substrate session's twin of the volume's bound: refused as
+    ``caller_principal_absent``, recovered (the claim with the held nonce
+    returns a principal that differs from the one presented), and refused
+    AGAIN as ``caller_principal_foreign`` — the request is retried exactly
+    ONCE after exactly ONE claim, and the typed refusal carries the SECOND
+    refusal's reason and says it was refused again. A session that kept
+    re-claiming would turn one refused request into an unbounded loop."""
+    from ccs.cli._coherence_client import PRINCIPAL_REFUSED_AGAIN, PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        claims: list[str] = []
+
+        def always_a_new_principal(_endpoint, _sid, nonce):  # noqa: ANN001, ANN202
+            claims.append(nonce)
+            return PrincipalClaim("bound", principal=f"{len(claims):043d}")
+
+        monkeypatch.setattr(substrate_module, "claim_caller_principal", always_a_new_principal)
+        sent: list[str | None] = []
+        _refuse_pre_read(monkeypatch, ["caller_principal_absent", "caller_principal_foreign"], sent)
+        held = sa._principal
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            sa.pre_read(REF, None)
+
+        assert sent == [held, "1".zfill(43)], "the refused request, then ONE retry under the new principal"
+        assert claims == [sa._mint_nonce]
+        assert raised.value.reason == "caller_principal_foreign"
+        assert "(caller_principal_foreign)" in str(raised.value)
+        assert PRINCIPAL_REFUSED_AGAIN in str(raised.value)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_no_coordinator_supplied_text_rides_the_chain_of_what_the_session_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read is refused, recovery adopts a new principal, and the retry is
+    answered 500 with the held principal, the nonce and the adopted principal
+    as the status line's reason phrase. The raised error names the status
+    only — and nothing on its CHAIN carries the phrase, so a traceback prints
+    no principal or nonce either."""
+    import io
+    import json
+    import traceback
+    import urllib.error
+
+    from ccs.cli import _coherence_client
+
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        adopted = "Q" * 43
+        held = (sa._principal, sa._mint_nonce, adopted)
+        echo = " ".join(held)  # type: ignore[arg-type]
+        real_claim_post = _coherence_client.post
+
+        def claim_binds(endpoint, path, body, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path == "/principal/claim":
+                return {"ok": True, "principal": adopted}
+            return real_claim_post(endpoint, path, body, **kwargs)
+
+        monkeypatch.setattr(_coherence_client, "post", claim_binds)
+        statuses = [400, 500]
+        real_post = substrate_module._coordinator_post
+
+        def answering(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path != "/hooks/pre-read":
+                return real_post(endpoint, path, payload, **kwargs)
+            status = statuses.pop(0)
+            body = {"reason": "caller_principal_foreign"} if status == 400 else {"error": echo}
+            raw = io.BytesIO(json.dumps(body).encode())
+            raise urllib.error.HTTPError(path, status, echo, {}, raw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", answering)
+
+        with pytest.raises(CoherenceError) as raised:
+            sa.pre_read(REF, None)
+
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert "HTTP 500" in rendered, "control: the retried request was the one answered 500"
+        for secret in held:
+            assert secret and secret not in rendered
+    finally:
+        stop_coordinator(tmp_path)

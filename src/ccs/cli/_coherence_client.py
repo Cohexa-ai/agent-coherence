@@ -17,6 +17,7 @@ print a one-line human message + exit 1 rather than dump a stack trace.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import logging
@@ -648,10 +649,14 @@ def claim_caller_principal(
 ) -> PrincipalClaim:
     """Claim ``session_id``'s caller principal, presenting ``mint_nonce``.
 
-    Transport-shaped failures come back as ``unconfirmed`` rather than raising;
-    a typed trust refusal (TLS verification, a redirect) still raises, exactly
-    as it does from :func:`post`. The coordinator's ``reason`` is repeated in
-    ``detail`` only when it is a known token (:func:`reportable_reason`)."""
+    Transport-shaped failures — an unreachable coordinator, and a malformed
+    answer such as a non-HTTP status line or a truncated body — come back as
+    ``unconfirmed`` rather than raising; a typed trust refusal (TLS
+    verification, a redirect) still raises, exactly as it does from
+    :func:`post`, and a redirect refusal for a claim names no ``Location``
+    (:data:`REDIRECT_LOCATION_WITHHELD`). The coordinator's ``reason`` is
+    repeated in ``detail`` only when it is a known token
+    (:func:`reportable_reason`)."""
     try:
         body = post(
             endpoint,
@@ -848,30 +853,41 @@ def post_with_stored_principal(
     ``send`` is the transport (:func:`post`; a caller's own seam)."""
     session_id = payload["session_id"]
     principal = obtain_stored_principal(endpoint, coordinator_root, session_id, report=report)
+    answer, reason = _send_presenting(send, endpoint, path, payload, principal)
+    if reason is None:
+        return answer
+    recovery = recover_stored_principal(endpoint, coordinator_root, session_id, principal, report)
+    if recovery.action == "stop":
+        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, recovery.detail))
+    answer, reason = _send_presenting(send, endpoint, path, payload, recovery.principal)
+    if reason is None:
+        return answer
+    raise CallerPrincipalRefused(reason, principal_refusal_message(reason, PRINCIPAL_REFUSED_AGAIN))
+
+
+def _send_presenting(
+    send: Callable[..., dict[str, Any]],
+    endpoint: CoordinatorEndpoint,
+    path: str,
+    payload: dict[str, Any],
+    principal: str | None,
+) -> tuple[Any, str | None]:
+    """One send presenting ``principal``: ``(answer, None)``, or ``(None,
+    reason)`` when the coordinator refused the principal with a typed reason.
+    Any other ``HTTPError`` re-raises.
+
+    The refusal is RETURNED, so the caller raises its
+    :class:`~ccs.core.exceptions.CallerPrincipalRefused` outside this
+    ``except`` block and the ``HTTPError`` — whose text is the status line's
+    reason phrase, the coordinator's — never rides that error's chain."""
     try:
-        return send(endpoint, path, payload, extra_headers=caller_principal_headers(principal))
+        answer = send(endpoint, path, payload, extra_headers=caller_principal_headers(principal))
     except urllib.error.HTTPError as exc:
         reason = principal_refusal_reason(exc)
         if reason is None:
             raise
-        recovery = recover_stored_principal(
-            endpoint, coordinator_root, session_id, principal, report
-        )
-        if recovery.action == "stop":
-            raise CallerPrincipalRefused(
-                reason, principal_refusal_message(reason, recovery.detail)
-            ) from exc
-    try:
-        return send(
-            endpoint, path, payload, extra_headers=caller_principal_headers(recovery.principal)
-        )
-    except urllib.error.HTTPError as exc:
-        reason = principal_refusal_reason(exc)
-        if reason is None:
-            raise
-        raise CallerPrincipalRefused(
-            reason, principal_refusal_message(reason, PRINCIPAL_REFUSED_AGAIN)
-        ) from exc
+        return None, reason
+    return answer, None
 
 
 def obtain_stored_principal(
@@ -934,6 +950,20 @@ def obtain_stored_principal(
     return None
 
 
+REDIRECT_LOCATION_WITHHELD = "(withheld)"
+"""The ``location`` a :class:`~ccs.core.exceptions.RedirectRefused` carries,
+in place of the one the coordinator sent, when the redirected request carried
+a caller principal (header) or a mint nonce (the claim)."""
+
+
+def _carries_principal_material(req: urllib.request.Request) -> bool:
+    """Whether ``req`` sent a caller principal or a mint nonce: the principal
+    header (urllib stores header names ``capitalize()``d), or the claim route,
+    whose body carries the nonce."""
+    route = req.selector.split("?", 1)[0]
+    return req.has_header(CALLER_PRINCIPAL_HEADER.capitalize()) or route == PRINCIPAL_CLAIM_ROUTE
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse ANY 3xx instead of following it.
 
@@ -948,6 +978,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # type: ignore[override]
         self, req, fp, code, msg, headers, newurl
     ):  # noqa: ANN001, ANN201 - matches the stdlib handler signature
+        if _carries_principal_material(req):
+            # The Location is the coordinator's text, and this request sent it
+            # a caller principal or a mint nonce: a coordinator — or anything
+            # in front of it — that echoed either into the Location would put
+            # it in the refusal's message, and from there in logs and tool
+            # results. The refusal names the status only.
+            raise RedirectRefused(REDIRECT_LOCATION_WITHHELD, status=code)
         raise RedirectRefused(newurl, status=code)
 
     # urllib's HTTPRedirectHandler routes 301/302/303/307 through
@@ -980,6 +1017,7 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         context = build_tls_context(ca_file)
 
     opener = _build_opener(context)
+    malformed: str | None = None
     try:
         with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
             raw = resp.read()
@@ -1006,6 +1044,18 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         raise CoordinatorUnavailable(
             f"network error talking to coordinator: {exc}"
         ) from exc
+    except http.client.HTTPException as exc:
+        # A malformed answer — a status line that is not HTTP (BadStatusLine),
+        # a body cut short (IncompleteRead), an overlong header line — is
+        # transport-shaped like the failures above, so it is reported as one:
+        # urllib does not wrap these, and they would otherwise escape every
+        # caller's transport handling untyped. Only the exception TYPE is
+        # named: a BadStatusLine's text IS the line the coordinator sent, and
+        # an IncompleteRead holds the partial body. The CoordinatorUnavailable
+        # is raised below, outside this block, so neither rides its chain.
+        malformed = type(exc).__name__
+    if malformed is not None:
+        raise CoordinatorUnavailable(f"coordinator sent a malformed HTTP response ({malformed})")
 
     if not raw:
         return {}

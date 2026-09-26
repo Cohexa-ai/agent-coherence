@@ -660,7 +660,13 @@ class SubstrateCoordinatorSession:
     ) -> _Sent:
         """One POST presenting the current principal. A caller-principal refusal
         is returned for :meth:`_post` to recover; anything else that is not a
-        dict body raises ``unknown``."""
+        dict body raises ``unknown``.
+
+        A rejected request raises OUTSIDE the ``except`` block, so the
+        ``HTTPError`` is not on the raised error's chain: its text is the
+        status line's reason phrase — the coordinator's — which a traceback
+        would print. This client reports a rejected request by its status
+        code only."""
         try:
             resp = _coordinator_post(
                 self._endpoint,
@@ -669,21 +675,20 @@ class SubstrateCoordinatorSession:
                 extra_headers=caller_principal_headers(self._principal),
             )
         except urllib.error.HTTPError as exc:
-            reason = principal_refusal_reason(exc)
-            if reason is not None:
-                return _Sent(None, reason)
-            # The status code only: the reason phrase and the body are the
-            # coordinator's text, which this client never repeats.
-            raise unknown(
-                f"coordinator {endpoint_path} failed (fail-closed): HTTP {exc.code}"
-            ) from exc
+            status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
             raise unknown(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"
             ) from exc
-        if not isinstance(resp, dict):
-            raise unknown(f"coordinator {endpoint_path} returned a non-dict body (fail-closed)")
-        return _Sent(resp, None)
+        else:
+            if not isinstance(resp, dict):
+                raise unknown(
+                    f"coordinator {endpoint_path} returned a non-dict body (fail-closed)"
+                )
+            return _Sent(resp, None)
+        if reason is not None:
+            return _Sent(None, reason)
+        raise unknown(f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}")
 
 
 @dataclass(frozen=True)

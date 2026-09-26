@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3322,5 +3323,417 @@ def test_no_coordinator_supplied_text_reaches_what_a_volume_raises_warns_or_logs
         if scenario == "the_claim_echoes":
             assert any(r.startswith(CallerPrincipalRefused.__name__) for r in reported)
         _assert_no_secret_in(text, *held)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a request that raises leaves the client's per-path beliefs untouched -----
+
+
+def _sha(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _lose_the_next_claims_answer(monkeypatch: pytest.MonkeyPatch, nonces: list[str]) -> None:
+    """The NEXT claim's answer is lost (reported ``unconfirmed``); later claims
+    go to the coordinator. Records the nonce every claim presents."""
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    real = coherent_volume_module.claim_caller_principal
+
+    def lossy(endpoint: object, session_id: str, nonce: str) -> object:
+        nonces.append(nonce)
+        if len(nonces) == 1:
+            return PrincipalClaim("unconfirmed", detail="answer lost")
+        return real(endpoint, session_id, nonce)
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", lossy)
+
+
+_REFUSED_READS = {
+    "read": lambda vol, rel: vol.read(rel),
+    "read_with_version": lambda vol, rel: vol.read_with_version(rel),
+    # write_cas's comparand read is the refused request here.
+    "write_cas": lambda vol, rel: vol.write_cas(rel, lambda cur: cur + b"+mine"),
+}
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("refused", ["read", "read_with_version", "write_cas", "none"])
+def test_a_read_refused_for_its_principal_does_not_absolve_a_foreign_edit(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    on_error: str, refused: str,
+) -> None:
+    """The volume reads v1; the file is then rewritten out of band (the
+    coordinator never hears of it). A read is refused for its principal — the
+    presented one is no longer the bound one, and the recovery claim's answer
+    is lost once — so it raises and the caller never receives the foreign
+    bytes. The next write() recovers the principal with the SAME nonce, so it
+    reaches the coordinator admitted; it must still be DENIED as a foreign
+    edit, and the disk must keep the foreign bytes.
+
+    Before, the refused read had already moved the SB-23 baseline to the
+    foreign bytes it never returned, so the write clobbered the edit — in
+    strict and degrade mode, through read, read_with_version and write_cas's
+    comparand read. ``none`` is the control: without the refused read the same
+    write is denied."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        assert vol.read(rel) == b"v1"
+        bound = vol._principal
+        target.write_bytes(b"FOREIGN")
+        nonces: list[str] = []
+        if refused != "none":
+            _lose_the_next_claims_answer(monkeypatch, nonces)
+            vol._principal = "X" * 43  # no longer the bound one, as after a store reset
+            with pytest.raises(CallerPrincipalRefused) as raised:
+                _REFUSED_READS[refused](vol, rel)
+            assert raised.value.reason == "caller_principal_foreign"
+            assert vol._last_observed_hash[rel] == _sha(b"v1"), "the refused read moved the baseline"
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+
+        with pytest.raises(StaleView) as denied:
+            vol.write(rel, b"mine-derived-from-v1")
+
+        assert str(denied.value) == coherent_volume_module._STALE_WRITE_DENY_REASON
+        assert target.read_bytes() == b"FOREIGN", "the out-of-band edit was clobbered"
+        assert ("/hooks/pre-edit", bound) in sent, "control: the write reached the coordinator admitted"
+        if refused != "none":
+            assert nonces == [vol._mint_nonce] * 2, "recovered with the SAME nonce, once lost"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("cause", ["stale_view", "watchdog"])
+def test_a_read_that_raises_leaves_the_foreign_edit_baseline_where_it_was(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, cause: str,
+) -> None:
+    """The same rule for the other reads that raise without returning their
+    bytes: under ``on_stale_read="raise"`` the strict deny surfaces as
+    ``StaleView``; in strict mode a watchdog-degraded pre-read answer raises
+    ``CoherenceError``. Neither hands the caller the foreign bytes, so neither
+    may advance the baseline to them: a write() that ignores the raise is
+    still denied as a foreign edit rather than clobbering it."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",),
+        on_stale_read="raise" if cause == "stale_view" else "allow", config=fast_cfg,
+    )
+    try:
+        assert vol.read(rel) == b"v1"
+        target.write_bytes(b"FOREIGN")
+        if cause == "watchdog":
+            real_post = coherent_volume_module._coordinator_post
+
+            def degraded_once(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+                if path == "/hooks/pre-read":
+                    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+                    return {"ok": True, "degraded": True}
+                return real_post(endpoint, path, payload, **kwargs)
+
+            monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_once)
+        with pytest.raises(StaleView if cause == "stale_view" else CoherenceError):
+            vol.read(rel)
+        assert vol._last_observed_hash[rel] == _sha(b"v1")
+
+        with pytest.raises(StaleView) as denied:
+            vol.write(rel, b"mine-derived-from-v1")
+
+        assert str(denied.value) == coherent_volume_module._STALE_WRITE_DENY_REASON
+        assert target.read_bytes() == b"FOREIGN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("how", ["read", "read_with_version"])
+def test_a_read_that_returns_still_seeds_the_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig, how: str
+) -> None:
+    """Control for the two tests above, in both directions: a read that
+    RETURNS the bytes seeds the baseline with them. Advanced to the bytes a
+    read returned after an out-of-band edit, the next write() replaces them;
+    seeded by a read BEFORE an out-of-band edit, a write over it is denied."""
+    def read(rel: str) -> bytes:
+        return vol.read(rel) if how == "read" else vol.read_with_version(rel)[0]
+
+    seen, unseen = _seed(tmp_path, "data/seen.txt"), _seed(tmp_path, "data/unseen.txt")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read("data/seen.txt")
+        seen.write_bytes(b"v2-seen")
+        assert read("data/seen.txt") == b"v2-seen"
+        assert vol._last_observed_hash["data/seen.txt"] == _sha(b"v2-seen")
+        vol.write("data/seen.txt", b"v3")
+        assert seen.read_bytes() == b"v3"
+
+        assert read("data/unseen.txt") == b"v1"
+        assert vol._last_observed_hash["data/unseen.txt"] == _sha(b"v1")
+        unseen.write_bytes(b"v2-unseen")
+        with pytest.raises(StaleView):
+            vol.write("data/unseen.txt", b"mine")
+        assert unseen.read_bytes() == b"v2-unseen"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, on_error: str,
+) -> None:
+    """write() holds the grant and has put the bytes on disk when its commit
+    (post-edit) is refused for the caller principal, and recovery cannot cure
+    it. The refusal itself changed nothing at the coordinator — the version
+    did not advance, no peer was invalidated, the grant is still held — but
+    the file DID change, so the typed refusal says so: it must not read like
+    a request that had no effect. The grant stays recorded for the next
+    re-mint to release; a peer's write is still refused while it is held; no
+    principal or nonce reaches the message."""
+    import traceback
+
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        peer.read(rel)
+        bound, nonce = vol._principal, vol._mint_nonce
+        real_post = coherent_volume_module._coordinator_post
+
+        def lose_principal_after_the_grant(
+            endpoint: object, path: str, payload: dict, **kwargs: object
+        ) -> object:
+            answer = real_post(endpoint, path, payload, **kwargs)
+            if path == "/hooks/pre-edit" and payload.get("session_id") == vol.session_id:
+                vol._mint_nonce, vol._principal = "Z" * 43, "X" * 43
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_principal_after_the_grant)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            with pytest.raises(CallerPrincipalRefused) as raised:
+                vol.write(rel, b"v2")
+
+        message = str(raised.value)
+        assert raised.value.reason == "caller_principal_foreign"
+        assert target.read_bytes() == b"v2"
+        assert "on disk" in message and "did not record the write" in message
+        assert "still holds the write grant" in message
+        assert "(caller_principal_foreign)" in message
+        assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
+        _data, version = peer.read_with_version(rel)
+        assert version == 1, "the coordinator recorded nothing"
+        with pytest.raises(StaleView):
+            peer.write(rel, b"peer")
+        rendered = "".join(traceback.format_exception(raised.value))
+        _assert_no_secret_in(
+            rendered + caplog.text + " ".join(str(w.message) for w in warned),
+            bound, nonce, "Z" * 43, "X" * 43,
+        )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- the reason a second refusal carries; what rides an exception's chain -----
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_request_refused_again_reports_the_second_refusals_reason(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """Refused as ``caller_principal_absent``, recovered, and refused AGAIN
+    as ``caller_principal_foreign``: the typed refusal carries the reason of
+    the refusal it reports — the retry's — not the first one's. (Two equal
+    reasons cannot tell which is carried.)"""
+    from ccs.cli._coherence_client import PRINCIPAL_REFUSED_AGAIN, PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        monkeypatch.setattr(
+            coherent_volume_module, "claim_caller_principal",
+            lambda *_a: PrincipalClaim("bound", principal="Q" * 43),
+        )
+        reasons = ["caller_principal_absent", "caller_principal_foreign"]
+        sent: list[str] = []
+        _answer_route(
+            monkeypatch, "/hooks/pre-edit", sent,
+            lambda n: _http_error(
+                "/hooks/pre-edit", 400, {"error": "refused", "reason": reasons[n % 2]}
+            ),
+        )
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+
+        assert sent.count("/hooks/pre-edit") == 2
+        assert raised.value.reason == "caller_principal_foreign"
+        assert "(caller_principal_foreign)" in str(raised.value)
+        assert PRINCIPAL_REFUSED_AGAIN in str(raised.value)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _rendered(exc: BaseException) -> str:
+    """What a traceback or ``logger.exception`` prints for ``exc``: its whole
+    chain, as Python renders it."""
+    import traceback
+
+    return "".join(traceback.format_exception(exc))
+
+
+def test_no_coordinator_supplied_text_rides_the_chain_of_what_a_volume_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict mode: the read is refused, recovery adopts a new principal, and
+    the retry is answered 500 with the held principal, the nonce and the
+    adopted principal as the status line's reason phrase. The raised error
+    names the status only — and so does its CHAIN: the ``HTTPError`` carrying
+    the phrase is not on it, so a traceback or ``logger.exception`` prints no
+    principal or nonce either."""
+    from ccs.cli import _coherence_client
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        adopted = "Q" * 43
+        held = (vol._principal, vol._mint_nonce, adopted)
+        echo = " ".join(held)  # type: ignore[arg-type]
+        real_post = _coherence_client.post
+
+        def claim_binds(endpoint: object, path: str, body: dict, **kwargs: object) -> object:
+            if path == "/principal/claim":
+                return {"ok": True, "principal": adopted}
+            return real_post(endpoint, path, body, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(_coherence_client, "post", claim_binds)
+        answers = [
+            _http_error("/hooks/pre-read", 400, {"reason": "caller_principal_foreign"}, phrase=echo),
+            _http_error("/hooks/pre-read", 500, {"error": echo}, phrase=echo),
+        ]
+        sent: list[str] = []
+        _answer_route(monkeypatch, "/hooks/pre-read", sent, lambda n: answers[n])
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.read(rel)
+
+        rendered = _rendered(raised.value)
+        assert "HTTP 500" in rendered, "control: the retried request was the one answered 500"
+        _assert_no_secret_in(rendered, *held)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _malformed_answers(
+    monkeypatch: pytest.MonkeyPatch, route: str, error: Callable[[], Exception]
+) -> list[str]:
+    """Every request to ``route`` meets ``error()`` where the transport would
+    read the answer — a malformed HTTP answer the client's ``_execute`` must
+    classify; every other request goes to the coordinator. Returns the list
+    of routes sent."""
+    from ccs.cli import _coherence_client
+
+    real_build = _coherence_client._build_opener
+    sent: list[str] = []
+
+    class _Opener:
+        def __init__(self, real: object) -> None:
+            self._real = real
+
+        def open(self, req: object, timeout: float | None = None) -> object:
+            sent.append(req.selector)  # type: ignore[attr-defined]
+            if req.selector == route:  # type: ignore[attr-defined]
+                raise error()
+            return self._real.open(req, timeout=timeout)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(_coherence_client, "_build_opener", lambda ctx: _Opener(real_build(ctx)))
+    return sent
+
+
+_ECHOED_NONCE = "N" * 43
+
+
+def _malformed(kind: str) -> Exception:
+    import http.client
+
+    if kind == "bad_status_line":
+        return http.client.BadStatusLine(f"XHTTP/1.1 200 {_ECHOED_NONCE}\r\n")
+    return http.client.IncompleteRead(f'{{"principal": "{_ECHOED_NONCE}'.encode(), 40)
+
+
+@pytest.mark.parametrize("kind", ["bad_status_line", "incomplete_read"])
+def test_a_malformed_claim_answer_is_unconfirmed_never_an_untyped_escape(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    """A claim answered with a status line that is not HTTP, or with a body
+    cut short, is a transport failure: the claim is ``unconfirmed`` (claimed
+    again with the SAME nonce before the next request), degrade mode warns
+    and constructs, strict mode raises ``CoherenceError`` — never the raw
+    ``http.client`` exception, whose text is the line the coordinator sent.
+    Nothing the coordinator sent reaches the message or its chain."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    sent = _malformed_answers(monkeypatch, "/principal/claim", lambda: _malformed(kind))
+    try:
+        with pytest.raises(CoherenceError) as strict:
+            CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        with pytest.warns(CoherenceDegradedWarning) as warned:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+
+        assert vol._claim_outcome == "unconfirmed" and vol._principal is None
+        assert vol.read(rel) == b"v1"
+        assert sent.count("/principal/claim") == 3, "claimed again before the read"
+        text = _rendered(strict.value) + " ".join(str(w.message) for w in warned)
+        assert "malformed" in text
+        assert _ECHOED_NONCE not in text
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_no_malformed_answer_text_rides_the_chain_of_a_strict_request_failure(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-read answered with a non-HTTP status line that echoes the
+    principal the request presented: strict raises ``CoherenceError`` naming
+    the malformed answer by its TYPE, and neither the message nor the chain
+    carries the line."""
+    import http.client
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        principal = vol._principal
+        assert principal
+        _malformed_answers(
+            monkeypatch, "/hooks/pre-read",
+            lambda: http.client.BadStatusLine(f"XHTTP/1.1 200 {principal}\r\n"),
+        )
+        with pytest.raises(CoherenceError) as raised:
+            vol.read(rel)
+        rendered = _rendered(raised.value)
+        assert "BadStatusLine" in rendered
+        _assert_no_secret_in(rendered, principal, vol._mint_nonce)
     finally:
         stop_coordinator(tmp_path)

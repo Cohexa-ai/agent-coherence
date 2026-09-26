@@ -44,6 +44,7 @@ from ccs.cli._coherence_client import (
     http_status_from_error,
     post,
     principal_refusal_reason,
+    reportable_reason,
     resolve_endpoint,
 )
 
@@ -204,10 +205,14 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         if not claimed:
             return 3
 
+    # What a failure reports is built from the step, the HTTP status, the
+    # answer's known tokens and numbers (_answer_summary) — never the answer
+    # itself: a coordinator, or anything in front of it, that echoed the
+    # principal header into a field would otherwise print it here.
     def _step(name: str, body: dict[str, Any]) -> dict[str, Any] | None:
         headers = caller_principal_headers(principals[body["session_id"]])
         try:
-            return post(endpoint, name, body, extra_headers=headers)
+            answer = post(endpoint, name, body, extra_headers=headers)
         except urllib.error.HTTPError as exc:
             reason = principal_refusal_reason(exc)
             if reason is not None:
@@ -215,6 +220,13 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
             else:
                 err(f"--self-test: {name} returned HTTP {exc.code}")
             return None
+        except CoordinatorUnavailable as exc:
+            err(f"--self-test: {name} failed: {exc}")
+            return None
+        if not isinstance(answer, dict):
+            err(f"--self-test: {name} answered with {_answer_summary(answer)}")
+            return None
+        return answer
 
     # Step 1 — A's first read seeds the artifact, or (a later run) observes
     # the one an earlier run seeded; either way A then holds a current view.
@@ -224,14 +236,18 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     })
     if r1 is not None and r1.get("status") != "fresh":
         r1 = _step("/hooks/pre-read", {"session_id": sid_a, "path": path})
-    if r1 is None or r1.get("status") != "fresh":
-        err(f"--self-test: expected fresh on first pre-read, got {r1!r}")
+    if r1 is None:
+        return 3
+    if r1.get("status") != "fresh":
+        err(f"--self-test: expected fresh on first pre-read, got {_answer_summary(r1)}")
         return 3
 
     # Step 2 — B pre-edits.
     r2 = _step("/hooks/pre-edit", {"session_id": sid_b, "path": path})
-    if r2 is None or not r2.get("ok", True):
-        err(f"--self-test: pre-edit failed: {r2!r}")
+    if r2 is None:
+        return 3
+    if not r2.get("ok", True):
+        err(f"--self-test: pre-edit failed: {_answer_summary(r2)}")
         return 3
 
     # Step 3 — B commits.
@@ -239,8 +255,10 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         "session_id": sid_b, "path": path,
         "content_hash": "b" * 64, "success": True,
     })
-    if r3 is None or not r3.get("ok"):
-        err(f"--self-test: post-edit failed: {r3!r}")
+    if r3 is None:
+        return 3
+    if not r3.get("ok"):
+        err(f"--self-test: post-edit failed: {_answer_summary(r3)}")
         return 3
 
     # Step 4 — A re-reads → expect stale.
@@ -250,17 +268,18 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     if r4.get("status") != "stale":
         err(
             f"--self-test: expected stale warning on A's re-read after B's "
-            f"commit, got {r4.get('status')!r} (full response: {r4!r}). "
+            f"commit, got {_answer_summary(r4)}. "
             f"This usually means the hooks aren't wired or the coordinator "
             f"is running a stale build."
         )
         return 3
-    out = r4.get("hookSpecificOutput") or {}
-    ctx = out.get("additionalContext", "")
-    if path not in ctx:
+    out = r4.get("hookSpecificOutput")
+    ctx = out.get("additionalContext") if isinstance(out, dict) else None
+    if not isinstance(ctx, str) or path not in ctx:
+        shape = f"{len(ctx)} characters" if isinstance(ctx, str) else "absent"
         err(
-            f"--self-test: stale-warning prose did not mention {path}: "
-            f"{ctx!r}"
+            f"--self-test: stale-warning prose did not mention {path} "
+            f"(additionalContext: {shape})"
         )
         return 3
 
@@ -273,17 +292,25 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     except urllib.error.HTTPError as exc:
         err(f"--self-test: /status returned HTTP {exc.code}")
         return 3
-    if status.get("stale_warning_emitted_total", 0) < 1:
+    except CoordinatorUnavailable as exc:
+        err(f"--self-test: /status failed: {exc}")
+        return 3
+    if not isinstance(status, dict):
+        err(f"--self-test: /status answered with {_answer_summary(status)}")
+        return 3
+    if _count(status, "stale_warning_emitted_total") < 1:
         err(
             "--self-test: stale_warning_emitted_total did not increment "
             "(coordinator KTD-J counters appear to be inert)."
         )
         return 3
-    eps = status.get("endpoint_counters") or {}
-    if eps.get("pre_read_total", 0) < 2 or eps.get("post_edit_total", 0) < 1:
+    eps = status.get("endpoint_counters")
+    eps = eps if isinstance(eps, dict) else {}
+    pre_reads, post_edits = _count(eps, "pre_read_total"), _count(eps, "post_edit_total")
+    if pre_reads < 2 or post_edits < 1:
         err(
             f"--self-test: endpoint counters did not reflect the four-step "
-            f"scenario: {eps!r}"
+            f"scenario: pre_read_total={pre_reads}, post_edit_total={post_edits}"
         )
         return 3
 
@@ -324,6 +351,47 @@ def _claim_self_test_principal(
         return True, None
     err(f"--self-test: caller principal not obtained ({claim.outcome}: {claim.detail})")
     return False, None
+
+
+_SELF_TEST_STATUSES: frozenset[str] = frozenset({"fresh", "stale"})
+"""The pre-read ``status`` values the self-test names; any other reads
+``unrecognised``."""
+
+
+def _answer_summary(answer: object) -> str:
+    """An answer described by what the self-test knows of it — its ``status``
+    (a known value), ``ok`` and ``degraded`` flags, and ``reason`` as a known
+    token (:func:`reportable_reason`) — never by the answer's own text."""
+    if answer is None:
+        return "no answer"
+    if not isinstance(answer, dict):
+        return "a non-object answer"
+    status = answer.get("status")
+    known_status = status if isinstance(status, str) and status in _SELF_TEST_STATUSES else None
+    parts = [
+        f"status={known_status or ('absent' if status is None else 'unrecognised')}",
+        f"ok={_flag(answer.get('ok'))}",
+    ]
+    if answer.get("degraded") is True:
+        parts.append("degraded=true")
+    if "reason" in answer:
+        parts.append(f"reason={reportable_reason(answer['reason'])}")
+    return ", ".join(parts)
+
+
+def _flag(value: object) -> str:
+    if value is None:
+        return "absent"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return "unrecognised"
+
+
+def _count(counters: dict[str, Any], key: str) -> int:
+    """A counter from a ``/status`` answer, or ``0`` when absent or not an
+    integer (so it is reported as a number, never as the answer's text)."""
+    value = counters.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _terminal_columns() -> int:
