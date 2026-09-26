@@ -157,11 +157,15 @@ What follows from that:
   request, a stale session id, a wrong id in a retry — from ending another
   writer's work or writing under its name. A session that never claimed one
   behaves as before: any holder of the secret can act as it.
-- How much the principal separates depends on where it is kept. The Claude Code
-  hook client stores it in `.coherence/`, which any process running as your OS
-  user can read, so on that surface it separates writers that follow the
-  protocol and nothing more. `CoherentVolume`, the MCP server and the substrate
-  session keep theirs in memory for their lifetime.
+- The principal separates writers that follow the protocol, and nothing more.
+  Every principal is stored in `.coherence/state.db`, which any process running
+  as your OS user can read. `CoherentVolume`, the MCP server and the substrate
+  session present only the principal issued for their own session, so a request
+  from them naming another session is refused. The Claude Code hook client finds
+  its principal by the session id in each hook event, so on that surface a wrong
+  session id can find a matching principal; there the principal exposes a client
+  that never claimed or presents the wrong principal, but does not tell sessions
+  apart.
 - `last_writer_id`, and the sessions listed by `/status`, record which session a
   caller *said* it was — verified against its principal when it has one. Treat
   them as a record of cooperating writers, useful for debugging and display, not

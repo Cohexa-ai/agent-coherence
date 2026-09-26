@@ -621,7 +621,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 
@@ -1259,21 +1259,30 @@ The coordinator authenticates the workspace, not the caller: one bearer secret
 covers every process, and the session a request acts as is the `session_id` in
 its body. A **caller principal** is a value the coordinator issues and binds to
 one session, so that a request naming that session can be checked against it.
-It turns "a writer typed the wrong session id" — a copied request, a stale id
-after a fork, a retry that picked up a peer's id — from a silent success into a
-refusal.
+For a long-lived client it turns "a writer sent the wrong session id" — a copied
+request, a stale id after a fork, a retry that picked up a peer's id — from a
+silent success into a refusal.
 
 It is not a security boundary. The bearer secret still gives full authority over
-the workspace, and the hook client stores its principal in `.coherence/`, which
-any process running as your OS user can read. What it separates is writers that
-follow the protocol. A long-lived client — `CoherentVolume`, the MCP server,
-the substrate session — keeps its principal in memory for its lifetime, so on
-those surfaces another process has no file to read it from.
+the workspace, and every principal is stored in `.coherence/state.db`, where any
+process running as your OS user can read it. What a principal catches depends on
+the client:
+
+- A long-lived client — `CoherentVolume`, the MCP server, the substrate session —
+  is issued one principal for its own session and presents only that one, so a
+  request it sends naming any other session is refused.
+- The Claude Code hook client runs once per hook event and finds its principal
+  in `.coherence/` by the session id in the event. A hook carrying another
+  session's id can therefore find that session's principal too. On this surface
+  the principal makes a client that never claimed, or one presenting the wrong
+  principal, visible; it does not tell sessions apart.
 
 ### You usually do nothing
 
 The Claude Code hook client, `CoherentVolume`, the MCP server and the substrate
-session claim a principal for their session and send it on every request. A
+session claim a principal for their session and send it on every request. If a
+claim's answer is lost, or the binding disappears because `state.db` was
+deleted, they claim again with the nonce they kept and carry on. A
 client written before principals existed keeps working unchanged: its sessions
 never claim one, and a request naming a session that never claimed one is
 admitted exactly as before (and counted, see below).
@@ -1289,26 +1298,32 @@ Every route that takes a `session_id` is in one of three classes:
 
 | Class | Routes | A request naming a session that has claimed a principal… |
 |---|---|---|
-| require | `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member` | …must present it. Without it, or with a different one, the answer is `400`. |
-| accept | `/hooks/pre-read`, `/hooks/pre-edit`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
+| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member` | …must present it. Without it, or with a different one, the answer is `400`. |
+| accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
 | mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
 
-The require class is the routes that release a session's grants, commit or
-record who wrote a version, answer the effect fence about a session's grant, or
-record workspace ownership — the things a caller naming the wrong session could
-do to someone else's work. The snapshot-session routes are accept-class because
+The require class is the routes that take, release or commit a session's
+grants, record who wrote a version, answer the effect fence about a session's
+grant, or record workspace ownership — the things a caller naming the wrong
+session could do to someone else's work. `pre-edit` is among them because a
+grant taken without the principal could then be neither committed nor released.
+The accept-class reads change no grant or version, but they do deliver the
+named session's pending notices, so a read naming the wrong session can consume
+advisories meant for it. The snapshot-session routes are accept-class because
 each is already gated by the server-issued session token.
 
-A refusal is HTTP `400` with one `error` field naming the header and ending in
-the reason: `caller_principal_absent` when a claimed session is named with no
+A refusal is HTTP `400` with an `error` field naming the header and a `reason`
+field: `caller_principal_absent` when a claimed session is named with no
 principal, `caller_principal_foreign` when the principal presented is not the
-one bound to the named session. It is never a hold: no retry can supply a
-principal the caller does not have.
+one bound to the named session. Branch on `reason`, not on the text. It is never
+a hold, and a refused request changes nothing, so it is safe to send again once
+the client has the right principal.
 
-`GET /status` reports `caller_principal_absent_total` at every tier: how many
-requests this coordinator process admitted without a principal. It is a local
-diagnostic — a nonzero value means some client is not sending one yet — and it
-resets when the coordinator restarts.
+`GET /status` reports two counters at every tier: `caller_principal_absent_total`,
+the requests this coordinator process admitted without a principal (a nonzero
+value means some client is not sending one yet), and
+`caller_principal_refused_total`, the requests it refused. Both are local
+diagnostics that reset when the coordinator restarts.
 
 ### Writing your own HTTP client
 
@@ -1323,6 +1338,12 @@ resets when the coordinator restarts.
 3. Send the principal in the `Coherence-Caller-Principal` header on every
    request that names the session. The principal appears in the claim response
    and nowhere else: never log it.
+4. If a request is refused with `caller_principal_absent` or
+   `caller_principal_foreign` — for example because `state.db` was deleted and
+   the binding with it — claim again with the **same** nonce, and send the
+   request once more with the principal you get back. Never pick a new nonce:
+   that is what stops a client from taking over a session someone else has
+   claimed.
 
 A subagent shares its parent session's principal.
 
@@ -1350,15 +1371,18 @@ caller could step around by naming the holder's session is not a refusal.
 
 **Refusal.** HTTP 200 with
 `{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent id>"}` — the
-same reason string `post-edit-cas` already returns when a commit meets a live
-writer. The holder is named by agent id, never by session id. Nothing changes
-hands: the holder keeps its grant and the caller gains none.
+same reason string `post-edit-cas` already returns when a commit meets a
+session holding the write grant. The holder is named by agent id, never by
+session id. Nothing changes hands: the holder keeps its grant and the caller
+gains none.
 
-**What the refused caller does.** Back off and retry the acquire, or take the
-optimistic lane — read, then commit with `post-edit-cas`, which detects a
-conflict at commit and never displaces anyone. The refusal carries no retry
-hint because none exists: a grant ends when its holder commits or releases, or
-when the coordinator reclaims it from a silent holder (no heartbeat for
+**What the refused caller does.** Back off and retry the acquire. The refusal
+carries no retry hint because none exists. Committing does not end a grant: a
+holder that commits keeps the file MODIFIED, and the optimistic lane is no way
+around it — `post-edit-cas` answers `other_holder` against a MODIFIED holder
+too. A grant ends when its holder releases it — `session-stop`, which a Claude
+Code session sends at the end of its turn, or a failed `post-edit` — or when the
+coordinator reclaims it from a silent holder (no heartbeat for
 `grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
 with backoff rather than wait for a signal.
 
