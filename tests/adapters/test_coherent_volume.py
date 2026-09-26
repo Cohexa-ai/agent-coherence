@@ -36,6 +36,7 @@ from ccs.adapters.coherent_volume import (
     MAX_CAS_REACQUIRES,
     CoherentVolume,
     coherent_workspace,
+    denied_read_backoff_sec,
     install,
     uninstall,
 )
@@ -875,9 +876,15 @@ def test_write_cas_deny_raises_in_both_on_error_modes(
             assert vol.read("data/shared.txt") == b"v1"
             # Force expected_version far above current → corruption body
             # ({ok:false, reason:commit_cas_corruption...}) which must raise.
-            # (bytes, version, stale_denied, generation, stale_status) — not
-            # stale, so no reacquire.
-            vol._read_with_version = lambda rel: (b"v1", 999, False, 0, False)  # type: ignore[assignment]
+            # Not stale, so no reacquire.
+            vol._read_with_version = lambda rel: coherent_volume_module._ReadResult(  # type: ignore[assignment]
+                data=b"v1",
+                version=999,
+                stale_denied=False,
+                owner_generation=0,
+                stale_status=False,
+                content_differs=False,
+            )
             with pytest.raises(CoherenceError):
                 vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
             assert not vol.is_degraded, (
@@ -1169,7 +1176,7 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
 
         # Confirm B really is in the sticky-deny state BEFORE write_cas: a bare
         # version-aware read reports stale_denied=True (INVALID, not re-granted).
-        _bytes, _ver, stale_denied, _gen, _stale = vol_b._read_with_version(
+        _bytes, _ver, stale_denied, _gen, _stale, _differs = vol_b._read_with_version(
             "data/shared.txt"
         )
         assert stale_denied is True, "precondition: B must be a sticky strict-deny"
@@ -1213,11 +1220,17 @@ def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
         calls = {"n": 0}
 
         def always_denied(rel: str):
-            # (bytes, version, stale_denied, generation, stale_status) — every
-            # comparand read is a deny (a deny carries no confirmed generation
-            # and is a stale-status read).
+            # Every comparand read is a deny (a deny carries no confirmed
+            # generation and is a stale-status read).
             calls["n"] += 1
-            return (b"v1", 1, True, None, True)
+            return coherent_volume_module._ReadResult(
+                data=b"v1",
+                version=1,
+                stale_denied=True,
+                owner_generation=None,
+                stale_status=True,
+                content_differs=False,
+            )
 
         vol._read_with_version = always_denied  # type: ignore[assignment]
 
@@ -1694,6 +1707,186 @@ def test_reacquire_recovers_under_on_stale_read_raise(
         stop_coordinator(tmp_path)
 
 
+def test_refused_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A read refused with StaleView hands the caller no bytes, so it must not
+    advance the foreign-edit baseline: a write built from the pre-edit buffer is
+    still denied and the foreign bytes survive."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")              # FOREIGN edit (not via the volume)
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")                # refused: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails closed on a watchdog degrade (on_error='strict') also
+    hands the caller no bytes, so it must not advance the baseline either."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_refused_first_read_still_guards_a_peer_commit_landing_after_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused FIRST read returns no bytes, but it must still leave a baseline:
+    without one, a write built from no read overwrites a peer's commit that reached
+    disk after the refusal."""
+    target = _seed_file(tmp_path, content=b"0")
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    reader = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    committed, release = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    real_write = peer._atomic_write
+
+    def lagging_write(abs_path: Path, data: bytes) -> None:
+        committed.set()                           # CAS confirmed at the coordinator,
+        if not release.wait(10):                  # held off disk until released
+            raise AssertionError("peer disk write was never released")
+        real_write(abs_path, data)
+
+    monkeypatch.setattr(peer, "_atomic_write", lagging_write)
+
+    def peer_commit(version: int) -> None:
+        try:
+            peer.write_cas_at("data/x.txt", version, b"1")
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+            committed.set()
+
+    thread: threading.Thread | None = None
+    try:
+        _data, version = peer.read_with_version("data/x.txt")
+        thread = threading.Thread(target=peer_commit, args=(version,))
+        thread.start()
+        assert committed.wait(10) and not errors, errors
+        with pytest.raises(StaleView):
+            reader.read("data/x.txt")             # first read, inside the window
+        release.set()
+        thread.join(10)
+        assert not errors, errors
+        assert target.read_bytes() == b"1"        # the peer's commit is on disk
+        with pytest.raises(StaleView):
+            reader.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"1"        # ... and NOT overwritten
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(10)
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_first_read_still_guards_a_later_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FIRST read that fails closed on a watchdog degrade returns no bytes but
+    still leaves a baseline, so a write built from no read cannot overwrite an
+    out-of-band edit made after it."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # first read fails closed
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        target.write_bytes(b"HUMAN")              # FOREIGN edit after the refusal
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_after_refused_read_reseeds_then_write_succeeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """reacquire() returns the bytes it reads, so it DOES advance the baseline: a
+    write rebuilt from those bytes after a refused read is not false-denied."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")
+        fresh = vol.reacquire("data/x.txt")
+        assert fresh == b"HUMAN"
+        vol.write("data/x.txt", fresh + b"+agent")
+        assert target.read_bytes() == b"HUMAN+agent"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_reacquire_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reacquire() takes a fresh identity before it reads, so the coordinator
+    grants the next write. When that read fails closed (on_error='strict') the
+    caller gets no bytes, and the baseline is the only guard left: it must not
+    advance, or a write from the pre-edit buffer clobbers the foreign edit."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.reacquire("data/x.txt")           # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_on_stale_read_raise_does_not_fire_on_unmanaged_path(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -2064,6 +2257,8 @@ def test_write_cas_waits_between_denied_comparand_reads(
         min(DENIED_READ_BACKOFF_BASE_SEC * 2**i, DENIED_READ_BACKOFF_CAP_SEC)
         for i in range(MAX_CAS_REACQUIRES)  # one wait per denied read before the bound trips
     ]
+    # The restore leg of WorkspaceVersioner waits on the same helper, counted from 1.
+    assert [denied_read_backoff_sec(n) for n in range(1, MAX_CAS_REACQUIRES + 1)] == schedule
 
     # Record what the loop asks to wait, and still wait it. ``time`` is used nowhere
     # else in the adapter, so shimming that module-level name leaves the real

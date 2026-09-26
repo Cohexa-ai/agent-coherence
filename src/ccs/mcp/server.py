@@ -100,7 +100,15 @@ _READ_DESC = (
     "read (owner_generation=null means this coordinator does not report "
     "generations, so swg_gate will hold). A "
     "sticky-INVALID view returns fresh bytes but stays INVALID — use "
-    "swg_reacquire to recover before writing." + _SCOPE_CLAUSE
+    "swg_reacquire to recover before writing. If the bytes on disk are not the "
+    "content at the current version, the read is DENIED with reason=stale_view "
+    "and no version. A peer's commit still reaching disk clears on its own: "
+    "swg_reacquire, then swg_read again, retrying for a few seconds. Only if it "
+    "stays denied past that was the file changed outside the coordinator (an "
+    "out-of-band edit, or a commit whose disk write failed): swg_write the "
+    "content swg_reacquire returned (or your merge of it), then swg_read. A "
+    "write made sooner can be overwritten by a peer commit still reaching "
+    "disk." + _SCOPE_CLAUSE
 )
 _GATE_DESC = (
     "Verify a file is STILL unchanged and still under the same grant. Pass BOTH "

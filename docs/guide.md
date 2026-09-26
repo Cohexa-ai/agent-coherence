@@ -673,8 +673,10 @@ disk fault fails before any rename (disk stays uniformly old) and a rename faili
 partway raises a typed `PublishMaterializationError` naming exactly which files
 landed — never a bare error implying nothing published. A crash between renames can
 still tear the on-disk set (no POSIX multi-file atomic rename exists); on that error
-the coordinator is ahead of disk, so re-read each member at its current version and
-re-materialize (don't retry the publish — it would version-mismatch). Run it:
+the coordinator is ahead of disk, so write each file that didn't land again with
+`write()`, using the bytes you published (until then, `read_with_version` refuses
+that file, because the bytes on disk are not what the coordinator recorded). Don't
+retry the publish — it would version-mismatch. Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 
@@ -1263,7 +1265,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
