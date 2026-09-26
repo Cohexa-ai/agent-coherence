@@ -58,6 +58,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
+    RedirectRefused,
     StaleView,
     ViewWedged,
 )
@@ -680,7 +681,16 @@ class SubstrateCoordinatorSession:
         ``HTTPError`` is not on the raised error's chain: its text is the
         status line's reason phrase — the coordinator's — which a traceback
         would print. This client reports a rejected request by its status
-        code only."""
+        code only.
+
+        A redirect is a non-2xx like any other, so it raises ``unknown`` too:
+        refused and never followed, but whatever answered may have passed the
+        request on, so on the commit leg — reached only after the substrate
+        write landed — whether the bump landed is not known. Reported by its
+        status alone, outside the ``except`` block: the ``RedirectRefused``
+        quotes the ``Location``, the coordinator's text, whenever the request
+        presented no principal."""
+        redirected = False
         try:
             resp = _coordinator_post(
                 self._endpoint,
@@ -690,6 +700,8 @@ class SubstrateCoordinatorSession:
             )
         except urllib.error.HTTPError as exc:
             status, reason = exc.code, principal_refusal_reason(exc)
+        except RedirectRefused as exc:
+            status, reason, redirected = exc.status, None, True
         except CoordinatorUnavailable as exc:
             raise unknown(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"
@@ -700,6 +712,11 @@ class SubstrateCoordinatorSession:
                     f"coordinator {endpoint_path} returned a non-dict body (fail-closed)"
                 )
             return _Sent(resp, None)
+        if redirected:
+            raise unknown(
+                f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}, "
+                "a redirect, which this client never follows"
+            )
         if reason is not None:
             return _Sent(None, reason)
         raise unknown(f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}")

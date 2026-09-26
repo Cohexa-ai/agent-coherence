@@ -1538,6 +1538,10 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
             self._send({"ok": False, "reason": echo} if at == "post-edit" else {"ok": True})
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib name
+        at = type(self).echo_at
+        if at in ("status-redirect", "status-bad-location"):
+            self._redirect(at, self._echo().replace(" ", ""))
+            return
         counters: dict[str, object] = {"pre_read_total": 2, "post_edit_total": 1}
         if type(self).echo_at == "counters":
             # Too few, and a field carrying the echo beside them.
@@ -1560,6 +1564,8 @@ _SELF_TEST_FAILURES = {
     "pre-read-2": "expected stale warning",
     "stale-prose": "stale-warning prose did not mention plan.md",
     "counters": "endpoint counters did not reflect",
+    "status-redirect": "/status was redirected (HTTP 302); not followed",
+    "status-bad-location": "/status was redirected (HTTP 302); not followed",
 }
 
 
@@ -1571,8 +1577,11 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     header and the claimed nonces into the answer that fails a step cannot get
     either onto the self-test's output: each failure is reported by the step,
     the answer's status, ok flag and known reason token, the prose's length,
-    or the counters as numbers — never the answer itself. Every failing step
-    exits 3; the control run, with no echo, passes."""
+    or the counters as numbers — never the answer itself. A redirect —
+    including the ``/status`` read's, which carries no principal, so the
+    refusal itself names the ``Location`` — is reported by its status alone,
+    with no traceback. Every failing step exits 3; the control run, with no
+    echo, passes."""
     _EchoCoordinator.echo_at, _EchoCoordinator.pre_reads = echo_at, 0
     _EchoCoordinator.nonces, _EchoCoordinator.principals = [], []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoCoordinator)
@@ -1595,3 +1604,5 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     _assert_nothing_leaks(
         captured.out + captured.err, *_EchoCoordinator.principals, *_EchoCoordinator.nonces
     )
+    for location in ("http://127.0.0.1:1/", "http://[x"):
+        assert location not in captured.out + captured.err, "a redirect's Location was echoed"

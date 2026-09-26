@@ -190,16 +190,38 @@ _PUBLISH_HELD_REASON = (
     "written). reacquire() and rebuild the publish from the fresh versions."
 )
 
+# What a multi-member atomic_publish raises (CommitUnconfirmed) when the batch
+# commit is not confirmed, or is answered with nothing this client can
+# classify: whether it landed at the coordinator is unknown, and CAS-first
+# means no member touched disk. Built from constants — no coordinator text.
+_PUBLISH_UNCONFIRMED_MESSAGE = (
+    "atomic_publish commit was not confirmed (the coordinator answered that "
+    "its commit is unconfirmed); whether the batch landed at the coordinator "
+    "is unknown, and no file was written. Re-read every member, and retry only "
+    "if the publish is absent."
+)
+_PUBLISH_UNCLASSIFIABLE_MESSAGE = (
+    "atomic_publish commit was answered with no outcome this client can "
+    "classify (not a win, and no reason); whether the batch landed at the "
+    "coordinator is unknown, and no file was written. Re-read every member, "
+    "and retry only if the publish is absent."
+)
+
 
 # What write()'s grant request (pre-edit) had already done when its commit is
-# refused for the caller principal after the bytes reached disk. An admitted
-# EXCLUSIVE acquire invalidates every peer holding a copy (KTD-1) BEFORE the
-# bytes are written, so the refusal of the commit cannot un-invalidate them;
-# a degraded or lost answer leaves both the grant and the peers unknown.
+# refused for the caller principal after the bytes reached disk. On a path the
+# coordinator tracks, an admitted EXCLUSIVE acquire invalidates every peer
+# holding a copy (KTD-1), which the refusal of the commit cannot undo; on a
+# path it does not track, the request takes its fast path and does neither.
+# Both answer a bare {"ok": true}, and nothing the volume holds says which
+# (its managed globs do not: an ignored.yaml untracks a managed path, and
+# /policy/untrack can change it at runtime), so the text states both cases.
+# A degraded or lost answer leaves the grant and the peers unknown.
 _GRANT_REQUEST_ADMITTED = (
-    "Any peer that held a copy was invalidated when this write's grant request "
-    "was admitted, before the bytes were written, and must re-read the file; "
-    "this volume has not released any grant that request took."
+    "If the coordinator tracked the path when it admitted this write's grant "
+    "request, that request invalidated every peer it had recorded as holding a "
+    "copy and took a grant this volume has not released; if it did not track "
+    "the path, the request took no grant and invalidated no peer."
 )
 _GRANT_REQUEST_UNCONFIRMED = (
     "The answer to this write's grant request was not confirmed, so whether it "
@@ -223,19 +245,22 @@ def _unclassifiable_cas_message(rel: str) -> str:
     )
 
 
-def _unrecorded_write_message(
-    rel: str, refusal: CallerPrincipalRefused, *, grant_confirmed: bool
-) -> str:
-    """What :meth:`CoherentVolume.write` reports when its commit (post-edit)
-    is refused for the caller principal AFTER the bytes reached disk: the
-    state the write left — the file, the coordinator's record and version,
-    the peers and the grant, each as far as this client knows it — then the
-    refusal's own text (built from the typed reason and constants — never the
-    coordinator's prose, so no principal or nonce)."""
+def _unrecorded_write_state(rel: str, *, wrote: bool, grant_confirmed: bool) -> str:
+    """What :meth:`CoherentVolume.write` reports, ahead of the refusal's own
+    text, when its commit (post-edit) is refused for the caller principal
+    after its grant request: the state the write left — the file (``wrote``:
+    whether this call put the bytes there, or they were already on disk),
+    the coordinator's record and version, the peers and the grant, each as
+    far as this client knows it. Built from constants and the path — no
+    coordinator text, so no principal or nonce."""
+    if wrote:
+        disk = f"This write put its bytes on disk at {rel}."
+    else:
+        disk = f"{rel} already held this write's bytes on disk, so this write left the file as it was."
     grant = _GRANT_REQUEST_ADMITTED if grant_confirmed else _GRANT_REQUEST_UNCONFIRMED
     return (
-        f"{rel} holds the new bytes on disk, but the coordinator did not record "
-        f"the write: its version did not advance. {grant} {refusal}"
+        f"{disk} The coordinator did not record the write: no version it keeps "
+        f"for the path advanced. {grant}"
     )
 
 
@@ -1048,17 +1073,18 @@ class CoherentVolume:
                 },
             )
         except CallerPrincipalRefused as refusal:
-            # Refused AFTER the bytes reached disk: the refusal itself changed
-            # nothing at the coordinator, but this write() had already changed
-            # the file — and, through its admitted grant request, invalidated
-            # the peers — so the error says so rather than reading like a
-            # request that had no effect. The grant stays recorded (nothing
-            # released it for this incarnation); the observed baseline already
-            # names the bytes on disk, which are this instance's own.
-            raise CallerPrincipalRefused(
-                refusal.reason,
-                _unrecorded_write_message(rel, refusal, grant_confirmed=grant_confirmed),
-            ) from None
+            # Refused AFTER the grant request: the refusal itself changed
+            # nothing at the coordinator, but this write() had already put its
+            # bytes on disk (unless they were there) and — on a tracked path —
+            # invalidated the peers through its admitted grant request, so the
+            # error says so rather than reading like a request that had no
+            # effect. The grant stays recorded (nothing released it for this
+            # incarnation); the observed baseline already names the bytes on
+            # disk, which are this instance's own.
+            state = _unrecorded_write_state(
+                rel, wrote=not already_on_disk, grant_confirmed=grant_confirmed
+            )
+            raise CallerPrincipalRefused(refusal.reason, f"{state} {refusal}") from None
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);
@@ -1579,6 +1605,11 @@ class CoherentVolume:
           - a peer commits a member in the capture→commit window →
             :class:`~ccs.core.exceptions.StaleView` (HELD; recover via
             :meth:`reacquire` + re-decide + retry); NOTHING committed, NO file written.
+          - the commit is answered as unconfirmed, or with no outcome this
+            client can classify →
+            :class:`~ccs.core.exceptions.CommitUnconfirmed` in both ``on_error``
+            modes; whether the batch committed is unknown, NO file written —
+            re-read, and retry only if the publish is absent.
 
         **Atomicity boundary (read this).** The all-or-nothing guarantee is at the
         COORDINATOR commit: either every member's version advances as one unit or
@@ -1676,7 +1707,10 @@ class CoherentVolume:
         ``CasVersionConflict``, nothing committed), then ``/session/commit_all``
         atomically. On a confirmed WIN write EVERY file (no same-bytes skip, so
         disk can't diverge from the coordinator's recorded hash); on a HELD
-        conflict (a peer raced the window) write NONE and raise ``StaleView``.
+        conflict (a peer raced the window) write NONE and raise ``StaleView``;
+        on an answer that does not confirm the commit — unconfirmed, or with
+        no reason this client can classify — write NONE and raise
+        ``CommitUnconfirmed`` in both ``on_error`` modes.
         """
         self._ensure_attached()
         if self._endpoint is None:
@@ -1742,19 +1776,31 @@ class CoherentVolume:
                 "atomic_publish commit could not be confirmed (coordinator transport "
                 "failed mid-commit); nothing landed. re-read and retry."
             )
+        # An unconfirmed commit — the watchdog's degrade envelope, or a non-win
+        # carrying its reason — raises in BOTH on_error modes, as on the
+        # single-commit paths: degrade mode must not soften it into the HELD
+        # conflict below, which would say nothing was published of a batch
+        # that may have landed.
         if commit.get("degraded"):
-            self._fail_closed_or_degrade(
-                "coordinator watchdog timeout committing the publish"
-            )
+            raise CommitUnconfirmed(_PUBLISH_UNCONFIRMED_MESSAGE)
         if commit.get("ok") is True:
             return self._materialize_publish(entries, commit.get("versions") or {})
+        reason = commit.get("reason")
+        if reason == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(_PUBLISH_UNCONFIRMED_MESSAGE)
+        # Non-WIN with no string reason: the coordinator's own non-win answers
+        # always carry one, so this is what a proxy or gateway could send, and
+        # it says nothing about whether the batch landed — the unknown, as on
+        # the single-commit paths; never the HELD conflict (a definite "nothing
+        # committed"), and never a TypeError from the substring test below.
+        if not isinstance(reason, str):
+            raise CommitUnconfirmed(_PUBLISH_UNCLASSIFIABLE_MESSAGE)
         # Non-WIN. A retry-eligible batch conflict (peer raced the window) is a
         # StaleView; a NON-retryable corruption reason must not masquerade as one
         # (mirror the size-1 CAS path, which raises CoherenceError on corruption).
         # Corruption is unreachable via the pinned cut (which guarantees
         # expected <= current), so this is defense-in-depth against a future
         # comparand source, not a currently-reachable branch.
-        reason = commit.get("reason") or ""
         if "corruption" in reason:
             raise CoherenceError(
                 f"atomic_publish rejected (non-retryable): {reason}"

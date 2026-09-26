@@ -19,8 +19,11 @@ token-identity logic both real bindings use.
 from __future__ import annotations
 
 import hashlib
+import http.server
 import logging
 import os
+import threading
+import traceback
 from pathlib import Path
 
 import pytest
@@ -920,6 +923,100 @@ def test_an_unrecognisable_bump_answer_after_the_substrate_write_is_the_bump_leg
         assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
         assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
     finally:
+        stop_coordinator(tmp_path)
+
+
+class _Redirector(http.server.BaseHTTPRequestHandler):
+    """Answers every POST with a redirect to ``location`` — which the test
+    fills with the session's nonce and principal, as a coordinator (or a
+    proxy in front of it) echoing what it was sent would. Never followed:
+    the client refuses every 3xx before a second request is made."""
+
+    code = 302
+    location = ""
+    seen: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        type(self).seen.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(type(self).code)
+        self.send_header("Location", type(self).location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+@pytest.mark.parametrize(
+    ("leg", "code", "principal"),
+    [
+        *[("bump", code, "presented") for code in (301, 302, 303, 307, 308)],
+        ("bump", 302, "none"),
+        ("pre-read", 302, "none"),
+    ],
+    ids=lambda value: str(value),
+)
+def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    leg: str, code: int, principal: str,
+) -> None:
+    """The substrate CAS lands; the coordinator bump is answered with a
+    redirect, refused and never followed. Whether the bump landed is not
+    known — what answered may have passed it on — and the substrate already
+    holds the new bytes, so it is the bump leg's unknown like every other
+    failure there: ``CommitUnconfirmed`` (re-read; retry only if absent),
+    never re-driven. Before, the typed ``RedirectRefused`` escaped after the
+    write had landed, reading as a refusal that changed nothing.
+
+    What is reported is the status: the ``Location`` — the coordinator's
+    text, echoing the nonce and principal here — is on neither the message
+    nor the chain, including when no principal was presented and the refusal
+    itself quotes it (``none``). ``pre-read`` is the control leg: redirected
+    before the substrate is touched, the commit is refused with nothing
+    written — not the unknown."""
+    from ccs.cli._coherence_client import CoordinatorEndpoint
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    _Redirector.code, _Redirector.seen = code, []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    real_post = substrate_module._coordinator_post
+    redirected = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        material = [sa._mint_nonce, sa._principal]
+        if principal == "none":
+            sa._principal = None  # the request presents no header, so the refusal names the Location
+        _Redirector.location = f"http://127.0.0.1:1/{''.join(material)}"
+        redirector = CoordinatorEndpoint(port=httpd.server_address[1], bearer=sa._endpoint.bearer)
+
+        def redirect_one_leg(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            return real_post(redirector if path == redirected else endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", redirect_one_leg)
+        with pytest.raises(CoherenceError) as raised:
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert _Redirector.seen == [redirected], "control: that leg was answered with the redirect"
+        if leg == "bump":
+            assert isinstance(raised.value, CommitUnconfirmed), type(raised.value)
+            assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+            assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+        else:
+            assert not isinstance(raised.value, CommitUnconfirmed), "nothing landed to be unknown"
+            assert store.get(REF)[0] == b"v1" and fake_a.cas_calls == []
+        assert f"HTTP {code}" in str(raised.value)
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert all(isinstance(m, str) and m for m in material), "control: real values to look for"
+        assert not [m for m in material if m in rendered], "a nonce or principal reached the error"
+        assert "127.0.0.1:1" not in rendered, "the Location reached the error"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
         stop_coordinator(tmp_path)
 
 

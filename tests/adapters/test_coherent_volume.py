@@ -3673,16 +3673,24 @@ def test_a_cas_that_never_hands_its_comparand_bytes_on_never_seeds_the_baseline(
 # the caller principal after the bytes reached disk — never built from the
 # constants under test. Each clause is a claim about state (the disk, the
 # coordinator's record, its version, the peers, the grant) and a test below
-# observes that state.
+# observes that state — on a path the coordinator tracks and on one it does
+# not, whose admitted grant requests get the same answer, and for a write
+# whose bytes were already on disk.
 
+_WROTE = "This write put its bytes on disk at {rel}. "
+_ALREADY_HELD = (
+    "{rel} already held this write's bytes on disk, so this write left the file "
+    "as it was. "
+)
 _UNRECORDED_WRITE = (
-    "{rel} holds the new bytes on disk, but the coordinator did not record the "
-    "write: its version did not advance. {grant} "
+    "The coordinator did not record the write: no version it keeps for the path "
+    "advanced. {grant} "
 )
 _GRANT_TAKEN = (
-    "Any peer that held a copy was invalidated when this write's grant request "
-    "was admitted, before the bytes were written, and must re-read the file; "
-    "this volume has not released any grant that request took."
+    "If the coordinator tracked the path when it admitted this write's grant "
+    "request, that request invalidated every peer it had recorded as holding a "
+    "copy and took a grant this volume has not released; if it did not track "
+    "the path, the request took no grant and invalidated no peer."
 )
 _GRANT_UNCONFIRMED = (
     "The answer to this write's grant request was not confirmed, so whether it "
@@ -3714,10 +3722,10 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
     (post-edit) is refused for the caller principal, and recovery cannot cure
     it. The refusal itself changed nothing at the coordinator — the version
     did not advance — but the write had changed two things before it: the
-    file, and every peer that held a copy, which the grant request
-    invalidated (KTD-1) before the bytes were written. So the typed refusal
-    says both, and that the grant was not released: it must not read like a
-    request that had no effect, nor tell a peer it may keep its copy.
+    file, and (the path is tracked) every peer that held a copy, which the
+    grant request invalidated (KTD-1). So the typed refusal says both, and
+    that the grant was not released: it must not read like a request that
+    had no effect, nor tell a peer it may keep its copy.
 
     The peer's state is observed, not assumed: a verification read finds it
     holding a live copy before the write and invalidated after; its own
@@ -3758,7 +3766,7 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
         message = str(raised.value)
         assert raised.value.reason == "caller_principal_foreign"
         assert target.read_bytes() == b"v2"
-        assert message.startswith(_UNRECORDED_WRITE.format(rel=rel, grant=_GRANT_TAKEN))
+        assert message.startswith((_WROTE + _UNRECORDED_WRITE).format(rel=rel, grant=_GRANT_TAKEN))
         assert "(caller_principal_foreign)" in message
         assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
         assert _coordinator_state(vol, rel) == "EXCLUSIVE", "and was not released"
@@ -3820,9 +3828,117 @@ def test_a_commit_refused_after_an_unconfirmed_grant_request_does_not_say_peers_
 
         message = str(raised.value)
         assert target.read_bytes() == b"v2"
-        assert message.startswith(_UNRECORDED_WRITE.format(rel=rel, grant=_GRANT_UNCONFIRMED))
+        assert message.startswith(
+            (_WROTE + _UNRECORDED_WRITE).format(rel=rel, grant=_GRANT_UNCONFIRMED)
+        )
         assert _coordinator_state(peer, rel) == "SHARED", "the grant request never reached the coordinator"
         _assert_no_secret_in(message, bound, nonce, "Z" * 43, "X" * 43)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _tracked_version(vol: CoherentVolume, rel: str) -> int | None:
+    """The version the coordinator keeps for ``rel``, read from ``/status``
+    (which changes nothing) — ``None`` when it keeps no record of the path."""
+    status = coherent_volume_module._coordinator_get(vol._endpoint, "/status")
+    for artifact in status.get("tracked_artifacts", []):
+        if artifact.get("path") == rel:
+            return artifact.get("version")
+    return None
+
+
+# Where the refused write goes: a path the coordinator tracks, one it does not
+# track, and one the VOLUME manages but the coordinator is told to ignore — so
+# nothing the volume holds says whether the coordinator tracks a path.
+_REFUSED_WRITE_PATHS = {
+    "tracked": ("data/shared.txt", None),
+    "untracked": ("notes/free.txt", None),
+    "managed-but-ignored": ("data/shared.txt", "- data/**\n"),
+}
+
+
+@pytest.mark.parametrize("rewrite", ["new-bytes", "same-bytes"])
+@pytest.mark.parametrize("where", list(_REFUSED_WRITE_PATHS))
+def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    where: str, rewrite: str,
+) -> None:
+    """The grant request's admitted answer is the same bare ``{"ok": true}``
+    whether the coordinator tracks the path — it took EXCLUSIVE and
+    invalidated every peer holding a copy — or does not, when it took no
+    grant and invalidated nobody. The volume cannot tell which (its managed
+    globs do not decide it: an ignored path is managed here and untracked
+    there), so the message states both cases, and each is observed where it
+    applies. ``same-bytes`` rewrites bytes the file already holds, so the
+    write never touches the disk — and the message says so instead of
+    claiming it put them there.
+
+    Every clause is checked against state: the disk (and whether this call
+    wrote it), the coordinator's version, the grant, and the peer — which,
+    on a tracked path, is invalidated and refused as revoked, and on an
+    untracked one, held no copy the coordinator knew of and writes freely."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel, ignored = _REFUSED_WRITE_PATHS[where]
+    if ignored is not None:
+        coherence_dir = tmp_path / ".coherence"
+        coherence_dir.mkdir(mode=0o700, exist_ok=True)
+        (coherence_dir / "ignored.yaml").write_text(ignored, encoding="utf-8")
+    target = _seed(tmp_path, rel=rel, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
+    try:
+        vol.read(rel)
+        if rewrite == "same-bytes":
+            vol.write(rel, b"v2")  # recorded: the refused write below changes no byte
+        peer.read(rel)
+        version_before = _tracked_version(vol, rel)
+        peer_before = _coordinator_state(peer, rel)
+        disk_writes: list[Path] = []
+        real_atomic_write = vol._atomic_write
+
+        def counted_atomic_write(abs_path: Path, data: bytes) -> None:
+            disk_writes.append(abs_path)
+            real_atomic_write(abs_path, data)
+
+        monkeypatch.setattr(vol, "_atomic_write", counted_atomic_write)
+        real_post = coherent_volume_module._coordinator_post
+
+        def lose_principal_after_the_grant(
+            endpoint: object, path: str, payload: dict, **kwargs: object
+        ) -> object:
+            answer = real_post(endpoint, path, payload, **kwargs)
+            if path == "/hooks/pre-edit" and payload.get("session_id") == vol.session_id:
+                assert answer == {"ok": True}, "control: the admitted answer names neither case"
+                vol._mint_nonce, vol._principal = "Z" * 43, "X" * 43
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_principal_after_the_grant)
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+
+        disk = _WROTE if rewrite == "new-bytes" else _ALREADY_HELD
+        assert str(raised.value).startswith(
+            (disk + _UNRECORDED_WRITE).format(rel=rel, grant=_GRANT_TAKEN)
+        )
+        assert target.read_bytes() == b"v2"
+        assert len(disk_writes) == (1 if rewrite == "new-bytes" else 0), "the disk clause"
+        assert _tracked_version(vol, rel) == version_before, "no version advanced"
+        if where == "tracked":
+            assert version_before is not None, "control: the coordinator tracks the path"
+            assert peer_before == "SHARED", "control: the peer held a copy"
+            assert _coordinator_state(vol, rel) == "EXCLUSIVE", "a grant, not released"
+            assert _coordinator_state(peer, rel) is None, "the peer was invalidated"
+            with pytest.raises(StaleView, match="revoked"):
+                peer.write(rel, b"peer")
+            assert target.read_bytes() == b"v2"
+        else:
+            assert version_before is None, "control: the coordinator keeps no record of it"
+            assert peer_before is None, "so the peer held no copy it knew of"
+            assert _coordinator_state(vol, rel) is None, "no grant was taken"
+            peer.write(rel, b"peer")  # nobody was invalidated: the peer's write is admitted
+            assert target.read_bytes() == b"peer"
     finally:
         stop_coordinator(tmp_path)
 
