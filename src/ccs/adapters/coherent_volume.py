@@ -357,8 +357,10 @@ class CoherentVolume:
         parent's). The child's first ``read``/``write`` re-attaches here,
         sibling-attaching to the coordinator under the child's fresh identity.
         A no-op outside the post-fork window. Under ``on_error="strict"`` a
-        failed attempt keeps that window open: every read and write retries
-        until one attaches.
+        failed attempt keeps that window open: every ``read``, ``write``,
+        ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
+        attaches. The versioned reads never call this and keep their version-0
+        fallback.
         """
         if self._endpoint is None and self._needs_reattach:
             # Cleared BEFORE the attempt: _attach reads .coherence/ files, and

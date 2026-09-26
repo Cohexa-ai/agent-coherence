@@ -214,10 +214,12 @@ Alpha — APIs may change before `v1.0`.
   *not* enforcing strict mode for the managed paths raised once but kept its
   connection, so later operations ran through that coordinator unenforced.
   A failed strict re-attach now always leaves the child detached, whatever
-  it raised and wherever, so the next read or write retries.
+  it raised and wherever, so the next `read` or write retries.
 
-  `on_error="degrade"` is unchanged: one attempt, then best-effort, the same
-  as a failed attach at construction.
+  `on_error="degrade"` keeps its one attempt, then best-effort, the same as a
+  failed attach at construction. The one change there: a re-attach refused
+  for not enforcing strict mode now drops the connection before it warns,
+  not after.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was

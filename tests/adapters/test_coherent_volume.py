@@ -253,6 +253,43 @@ def test_failed_reattach_after_fork_is_retried_in_strict_mode(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda vol: vol.read("data/shared.txt"),
+        lambda vol: vol.write("data/shared.txt", b"child"),
+        lambda vol: vol.write_cas("data/shared.txt", lambda current: current + b"+child"),
+    ],
+    ids=["read", "write", "write_cas"],
+)
+def test_strict_child_fails_closed_on_every_op_while_reattach_fails(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Callable[[CoherentVolume], object],
+) -> None:
+    """While the re-attach keeps failing, each read, write and write_cas of a
+    strict forked child raises and nothing lands on disk — none of them may
+    fall through to the unattached branch, first call or retry."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+
+        def unavailable(*_args: object) -> None:
+            raise CoordinatorUnavailable("server.pid missing (coordinator restarting)")
+
+        monkeypatch.setattr(coherent_volume_module, "resolve_endpoint", unavailable)
+
+        for _ in range(2):
+            with pytest.raises(CoherenceError):
+                operation(vol)
+        assert target.read_bytes() == b"v1"
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1322,7 +1359,7 @@ def test_shim_lost_update_is_denied_through_open(
         stop_coordinator(tmp_path)
 
 
-@pytest.mark.parametrize("managed", [("data/**",), ("**",)])
+@pytest.mark.parametrize("managed", [("data/**",), ("**",)], ids=["data-glob", "all-glob"])
 def test_shim_reattaches_after_fork(
     tmp_path: Path, fast_cfg: LifecycleConfig, managed: tuple[str, ...]
 ) -> None:
