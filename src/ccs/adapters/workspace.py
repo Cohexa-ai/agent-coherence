@@ -197,6 +197,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import UUID
@@ -208,6 +209,7 @@ from ccs.adapters.coherent_object import (
     VersionedCasWritten,
     VersionPointerUnconfirmed,
 )
+from ccs.adapters.coherent_volume import denied_read_backoff_sec
 from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
@@ -246,6 +248,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitUnconfirmed,
     OccCallerTransientError,
+    StaleView,
     ViewWedged,
 )
 from ccs.core.substrate import ArbitrationTier, RestoreTier, derive_restore_tier
@@ -396,6 +399,11 @@ class FileMemberSource(Protocol):
     Raises ``FileNotFoundError`` for an absent member (the ABSENT fact).
     A version ``< 1`` means the pointer could not be resolved (no coordinator
     / degraded) — the capture treats it as UNCONFIRMED (never manifested).
+    May raise :class:`~ccs.core.exceptions.StaleView` when the bytes on disk
+    cannot be paired with a version (``CoherentVolume`` refuses that pair):
+    capture records the member UNCONFIRMED too, with no digest, and flags it
+    ``dirty_during_window``; a restore leg re-drives within its budget and then
+    concludes ``conflict`` without writing.
     May raise :class:`StructuralMemberRefused` (or a subclass) to declare THIS
     MEMBER undrivable through this surface: capture propagates it as a hard
     typed refusal, restore absorbs it into that member's ``target_lost``.
@@ -606,9 +614,12 @@ class _Observation:
     """One member's live observation — capture pass and verify pass share it.
 
     ``token`` is the restore pointer (or ``None`` when absent/unconfirmed);
-    ``fingerprint`` is the fixed-width content digest (``None`` when absent);
-    ``restorable``/``pinnable`` feed :func:`derive_restore_tier` on the
-    capture pass (the verify pass compares only presence/token/fingerprint).
+    ``fingerprint`` is the fixed-width content digest (``None`` when absent, or
+    when the read returned no bytes); ``restorable``/``pinnable`` feed
+    :func:`derive_restore_tier` on the capture pass (the verify pass compares
+    only presence/token/fingerprint). ``confirmed`` is ``False`` when the source
+    refused to pair the member's bytes with a version, so neither a pointer nor
+    a digest was observed.
     """
 
     absent: bool
@@ -616,6 +627,7 @@ class _Observation:
     fingerprint: str | None
     versioned: bool = False
     pinnable: bool = False
+    confirmed: bool = True
 
 
 # --- the restore report (frozen facts; durably mirrored in the registry) --------
@@ -1149,8 +1161,11 @@ class WorkspaceVersioner:
                 verified.append(row)
                 continue
             live = self._observe(member, refuse_binary=False)
+            # A re-read the source refused observed nothing, so the member was
+            # not verified quiescent, whatever the capture pass recorded.
             dirty = (
-                live.absent != row.absent
+                not live.confirmed
+                or live.absent != row.absent
                 or live.token != row.native_token
                 or live.fingerprint != row.fingerprint
             )
@@ -1175,6 +1190,14 @@ class WorkspaceVersioner:
             data, version = member.source.read_with_version(member.member_path)
         except FileNotFoundError:
             return _Observation(absent=True, token=None, fingerprint=None)
+        except StaleView:
+            # The source refused to pair the bytes on disk with a version: they
+            # are not the content the coordinator records (a peer's commit still
+            # reaching disk, or an out-of-band edit). No pointer can be
+            # manifested, which is the unconfirmed-pointer case below (the
+            # Sentinel rule): present, never above forward_only, and described
+            # without a digest because the read returned no bytes.
+            return _Observation(absent=False, token=None, fingerprint=None, confirmed=False)
         if refuse_binary:
             self._require_utf8_text(member.member_path, data)
         if version < 1:
@@ -2216,6 +2239,10 @@ class WorkspaceVersioner:
                     "live — nothing to delete"
                 ),
             )
+        except StaleView:
+            # A refusal is about bytes that exist on disk but cannot be paired
+            # with a version, so the file IS present live: the divergence below.
+            pass
         # v1 residual: the file seam offers no delete leg, so a live file the
         # manifest records ABSENT is a divergence this engine cannot converge
         # — absorbed as conflict (detection only; no-arbiter), never a raise
@@ -2516,6 +2543,7 @@ class WorkspaceVersioner:
         # retention has since expired; the resolver is consulted only when a
         # write is actually needed).
         pinned: bytes | None = None
+        refusals = 0  # refused reads so far in this leg, which set the next wait
         while True:
             if budget.try_consume() is None:
                 return MemberRestoreOutcome(
@@ -2531,6 +2559,19 @@ class WorkspaceVersioner:
                 )
             try:
                 live_bytes, live_version = member.source.read_with_version(row.member_path)
+            except StaleView:
+                # The source refused to pair the live bytes with a version (a
+                # peer's commit still reaching disk, or an out-of-band edit), so
+                # there is no comparand to CAS from. Re-drive: the transient
+                # clears once the disk write lands, and a lasting refusal spends
+                # the budget into conflict with no write, so the run concludes.
+                # WAIT between refused reads, on the schedule write_cas uses for
+                # the same transient: back-to-back reads spend the budget before
+                # a peer's disk write can land, which bounds the leg by read
+                # latency instead of by time.
+                refusals += 1
+                time.sleep(denied_read_backoff_sec(refusals))
+                continue
             except FileNotFoundError:
                 # v1 residual: recreation needs the coordinator artifact
                 # identity, which lands with Unit-5 registration — absorbed,
