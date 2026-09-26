@@ -356,11 +356,31 @@ class CoherentVolume:
         re-attach in the fork handler (the coordinator-client context is the
         parent's). The child's first ``read``/``write`` re-attaches here,
         sibling-attaching to the coordinator under the child's fresh identity.
-        A no-op outside the post-fork window.
+        A no-op outside the post-fork window. Under ``on_error="strict"`` a
+        failed attempt keeps that window open: every ``read``, ``write``,
+        ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
+        attaches. The versioned reads never call this and keep their version-0
+        fallback.
         """
         if self._endpoint is None and self._needs_reattach:
+            # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
+            # under the install() shim with a managed glob that matches them each
+            # of those reads re-enters here. The cleared flag stops the recursion.
             self._needs_reattach = False
-            self._attach()
+            try:
+                self._attach()
+            except BaseException:
+                # Strict re-arms and detaches, so the next read or write retries
+                # the re-attach instead of taking the unattached branch — which
+                # skips the coordinator and its invalidations for the child's
+                # whole life. Detaching covers a failure that escapes after the
+                # endpoint was resolved (an interrupt during the strict check):
+                # the retry runs only while the endpoint is None. Degrade keeps
+                # its one attempt, as at construction.
+                if self._on_error == "strict":
+                    self._endpoint = None
+                    self._needs_reattach = True
+                raise
 
     @property
     def session_id(self) -> str:
@@ -519,6 +539,13 @@ class CoherentVolume:
         # stays False). A precise per-glob check needs coordinator support; until
         # then a heterogeneous-globs fleet is unsupported (v1.1).
         if self._managed and not self.strict_mode_active():
+            # Detach BEFORE failing, in both modes. Do NOT keep a live endpoint to
+            # a coordinator that does not enforce our paths — that would route
+            # reads/writes through a non-strict coordinator while is_attached
+            # reported True. Degrade falls through detached, mirroring the other
+            # two degrade branches; strict raises detached rather than relying
+            # on the caller to drop the endpoint.
+            self._endpoint = None
             self._fail_closed_or_degrade(
                 "attached to a coordinator that does not enforce strict mode for the "
                 "managed paths. CoherentVolume v1 can enable strict mode only on a "
@@ -528,11 +555,6 @@ class CoherentVolume:
                 "(v1.1). In degrade mode the volume operates best-effort with coherence "
                 "enforcement off."
             )
-            # Degrade mode fell through (strict raised above). Do NOT keep a live
-            # endpoint to a coordinator that does not enforce our paths — that
-            # would route reads/writes through a non-strict coordinator while
-            # is_attached reported True. Mirror the other two degrade branches.
-            self._endpoint = None
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.

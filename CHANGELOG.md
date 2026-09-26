@@ -209,6 +209,30 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A forked `CoherentVolume` whose first re-attach fails now retries it
+  instead of running unenforced.** After `os.fork` the child drops the
+  parent's coordinator connection and re-attaches on its next `read` or write.
+  When that attempt failed — the coordinator mid-restart, its `server.pid` or
+  `hook.secret` briefly missing — `on_error="strict"` raised from that one
+  operation and never tried again. Every later `read`, `write` and
+  `write_cas` then skipped the coordinator: the child's writes were neither
+  recorded nor versioned there, peers holding the old bytes were never
+  invalidated, and `is_degraded` stayed `False`. The adapter-local
+  foreign-edit check (`on_stale_write="raise"`) still ran and `write_cas_at` /
+  `atomic_publish` still refused without a coordinator, but an ordinary write
+  landed with no error. A strict child now retries the re-attach on every
+  such operation, failing closed, until it attaches.
+  A second path had the same effect: a re-attach that reached a coordinator
+  *not* enforcing strict mode for the managed paths raised once but kept its
+  connection, so later operations ran through that coordinator unenforced.
+  A failed strict re-attach now always leaves the child detached, whatever
+  it raised and wherever, so the next `read` or write retries.
+
+  `on_error="degrade"` keeps its one attempt, then best-effort, the same as a
+  failed attach at construction. The one change there: a re-attach refused
+  for not enforcing strict mode now drops the connection before it warns,
+  not after.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
