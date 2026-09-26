@@ -357,10 +357,10 @@ class CoherentVolume:
         parent's). The child's first ``read``/``write`` re-attaches here,
         sibling-attaching to the coordinator under the child's fresh identity.
         A no-op outside the post-fork window. Under ``on_error="strict"`` a
-        failed attempt keeps that window open: every ``read``, ``write``,
+        failed attempt keeps that window open: every ``read``,
+        ``read_with_version``, ``read_with_version_generation``, ``write``,
         ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
-        attaches. The versioned reads never call this and keep their version-0
-        fallback.
+        attaches.
         """
         if self._endpoint is None and self._needs_reattach:
             # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
@@ -1798,6 +1798,7 @@ class CoherentVolume:
         when the coordinator did not confirm one (older coordinator, deny,
         degraded), which generation-aware callers treat as UNCONFIRMED.
         """
+        self._ensure_attached()
         abs_path, _rel = self._to_relative(rel)
         if not abs_path.is_file():
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
