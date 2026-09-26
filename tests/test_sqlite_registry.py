@@ -2214,6 +2214,24 @@ def test_status_snapshot_unscoped_reads_every_agent(db_path: Path) -> None:
         }
 
 
+def test_status_snapshot_carries_last_writer_and_updated_at(db_path: Path) -> None:
+    """#199 §2: the writer rides the batched artifact row so /status never
+    falls back to per-artifact ``last_writer_for`` calls."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+        artifact_by_id, _ = reg.status_snapshot()
+        assert artifact_by_id[art.id]["last_writer_id"] is None
+        assert artifact_by_id[art.id]["updated_at"] == reg.get_artifact_updated_at(art.id)
+
+        writer = uuid4()
+        new_art = Artifact(id=art.id, name=art.name, version=2, content_hash="h2")
+        reg.set_artifact_and_content(art.id, new_art, content="", last_writer=writer)
+        artifact_by_id, _ = reg.status_snapshot()
+        assert artifact_by_id[art.id]["last_writer_id"] == writer == reg.last_writer_for(art.id)
+        assert artifact_by_id[art.id]["updated_at"] == reg.get_artifact_updated_at(art.id)
+
+
 def test_status_snapshot_scoped_reads_only_the_named_agents(db_path: Path) -> None:
     """SB-10 review: the session-start builder runs on a HOOK path, twice per
     compaction, under the registry lock — and can only ever render its own
