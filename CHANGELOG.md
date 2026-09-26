@@ -217,9 +217,28 @@ Alpha — APIs may change before `v1.0`.
   it raised and wherever, so the next `read` or write retries.
 
   `on_error="degrade"` keeps its one attempt, then best-effort, the same as a
-  failed attach at construction. The one change there: a re-attach refused
+  failed attach at construction. One change there: a re-attach refused
   for not enforcing strict mode now drops the connection before it warns,
   not after.
+
+- **A forked `CoherentVolume` in `on_error="degrade"` now reports itself
+  degraded when its re-attach fails unexpectedly.** The child makes one
+  re-attach attempt. When it failed with anything other than an unreachable
+  or non-enforcing coordinator — for example an `OSError` writing the
+  strict-mode policy files, an error while spawning the coordinator, or an
+  interrupt — the operation raised that error, but no
+  `CoherenceDegradedWarning` was emitted and `is_degraded` stayed `False`.
+  A failure before the child connected left every later operation
+  unattached, with coherence enforcement off. An interrupt during the
+  strict-mode check, after it connected, left it connected to a coordinator
+  it never confirmed enforces strict mode for the managed paths. Both now
+  warn once and count toward `degradation_count` before the error
+  propagates, as the handled failures do, and the interrupt case also drops
+  the connection, so either way the child runs best-effort from then on. It
+  still makes only one attempt. When `CoherenceDegradedWarning` is turned
+  into an error, an unexpected error or interrupt still propagates as
+  itself, and each failure is counted once. `on_error="strict"` is
+  unchanged.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was

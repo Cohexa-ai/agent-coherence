@@ -18,6 +18,7 @@ import os
 import subprocess
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -366,17 +367,141 @@ def test_unexpected_reattach_error_after_fork_is_not_retried_in_degrade_mode(
 ) -> None:
     """Degrade keeps its one attempt even when the re-attach fails with an error
     the degrade path does not handle: that op raises it, and later ops run
-    best-effort instead of retrying (and re-raising) on every call."""
+    best-effort instead of retrying (and re-raising) on every call. Running
+    best-effort for life, the child must warn and count like the handled
+    failures — re-raising alone left is_degraded False while enforcement was off."""
     target = _seed(tmp_path)
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
     try:
         vol._after_fork()
-        monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", _raise_oserror)
+        attempts: list[object] = []
 
-        with pytest.raises(OSError):
-            vol.read("data/shared.txt")
-        vol.write("data/shared.txt", b"child")
+        def failing_connect_or_spawn(*args: object, **kwargs: object) -> None:
+            attempts.append(args)
+            _raise_oserror()
+
+        monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", failing_connect_or_spawn)
+
+        with pytest.warns(CoherenceDegradedWarning, match="OSError"):
+            with pytest.raises(OSError):
+                vol.read("data/shared.txt")
+        assert vol.is_degraded
+
+        vol.write("data/shared.txt", b"child")  # best-effort, no second attempt
         assert target.read_bytes() == b"child"
+        assert len(attempts) == 1
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _fail_spawn(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An error the degrade path does not handle, before the child connects."""
+    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", _raise_oserror)
+
+
+def _interrupt_strict_check(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt after the child connected, during the strict-mode check."""
+    flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
+    monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+
+
+def _fail_resolve(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure the degrade path handles: the coordinator briefly unreachable."""
+    _fail_first_resolve(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [(_fail_spawn, OSError), (_interrupt_strict_check, _Interrupted)],
+    ids=["unhandled-error", "interrupt"],
+)
+def test_failed_reattach_after_fork_never_reports_degraded_in_strict_mode(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """Strict fails closed on these failures and retries on the next op, so it is
+    never running best-effort and must not report itself degraded."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+
+        with pytest.raises(raised):
+            vol.read("data/shared.txt")
+        assert not vol.is_degraded
+
+        monkeypatch.undo()
+        assert vol.read("data/shared.txt") == b"v1"  # retries the re-attach
+        assert vol.is_attached
+        assert not vol.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_interrupted_reattach_after_fork_is_detached_and_degraded_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Degrade reports the escaped interrupt as degraded, so it must also drop the
+    endpoint resolved before it. Keeping it would report degraded while later
+    ops ran through a coordinator whose enforcement was never checked."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
+        monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+
+        with pytest.warns(CoherenceDegradedWarning):
+            with pytest.raises(_Interrupted):
+                vol.read("data/shared.txt")
+        assert vol.is_degraded
+        assert not vol.is_attached
+
+        vol.write("data/shared.txt", b"child")  # best-effort, no second attempt
+        assert target.read_bytes() == b"child"
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [
+        (_fail_spawn, OSError),
+        (_interrupt_strict_check, _Interrupted),
+        (_fail_resolve, CoherenceDegradedWarning),
+    ],
+    ids=["unhandled-error", "interrupt", "coordinator-unavailable"],
+)
+def test_failed_degrade_reattach_counts_once_and_keeps_its_error_when_warnings_are_errors(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """With CoherenceDegradedWarning escalated to an error, a failed re-attach
+    still counts once and raises what it raised before. An unhandled error or
+    interrupt propagates as itself, not as the warning (which ``except
+    Exception`` would catch in place of an interrupt). A handled failure already
+    raised the escalated warning from inside the attempt and must not be
+    counted a second time on the way out."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceDegradedWarning)
+            with pytest.raises(raised):
+                vol.read("data/shared.txt")
+        assert vol.degradation_count == 1
         assert not vol.is_attached
     finally:
         stop_coordinator(tmp_path)
