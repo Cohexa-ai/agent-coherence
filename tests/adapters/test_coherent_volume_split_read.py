@@ -27,7 +27,7 @@ import pytest
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import gate
-from ccs.core.exceptions import CoherenceError, StaleView
+from ccs.core.exceptions import CasVersionConflict, CoherenceError, StaleView, ViewWedged
 
 _PATH = "data/counter.txt"
 _WAIT_SEC = 10.0
@@ -244,6 +244,67 @@ def test_refused_first_read_still_guards_a_later_write(
         reader.write(_PATH, b"blind")
     assert target.read_bytes() == b"1"
 
+
+
+def test_lost_write_cas_at_on_a_never_read_path_still_guards_a_later_write(
+    volumes,
+) -> None:
+    """write_cas_at's comparand read discards its bytes, so it must not ADVANCE
+    a baseline; but on a path this instance never read it still records the
+    first one. Otherwise a lost CAS leaves no baseline, and a write() made after
+    an out-of-band edit lands over it unchecked."""
+    target, peer, agent = volumes
+    peer.read(_PATH)
+    peer.write(_PATH, b"1")
+    with pytest.raises(CasVersionConflict):
+        agent.write_cas_at(_PATH, 1, b"agent")
+    target.write_bytes(b"HUMAN")
+    with pytest.raises(StaleView):
+        agent.write(_PATH, b"agent")
+    assert target.read_bytes() == b"HUMAN"
+
+
+def test_refused_write_cas_at_on_a_never_read_path_still_guards_a_later_write(
+    volumes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same first baseline is recorded when the comparand read itself is
+    refused inside a peer's commit window (ViewWedged), not only when the CAS
+    loses on version."""
+    target, peer_vol, agent = volumes
+    peer = LaggingPeer(peer_vol, monkeypatch)
+    peer.commit(b"1")
+    try:
+        with pytest.raises(ViewWedged):
+            agent.write_cas_at(_PATH, 2, b"agent")
+    finally:
+        peer.finish()
+    target.write_bytes(b"HUMAN")
+    with pytest.raises(StaleView):
+        agent.write(_PATH, b"agent")
+    assert target.read_bytes() == b"HUMAN"
+
+
+def test_failed_write_cas_at_read_on_a_never_read_path_still_guards_a_later_write(
+    volumes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first baseline is recorded before the comparand read's request, so a
+    read that fails closed (the coordinator answers degraded) still leaves one."""
+    target, _peer, agent = volumes
+    real_post = agent._post
+
+    def degraded_pre_read(endpoint_path: str, payload: dict) -> dict | None:
+        if endpoint_path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}
+        return real_post(endpoint_path, payload)
+
+    monkeypatch.setattr(agent, "_post", degraded_pre_read)
+    with pytest.raises(CoherenceError):
+        agent.write_cas_at(_PATH, 1, b"agent")
+    monkeypatch.setattr(agent, "_post", real_post)
+    target.write_bytes(b"HUMAN")
+    with pytest.raises(StaleView):
+        agent.write(_PATH, b"agent")
+    assert target.read_bytes() == b"HUMAN"
 
 def _read_following_the_deny_guidance(
     vol: CoherentVolume, patience_sec: float = 3.0

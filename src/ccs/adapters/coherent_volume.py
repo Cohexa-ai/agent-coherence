@@ -120,7 +120,8 @@ class _ReadResult(NamedTuple):
     def split_pair(self) -> bool:
         """The coordinator refused this read AND said ``data`` is not its content
         at ``version``: a pair no caller may CAS from, so the public reads refuse
-        it and the read records nothing as observed."""
+        it and the read does not advance the foreign-edit baseline (a path's
+        first read still records one; see :meth:`_read_with_version`)."""
         return self.stale_denied and self.content_differs
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
@@ -1202,12 +1203,20 @@ class CoherentVolume:
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU). The read's bytes are
         # discarded (the caller already holds new_content), so it is not an
-        # observation: seeding the foreign-edit baseline from it let a caller
+        # observation: advancing the foreign-edit baseline from it let a caller
         # whose CAS lost fall back to write() with older content and land it
         # over the peer's commit. A win records its own bytes below.
+        # observe=False also asks the coordinator for a verify-only read: the
+        # fresh identity takes no SHARED grant (commit_cas admits a caller with
+        # none; the version check arbitrates), and the stale markers and notices
+        # it skips are keyed to that fresh identity, which has none yet.
+        # A path this instance never read still gets a FIRST baseline from this
+        # read, recorded before its request (seed_first_baseline): without it a
+        # CAS that loses, is refused, or whose read fails closed leaves no
+        # baseline, and a later write() lands over an out-of-band edit unchecked.
         self._remint()
         _current_bytes, current_version, stale_denied, _gen, _stale, _differs = (
-            self._read_with_version(rel, observe=False)
+            self._read_with_version(rel, observe=False, seed_first_baseline=True)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1829,7 +1838,9 @@ class CoherentVolume:
                 self._refuse_split_pair(result)
             return result.data, result.version, result.owner_generation
 
-    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
+    def _read_with_version(
+        self, rel: str, *, observe: bool = True, seed_first_baseline: bool = False
+    ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation, stale_status,
         content_differs)``
@@ -1868,7 +1879,11 @@ class CoherentVolume:
         # cannot absolve an edit made after an earlier read; it only keeps a
         # path whose first read was refused from having no baseline at all, which
         # would let a later write land over a peer commit unchecked.
-        if observe:
+        # ``seed_first_baseline`` applies the same first-read rule to a
+        # verification read that is still a path's first contact
+        # (write_cas_at's comparand read); the effect fence's re-check leaves it
+        # off.
+        if observe or seed_first_baseline:
             self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
