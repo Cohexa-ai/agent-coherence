@@ -209,10 +209,7 @@ from ccs.adapters.coherent_object import (
     VersionedCasWritten,
     VersionPointerUnconfirmed,
 )
-from ccs.adapters.coherent_volume import (
-    DENIED_READ_BACKOFF_BASE_SEC,
-    DENIED_READ_BACKOFF_CAP_SEC,
-)
+from ccs.adapters.coherent_volume import denied_read_backoff_sec
 from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
@@ -2573,12 +2570,7 @@ class WorkspaceVersioner:
                 # a peer's disk write can land, which bounds the leg by read
                 # latency instead of by time.
                 refusals += 1
-                time.sleep(
-                    min(
-                        DENIED_READ_BACKOFF_BASE_SEC * (2 ** (refusals - 1)),
-                        DENIED_READ_BACKOFF_CAP_SEC,
-                    )
-                )
+                time.sleep(denied_read_backoff_sec(refusals))
                 continue
             except FileNotFoundError:
                 # v1 residual: recreation needs the coordinator artifact

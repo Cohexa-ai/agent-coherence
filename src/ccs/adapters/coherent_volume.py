@@ -166,6 +166,21 @@ MAX_CAS_REACQUIRES = 8
 DENIED_READ_BACKOFF_BASE_SEC = 0.002
 DENIED_READ_BACKOFF_CAP_SEC = 0.05
 
+
+def denied_read_backoff_sec(refusals: int) -> float:
+    """The wait before the next read after ``refusals`` consecutive refused
+    reads (counted from 1): capped-exponential from the base to the cap.
+
+    ``write_cas`` and ``WorkspaceVersioner``'s restore leg both wait on this
+    schedule for the same transient, a peer's commit still reaching disk. Each
+    caller keeps its own count: ``write_cas`` resets its streak on a clean read,
+    and a restore leg counts refusals across its whole budget."""
+    return min(
+        DENIED_READ_BACKOFF_BASE_SEC * (2 ** (refusals - 1)),
+        DENIED_READ_BACKOFF_CAP_SEC,
+    )
+
+
 # SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
 # model's retry loop sees identical text each attempt (KTD-P), and distinct from
 # the coordinator's INVALID-deny prose so the two are not conflated.
@@ -1069,12 +1084,7 @@ class CoherentVolume:
                 self._remint()
                 # WAIT, don't spin: yield the CPU to the peer whose disk write
                 # clears this view (see DENIED_READ_BACKOFF_BASE_SEC).
-                time.sleep(
-                    min(
-                        DENIED_READ_BACKOFF_BASE_SEC * (2 ** (denied_streak - 1)),
-                        DENIED_READ_BACKOFF_CAP_SEC,
-                    )
-                )
+                time.sleep(denied_read_backoff_sec(denied_streak))
                 continue
             denied_streak = 0
 

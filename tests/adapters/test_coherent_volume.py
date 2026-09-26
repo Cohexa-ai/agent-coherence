@@ -35,6 +35,7 @@ from ccs.adapters.coherent_volume import (
     MAX_CAS_REACQUIRES,
     CoherentVolume,
     coherent_workspace,
+    denied_read_backoff_sec,
     install,
     uninstall,
 )
@@ -2042,6 +2043,8 @@ def test_write_cas_waits_between_denied_comparand_reads(
         min(DENIED_READ_BACKOFF_BASE_SEC * 2**i, DENIED_READ_BACKOFF_CAP_SEC)
         for i in range(MAX_CAS_REACQUIRES)  # one wait per denied read before the bound trips
     ]
+    # The restore leg of WorkspaceVersioner waits on the same helper, counted from 1.
+    assert [denied_read_backoff_sec(n) for n in range(1, MAX_CAS_REACQUIRES + 1)] == schedule
 
     # Record what the loop asks to wait, and still wait it. ``time`` is used nowhere
     # else in the adapter, so shimming that module-level name leaves the real
