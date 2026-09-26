@@ -310,12 +310,25 @@ def test_staging_failure_leaves_disk_uniformly_old(
             )
         assert exc.value.landed == ()
         assert set(exc.value.not_landed) == {"data/a.txt", "data/b.txt"}
+        # The message names the recovery the rest of this test performs.
+        assert "with write()" in str(exc.value)
         # NEITHER file replaced — both hold their old bytes.
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
         vol_a._stage_tmp = real_stage
-        _bytes, version = vol_a.read_with_version("data/b.txt")
-        assert isinstance(version, int)
+        # The coordinator records b-v2 at the new version while disk holds b-v1,
+        # so a versioned read cannot pair them — and reacquire() cannot clear it,
+        # because disk never catches up on its own.
+        with pytest.raises(StaleView):
+            vol_a.read_with_version("data/b.txt")
+        assert vol_a.reacquire("data/b.txt") == b"b-v1"
+        with pytest.raises(StaleView):
+            vol_a.read_with_version("data/b.txt")
+        # The documented recovery: re-materialize the member with write().
+        vol_a.write("data/b.txt", b"b-v2")
+        data, version = vol_a.read_with_version("data/b.txt")
+        assert data == b"b-v2"
+        assert version == 3
     finally:
         stop_coordinator(tmp_path)
 

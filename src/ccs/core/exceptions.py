@@ -663,9 +663,11 @@ class PublishMaterializationError(CoherenceError):
     disk; ``not_landed`` names the members still holding their old bytes. When
     ``landed`` is non-empty the on-disk set is TORN relative to the coordinator;
     when it is empty the disk is uniformly stale (coordinator ahead of disk).
-    Recover by re-reading each member at the coordinator's current version and
-    re-materializing from those bytes (never from bytes computed before the
-    publish)."""
+    Recover by re-materializing each ``not_landed`` member with ``write()`` of
+    the bytes this publish committed for it. Until those bytes reach disk, a
+    version-checked read of that member (``read_with_version``) raises
+    ``StaleView``: its disk bytes are not the content at the coordinator's
+    version, so no version is returned for them."""
 
     def __init__(
         self,
@@ -677,9 +679,10 @@ class PublishMaterializationError(CoherenceError):
         super().__init__(
             f"atomic_publish committed at the coordinator but disk materialization "
             f"failed{detail}: landed={list(landed)} not_landed={list(not_landed)}. "
-            "The coordinator is ahead of disk — re-read each member at its current "
-            "version and re-materialize; do NOT retry the publish (it would "
-            "version-mismatch)."
+            "The coordinator is ahead of disk — re-materialize each not_landed "
+            "member with write() of the bytes this publish committed for it (a "
+            "versioned read of it is refused until then); do NOT retry the "
+            "publish (it would version-mismatch)."
         )
         self.landed = landed
         self.not_landed = not_landed

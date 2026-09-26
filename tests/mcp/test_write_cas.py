@@ -8,6 +8,7 @@ per-session counter bounds a cooperating agent's retry loop.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -16,13 +17,16 @@ from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import CasVersionConflict
 from ccs.mcp.server import (
+    _READ_DESC,
     _WRITE_CAS_DESC,
     MAX_CAS_CONFLICTS,
+    _do_reacquire,
     _do_read,
     _do_write,
     _do_write_cas,
 )
 from ccs.mcp.session import SessionConfig
+from tests.adapters.test_coherent_volume_split_read import LaggingPeer
 
 
 @pytest.fixture
@@ -266,6 +270,92 @@ def test_swg_write_denies_foreign_edit(tmp_path: Path, fast_cfg: LifecycleConfig
         stop_coordinator(tmp_path)
 
 
+def test_swg_write_still_denies_a_foreign_edit_after_a_refused_swg_read(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A refused swg_read returns no content, so it must not count as having
+    seen the foreign edit: the agent's next swg_write, built from its older
+    read, is still denied rather than landing over the edit."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(vol, config, _PATH)
+        target.write_bytes(b"foreign-v2")
+        refused = _do_read(vol, config, _PATH)
+        assert refused.isError is True
+        assert refused.structuredContent["reason"] == "stale_view"
+        denied = _do_write(vol, config, _PATH, "v1-plus-agent-edit")
+        assert denied.isError is True
+        assert denied.structuredContent["reason"] == "stale_view"
+        assert target.read_bytes() == b"foreign-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_swg_read_refused_after_out_of_band_edit_recovers_by_reacquire_then_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """After an out-of-band edit every swg_read is refused, and swg_reacquire
+    alone does not change that: the coordinator has never recorded the bytes on
+    disk. Writing the reacquired content records them, and reads answer again.
+    This is the recovery the swg_read description names for a refusal that
+    outlasts its retries (the retries are skipped here: the cause is known)."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(vol, config, _PATH)
+        target.write_bytes(b"foreign")
+        assert _do_read(vol, config, _PATH).structuredContent["reason"] == "stale_view"
+        reacquired = _do_reacquire(vol, config, _PATH)
+        assert reacquired.structuredContent["content"] == "foreign"
+        assert _do_read(vol, config, _PATH).structuredContent["reason"] == "stale_view"
+        merged = reacquired.structuredContent["content"] + "+agent"
+        assert _do_write(vol, config, _PATH, merged).isError is False
+        read = _do_read(vol, config, _PATH)
+        assert read.isError is False
+        assert read.structuredContent["content"] == "foreign+agent"
+        assert isinstance(read.structuredContent["version"], int)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_swg_write_after_a_lost_swg_write_cas_is_still_denied(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A lost CAS discards the bytes of its own comparand read, so that read must
+    not count as the agent having seen the peer's commit. When it did, an
+    agent falling back from the conflict to swg_write with its older content
+    overwrote the peer's committed update."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    vol_a = _vol(tmp_path, fast_cfg)
+    vol_b = _vol(tmp_path, fast_cfg)
+    try:
+        version = _do_read(vol_a, config, _PATH).structuredContent["version"]
+        _do_read(vol_b, config, _PATH)
+        assert _do_write(vol_b, config, _PATH, "v2-from-b").isError is False
+
+        lost = _do_write_cas(vol_a, config, {}, _PATH, version, "v1+agent")
+        assert lost.structuredContent["reason"] == "version_mismatch"
+        fallback = _do_write(vol_a, config, _PATH, "v1+agent")
+        assert fallback.isError is True
+        assert fallback.structuredContent["reason"] == "stale_view"
+        assert target.read_bytes() == b"v2-from-b"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_read_description_names_the_write_recovery_for_a_lasting_refusal() -> None:
+    # Whole word: "swg_write_cas" is already in the description and says nothing
+    # about recovering from a refused read.
+    assert re.search(r"\bswg_write\b", _READ_DESC)
+    # ...and only after retrying, since a peer's commit still reaching disk
+    # clears on its own and a write made inside that window is overwritten.
+    assert "few seconds" in _READ_DESC
+
+
 # --- the refusal reason reaches the caller -----------------------------------
 #
 # The coordinator distinguishes four CAS refusals; each needs different
@@ -321,5 +411,64 @@ def test_adapter_reports_other_holder_not_version_mismatch(
 
         assert exc.value.reason == "other_holder"
         assert exc.value.expected_version == exc.value.current_version == version
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- swg_read inside a peer's commit→disk window ------------------------------
+
+
+def test_swg_read_in_a_peer_commit_window_returns_no_version(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that lands after a peer's CAS is confirmed but before its bytes
+    reach disk sees the old content under the new version. swg_read must refuse
+    it as a recoverable stale_view and carry no version an agent could CAS at."""
+    _seed(tmp_path, b"0")
+    config = _config(tmp_path)
+    peer = LaggingPeer(_vol(tmp_path, fast_cfg), monkeypatch, _PATH)
+    agent = _vol(tmp_path, fast_cfg)
+    try:
+        peer.commit(b"1")
+        try:
+            read = _do_read(agent, config, _PATH)
+        finally:
+            peer.finish()
+        assert read.isError is True
+        sc = read.structuredContent
+        assert sc["reason"] == "stale_view"
+        assert sc["recover"] == "reacquire"
+        assert sc["retryable"] is True
+        assert "version" not in sc
+        assert "content" not in sc
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_swg_read_then_write_cas_through_a_peer_commit_window_loses_no_update(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """swg_read → merge → swg_write_cas, run the way a cooperating agent runs it
+    (a stale_view read is recovered by swg_reacquire, then read again). When
+    swg_read answered inside the window, the agent merged "1" from the old "0"
+    at the peer's version and the CAS won, so the file ended at "1"."""
+    target = _seed(tmp_path, b"0")
+    config = _config(tmp_path)
+    peer = LaggingPeer(_vol(tmp_path, fast_cfg), monkeypatch, _PATH)
+    agent = _vol(tmp_path, fast_cfg)
+    try:
+        peer.commit(b"1")
+        read = _do_read(agent, config, _PATH)
+        peer.finish()
+        if read.isError:
+            assert read.structuredContent["recover"] == "reacquire"
+            assert _do_reacquire(agent, config, _PATH).isError is False
+            read = _do_read(agent, config, _PATH)
+        assert read.isError is False
+        sc = read.structuredContent
+        merged = str(int(sc["content"]) + 1)
+        result = _do_write_cas(agent, config, {}, _PATH, sc["version"], merged)
+        assert result.isError is False
+        assert target.read_bytes() == b"2"
     finally:
         stop_coordinator(tmp_path)

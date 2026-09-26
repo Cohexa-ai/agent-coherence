@@ -209,6 +209,47 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A read inside a peer's commit→disk window no longer hands out a comparand
+  that loses that peer's update.** A peer's `write_cas_at` confirms its CAS at
+  the coordinator and only then writes its bytes to disk. A read landing between
+  the two sees the old bytes while the coordinator already reports the new
+  version; strict mode denies that read with `hash_differs`, but
+  `read_with_version()` and `read_with_version_generation()` returned the pair
+  anyway, and so did `swg_read`. A caller that derived from those bytes and
+  passed that version to `write_cas_at` / `swg_write_cas` won the CAS once the
+  peer's disk write landed (the CAS compares versions, and by then the version
+  matched), overwriting the peer's update. Those reads now raise `StaleView`
+  (`swg_read`: `reason=stale_view`, `recover=reacquire`, no `version` returned)
+  when the coordinator both denied the read and reported that the bytes are not
+  its content at that version; re-reading once the peer's write has landed
+  returns a sound pair. A denied read whose bytes do match — the sticky-INVALID
+  read after a peer's commit — is returned as before, and the effect fence's
+  verification read (`observe=False`) still reports rather than raises.
+
+  A refused read returns no bytes, so it also leaves the foreign-edit baseline
+  where it was: a `write()` / `swg_write` built from an earlier read is still
+  denied after an out-of-band edit, instead of landing over it. A file's first
+  read still records what it found, even when refused, so a write that follows
+  it is still checked. `write_cas_at` / `swg_write_cas` discards the bytes its
+  own read returns, so a CAS that loses no longer counts the peer's bytes as
+  seen: after reading a file and then losing a CAS on it, a `write()` /
+  `swg_write` of the older content is denied instead of overwriting the peer's
+  commit, including while that commit is still reaching disk. On a file the
+  volume never read, that read still records what it found, even when the CAS
+  loses or the read fails, so an edit made outside the coordinator afterwards
+  is still caught. A refusal
+  caused by a peer's commit still reaching disk clears on its own, so retry
+  `reacquire()` and the read for a few seconds first. When the refusal outlasts
+  that (an out-of-band edit, or a commit whose disk write failed), the
+  coordinator has never recorded the bytes on disk and re-reading will not clear
+  it: `write()` the bytes `reacquire()` returned, or a merge of them, to record
+  them. A write made sooner can be overwritten by the peer's commit when it
+  lands. The deny text and the `swg_read` description now say so.
+  `WorkspaceVersioner` handles the refusal from a `CoherentVolume` file member:
+  a checkpoint records that member as an unconfirmed pointer (`forward_only`,
+  flagged `dirty_during_window`) instead of raising, and a restore leg re-drives
+  and then concludes `conflict` without writing, so the restore still finishes.
+
 - **A refused `read()` no longer lets the next `write()` overwrite an
   out-of-band edit.** With `on_stale_read="raise"`, a read of a file someone
   edited outside the volume raises `StaleView` and returns no bytes. It still

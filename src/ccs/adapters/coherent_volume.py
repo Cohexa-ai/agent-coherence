@@ -92,7 +92,7 @@ __all__ = ["CoherentVolume", "coherent_workspace", "install", "uninstall"]
 
 class _ReadResult(NamedTuple):
     """What one coordinator-mediated read yields. Named rather than a bare
-    tuple because two of the five fields are int-shaped and adjacent
+    tuple because two of its fields are int-shaped and adjacent
     (``version`` and ``owner_generation``), so a positional transposition would
     type-check in one direction while silently swapping a value comparand for
     an authority one."""
@@ -108,6 +108,21 @@ class _ReadResult(NamedTuple):
     #: owner_generation)`` pair is unchanged, because a peer's write-claim
     #: acquire preempts a holder while moving NEITHER comparand.
     stale_status: bool
+    #: The coordinator reported that ``data`` is NOT the content it records at
+    #: ``version`` (``hash_differs``, on either response shape). Together with
+    #: ``stale_denied`` this names the split pair a read inside a peer's
+    #: commit→disk window produces: old bytes under the new version. ``False``
+    #: also covers a coordinator holding no recorded hash to compare against;
+    #: the wire does not tell the two apart.
+    content_differs: bool
+
+    @property
+    def split_pair(self) -> bool:
+        """The coordinator refused this read AND said ``data`` is not its content
+        at ``version``: a pair no caller may CAS from, so the public reads refuse
+        it and the read does not advance the foreign-edit baseline (a path's
+        first read still records one; see :meth:`_read_with_version`)."""
+        return self.stale_denied and self.content_differs
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -166,6 +181,20 @@ _PUBLISH_HELD_REASON = (
     "atomic publish held: a peer committed a member of this write-set since it "
     "was read, so the batch was NOT published (all-or-nothing — no file was "
     "written). reacquire() and rebuild the publish from the fresh versions."
+)
+
+# Split-pair read refusal. Byte-stable (no path/version interpolation) so a
+# model's retry loop sees identical text each attempt (KTD-P).
+_SPLIT_READ_DENY_REASON = (
+    "stale read refused: the bytes on disk are not the content the coordinator "
+    "records at its current version, so no version is returned for them. A "
+    "peer's commit still reaching disk clears on its own: reacquire() and read "
+    "again, retrying with backoff for a few seconds. Only a refusal that "
+    "outlasts that means the file was changed outside the coordinator (an "
+    "out-of-band edit, or a commit whose disk write failed): then write() the "
+    "bytes reacquire() returned, or your merge of them, to record them, and read "
+    "again. A write made while a peer's commit is still reaching disk is "
+    "overwritten when that commit lands."
 )
 
 
@@ -1009,7 +1038,7 @@ class CoherentVolume:
             # SHARED and route the next comparand read through the coordinator's
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
-            current_bytes, expected_version, stale_denied, _gen, _stale = (
+            current_bytes, expected_version, stale_denied, _gen, _stale, _differs = (
                 self._read_with_version(rel)
             )
             if stale_denied:
@@ -1172,10 +1201,21 @@ class CoherentVolume:
             )
         # Re-mint first / read second: a hash-checked None-state read establishes
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
-        # re-create the split-comparand hole — KTD-LU).
+        # re-create the split-comparand hole — KTD-LU). The read's bytes are
+        # discarded (the caller already holds new_content), so they must not
+        # ADVANCE the foreign-edit baseline: that let a caller whose CAS lost
+        # fall back to write() with older content and land it over the peer's
+        # commit. It stays an observing read otherwise, and both halves matter:
+        # on a path never read it records the first baseline before its request
+        # (so a lost, refused or failed CAS still leaves write() one to check),
+        # and it registers the fresh identity SHARED, so a peer commit that wins
+        # before our CAS invalidates it and the write() fallback is refused at
+        # the coordinator even while the peer's bytes are still reaching disk,
+        # when the disk alone still matches the baseline. A win records its own
+        # bytes below.
         self._remint()
-        _current_bytes, current_version, stale_denied, _gen, _stale = (
-            self._read_with_version(rel)
+        _current_bytes, current_version, stale_denied, _gen, _stale, _differs = (
+            self._read_with_version(rel, advance_baseline=False)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1264,9 +1304,11 @@ class CoherentVolume:
         which members landed. This shrinks — but a process crash between two
         renames cannot fully eliminate — the multi-file disk window (no POSIX
         multi-file atomic rename exists). On a ``PublishMaterializationError`` the
-        coordinator is ahead of disk; recover by re-reading each member at its
-        current version and re-materializing (never retry the publish — it would
-        version-mismatch).
+        coordinator is ahead of disk; recover by re-materializing each
+        ``not_landed`` member with :meth:`write` of the bytes this publish
+        committed for it (until then :meth:`read_with_version` refuses that
+        member, since its disk bytes are not the content at the current
+        version). Never retry the publish — it would version-mismatch.
 
         **Foreign-edit boundary (read this too).** The staleness this API
         detects is VERSION drift at the coordinator — and only volume-mediated
@@ -1696,12 +1738,44 @@ class CoherentVolume:
         :meth:`read`, a sticky-INVALID instance still returns fresh bytes and the
         version reflects the peer's commit; the instance stays INVALID until
         :meth:`reacquire` re-mints. ``FileNotFoundError`` for a missing file.
+
+        Raises :class:`~ccs.core.exceptions.StaleView` instead of returning a
+        pair the coordinator denied because the bytes are not its content at
+        that version (see :meth:`_refuse_split_pair`).
         """
         with self._single_op_guard():
-            data, version, _stale_denied, _generation, _stale = (
-                self._read_with_version(path)
-            )
-            return data, version
+            result = self._read_with_version(path)
+            self._refuse_split_pair(result)
+            return result.data, result.version
+
+    @staticmethod
+    def _refuse_split_pair(result: _ReadResult) -> None:
+        """Raise ``StaleView`` rather than hand out a split ``(bytes, version)``.
+
+        A read that lands between a peer's confirmed CAS and that peer's disk
+        write sees the OLD bytes while the coordinator already reports the NEW
+        version. Strict mode denies it with ``hash_differs``, but the pair used
+        to be returned anyway, and a caller that derived from those bytes and
+        CASed at that version won once the peer's disk write landed: the peer's
+        update was overwritten. ``write_cas_at`` cannot catch this, because its
+        own comparand read runs after the disk write and compares only
+        versions. The same deny also fires on an out-of-band edit; that pair is
+        just as unsound.
+
+        A deny WITHOUT ``hash_differs`` is kept: that is the sticky-INVALID read
+        of bytes that match the version (the pair is sound; the instance still
+        has to reacquire before a plain :meth:`write`). An admitted pair is
+        returned unchanged even when it carries ``hash_differs``. On a
+        tracked-but-not-strict path a mismatch is the normal state (the
+        cross-host mode keeps each host's bytes on its own disk). On a strict
+        path the coordinator admits a mismatch for this instance while it is
+        the artifact's most recent committer, within the coordinator's short
+        commit-lag window, whatever the cause: its own disk write not yet
+        landed or failed, or an out-of-band edit made after it landed. Those
+        split pairs are returned, not refused.
+        """
+        if result.split_pair:
+            raise StaleView(_SPLIT_READ_DENY_REASON)
 
     #: Whether the most recent :meth:`read_with_version_generation` was refused
     #: by the coordinator (strict-mode deny). Read by the effect fence to name
@@ -1739,28 +1813,36 @@ class CoherentVolume:
         discards (the effect fence re-reading to compare comparands). It leaves
         the foreign-edit baseline where it was, so checking freshness cannot
         absolve an out-of-band edit the caller never actually saw.
+
+        An observing read raises :class:`~ccs.core.exceptions.StaleView` instead
+        of returning a split pair (see :meth:`_refuse_split_pair`). A
+        verification read still returns: its bytes are discarded, and the fence
+        classifies it from ``_last_read_denied``, which is set either way.
         """
         with self._single_op_guard():
-            data, version, stale_denied, generation, stale_status = (
-                self._read_with_version(path, observe=observe)
-            )
+            result = self._read_with_version(path, observe=observe)
             # A strict-mode deny is reported as a REFUSED read, not merely as a
             # missing generation: they need different answers (a deny clears
             # with reacquire; a coordinator that cannot report generations at
             # all does not), and on the strict path a sweep reclaim reaches the
             # client precisely AS a deny.
-            self._last_read_denied = stale_denied
+            self._last_read_denied = result.stale_denied
             # A stale-status read (warn re-grant OR deny) means the grant this
             # instance was previously read under did NOT stand at this read —
             # the re-grant, if any, is a NEW grant. The effect fence keys the
             # write-preemption HOLD on this: a peer's write-claim acquire ends
             # the caller's grant while moving neither comparand.
-            self._last_read_stale = stale_status
-            return data, version, generation
+            self._last_read_stale = result.stale_status
+            if observe:
+                self._refuse_split_pair(result)
+            return result.data, result.version, result.owner_generation
 
-    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
+    def _read_with_version(
+        self, rel: str, *, observe: bool = True, advance_baseline: bool = True
+    ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
-        ``(bytes, version, stale_denied, owner_generation, stale_status)``
+        ``(bytes, version, stale_denied, owner_generation, stale_status,
+        content_differs)``
         (a :class:`_ReadResult`); ``stale_status`` is True when the coordinator
         classified this read as stale (a warn re-grant or a deny), the
         standing-grant signal the effect fence keys the ``grant_preempted``
@@ -1791,18 +1873,17 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
-        # ONLY when the caller actually OBSERVES these bytes. A verification
-        # read (``observe=False``, used by the effect fence) reads the file to
-        # compare comparands and then DISCARDS the bytes; advancing the
-        # baseline there would silently absolve a foreign edit the caller never
-        # saw, so the next write would clobber it instead of denying. A
-        # fail-closed check must not have a fail-open side effect.
+        # A path's FIRST observing read records what the disk held, before the
+        # response can refuse or fail it. It never replaces a baseline, so it
+        # cannot absolve an edit made after an earlier read; it only keeps a
+        # path whose first read was refused from having no baseline at all, which
+        # would let a later write land over a peer commit unchecked.
         if observe:
-            self._last_observed_hash[_rel] = content_hash
+            self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
         stale_status = False
+        content_differs = False
         owner_generation: int | None = None
         if self._endpoint is not None:
             resp = self._post(
@@ -1849,7 +1930,27 @@ class CoherentVolume:
                 # Any stale-status response — warn re-grant or deny alike —
                 # means this instance's prior grant did not stand at this read.
                 stale_status = resp.get("status") == "stale"
-        return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
+                content_differs = self._pre_read_hash_differs(resp)
+        result = _ReadResult(
+            data, version, stale_denied, owner_generation, stale_status, content_differs
+        )
+        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
+        # ONLY when the caller actually OBSERVES these bytes. A verification
+        # read (``observe=False``, used by the effect fence) reads the file to
+        # compare comparands and then DISCARDS the bytes; advancing the
+        # baseline there would silently absolve a foreign edit the caller never
+        # saw, so the next write would clobber it instead of denying. A
+        # fail-closed check must not have a fail-open side effect. A split
+        # pair reaches no caller either (the public reads refuse it and the
+        # OCC loops discard it), so it is decided AFTER the response, not
+        # before: seeding first let a refused read of an out-of-band edit
+        # clear the way for a write over that edit.
+        # ``advance_baseline=False`` (write_cas_at's comparand read, whose bytes
+        # the caller discards) keeps the first-read seed above but never moves
+        # an existing baseline.
+        if observe and advance_baseline and not result.split_pair:
+            self._last_observed_hash[_rel] = content_hash
+        return result
 
     @staticmethod
     def _pre_read_version(resp: dict) -> int:
