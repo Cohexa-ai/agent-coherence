@@ -348,10 +348,13 @@ def test_node_asymmetry_row_cannot_be_satisfied_by_a_skip() -> None:
     machine or CI job without the built plugin fails the gate rather than
     quietly satisfying it.
 
-    Point ``AGENT_COHERENCE_PLUGIN_DIST_PATH`` at a nonexistent file with
-    ``HOME`` redirected (the resolver's third fallback is ``~/projects/...``)
-    to watch this go red — that is the mutation this assertion exists to fail
-    against."""
+    Leave ``AGENT_COHERENCE_PLUGIN_DIST_PATH`` unset, redirect ``HOME`` (the
+    resolver's third fallback is ``~/projects/...``) and run from a checkout
+    with no sibling ``agent-coherence-plugin`` to watch this go red — that is
+    the mutation this assertion exists to fail against. Pointing the variable
+    at a nonexistent file no longer reaches this assertion: the resolver
+    refuses an explicit path that does not exist, so the module fails at
+    collection instead."""
     assert _NODE_DIST_PATH is not None, _NODE_DIST_UNRESOLVED
     assert _NODE_DIST_PATH.exists(), (
         f"resolved dist path does not exist: {_NODE_DIST_PATH}"

@@ -8,6 +8,38 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A caller principal: the coordinator can check which session a request is
+  from.** The coordinator authenticates the workspace, not the caller — the
+  session a request acts as is a body field — so a copied request, a stale
+  session id or a wrong id in a retry could release another writer's grants or
+  commit under its name. `POST /principal/claim` now binds a principal to a
+  session on its first claim; the claimant sends a nonce it kept beforehand, so a
+  retry after a lost response gets the same principal back and any other
+  claimant is refused. Clients send it in the `Coherence-Caller-Principal`
+  header, and the Claude Code hook client, `CoherentVolume`, the MCP server and
+  the substrate session do so automatically.
+
+  What it catches depends on the client. `CoherentVolume`, the MCP server and the
+  substrate session present only their own session's principal, so a request
+  from them naming another session is refused. The hook client finds its
+  principal by the session id in each hook event, so a wrong id there is not
+  caught; on that surface the principal exposes a client that never claimed or
+  presents the wrong one. A client whose claim answer is lost, or whose binding
+  disappears with a deleted `state.db`, claims again with the nonce it kept. A
+  coordinator that issues no principals (the plugin's Node coordinator, or an
+  older release) answers `404`, and clients proceed without one.
+
+  This is not a security boundary: the bearer secret still grants full
+  authority, and every principal is stored in `.coherence/state.db`, which any
+  process of the same OS user can read. See the guide's
+  [Caller principal](docs/guide.md#caller-principal) section.
+
+- **The acquire-or-fail refusal on `pre-edit` is specified.** The guide now
+  records the request, refusal shape, reason channel and timeout answer an
+  opt-in "acquire or fail" on `pre-edit` will use, and the gaps it will not
+  close. It is **not implemented**; `pre-edit` still grants EXCLUSIVE to
+  whoever asks.
+
 - **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
   "May this irreversible effect still fire, and if not, why?" was reachable
   from Python (`gate()`) and from MCP (`swg_gate`); a client that speaks
@@ -151,6 +183,27 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **Requests naming a session that has claimed a principal must present it on
+  the routes that can change another writer's work.** `pre-edit`,
+  `session-stop`, `post-edit`, `post-edit-cas`, `effect-fence` and the four
+  `/workspace/checkpoint` and `/workspace/restore/*` routes answer HTTP `400`
+  with a `reason` of `caller_principal_absent` or `caller_principal_foreign`
+  when the named session is bound and the header is missing or wrong; a refused
+  request changes nothing. Every other route refuses a principal that is not the
+  one bound to the named session. A request naming a session that never claimed
+  one is admitted exactly as before, so clients that predate this keep working.
+  `/status` counts admissions without a principal as
+  `caller_principal_absent_total` and refusals as
+  `caller_principal_refused_total`. The Node coordinator enforces none of this.
+
+- **Registry schema version 8 (forward-only).** Principals get their own table,
+  which the grant sweep, the session-liveness sweep, the session cap and
+  session release never touch, so a principal outlives all three. As with
+  earlier steps, the migration runs on first open and there is no down step:
+  once a workspace's `state.db` is at version 8, an older release refuses it.
+  The v6→v7 step now stamps its own literal version, so a database migrating
+  from any earlier version lands each step at its correct stamp.
+
 - **A `CoherentVolume`'s `session_id` is now stable for its lifetime.** The
   fresh identity each attempt needs — it is what clears a stale view — is now
   carried as the request's `agent_id` under the same session, instead of
@@ -170,6 +223,13 @@ Alpha — APIs may change before `v1.0`.
   states are unchanged at every tier, so anything reading those is
   unaffected. The `--detail` help text no longer claims the process id is
   redacted at the minimal tier; it is emitted at every tier, deliberately.
+
+- **A coordinator redirect is refused without naming where it pointed.** No
+  client follows a 3xx answer from the coordinator, and the error used to quote
+  the redirect's `Location`. A redirector that echoes what it was sent could put
+  a caller principal or claim nonce into that text, so `RedirectRefused` now
+  names only the status: its message reads `redirect (302) to '(withheld)'` and
+  its `location` is always `(withheld)`, on every request.
 
 - **A hook response names a peer by agent id, and a denial no longer reports a
   write that did not happen.** Two corrections on the same surface. The

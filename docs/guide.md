@@ -32,21 +32,23 @@ full command-line toolset, and the API reference.
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 14. [Effect fence over HTTP](#effect-fence-over-http)
-15. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-16. [Inline benchmark mode](#inline-benchmark-mode)
-17. [Telemetry](#telemetry)
-18. [Graceful degradation](#graceful-degradation)
-19. [Examples](#examples)
-20. [Real-workload benchmarks](#real-workload-benchmarks)
-21. [Benchmarking your own workload](#benchmarking-your-own-workload)
-22. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-23. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-24. [Replay (v0.8.2+)](#replay-v082)
-25. [Command-line tools](#command-line-tools)
-26. [API reference](#api-reference)
-27. [Low-level adapter API](#low-level-adapter-api)
-28. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-29. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+15. [Caller principal](#caller-principal)
+16. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+17. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+18. [Inline benchmark mode](#inline-benchmark-mode)
+19. [Telemetry](#telemetry)
+20. [Graceful degradation](#graceful-degradation)
+21. [Examples](#examples)
+22. [Real-workload benchmarks](#real-workload-benchmarks)
+23. [Benchmarking your own workload](#benchmarking-your-own-workload)
+24. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+25. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+26. [Replay (v0.8.2+)](#replay-v082)
+27. [Command-line tools](#command-line-tools)
+28. [API reference](#api-reference)
+29. [Low-level adapter API](#low-level-adapter-api)
+30. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+31. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -619,7 +621,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 
@@ -1096,6 +1098,10 @@ client that omits `session_id` in particular could otherwise spend a long time
 reading holds it can never clear, because the answer depends on which session
 holds the grant.
 
+If your client has claimed a [caller principal](#caller-principal) for
+`session_id`, send it in the `Coherence-Caller-Principal` header: this route is
+require-class, so a request naming a claimed session without it answers `400`.
+
 **Omitted and `null` are different answers for `expected_generation`, and the
 difference is the point of the field.** Leaving the key out is a client that
 never captured the comparand; no number of identical retries supplies a value
@@ -1246,6 +1252,161 @@ a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
 fired/held result types, not in the vocabulary above.
+
+## Caller principal
+
+The coordinator authenticates the workspace, not the caller: one bearer secret
+covers every process, and the session a request acts as is the `session_id` in
+its body. A **caller principal** is a value the coordinator issues and binds to
+one session, so that a request naming that session can be checked against it.
+For a long-lived client it turns "a writer sent the wrong session id" — a copied
+request, a stale id after a fork, a retry that picked up a peer's id — from a
+silent success into a refusal.
+
+It is not a security boundary. The bearer secret still gives full authority over
+the workspace, and every principal is stored in `.coherence/state.db`, where any
+process running as your OS user can read it. What a principal catches depends on
+the client:
+
+- A long-lived client — `CoherentVolume`, the MCP server, the substrate session —
+  is issued one principal for its own session and presents only that one, so a
+  request it sends naming any other session is refused.
+- The Claude Code hook client runs once per hook event and finds its principal
+  in `.coherence/` by the session id in the event. A hook carrying another
+  session's id can therefore find that session's principal too. On this surface
+  the principal makes a client that never claimed, or one presenting the wrong
+  principal, visible; it does not tell sessions apart.
+
+### You usually do nothing
+
+The Claude Code hook client, `CoherentVolume`, the MCP server and the substrate
+session claim a principal for their session and send it on every request. If a
+claim's answer is lost, or the binding disappears because `state.db` was
+deleted, they claim again with the nonce they kept and carry on. A
+client written before principals existed keeps working unchanged: its sessions
+never claim one, and a request naming a session that never claimed one is
+admitted exactly as before (and counted, see below).
+
+The Claude Code plugin's Node coordinator issues no principals. It answers
+`/principal/claim` with `404`, and clients proceed without one; the hook
+clients skip the request altogether when `.coherence/server.pid` names the Node
+backend.
+
+### What is checked, and where
+
+Every route that takes a `session_id` is in one of three classes:
+
+| Class | Routes | A request naming a session that has claimed a principal… |
+|---|---|---|
+| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member` | …must present it. Without it, or with a different one, the answer is `400`. |
+| accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
+| mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
+
+The require class is the routes that take, release or commit a session's
+grants, record who wrote a version, answer the effect fence about a session's
+grant, or record workspace ownership — the things a caller naming the wrong
+session could do to someone else's work. `pre-edit` is among them because a
+grant taken without the principal could then be neither committed nor released.
+The accept-class reads change no grant or version, but they do deliver the
+named session's pending notices, so a read naming the wrong session can consume
+advisories meant for it. The snapshot-session routes are accept-class because
+each is already gated by the server-issued session token.
+
+A refusal is HTTP `400` with an `error` field naming the header and a `reason`
+field: `caller_principal_absent` when a claimed session is named with no
+principal, `caller_principal_foreign` when the principal presented is not the
+one bound to the named session. Branch on `reason`, not on the text. It is never
+a hold, and a refused request changes nothing, so it is safe to send again once
+the client has the right principal.
+
+`GET /status` reports two counters at every tier: `caller_principal_absent_total`,
+the requests this coordinator process admitted without a principal (a nonzero
+value means some client is not sending one yet), and
+`caller_principal_refused_total`, the requests it refused. Both are local
+diagnostics that reset when the coordinator restarts.
+
+### Writing your own HTTP client
+
+1. Generate a mint nonce — 16 to 128 characters from `[A-Za-z0-9_-]`, for
+   example `secrets.token_urlsafe(32)` — and keep it **before** you call. It is
+   what lets you recover your principal if the response is lost.
+2. `POST /principal/claim` with `{"session_id": ..., "mint_nonce": ...}`. The
+   answer is `{"ok": true, "principal": "..."}`. A retry with the same nonce gets
+   the same principal back. If the session is already bound under a different
+   nonce, the answer is `{"ok": false, "reason": "caller_principal_claimed", "detail": ...}`
+   and you do not become that session; a malformed request is `400`.
+3. Send the principal in the `Coherence-Caller-Principal` header on every
+   request that names the session. The principal appears in the claim response
+   and nowhere else: never log it.
+4. If a request is refused with `caller_principal_absent` or
+   `caller_principal_foreign` — for example because `state.db` was deleted and
+   the binding with it — claim again with the **same** nonce, and send the
+   request once more with the principal you get back. Never pick a new nonce:
+   that is what stops a client from taking over a session someone else has
+   claimed.
+
+A subagent shares its parent session's principal.
+
+### Upgrading
+
+Principals live in their own table, added by registry schema version 8. Like
+earlier schema steps it is forward-only: once a workspace's `state.db` has been
+opened by this version, an older release refuses it. Upgrade forward rather than
+rolling back.
+
+## Acquire-or-fail on `pre-edit` (specified, not yet built)
+
+**Nothing in this section is implemented.** It fixes the shape of an opt-in
+refusal so the change that builds it does not have to re-decide it.
+
+Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks. A session already
+holding the grant is set to INVALID — nothing is committed — and finds out on its
+next request. There is no request that declines instead, so a real mutex cannot be
+built on this route: the second session to ask always wins.
+
+**Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
+[caller principal](#caller-principal). An opted-in request without a principal is refused as a
+malformed request (HTTP 400 naming the principal), because a refusal that a
+caller could step around by naming the holder's session is not a refusal.
+
+**Refusal.** HTTP 200 with
+`{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent id>"}` — the
+same reason string `post-edit-cas` already returns when a commit meets a
+session holding the write grant. The holder is named by agent id, never by
+session id. Nothing changes hands: the holder keeps its grant and the caller
+gains none.
+
+**What the refused caller does.** Back off and retry the acquire. The refusal
+carries no retry hint because none exists. Committing does not end a grant: a
+holder that commits keeps the file MODIFIED, and the optimistic lane is no way
+around it — `post-edit-cas` answers `other_holder` against a MODIFIED holder
+too. A grant ends when its holder releases it — `session-stop`, which a Claude
+Code session sends at the end of its turn, or a failed `post-edit` — or when the
+coordinator reclaims it from a silent holder (no heartbeat for
+`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
+with backoff rather than wait for a signal.
+
+**Under load.** A timed-out opted-in request must not answer in a shape that
+admits the edit: the contention that makes a holder worth respecting is the
+contention that times a handler out. It answers `ok: false` with
+`"degraded": true`, and the caller treats that as a refusal. Today a timed-out
+`pre-edit` answers `{"ok": true, "degraded": true}`; a test in the coordinator
+suite fails as soon as a refusal reason is registered while that is still the
+answer.
+
+**What it does not close.**
+
+- A refused agent can still write the file with a shell command. The Bash hook
+  looks for commands that read tracked files, not ones that write them, so a
+  write that goes around the Edit and Write tools is not refused;
+  [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+  reports it afterwards.
+- A new kind of deny on the edit path is shown to the model, and that changes
+  how it retries. The change that builds the refusal needs its own measurement
+  of that before it ships.
+- On the hook surface, any process that can read `.coherence/` can read another
+  session's principal. The refusal separates writers that follow the protocol;
+  it does not stop one that deliberately uses another's principal.
 
 ## `stale-write-guard-fs` MCP server
 

@@ -37,6 +37,7 @@ import hashlib
 import io
 import logging
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -56,9 +57,17 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.policy import matches_any
 from ccs.cli._coherence_client import (
+    PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    PrincipalClaim,
+    PrincipalRecovery,
     RemoteCoordinatorConfig,
+    caller_principal_headers,
+    claim_caller_principal,
+    decide_principal_recovery,
+    principal_refusal_message,
+    principal_refusal_reason,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
@@ -68,9 +77,11 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
+    CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
@@ -79,6 +90,7 @@ from ccs.core.exceptions import (
     CommitUnconfirmed,
     InternalConcurrencyError,
     PublishMaterializationError,
+    RedirectRefused,
     RemoteAuthFailed,
     StaleView,
     ViewWedged,
@@ -108,6 +120,17 @@ class _ReadResult(NamedTuple):
     #: owner_generation)`` pair is unchanged, because a peer's write-claim
     #: acquire preempts a holder while moving NEITHER comparand.
     stale_status: bool
+
+
+class _Sent(NamedTuple):
+    """What one POST from :meth:`CoherentVolume._send` yielded: the 2xx body,
+    or the typed reason of a caller-principal refusal left to the caller's
+    recovery (R20). Both ``None`` after any other failure, which already went
+    through ``on_error`` (degrade mode only — strict raised)."""
+
+    body: dict | None
+    principal_refusal: str | None
+
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
 # :meth:`CoherentVolume.write_cas`. Mirrors ``SyncStrategy.max_cas_retries``
@@ -167,6 +190,81 @@ _PUBLISH_HELD_REASON = (
     "was read, so the batch was NOT published (all-or-nothing — no file was "
     "written). reacquire() and rebuild the publish from the fresh versions."
 )
+
+# What a multi-member atomic_publish raises (CommitUnconfirmed) when the batch
+# commit is not confirmed, or is answered with nothing this client can
+# classify: whether it landed at the coordinator is unknown, and CAS-first
+# means no member touched disk. Built from constants — no coordinator text.
+_PUBLISH_UNCONFIRMED_MESSAGE = (
+    "atomic_publish commit was not confirmed (the coordinator answered that "
+    "its commit is unconfirmed); whether the batch landed at the coordinator "
+    "is unknown, and no file was written. Re-read every member, and retry only "
+    "if the publish is absent."
+)
+_PUBLISH_UNCLASSIFIABLE_MESSAGE = (
+    "atomic_publish commit was answered with no outcome this client can "
+    "classify (not a win, and no reason); whether the batch landed at the "
+    "coordinator is unknown, and no file was written. Re-read every member, "
+    "and retry only if the publish is absent."
+)
+
+
+# What write()'s grant request (pre-edit) had already done when its commit is
+# refused for the caller principal after the bytes reached disk. On a path the
+# coordinator tracks, an admitted EXCLUSIVE acquire invalidates every peer
+# holding a copy (KTD-1), which the refusal of the commit cannot undo; on a
+# path it does not track, the request takes its fast path and does neither.
+# Both answer a bare {"ok": true}, and nothing the volume holds says which
+# (its managed globs do not: an ignored.yaml untracks a managed path, and
+# /policy/untrack can change it at runtime), so the text states both cases.
+# A degraded or lost answer leaves the grant and the peers unknown.
+_GRANT_REQUEST_ADMITTED = (
+    "If the coordinator tracked the path when it admitted this write's grant "
+    "request, that request invalidated every peer it had recorded as holding a "
+    "copy and took a grant this volume has not released; if it did not track "
+    "the path, the request took no grant and invalidated no peer."
+)
+_GRANT_REQUEST_UNCONFIRMED = (
+    "The answer to this write's grant request was not confirmed, so whether it "
+    "invalidated any peer, and whether it took a grant this volume now holds, "
+    "is not known."
+)
+
+
+def _unclassifiable_cas_message(rel: str) -> str:
+    """What an OCC commit reports when its answer is not a win and carries no
+    string reason. The coordinator's own non-win answers always carry one, so
+    this is what a proxy or gateway in front of it could send; nothing says
+    whether the commit landed, so it is the unknown outcome
+    (:class:`~ccs.core.exceptions.CommitUnconfirmed`) — and CAS-first means the
+    bytes never touched disk. Built from constants: no coordinator text."""
+    return (
+        f"OCC commit of {rel} was answered with no outcome this client can "
+        "classify (not a win, and no reason); whether it landed at the "
+        "coordinator is unknown, and the write did not touch disk. Re-read, "
+        "and retry only if it is absent."
+    )
+
+
+def _unrecorded_write_state(rel: str, *, wrote: bool, grant_confirmed: bool) -> str:
+    """What :meth:`CoherentVolume.write` reports, ahead of the refusal's own
+    text, when its commit (post-edit) is refused for the caller principal
+    after its grant request: the state the write left — the file (``wrote``:
+    whether this call put the bytes there, or they were already on disk),
+    the coordinator's record of this write's commit, the peers and the
+    grant, each as far as this client knows it. Built from constants and the
+    path — no coordinator text, so no principal or nonce.
+
+    It says the commit was not recorded, not that no version moved: the
+    grant request registers a path the coordinator has never seen (no
+    version, then 1), and a peer can commit between the grant and the
+    refused commit."""
+    if wrote:
+        disk = f"This write put its bytes on disk at {rel}."
+    else:
+        disk = f"{rel} already held this write's bytes on disk, so this write left the file as it was."
+    grant = _GRANT_REQUEST_ADMITTED if grant_confirmed else _GRANT_REQUEST_UNCONFIRMED
+    return f"{disk} The coordinator did not record this write's commit. {grant}"
 
 
 class CoherentVolume:
@@ -347,6 +445,27 @@ class CoherentVolume:
         # per attempt while the session id is not.
         self._session_id = str(uuid.uuid4())
         self._incarnation = self._new_incarnation()
+        self._new_principal_claim()
+
+    def _new_principal_claim(self) -> None:
+        # The caller principal is bound to the SESSION, so it is obtained once per
+        # session — at attach, and in a forked child for the child's own session —
+        # and never at _remint, which keeps the session (plan KTD14). A long-lived
+        # caller holds the nonce and the principal in memory and never looks a
+        # principal up by the identity it names, so it cannot present another
+        # identity's by accident (KTD5). That is accident-resistance, not
+        # unreadability: the coordinator keeps every principal it issued in
+        # ``.coherence/state.db``, which any process of the same OS user can read.
+        # The nonce lives as long as the session: it is what a later claim
+        # presents to re-obtain the binding after a lost answer or a refused
+        # principal (R20). ``_principal`` is ``None`` until the claim at attach,
+        # and for good against a coordinator that issues none.
+        self._mint_nonce = secrets.token_urlsafe(32)
+        self._principal: str | None = None
+        # The last claim's outcome (the PrincipalClaim vocabulary): "unconfirmed"
+        # is claimed again, same nonce, before the next request; "refused" (the
+        # session is bound under another nonce) is never claimed again.
+        self._claim_outcome: str | None = None
 
     @staticmethod
     def _new_incarnation() -> str:
@@ -367,6 +486,10 @@ class CoherentVolume:
         with self._lock:
             self._session_id = str(uuid.uuid4())
             self._incarnation = self._new_incarnation()
+            # The parent's principal is bound to the parent's session: discard
+            # it (and its nonce); the child claims for its own session when it
+            # re-attaches.
+            self._new_principal_claim()
             self._grant_incarnations.clear()
             self._endpoint = None
             self._needs_reattach = True
@@ -495,6 +618,7 @@ class CoherentVolume:
             self._endpoint = None
             return
         self._endpoint = endpoint
+        self._claim_principal()
 
     # --- spawn-with-strict --------------------------------------------------
 
@@ -562,6 +686,77 @@ class CoherentVolume:
             # would route reads/writes through a non-strict coordinator while
             # is_attached reported True. Mirror the other two degrade branches.
             self._endpoint = None
+            return
+        self._claim_principal()
+
+    def _claim_principal(self) -> None:
+        """Obtain this session's caller principal: once per session, at attach.
+
+        A coordinator that answers 404 issues none (the sibling Node coordinator,
+        or an older Python one) and the volume proceeds without a header, as
+        before. A claim REFUSED because the session is already bound under
+        another nonce routes through ``on_error`` as the typed
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` and is never made
+        again: a retry would present the same nonce and meet the same refusal,
+        and a new nonce would be a second claimant (KTD11). An UNCONFIRMED claim
+        may have bound anyway (R20): it routes through ``on_error`` too — strict
+        raises, degrade warns once — and the SAME nonce is claimed again before
+        this volume's next request (:meth:`_settle_unconfirmed_claim`). Nothing
+        is re-minted."""
+        if self._endpoint is None:
+            return
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        if claim.outcome == "refused":
+            self._refuse_principal(
+                CALLER_PRINCIPAL_CLAIMED_REASON,
+                f"coordinator caller principal not obtained (refused: {claim.detail})",
+            )
+        elif claim.outcome == "unconfirmed":
+            self._fail_closed_or_degrade(
+                f"coordinator caller principal not obtained (unconfirmed: {claim.detail}); "
+                "the same mint nonce is claimed again before the next request"
+            )
+
+    def _adopt_claim(self, claim: PrincipalClaim) -> None:
+        """Record ``claim``'s outcome, and the principal it settles: the bound
+        one, or none when the coordinator issues none."""
+        self._claim_outcome = claim.outcome
+        if claim.outcome == "bound":
+            self._principal = claim.principal
+        elif claim.outcome == "unsupported":
+            self._principal = None
+
+    def _settle_unconfirmed_claim(self) -> None:
+        """Claim again, presenting the SAME nonce, while this session's last
+        claim is unconfirmed — before every request, until an answer settles it.
+
+        A bind that landed while its answer was lost leaves the session bound
+        and this volume without the principal every require-class route now
+        demands; this is the recovery R20 promises, and it adds no binding (the
+        nonce is the first claim's). Still unconfirmed: the request goes out
+        without a principal and reports its own outcome. Refused now: routes
+        through ``on_error`` as at attach."""
+        if self._claim_outcome != "unconfirmed" or self._endpoint is None:
+            return
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        if claim.outcome == "refused":
+            self._refuse_principal(
+                CALLER_PRINCIPAL_CLAIMED_REASON,
+                f"coordinator caller principal not obtained (refused: {claim.detail})",
+            )
+
+    def _refuse_principal(self, reason: str, message: str) -> None:
+        """A CLAIM that did not bind, through ``on_error``: strict raises the
+        typed :class:`~ccs.core.exceptions.CallerPrincipalRefused` carrying
+        ``reason``; degrade warns once and counts, and the volume goes on
+        without a principal — the routes that admit none still serve it, and a
+        request one of them refuses raises from :meth:`_post` in both modes.
+        ``message`` never carries a principal or a nonce."""
+        if self._on_error == "strict":
+            raise CallerPrincipalRefused(reason, message)
+        self._record_degraded(message)
 
     def _write_policy_yaml(self) -> None:
         """Enable strict mode on the managed globs before the coordinator spawns.
@@ -697,8 +892,6 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
-        # SB-23: seed the foreign-edit baseline with what we just observed on disk.
-        self._last_observed_hash[rel] = content_hash
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -730,6 +923,14 @@ class CoherentVolume:
                     and hook_output.get("permissionDecision") == "deny"
                 ):
                     raise StaleView(self._deny_reason(resp))
+        # SB-23: seed the foreign-edit baseline with what we observed on disk —
+        # only HERE, where the bytes reach the caller. Every raise above leaves
+        # the caller without them: a request refused for its caller principal
+        # (raised out of _post in both on_error modes), a strict-mode transport
+        # or watchdog failure, a StaleView. A baseline advanced on any of those
+        # would absolve an out-of-band edit the caller never saw, and its next
+        # write() would clobber it instead of being denied.
+        self._last_observed_hash[rel] = content_hash
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
@@ -797,12 +998,23 @@ class CoherentVolume:
         # incarnation may still hold a grant from an earlier write() on another path.
         recorded_before = self._incarnation in self._grant_incarnations
         self._grant_incarnations.add(self._incarnation)
-        # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
-        resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+        # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID. A
+        # principal refusal proves no grant was taken too — the coordinator
+        # refuses before any mutation — so it withdraws the record like a deny.
+        try:
+            resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+        except CallerPrincipalRefused:
+            if not recorded_before:
+                self._grant_incarnations.discard(self._incarnation)
+            raise
         if isinstance(resp, dict) and resp.get("ok") is False and not recorded_before:
             self._grant_incarnations.discard(self._incarnation)
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
+        # Past the deny check, a dict answer that is not watchdog-degraded is
+        # an admitted acquire; a degraded or lost one (degrade mode only) may
+        # or may not have taken the grant.
+        grant_confirmed = isinstance(resp, dict) and not resp.get("degraded")
 
         # EXCLUSIVE grant is now held. ANY failure before the post-edit commit
         # must release it via the coordinator's tool-failure path (success:false),
@@ -849,18 +1061,46 @@ class CoherentVolume:
                         "path": rel,
                         "success": False,
                     },
+                    extra_headers=caller_principal_headers(self._principal),
                 )
             raise
 
-        post_resp = self._post(
-            "/hooks/post-edit",
-            {
-                "session_id": self._session_id,
-                "path": rel,
-                "success": True,
-                "content_hash": new_hash,
-            },
-        )
+        redirect_status: int | None = None
+        try:
+            post_resp = self._post(
+                "/hooks/post-edit",
+                {
+                    "session_id": self._session_id,
+                    "path": rel,
+                    "success": True,
+                    "content_hash": new_hash,
+                },
+            )
+        except RedirectRefused as redirect:
+            # A redirected commit is a failed commit like any other status
+            # outside 2xx — refused, never followed — so, the bytes being on
+            # disk, it takes on_error's path below, as a 5xx or a lost answer
+            # does, by its status alone, and not the typed refusal of a request
+            # that changed nothing.
+            post_resp, redirect_status = None, redirect.status
+        except CallerPrincipalRefused as refusal:
+            # Refused AFTER the grant request: the refusal itself changed
+            # nothing at the coordinator, but this write() had already put its
+            # bytes on disk (unless they were there) and — on a tracked path —
+            # invalidated the peers through its admitted grant request, so the
+            # error says so rather than reading like a request that had no
+            # effect. The grant stays recorded (nothing released it for this
+            # incarnation); the observed baseline already names the bytes on
+            # disk, which are this instance's own.
+            state = _unrecorded_write_state(
+                rel, wrote=not already_on_disk, grant_confirmed=grant_confirmed
+            )
+            raise CallerPrincipalRefused(refusal.reason, f"{state} {refusal}") from None
+        if redirect_status is not None:
+            self._fail_closed_or_degrade(
+                f"coordinator request to /hooks/post-edit failed: HTTP {redirect_status}, "
+                "a redirect, which this client never follows"
+            )
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);
@@ -946,9 +1186,9 @@ class CoherentVolume:
             # last read/wrote a path), not identity-scoped — a re-mint changes the
             # coordinator identity but not the disk. Clearing them would blind the
             # foreign-edit guard on every OTHER path after a write_cas conflict
-            # remint (the CAS path is re-seeded by the loop's next _read_with_version
-            # anyway). _after_fork still clears them — a forked child is a new
-            # process that must re-establish its own view.
+            # remint (the CAS path is re-seeded once the loop's next clean read
+            # reaches make_content anyway). _after_fork still clears them — a
+            # forked child is a new process that must re-establish its own view.
         # The release runs OUTSIDE self._lock. That lock is a plain (non-
         # reentrant) threading.Lock guarding identity mutation, and a failed
         # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
@@ -1123,7 +1363,7 @@ class CoherentVolume:
             # fresh-SHARED branch, which returns the version WITHOUT a hash
             # check — see _remint() / KTD-LU.)
             current_bytes, expected_version, stale_denied, _gen, _stale = (
-                self._read_with_version(rel)
+                self._read_with_version(rel, seed_baseline=False)
             )
             if stale_denied:
                 # Cannot CAS from this view: INVALID, or the disk lags a just-
@@ -1161,6 +1401,11 @@ class CoherentVolume:
                 continue
             denied_streak = 0
 
+            # SB-23: a clean read's bytes reach the caller HERE, through
+            # make_content, so they become the foreign-edit baseline — and only
+            # here: a denied read (above) was never handed to it, and seeding
+            # from one would absolve the out-of-band edit that got it denied.
+            self._last_observed_hash[rel] = self._sha256_bytes(current_bytes)
             data = bytes(make_content(current_bytes))
             new_hash = self._sha256_bytes(data)
 
@@ -1235,9 +1480,12 @@ class CoherentVolume:
             #    only if absent — the false-negative-ack window);
             #  - a permission-style deny → StaleView (recoverable by reacquire);
             #  - anything else (corruption: commit_cas_corruption / expected>current)
-            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            #    → plain CoherenceError → the mapper fails it closed as internal_error;
+            #  - no string reason at all → the outcome is unknown → CommitUnconfirmed.
             if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
                 raise CommitUnconfirmed(self._deny_reason(resp))
+            if not isinstance(resp.get("reason"), str):
+                raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
             hook_output = resp.get("hookSpecificOutput")
             if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
                 raise StaleView(self._deny_reason(resp))
@@ -1287,8 +1535,13 @@ class CoherentVolume:
         # a VALIDATED (bytes, version) comparand under a fresh identity (do NOT
         # re-create the split-comparand hole — KTD-LU).
         self._remint()
+        # The comparand read's bytes reach no one — the caller supplies the
+        # content, merged against the version IT read — so they never seed the
+        # foreign-edit baseline: seeded, a denied or a conflicting CAS would
+        # absolve bytes the caller never saw, and its next write() would
+        # overwrite them. A win records the bytes it wrote.
         _current_bytes, current_version, stale_denied, _gen, _stale = (
-            self._read_with_version(rel)
+            self._read_with_version(rel, seed_baseline=False)
         )
         if stale_denied:
             # The comparand view is INVALID / the disk lags a just-landed commit;
@@ -1335,9 +1588,12 @@ class CoherentVolume:
                 self._cas_current_version(resp, current_version),
                 reason=resp.get("reason"),
             )
-        # outcome == "raise": corruption or the commit_unconfirmed degrade body.
+        # outcome == "raise": corruption or the commit_unconfirmed degrade body,
+        # or an answer with no string reason, whose outcome is unknown.
         if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
             raise CommitUnconfirmed(self._deny_reason(resp))
+        if not isinstance(resp.get("reason"), str):
+            raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
         raise CoherenceError(self._deny_reason(resp))
 
     def atomic_publish(
@@ -1365,6 +1621,11 @@ class CoherentVolume:
           - a peer commits a member in the capture→commit window →
             :class:`~ccs.core.exceptions.StaleView` (HELD; recover via
             :meth:`reacquire` + re-decide + retry); NOTHING committed, NO file written.
+          - the commit is answered as unconfirmed, or with no outcome this
+            client can classify →
+            :class:`~ccs.core.exceptions.CommitUnconfirmed` in both ``on_error``
+            modes; whether the batch committed is unknown, NO file written —
+            re-read, and retry only if the publish is absent.
 
         **Atomicity boundary (read this).** The all-or-nothing guarantee is at the
         COORDINATOR commit: either every member's version advances as one unit or
@@ -1389,7 +1650,7 @@ class CoherentVolume:
         never re-reads disk between the caller's read and materialization, the
         batch commits, and the foreign bytes are silently overwritten. The
         SB-23 content-CAS (``on_stale_write``) does NOT run on this path —
-        :meth:`_read_with_version` seeds the foreign-edit baseline, but no
+        the caller's own read seeds the foreign-edit baseline, but no
         publish step consults it. This is a deliberate, regression-pinned
         boundary (see test_atomic_publish.py's foreign-edit-boundary section),
         not a gap in the version check. Contrast: plain :meth:`write` denies
@@ -1462,7 +1723,10 @@ class CoherentVolume:
         ``CasVersionConflict``, nothing committed), then ``/session/commit_all``
         atomically. On a confirmed WIN write EVERY file (no same-bytes skip, so
         disk can't diverge from the coordinator's recorded hash); on a HELD
-        conflict (a peer raced the window) write NONE and raise ``StaleView``.
+        conflict (a peer raced the window) write NONE and raise ``StaleView``;
+        on an answer that does not confirm the commit — unconfirmed, or with
+        no reason this client can classify — write NONE and raise
+        ``CommitUnconfirmed`` in both ``on_error`` modes.
         """
         self._ensure_attached()
         if self._endpoint is None:
@@ -1528,19 +1792,31 @@ class CoherentVolume:
                 "atomic_publish commit could not be confirmed (coordinator transport "
                 "failed mid-commit); nothing landed. re-read and retry."
             )
+        # An unconfirmed commit — the watchdog's degrade envelope, or a non-win
+        # carrying its reason — raises in BOTH on_error modes, as on the
+        # single-commit paths: degrade mode must not soften it into the HELD
+        # conflict below, which would say nothing was published of a batch
+        # that may have landed.
         if commit.get("degraded"):
-            self._fail_closed_or_degrade(
-                "coordinator watchdog timeout committing the publish"
-            )
+            raise CommitUnconfirmed(_PUBLISH_UNCONFIRMED_MESSAGE)
         if commit.get("ok") is True:
             return self._materialize_publish(entries, commit.get("versions") or {})
+        reason = commit.get("reason")
+        if reason == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(_PUBLISH_UNCONFIRMED_MESSAGE)
+        # Non-WIN with no string reason: the coordinator's own non-win answers
+        # always carry one, so this is what a proxy or gateway could send, and
+        # it says nothing about whether the batch landed — the unknown, as on
+        # the single-commit paths; never the HELD conflict (a definite "nothing
+        # committed"), and never a TypeError from the substring test below.
+        if not isinstance(reason, str):
+            raise CommitUnconfirmed(_PUBLISH_UNCLASSIFIABLE_MESSAGE)
         # Non-WIN. A retry-eligible batch conflict (peer raced the window) is a
         # StaleView; a NON-retryable corruption reason must not masquerade as one
         # (mirror the size-1 CAS path, which raises CoherenceError on corruption).
         # Corruption is unreachable via the pinned cut (which guarantees
         # expected <= current), so this is defense-in-depth against a future
         # comparand source, not a currently-reachable branch.
-        reason = commit.get("reason") or ""
         if "corruption" in reason:
             raise CoherenceError(
                 f"atomic_publish rejected (non-retryable): {reason}"
@@ -1783,29 +2059,96 @@ class CoherentVolume:
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
         body that already names one — the release of an abandoned incarnation —
-        keeps its own."""
+        keeps its own. Every request presents the session's caller principal
+        (header), which a require-class route checks the session against; an
+        incarnation is a subagent component, so it shares the session's.
+
+        A request refused for its principal (a typed ``caller_principal_*``
+        reason) is recovered as R20 describes: the SAME nonce claims again, and
+        a principal that differs from the one presented is adopted and the
+        request retried exactly ONCE — safe, because a refused request mutated
+        nothing. A 404 on that claim retries once without the header. A refusal
+        the claim cannot cure raises the typed
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` in BOTH ``on_error``
+        modes: it is the coordinator's definite answer, not an infrastructure
+        failure, so degrade mode does not soften it into a ``None`` that the
+        caller would read as an unanswered request (a degraded read, a
+        ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
         payload = {"agent_id": self._incarnation, **payload}
-        try:
-            return _coordinator_post(self._endpoint, endpoint_path, payload)
-        except urllib.error.HTTPError as exc:
-            # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
-            # with a distinct type, never the generic degrade path (which a
-            # degrade-mode local client could swallow).
-            if self._remote_endpoint is not None and exc.code == 401:
-                raise RemoteAuthFailed(
-                    "remote coordinator rejected the bearer token (401); the remote "
-                    "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
-                    "hook.secret"
-                ) from exc
-            self._fail_closed_or_degrade(
-                f"coordinator request to {endpoint_path} failed: {exc}"
+        self._settle_unconfirmed_claim()
+        sent = self._send(endpoint_path, payload)
+        if sent.principal_refusal is None:
+            return sent.body
+        reason = sent.principal_refusal
+        recovery = self._recover_principal()
+        detail = recovery.detail
+        if recovery.action == "retry":
+            sent = self._send(endpoint_path, payload)
+            if sent.principal_refusal is None:
+                return sent.body
+            reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
+        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, detail))
+
+    def _recover_principal(self) -> PrincipalRecovery:
+        """Claim again with the session's SAME nonce after a principal refusal
+        and adopt what that settles (:func:`decide_principal_recovery` says
+        whether to retry). Nothing is claimed once the session is known to be
+        bound under another nonce: that never changes, so a permanently refused
+        session costs no round trip per request."""
+        if self._claim_outcome == "refused" or self._endpoint is None:
+            return PrincipalRecovery(
+                "stop", None,
+                detail=(
+                    "the session is bound under a different mint nonce "
+                    f"({CALLER_PRINCIPAL_CLAIMED_REASON}); not claiming again"
+                ),
             )
-            return None  # reached only in degrade mode
+        presented = self._principal
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        self._adopt_claim(claim)
+        return decide_principal_recovery(claim, presented)
+
+    def _send(self, endpoint_path: str, payload: dict) -> _Sent:
+        """One POST presenting the current principal. A caller-principal
+        refusal is returned for :meth:`_post` to recover; every other failure
+        routes through ``on_error`` here.
+
+        Every raise for a rejected request happens OUTSIDE the ``except``
+        block, so the ``HTTPError`` never rides the raised error's chain: its
+        text is the status line's reason phrase, which is the coordinator's,
+        and a traceback or ``logger.exception`` would print it. What this
+        client reports of a rejected request is its status code."""
+        try:
+            body = _coordinator_post(
+                self._endpoint,
+                endpoint_path,
+                payload,
+                extra_headers=caller_principal_headers(self._principal),
+            )
+        except urllib.error.HTTPError as exc:
+            status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
             self._fail_closed_or_degrade(
                 f"coordinator request to {endpoint_path} failed: {exc}"
             )
-            return None  # reached only in degrade mode
+            return _Sent(None, None)  # reached only in degrade mode
+        else:
+            return _Sent(body, None)
+        # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
+        # with a distinct type, never the generic degrade path (which a
+        # degrade-mode local client could swallow).
+        if self._remote_endpoint is not None and status == 401:
+            raise RemoteAuthFailed(
+                "remote coordinator rejected the bearer token (401); the remote "
+                "secret (CCS_REMOTE_SECRET_FILE) does not match the coordinator's "
+                "hook.secret"
+            )
+        if reason is not None:
+            return _Sent(None, reason)
+        self._fail_closed_or_degrade(
+            f"coordinator request to {endpoint_path} failed: HTTP {status}"
+        )
+        return _Sent(None, None)  # reached only in degrade mode
 
     def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:
         """Read current bytes + the coordinator's authoritative version.
@@ -1877,13 +2220,24 @@ class CoherentVolume:
             self._last_read_stale = stale_status
             return data, version, generation
 
-    def _read_with_version(self, rel: str, *, observe: bool = True) -> _ReadResult:
+    def _read_with_version(
+        self, rel: str, *, observe: bool = True, seed_baseline: bool = True
+    ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation, stale_status)``
         (a :class:`_ReadResult`); ``stale_status`` is True when the coordinator
         classified this read as stale (a warn re-grant or a deny), the
         standing-grant signal the effect fence keys the ``grant_preempted``
         HOLD on.
+
+        ``seed_baseline=False`` is for a CAS comparand read, whose bytes are
+        not handed to the caller as such: :meth:`write_cas` seeds the
+        foreign-edit baseline itself, only once a clean read's bytes reach
+        ``make_content``, and :meth:`write_cas_at` never does (its caller
+        supplies the content). The one exception is a path this instance has
+        never observed: there the comparand read records the first baseline,
+        and it never replaces one. It changes nothing on the wire, unlike
+        ``observe=False``.
 
         Mirrors :meth:`read` (same pre-read call + same fail-closed degrade
         handling) but also surfaces the coordinator's authoritative ``version``
@@ -1910,15 +2264,15 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
-        # ONLY when the caller actually OBSERVES these bytes. A verification
-        # read (``observe=False``, used by the effect fence) reads the file to
-        # compare comparands and then DISCARDS the bytes; advancing the
-        # baseline there would silently absolve a foreign edit the caller never
-        # saw, so the next write would clobber it instead of denying. A
-        # fail-closed check must not have a fail-open side effect.
-        if observe:
-            self._last_observed_hash[_rel] = content_hash
+        if observe and not seed_baseline:
+            # A CAS comparand read never MOVES a baseline the caller already
+            # has (see the seeding note below). On a path this instance has
+            # never observed there is none to move: this read is its first
+            # observation and records one, before the request, as a refused
+            # first read() does. Without it a CAS that fails, followed by an
+            # out-of-band edit, leaves write() nothing to compare against, and
+            # write() overwrites the edit.
+            self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
         stale_status = False
@@ -1968,6 +2322,19 @@ class CoherentVolume:
                 # Any stale-status response — warn re-grant or deny alike —
                 # means this instance's prior grant did not stand at this read.
                 stale_status = resp.get("status") == "stale"
+        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
+        # ONLY when the caller actually OBSERVES these bytes: here, where they
+        # are returned to it (a raise above — a request refused for its caller
+        # principal, a strict-mode transport or watchdog failure — leaves the
+        # caller without them). A verification read (``observe=False``, used
+        # by the effect fence) reads the file to compare comparands and then
+        # DISCARDS the bytes, and a CAS comparand read (``seed_baseline=False``)
+        # hands them on only if it is clean, and then itself. Advancing the
+        # baseline in any of these cases would silently absolve a foreign edit
+        # the caller never saw, so the next write would clobber it instead of
+        # denying. A fail-closed check must not have a fail-open side effect.
+        if observe and seed_baseline:
+            self._last_observed_hash[_rel] = content_hash
         return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
 
     @staticmethod
@@ -2074,7 +2441,10 @@ class CoherentVolume:
         if resp.get("ok") is True:
             return "win"
         reason = resp.get("reason")
-        if reason in self._CAS_RETRY_REASONS:
+        # Only a string can be a member: a list or an object here (never the
+        # coordinator's own answer) is not retry-eligible, not a TypeError
+        # from the frozenset membership test.
+        if isinstance(reason, str) and reason in self._CAS_RETRY_REASONS:
             return "conflict"
         return "raise"
 

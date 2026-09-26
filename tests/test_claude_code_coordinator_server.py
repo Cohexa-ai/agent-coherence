@@ -30,6 +30,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     CoordinatorHTTPServer,
     TrackedReadDecision,
     _is_recent_self_commit_lag,
+    caller_principal_identity,
     decide_tracked_read,
     session_to_agent_id,
 )
@@ -56,6 +57,12 @@ def _hash(label: str) -> str:
 # ----------------------------------------------------------------------
 
 
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"
+"""The caller-principal request header: a FROZEN duplicate of the wire name,
+never imported from the code under test (a derived name moves with a rename
+instead of catching it)."""
+
+
 class _Client:
     """Tiny urllib-based client. Returns (status, body_dict)."""
 
@@ -74,12 +81,15 @@ class _Client:
         body: Optional[dict] = None,
         *,
         headers_override: Optional[dict] = None,
+        principal: Optional[str] = None,
     ) -> tuple[int, dict]:
         url = self.base + path
         data = json.dumps(body).encode("utf-8") if body is not None else b""
         headers = dict(self.headers)
         if headers_override:
             headers.update(headers_override)
+        if principal is not None:
+            headers[_PRINCIPAL_HEADER] = principal
         req = urlrequest.Request(url, data=data if method == "POST" else None,
                                  method=method, headers=headers)
         try:
@@ -3326,7 +3336,7 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     result.get('ok') don't see None. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3348,7 +3358,7 @@ def test_ac05_post_edit_degraded_response_returns_ok_shape(
     include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3373,7 +3383,7 @@ def test_ac05_session_stop_degraded_response_returns_ok_shape(
     must include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3393,7 +3403,7 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     don't see ok=None. AC-05 contract preservation."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3417,7 +3427,7 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
     timeout cannot masquerade as a confirmed fresh read."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3448,6 +3458,16 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
 
 # The held lock, not this value, is what makes the request time out; it only
 # needs to be short enough to keep the tests fast.
+#
+# Every session below CLAIMS and presents its caller principal. pre-edit is
+# require-class, and its gate runs BEFORE the work body: a presented principal
+# resolves from the service's in-process cache on the handler thread, but an
+# absent one on a never-claimed session is first looked up in the durable store
+# under the very registry lock these tests hold. That lookup is bounded by the
+# same watchdog deadline, so it would time out in the GATE and answer degraded
+# before the work body ever ran -- and these tests measure the work body. The
+# gate's own timeout is pinned in the caller-principal section below ("the gate
+# under registry contention").
 _DEGRADE_DEADLINE_SEC = 0.25
 _ABANDONED_BODY_SETTLE_SEC = 5.0
 
@@ -3530,6 +3550,8 @@ def test_pre_edit_watchdog_timeout_answers_the_named_degraded_disposition(
     ``run_with_watchdog`` wholesale."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
+    sid = _sid("u8-timed-out")
+    principal = _explicit_claim(client, sid)
     monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
     timeouts_before = coordinator._watchdog_timeouts_total
     aborts_before = coordinator._watchdog_late_aborts_total
@@ -3537,7 +3559,7 @@ def test_pre_edit_watchdog_timeout_answers_the_named_degraded_disposition(
 
     with _HeldRegistryLock(coordinator) as held:
         status, body = client.post(
-            "/hooks/pre-edit", {"session_id": _sid("u8-timed-out"), "path": "plan.md"})
+            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}, principal=principal)
         held.release()
     _await_abandoned_body_settled(
         coordinator, aborts_before=aborts_before, completions_before=completions_before)
@@ -3568,7 +3590,10 @@ def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
 
     path = "plan.md"
     holder, caller = _sid("u8-holder"), _sid("u8-late-caller")
-    status, _ = client.post("/hooks/pre-edit", {"session_id": holder, "path": path})
+    holder_principal = _explicit_claim(client, holder)
+    caller_principal = _explicit_claim(client, caller)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": holder, "path": path}, principal=holder_principal)
     assert status == 200
     assert _agent_state_on(coordinator, path, holder) == MESIState.EXCLUSIVE
     assert _agent_state_on(coordinator, path, caller) is None
@@ -3578,7 +3603,8 @@ def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
     aborts_before = coordinator._watchdog_late_aborts_total
     completions_before = coordinator._watchdog_late_completion_total
     with _HeldRegistryLock(coordinator) as held:
-        status, body = client.post("/hooks/pre-edit", {"session_id": caller, "path": path})
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": caller, "path": path}, principal=caller_principal)
         held.release()
     _await_abandoned_body_settled(
         coordinator, aborts_before=aborts_before, completions_before=completions_before)
@@ -3593,7 +3619,8 @@ def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
     assert coordinator._watchdog_late_completion_total == completions_before
 
     monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", undegraded_deadline)
-    status, body = client.post("/hooks/pre-edit", {"session_id": caller, "path": path})
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": caller, "path": path}, principal=caller_principal)
     assert status == 200 and "degraded" not in body, body
     assert _agent_state_on(coordinator, path, caller) == MESIState.EXCLUSIVE
     assert _agent_state_on(coordinator, path, holder) == MESIState.INVALID
@@ -7127,6 +7154,12 @@ def test_the_fence_call_mutates_nothing(
     )
     version, generation = _u4_captured(server, artifact_id)
     _u4_seed_every_dimension(server, client, agent_id, artifact_id, sid, _U3A_WARN_PATH)
+    # A credentialed fence call (the route is require-class): claimed BEFORE the
+    # snapshot, so neither the claim nor an uncredentialed-request count is
+    # charged to the call under test — the guard stays over every other counter.
+    status, minted = client.post(
+        "/principal/claim", {"session_id": sid, "mint_nonce": uuid.uuid4().hex})
+    assert status == 200 and minted["ok"] is True, minted
 
     before = _u4_observable(server, agent_id, artifact_id, sid)
     # Controls for the seeding: a guard whose dimensions are all at their
@@ -7144,7 +7177,7 @@ def test_the_fence_call_mutates_nothing(
     status, body = client.post(_U4_ROUTE, _u4_body(
         sid, _U3A_WARN_PATH, version=version + sent_version_delta,
         generation=generation, content_hash=_hash("canonical"),
-    ))
+    ), principal=minted["principal"])
 
     assert status == 200
     assert body["verdict"] == expect, f"the {arm} arm did not take its branch"
@@ -7842,3 +7875,1560 @@ def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
         "Re-acquire before writing to docs/plan.md."
     )
     assert "was updated by" not in text
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that takes a ``session_id`` is classified by the harm an ABSENT
+# principal admits there (KTD3): require-class routes refuse a request naming
+# a BOUND session without the principal ``POST /principal/claim`` bound to it
+# (a session nobody ever claimed — an older client's — is admitted and
+# counted, as before the principal existed: R16); accept-class routes admit an
+# absent principal and count it; every class refuses a foreign one; the mint
+# itself is neither. The
+# guarantee is accident-resistance and attributability under the same-OS-user
+# cooperative trust model — a caller that presents no principal, or one bound
+# to a different session, cannot end another writer's grant or have a write
+# recorded under another writer's name by mistake. It is not a boundary
+# against a process that can read ``.coherence/``: on the hook surface a
+# principal is stored there, so any process that can read it can present it.
+#
+# These tests drive the coordinator routes directly. A test that "forges" a
+# peer's identity deliberately does NOT present that peer's principal; that
+# abstention is the whole content of what the route can check.
+
+#: FROZEN duplicates of the wire refusals. Byte-stable on purpose: the two
+#: cases must stay distinguishable. A client classifies a refusal by the typed
+#: ``reason`` key, by equality — never by a substring of ``error``, which stays
+#: the prose every non-200 body carries.
+_PRINCIPAL_ABSENT_ERROR = (
+    "missing Coherence-Caller-Principal header: this route requires the caller "
+    "principal that POST /principal/claim bound to the session_id it names "
+    "(caller_principal_absent)"
+)
+_PRINCIPAL_FOREIGN_ERROR = (
+    "the Coherence-Caller-Principal header is not the caller principal bound to "
+    "the session_id this request names (caller_principal_foreign)"
+)
+_PRINCIPAL_ABSENT_REFUSAL = {
+    "error": _PRINCIPAL_ABSENT_ERROR, "reason": "caller_principal_absent",
+}
+_PRINCIPAL_FOREIGN_REFUSAL = {
+    "error": _PRINCIPAL_FOREIGN_ERROR, "reason": "caller_principal_foreign",
+}
+_PRINCIPAL_REFUSALS = (_PRINCIPAL_ABSENT_REFUSAL, _PRINCIPAL_FOREIGN_REFUSAL)
+
+
+def _principal_refused(response: tuple[int, dict]) -> bool:
+    """Whether ``response`` is a principal refusal, in EITHER body shape — so
+    an "admitted" assertion cannot pass merely because a refusal came back in
+    a shape this module no longer spells out."""
+    status, body = response
+    return status == 400 and (
+        body.get("error") in (_PRINCIPAL_ABSENT_ERROR, _PRINCIPAL_FOREIGN_ERROR)
+        or body.get("reason") in ("caller_principal_absent", "caller_principal_foreign")
+    )
+
+#: FROZEN duplicate of the posture table (route -> class). Never derived from
+#: ``_CALLER_PRINCIPAL_POSTURE``: a derived expectation moves with the edit that
+#: breaks it. Nineteen routes: the eighteen the plan enumerates plus the mint.
+#: ``pre-edit`` is require-class: a bound session's caller without its
+#: principal could take an EXCLUSIVE grant it can neither commit nor release.
+_EXPECTED_ROUTE_POSTURE: dict[tuple[str, str], str] = {
+    ("POST", "/hooks/pre-read"): "accept",
+    ("POST", "/hooks/effect-fence"): "require",
+    ("POST", "/hooks/pre-edit"): "require",
+    ("POST", "/hooks/post-edit"): "require",
+    ("POST", "/hooks/post-edit-cas"): "require",
+    ("POST", "/hooks/session-stop"): "require",
+    ("POST", "/hooks/session-start"): "accept",
+    ("POST", "/hooks/pre-bash"): "accept",
+    ("POST", "/hooks/pre-grep"): "accept",
+    ("POST", "/session/begin"): "accept",
+    ("POST", "/session/read"): "accept",
+    ("POST", "/session/commit"): "accept",
+    ("POST", "/session/commit_all"): "accept",
+    ("POST", "/session/heartbeat"): "accept",
+    ("POST", "/workspace/checkpoint"): "require",
+    ("POST", "/workspace/restore/status"): "require",
+    ("POST", "/workspace/restore/member"): "require",
+    ("POST", "/workspace/restore/register"): "require",
+    ("POST", "/principal/claim"): "mint",
+}
+_EXPECTED_POSTURE_ROUTE_COUNT = 19
+
+_NEVER_MINTED_TOKEN = "A" * 43  # in session-token shape, never issued
+
+
+def _posture_body(route: tuple[str, str], sid: str) -> dict:
+    """A request body that passes every shape check on ``route`` for ``sid``,
+    so the request reaches the principal gate. Ordinary answers past the gate
+    (an untracked path, an unknown checkpoint, a never-minted token) are all
+    fine: the tests below only ask whether the GATE refused."""
+    _, path = route
+    h = _hash(f"posture:{path}")
+    member = {
+        "member_path": "posture.md", "native_token": "v1", "fingerprint": h,
+        "captured_at": 1.0, "absent": False, "dirty_during_window": False,
+        "arbitration_tier": "no-arbiter", "restore_tier": "forward_only",
+    }
+    bodies: dict[str, dict] = {
+        "/hooks/pre-read": {"path": "posture.md"},
+        "/hooks/effect-fence": {
+            "path": "posture.md", "expected_version": 1,
+            "expected_generation": 0, "content_hash": h,
+        },
+        "/hooks/pre-edit": {"path": "posture.md"},
+        "/hooks/post-edit": {"path": "posture.md", "success": False},
+        "/hooks/post-edit-cas": {
+            "path": "posture.md", "content_hash": h, "expected_version": 0,
+        },
+        "/hooks/session-stop": {},
+        "/hooks/session-start": {},
+        "/hooks/pre-bash": {"command": "cat posture.md"},
+        "/hooks/pre-grep": {"search_root": ""},
+        "/session/begin": {"read_set": ["posture.md"]},
+        "/session/read": {"session_token": _NEVER_MINTED_TOKEN, "path": "posture.md"},
+        "/session/commit": {
+            "session_token": _NEVER_MINTED_TOKEN, "path": "posture.md", "content": "x",
+        },
+        "/session/commit_all": {
+            "session_token": _NEVER_MINTED_TOKEN,
+            "writes": [{"path": "posture.md", "content": "x"}],
+        },
+        "/session/heartbeat": {"session_token": _NEVER_MINTED_TOKEN},
+        "/workspace/checkpoint": {
+            "name": "posture", "window_min": 1.0, "window_max": 1.0, "members": [member],
+        },
+        "/workspace/restore/status": {"checkpoint_id": "cp-unknown", "status": "in_progress"},
+        "/workspace/restore/member": {
+            "checkpoint_id": "cp-unknown", "member_path": "posture.md",
+            "restore_outcome": None,
+        },
+        "/workspace/restore/register": {
+            "checkpoint_id": "cp-unknown",
+            "writes": [{"member_path": "posture.md", "fingerprint": h}],
+        },
+        "/principal/claim": {"mint_nonce": uuid.uuid4().hex},
+    }
+    return {"session_id": sid, **bodies[path]}
+
+
+def _explicit_claim(client: _Client, sid: str) -> str:
+    """Claim ``sid`` with a fresh random nonce, outside the auto client."""
+    status, body = client.post(
+        "/principal/claim",
+        {"session_id": sid, "mint_nonce": uuid.uuid4().hex},
+        principal=None,
+    )
+    assert status == 200 and body["ok"] is True, body
+    return body["principal"]
+
+
+def _absent_count(coordinator) -> int | None:
+    """The absent-principal counter: every ADMISSION that presents no
+    principal — any accept-class request, or a require-class request naming an
+    identity nobody claimed (KTD15). ``None`` if it is missing, so a test
+    reports its response assertions before the counter's."""
+    return coordinator.counters_snapshot().get("caller_principal_absent_total")
+
+
+def _refused_count(coordinator) -> int | None:
+    """The principal-refusal counter: every request a route REFUSED as absent
+    or foreign. ``None`` if it is missing, as :func:`_absent_count`."""
+    return coordinator.counters_snapshot().get("caller_principal_refused_total")
+
+
+def _principal_counts(coordinator) -> tuple[int | None, int | None]:
+    return _absent_count(coordinator), _refused_count(coordinator)
+
+
+@pytest.mark.parametrize(
+    "route", sorted(_EXPECTED_ROUTE_POSTURE), ids=lambda r: r[1].strip("/"),
+)
+def test_each_session_id_route_answers_its_posture_class(
+    route: tuple[str, str], coordinator, client: _Client
+) -> None:
+    """Every route in the table, in all five principal states: absent on a
+    BOUND identity, absent on an UNBOUND one, foreign on a bound one, foreign
+    on an UNBOUND one, and matching — each answer checked, and each state's
+    effect on the two counters (admitted-without-a-principal, and refused).
+
+    Prevents a route being left out of enforcement, a require-class route
+    admitting an absent principal for a claimed session (a stray caller
+    ending a claimed peer's grant), a require-class route refusing a session
+    nobody claimed (an older client's writes silently dropped, because the
+    shipped hook client turns every non-2xx into an allow), absent collapsing
+    into foreign (a phase no longer diagnosable), a refusal losing its typed
+    ``reason`` (clients classify by it), an accept-class route either not
+    counting the absent case or treating a foreign principal as absent — the
+    case that separates OPTIONAL from IGNORED — and a principal presented for a
+    session nobody claimed being waved through: nothing is bound there, so no
+    presented value can match, and it is foreign on every class."""
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    _, path = route
+    owner, other = str(uuid.uuid4()), str(uuid.uuid4())
+    owner_principal = _explicit_claim(client, owner)
+    foreign_principal = _explicit_claim(client, other)
+
+    def send(principal: str | None, sid: str = owner) -> tuple[int, dict]:
+        # The mint route needs an unclaimed session per request.
+        sid = str(uuid.uuid4()) if posture == "mint" else sid
+        return client.post(path, _posture_body(route, sid), principal=principal)
+
+    counts = [_principal_counts(coordinator)]
+    answers = {}
+    for state, principal, sid in (
+        ("absent", None, owner),
+        ("foreign", foreign_principal, owner),
+        ("valid", owner_principal, owner),
+        ("unbound", None, str(uuid.uuid4())),
+        ("foreign_unbound", foreign_principal, str(uuid.uuid4())),
+    ):
+        answers[state] = send(principal, sid=sid)
+        counts.append(_principal_counts(coordinator))
+    assert None not in counts[0], f"a principal counter is missing: {counts[0]}"
+    # Per-state movement of (absent counter, refused counter), in send order.
+    moved = {
+        state: (after[0] - prior[0], after[1] - prior[1])
+        for state, prior, after in zip(answers, counts, counts[1:])
+    }
+
+    if posture == "require":
+        assert answers["absent"] == (400, _PRINCIPAL_ABSENT_REFUSAL)
+        assert answers["foreign"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert not _principal_refused(answers["valid"]), answers["valid"]
+        assert not _principal_refused(answers["unbound"]), (
+            "a session nobody claimed is an older client's: admitted, as before",
+            answers["unbound"])
+        assert answers["foreign_unbound"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert moved == {
+            "absent": (0, 1), "foreign": (0, 1), "valid": (0, 0),
+            "unbound": (1, 0), "foreign_unbound": (0, 1),
+        }, "a refusal is counted as refused, the admitted unbound request as absent"
+    elif posture == "accept":
+        assert not _principal_refused(answers["absent"]), answers["absent"]
+        assert answers["foreign"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert not _principal_refused(answers["valid"]), answers["valid"]
+        assert not _principal_refused(answers["unbound"]), answers["unbound"]
+        assert answers["foreign_unbound"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert moved == {
+            "absent": (1, 0), "foreign": (0, 1), "valid": (0, 0),
+            "unbound": (1, 0), "foreign_unbound": (0, 1),
+        }, "only an admitted absent principal is absent; only a refusal is refused"
+    else:
+        assert posture == "mint"
+        for status, body in answers.values():
+            assert status == 200 and body["ok"] is True, body
+        assert set(moved.values()) == {(0, 0)}, "the mint is neither uncredentialed nor refused"
+
+
+def test_an_older_client_that_never_claims_still_commits_and_stops(
+    coordinator, client: _Client
+) -> None:
+    """R16, the version-skew direction this coordinator can observe: a client
+    that predates the principal sends no header and never claims, so the
+    session it names stays UNBOUND — and its require-class pre-edit, commit
+    and stop are admitted exactly as before: the version advances,
+    ``last_writer_id`` is its composite id, its grant is released, and each of
+    the four admissions is counted as uncredentialed. Refusing it would not surface anywhere: the shipped
+    hook client turns every non-2xx into ``{}``, an allow, so the edit would
+    proceed with coherence silently off."""
+    old = str(uuid.uuid4())
+    before = _absent_count(coordinator)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": old, "agent_id": "sub-1", "path": "plan.md"})
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": old, "agent_id": "sub-1", "path": "plan.md",
+        "success": True, "content_hash": _hash("old-client"),
+    })
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(old, "sub-1")
+
+    status, _ = client.post("/hooks/pre-edit", {"session_id": old, "path": "plan.md"})
+    status, body = client.post("/hooks/session-stop", {"session_id": old})
+    assert status == 200 and body["released_artifacts"] == ["plan.md"], body
+    assert _absent_count(coordinator) == before + 4
+
+
+def test_posture_table_classifies_every_session_id_route_with_no_residual() -> None:
+    """R13: one explicit table over every route that reads a ``session_id``,
+    and nothing else — no route falls to a default. A route added to
+    ``_ROUTES`` that reads a session id without a table entry fails here, and
+    so does an entry for a route that no longer exists.
+
+    ``/workspace/restore/status`` and ``/workspace/restore/member`` validate
+    the session id and then never consult it; they are DECIDED require-class
+    rather than dropped (see the table's harm text), and the frozen
+    expectation pins that decision."""
+    import inspect
+
+    from ccs.adapters.claude_code.coordinator_server import (
+        _CALLER_PRINCIPAL_POSTURE,
+        _ROUTES,
+    )
+
+    reads_session_id = {
+        route for route, handler in _ROUTES.items()
+        if 'body.get("session_id")' in inspect.getsource(handler)
+    }
+    assert set(_CALLER_PRINCIPAL_POSTURE) == reads_session_id
+    assert {
+        route: entry.posture.value for route, entry in _CALLER_PRINCIPAL_POSTURE.items()
+    } == _EXPECTED_ROUTE_POSTURE
+    assert len(_CALLER_PRINCIPAL_POSTURE) == _EXPECTED_POSTURE_ROUTE_COUNT
+    for route, entry in _CALLER_PRINCIPAL_POSTURE.items():
+        assert entry.harm.strip(), f"{route} states no harm for its class"
+
+
+# --- the gate under registry contention: bounded by the handler watchdog ------
+#
+# A require-class gate asks whether the named session is BOUND; for a session
+# nobody claimed (an older client's, admitted as before -- KTD15) the first
+# answer lives in the durable store, behind the registry lock. These tests hold
+# that lock the way the pre-edit degraded tests above do (_HeldRegistryLock)
+# and drive the REAL watchdog with a shortened HANDLER_TIMEOUT_SEC.
+
+#: How long a test waits for an answer while the registry lock is held -- eight
+#: times the shortened deadline, so only a request that is NOT bounded by the
+#: watchdog misses it.
+_GATE_ANSWER_BOUND_SEC = 2.0
+#: A value in principal shape that no coordinator minted.
+_NEVER_MINTED_PRINCIPAL = "B" * 43
+
+
+class _Background:
+    """One request sent from a helper thread, so a test can bound its own wait
+    for the answer and still release the lock the request is blocked on."""
+
+    def __init__(self, client: _Client, path: str, body: dict, principal: str | None = None):
+        self._done = threading.Event()
+        self._response: tuple[int, dict] | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._send, args=(client, path, body, principal), daemon=True)
+        self._thread.start()
+
+    def _send(self, client: _Client, path: str, body: dict, principal: str | None) -> None:
+        try:
+            self._response = client.post(path, body, principal=principal)
+        except BaseException as exc:  # re-raised on the test thread by result()
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def answered_within(self, seconds: float) -> bool:
+        return self._done.wait(seconds)
+
+    def result(self) -> tuple[int, dict]:
+        if not self._done.wait(10.0):
+            pytest.fail("the request never answered, even with the registry lock released")
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+def _count_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every durable-store read of a caller-principal binding: one entry
+    per ``registry.get_caller_principal`` call, naming the thread that made it."""
+    reads: list[str] = []
+    real = coordinator.registry.get_caller_principal
+
+    def recording(identity):
+        reads.append(threading.current_thread().name)
+        return real(identity)
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", recording)
+    return reads
+
+
+def test_a_never_claimed_pre_edit_answers_degraded_in_time_while_its_gate_cannot_read(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-edit from a session nobody claimed answers pre-edit's degraded
+    envelope within the handler watchdog while the registry lock is held, and
+    changes nothing.
+
+    Prevents the regression making pre-edit require-class introduced: its gate
+    asked the durable store whether the session was bound on the request
+    thread, under the registry lock and BEFORE the watchdog started, so a
+    client that never claims -- which must keep working (KTD15) -- waited on
+    registry contention with no deadline, past the hook's own budget, where it
+    used to get the degraded answer. The gate cannot decide in time here, and
+    it answers exactly what a timed-out work body answers: not a refusal
+    (nothing was refused) and not an admission (nothing was checked)."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    principal_counts_before = _principal_counts(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+    response = answer.result()
+
+    assert answered, (
+        f"a pre-edit from a never-claimed session got no answer for {waited:.2f}s while "
+        f"the registry lock was held: its caller-principal gate is not bounded by the "
+        f"{_DEGRADE_DEADLINE_SEC}s handler watchdog")
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert _principal_counts(coordinator) == principal_counts_before, (
+        "an undecided gate neither admitted nor refused the request")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran: it seeded the artifact")
+    assert session_to_agent_id(sid) not in dict(coordinator.agent_names_snapshot()), (
+        "the handler registered the session past an undecided gate")
+
+
+def test_the_gate_degraded_table_covers_every_route_whose_gate_reads_the_registry() -> None:
+    """Every route but the mint can reach the store lookup (require-class
+    always, accept-class when a principal is presented), so each needs an
+    answer for a gate that times out. The table has no default: a route missing
+    from it would answer a 500 under exactly the contention the watchdog exists
+    for, so the key set is pinned against the FROZEN posture table here."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_GATE_DEGRADED_RESPONSE
+
+    assert set(_CALLER_GATE_DEGRADED_RESPONSE) == {
+        route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+    }
+
+
+def test_the_gate_store_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, a request whose gate
+    would have to read the store answers the queue-overflow 503 at once, as a
+    work body does (A7), and reads nothing.
+
+    Prevents the gate's lookup becoming a way around the queue-depth gate:
+    queued behind an overloaded pool it would sit until the deadline and answer
+    degraded, where the route answers 503 immediately today."""
+    from unittest.mock import patch
+
+    class _OverflowingQueue:
+        @staticmethod
+        def qsize() -> int:
+            return 100  # well above the limit
+
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingQueue()):
+        response = client.post(
+            "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert reads == [], f"the gate read the store past a full queue: {reads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+_GATED_ROUTES = sorted(
+    route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+)
+
+
+def _degrade_body(route: tuple[str, str], sid: str) -> dict:
+    """:func:`_posture_body`, with a TRACKED path wherever the posture body's
+    untracked one would let the handler answer before its work body runs."""
+    body = _posture_body(route, sid)
+    if body.get("path") == "posture.md":
+        body["path"] = "plan.md"
+    if body.get("command") == "cat posture.md":
+        body["command"] = "cat plan.md"
+    return body
+
+
+@pytest.mark.parametrize("route", _GATED_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
+    route: tuple[str, str], coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every route whose gate can read the registry, a gate that cannot
+    decide within the watchdog answers byte-for-byte what the same route
+    answers when its WORK BODY times out, and counts one watchdog timeout.
+
+    Prevents two things. A route whose gate waits on registry contention with
+    no deadline: the lookup runs for an identity the cache does not know -- a
+    never-claimed session presenting no principal on a require-class route, or
+    presenting one on an accept-class route. And a gate that times out
+    answering something else than the route's own degraded answer (a
+    refusal, an admission, another route's envelope): hook clients and the
+    library branch on that answer's shape. The second half is the control:
+    it times the work body out instead (``run_with_watchdog`` raising, as the
+    AC-05 tests do) for a claimed session the gate decides from the cache."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _, path = route
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    never_claimed = str(uuid.uuid4())
+    presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, path, _degrade_body(route, never_claimed), presented)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    gate_timed_out = answer.result()
+    assert answered, f"{path}: no answer while the registry lock was held"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
+    # pre-grep answers "fresh" before its work body when the store knows no
+    # tracked artifact under the search root.
+    coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
+
+    def work_times_out(fn, abort=None, deadline=None):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", work_times_out)
+    work_timed_out = client.post(path, _degrade_body(route, claimed), principal=principal)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 2, (
+        f"{path}: the control never reached its work body, so it compares nothing")
+    assert gate_timed_out == work_timed_out, (
+        f"{path}: a timed-out gate answered {gate_timed_out!r}, "
+        f"a timed-out work body {work_timed_out!r}")
+
+
+def test_a_never_claimed_session_is_answered_without_touching_the_registry(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the durable store has said a session is unbound, the service keeps
+    that answer: later requests naming the session read no registry at all in
+    the gate, so registry contention neither slows nor degrades an answer the
+    route itself gives without the registry -- here the untracked fast path,
+    registry-free by design (R8).
+
+    Prevents every request of a client that never claims (KTD15) paying a
+    store read in the gate: bounded by the watchdog, that read still turns the
+    fast path's own answer into a degraded one whenever the lock is busy."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    untracked = {"session_id": sid, "path": "notes/untracked.txt"}
+    assert client.post("/hooks/pre-edit", untracked) == (200, {"ok": True})
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-edit", untracked)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    assert answered, "the second request waited on the registry lock"
+    assert answer.result() == (200, {"ok": True}), (
+        "the untracked fast path's own answer, not a degraded one")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+    for body in (untracked, {**untracked, "success": False}):
+        route = "/hooks/pre-edit" if "success" not in body else "/hooks/post-edit"
+        assert client.post(route, body) == (200, {"ok": True})
+    assert reads == [], f"the gate read the store for a session it already knew: {reads}"
+
+
+def test_a_claim_replaces_the_cached_unbound_answer_for_its_session(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cached UNBOUND answer lasts only until the session is claimed: from
+    the first request after the claim, the same request without the principal
+    is refused as absent, and the principal is admitted.
+
+    Prevents the negative cache outliving the bind. The session's own client
+    claims it -- through this coordinator, the only writer of bindings -- and a
+    stale UNBOUND answer would keep admitting absent-principal requests naming
+    it as an older client's, the #188 case the require class exists to refuse,
+    while refusing the claimed client's own principal as foreign. The first
+    half proves the answer really was cached (a second absent request reads no
+    store), so the second half tests the replacement of a real cache entry."""
+    sid = str(uuid.uuid4())
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    for _ in range(2):
+        status, body = client.post("/hooks/session-stop", {"session_id": sid})
+        assert status == 200 and body["ok"] is True, body
+    assert len(reads) == 1, f"the UNBOUND answer was not cached: {len(reads)} store reads"
+
+    principal = _explicit_claim(client, sid)
+    assert client.post("/hooks/session-stop", {"session_id": sid}) == (
+        400, _PRINCIPAL_ABSENT_REFUSAL)
+    status, body = client.post("/hooks/session-stop", {"session_id": sid}, principal=principal)
+    assert status == 200 and body["ok"] is True, body
+
+
+def test_a_refusal_the_store_lookup_decides_is_still_a_400_that_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """After a restart the service's cache is empty, so a request naming a
+    session claimed before it is decided by the store lookup -- which runs in
+    the watchdog pool, off the request thread. A refusal decided there is the
+    same HTTP 400 with its typed reason, never a hold and never degraded; the
+    refused pre-edit seeds nothing, registers nothing and times nothing out;
+    and the session's principal is then admitted.
+
+    Prevents the bounded lookup changing what it decides: a refusal turned
+    into the degraded envelope would ADMIT the edit (pre-edit degrades to
+    ``ok: true``) for the claimed session whose principal is absent -- the
+    #188 case again -- and a lookup made back on the request thread would
+    reopen the unbounded wait."""
+    sid = str(uuid.uuid4())
+    before = _restart_on(tmp_path, "gate-before-restart")
+    try:
+        secret = load_secret(before.coordinator_root)
+        assert secret is not None
+        principal = _explicit_claim(_Client("127.0.0.1", before.port, secret), sid)
+    finally:
+        before.shutdown()
+
+    after = _restart_on(tmp_path, "gate-after-restart")
+    try:
+        secret = load_secret(after.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", after.port, secret)
+        reads: list[str] = []
+        real = after.registry.get_caller_principal
+
+        def recording(identity):
+            reads.append(threading.current_thread().name)
+            return real(identity)
+
+        after.registry.get_caller_principal = recording
+        timeouts_before = after._watchdog_timeouts_total
+        body = {"session_id": sid, "path": "plan.md"}
+
+        assert client.post("/hooks/pre-edit", body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+        assert reads and all(name.startswith("coord-wd") for name in reads), (
+            f"the gate read the store on the request thread: {reads}")
+        assert after._watchdog_timeouts_total == timeouts_before
+        assert after.registry.lookup_artifact_id_by_name("plan.md") is None
+        assert session_to_agent_id(sid) not in dict(after.agent_names_snapshot())
+
+        status, admitted = client.post("/hooks/pre-edit", body, principal=principal)
+        assert (status, admitted) == (200, {"ok": True}), admitted
+    finally:
+        after.shutdown()
+
+
+def test_the_gate_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request whose gate spent part of the watchdog budget reading the
+    store gives its work body only what is left: a work body that then blocks
+    is answered at the ONE deadline, not at the lookup's time plus a fresh one.
+
+    Prevents bounding the gate by turning a request into one that waits up to
+    twice the watchdog -- past the hook's own 5s budget, where the hook client
+    gives up on its own and a work body not yet aborted can still land state
+    the caller was never told about. The store read is made slow by a stand-in
+    that answers "unbound" after a delay WITHOUT the registry lock, so the lock
+    this test holds blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
+def test_the_fast_path_delivery_gets_only_what_the_gate_left_of_the_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The untracked fast path runs work under the watchdog too -- the deferred
+    re-grounding delivery, when the session has compact-pending armed -- and
+    that delivery also gets only what the gate's store lookup left of the ONE
+    deadline.
+
+    Prevents the fast path's call site starting a fresh deadline after the
+    gate, which the test above cannot see: it pins the tracked work body's call
+    site only. The path is reachable by a client that never claims (KTD15): its
+    session-start after a compaction arms compact-pending, and its pre-edit on
+    an untracked path then has the gate read the store and the delivery walk
+    the registry -- with two budgets, up to twice the watchdog, past the hook's
+    own 5s budget. The store read is the same lock-free slow stand-in as
+    above, so the lock this test holds blocks only the delivery."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    sid = str(uuid.uuid4())
+    coordinator.mark_compact_pending(sid)
+    assert coordinator.has_compact_pending(sid)
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"ok": True}), (
+        "the gate admitted the session and the fast path answered its bare body")
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the delivery never timed out, so this measured nothing about its deadline")
+    # One deadline answers at ~1.0s; a fresh one for the delivery at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the fast-path delivery got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
+def test_a_work_body_whose_deadline_has_already_passed_is_never_submitted(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the request's watchdog deadline has passed by the time its work
+    body would start, the body is not submitted at all: the request answers the
+    route's degraded envelope, counts one watchdog timeout, and nothing runs
+    afterwards.
+
+    Prevents ``run_with_watchdog`` submitting the body anyway with a token
+    wait. The caller is told "degraded" at once while the body runs with nobody
+    waiting for it -- for pre-edit it seeds the artifact and can land an
+    EXCLUSIVE grant the agent never learns of, the late completion the A6 abort
+    exists to prevent. The gate's store lookup starts the deadline (a session
+    nobody claimed, which the cache cannot answer), and a registration made
+    slow on the request thread spends the rest of it before the body."""
+    from concurrent.futures import Future
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 0.5
+    real_register = coordinator.register_session
+
+    def register_past_the_deadline(*args, **kwargs):
+        time.sleep(deadline + 0.2)
+        return real_register(*args, **kwargs)
+
+    submitted: list[Future] = []
+    real_submit = coordinator._watchdog.submit
+
+    def recording_submit(fn, *args, **kwargs):
+        future = real_submit(fn, *args, **kwargs)
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(coordinator, "register_session", register_past_the_deadline)
+    monkeypatch.setattr(coordinator._watchdog, "submit", recording_submit)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    response = client.post(
+        "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    _, still_running = futures_wait(submitted, timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert not still_running, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the work submitted "
+        f"to the watchdog pool to finish")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran after its deadline had passed: it seeded plan.md")
+    assert len(submitted) == 1, (
+        f"{len(submitted)} submissions to the watchdog pool: the gate's store lookup, "
+        f"then a work body submitted after its deadline had passed")
+
+
+def test_a_cached_identity_is_admitted_on_the_request_thread_not_in_the_watchdog_pool(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session the service's binding cache knows is decided on the request
+    thread: with every watchdog worker stuck on the registry lock, a claimed
+    session's untracked pre-edit still answers the fast path's own
+    ``{ok: true}`` at once and counts no timeout.
+
+    Prevents the gate taking every lookup through the watchdog pool. The cache
+    would still decide, but only once a worker came free, so while work bodies
+    blocked on registry contention fill the pool, a request the route answers
+    without the registry at all (the untracked fast path, R8) waits out the
+    deadline and degrades. The pool is shown to be full before the request is
+    sent -- every worker started and none free to run a no-op -- because with a
+    free worker the lookup would get through at once and this would measure
+    nothing."""
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    free_worker_grace_sec = 0.2
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    workers = mod._WATCHDOG_POOL_SIZE
+    blockers = [(s, _explicit_claim(client, s)) for s in (str(uuid.uuid4()) for _ in range(workers))]
+    sid = str(uuid.uuid4())
+    principal = _explicit_claim(client, sid)
+
+    with _HeldRegistryLock(coordinator) as held:
+        stuck = [
+            _Background(client, "/hooks/pre-edit", {"session_id": s, "path": "plan.md"}, p)
+            for s, p in blockers
+        ]
+        for request in stuck:
+            assert request.answered_within(_GATE_ANSWER_BOUND_SEC), (
+                f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for a blocker's "
+                f"degraded answer")
+            assert request.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), (
+                "a blocker's work body did not time out on the registry lock")
+        no_op = coordinator._watchdog.submit(lambda: None)
+        ran, _ = futures_wait([no_op], timeout=free_worker_grace_sec)
+        assert not ran and len(coordinator._watchdog._threads) == workers, (
+            "a watchdog worker was still free, so a lookup sent through the pool "
+            "would not have waited: this measures nothing")
+        timeouts_before = coordinator._watchdog_timeouts_total
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"},
+            principal)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for the answer"
+    assert answer.result() == (200, {"ok": True}), (
+        f"after {waited:.2f}s, the fast path's own answer, not a degraded one: the gate "
+        f"queued a cached identity's decision behind the stuck watchdog workers")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+    drained, _ = futures_wait([no_op], timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert drained, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the watchdog pool "
+        f"to drain once the registry lock was released")
+
+
+def _pre_edit_with(client: _Client, sid: str, principal: str, path: str) -> None:
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": path}, principal=principal
+    )
+    assert status == 200 and body.get("ok") is not False, body
+
+
+def test_session_stop_without_a_principal_leaves_a_peers_grant_standing(
+    coordinator, client: _Client
+) -> None:
+    """The #188 reproduction on the route surface: a stop naming a peer's
+    session with no principal does not release the peer's EXCLUSIVE grant.
+    The forger deliberately does not present the peer's principal — on the
+    hook surface a principal is readable from ``.coherence/``, so that
+    abstention is exactly what this check can enforce. Asserts the grant
+    STANDS afterwards, not merely that an error came back; the control shows
+    the same stop with the peer's own principal does release it."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    peer_agent = session_to_agent_id(peer)
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=None
+    )
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=peer_principal
+    )
+    assert status == 200 and body["released_artifacts"] == ["plan.md"]
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] != MESIState.EXCLUSIVE
+
+
+def test_session_stop_naming_a_peer_under_the_callers_own_principal_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """A caller holding a principal of its OWN cannot spend it on a peer's
+    session: the principal is bound to one identity, so naming another is
+    foreign, and the peer's grant stands."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=caller_principal
+    )
+    assert (status, body) == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+    assert (
+        coordinator.registry.get_state_map(artifact_id)[session_to_agent_id(peer)]
+        == MESIState.EXCLUSIVE
+    )
+
+
+def test_post_edit_under_a_forged_identity_records_no_attribution(
+    coordinator, client: _Client
+) -> None:
+    """A commit naming a peer's session without the peer's principal bumps
+    nothing and records no ``last_writer_id`` — neither with no principal nor
+    with the caller's own. The control commits with the peer's principal and
+    records the peer's composite writer id, so the negative assertions are
+    measured against a route that does record attribution."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    before = coordinator.registry.get_artifact(artifact_id).version
+    writer_before = coordinator.registry.last_writer_for(artifact_id)
+    commit = {"session_id": peer, "path": "plan.md", "success": True,
+              "content_hash": _hash("forged")}
+
+    for principal, refusal in ((None, _PRINCIPAL_ABSENT_REFUSAL),
+                               (caller_principal, _PRINCIPAL_FOREIGN_REFUSAL)):
+        status, body = client.post("/hooks/post-edit", commit, principal=principal)
+        assert (status, body) == (400, refusal)
+        assert coordinator.registry.get_artifact(artifact_id).version == before
+        assert coordinator.registry.last_writer_for(artifact_id) == writer_before
+
+    status, body = client.post("/hooks/post-edit", commit, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == before + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(peer)
+
+
+def test_post_edit_attributes_the_composite_writer_through_the_principal(
+    coordinator, client: _Client
+) -> None:
+    """Attribution on post-edit goes through the presented caller: a
+    subagent presents its PARENT session's principal (the principal's unit of
+    identity is the session) and is recorded under the COMPOSITE id (session
+    + caller-asserted subagent); the same subagent commit with no principal
+    records nothing; and a second session's commit records a different
+    writer — so the positive assertion cannot pass on a constant."""
+    sid_a, sid_b = str(uuid.uuid4()), str(uuid.uuid4())
+    principal_a = _explicit_claim(client, sid_a)
+    principal_b = _explicit_claim(client, sid_b)
+    reg = coordinator.registry
+
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md"},
+        principal=principal_a,
+    )
+    assert status == 200
+    sub_commit = {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md",
+                  "success": True, "content_hash": _hash("a2")}
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md")) is None
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=principal_a)
+    assert status == 200 and body["ok"] is True, body
+    _pre_edit_with(client, sid_b, principal_b, "b/plan.md")
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": sid_b, "path": "b/plan.md", "success": True,
+         "content_hash": _hash("b2")},
+        principal=principal_b,
+    )
+    assert status == 200 and body["ok"] is True, body
+
+    writer_a = reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md"))
+    writer_b = reg.last_writer_for(reg.lookup_artifact_id_by_name("b/plan.md"))
+    assert writer_a == session_to_agent_id(sid_a, "sub-1")
+    assert writer_a != session_to_agent_id(sid_a)
+    assert writer_b == session_to_agent_id(sid_b)
+    assert writer_a != writer_b
+
+
+def test_post_edit_cas_under_a_forged_identity_bumps_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The optimistic commit is require-class too: a CAS naming a peer's
+    session with no principal does not advance the version it names."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    status, read = client.post(
+        "/hooks/pre-read",
+        {"session_id": peer, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=peer_principal,
+    )
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+    cas = {"session_id": peer, "path": "plan.md", "success": True,
+           "content_hash": _hash("forged"), "expected_version": version}
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert coordinator.registry.get_artifact(artifact_id).version == version
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+
+
+def test_a_principal_refusal_is_a_client_error_never_a_hold(
+    coordinator, client: _Client
+) -> None:
+    """KTD9: a hold invites a retry, and no retry supplies a principal the
+    caller never had. The effect fence — the route whose protocol answer IS
+    the hold vocabulary — refuses an absent or foreign principal with HTTP
+    400 and no ``verdict``, and neither refusal reason is a hold reason."""
+    from ccs.core.exceptions import (
+        CALLER_PRINCIPAL_ABSENT_REASON,
+        CALLER_PRINCIPAL_FOREIGN_REASON,
+    )
+
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    _explicit_claim(client, sid)
+    foreign = _explicit_claim(client, other)
+    fence = _posture_body(("POST", "/hooks/effect-fence"), sid)
+
+    for principal, reason in ((None, CALLER_PRINCIPAL_ABSENT_REASON),
+                              (foreign, CALLER_PRINCIPAL_FOREIGN_REASON)):
+        status, body = client.post("/hooks/effect-fence", fence, principal=principal)
+        assert status == 400
+        assert "verdict" not in body and set(body) == {"error", "reason"}
+        assert body["reason"] == reason
+    assert CALLER_PRINCIPAL_ABSENT_REASON not in HOLD_REASONS
+    assert CALLER_PRINCIPAL_FOREIGN_REASON not in HOLD_REASONS
+
+
+def _status_tiers(client: _Client) -> dict[str, dict]:
+    """``/status`` at every tier, the operator tier with its opt-in header."""
+    tiers = {}
+    for tier, query, headers in (
+        ("metrics", "/status?detail=metrics", None),
+        ("minimal", "/status", None),
+        ("full", "/status?detail=full", {"Coherence-Local-Operator": "true"}),
+    ):
+        status, body = client.get(query, headers_override=headers)
+        assert status == 200, (tier, body)
+        tiers[tier] = body
+    return tiers
+
+
+def test_the_principal_counters_are_status_counters_at_every_tier(
+    coordinator, client: _Client
+) -> None:
+    """KTD4: two local diagnostics an operator reads on /status, at every tier,
+    beside the other product counters. ``caller_principal_absent_total`` counts
+    every ADMISSION that presents no principal — any accept-class request, or
+    a require-class request naming an identity nobody claimed (KTD15) — and
+    never a refusal. ``caller_principal_refused_total`` counts every REFUSAL,
+    absent or foreign, on any class, and never an admission. Each step below
+    moves exactly the counter it should and pins the other unmoved, so neither
+    counter can quietly absorb the other's events; a request presenting the
+    matching principal moves neither."""
+    def counts() -> set[tuple[int, int]]:
+        return {
+            (body["caller_principal_absent_total"], body["caller_principal_refused_total"])
+            for body in _status_tiers(client).values()
+        }
+
+    assert counts() == {(0, 0)}
+    unbound = str(uuid.uuid4())
+    client.post("/hooks/pre-read", {"session_id": unbound, "path": "x.md"}, principal=None)
+    assert counts() == {(1, 0)}, "an accept-class admission without a principal"
+    client.post("/hooks/session-stop", {"session_id": unbound}, principal=None)
+    assert counts() == {(2, 0)}, "a require-class admission naming an unclaimed session"
+
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    principal = _explicit_claim(client, sid)
+    foreign = _explicit_claim(client, other)
+    assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 400
+    assert counts() == {(2, 1)}, "a require-class refusal of an absent principal"
+    assert client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "x.md"}, principal=foreign)[0] == 400
+    assert counts() == {(2, 2)}, "an accept-class refusal of a foreign principal"
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "x.md"}, principal=principal)
+    assert status == 200
+    assert counts() == {(2, 2)}, "a matching principal moves neither counter"
+
+
+def test_a_principal_refusal_is_logged_at_info_with_its_route_and_reason(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An operator whose session is refused sees why: each refusal leaves one
+    INFO record naming the route and the typed reason — the hook client exits 0
+    and Claude Code shows no stderr, so without it a refused session looks
+    healthy everywhere. The record never carries the principal (R5), the
+    presented one or the bound one; an admission writes no such record, so
+    ordinary traffic does not flood the log."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    h = _hash("logged")
+    refusals = [
+        ("/hooks/session-stop", {"session_id": peer}, None, "caller_principal_absent"),
+        ("/hooks/post-edit", {"session_id": peer, "path": "plan.md", "success": True,
+                              "content_hash": h}, caller_principal, "caller_principal_foreign"),
+        ("/hooks/pre-read", {"session_id": peer, "path": "plan.md"}, caller_principal,
+         "caller_principal_foreign"),
+    ]
+    for path, body, principal, reason in refusals:
+        status, answer = client.post(path, body, principal=principal)
+        assert (status, answer.get("reason")) == (400, reason), answer
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": peer, "path": "plan.md"}, principal=peer_principal)
+    assert status == 200
+
+    refusal_records = [
+        r for r in caplog.records
+        if r.levelno == logging.INFO and "caller_principal_" in r.getMessage()
+    ]
+    assert len(refusal_records) == len(refusals), [r.getMessage() for r in refusal_records]
+    for record, (path, _body, _principal, reason) in zip(refusal_records, refusals):
+        message = record.getMessage()
+        assert path in message and reason in message, message
+    for record in caplog.records:
+        rendered = f"{record.getMessage()} {record.args!r} {record.exc_text or ''}"
+        for principal in (peer_principal, caller_principal):
+            assert principal not in rendered, record.name
+
+
+def test_pre_edit_without_its_principal_cannot_take_a_grant_it_could_not_release(
+    coordinator, client: _Client
+) -> None:
+    """A bound session whose caller has lost its principal — a CoherentVolume
+    whose claim landed but whose answer was lost, or a hook client whose claim
+    was refused — used to be admitted on pre-edit and take EXCLUSIVE. It could
+    then neither commit that grant nor release it: post-edit (either
+    ``success`` value) and session-stop are require-class. Its own reads kept
+    the heartbeat fresh, so only the max-hold sweep freed the grant, and every
+    optimistic peer's commit was refused ``other_holder`` meanwhile. pre-edit
+    refuses that caller now, under the same rule as the release routes (an
+    identity nobody claimed is still admitted), so the grant is never taken
+    and the peer's commit lands. Control: presenting its principal, the same
+    caller takes the grant and releases it — the refusal sits exactly where
+    the release lives."""
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    a_principal = _explicit_claim(client, a)
+    b_principal = _explicit_claim(client, b)
+    reg = coordinator.registry
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": b, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=b_principal,
+    )
+    assert status == 200
+    artifact_id = reg.lookup_artifact_id_by_name("plan.md")
+    version = reg.get_artifact(artifact_id).version
+    a_agent = session_to_agent_id(a)
+
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": a, "path": "plan.md"}, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert reg.get_agent_state(artifact_id, a_agent) not in (
+        MESIState.EXCLUSIVE, MESIState.MODIFIED)
+    status, body = client.post("/hooks/post-edit-cas", {
+        "session_id": b, "path": "plan.md", "success": True,
+        "content_hash": _hash("v2"), "expected_version": version,
+    }, principal=b_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert reg.get_artifact(artifact_id).version == version + 1
+
+    _pre_edit_with(client, a, a_principal, "plan.md")
+    assert reg.get_agent_state(artifact_id, a_agent) == MESIState.EXCLUSIVE
+    status, body = client.post(
+        "/hooks/post-edit", {"session_id": a, "path": "plan.md", "success": False},
+        principal=a_principal,
+    )
+    assert status == 200 and body["ok"] is True, body
+    assert reg.get_agent_state(artifact_id, a_agent) not in (
+        MESIState.EXCLUSIVE, MESIState.MODIFIED)
+
+
+def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decider) -> None:
+    """The other side of the test above, which the posture table must state
+    rather than leave out: refusing a claimed session's pre-edit that carries
+    no principal also withholds everything pre-edit does FOR that session --
+    the strict-mode deny, the grant and the invalidation of its peers -- and
+    the hook clients read a 400 like any other refusal, so the edit then
+    proceeds uncoordinated.
+
+    Each cost is shown against a control that GETS it, in a setup where
+    admission and refusal differ in that cost. A refused request that changed
+    nothing looks exactly like an admitted one that happened to change
+    nothing, and on a strict-mode path where the session was preempted an
+    admitted pre-edit is denied: it takes no grant and invalidates no peer
+    either, so there only the deny separates the two. The grant and the
+    invalidation are shown on an unpreempted path instead, where the same
+    request presenting the principal takes EXCLUSIVE and invalidates the
+    SHARED peer.
+
+    Prevents the table describing only what the refusal rules out. The
+    trade-off was chosen -- over admitting an acquire the caller could neither
+    commit nor release -- and its cost is pinned here with the words that
+    state it, the sentence stating the choice included."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    server, client = served_decider
+    reg = server.registry
+    path = _U3A_STRICT_PATH
+    editor, peer = str(uuid.uuid4()), str(uuid.uuid4())
+    editor_principal = _explicit_claim(client, editor)
+    peer_principal = _explicit_claim(client, peer)
+    editor_agent, peer_agent = session_to_agent_id(editor), session_to_agent_id(peer)
+
+    # The deny: a strict-mode path where the peer's edit preempted the editor.
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": editor, "path": path, "content_hash": _hash("v1")},
+        principal=editor_principal)
+    assert status == 200
+    _pre_edit_with(client, peer, peer_principal, path)
+    artifact_id = reg.lookup_artifact_id_by_name(path)
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
+    denials_before = server.counters_snapshot()["strict_mode_denials_total"]
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert "hookSpecificOutput" not in refused[1], "a refusal relays no deny"
+    # The 400 is written before the handler returns; a side effect after it
+    # would land after this read unless the handler is waited out first.
+    _await_in_flight_drain(server)
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before, (
+        "no strict-mode deny")
+    # Not costs of the refusal on this path (the admitted control below is
+    # denied and changes neither): only that the refused request changed nothing.
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
+
+    status, denied = client.post(
+        "/hooks/pre-edit", {"session_id": editor, "path": path}, principal=editor_principal)
+    assert status == 200 and denied["ok"] is False, denied
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before + 1
+
+    # The grant and the invalidation: an unpreempted path, both sessions SHARED.
+    open_path = _U3A_WARN_PATH
+    for sid, principal in ((editor, editor_principal), (peer, peer_principal)):
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": open_path, "content_hash": _hash("v1")},
+            principal=principal)
+        assert status == 200
+    open_id = reg.lookup_artifact_id_by_name(open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": open_path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    _await_in_flight_drain(server)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED, "no grant"
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED, (
+        "no peer invalidated")
+
+    _pre_edit_with(client, editor, editor_principal, open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.EXCLUSIVE, (
+        "control: the same pre-edit, admitted, takes the grant")
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.INVALID, (
+        "control: the same pre-edit, admitted, invalidates the SHARED peer")
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-edit")].harm
+    for stated in ("proceeds uncoordinated", "no grant", "no strict-mode deny",
+                   "no invalidation of its peers", "neither commit nor release",
+                   "chosen over admitting an acquire"):
+        assert stated in harm, f"pre-edit's harm text does not state {stated!r}: {harm}"
+
+
+# --- a REFUSED require-class request leaves every piece of state as it was ---
+
+_REQUIRE_CLASS_ROUTES = sorted(
+    route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture == "require"
+)
+#: FROZEN duplicate of the per-route attempt counters (``_ENDPOINT_COUNTER_NAMES``)
+#: for the require class: the one counter besides the refusal counter a refused
+#: request may move — it counts attempts by contract. The workspace routes have
+#: no attempt counter.
+_ATTEMPT_COUNTER = {
+    "/hooks/effect-fence": "effect_fence_total",
+    "/hooks/pre-edit": "pre_edit_total",
+    "/hooks/post-edit": "post_edit_total",
+    "/hooks/post-edit-cas": "post_edit_cas_total",
+    "/hooks/session-stop": "session_stop_total",
+}
+_REFUSED_SUBAGENT = "sub-refused"
+
+
+def _seed_a_claimed_peer(coordinator, client: _Client) -> dict:
+    """A CLAIMED peer with a non-default value in every dimension a require-
+    class handler touches once admitted: an EXCLUSIVE grant on a tracked path,
+    a heartbeat, a queued preemption notice, an armed re-grounding flag, a
+    stale-warned pair, a strict-deny memory, and a checkpoint it owns. Seeded
+    through the registry, never a hook route, so the peer's names are NOT in
+    the display-name map: a handler that registers its caller before the gate
+    shows up as a new entry."""
+    from ccs.coordinator.registry_protocol import CheckpointMember
+
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    seed = {
+        "peer": peer,
+        "peer_principal": _explicit_claim(client, peer),
+        "caller_principal": _explicit_claim(client, caller),
+        "peer_agent": session_to_agent_id(peer),
+    }
+    reg = coordinator.registry
+    artifact_id = reg.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    coordinator.service.write(agent_id=seed["peer_agent"], artifact_id=artifact_id, issued_at_tick=1)
+    reg.record_heartbeat(seed["peer_agent"], 41)
+    reg.record_preemption_notice(
+        victim_agent_id=seed["peer_agent"], artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(caller), preempted_at_unix_ts=1234.0,
+    )
+    coordinator.mark_compact_pending(peer)
+    coordinator.mark_stale_warned(seed["peer_agent"], artifact_id)
+    coordinator.record_strict_deny(peer, "plan.md")
+    record = coordinator.service.create_workspace_checkpoint(
+        name="seeded", owner=seed["peer_agent"],
+        members=[CheckpointMember(
+            member_path="plan.md", artifact_id=None, native_token="v1",
+            fingerprint=_hash("v1"), captured_at=1.0,
+        )],
+        window_min=1.0, window_max=1.0, issued_at_tick=1,
+    )
+    return {**seed, "artifact_id": artifact_id, "checkpoint_id": record.checkpoint_id}
+
+
+def _refused_request_body(route: tuple[str, str], seed: dict, *, subagent: bool) -> dict:
+    """A body that passes every shape check on ``route``, names the claimed
+    peer, and — were it admitted — would move state: a TRACKED path (so no
+    untracked fast path answers before the handler's work) and the peer's real
+    checkpoint. ``subagent`` adds an ``agent_id`` field on the hook routes."""
+    from ccs.core.exceptions import RESTORE_MEMBER_OUTCOMES
+
+    _, path = route
+    h = _hash(f"refused:{path}")
+    bodies: dict[str, dict] = {
+        "/hooks/effect-fence": {
+            "path": "plan.md", "expected_version": 99, "expected_generation": 0,
+            "content_hash": h,
+        },
+        "/hooks/pre-edit": {"path": "plan.md"},
+        "/hooks/post-edit": {"path": "plan.md", "success": True, "content_hash": h},
+        "/hooks/post-edit-cas": {"path": "plan.md", "content_hash": h, "expected_version": 1},
+        "/hooks/session-stop": {},
+        "/workspace/checkpoint": {
+            "name": "refused", "window_min": 1.0, "window_max": 1.0,
+            "members": [{"member_path": "plan.md", "native_token": "v2",
+                         "fingerprint": h, "captured_at": 2.0}],
+        },
+        "/workspace/restore/status": {
+            "checkpoint_id": seed["checkpoint_id"], "status": "in_progress"},
+        "/workspace/restore/member": {
+            "checkpoint_id": seed["checkpoint_id"], "member_path": "plan.md",
+            "restore_outcome": sorted(RESTORE_MEMBER_OUTCOMES)[0],
+        },
+        "/workspace/restore/register": {
+            "checkpoint_id": seed["checkpoint_id"],
+            "writes": [{"member_path": "plan.md", "fingerprint": h}],
+        },
+    }
+    body = {"session_id": seed["peer"], **bodies[path]}
+    if subagent:
+        body["agent_id"] = _REFUSED_SUBAGENT
+    return body
+
+
+def _refusal_observable(coordinator, seed: dict) -> dict:
+    """Everything an admitted require-class request could move, read through
+    NON-destructive accessors only. Principals appear only as digests, so a
+    failing comparison prints none."""
+    reg = coordinator.registry
+    artifacts, states = reg.status_snapshot()
+    agents = (seed["peer_agent"], session_to_agent_id(seed["peer"], _REFUSED_SUBAGENT))
+    coherence = coordinator.coordinator_root / ".coherence"
+    return {
+        "counters": coordinator.counters_snapshot(),
+        "artifacts": {str(a): dict(meta) for a, meta in artifacts.items()},
+        "grants": {
+            str(a): {str(agent): state.name for agent, state in held.items()}
+            for a, held in states.items()
+        },
+        "last_writers": {str(a): reg.last_writer_for(a) for a in artifacts},
+        "heartbeats": {str(agent): reg.last_heartbeat_tick(agent) for agent in agents},
+        "notices": {
+            str(agent): reg.peek_preemption_notice(agent, seed["artifact_id"])
+            for agent in agents
+        },
+        "agent_names": sorted((str(a), n) for a, n in coordinator.agent_names_snapshot()),
+        "compact_pending": coordinator.has_compact_pending(seed["peer"]),
+        "stale_warned": set(coordinator._stale_warned_pairs),
+        "strict_denies": set(coordinator._recent_strict_denies),
+        "bindings": [
+            hashlib.sha256(value.encode()).hexdigest()
+            for value in (
+                reg.get_caller_principal(caller_principal_identity(seed["peer"])) or "",
+            )
+        ],
+        "checkpoints": [
+            (dataclasses.asdict(record),
+             [dataclasses.asdict(m) for m in reg.get_checkpoint_members(record.checkpoint_id)])
+            for record in reg.list_checkpoints()
+        ],
+        "audit_logs": sorted((p.name, p.stat().st_size) for p in coherence.glob("*.log")),
+    }
+
+
+def _split_counters(observable: dict, path: str) -> tuple[dict, int | None, int | None]:
+    """``observable`` minus the two counters a refusal may move — the route's
+    attempt counter and the refusal counter — returned beside them."""
+    rest = dict(observable)
+    counters = dict(rest["counters"])
+    endpoint = dict(counters["endpoint_counters"])
+    attempts = endpoint.pop(_ATTEMPT_COUNTER[path]) if path in _ATTEMPT_COUNTER else None
+    counters["endpoint_counters"] = endpoint
+    refused = counters.pop("caller_principal_refused_total", None)
+    rest["counters"] = counters
+    return rest, attempts, refused
+
+
+@pytest.mark.parametrize("route", _REQUIRE_CLASS_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_refused_require_class_request_leaves_state_untouched(
+    route: tuple[str, str], coordinator, client: _Client
+) -> None:
+    """KTD9 makes a principal refusal a client error, and the caller is told
+    to retry only once it has its principal — which is safe only if the refused
+    request changed nothing. Every require-class route is driven with an ABSENT
+    principal and with a FOREIGN one (the caller's own valid principal, spent
+    on the peer's session), in the parent and the subagent form, against a
+    claimed peer seeded with a non-default value in every dimension. Nothing
+    may move: no display name registered, no heartbeat, no re-grounding flag
+    expired, no notice drained, no grant, version, writer, checkpoint or
+    binding changed, no audit row — and no counter but the route's attempt
+    counter and the refusal counter, each by exactly one per request.
+
+    Control: the same request presenting the peer's principal IS admitted and
+    DOES move the snapshot, so the snapshot can see this route's effects and
+    the equality above is not vacuous."""
+    _, path = route
+    seed = _seed_a_claimed_peer(coordinator, client)
+    before = _refusal_observable(coordinator, seed)
+    assert before["heartbeats"][str(seed["peer_agent"])] == 41
+    assert before["notices"][str(seed["peer_agent"])] is not None
+    assert before["compact_pending"] is True
+    assert before["grants"][str(seed["artifact_id"])][str(seed["peer_agent"])] == "EXCLUSIVE"
+    assert before["checkpoints"] and before["stale_warned"] and before["strict_denies"]
+    assert not any(str(seed["peer"]) in name for _a, name in before["agent_names"])
+
+    forms = (False, True) if path.startswith("/hooks/") else (False,)
+    sent = 0
+    for principal, refusal in ((None, _PRINCIPAL_ABSENT_REFUSAL),
+                               (seed["caller_principal"], _PRINCIPAL_FOREIGN_REFUSAL)):
+        for subagent in forms:
+            body = _refused_request_body(route, seed, subagent=subagent)
+            assert client.post(path, body, principal=principal) == (400, refusal), body
+            sent += 1
+    after = _refusal_observable(coordinator, seed)
+
+    rest_before, attempts_before, refused_before = _split_counters(before, path)
+    rest_after, attempts_after, refused_after = _split_counters(after, path)
+    assert rest_after == rest_before
+    assert refused_before is not None and refused_after == refused_before + sent
+    if attempts_before is not None:
+        assert attempts_after == attempts_before + sent
+
+    status, body = client.post(
+        path, _refused_request_body(route, seed, subagent=False),
+        principal=seed["peer_principal"],
+    )
+    assert not _principal_refused((status, body)), body
+    rest_admitted, _, _ = _split_counters(_refusal_observable(coordinator, seed), path)
+    assert rest_admitted != rest_after, "the admitted request moved nothing the snapshot sees"
+
+
+# --- the accept-class notice drain, stated rather than implied --------------
+
+
+@pytest.mark.parametrize("path,extra", [
+    ("/hooks/pre-read", {"path": "plan.md"}),
+    ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    ("/hooks/pre-grep", {"search_root": ""}),
+], ids=["pre-read", "pre-bash", "pre-grep"])
+def test_an_accept_class_read_naming_a_bound_peer_drains_its_notices_and_says_so(
+    path: str, extra: dict, coordinator, client: _Client
+) -> None:
+    """Accepted behaviour, pinned so the posture table cannot understate it.
+    The accept-class reads pop the NAMED identity's pending notices and deliver
+    them in their own response. A request naming a bound peer without a
+    principal — a stray or older client, or a misnamed session — therefore
+    receives the peer's "you were preempted" notice, and the peer never sees
+    it. The table's harm text for the route says so, as the require-class
+    session-stop entry does for the same effect."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    peer = str(uuid.uuid4())
+    _explicit_claim(client, peer)
+    peer_agent = session_to_agent_id(peer)
+    reg = coordinator.registry
+    artifact_id = reg.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    reg.record_preemption_notice(
+        victim_agent_id=peer_agent, artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    status, body = client.post(path, {"session_id": peer, **extra}, principal=None)
+    assert status == 200 and not _principal_refused((status, body)), body
+    assert "preempted" in json.dumps(body), "the notice went to this caller"
+    assert reg.peek_preemption_notice(peer_agent, artifact_id) is None, "and is gone"
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", path)].harm
+    assert "drains the named identity's pending notices" in harm, harm
+
+
+def test_session_start_shows_a_bound_peers_notices_without_draining_them(
+    coordinator, client: _Client
+) -> None:
+    """session-start is accept-class and only SHOWS the named identity's
+    notices; it does not drain them, and its harm text says what it does
+    write — the display name and, for a non-empty re-grounding, the
+    compact-pending flag the named identity's next admit delivers."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    peer_agent = session_to_agent_id(peer)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=peer_agent, artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    status, body = client.post("/hooks/session-start", {"session_id": peer}, principal=None)
+    assert status == 200, body
+    assert coordinator.registry.peek_preemption_notice(peer_agent, artifact_id) is not None
+    assert coordinator.has_compact_pending(peer) is True
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/session-start")].harm
+    assert "without draining them" in harm and "compact-pending" in harm, harm

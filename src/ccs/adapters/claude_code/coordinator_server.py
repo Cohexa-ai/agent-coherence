@@ -17,6 +17,13 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
+- ``POST /principal/claim``     — caller-principal mint (plan U4; Python-only)
+
+Every route that names an acting identity (``session_id``) has a caller-
+principal posture in :data:`_CALLER_PRINCIPAL_POSTURE` (plan U6): require-class
+routes refuse a request naming a CLAIMED identity without the principal minted
+for it, accept-class routes admit and count one, every class refuses a foreign
+principal, the mint is neither.
 
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
@@ -24,7 +31,8 @@ Every handler:
 - Records the calling session's heartbeat (KTD-2)
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
-  SQLite contention exceeds busy_timeout=2000)
+  SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
+  must read the registry runs under the same deadline, before the call
 - Converts ``CoherenceError`` to 200 ``{ok: false, reason}`` (NOT 500 — we
   want hooks to proceed gracefully on protocol violations, not block)
 - Logs request/response at DEBUG, errors at WARNING
@@ -48,6 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -56,6 +65,7 @@ from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
+    CALLER_PRINCIPAL_HEADER,
     assert_serve_transport_acknowledged,
     build_host_allowlist,
     ensure_secret,
@@ -65,10 +75,16 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import (
+    CallerPrincipalUncached,
+    CoordinatorService,
+    mint_nonce_problem,
+)
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_ABSENT_REASON,
+    CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
@@ -77,6 +93,7 @@ from ccs.core.exceptions import (
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CallerPrincipalRefused,
     CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
@@ -119,6 +136,14 @@ class _RequestProtocol(Protocol):
 
     headers: Any  # http.client.HTTPMessage (Mapping-like)
     path: str
+    #: ``(method, route path)`` the dispatcher matched in ``_ROUTES``, set
+    #: before the handler runs; keys the caller-principal posture lookup.
+    _route_key: tuple[str, str]
+    #: ``time.monotonic()`` instant this request's handler watchdog expires, or
+    #: ``None`` while nothing has started it. The dispatcher resets it; the
+    #: caller-principal gate starts it when it must read the registry, and the
+    #: work body then waits only for what is left (:func:`_watchdog_deadline`).
+    _watchdog_deadline: float | None
 
     def _read_json(self) -> dict | None:
         """Read + parse the request body as JSON. Returns None on error."""
@@ -221,7 +246,7 @@ abuse vector (Adv #13)."""
 
 _CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 """SHA-256 hex shape. Rejecting malformed hashes closes the
-caller-supplied-hash abuse vector (Adv #6) where an authenticated client
+caller-supplied-hash abuse vector (Adv #6) where a bearer-holding client
 could mint v1 with attacker-chosen hash strings."""
 
 
@@ -259,6 +284,376 @@ def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> st
     if subagent_id:
         return f"claude-session-{session_id}:subagent-{subagent_id}"
     return f"claude-session-{session_id}"
+
+
+def caller_principal_identity(session_id: str) -> UUID:
+    """The identity a caller principal binds to: the SESSION component of the
+    acting identity, i.e. the parent session's agent id.
+
+    A subagent carries its parent's ``session_id``, so it presents its parent's
+    principal: the principal's unit of identity is the session, and it cannot
+    separate a subagent from its parent (the subagent component stays
+    caller-asserted and unverified — plan R3). Keyed by the uuid5 rather than
+    the raw ``session_id`` so the store holds no raw session identifier."""
+    return session_to_agent_id(session_id)
+
+
+@dataclass(frozen=True)
+class PresentedCaller:
+    """The acting identity as ONE request presents it.
+
+    ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only; the coordinator authenticates the workspace bearer, not the
+    caller. ``subagent_id`` is caller-asserted and unverified. ``principal`` is
+    the caller principal the request carries, or ``None``. This value is what
+    lets a route check the SESSION component of the acting identity against the
+    principal the coordinator minted for it (plan U4 / R1, R3)."""
+
+    session_id: str
+    subagent_id: str | None
+    principal: str | None
+
+    def attributed_agent_id(
+        self, service: CoordinatorService, *, cached_only: bool = False
+    ) -> UUID:
+        """The composite agent id a write by this caller is attributed to
+        (``artifacts.last_writer_id``), with its SESSION component verified
+        against the caller principal first.
+
+        ``cached_only`` decides from the service's in-process binding cache and
+        raises :class:`~ccs.coordinator.service.CallerPrincipalUncached` where
+        the durable store would have to be read — the admission gate's way of
+        keeping that read off the request thread (:func:`_admit_caller`).
+
+        Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when a
+        principal is presented and does not match the session's binding
+        (``caller_principal_foreign`` — including one presented for a session
+        nobody claimed), or when none is presented for a session that IS bound
+        (``caller_principal_absent``), so a refused caller never reaches a
+        write. A caller presenting none for a session nobody ever claimed is a
+        client that predates the principal: it is attributed under the plain
+        composite, as before the principal existed (plan U6 / R16) — refusing
+        it would only turn its writes silently unrecorded, since the shipped
+        hook client reads any non-2xx as an allow. The composite over session
+        and subagent is unchanged — two subagents of one session keep distinct
+        writer ids, which the self-commit-lag comparison depends on."""
+        identity = caller_principal_identity(self.session_id)
+        if self.principal is None and not service.is_caller_principal_bound(
+            identity, cached_only=cached_only
+        ):
+            return session_to_agent_id(self.session_id, self.subagent_id)
+        service.validate_caller_principal(
+            identity=identity, principal=self.principal, cached_only=cached_only
+        )
+        return session_to_agent_id(self.session_id, self.subagent_id)
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that reads a ``session_id`` is classified by the harm an ABSENT
+# principal admits on it (KTD3) — not by retryability: a principal is an
+# authorization operand, and no downstream invariant catches a request that
+# acted as someone else. What the principal buys is accident-resistance and
+# attributability under the same-OS-user cooperative trust model; on the hook
+# surface it is stored under ``.coherence/``, so there it is convention-
+# enforcement and a detectable unbound caller, never caller separation (KTD5).
+#
+# Enforcement is THIS coordinator's only: the sibling Node coordinator issues
+# no principals, answers 404 on ``/principal/claim`` and ignores the header
+# (KTD12). The protocol corpus pins that asymmetry.
+
+
+class PrincipalPosture(Enum):
+    """How a route treats the caller principal of the identity it names."""
+
+    #: Refuse a foreign principal, and an absent one for an identity that is
+    #: BOUND (HTTP 400 naming the header, with a typed ``reason``; never a
+    #: hold — KTD9). An absent principal for an identity nobody ever claimed is
+    #: an older client's: admitted and counted, as before the principal
+    #: existed (R16, KTD15).
+    REQUIRE = "require"
+    #: Admit an absent principal, bound identity or not, and count it (a local
+    #: diagnostic, not a flip trigger — KTD4); refuse a foreign one, so a
+    #: presented principal is always CHECKED, never ignored.
+    ACCEPT = "accept"
+    #: The route that issues principals. It cannot require one (that would be
+    #: circular); its gate is the mint nonce (KTD11). The header is not read.
+    MINT = "mint"
+
+
+@dataclass(frozen=True)
+class RoutePrincipalPosture:
+    """One route's posture and the harm that places it there."""
+
+    posture: PrincipalPosture
+    harm: str
+
+
+_REQUIRE = PrincipalPosture.REQUIRE
+_ACCEPT = PrincipalPosture.ACCEPT
+
+_CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
+    # -- the nine hook routes ------------------------------------------------
+    ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
+        "a read: registers or refreshes the named identity's SHARED view and "
+        "records no attribution; strict mode never re-grants on a stale read, "
+        "so a strict-mode write route still catches a stale writer. Accepted "
+        "behaviour for an absent principal, whether the identity is unbound or "
+        "bound: the read drains the named identity's pending notices into its "
+        "own response, and in warn mode a stale read re-grants the identity "
+        "SHARED and uses up its stale warning, so a caller naming a bound peer "
+        "without its principal takes the peer's notices and warning and the "
+        "peer never sees them")),
+    ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
+        "gates an escaping effect on the named identity's grant standing: a "
+        "caller naming a claimed peer without its principal would be answered "
+        "about the PEER's grant and told an irreversible effect may fire")),
+    ("POST", "/hooks/pre-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "acquires EXCLUSIVE under the named identity, preempting its holders, "
+        "and drains its pending notices: a caller without a claimed identity's "
+        "principal could take a grant it can then neither commit nor release "
+        "(post-edit, either success value, and session-stop refuse it), so the "
+        "grant would stand until the max-hold sweep while optimistic peers are "
+        "refused other_holder. The trade-off, accepted: a claimed session whose "
+        "client cannot present its principal (and cannot recover it by "
+        "re-claiming with its stored nonce) has its pre-edit refused, and a "
+        "hook client then proceeds uncoordinated, as on any other refusal: the "
+        "edit gets no grant, no strict-mode deny and no invalidation of its "
+        "peers. That was chosen over admitting an acquire the caller could "
+        "neither commit nor release. The class does not stop preemption "
+        "itself: a fresh, principal-bearing identity preempts identically "
+        "until the acquire-or-fail contract lands")),
+    ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "commits a version and records artifacts.last_writer_id under the "
+        "named identity (or, on success:false, releases its grant): a caller "
+        "without a claimed peer's principal could write under the peer's name "
+        "or drop the peer's grant")),
+    ("POST", "/hooks/post-edit-cas"): RoutePrincipalPosture(_REQUIRE, (
+        "the optimistic commit: bumps a version and records last_writer_id "
+        "under the named identity")),
+    ("POST", "/hooks/session-stop"): RoutePrincipalPosture(_REQUIRE, (
+        "releases every EXCLUSIVE/MODIFIED grant the named identity holds and "
+        "drains its notices: a caller without a claimed peer's principal could "
+        "end the peer's work")),
+    ("POST", "/hooks/session-start"): RoutePrincipalPosture(_ACCEPT, (
+        "re-grounding of the named session; names peers only by agent id (R7). "
+        "It shows the named identity's pending notices without draining them "
+        "and writes only advisory state: the session's display name and, when "
+        "the re-grounding is non-empty, its compact-pending flag, which the "
+        "named identity's next admit delivers. Accepted behaviour for an "
+        "absent principal: a caller naming a bound peer without its principal "
+        "can arm that delivery; nothing a later check depends on changes")),
+    ("POST", "/hooks/pre-bash"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for paths a shell command "
+        "names. Accepted behaviour for an absent principal, as pre-read's: it "
+        "drains the named identity's pending notices into its own response, so "
+        "a caller naming a bound peer without its principal takes the peer's "
+        "notices")),
+    ("POST", "/hooks/pre-grep"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for a search root. Accepted "
+        "behaviour for an absent principal, as pre-read's: it drains the named "
+        "identity's pending notices into its own response, so a caller naming "
+        "a bound peer without its principal takes the peer's notices")),
+    # -- the five snapshot-session routes (KTD3's own exemption) -------------
+    ("POST", "/session/begin"): RoutePrincipalPosture(_ACCEPT, (
+        "opens a snapshot session owned by the named identity; the session "
+        "token it returns is server-minted and reaches only this caller, and "
+        "every later session route is gated by that token's owner binding")),
+    ("POST", "/session/read"): RoutePrincipalPosture(_ACCEPT, (
+        "gated by the server-minted session token's owner binding, which the "
+        "caller cannot assert; an absent principal admits nothing more")),
+    ("POST", "/session/commit"): RoutePrincipalPosture(_ACCEPT, (
+        "writes attribution, but only through a server-minted session token "
+        "bound to its owner; an absent principal admits nothing more")),
+    ("POST", "/session/commit_all"): RoutePrincipalPosture(_ACCEPT, (
+        "as /session/commit, over a write-set")),
+    ("POST", "/session/heartbeat"): RoutePrincipalPosture(_ACCEPT, (
+        "keeps a snapshot session alive; the token's owner binding already "
+        "refuses a request naming another session")),
+    # -- the four workspace checkpoint-and-restore routes --------------------
+    ("POST", "/workspace/checkpoint"): RoutePrincipalPosture(_REQUIRE, (
+        "records durable checkpoint-manifest ownership under the named "
+        "identity: a caller without a claimed identity's principal could "
+        "record a manifest as that identity's")),
+    ("POST", "/workspace/restore/status"): RoutePrincipalPosture(_REQUIRE, (
+        "writes durable restore progress that crash-resume acts on. The route "
+        "validates the identity and never consults it, so the check refuses "
+        "only a request naming a CLAIMED identity without its principal; a "
+        "caller naming an unclaimed identity is admitted, so this class does "
+        "not limit who moves a restore's state. Kept require (not the field "
+        "dropped) to match its register sibling; see the plan's U6 choice")),
+    ("POST", "/workspace/restore/member"): RoutePrincipalPosture(_REQUIRE, (
+        "writes a member's durable restore terminal; as /workspace/restore/"
+        "status, the identity is validated but not consulted")),
+    ("POST", "/workspace/restore/register"): RoutePrincipalPosture(_REQUIRE, (
+        "a version-bumping write registered under a controller identity "
+        "derived from the named session: a caller without a claimed session's "
+        "principal could register a restore as that session's")),
+    # -- the mint itself -----------------------------------------------------
+    ("POST", "/principal/claim"): RoutePrincipalPosture(PrincipalPosture.MINT, (
+        "issues principals; requiring one would be circular, and its gate is "
+        "the mint nonce (first claim wins, a retry must present the same nonce)")),
+}
+"""Route -> caller-principal posture, over EVERY route that reads a
+``session_id`` and no other. The require-class harm is what an absent
+principal admits for an identity a client has CLAIMED; a request naming an
+identity nobody claimed (a client predating the principal) is admitted and
+counted on every class, as it was before. An accept-class entry states what an
+absent principal is nonetheless ALLOWED to do there — the accepted behaviour,
+not only the harm it rules out. The lookup in :func:`_admit_caller` has no
+default: a route missing here fails loudly (500) rather than falling to a
+residual class, and a test pins the key set to the routes that read one."""
+
+# Sent only for a session that IS bound; a session nobody claimed is admitted
+# without a principal (KTD15).
+_CALLER_PRINCIPAL_ABSENT_ERROR = (
+    f"missing {CALLER_PRINCIPAL_HEADER} header: this route requires the caller "
+    f"principal that POST /principal/claim bound to the session_id it names "
+    f"({CALLER_PRINCIPAL_ABSENT_REASON})"
+)
+# Sent on every class for a presented principal that is not the one bound to the
+# named session — including one presented for a session nobody claimed, where
+# nothing is bound and so no presented value can match.
+_CALLER_PRINCIPAL_FOREIGN_ERROR = (
+    f"the {CALLER_PRINCIPAL_HEADER} header is not the caller principal bound to "
+    f"the session_id this request names ({CALLER_PRINCIPAL_FOREIGN_REASON})"
+)
+_CALLER_PRINCIPAL_ERRORS: dict[str, str] = {
+    CALLER_PRINCIPAL_ABSENT_REASON: _CALLER_PRINCIPAL_ABSENT_ERROR,
+    CALLER_PRINCIPAL_FOREIGN_REASON: _CALLER_PRINCIPAL_FOREIGN_ERROR,
+}
+"""The ``error`` text of a principal refusal, keyed by its reason. The 400 body
+is ``{"error": <text>, "reason": <reason>}``: ``error`` keeps the key every
+non-200 body carries (the CLI reads it), and ``reason`` is the typed key a
+client classifies the refusal by — by equality against
+:data:`~ccs.core.exceptions.CALLER_PRINCIPAL_REFUSAL_REASONS`, never by a
+substring of ``error``. Each text names the header and ends with its reason, so
+an absent principal and a foreign one stay distinguishable from either key (a
+phase is diagnosable from the refusal alone). Neither carries a principal."""
+
+
+def _admit_caller(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """Apply the dispatched route's posture to ``presented``.
+
+    Returns the composite agent id the request acts as, or ``None`` after
+    writing the HTTP 400 refusal. On a require-class route, and whenever a
+    principal IS presented, the id comes from
+    :meth:`PresentedCaller.attributed_agent_id`, which owns the rule: a
+    presented principal must be the bound one; none may be presented only for
+    an identity nobody has claimed. An accept-class request presenting none is
+    admitted under the unverified derivation. Every admission without a
+    principal — accept-class, or require-class on an unbound identity — is
+    counted (a local diagnostic, KTD4); every refusal is counted separately and
+    logged, by :func:`_refuse_caller`.
+
+    The gate runs BEFORE any handler mutation — the display-name registration,
+    the heartbeat, the re-grounding flag, a notice drain, a grant — so a
+    refused request has changed nothing, and a client may retry it once it
+    holds the right principal.
+
+    It never waits longer than the handler watchdog: see
+    :func:`_attributed_within_deadline`. A gate that cannot decide in time
+    writes the route's degraded envelope (past a full watchdog queue, the 503)
+    and returns ``None`` too — neither admitted nor refused, so it is counted
+    by neither principal counter."""
+    posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
+    unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
+    if posture is PrincipalPosture.MINT:
+        return unverified
+    if posture is PrincipalPosture.ACCEPT and presented.principal is None:
+        coordinator.increment_caller_principal_absent()
+        return unverified
+    try:
+        agent_id = _attributed_within_deadline(req, coordinator, presented)
+    except CallerPrincipalRefused as exc:
+        _refuse_caller(req, coordinator, exc.reason)
+        return None
+    if agent_id is None:
+        return None
+    if presented.principal is None:
+        # Require-class, admitted without a principal: the identity is unbound.
+        coordinator.increment_caller_principal_absent()
+    return agent_id
+
+
+def _attributed_within_deadline(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """:meth:`PresentedCaller.attributed_agent_id`, decided without waiting
+    past the handler watchdog.
+
+    The service's binding cache answers on this thread, touching no registry:
+    a bound identity, and — after one read of the store — an unbound one
+    (the negative tier, so a client that never claims stops costing a registry
+    read per request). Only a cache miss reads the durable store, and that read
+    waits on the registry lock, so it runs in the watchdog pool and STARTS this
+    request's watchdog deadline: the work body later gets only what the lookup
+    left of it (:func:`_watchdog_deadline`), and gate plus body stay inside one
+    ``HANDLER_TIMEOUT_SEC``. Were the read made here instead, a client that
+    never claims (KTD15) would wait on registry contention with no deadline on
+    every require-class route — pre-edit included.
+
+    Returns the agent id, or ``None`` after writing the answer itself: the
+    watchdog pool's queue-overflow 503, or — the lookup not done by the
+    deadline — exactly the route's degraded envelope
+    (:data:`_CALLER_GATE_DEGRADED_RESPONSE`), counted as a watchdog timeout
+    like a timed-out work body. Raises :class:`CallerPrincipalRefused` for a
+    refusal decided within the deadline, which stays an HTTP 400."""
+    service = coordinator.service
+    try:
+        return presented.attributed_agent_id(service, cached_only=True)
+    except CallerPrincipalUncached:
+        pass
+    if _watchdog_queue_overflowed(req, coordinator):
+        return None
+    deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
+    req._watchdog_deadline = deadline
+    try:
+        return coordinator.run_admission_lookup(
+            lambda: presented.attributed_agent_id(service), deadline=deadline
+        )
+    except FuturesTimeout:
+        coordinator.increment_watchdog_timeout()
+        method, path = req._route_key
+        logger.warning(
+            "caller-principal lookup on %s %s timed out after %ss; degrading",
+            method, path, HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _CALLER_GATE_DEGRADED_RESPONSE[req._route_key])
+        return None
+
+
+def _refuse_caller(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer, reason: str
+) -> None:
+    """Answer a principal refusal: HTTP 400 ``{"error", "reason"}``.
+
+    Counted and logged at INFO with the route and the reason BEFORE the answer
+    goes out, so an operator can see a session being refused — the hook client
+    exits 0 on a refusal and Claude Code shows no stderr, so nothing else
+    would. Only the reason is read: neither the presented principal nor the
+    bound one reaches the log, the counter or the body (R5)."""
+    coordinator.increment_caller_principal_refused()
+    method, path = req._route_key
+    logger.info("caller principal refused on %s %s (%s)", method, path, reason)
+    req._json(400, {"error": _CALLER_PRINCIPAL_ERRORS[reason], "reason": reason})
+
+
+def _presented_caller(
+    req: _RequestProtocol, session_id: str, subagent_id: str | None = None
+) -> PresentedCaller:
+    """The acting identity this request presents: the body's ``session_id``
+    and subagent id, and the header's principal (an empty header is absent)."""
+    principal = req.headers.get(CALLER_PRINCIPAL_HEADER) or None
+    return PresentedCaller(session_id=session_id, subagent_id=subagent_id, principal=principal)
 
 
 # ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
@@ -565,6 +960,9 @@ class CoordinatorHTTPServer:
             # so a route named there but missing here is counted nowhere while
             # still looking wired up at both call sites.
             "effect_fence_total": 0,
+            # Same rule as effect_fence_total above: registered in
+            # _ENDPOINT_COUNTER_NAMES too, or the mint is counted nowhere.
+            "principal_claim_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -623,6 +1021,21 @@ class CoordinatorHTTPServer:
         # ``effect_fence_total``; the ratio is what tells an operator whether
         # their agents are gating on state the coordinator can confirm.
         self._effect_fence_holds_total: int = 0
+        # caller_principal_absent_total: requests admitted without a caller
+        # principal — on an accept-class route, or on a require-class route for
+        # an identity nobody claimed (plan U6 / KTD4). A LOCAL diagnostic an
+        # operator reads on one workspace — "some caller here is not yet sending
+        # a principal". Never a trigger for making a route require one: like
+        # every counter here it is process-local, resets on respawn and on idle
+        # shutdown, so a zero proves nothing about the callers out there.
+        self._caller_principal_absent_total: int = 0
+        # caller_principal_refused_total: requests a route REFUSED for their
+        # caller principal — an absent one naming a bound identity, or a
+        # foreign one on any class (plan U6). The operator-visible trace of a
+        # session being refused: the endpoint counters count attempts, so a
+        # refused request looks like any other there. Process-local like
+        # every counter here.
+        self._caller_principal_refused_total: int = 0
         # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
         # mismatch on a strict path was SUPPRESSED as the benign
         # commit→disk-write lag (this session's own recent commit) rather than
@@ -1013,6 +1426,25 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._effect_fence_holds_total += 1
 
+    def increment_caller_principal_absent(self) -> None:
+        """Bumped when a route ADMITS a request that names an identity but
+        presents no caller principal (plan U6): any accept-class route, and a
+        require-class route naming an identity nobody has claimed (a client
+        that predates the principal). A refusal is not counted here (it
+        answered 400 and is counted by :meth:`increment_caller_principal_refused`),
+        nor is a foreign principal (refused on every class). A local
+        diagnostic, not a flip trigger (KTD4). Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_absent_total += 1
+
+    def increment_caller_principal_refused(self) -> None:
+        """Bumped when a route REFUSES a request for its caller principal:
+        absent for a bound identity, or foreign on any class (plan U6). Never
+        bumped by an admission. Surfaced at every /status tier beside
+        ``caller_principal_absent_total``. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_refused_total += 1
+
     def increment_shared_foreign_lag_suppressed(self) -> None:
         """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
         strict path is suppressed as the benign commit→disk-write lag (this
@@ -1118,6 +1550,8 @@ class CoordinatorHTTPServer:
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
+            "caller_principal_absent_total": self._caller_principal_absent_total,
+            "caller_principal_refused_total": self._caller_principal_refused_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1182,10 +1616,20 @@ class CoordinatorHTTPServer:
             self._compact_pending.discard(session_id)
 
     def run_with_watchdog(
-        self, fn: Callable[[], Any], abort: threading.Event | None = None
+        self,
+        fn: Callable[[], Any],
+        abort: threading.Event | None = None,
+        *,
+        deadline: float | None = None,
     ) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
         :class:`FuturesTimeout` on timeout (caller decides degradation).
+
+        ``deadline`` is the request's watchdog deadline when something earlier
+        in the request already started it (a ``time.monotonic()`` instant, see
+        :func:`_watchdog_deadline`): ``fn`` then gets only the time left, and
+        none at all — it is not submitted — once the deadline has passed.
+        ``None`` gives ``fn`` the whole ``HANDLER_TIMEOUT_SEC``.
 
         A6 mitigation: when the future times out, ``cancel_futures`` is not
         set so the underlying work keeps running in the pool. If the caller
@@ -1202,14 +1646,30 @@ class CoordinatorHTTPServer:
         cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
         mitigation working.
         """
+        timeout = HANDLER_TIMEOUT_SEC if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            raise FuturesTimeout()
         future = self._watchdog.submit(fn)
         try:
-            return future.result(timeout=HANDLER_TIMEOUT_SEC)
+            return future.result(timeout=timeout)
         except FuturesTimeout:
             if abort is not None:
                 abort.set()
             future.add_done_callback(self._on_watchdog_future_done_after_timeout)
             raise
+
+    def run_admission_lookup(self, fn: Callable[[], Any], *, deadline: float) -> Any:
+        """Run the caller-principal gate's durable-store lookup in the watchdog
+        pool, waiting until ``deadline`` (a ``time.monotonic()`` instant) at
+        most. Raises :class:`FuturesTimeout` when it is not done by then, and
+        re-raises whatever ``fn`` raised — a refusal included.
+
+        Unlike :meth:`run_with_watchdog` there is no abort and no late-completion
+        accounting: the lookup only READS, so a late one lands no coordinator
+        state (it can only fill the service's binding cache), and counting it as
+        a late completion would report a phantom mutation that never happened."""
+        future = self._watchdog.submit(fn)
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
     def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
@@ -1446,6 +1906,12 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     counter_name = _ENDPOINT_COUNTER_NAMES.get((method, route_path))
                     if counter_name is not None:
                         coordinator.increment_endpoint_counter(counter_name)
+                    # The route this request dispatched to, for the handler's
+                    # caller-principal posture lookup (_admit_caller).
+                    self._route_key = (method, route_path)
+                    # No watchdog deadline yet: the caller-principal gate starts
+                    # one only when it has to read the registry.
+                    self._watchdog_deadline = None
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -1587,6 +2053,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(400, {"error": err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
     # touching SQLite (R8 false-positive budget protection). SB-10 U4
     # (KTD6): the advisory compact-pending peek — a process-local dict
@@ -2332,6 +2800,8 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if read_subagent_id(body) is None and has_subagent_id_field(body):
         req._json(400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     agent_id = session_to_agent_id(session_id, read_subagent_id(body))
 
     def work() -> dict:
@@ -2386,6 +2856,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     if path_err:
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.
@@ -2579,11 +3051,20 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     if err:
         req._json(400, {"error": err})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2751,11 +3232,20 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
         req._json(400, {"error": "expected_version must be a non-negative integer"})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2841,6 +3331,8 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
 
     subagent_id = read_subagent_id(body)
@@ -2978,6 +3470,8 @@ def _handle_session_start(
         req._json(400, {"error": sid_err[1]})
         return
     subagent_id = read_subagent_id(body)
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, subagent_id)) is None:
+        return
 
     # R8 breadcrumb precondition: sample seen-ness BEFORE registration
     # erases it — registration below makes this session "seen" for every
@@ -3036,7 +3530,7 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     P2 ce-review fixes:
     - #4 (security YAML injection): every path passes validate_path() which
       rejects control chars (newlines), absolute paths, and ../ traversal
-      before being appended to tracked.yaml. Without this, an authenticated
+      before being appended to tracked.yaml. Without this, a bearer-holding
       caller could POST {"paths":["real.md\\n- injected.yaml"]} and inject
       additional patterns.
     - #11 (correctness 500→400): _append_policy_yaml's ValueError on YAML
@@ -3203,6 +3697,8 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(413, {"error": "command too long"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
@@ -3397,6 +3893,8 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             req._json(400, {"error": v})
             return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
@@ -3540,18 +4038,23 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 # Four ADDITIVE routes — registered in the central ``_ROUTES`` table so they
 # ride the SAME ``verify_bearer`` + ``verify_host`` seam every other endpoint
 # uses (the dispatcher applies auth before any handler runs; there is NO
-# parallel router). All four derive the CALLER/OWNER identity SERVER-SIDE from
-# the authenticated ``session_id`` via :func:`session_to_agent_id` — the same
-# agent-identity mechanism the hook endpoints use — and NEVER from a
-# client-supplied identity field. This is the R9 server-capture boundary lock:
+# parallel router). All four derive the CALLER/OWNER identity from the request
+# body's ``session_id`` via :func:`session_to_agent_id` — the same derivation the
+# hook endpoints use. That ``session_id`` is caller-asserted and validated for
+# UUID shape only: the dispatcher authenticates the workspace bearer, not the
+# caller, so the owner is whichever identity the request NAMES. (A caller
+# principal, minted by ``POST /principal/claim``, is what a route can check the
+# named identity against — plan U4; which routes require it is U6.) What the
+# lock guarantees is narrower: no OTHER client-supplied identity field sets the
+# owner. This is the R9 server-capture boundary lock:
 #
 #   * ``begin_session`` captures the cut SERVER-SIDE; the client cannot supply a
 #     cut / pinned versions.
 #   * ``/session/read`` and ``/session/commit`` carry ONLY the ``session_token``
 #     (+ artifact path / content). Any client-supplied ``cut`` / ``pinned_*`` /
 #     ``owner`` / ``caller`` field is IGNORED — the server reads the pinned cut
-#     from the registry by token and derives the owner from the authenticated
-#     session. A forged / replayed token CANNOT forge or bypass the server-side
+#     from the registry by token and derives the owner from the request's
+#     ``session_id``. A forged / replayed token CANNOT forge or bypass the server-side
 #     capture: a token with no live cut fails closed (``session_invalidated`` /
 #     ``session_not_found``), and a foreign caller raises ``SessionInvalidated``.
 #   * The day a client legitimately carries the cut is CROSS-HOST — out of scope
@@ -3561,13 +4064,18 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 def _session_owner_from_request(
     coordinator: CoordinatorHTTPServer, session_id: str
 ) -> UUID:
-    """Derive the session OWNER/CALLER identity SERVER-SIDE from the
-    authenticated ``session_id`` (R9 / R13). Reuses the SAME
-    :func:`session_to_agent_id` derivation the hook endpoints use via
-    ``register_session`` — the identity comes from AUTH (the validated
-    ``session_id``), NEVER a client-supplied ``owner``/``caller`` field. Also
-    registers the session so status/name lookups stay consistent with the hook
-    surface."""
+    """Derive the session OWNER/CALLER identity from the request's
+    ``session_id`` (R9 / R13), via the SAME :func:`session_to_agent_id`
+    derivation the hook endpoints use through ``register_session``.
+
+    The ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only, never authenticated: the bearer authenticates the workspace,
+    not the caller, so this returns whichever identity the request names. The
+    guarantee is narrower than "the identity comes from auth": no client-supplied
+    ``owner``/``caller`` field is ever consulted. Checking the named identity
+    against its caller principal is :meth:`PresentedCaller.attributed_agent_id`
+    (plan U4); which routes require that check is U6. Also registers the session
+    so status/name lookups stay consistent with the hook surface."""
     return coordinator.register_session(session_id)
 
 
@@ -3594,9 +4102,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     Request: ``{session_id, read_set: [<repo-rel path>, ...]}``.
 
-    The CALLER/OWNER is derived SERVER-SIDE from ``session_id`` (R9/R13) — the
-    client does NOT supply an owner. The server resolves each read-set PATH to
-    an artifact id (seeding first-observations like pre-read), captures the cut
+    The CALLER/OWNER is derived from the caller-asserted ``session_id``
+    (R9/R13) — the client does NOT supply a separate owner field. The server
+    resolves each read-set PATH to an artifact id (seeding first-observations
+    like pre-read), captures the cut
     via ``service.begin_session``, and returns the server-minted
     ``session_token`` plus the INSPECTABLE path-keyed cut. The bytes are never
     captured here (version-map only); ``retain_versions`` tells the client which
@@ -3628,7 +4137,9 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             req._json(400, {"error": path_err})
             return
 
-    # OWNER derived from AUTH, never a client field (R9/R13).
+    # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3695,7 +4206,7 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     R9 boundary lock: the request carries ONLY the ``session_token`` + ``path``
     — NO client-supplied cut / pinned version / owner. The server reads the
     pinned version from the registry by token and derives the caller from the
-    authenticated ``session_id``. A forged/replayed token or a foreign caller
+    caller-asserted ``session_id``. A forged/replayed token or a foreign caller
     cannot forge or bypass the server-side capture.
 
     Responses:
@@ -3726,6 +4237,8 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": path_err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
@@ -3788,7 +4301,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     owner. The pinned ``expected_version`` is read SERVER-SIDE from the cut
     (``service.session_commit`` sources it from ``cut[artifact_id]``); a client
     cannot drive the CAS with a forged comparand. The caller is derived from the
-    authenticated ``session_id``.
+    caller-asserted ``session_id``.
 
     Responses (preserving the shipped ``commit_cas`` taxonomy):
       - WIN → ``{ok: true, version: N+1, coordinator_epoch}``
@@ -3819,6 +4332,8 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         req._json(400, {"error": "content must be a string"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3897,7 +4412,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     owner. Each member's ``expected_version`` is read SERVER-SIDE from the pinned
     cut (``service.session_commit_all`` sources it from ``cut[artifact_id]``), so
     a client cannot drive any member's CAS with a forged comparand. The caller is
-    derived from the authenticated ``session_id``.
+    derived from the caller-asserted ``session_id``.
 
     Responses (the batch generalization of ``/session/commit``):
       - WIN → ``{ok: true, versions: {path: N+1, ...}, coordinator_epoch}``
@@ -3948,6 +4463,8 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         req._json(400, {"error": "writes contains duplicate paths"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4034,10 +4551,11 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
     Request: ``{session_id, session_token}``.
 
-    The OWNER is derived from the authenticated ``session_id`` — a foreign
-    caller cannot keep another agent's session alive (the service enforces the
-    timing-safe owner-binding and returns False on mismatch; the response does
-    NOT reveal whether the token exists). ``{ok: true, refreshed: bool}``.
+    The OWNER is derived from the caller-asserted ``session_id`` — a request
+    naming a different session cannot keep another agent's session alive (the
+    service enforces the timing-safe owner-binding and returns False on
+    mismatch; the response does NOT reveal whether the token exists).
+    ``{ok: true, refreshed: bool}``.
     """
     body = req._read_json()
     if body is None:
@@ -4052,6 +4570,8 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
         req._json(400, {"error": "missing or invalid session_token"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4065,14 +4585,89 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
 
 # ----------------------------------------------------------------------
+# Caller-principal mint (coordinator caller principal plan, U4)
+# ----------------------------------------------------------------------
+#
+# The coordinator authenticates the WORKSPACE bearer, not the caller: the
+# acting identity every route reads is the body-supplied ``session_id``. The
+# mint binds a coordinator-issued caller principal to that identity on its
+# first claim, so a route can later check a request naming the identity
+# against it. Accident-resistance and attributability under same-OS-user
+# cooperative trust: a process that can read ``.coherence/`` can read whatever
+# a hook client stores there. Which routes REQUIRE the principal is U6's
+# posture table, not this route's concern.
+
+_PRINCIPAL_CLAIM_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "claim_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /principal/claim``: a timed-out claim
+must NOT read as success and carries no principal. The watchdog abort fails a
+late bind closed at the registry lock; if one lands anyway, the claimant
+recovers it by retrying with the SAME mint nonce (R20)."""
+
+
+def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /principal/claim — bind a caller principal to the acting identity
+    on its first claim, or hand it back to a retry of that claim (U4 / R1, R2,
+    R5, R20).
+
+    Request: ``{session_id, mint_nonce}``. ``mint_nonce`` is generated by the
+    claimant and persisted BEFORE this call (KTD11); it is the only thing that
+    tells a retry of a claim whose response was lost from a second claimant.
+
+    Responses:
+      - bound → ``{ok: true, principal}`` — the ONLY response a principal ever
+        crosses the wire in (R5). A retry presenting the same nonce gets the
+        same principal.
+      - identity already bound under a different nonce → ``{ok: false, reason:
+        "caller_principal_claimed", detail}`` — the claimant does not become
+        the identity (R2). Never a hold.
+      - malformed ``session_id`` / ``mint_nonce`` → HTTP 400 naming the field.
+      - watchdog degrade → :data:`_PRINCIPAL_CLAIM_DEGRADED_RESPONSE`.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    mint_nonce = body.get("mint_nonce")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    nonce_err = mint_nonce_problem(mint_nonce)
+    if nonce_err:
+        req._json(400, {"error": nonce_err})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
+    identity = caller_principal_identity(session_id)
+
+    def work() -> dict:
+        try:
+            principal = coordinator.service.claim_caller_principal(
+                identity=identity, mint_nonce=mint_nonce, abort=abort,
+            )
+        except CallerPrincipalRefused as exc:
+            return _typed_reason_response(exc)
+        return {"ok": True, "principal": principal}
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+# ----------------------------------------------------------------------
 # Workspace-checkpoint endpoints (WV plan Unit 3 — R1/R2/R8)
 # ----------------------------------------------------------------------
 #
 # Registered in the central ``_ROUTES`` table so they ride the SAME
 # ``verify_bearer`` + ``verify_host`` seam as every other endpoint (no parallel
-# router). The OWNER is derived SERVER-SIDE from the authenticated
-# ``session_id`` (the R9/R13 boundary lock — a client-supplied ``owner`` field
-# is ignored), and the ``checkpoint_id`` is minted SERVER-SIDE by the service.
+# router). The OWNER is derived from the caller-asserted ``session_id`` (the
+# R9/R13 boundary lock — a client-supplied ``owner`` field is ignored), and the
+# ``checkpoint_id`` is minted SERVER-SIDE by the service.
 # The member rows themselves are CLIENT-captured facts (tokens, fingerprints,
 # timestamps — the capture engine runs client-side against ITS substrates, the
 # coordinator never sees the bytes); the boundary validates their SHAPE
@@ -4194,7 +4789,7 @@ def _handle_workspace_checkpoint(
     member_path, native_token?, fingerprint?, captured_at, absent?,
     dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
 
-    The OWNER is derived from the authenticated ``session_id`` (R9/R13); the
+    The OWNER is derived from the caller-asserted ``session_id`` (R9/R13); the
     ``checkpoint_id`` is minted server-side. The registration is ONE registry
     transaction (header + owner + every member — the Unit-2 API), so a typed
     failure means NO partial manifest.
@@ -4259,6 +4854,8 @@ def _handle_workspace_checkpoint(
         req._json(400, {"error": "members contains duplicate member_path values"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4436,6 +5033,8 @@ def _handle_workspace_restore_status(
     if status not in RESTORE_STATUSES:
         req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -4517,6 +5116,8 @@ def _handle_workspace_restore_member(
     ):
         req._json(400, {"error": "deleted_at_restore must be null or a number"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
 
     def work() -> dict:
         try:
@@ -4561,8 +5162,8 @@ def _handle_workspace_restore_register(
     Request: ``{session_id, checkpoint_id, writes: [{member_path,
     fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
     (fingerprints, never content bytes; the boundary enforces 64-hex). The
-    CONTROLLER identity derives from the authenticated ``session_id``
-    server-side (R9/R13), never a client field. One
+    CONTROLLER identity derives from the caller-asserted ``session_id``
+    (R9/R13), never a separate client field. One
     ``register_workspace_restore`` call → at most one all-or-nothing
     ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
     (``commit_all`` never called, by contract).
@@ -4628,7 +5229,9 @@ def _handle_workspace_restore_register(
             WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
         )
 
-    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    # CONTROLLER derived from the caller-asserted session_id, never a separate field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -5065,6 +5668,14 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/commit"): _handle_session_commit,
     ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
+    # Caller-principal plan U4 — the mint. Registered HERE so it rides the one
+    # dispatcher seam (Host -> Bearer -> migration gate -> counter -> handler).
+    # Out of _MIGRATION_REJECTED_ROUTES: a binding is durable metadata with no
+    # version bump and no grant (the checkpoint-create rationale), and a
+    # claimant that loses its response to a restart recovers it by nonce.
+    # Python-only: the sibling Node coordinator answers 404 here; U6 declares
+    # that asymmetry with a corpus fixture rather than leaving it silent.
+    ("POST", "/principal/claim"): _handle_principal_claim,
     # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
     # ride the central verify_bearer + verify_host seam like every route. The
     # POST threads a watchdog abort Event into the service's abort_guard (the
@@ -5132,6 +5743,7 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/policy/track"): "policy_track_total",
     ("POST", "/policy/untrack"): "policy_untrack_total",
     ("GET", "/status"): "status_total",
+    ("POST", "/principal/claim"): "principal_claim_total",
     # /admin/prepare-for-migration intentionally not counted — it
     # initiates shutdown, so counting it would never be observable via
     # subsequent /status calls (coordinator is already down).
@@ -5238,6 +5850,66 @@ fail-closed client to raise. The residual is a phantom version bump, NOT a
 lost update — full fencing is deferred to the cross-host follow-on (see
 ``_handle_post_edit_cas``)."""
 
+_CALLER_GATE_DEGRADED_RESPONSE: dict[tuple[str, str], dict] = {
+    ("POST", "/hooks/pre-read"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/effect-fence"): _EFFECT_FENCE_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-edit"): _PRE_EDIT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit-cas"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-stop"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-start"): _SESSION_START_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-bash"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-grep"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/session/begin"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/read"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/commit"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/commit_all"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/heartbeat"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/workspace/checkpoint"): _CHECKPOINT_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/status"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/member"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/register"): _RESTORE_REGISTER_DEGRADED_RESPONSE,
+}
+"""What a route answers when its caller-principal gate cannot decide within the
+handler watchdog: exactly what its handler passes ``_run_or_degrade`` for a
+timed-out work body. The request was neither admitted nor refused, so it gets
+the route's ordinary degraded answer — never a principal refusal (nothing was
+refused) and never an admission (nothing was checked). Keyed like
+:data:`_CALLER_PRINCIPAL_POSTURE`, over every route whose gate can read the
+registry, i.e. all but the mint; no default, so a missing route fails loudly. A
+test compares each entry with the route's own timed-out work body, so the two
+cannot drift."""
+
+
+def _watchdog_deadline(req: _RequestProtocol) -> float | None:
+    """The request's watchdog deadline, if its caller-principal gate started
+    one (``None`` — the full ``HANDLER_TIMEOUT_SEC`` — otherwise)."""
+    return getattr(req, "_watchdog_deadline", None)
+
+
+def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> bool:
+    """KTD-G item 1: the queue-depth gate in front of the watchdog pool. When
+    the pool's work queue is past :data:`WATCHDOG_QUEUE_LIMIT`, count it, write
+    the 503 and return True — the caller submits nothing. Shared by
+    :func:`_run_or_degrade` and the caller-principal gate's registry lookup, so
+    neither path queues work the other would have refused."""
+    # A defensive try because ThreadPoolExecutor's _work_queue attribute is
+    # technically private — guard against future stdlib changes.
+    try:
+        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
+    except AttributeError:
+        qsize = 0
+    if qsize <= WATCHDOG_QUEUE_LIMIT:
+        return False
+    coordinator.increment_watchdog_queue_overflow()  # finding #31
+    logger.warning(
+        "watchdog queue at %d items (limit %d); rejecting with 503",
+        qsize,
+        WATCHDOG_QUEUE_LIMIT,
+    )
+    req._json(503, {"error": "watchdog queue overloaded"})
+    return True
+
 
 def _run_or_degrade(
     req: _RequestProtocol,
@@ -5271,26 +5943,18 @@ def _run_or_degrade(
     Item 2 (handler concurrency semaphore) lives in
     _ThreadingHTTPServer.process_request — gates BEFORE this function
     is reached.
+
+    The watchdog deadline is the REQUEST's: when the caller-principal gate
+    already started it with a registry lookup, ``work`` gets only what is left
+    (:func:`_watchdog_deadline`).
     """
-    # KTD-G item 1: queue-depth gate. Use a defensive try because
-    # ThreadPoolExecutor's _work_queue attribute is technically private
-    # — guard against future stdlib changes that would break this.
-    try:
-        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
-    except AttributeError:
-        qsize = 0
-    if qsize > WATCHDOG_QUEUE_LIMIT:
-        coordinator.increment_watchdog_queue_overflow()  # finding #31
-        logger.warning(
-            "watchdog queue at %d items (limit %d); rejecting with 503",
-            qsize,
-            WATCHDOG_QUEUE_LIMIT,
-        )
-        req._json(503, {"error": "watchdog queue overloaded"})
+    if _watchdog_queue_overflowed(req, coordinator):
         return
 
     try:
-        result = coordinator.run_with_watchdog(work, abort=abort)
+        result = coordinator.run_with_watchdog(
+            work, abort=abort, deadline=_watchdog_deadline(req)
+        )
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
         coordinator.increment_watchdog_timeout()  # finding #31
@@ -5730,7 +6394,9 @@ def _fast_path_json(
             )
 
         try:
-            base = coordinator.run_with_watchdog(deliver, abort=abort)
+            base = coordinator.run_with_watchdog(
+                deliver, abort=abort, deadline=_watchdog_deadline(req)
+            )
         except FuturesTimeout:
             # KTD-G item 3 mirror of _run_or_degrade: surface the
             # degradation via the /status counter, then fall through to

@@ -147,7 +147,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 7
+SCHEMA_USER_VERSION = 8
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -203,6 +203,23 @@ paired v4 adds an ``agent_states.last_observed_version`` of its own, so BOTH
 ledgers carry it. The disjoint load-bearing fingerprint is
 ``agent_states.deadline_tick`` (Node-only, below — this repo must never add
 that column), backed by the ``registry_meta.schema_runtime`` stamp.
+
+**v6 -> v7** (SB-10 perf follow-up) indexes ``agent_states(agent_id)``.
+Index-only; see ``_migrate_v6_to_v7``.
+
+**v7 -> v8** (coordinator caller principal, U4) adds the ``caller_principals``
+table: one row per acting identity, binding the caller principal the
+coordinator minted on that identity's first claim, with the claimant's mint
+nonce beside it (the retry proof, KTD11). Its OWN table on purpose — the
+session-liveness sweep, the session cap and session release each touch only
+``session_meta``, so a principal stored there would be reaped at the
+absolute-age ceiling and would consume a snapshot-session slot; here it is
+invisible to all three by construction (R4). Additive-only. The step carries
+the ``_V7_USER_VERSION`` literal conversion (the re-stamp trap, fourth
+arming): ``_migrate_v6_to_v7`` stamped the constant while it was the final
+step and now stamps its own literal 7. FORWARD-ONLY: once a store opens at v8,
+an earlier build refuses it (an unrecognized ``user_version`` raises; there is
+no down step).
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -262,6 +279,13 @@ literal for the same reason as ``_V4_USER_VERSION``/``_V5_USER_VERSION``:
 stamping the constant would mark a v5-origin db ``user_version=7`` WITHOUT
 the index, and the chained v6->v7 loser-guard would no-op (the re-stamp
 trap, third arming)."""
+
+_V7_USER_VERSION = 7
+"""``_migrate_v6_to_v7``'s guard/stamp literal: it adds the
+``agent_states(agent_id)`` index and advances to v7 — NO LONGER the final step
+once v8 (the ``caller_principals`` table) landed. Stamping the constant would
+mark a v6-origin db ``user_version=8`` WITHOUT the table, and the chained
+v7->v8 loser-guard would no-op (the re-stamp trap, fourth arming)."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -404,6 +428,24 @@ CREATE TABLE workspace_checkpoint_members (
     deleted_at_restore  REAL,
     PRIMARY KEY (checkpoint_id, member_path),
     FOREIGN KEY (checkpoint_id) REFERENCES workspace_checkpoints(checkpoint_id) ON DELETE CASCADE
+)
+"""
+
+# Caller-principal bindings (schema v8; coordinator caller principal, U4). One
+# row per acting identity (the session component's agent id, hex), first claim
+# wins and a row is never rebound. ``principal`` is stored as issued because a
+# retry presenting the same ``mint_nonce`` must receive the SAME principal back
+# (R20); the nonce is stored as presented — hashing it would buy nothing while
+# the principal it guards sits beside it in the same 0600 file. Its own table,
+# never ``session_meta``: the session sweep (``all_session_meta``), the cap
+# (``session_count``) and ``release_session`` read or delete only that table,
+# so a principal here outlives every grant and snapshot session (R4). No FK:
+# an identity is not an artifact.
+_CALLER_PRINCIPALS_DDL = """
+CREATE TABLE caller_principals (
+    identity   TEXT PRIMARY KEY,
+    principal  TEXT NOT NULL,
+    mint_nonce TEXT NOT NULL
 )
 """
 
@@ -773,8 +815,8 @@ class SqliteArtifactRegistry:
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
           + the workspace-checkpoint tables + the v6 ``last_observed_version``
-          column + the indexes) in one atomic transaction (no shim ever runs on a
-          fresh db).
+          column + the indexes + the v8 ``caller_principals`` table) in one
+          atomic transaction (no shim ever runs on a fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
           ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
           ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``: idempotently subsumes
@@ -795,7 +837,11 @@ class SqliteArtifactRegistry:
         - ``user_version == 4`` → ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``.
         - ``user_version == 5`` → ``_migrate_v5_to_v6``: an existing v5 db gains
           the ``agent_states.last_observed_version`` column.
-        - ``user_version == 7`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+        - ``user_version == 6`` → ``_migrate_v6_to_v7`` (the agent_id index).
+        - ``user_version == 7`` → ``_migrate_v7_to_v8``: the ``caller_principals``
+          table.
+        - Every branch above ends at ``_migrate_v7_to_v8``, the final chain step.
+        - ``user_version == 8`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -821,6 +867,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
             elif current == 2:
                 # 2 → 3 → 4 → 5 → 6: session_pins, session_meta + index,
                 # checkpoints, last_observed_version.
@@ -829,6 +876,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
                 # commits of that branch stamped it) → add session_meta + index,
@@ -839,22 +887,30 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
             elif current == _V4_USER_VERSION:
                 # An existing v4 db → the workspace-checkpoint tables (v5), then
                 # the last_observed_version column (v6).
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
             elif current == _V5_USER_VERSION:
                 # An existing v5 db → last_observed_version (v6), then the
                 # agent_id index (v7).
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
             elif current == _V6_USER_VERSION:
-                # An existing v6 db (SB-10-era) → index agent_states(agent_id).
+                # An existing v6 db (SB-10-era) → index agent_states(agent_id),
+                # then the caller-principal table (v8).
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+            elif current == _V7_USER_VERSION:
+                # An existing v7 db → the caller-principal table (v8).
+                self._migrate_v7_to_v8(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v7 database — rehydrate; NO writes on this path (the
+                # Existing v8 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -995,6 +1051,13 @@ class SqliteArtifactRegistry:
         add that column), so probe 2 still neither misses a Node db nor
         false-positives on a Python v6 one.
 
+        6. ``user_version == 8`` WITHOUT ``caller_principals`` — the v5 probe's
+           reasoning for the v8 table: ``_migrate_v7_to_v8`` / the fresh apply
+           create it atomically with the v8 stamp (the ``_V7_USER_VERSION``
+           literal conversion makes that hold for every origin), and the Node
+           ledger stops below v8, so the state is foreign-or-corrupt either
+           way. Literal ``8`` — pins Python-v8 semantics.
+
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
         indistinguishable by design — the normal v1->v2 migration proceeds
@@ -1030,6 +1093,13 @@ class SqliteArtifactRegistry:
                 "Python-v5 store always has it — the v4->v5 migration creates "
                 "it atomically with the v5 stamp; no ledger this build "
                 "recognizes stamps 5 without it)"
+            )
+        if current == 8 and not self._has_table("caller_principals"):
+            self._raise_cross_runtime(
+                "is user_version=8 without the caller_principals table (a "
+                "Python-v8 store always has it — the v7->v8 migration creates "
+                "it atomically with the v8 stamp; no ledger this build "
+                "recognizes stamps 8 without it)"
             )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
@@ -1172,6 +1242,8 @@ class SqliteArtifactRegistry:
             c.execute(_WORKSPACE_CHECKPOINTS_DDL)
             c.execute(_WORKSPACE_CHECKPOINT_MEMBERS_DDL)
             c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
+            # Caller-principal bindings (v8, caller-principal U4): same rule.
+            c.execute(_CALLER_PRINCIPALS_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -1611,8 +1683,10 @@ class SqliteArtifactRegistry:
     def _migrate_v6_to_v7(self, instance_id: str | None) -> None:
         """Migrate a v6 db to v7 in ONE atomic transaction (SB-10 perf
         follow-up): index ``agent_states(agent_id)``, then stamp
-        ``user_version=7``. Caller holds lock. The FINAL step of the chain,
-        so it stamps ``SCHEMA_USER_VERSION``.
+        ``user_version=7``. Caller holds lock. Guards and stamps the
+        ``_V7_USER_VERSION`` literal — v8 (the ``caller_principals`` table)
+        made this a chained step, so stamping the constant would re-arm the
+        re-stamp trap (fourth arming).
 
         WHY: the post-compaction session-start builder reads ``agent_states``
         scoped by ``agent_id IN (...)`` (``status_snapshot(agent_ids=...)``),
@@ -1645,7 +1719,7 @@ class SqliteArtifactRegistry:
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
-            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V7_USER_VERSION:
                 # A racing winner already advanced to v7 — nothing to do.
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
@@ -1653,6 +1727,58 @@ class SqliteArtifactRegistry:
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_states_agent "
                 "ON agent_states(agent_id)"
+            )
+            c.execute(f"PRAGMA user_version = {_V7_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v7_to_v8(self, instance_id: str | None) -> None:
+        """Migrate a v7 db to v8 in ONE atomic transaction (coordinator caller
+        principal, U4): create the ``caller_principals`` table, then stamp
+        ``user_version=8``. Caller holds lock. The FINAL step of the chain, so
+        it stamps ``SCHEMA_USER_VERSION``.
+
+        Table-only and additive: no existing table, column or index is touched.
+        ``CREATE TABLE IF NOT EXISTS`` is the half-migrated-db guard (a crash
+        after the CREATE but before the stamp rolls both back under the one
+        transaction; a re-migrate re-creates). Same atomicity discipline as
+        every other step: ONE ``BEGIN IMMEDIATE`` wrapping CREATE + stamp,
+        individual ``execute()`` calls, ``except BaseException`` ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v8 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION (KTD6): the sibling Node coordinator's ledger
+        stops below v8, and its guard refuses a Python-lineage store on the
+        ``schema_runtime='python'`` stamp and the ``artifact_versions`` table
+        before it interprets the integer — so this Python-only bump needs no
+        coordinated guard edit. This side adds probe 6 to
+        ``_reject_foreign_ledger_db`` (v8 stamped WITHOUT the table), the v5
+        precedent for a table-adding step.
+
+        Concurrent-loser path: both processes can read ``user_version == 7``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v8 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _CALLER_PRINCIPALS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
             )
             c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
@@ -2538,6 +2664,46 @@ class SqliteArtifactRegistry:
             return int(
                 self._conn.execute("SELECT COUNT(*) FROM session_meta").fetchone()[0]
             )
+
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind (coordinator caller principal, U4); returns the
+        BOUND ``(principal, mint_nonce)`` pair. The insert-if-absent and the
+        read-back share one ``BEGIN IMMEDIATE`` under ``_lock``, so two
+        concurrent first claims bind ONE principal. ``ON CONFLICT(identity) DO
+        NOTHING`` rather than ``INSERT OR IGNORE``: only the identity conflict
+        is the first-claim-wins rule — a NOT NULL violation must still raise,
+        never be silently ignored into a missing row."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO caller_principals (identity, principal, mint_nonce) "
+                    "VALUES (?, ?, ?) ON CONFLICT(identity) DO NOTHING",
+                    (identity.hex, principal, mint_nonce),
+                )
+                row = self._conn.execute(
+                    "SELECT principal, mint_nonce FROM caller_principals "
+                    "WHERE identity = ?",
+                    (identity.hex,),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return (row[0], row[1])
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when unclaimed.
+        A plain read, so it serves a read-only open too."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT principal FROM caller_principals WHERE identity = ?",
+                (identity.hex,),
+            ).fetchone()
+        return row[0] if row is not None else None
 
     def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
         """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,

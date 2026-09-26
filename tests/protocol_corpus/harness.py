@@ -55,15 +55,28 @@ A principal is subject to R5 and is NOT expressible in an expectation: it
 normalizes to ``PRINCIPAL_SENTINEL``, ``preserve_identity`` cannot un-hide it,
 and ``build_fixture`` refuses a fixture whose expected body carries one.
 
+- **A value only one backend issues.** A preflight may declare
+  ``"backends": [...]``; it then runs only on those backends. The caller
+  principal is the case: only the Python coordinator mints one, and a
+  both-backend fixture that exercises a require-class route must present it
+  there while the Node coordinator (which answers 404 on the claim and ignores
+  the header, plan KTD12) gets none. A capture made by such a preflight may be
+  referenced ONLY as the whole value of a request header; on a backend where
+  the preflight did not run, that header is omitted — exactly what a conforming
+  client does after a 404 on the claim. Any other reference is refused at load.
+
 Spawn isolation: each fixture gets a fresh ``tmp_path`` workspace. The Python
 coordinator runs in-thread (no subprocess overhead). The Node coordinator runs
 as ``node <plugin-dist>/coordinator.js`` with ``AGENT_COHERENCE_WORKSPACE``
 pointing at the tmp workspace. Both coordinators bind ephemeral ports.
 
 Plugin coordinator discovery: ``AGENT_COHERENCE_PLUGIN_DIST_PATH`` env var
-(absolute path to ``dist/coordinator.js``); fallback ``../agent-coherence-plugin/dist/coordinator.js``
-relative to the library repo root; fallback ``~/projects/agent-coherence-plugin/dist/coordinator.js``.
-If none resolve, Node backend scenarios xfail with a clear reason."""
+(absolute path to ``dist/coordinator.js``); only while it is UNSET, fallback
+``../agent-coherence-plugin/dist/coordinator.js`` relative to the library repo root, then
+``~/projects/agent-coherence-plugin/dist/coordinator.js``. Set to a path that does not exist, it
+raises instead of falling back. If it is unset and neither fallback exists, the resolver returns
+``None``: the parity corpora xfail their Node rows with a clear reason, and the asymmetry corpora
+(caller principal, effect fence) fail them."""
 
 from __future__ import annotations
 
@@ -85,6 +98,8 @@ FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
 HARNESS_TIMEOUT_SEC = 10.0
 NODE_SPAWN_TIMEOUT_SEC = 8.0
 NODE_SHUTDOWN_TIMEOUT_SEC = 5.0
+#: Names the Node coordinator entry point to run; see :func:`resolve_node_dist_path`.
+NODE_DIST_PATH_ENV = "AGENT_COHERENCE_PLUGIN_DIST_PATH"
 
 
 # ----------------------------------------------------------------------
@@ -427,8 +442,15 @@ def _validate_capture_references(name: str, setup: dict, request: dict) -> None:
     Checked at load so the failure lands at collection, where it names the
     fixture, rather than mid-run where it names a request. The run-time guard in
     ``_substitute`` stays regardless: a fixture mutated in memory (which is how
-    the corpus tests drive their controls) never passes through here."""
+    the corpus tests drive their controls) never passes through here.
+
+    A capture made by a backend-scoped preflight is SCOPED: it is not issued on
+    the other backends, so it may appear only as the whole value of a request
+    header (omitted where it was not issued). Anywhere else — a body field, a
+    path, part of a longer string — there is no honest value to send in its
+    place, and the fixture is refused."""
     declared: set[str] = set()
+    scoped: set[str] = set()
     stages: list[tuple[str, Any]] = [
         (f"preflight #{i}", req)
         for i, req in enumerate(setup.get("preflight_requests") or [])
@@ -443,6 +465,41 @@ def _validate_capture_references(name: str, setup: dict, request: dict) -> None:
                         f"preflight captures. Declared so far: "
                         f"{sorted(declared) or '<none>'}."
                     )
+        header_refs = {
+            m.group(1)
+            for value in (stage.get("headers") or {}).values()
+            if isinstance(value, str) and (m := _CAPTURE_REF_RE.fullmatch(value))
+        }
+        without_headers = {k: v for k, v in stage.items() if k != "headers"}
+        for text in _iter_strings(without_headers):
+            for ref in _CAPTURE_REF_RE.findall(text):
+                if ref in scoped:
+                    raise FixtureContractError(
+                        f"{name}: {label} references the backend-scoped capture "
+                        f"{ref!r} outside a request header. It is not issued on "
+                        f"every backend, so it may only be a whole header value."
+                    )
+        for value in (stage.get("headers") or {}).values():
+            for ref in _CAPTURE_REF_RE.findall(value if isinstance(value, str) else ""):
+                if ref in scoped and ref not in header_refs:
+                    raise FixtureContractError(
+                        f"{name}: {label} embeds the backend-scoped capture "
+                        f"{ref!r} in a longer header value; it must be the whole "
+                        f"value so the header can be omitted where it is not issued."
+                    )
+        stage_backends = stage.get("backends")
+        if stage_backends is not None:
+            if label == "request":
+                raise FixtureContractError(
+                    f"{name}: the main request cannot be backend-scoped; scope the "
+                    f"fixture with its top-level 'backends' instead."
+                )
+            unknown = [b for b in stage_backends if b not in ALL_BACKENDS]
+            if not stage_backends or unknown:
+                raise FixtureContractError(
+                    f"{name}: {label} declares backends {stage_backends!r}; it "
+                    f"must be a non-empty subset of {ALL_BACKENDS}."
+                )
         for captured in stage.get("capture") or {}:
             if captured in declared:
                 raise FixtureContractError(
@@ -451,6 +508,8 @@ def _validate_capture_references(name: str, setup: dict, request: dict) -> None:
                     f"wrong mint."
                 )
             declared.add(captured)
+            if stage_backends is not None and set(stage_backends) != set(ALL_BACKENDS):
+                scoped.add(captured)
 
 
 def _validate_preserve_identity(
@@ -597,6 +656,34 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
             )
 
 
+class _NotIssued:
+    """A capture whose preflight was scoped away from this backend."""
+
+    def __repr__(self) -> str:
+        return "<not issued on this backend>"
+
+
+NOT_ISSUED = _NotIssued()
+
+
+def _omit_headers_not_issued(request: dict, captures: dict[str, Any]) -> dict:
+    """Drop every request header whose whole value names a capture this backend
+    never issued (see the module docstring). Everything else is left for
+    ``_substitute``, which refuses a not-issued value anywhere else."""
+    headers = request.get("headers")
+    if not headers:
+        return request
+    kept = {
+        k: v for k, v in headers.items()
+        if not (
+            isinstance(v, str)
+            and (m := _CAPTURE_REF_RE.fullmatch(v))
+            and captures.get(m.group(1)) is NOT_ISSUED
+        )
+    }
+    return {**request, "headers": kept}
+
+
 def _substitute(value: Any, captures: dict[str, Any], *, where: str) -> Any:
     """Replace every ``${name}`` in a request tree with its captured value.
 
@@ -620,6 +707,12 @@ def _substitute(value: Any, captures: dict[str, Any], *, where: str) -> Any:
                 f"{sorted(captures) or '<none>'}. Refusing to send the literal "
                 f"— a never-minted value draws a rejection that can silently "
                 f"satisfy the fixture's own expectation."
+            )
+        if captures[ref] is NOT_ISSUED:
+            raise FixtureSubstitutionError(
+                f"{where}: ${{{ref}}} was not issued on this backend and is "
+                f"referenced outside a whole header value; there is no honest "
+                f"value to send in its place."
             )
         return captures[ref]
 
@@ -681,7 +774,17 @@ def apply_preflight_requests(
     captures: dict[str, Any] = {}
     for i, req in enumerate(preflight):
         where = f"preflight #{i} ({req.get('method', 'POST')} {req.get('path')!r})"
-        resolved = _substitute(req, captures, where=where)
+        scope = req.get("backends")
+        if scope is not None and backend.backend_id not in scope:
+            # Scoped away from this backend: it never runs here, and what it
+            # would have captured is recorded as not issued.
+            for name in req.get("capture") or {}:
+                captures[name] = NOT_ISSUED
+            continue
+        resolved = _substitute(
+            _omit_headers_not_issued(req, captures), captures, where=where
+        )
+        resolved.pop("backends", None)
         status, body = execute_request(backend, resolved)
         # Allow 200, 400 (preflight that expects validation errors), 404.
         # Anything in the 500s indicates a coordinator bug — fail loud.
@@ -880,13 +983,29 @@ def resolve_node_dist_path() -> Optional[Path]:
     2. ``../agent-coherence-plugin/dist/coordinator.js`` relative to library repo root
     3. ``~/projects/agent-coherence-plugin/dist/coordinator.js``
 
-    Returns ``None`` if nothing resolves — the harness then xfails Node backend
-    scenarios with a clear reason rather than hanging."""
-    explicit = os.environ.get("AGENT_COHERENCE_PLUGIN_DIST_PATH")
-    if explicit:
-        p = Path(explicit).expanduser().resolve()
-        if p.exists():
-            return p
+    The fallbacks apply only while the variable is UNSET. Set to a path that
+    does not exist (or set empty), it raises ``FileNotFoundError`` naming the
+    variable: an explicit path is the one a run was asked to test, and falling
+    back from a mistyped one would run the Node rows against whatever dist the
+    fallback checkout holds and report green. Every corpus module resolves at
+    import, so the raise is a collection error in each of them and none of
+    their rows is collected -- not a failure in only the rows that remembered
+    to check.
+
+    Returns ``None`` if the variable is unset and no fallback exists — the
+    parity corpora then xfail their Node rows with a clear reason, and the
+    asymmetry corpora fail them, rather than hanging."""
+    explicit = os.environ.get(NODE_DIST_PATH_ENV)
+    if explicit is not None:
+        p = Path(explicit).expanduser().resolve() if explicit else None
+        if p is None or not p.exists():
+            raise FileNotFoundError(
+                f"{NODE_DIST_PATH_ENV} is set to {explicit!r}, which is not an "
+                f"existing path. An explicit dist is never replaced by a fallback "
+                f"checkout: point it at a built dist/coordinator.js, or unset it "
+                f"to use ../agent-coherence-plugin or ~/projects/agent-coherence-plugin."
+            )
+        return p
     sibling = (REPO_ROOT.parent / "agent-coherence-plugin" / "dist" / "coordinator.js").resolve()
     if sibling.exists():
         return sibling
@@ -989,7 +1108,9 @@ def run_scenario(
         # The main request may name any value a preflight captured. Applied to
         # the REQUEST only — never to the expected body (R5).
         request = _substitute(
-            fixture.request, captures, where=f"{fixture.name} request"
+            _omit_headers_not_issued(fixture.request, captures),
+            captures,
+            where=f"{fixture.name} request",
         )
         status, body = execute_request(backend, request)
     return status, normalize_response(

@@ -296,6 +296,19 @@ class RegistryBase(Protocol):
     def artifact_ids(self) -> list[UUID]:
         ...
 
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind of a caller principal to ``identity``: insert
+        ``(principal, mint_nonce)`` only if ``identity`` has no binding yet, and
+        return the BOUND pair either way — the caller's own on a first claim,
+        the earlier claimant's otherwise. Never rebinds. One atomic step, so two
+        concurrent first claims bind ONE principal. Deliberately its own store,
+        never the session-meta one: the session sweep, the session cap and
+        session release must not see it (a principal outlives both a grant and a
+        snapshot session)."""
+        ...
+
     def capture_version_vector(
         self,
         read_set: "Iterable[UUID]",
@@ -367,6 +380,12 @@ class RegistryBase(Protocol):
         ...
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
+        ...
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """Return the caller principal bound to ``identity``, or ``None`` when
+        the identity is unclaimed. The durable tier the service's validator
+        falls back to when its in-process cache misses."""
         ...
 
     def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
