@@ -209,6 +209,33 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Coordinator requests no longer reload the system CA store on every call.**
+  The client built a fresh `urllib` opener for every request, and the stdlib's
+  `build_opener()` always adds a default HTTPS handler. On Python 3.12 and
+  later, that handler's constructor creates an SSL context and loads every
+  certificate in the system trust store, even for plain `http://` to loopback:
+  13 ms or more of CPU per request, twice per `CoherentVolume.write_cas`, and at
+  least once for every CLI or hook call. Plain-http requests now share one
+  opener, built on first use with no HTTPS handler and safe to use from many
+  threads. Measured over loopback on Python 3.13, a request's median latency
+  drops from about 16–22 ms to under 1 ms, and the first request of a fresh
+  process from about 33 ms to about 10 ms. Python 3.11 creates that context
+  lazily, so it gains less (about 1.2 ms to 0.6–0.7 ms).
+  `https://` without `CCS_REMOTE_CA_FILE` paid the same kind of cost on every
+  Python version: it built its verified context, and so reloaded the system
+  trust store, for each request. That context is now built once per process
+  and shared. Measured against a 192-certificate system store on Python 3.11
+  and 3.13, a request's median drops from about 20–22 ms to about 3.5 ms.
+  Certificate verification is unchanged, every 3xx is still refused (308
+  included), and with `CCS_REMOTE_CA_FILE` set the context is still built on
+  every request, so that bundle is still checked and re-read each time. The
+  system trust store (including `SSL_CERT_FILE`) is now read once, when the
+  shared opener is built, instead of on every request, so a certificate removed
+  from it stays trusted until the process restarts. The rebuilt openers also go
+  straight to the coordinator and ignore proxy settings (`http_proxy`,
+  `https_proxy`, and on macOS and Windows the system proxy), for loopback and
+  remote endpoints alike.
+
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
   own preemption prose.** `short_session_id` landed in `hook_payloads` and was
   routed through the three renderers there, but `coordinator_server.py` never
