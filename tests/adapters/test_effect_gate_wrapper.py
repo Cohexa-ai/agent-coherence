@@ -22,12 +22,13 @@ from uuid import uuid4
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.effect_gate import check_fence, gate
+from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint, resolve_remote_endpoint
 from ccs.cli._coherence_client import post as _cc_post
-from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import (
     HOLD_GRANT_PREEMPTED,
     HOLD_GRANT_RECLAIMED,
@@ -583,6 +584,69 @@ def test_gate_propagates_infra_error_in_strict_mode(
             gate(vol, REL, decide=decide, effect=effect)
         assert not isinstance(exc_info.value, StaleView)  # infra failure, not a HOLD
         assert fired == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_forked_child_check_fence_holds_on_the_parents_comparands(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A forked child pulling the verdict with comparands its parent captured
+    must HOLD: the child re-mints its identity, so the grant the decision was
+    read under is the parent's, never the child's. The fence's verification
+    read re-attaches the child and is answered stale under the fresh identity.
+    If the coordinator ever answered it fresh, the child would fire an effect
+    decided under a grant it does not hold."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(REL, b"config-v1")
+        _data, version, generation = vol.read_with_version_generation(REL)
+        # Confirmed comparands, so the HOLD below cannot be an unconfirmed one.
+        assert version > 0 and generation is not None
+
+        vol._after_fork()  # simulate the child-side fork handler
+
+        with pytest.raises(StaleView) as exc_info:
+            check_fence(vol, REL, expected_version=version, expected_generation=generation)
+        assert vol.is_attached  # the verification read re-attached the child
+        exc = exc_info.value
+        assert exc.hold_cause == HOLD_GRANT_PREEMPTED
+        assert (exc.current_version, exc.current_generation) == (version, generation)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_forked_child_gate_raises_without_firing_while_reattach_fails(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strict child forked between capture and re-validate, whose re-attach
+    fails, raises the infra error from the re-validate read -- not a HOLD built
+    on a version it never asked the coordinator for -- and the effect never
+    fires."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict default
+    try:
+        vol.write(REL, b"config-v1")
+        fired: list[str] = []
+
+        def unavailable(*_args: object) -> None:
+            raise CoordinatorUnavailable("server.pid missing (coordinator restarting)")
+
+        def decide(data: bytes) -> str:
+            vol._after_fork()  # the child continues the gate from here
+            monkeypatch.setattr(coherent_volume_module, "resolve_endpoint", unavailable)
+            return "deploy"
+
+        def effect(decision: str) -> str:  # pragma: no cover - must never run
+            fired.append(decision)
+            return "should-not-fire"
+
+        with pytest.raises(CoherenceError) as exc_info:
+            gate(vol, REL, decide=decide, effect=effect)
+        assert not isinstance(exc_info.value, StaleView)  # infra failure, not a HOLD
+        assert fired == []
+        assert not vol.is_attached
     finally:
         stop_coordinator(tmp_path)
 
