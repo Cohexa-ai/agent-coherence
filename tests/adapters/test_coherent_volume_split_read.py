@@ -153,10 +153,17 @@ def test_read_with_version_refuses_a_split_pair_in_the_commit_window(
     peer = LaggingPeer(peer_vol, monkeypatch)
     peer.commit(b"1")
     try:
-        with pytest.raises(StaleView):
+        with pytest.raises(StaleView) as exc:
             reader.read_with_version(_PATH)
     finally:
         peer.finish()
+    # The refusal tells the caller to wait out a peer's commit BEFORE concluding
+    # the file changed outside the coordinator and writing: a write made inside
+    # the window is overwritten when the peer's bytes land.
+    guidance = str(exc.value)
+    assert "reacquire()" in guidance
+    assert guidance.index("few seconds") < guidance.index("write()")
+    assert "overwritten" in guidance
 
 
 @_READER_STATES
