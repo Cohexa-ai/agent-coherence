@@ -698,8 +698,10 @@ class RedirectRefused(CoherenceError):
     new hop* before application code can intervene, so the bearer would ride an
     attacker-chosen URL. The client therefore refuses ANY 3xx (both ``http`` and
     ``https`` endpoints) before a second request is made — the bearer never
-    leaves the configured endpoint. Carries the attempted ``location`` and
-    ``status``."""
+    leaves the configured endpoint. Carries the ``status``. The client never
+    passes the ``Location`` it was sent as ``location``, only a placeholder:
+    the ``Location`` is the redirector's text, and may echo a principal or a
+    mint nonce it was sent."""
 
     def __init__(self, location: str, status: int | None = None) -> None:
         status_part = f" ({status})" if status is not None else ""

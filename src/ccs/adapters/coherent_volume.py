@@ -90,6 +90,7 @@ from ccs.core.exceptions import (
     CommitUnconfirmed,
     InternalConcurrencyError,
     PublishMaterializationError,
+    RedirectRefused,
     RemoteAuthFailed,
     StaleView,
     ViewWedged,
@@ -250,18 +251,20 @@ def _unrecorded_write_state(rel: str, *, wrote: bool, grant_confirmed: bool) -> 
     text, when its commit (post-edit) is refused for the caller principal
     after its grant request: the state the write left — the file (``wrote``:
     whether this call put the bytes there, or they were already on disk),
-    the coordinator's record and version, the peers and the grant, each as
-    far as this client knows it. Built from constants and the path — no
-    coordinator text, so no principal or nonce."""
+    the coordinator's record of this write's commit, the peers and the
+    grant, each as far as this client knows it. Built from constants and the
+    path — no coordinator text, so no principal or nonce.
+
+    It says the commit was not recorded, not that no version moved: the
+    grant request registers a path the coordinator has never seen (no
+    version, then 1), and a peer can commit between the grant and the
+    refused commit."""
     if wrote:
         disk = f"This write put its bytes on disk at {rel}."
     else:
         disk = f"{rel} already held this write's bytes on disk, so this write left the file as it was."
     grant = _GRANT_REQUEST_ADMITTED if grant_confirmed else _GRANT_REQUEST_UNCONFIRMED
-    return (
-        f"{disk} The coordinator did not record the write: no version it keeps "
-        f"for the path advanced. {grant}"
-    )
+    return f"{disk} The coordinator did not record this write's commit. {grant}"
 
 
 class CoherentVolume:
@@ -1062,6 +1065,7 @@ class CoherentVolume:
                 )
             raise
 
+        redirect_status: int | None = None
         try:
             post_resp = self._post(
                 "/hooks/post-edit",
@@ -1072,6 +1076,13 @@ class CoherentVolume:
                     "content_hash": new_hash,
                 },
             )
+        except RedirectRefused as redirect:
+            # A redirected commit is a failed commit like any other status
+            # outside 2xx — refused, never followed — so, the bytes being on
+            # disk, it takes on_error's path below, as a 5xx or a lost answer
+            # does, by its status alone, and not the typed refusal of a request
+            # that changed nothing.
+            post_resp, redirect_status = None, redirect.status
         except CallerPrincipalRefused as refusal:
             # Refused AFTER the grant request: the refusal itself changed
             # nothing at the coordinator, but this write() had already put its
@@ -1085,6 +1096,11 @@ class CoherentVolume:
                 rel, wrote=not already_on_disk, grant_confirmed=grant_confirmed
             )
             raise CallerPrincipalRefused(refusal.reason, f"{state} {refusal}") from None
+        if redirect_status is not None:
+            self._fail_closed_or_degrade(
+                f"coordinator request to /hooks/post-edit failed: HTTP {redirect_status}, "
+                "a redirect, which this client never follows"
+            )
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);

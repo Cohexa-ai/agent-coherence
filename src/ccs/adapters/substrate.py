@@ -60,6 +60,7 @@ from ccs.core.exceptions import (
     CommitUnconfirmed,
     RedirectRefused,
     StaleView,
+    TlsVerificationFailed,
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor
@@ -596,17 +597,27 @@ class SubstrateCoordinatorSession:
             raise CallerPrincipalRefused(CALLER_PRINCIPAL_CLAIMED_REASON, message)
         raise CoherenceError(message)
 
-    def pre_read(self, artifact_ref: str, content_hash: str | None) -> PreReadResult:
+    def pre_read(
+        self,
+        artifact_ref: str,
+        content_hash: str | None,
+        *,
+        unknown: type[CoherenceError] = CoherenceError,
+    ) -> PreReadResult:
         """Register a SHARED view and return the coordinator's version + deny
         state. This is what makes a later peer commit invalidate this reader
         (pull invalidation, surfaced at THIS reader's next binding-mediated act).
+
+        A failure raises ``unknown`` — a plain ``CoherenceError`` for a read,
+        ``CommitUnconfirmed`` for a pre-read a commit sends after its
+        substrate write landed.
         """
         payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
         if content_hash is not None:
             payload["content_hash"] = content_hash
-        resp = self._post("/hooks/pre-read", payload, unknown=CoherenceError)
+        resp = self._post("/hooks/pre-read", payload, unknown=unknown)
         if resp.get("degraded"):
-            raise CoherenceError("coordinator watchdog timeout on pre-read (fail-closed)")
+            raise unknown("coordinator watchdog timeout on pre-read (fail-closed)")
         return PreReadResult(
             version=_pre_read_version(resp),
             stale_denied=_pre_read_denied(resp),
@@ -631,11 +642,18 @@ class SubstrateCoordinatorSession:
         resp = self._post("/hooks/post-edit-cas", payload, unknown=CommitUnconfirmed)
         return _classify_commit(resp, expected_version)
 
-    def coordinator_hash_matches(self, artifact_ref: str, content_hash: str) -> bool:
+    def coordinator_hash_matches(
+        self,
+        artifact_ref: str,
+        content_hash: str,
+        *,
+        unknown: type[CoherenceError] = CoherenceError,
+    ) -> bool:
         """True iff the coordinator's recorded hash equals ``content_hash`` — the
         token-identity signal that a byte-identical peer already carried this
-        writer's intended content to the coordinator (so the bump is complete)."""
-        return not self.pre_read(artifact_ref, content_hash).hash_differs
+        writer's intended content to the coordinator (so the bump is complete).
+        A failure to tell raises ``unknown`` (see :meth:`pre_read`)."""
+        return not self.pre_read(artifact_ref, content_hash, unknown=unknown).hash_differs
 
     def _post(
         self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]
@@ -687,9 +705,9 @@ class SubstrateCoordinatorSession:
         refused and never followed, but whatever answered may have passed the
         request on, so on the commit leg — reached only after the substrate
         write landed — whether the bump landed is not known. Reported by its
-        status alone, outside the ``except`` block: the ``RedirectRefused``
-        quotes the ``Location``, the coordinator's text, whenever the request
-        presented no principal."""
+        status alone, outside the ``except`` block, so the ``RedirectRefused``
+        is not on the raised error's chain either: the refusal withholds the
+        ``Location`` today, and this error does not depend on it doing so."""
         redirected = False
         try:
             resp = _coordinator_post(
@@ -916,22 +934,38 @@ class CoordinatedSubstrate:
         """The coordinator leg, reached only after the substrate write landed.
 
         A caller-principal refusal here is reported through the bump leg's
-        unknown, not raised bare: the refusal is definite (the coordinator
-        recorded nothing of this write), but the substrate already holds the
-        new bytes, so the commit is in exactly the state Case 1 leaves — and
-        the refusal's own recovery, resending a request that "changed nothing",
-        would re-drive a landed write. ``CommitUnconfirmed`` carries the
-        recovery that is right (re-read; retry only if absent; never re-drive),
-        its message says what happened, and the typed refusal is its cause."""
+        unknown, not raised bare: the refusal is definite (the refused request
+        changed nothing), but the substrate already holds the new bytes, so
+        the commit is in exactly the state Case 1 leaves — and the refusal's
+        own recovery, resending a request that "changed nothing", would
+        re-drive a landed write. ``CommitUnconfirmed`` carries the recovery
+        that is right (re-read; retry only if absent; never re-drive), its
+        message says what happened, and the typed refusal is its cause. A TLS
+        verification failure — definite too: the request was never sent — is
+        reported the same way.
+
+        Each message names what this write did not do, never the version: on
+        a converged write a byte-identical peer's bump may have advanced it,
+        and the refused request is then the pre-read that checks for it. Nor
+        does a converged write claim it "landed": attribution is disclaimed
+        (see :class:`ReconcileVerdict`)."""
+        landed = _landed_clause(pending.artifact_ref, converged=converged)
         try:
             return self._bump(pending, converged=converged)
         except CallerPrincipalRefused as refusal:
             raise CommitUnconfirmed(
-                f"the substrate write to {pending.artifact_ref!r} landed, but the "
-                "coordinator recorded nothing of it: it refused the caller principal "
-                f"({refusal.reason}), so no version was bumped and no peer invalidated. "
-                "Not re-driven; re-read before retrying."
+                f"{landed}, but the coordinator refused the caller principal of a "
+                f"request this commit sent ({refusal.reason}), so it recorded no bump "
+                "from this write, and this write invalidated no peer. Not re-driven; "
+                "re-read before retrying."
             ) from refusal
+        except TlsVerificationFailed as failure:
+            raise CommitUnconfirmed(
+                f"{landed}, but a request this commit made to the coordinator failed "
+                "TLS certificate verification, so it was never sent, and the "
+                "coordinator recorded no bump from this write. Not re-driven; re-read "
+                "before retrying."
+            ) from failure
 
     def _bump(self, pending: _PendingCommit, *, converged: bool) -> CommitResult:
         try:
@@ -955,9 +989,10 @@ class CoordinatedSubstrate:
     ) -> CommitResult:
         # A converged write whose bump lost to a byte-identical peer is COMPLETE
         # if the coordinator already holds the intended hash — no re-drive, no
-        # second bump (that would be a phantom advance).
+        # second bump (that would be a phantom advance). The substrate write has
+        # landed, so a check that cannot tell is the bump leg's unknown.
         if converged and self._coordinator.coordinator_hash_matches(
-            pending.artifact_ref, pending.intended_hash
+            pending.artifact_ref, pending.intended_hash, unknown=CommitUnconfirmed
         ):
             self._observed_hash[pending.artifact_ref] = pending.intended_hash
             return CommitResult(
@@ -1021,6 +1056,19 @@ class CoordinatedSubstrate:
             f"re-drive of {pending.artifact_ref!r} is again unconfirmed; reconcile by "
             "re-reading before retrying"
         )
+
+
+def _landed_clause(artifact_ref: str, *, converged: bool) -> str:
+    """How a commit's report names the substrate write once it is on the
+    substrate: "landed" for a confirmed write, and for a converged one only
+    that the substrate holds the intended bytes — a byte-identical peer may
+    have put them there."""
+    if converged:
+        return (
+            f"the substrate holds the bytes this write intended for {artifact_ref!r} "
+            "(converged: which write put them there is not claimed)"
+        )
+    return f"the substrate write to {artifact_ref!r} landed"
 
 
 def _replace_expected_version(pending: _PendingCommit, version: int) -> _PendingCommit:

@@ -12,6 +12,7 @@ separately.
 from __future__ import annotations
 
 import builtins
+import http.server
 import io
 import logging
 import os
@@ -46,7 +47,7 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
-from ccs.cli._coherence_client import CoordinatorUnavailable
+from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
@@ -3672,20 +3673,18 @@ def test_a_cas_that_never_hands_its_comparand_bytes_on_never_seeds_the_baseline(
 # FROZEN duplicates of the text write() raises when its commit is refused for
 # the caller principal after the bytes reached disk — never built from the
 # constants under test. Each clause is a claim about state (the disk, the
-# coordinator's record, its version, the peers, the grant) and a test below
-# observes that state — on a path the coordinator tracks and on one it does
-# not, whose admitted grant requests get the same answer, and for a write
-# whose bytes were already on disk.
+# coordinator's record of this write's commit, the peers, the grant) and a
+# test below observes that state — on a path the coordinator tracks and on
+# one it does not, whose admitted grant requests get the same answer; for a
+# write whose bytes were already on disk and for ones the volume rewrote; and
+# where the version moved for a reason other than this write's commit.
 
 _WROTE = "This write put its bytes on disk at {rel}. "
 _ALREADY_HELD = (
     "{rel} already held this write's bytes on disk, so this write left the file "
     "as it was. "
 )
-_UNRECORDED_WRITE = (
-    "The coordinator did not record the write: no version it keeps for the path "
-    "advanced. {grant} "
-)
+_UNRECORDED_WRITE = "The coordinator did not record this write's commit. {grant} "
 _GRANT_TAKEN = (
     "If the coordinator tracked the path when it admitted this write's grant "
     "request, that request invalidated every peer it had recorded as holding a "
@@ -3771,7 +3770,7 @@ def test_a_commit_refused_for_its_principal_after_the_bytes_landed_says_they_did
         assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
         assert _coordinator_state(vol, rel) == "EXCLUSIVE", "and was not released"
         _data, version, _generation = peer.read_with_version_generation(rel, observe=False)
-        assert version == 1, "the coordinator recorded nothing"
+        assert version == 1, "the coordinator did not record the commit"
         assert _coordinator_state(peer, rel) is None, "the peer was invalidated, as the message says"
         # The pre-edit deny fires only for an INVALID editor, so this is the
         # invalidation itself, not the moved disk.
@@ -3856,8 +3855,23 @@ _REFUSED_WRITE_PATHS = {
     "managed-but-ignored": ("data/shared.txt", "- data/**\n"),
 }
 
+# What the refused write puts, against what the file and the volume already
+# hold: (the bytes it writes, the disk writes it makes). The volume skips the
+# disk only when the file holds bytes it COMMITTED itself (``same-bytes``). It
+# rewrites them after a READ of the same bytes, which commits nothing
+# (``read-then-same-bytes``), and when its committed bytes go back over a
+# foreign edit under ``on_stale_write='allow'`` (``committed-over-foreign``) —
+# neither the disk nor the volume's record alone says which, so the disk
+# clause is checked against the writes counted in every arm.
+_REFUSED_WRITE_BYTES = {
+    "new-bytes": (b"v2", 1),
+    "same-bytes": (b"v2", 0),
+    "read-then-same-bytes": (b"v1", 1),
+    "committed-over-foreign": (b"v2", 1),
+}
 
-@pytest.mark.parametrize("rewrite", ["new-bytes", "same-bytes"])
+
+@pytest.mark.parametrize("rewrite", list(_REFUSED_WRITE_BYTES))
 @pytest.mark.parametrize("where", list(_REFUSED_WRITE_PATHS))
 def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
@@ -3869,29 +3883,33 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     grant and invalidated nobody. The volume cannot tell which (its managed
     globs do not decide it: an ignored path is managed here and untracked
     there), so the message states both cases, and each is observed where it
-    applies. ``same-bytes`` rewrites bytes the file already holds, so the
-    write never touches the disk — and the message says so instead of
-    claiming it put them there.
+    applies. The disk clause says whether THIS call wrote the file, and each
+    arm counts the disk writes it made (see ``_REFUSED_WRITE_BYTES``).
 
     Every clause is checked against state: the disk (and whether this call
-    wrote it), the coordinator's version, the grant, and the peer — which,
-    on a tracked path, is invalidated and refused as revoked, and on an
-    untracked one, held no copy the coordinator knew of and writes freely."""
+    wrote it), the coordinator's record of the commit, the grant, and the
+    peer — which, on a tracked path, is invalidated and refused as revoked,
+    and on an untracked one, held no copy the coordinator knew of and writes
+    freely."""
     from ccs.core.exceptions import CallerPrincipalRefused
 
     rel, ignored = _REFUSED_WRITE_PATHS[where]
+    data, expected_disk_writes = _REFUSED_WRITE_BYTES[rewrite]
     if ignored is not None:
         coherence_dir = tmp_path / ".coherence"
         coherence_dir.mkdir(mode=0o700, exist_ok=True)
         (coherence_dir / "ignored.yaml").write_text(ignored, encoding="utf-8")
     target = _seed(tmp_path, rel=rel, content=b"v1")
-    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    on_stale_write = "allow" if rewrite == "committed-over-foreign" else "raise"
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write=on_stale_write, config=fast_cfg)
     peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
     try:
         vol.read(rel)
-        if rewrite == "same-bytes":
-            vol.write(rel, b"v2")  # recorded: the refused write below changes no byte
+        if rewrite in ("same-bytes", "committed-over-foreign"):
+            vol.write(rel, b"v2")  # recorded: the refused write below writes these bytes again
         peer.read(rel)
+        if rewrite == "committed-over-foreign":
+            target.write_bytes(b"foreign")  # out of band: the file no longer holds them
         version_before = _tracked_version(vol, rel)
         peer_before = _coordinator_state(peer, rel)
         disk_writes: list[Path] = []
@@ -3915,16 +3933,16 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_principal_after_the_grant)
         with pytest.raises(CallerPrincipalRefused) as raised:
-            vol.write(rel, b"v2")
+            vol.write(rel, data)
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
 
-        disk = _WROTE if rewrite == "new-bytes" else _ALREADY_HELD
+        disk = _WROTE if expected_disk_writes else _ALREADY_HELD
         assert str(raised.value).startswith(
             (disk + _UNRECORDED_WRITE).format(rel=rel, grant=_GRANT_TAKEN)
         )
-        assert target.read_bytes() == b"v2"
-        assert len(disk_writes) == (1 if rewrite == "new-bytes" else 0), "the disk clause"
-        assert _tracked_version(vol, rel) == version_before, "no version advanced"
+        assert target.read_bytes() == data
+        assert len(disk_writes) == expected_disk_writes, "the disk clause"
+        assert _tracked_version(vol, rel) == version_before, "the commit was not recorded"
         if where == "tracked":
             assert version_before is not None, "control: the coordinator tracks the path"
             assert peer_before == "SHARED", "control: the peer held a copy"
@@ -3932,7 +3950,7 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
             assert _coordinator_state(peer, rel) is None, "the peer was invalidated"
             with pytest.raises(StaleView, match="revoked"):
                 peer.write(rel, b"peer")
-            assert target.read_bytes() == b"v2"
+            assert target.read_bytes() == data
         else:
             assert version_before is None, "control: the coordinator keeps no record of it"
             assert peer_before is None, "so the peer held no copy it knew of"
@@ -3940,6 +3958,236 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
             peer.write(rel, b"peer")  # nobody was invalidated: the peer's write is admitted
             assert target.read_bytes() == b"peer"
     finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("moved_by", ["the-grant-request", "a-peer-commit"])
+def test_the_commit_clause_holds_when_the_version_moved_for_another_reason(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, moved_by: str,
+) -> None:
+    """The message says the coordinator did not record this write's commit —
+    not that no version moved, which is false in two cases. The first write
+    to a tracked path the coordinator has never seen registers it through
+    the grant request (no version, then 1); and a peer can commit between
+    this write's grant and its refused commit (1, then 2). The commit clause
+    is observed in each: the version is what it would be WITHOUT this
+    write's commit — 1, where a recorded first write leaves 2 (control, on a
+    second path), and one past the read, the peer's commit alone."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    fresh = moved_by == "the-grant-request"
+    rel = "data/fresh.txt" if fresh else "data/shared.txt"
+    target = tmp_path / rel if fresh else _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
+    try:
+        if not fresh:
+            vol.read(rel)
+        version_before = _tracked_version(vol, rel)
+        real_post = coherent_volume_module._coordinator_post
+        peer_commits: list[int | None] = []
+
+        def refuse_the_commit(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            mine = payload.get("session_id") == vol.session_id
+            if mine and path == "/hooks/post-edit" and not fresh and not peer_commits:
+                peer.reacquire(rel)  # inside the window: after this write's grant, before its commit
+                peer.write(rel, b"peer")
+                peer_commits.append(_tracked_version(peer, rel))
+            answer = real_post(endpoint, path, payload, **kwargs)
+            if mine and path == "/hooks/pre-edit":
+                vol._mint_nonce, vol._principal = "Z" * 43, "X" * 43
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_the_commit)
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+
+        assert str(raised.value).startswith(
+            (_WROTE + _UNRECORDED_WRITE).format(rel=rel, grant=_GRANT_TAKEN)
+        )
+        if fresh:
+            assert version_before is None, "control: the coordinator had never seen the path"
+            assert _tracked_version(vol, rel) == 1, "only the grant request registered it"
+            assert target.read_bytes() == b"v2"
+            peer.write("data/control.txt", b"v2")
+            assert _tracked_version(peer, "data/control.txt") == 2, "control: a recorded first write"
+        else:
+            assert version_before == 1 and peer_commits == [2], "control: the peer committed in the window"
+            assert _tracked_version(vol, rel) == 2, "only the peer's commit advanced it"
+            assert target.read_bytes() == b"peer"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a commit that fails after the bytes landed: every failure, one path -------
+
+
+class _AnsweringCoordinator(http.server.BaseHTTPRequestHandler):
+    """Answers every POST with ``status`` — a redirect naming a ``Location``,
+    or a server error — and records the routes it was sent."""
+
+    status = 302
+    seen: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        type(self).seen.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(type(self).status)
+        self.send_header("Location", "http://127.0.0.1:1/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+# FROZEN duplicates of what a failed commit reports, by the status answering it.
+_FAILED_COMMIT = "coordinator request to /hooks/post-edit failed: HTTP {status}"
+_REDIRECTED = ", a redirect, which this client never follows"
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("status", [503, 302, 307, 308])
+def test_a_commit_that_fails_after_the_bytes_landed_takes_one_path_whatever_its_status(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    status: int, on_error: str,
+) -> None:
+    """write()'s commit (post-edit) fails after its bytes reached disk. A
+    failed commit takes ``on_error``'s path — strict raises a plain
+    ``CoherenceError`` naming the request and its status; degrade warns once
+    and the write stands — and a redirect is one more failed commit:
+    refused, never followed, and reported by its status alone. Before, a
+    redirect escaped as ``RedirectRefused`` in both modes: the trust refusal
+    of a request that changed nothing, after the write had changed the file.
+    The grant stays recorded, as for any failed commit."""
+    import traceback
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    _AnsweringCoordinator.status, _AnsweringCoordinator.seen = status, []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _AnsweringCoordinator)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        vol.read(rel)
+        real_post = coherent_volume_module._coordinator_post
+        answering = CoordinatorEndpoint(port=httpd.server_address[1], bearer=vol._endpoint.bearer)
+
+        def fail_the_commit(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            commit = path == "/hooks/post-edit" and payload.get("success") is True
+            return real_post(answering if commit else endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", fail_the_commit)
+        expected = _FAILED_COMMIT.format(status=status) + (_REDIRECTED if status < 400 else "")
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            if on_error == "strict":
+                with pytest.raises(CoherenceError) as raised:
+                    vol.write(rel, b"v2")
+                assert type(raised.value) is CoherenceError, type(raised.value)
+                assert str(raised.value) == expected
+                reported = "".join(traceback.format_exception(raised.value))
+            else:
+                vol.write(rel, b"v2")
+                assert vol.degradation_count == 1
+                degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+                reported = " ".join(str(w.message) for w in degraded)
+                assert reported == f"CoherentVolume degraded: {expected}"
+
+        assert _AnsweringCoordinator.seen == ["/hooks/post-edit"], "control: the commit was answered"
+        assert target.read_bytes() == b"v2", "control: the bytes had landed"
+        assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
+        # The one path, down to the commit record the 5xx arm (the control)
+        # leaves: strict raised before it; degrade wrote best-effort past it.
+        committed = _sha(b"v2") if on_error == "degrade" else None
+        assert vol._last_committed_hash.get(rel) == committed, "the commit record differs from a 5xx's"
+        assert "elsewhere" not in reported, "the Location reached the report"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        stop_coordinator(tmp_path)
+
+
+# --- a redirect echoing a nonce this session sent earlier -----------------------
+
+
+class _EchoingRedirector(http.server.BaseHTTPRequestHandler):
+    """Redirects every POST to a ``Location`` naming every mint nonce any
+    request has sent it so far — a redirector that echoes what it was sent,
+    into answers to requests that carry nothing of the kind."""
+
+    nonces: list[str] = []
+    locations: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        cls = type(self)
+        if isinstance(body.get("mint_nonce"), str):
+            cls.nonces.append(body["mint_nonce"])
+        cls.locations.append("http://127.0.0.1:1/" + "-".join(cls.nonces))
+        self.send_response(302)
+        self.send_header("Location", cls.locations[-1])
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+def test_a_redirect_echoing_the_nonce_a_claim_sent_names_no_location(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Degrade mode: the volume's claim is redirected (unconfirmed — it
+    attaches without a principal), and so is its read, whose ``Location``
+    echoes the mint nonce the claims sent. The read carries no principal and
+    no nonce of its own, but what answers it may have been sent one before:
+    the refusal names the status only, so neither the error, its chain nor a
+    warning carries the nonce. Before, a request carrying no principal
+    material quoted its ``Location``, and with it the echoed nonce."""
+    import traceback
+
+    from ccs.core.exceptions import RedirectRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    _EchoingRedirector.nonces, _EchoingRedirector.locations = [], []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoingRedirector)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    real_claim = coherent_volume_module.claim_caller_principal
+    real_post = coherent_volume_module._coordinator_post
+
+    def redirector(endpoint: CoordinatorEndpoint) -> CoordinatorEndpoint:
+        return CoordinatorEndpoint(port=httpd.server_address[1], bearer=endpoint.bearer)
+
+    def claim_redirected(endpoint: CoordinatorEndpoint, session_id: str, nonce: str) -> object:
+        return real_claim(redirector(endpoint), session_id, nonce)
+
+    def read_redirected(endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object) -> object:
+        return real_post(redirector(endpoint) if path == "/hooks/pre-read" else endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", claim_redirected)
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", read_redirected)
+    try:
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+            with pytest.raises(RedirectRefused) as raised:
+                vol.read(rel)
+
+        nonces = list(_EchoingRedirector.nonces)
+        assert nonces and vol._principal is None, "control: the claims were redirected"
+        assert all(n in _EchoingRedirector.locations[-1] for n in nonces), "control: the echo was sent"
+        assert raised.value.status == 302
+        reported = "".join(traceback.format_exception(raised.value))
+        reported += " ".join(str(w.message) for w in warned) + str(raised.value.location)
+        _assert_no_secret_in(reported, *nonces)
+        assert "127.0.0.1:1" not in reported, "the Location reached the error"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
         stop_coordinator(tmp_path)
 
 

@@ -25,7 +25,6 @@ import os
 import ssl
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -959,20 +958,9 @@ def obtain_stored_principal(
 
 
 REDIRECT_LOCATION_WITHHELD = "(withheld)"
-"""The ``location`` a :class:`~ccs.core.exceptions.RedirectRefused` carries,
-in place of the one the coordinator sent, when the redirected request carried
-a caller principal (header) or a mint nonce (the claim) — or when the
-``Location`` did not parse, so it names no URL there is to report."""
-
-
-def _carries_principal_material(req: urllib.request.Request) -> bool:
-    """Whether ``req`` sent a caller principal or a mint nonce: the principal
-    header (urllib stores header names ``capitalize()``d), or the claim route,
-    whose body carries the nonce. The route is read from the URL this client
-    built — not from ``selector``, which urllib rewrites to the absolute URL
-    when the request goes through a proxy."""
-    route = urllib.parse.urlsplit(req.full_url).path
-    return req.has_header(CALLER_PRINCIPAL_HEADER.capitalize()) or route == PRINCIPAL_CLAIM_ROUTE
+"""The ``location`` every :class:`~ccs.core.exceptions.RedirectRefused` carries,
+in place of the one the coordinator sent: a redirect is reported by its
+status alone."""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -985,28 +973,19 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     before the second request is issued, ensures the bearer never leaves the
     configured endpoint.
 
-    Every 3xx code enters through :meth:`_refuse`, BEFORE the stdlib's
-    ``http_error_302`` parses the ``Location``: that parse raises a
-    ``ValueError`` quoting a malformed one (a bracketed host that is not an
-    address), which would carry whatever the coordinator echoed into it past
-    any check made later, in :meth:`redirect_request`.
+    Every 3xx code enters through :meth:`_refuse`, which names the status
+    only — never the ``Location``, and nothing parses it first. The
+    ``Location`` is the coordinator's text, and whatever answers may echo
+    into it what it was sent: a principal header, or a mint nonce. A request
+    that carries neither cannot rule that out, because the session may have
+    sent its nonce to the same endpoint earlier, from this process or
+    another. Quoted, the echo would reach the refusal's message and from
+    there logs and tool results; and the stdlib's own parse raises a
+    ``ValueError`` that quotes a malformed ``Location`` (a bracketed host
+    that is not an address).
     """
 
     def _refuse(self, req, fp, code, msg, headers):  # noqa: ANN001, ANN202 - stdlib signature
-        if _carries_principal_material(req):
-            # The Location is the coordinator's text, and this request sent it
-            # a caller principal or a mint nonce: a coordinator — or anything
-            # in front of it — that echoed either into the Location would put
-            # it in the refusal's message, and from there in logs and tool
-            # results. The refusal names the status only, and nothing parses
-            # the Location first.
-            raise RedirectRefused(REDIRECT_LOCATION_WITHHELD, status=code)
-        try:
-            # Resolves the Location as the stdlib does, then refuses in
-            # redirect_request below, naming it.
-            return super().http_error_302(req, fp, code, msg, headers)
-        except ValueError:
-            pass  # it does not parse: refused below, outside this block
         raise RedirectRefused(REDIRECT_LOCATION_WITHHELD, status=code)
 
     # All five codes, 308 included: each stdlib ``http_error_30x`` starts by
@@ -1017,7 +996,9 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # type: ignore[override]
         self, req, fp, code, msg, headers, newurl
     ):  # noqa: ANN001, ANN201 - matches the stdlib handler signature
-        raise RedirectRefused(newurl, status=code)
+        # Unreached while every code above refuses first; kept so a redirect
+        # path added later still refuses — by the status alone.
+        raise RedirectRefused(REDIRECT_LOCATION_WITHHELD, status=code)
 
 
 def _build_opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:

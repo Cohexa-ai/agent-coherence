@@ -224,6 +224,13 @@ Alpha — APIs may change before `v1.0`.
   unaffected. The `--detail` help text no longer claims the process id is
   redacted at the minimal tier; it is emitted at every tier, deliberately.
 
+- **A coordinator redirect is refused without naming where it pointed.** No
+  client follows a 3xx answer from the coordinator, and the error used to quote
+  the redirect's `Location`. A redirector that echoes what it was sent could put
+  a caller principal or claim nonce into that text, so `RedirectRefused` now
+  names only the status: its message reads `redirect (302) to '(withheld)'` and
+  its `location` is always `(withheld)`, on every request.
+
 - **A hook response names a peer by agent id, and a denial no longer reports a
   write that did not happen.** Two corrections on the same surface. The
   preemption notice, and the last-writer field on every stale response and

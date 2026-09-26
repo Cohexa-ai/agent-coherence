@@ -52,6 +52,12 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from tests.test_coherence_client_tls import (
+    _make_handler_class,
+    _mint_bundle,
+    _start_tls_server,
+    requires_openssl,
+)
 
 REF = "workspace/shared.bin"
 
@@ -971,8 +977,8 @@ def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
 
     What is reported is the status: the ``Location`` — the coordinator's
     text, echoing the nonce and principal here — is on neither the message
-    nor the chain, including when no principal was presented and the refusal
-    itself quotes it (``none``). ``pre-read`` is the control leg: redirected
+    nor the chain, including when no principal was presented (``none``),
+    where the refusal once quoted it. ``pre-read`` is the control leg: redirected
     before the substrate is touched, the commit is refused with nothing
     written — not the unknown."""
     from ccs.cli._coherence_client import CoordinatorEndpoint
@@ -990,7 +996,7 @@ def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
         _bytes, tok = a.read(REF)
         material = [sa._mint_nonce, sa._principal]
         if principal == "none":
-            sa._principal = None  # the request presents no header, so the refusal names the Location
+            sa._principal = None  # the request presents no header (the refusal once named the Location then)
         _Redirector.location = f"http://127.0.0.1:1/{''.join(material)}"
         redirector = CoordinatorEndpoint(port=httpd.server_address[1], bearer=sa._endpoint.bearer)
 
@@ -1017,6 +1023,181 @@ def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
     finally:
         httpd.shutdown()
         httpd.server_close()
+        stop_coordinator(tmp_path)
+
+
+# --- a converged write whose completeness check fails, after it landed --------
+
+# FROZEN duplicates of what a commit reports when the coordinator leg fails
+# definitely after the substrate write is on the substrate — never built from
+# the code. A confirmed write "landed"; a converged one claims no attribution.
+_LANDED = "the substrate write to {ref!r} landed"
+_CONVERGED = (
+    "the substrate holds the bytes this write intended for {ref!r} (converged: "
+    "which write put them there is not claimed)"
+)
+_PRINCIPAL_REFUSED_AFTER = (
+    "{landed}, but the coordinator refused the caller principal of a request "
+    "this commit sent ({reason}), so it recorded no bump from this write, and "
+    "this write invalidated no peer. Not re-driven; re-read before retrying."
+)
+_TLS_FAILED_AFTER = (
+    "{landed}, but a request this commit made to the coordinator failed TLS "
+    "certificate verification, so it was never sent, and the coordinator "
+    "recorded no bump from this write. Not re-driven; re-read before retrying."
+)
+
+
+def _closed_port() -> int:
+    """A loopback port nothing listens on: bound, read, released."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["redirect-presented", "redirect-none", "unreachable", "http-503", "degraded", "principal-refused"],
+)
+def test_a_failed_completeness_check_of_a_converged_write_is_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """The substrate write lands under an unknown outcome and reconciles to
+    CONVERGE. A byte-identical peer has already bumped the coordinator, so
+    this writer's bump conflicts, and the pre-read that decides whether the
+    converged write is complete — does the coordinator hold its hash? —
+    fails. The substrate write has landed, so any failure there is the bump
+    leg's unknown: ``CommitUnconfirmed`` (re-read; retry only if absent),
+    never re-driven — as a principal refusal of the same request already
+    was. Before, a redirect, an unreachable coordinator, a 5xx and a
+    degraded answer each raised a plain ``CoherenceError`` after the write
+    had landed.
+
+    What a refusal reports is checked against state: the version DID
+    advance here — the peer's identical bump — so the message names what
+    this write did not do, not the version; and the write converged, so it
+    claims no attribution for the bytes on the substrate. No nonce,
+    principal or ``Location`` reaches the error."""
+    from ccs.cli._coherence_client import CoordinatorEndpoint
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    _Redirector.code, _Redirector.seen = (503 if failure == "http-503" else 302), []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    real_post = substrate_module._coordinator_post
+    sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        b, _fb = _agent(store, sb)
+        _ab, tok = a.read(REF)
+        b.read(REF)  # B is SHARED@v1 so it can bump the coordinator
+        material = [sa._mint_nonce, sa._principal]
+        _Redirector.location = f"http://127.0.0.1:1/{''.join(material)}"
+        answering = CoordinatorEndpoint(
+            port=_closed_port() if failure == "unreachable" else httpd.server_address[1],
+            bearer=sa._endpoint.bearer,
+        )
+        fake_a.script_unknown(landed=True)  # A's substrate write landed (b"v2")
+        fake_a.reconcile_hook = lambda: sb.commit_cas(REF, expected_version=1, content_hash=_sha256(b"v2"))
+        sent: list[str] = []
+
+        def fail_the_check(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if payload.get("session_id") != sa.session_id:
+                return real_post(endpoint, path, payload, **kwargs)
+            if path == "/hooks/post-edit-cas" or not sent:
+                sent.extend([path] if path == "/hooks/post-edit-cas" else [])
+                return real_post(endpoint, path, payload, **kwargs)
+            sent.append(path)
+            if failure == "degraded":
+                return {"status": "fresh", "version": 2, "degraded": True}
+            if failure == "principal-refused":
+                return real_post(endpoint, path, payload, extra_headers={_PRINCIPAL_HEADER: "X" * 43})
+            if failure == "redirect-none":
+                kwargs["extra_headers"] = None
+            return real_post(answering, path, payload, **kwargs)
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", fail_the_check)
+        with pytest.raises(CommitUnconfirmed) as raised:
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert sent[:2] == ["/hooks/post-edit-cas", "/hooks/pre-read"], "control: the bump, then the check"
+        assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+        assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+        if failure.startswith("redirect") or failure == "http-503":
+            assert _Redirector.seen == ["/hooks/pre-read"], "control: the check was answered there"
+        if failure == "principal-refused":
+            assert str(raised.value) == _PRINCIPAL_REFUSED_AFTER.format(
+                landed=_CONVERGED.format(ref=REF), reason="caller_principal_foreign"
+            )
+            observer = _session(tmp_path, fast_cfg)
+            assert observer.pre_read(REF, None).version == 2, "the peer's identical bump advanced it"
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert all(isinstance(m, str) and m for m in material), "control: real values to look for"
+        assert not [m for m in material if m in rendered], "a nonce or principal reached the error"
+        assert "127.0.0.1:1/" not in rendered, "the Location reached the error"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        stop_coordinator(tmp_path)
+
+
+@requires_openssl
+@pytest.mark.parametrize("leg", ["bump", "pre-read"])
+def test_a_tls_failure_on_the_bump_after_the_substrate_write_is_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, leg: str,
+) -> None:
+    """The session's endpoint is plain http, but an ``https://`` proxy in the
+    environment carries its requests over TLS, and a proxy certificate that
+    does not verify fails that request as ``TlsVerificationFailed`` before
+    it is sent. On the bump, after the substrate write landed, that is the
+    bump leg's unknown — ``CommitUnconfirmed``, never re-driven — whose
+    message says what happened; the verification failure is its cause.
+    Before, the ``TlsVerificationFailed`` escaped after the write had landed.
+    ``pre-read`` is the control leg: failed before the substrate is touched,
+    the trust refusal stands, with nothing written."""
+    from ccs.core.exceptions import TlsVerificationFailed
+
+    for name in ("no_proxy", "NO_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "certs").mkdir()
+    proxy = _start_tls_server(_mint_bundle(tmp_path / "certs"), _make_handler_class())
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    real_post = substrate_module._coordinator_post
+    proxied = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+
+        def through_the_proxy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path != proxied:
+                return real_post(endpoint, path, payload, **kwargs)
+            os.environ["http_proxy"] = f"https://127.0.0.1:{proxy.port}"
+            try:
+                return real_post(endpoint, path, payload, **kwargs)
+            finally:
+                del os.environ["http_proxy"]
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", through_the_proxy)
+        with pytest.raises(CoherenceError) as raised:
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert proxy.handler_cls.seen_authorizations == [], "nothing was sent past the handshake"
+        if leg == "bump":
+            assert isinstance(raised.value, CommitUnconfirmed), type(raised.value)
+            assert str(raised.value) == _TLS_FAILED_AFTER.format(landed=_LANDED.format(ref=REF))
+            assert isinstance(raised.value.__cause__, TlsVerificationFailed)
+            assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+            assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+        else:
+            assert isinstance(raised.value, TlsVerificationFailed), type(raised.value)
+            assert store.get(REF)[0] == b"v1" and fake_a.cas_calls == []
+    finally:
+        proxy.shutdown()
         stop_coordinator(tmp_path)
 
 
@@ -1214,8 +1395,8 @@ def test_a_bump_refused_for_its_principal_after_the_substrate_write_is_the_bump_
     the very state an unconfirmed bump leaves. So it goes through the bump
     leg's existing handling and surfaces as ``CommitUnconfirmed`` (re-read;
     retry only if absent; never re-drive), whose message says the substrate
-    write landed and the coordinator recorded nothing, with the typed refusal
-    as its cause.
+    write landed and the coordinator recorded no bump from it, with the typed
+    refusal as its cause.
 
     Raised bare, the refusal would invite its own recovery — a refused request
     changed nothing, so resend it once the principal is right — and that
@@ -1243,14 +1424,15 @@ def test_a_bump_refused_for_its_principal_after_the_substrate_write_is_the_bump_
         assert isinstance(cause, CallerPrincipalRefused)
         assert cause.reason == "caller_principal_absent"
         message = str(raised.value)
-        assert "caller_principal_absent" in message
-        assert "landed" in message and "recorded nothing" in message
+        assert message == _PRINCIPAL_REFUSED_AFTER.format(
+            landed=_LANDED.format(ref=REF), reason="caller_principal_absent"
+        )
         for secret in (bound, nonce, "Z" * 43):
             assert secret and secret not in message
         assert store.get(REF)[0] == b"v2", "the substrate write is durable"
         assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
         observer = _session(tmp_path, fast_cfg)
-        assert observer.pre_read(REF, None).version == 1, "the coordinator recorded nothing"
+        assert observer.pre_read(REF, None).version == 1, "no bump was recorded from this write"
 
         sa._principal, sa._mint_nonce = bound, nonce
         with pytest.raises(CasVersionConflict):

@@ -400,6 +400,23 @@ def test_corruption_reason_is_non_retryable_not_staleview(
         stop_coordinator(tmp_path)
 
 
+# FROZEN duplicates of what a multi-member publish raises when its commit is
+# not confirmed: the coordinator's own unconfirmed answer, and an answer with
+# nothing this client can classify — never built from the constants under test.
+_PUBLISH_UNCONFIRMED = (
+    "atomic_publish commit was not confirmed (the coordinator answered that "
+    "its commit is unconfirmed); whether the batch landed at the coordinator "
+    "is unknown, and no file was written. Re-read every member, and retry only "
+    "if the publish is absent."
+)
+_PUBLISH_UNCLASSIFIABLE = (
+    "atomic_publish commit was answered with no outcome this client can "
+    "classify (not a win, and no reason); whether the batch landed at the "
+    "coordinator is unknown, and no file was written. Re-read every member, "
+    "and retry only if the publish is absent."
+)
+
+
 def _answer_commit_all_with(
     monkeypatch: pytest.MonkeyPatch, body: dict, sent: list[str]
 ) -> None:
@@ -453,7 +470,7 @@ def test_a_commit_all_answer_whose_reason_is_not_a_string_is_unconfirmed(
             vol.atomic_publish([("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")])
 
         assert sent == ["/session/commit_all"], "sent once, never retried"
-        assert "corruption" not in str(raised.value) and "conflict" not in str(raised.value)
+        assert str(raised.value) == _PUBLISH_UNCLASSIFIABLE
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
     finally:
@@ -493,9 +510,10 @@ def test_an_unconfirmed_commit_all_answer_is_commit_unconfirmed_in_both_modes(
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with pytest.raises(CommitUnconfirmed):
+            with pytest.raises(CommitUnconfirmed) as raised:
                 vol.atomic_publish([("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")])
 
+        assert str(raised.value) == _PUBLISH_UNCONFIRMED
         assert sent == ["/session/commit_all"], "sent once, never retried"
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"

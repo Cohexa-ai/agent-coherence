@@ -519,8 +519,12 @@ class TestRedirectRefusal:
             )
             with pytest.raises(RedirectRefused) as exc:
                 cc.get(ep, "/status")
-            # The refusal carries the attempted location.
-            assert "elsewhere" in str(exc.value.location)
+            # The refusal names the status, never the attempted location:
+            # the Location is the redirector's text, and may echo what it
+            # was sent.
+            assert exc.value.status == 302
+            assert exc.value.location == cc.REDIRECT_LOCATION_WITHHELD
+            assert "elsewhere" not in str(exc.value)
             # The redirect TARGET must have received nothing — the bearer never
             # rode the hop.
             assert target.handler_cls.seen_authorizations == []

@@ -1282,29 +1282,40 @@ def test_the_self_test_reports_a_malformed_claim_answer_as_unconfirmed(
     _assert_nothing_leaks(captured.out + captured.err, *sent, "ECHO")
 
 
+@pytest.mark.parametrize("code", [302, 308])
 @pytest.mark.parametrize("answer", [_redirect, _bad_location], ids=["redirect", "bad-location"])
-def test_a_redirected_claim_is_unconfirmed_and_names_no_location(raw_workspace, answer: Any) -> None:
-    """A claim answered 302 with a ``Location`` that echoes the nonce it
+def test_a_redirected_claim_is_unconfirmed_and_names_no_location(
+    raw_workspace, answer: Any, code: int,
+) -> None:
+    """A claim answered 3xx with a ``Location`` that echoes the nonce it
     carried is never followed, and — as the Node client decides any answer
     outside 2xx — it is an ``unconfirmed`` claim, which the next claim with
     the SAME nonce settles; it does not raise. Its detail names the status,
-    never the ``Location``. Control: a request that carried no principal
-    material is still refused as a redirect naming the ``Location`` (the
-    echo really was sent)."""
+    never the ``Location``.
+
+    A later request carrying no principal material, redirected with the
+    same echo, is refused naming no ``Location`` either: it sent no nonce,
+    but what answers it had been sent one. Before, such a request's refusal
+    quoted its ``Location`` — and with it the nonce the claim sent."""
     from ccs.core.exceptions import RedirectRefused
 
     workspace, raw = raw_workspace
-    raw.responses = [answer(_value("N")), _redirect(_value("N"))]
+    later = _redirect(_value("N"), 307)
+    assert _value("N").encode() in later, "control: the later redirect echoes the nonce"
+    raw.responses = [answer(_value("N"), code), later]
     endpoint = _coherence_client.resolve_endpoint(workspace)
 
     claim = _coherence_client.claim_caller_principal(endpoint, _sid(), _value("N"))
-    with pytest.raises(RedirectRefused) as control:
+    with pytest.raises(RedirectRefused) as later_refusal:
         _coherence_client.get(endpoint, "/status")
 
     assert claim.outcome == "unconfirmed" and claim.principal is None
-    assert "HTTP 302" in claim.detail
+    assert f"HTTP {code}" in claim.detail
     _assert_nothing_leaks(claim.detail, _value("N"))
-    assert _value("N") in str(control.value.location), "control: the Location echoed the nonce"
+    assert [header for _path, header, _n in raw.seen] == [None, None], "control: no principal sent"
+    assert later_refusal.value.status == 307, "control: the later request was redirected"
+    assert later_refusal.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
+    _assert_nothing_leaks(_rendered(later_refusal.value), _value("N"))
 
 
 def test_a_redirected_request_presenting_a_principal_names_no_location(raw_workspace) -> None:
@@ -1339,18 +1350,19 @@ _REDIRECT_CODES = [301, 302, 303, 307, 308]
 
 
 @pytest.mark.parametrize("code", _REDIRECT_CODES)
-@pytest.mark.parametrize("material", ["principal-header", "claim-route"])
+@pytest.mark.parametrize("material", ["principal-header", "claim-route", "none"])
 def test_a_location_that_does_not_parse_is_withheld_before_it_is_parsed(
     raw_workspace, monkeypatch: pytest.MonkeyPatch, code: int, material: str,
 ) -> None:
-    """A redirect answering a request that carried a principal (header) or a
-    mint nonce (the claim) is refused naming no ``Location`` — BEFORE
-    anything parses it. A ``Location`` whose bracketed host is not an address
-    makes the stdlib's redirect handling raise a ``ValueError`` quoting the
-    host (precondition, below): parsed first, the echoed value escaped
-    untyped, in the message and down the chain, from every principal path.
-    Now it is the typed refusal, with the status only, and the stdlib's
-    redirect handling never saw the ``Location`` at all."""
+    """A redirect is refused naming no ``Location`` — BEFORE anything parses
+    it — whether the request carried a principal (header), a mint nonce (the
+    claim) or neither (what answers it may have been sent one earlier). A
+    ``Location`` whose bracketed host is not an address makes the stdlib's
+    redirect handling raise a ``ValueError`` quoting the host (precondition,
+    below): parsed first, the echoed value escaped untyped, in the message
+    and down the chain, from every principal path. Now it is the typed
+    refusal, with the status only, and the stdlib's redirect handling never
+    saw the ``Location`` at all."""
     import urllib.parse
     import urllib.request
 
@@ -1378,11 +1390,13 @@ def test_a_location_that_does_not_parse_is_withheld_before_it_is_parsed(
                 endpoint, "/hooks/pre-edit", {"session_id": _sid()},
                 extra_headers={_PRINCIPAL_HEADER: echo},
             )
-        else:
+        elif material == "claim-route":
             _coherence_client.post(
                 endpoint, _coherence_client.PRINCIPAL_CLAIM_ROUTE,
                 {"session_id": _sid(), "mint_nonce": echo},
             )
+        else:
+            _coherence_client.get(endpoint, "/status")
 
     assert raised.value.status == code
     assert raised.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
@@ -1414,7 +1428,8 @@ def test_a_claim_sent_through_a_proxy_still_withholds_the_location(
     """Sent through an HTTP proxy, the request line carries the absolute URL
     (urllib rewrites the selector to it), so a check keyed on the selector no
     longer sees the claim route and quoted the nonce the ``Location`` echoed.
-    The route is read from the request's URL, which a proxy leaves alone."""
+    No refusal reads the route any more — none names its ``Location`` — so
+    the proxy's rewrite cannot change what this one names."""
     from ccs.core.exceptions import RedirectRefused
 
     workspace, raw = raw_workspace
@@ -1497,7 +1512,8 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
         return " ".join([self.headers.get(_PRINCIPAL_HEADER) or "", *type(self).nonces])
 
     def _redirect(self, at: str, echo: str) -> None:
-        self.send_response(302)
+        # The status is the step's suffix (``status-redirect-307``), else 302.
+        self.send_response(int(at[-3:]) if at[-3:].isdigit() else 302)
         self.send_header(
             "Location", _bad_url(echo) if at.endswith("bad-location") else f"http://127.0.0.1:1/{echo}"
         )
@@ -1526,7 +1542,7 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
             else:
                 self._send({"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}})
         elif self.path == "/hooks/pre-edit":
-            if at in ("pre-edit-redirect", "pre-edit-bad-location"):
+            if at is not None and at.startswith(("pre-edit-redirect", "pre-edit-bad-location")):
                 self._redirect(at, echo.replace(" ", ""))
             elif at == "pre-edit":
                 self._send({"ok": False, "reason": echo, "error": echo})
@@ -1539,7 +1555,7 @@ class _EchoCoordinator(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib name
         at = type(self).echo_at
-        if at in ("status-redirect", "status-bad-location"):
+        if at is not None and at.startswith(("status-redirect", "status-bad-location")):
             self._redirect(at, self._echo().replace(" ", ""))
             return
         counters: dict[str, object] = {"pre_read_total": 2, "post_edit_total": 1}
@@ -1559,12 +1575,15 @@ _SELF_TEST_FAILURES = {
     "pre-edit": "pre-edit failed",
     "pre-edit-list": "/hooks/pre-edit answered with a non-object answer",
     "pre-edit-redirect": "/hooks/pre-edit was redirected (HTTP 302)",
+    "pre-edit-redirect-307": "/hooks/pre-edit was redirected (HTTP 307)",
     "pre-edit-bad-location": "/hooks/pre-edit was redirected (HTTP 302)",
     "post-edit": "post-edit failed",
     "pre-read-2": "expected stale warning",
     "stale-prose": "stale-warning prose did not mention plan.md",
     "counters": "endpoint counters did not reflect",
     "status-redirect": "/status was redirected (HTTP 302); not followed",
+    "status-redirect-307": "/status was redirected (HTTP 307); not followed",
+    "status-redirect-308": "/status was redirected (HTTP 308); not followed",
     "status-bad-location": "/status was redirected (HTTP 302); not followed",
 }
 
@@ -1578,10 +1597,10 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     either onto the self-test's output: each failure is reported by the step,
     the answer's status, ok flag and known reason token, the prose's length,
     or the counters as numbers — never the answer itself. A redirect —
-    including the ``/status`` read's, which carries no principal, so the
-    refusal itself names the ``Location`` — is reported by its status alone,
-    with no traceback. Every failing step exits 3; the control run, with no
-    echo, passes."""
+    including the ``/status`` read's, which carries no principal but is
+    answered by what the claims sent their nonces to — is reported by the
+    status it was answered with, and no traceback. Every failing step exits
+    3; the control run, with no echo, passes."""
     _EchoCoordinator.echo_at, _EchoCoordinator.pre_reads = echo_at, 0
     _EchoCoordinator.nonces, _EchoCoordinator.principals = [], []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoCoordinator)
