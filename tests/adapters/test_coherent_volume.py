@@ -245,6 +245,27 @@ def test_fork_reset_continues_past_a_failing_volume(monkeypatch: pytest.MonkeyPa
     assert "RuntimeError: reset b failed" in printed
 
 
+def test_fork_reset_raises_nothing_when_every_volume_resets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The handler runs in every forked child of a process that imported the
+    adapter, so a clean pass must raise nothing: anything it raises is printed as
+    an ignored exception in that child."""
+    reset_calls: list[str] = []
+
+    class _Reset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+
+    stubs = [_Reset("a"), _Reset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+
+
 def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[..., object]:
     """Wrap ``real`` so its next call raises ``error`` and later calls pass through."""
     pending_failures = [error]
