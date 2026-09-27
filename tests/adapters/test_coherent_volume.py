@@ -12,16 +12,19 @@ separately.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import gc
 import io
 import logging
 import os
+import select
+import signal
 import subprocess
 import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -264,6 +267,87 @@ def test_fork_reset_raises_nothing_when_every_volume_resets(monkeypatch: pytest.
     coherent_volume_module._reset_volumes_after_fork()
 
     assert sorted(reset_calls) == ["a", "b"]
+
+
+@contextlib.contextmanager
+def _held_by_another_thread(enter: Callable[[], contextlib.AbstractContextManager[object]]) -> Iterator[None]:
+    """Keep ``enter()`` entered on a second thread for the duration of the block."""
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with enter():
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        yield
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def _report_from_fork_child(child: Callable[[], str], timeout: float = 5.0) -> str | None:
+    """Fork, run ``child`` in the child, and return what it reported: ``""`` if it
+    raised, ``None`` if the child produced nothing within ``timeout`` (a hang). The
+    child is killed and reaped either way, so a hung child cannot stall the suite."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, child().encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], timeout)
+        return os.read(read_fd, 256).decode("utf-8") if ready else None
+    finally:
+        os.close(read_fd)
+        os.kill(pid, signal.SIGKILL)  # no-op on a child that already exited
+        os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+@pytest.mark.parametrize("held", ["lock", "single_op_guard", "guard_meta_lock"])
+def test_fork_while_another_thread_holds_volume_state_leaves_child_usable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, held: str
+) -> None:
+    """Only the forking thread survives a fork, so a lock or guard another parent
+    thread held at that moment stays held in the child with nothing left to
+    release it. The child must neither hang, in the fork handler or on a later
+    ``_lock`` or ``_guard_meta_lock``, nor refuse every operation as concurrent
+    use by a thread that no longer exists (the single-op guard)."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    enter = {
+        "lock": lambda: vol._lock,
+        "single_op_guard": vol._single_op_guard,
+        "guard_meta_lock": lambda: vol._guard_meta_lock,
+    }[held]
+
+    def child() -> str:
+        # A real read and write re-attach under the child's identity through the
+        # single-op guard; taking _lock covers reacquire and the degradation path.
+        if vol.read("data/seed.txt") != b"seed":
+            return ""
+        vol.write("data/seed.txt", b"child")
+        with vol._lock:
+            return vol.session_id
+
+    try:
+        vol.write("data/seed.txt", b"seed")
+        parent_id = vol.session_id
+        with _held_by_another_thread(enter):
+            reported = _report_from_fork_child(child)
+        assert reported is not None, "the forked child hung"
+        assert reported not in ("", parent_id)
+    finally:
+        stop_coordinator(tmp_path)
 
 
 def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[..., object]:

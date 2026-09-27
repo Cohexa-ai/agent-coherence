@@ -225,13 +225,20 @@ Alpha — APIs may change before `v1.0`.
   next read or write, never inside the fork handler. A volume whose reset
   fails in the child no longer stops the others: every live volume is reset,
   and the child still reports what failed: one failure exactly as before,
-  several as one entry that names each of them. Five regression tests pin
-  this. Two check that a dropped volume and a failed construction are
-  collected. One keeps a failed construction alive across a real fork and
-  checks that the child leaves it untouched: collection alone would not catch
-  a weak registration made before attach and never withdrawn. One forks with
-  two live volumes and checks the child resets both. One checks that a failing
-  reset does not stop the next.
+  several as one entry that names each of them. A forked child also no longer
+  hangs, or refuses every operation as concurrent use, when another thread of
+  the parent held one of a volume's locks or had an operation in flight at the
+  moment of the fork: the child replaces those locks and drops that
+  operation's claim instead of waiting on a thread that no longer exists.
+  Regression tests pin all of this. Two check that a dropped volume and a
+  failed construction are collected. One keeps a failed construction alive
+  across a real fork and checks that the child leaves it untouched: collection
+  alone would not catch a weak registration made before attach and never
+  withdrawn. One forks with two live volumes and checks the child resets both.
+  Two check that a failing reset does not stop the next and that a clean pass
+  raises nothing. One forks while a second thread holds each lock, or the
+  single-operation guard, in turn and checks the child can still use the
+  volume.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the

@@ -375,7 +375,8 @@ class CoherentVolume:
 
         self._lock = threading.Lock()
         # A5: single-instance concurrency guard, SEPARATE from self._lock (which
-        # protects identity mutation in reacquire/_after_fork). A non-reentrant
+        # protects identity mutation in reacquire and the degradation count;
+        # _after_fork replaces both locks instead of taking them). A non-reentrant
         # threading.Lock here would deadlock with the reacquire-within-write_cas
         # path; instead we track the owning thread + a re-entry depth so the SAME
         # thread's nested internal calls (write_cas → reacquire → read) pass while
@@ -417,15 +418,23 @@ class CoherentVolume:
         self._session_id = str(uuid.uuid4())
 
     def _after_fork(self) -> None:
-        # Runs in the child after fork. Re-mint identity, drop the inherited
-        # endpoint (its connection/secret context belongs to the parent), and
-        # clear per-path beliefs the child has not established itself.
-        with self._lock:
-            self._session_id = str(uuid.uuid4())
-            self._endpoint = None
-            self._needs_reattach = True
-            self._last_committed_hash.clear()
-            self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
+        # Runs in the child after fork, where the forking thread is the only
+        # thread. A lock another parent thread held at the fork stays held here
+        # with nothing left to release it, and an operation it had in flight
+        # never finishes, so replace the locks instead of taking them and drop
+        # that operation's claim on the single-op guard.
+        self._lock = threading.Lock()
+        self._guard_meta_lock = threading.Lock()
+        self._guard_owner_ident = None
+        self._guard_depth = 0
+        # Re-mint identity, drop the inherited endpoint (its connection/secret
+        # context belongs to the parent), and clear per-path beliefs the child
+        # has not established itself.
+        self._session_id = str(uuid.uuid4())
+        self._endpoint = None
+        self._needs_reattach = True
+        self._last_committed_hash.clear()
+        self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
 
     def _ensure_attached(self) -> None:
         """Lazily re-attach after a fork dropped the endpoint.
