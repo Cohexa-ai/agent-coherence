@@ -18,6 +18,7 @@ token-identity logic both real bindings use.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import http.server
 import logging
@@ -1149,44 +1150,44 @@ def test_a_failed_completeness_check_of_a_converged_write_is_the_bump_legs_unkno
 def test_a_tls_failure_on_the_bump_after_the_substrate_write_is_the_bump_legs_unknown(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, leg: str,
 ) -> None:
-    """The session's endpoint is plain http, but an ``https://`` proxy in the
-    environment carries its requests over TLS, and a proxy certificate that
-    does not verify fails that request as ``TlsVerificationFailed`` before
-    it is sent. On the bump, after the substrate write landed, that is the
-    bump leg's unknown — ``CommitUnconfirmed``, never re-driven — whose
-    message says what happened; the verification failure is its cause.
-    Before, the ``TlsVerificationFailed`` escaped after the write had landed.
+    """One leg's request goes to an ``https://`` endpoint whose certificate
+    does not verify against the system trust store, which fails that request
+    as ``TlsVerificationFailed`` before it is sent. On the bump, after the
+    substrate write landed, that is the bump leg's unknown —
+    ``CommitUnconfirmed``, never re-driven — whose message says what
+    happened; the verification failure is its cause. Before, the
+    ``TlsVerificationFailed`` escaped after the write had landed.
     ``pre-read`` is the control leg: failed before the substrate is touched,
-    the trust refusal stands, with nothing written."""
+    the trust refusal stands, with nothing written. (This used to reach TLS
+    through an ``https://`` proxy in the environment; coordinator requests
+    now skip any configured proxy, so the endpoint itself is https here.)"""
     from ccs.core.exceptions import TlsVerificationFailed
 
-    for name in ("no_proxy", "NO_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
-        monkeypatch.delenv(name, raising=False)
     (tmp_path / "certs").mkdir()
-    proxy = _start_tls_server(_mint_bundle(tmp_path / "certs"), _make_handler_class())
+    tls = _start_tls_server(_mint_bundle(tmp_path / "certs"), _make_handler_class())
     store = _FakeStore()
     store.seed(REF, b"v1")
     real_post = substrate_module._coordinator_post
-    proxied = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
+    over_tls = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
     sa = _session(tmp_path, fast_cfg)
     try:
         a, fake_a = _agent(store, sa)
         _bytes, tok = a.read(REF)
 
-        def through_the_proxy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
-            if path != proxied:
+        def to_an_unverifiable_endpoint(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path != over_tls:
                 return real_post(endpoint, path, payload, **kwargs)
-            os.environ["http_proxy"] = f"https://127.0.0.1:{proxy.port}"
-            try:
-                return real_post(endpoint, path, payload, **kwargs)
-            finally:
-                del os.environ["http_proxy"]
+            # The test CA is in no system trust store, and no CA file is named.
+            unverifiable = dataclasses.replace(
+                endpoint, scheme="https", port=tls.port, ca_file=None
+            )
+            return real_post(unverifiable, path, payload, **kwargs)
 
-        monkeypatch.setattr(substrate_module, "_coordinator_post", through_the_proxy)
+        monkeypatch.setattr(substrate_module, "_coordinator_post", to_an_unverifiable_endpoint)
         with pytest.raises(CoherenceError) as raised:
             a.commit(REF, expected_token=tok, new_bytes=b"v2")
 
-        assert proxy.handler_cls.seen_authorizations == [], "nothing was sent past the handshake"
+        assert tls.handler_cls.seen_authorizations == [], "nothing was sent past the handshake"
         if leg == "bump":
             assert isinstance(raised.value, CommitUnconfirmed), type(raised.value)
             assert str(raised.value) == _TLS_FAILED_AFTER.format(landed=_LANDED.format(ref=REF))
@@ -1197,7 +1198,7 @@ def test_a_tls_failure_on_the_bump_after_the_substrate_write_is_the_bump_legs_un
             assert isinstance(raised.value, TlsVerificationFailed), type(raised.value)
             assert store.get(REF)[0] == b"v1" and fake_a.cas_calls == []
     finally:
-        proxy.shutdown()
+        tls.shutdown()
         stop_coordinator(tmp_path)
 
 

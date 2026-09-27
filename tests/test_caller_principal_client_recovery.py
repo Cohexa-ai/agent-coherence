@@ -1460,14 +1460,18 @@ def test_a_location_that_does_not_parse_is_a_typed_refusal_on_any_request(raw_wo
     _assert_nothing_leaks(_rendered(raised.value), "ECHO")
 
 
-def test_a_claim_sent_through_a_proxy_still_withholds_the_location(
+def test_a_claim_with_a_proxy_configured_still_withholds_the_location(
     raw_workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sent through an HTTP proxy, the request line carries the absolute URL
-    (urllib rewrites the selector to it), so a check keyed on the selector no
-    longer sees the claim route and quoted the nonce the ``Location`` echoed.
-    No refusal reads the route any more — none names its ``Location`` — so
-    the proxy's rewrite cannot change what this one names."""
+    """With an HTTP proxy configured, a claim whose redirect echoes the nonce
+    is still refused naming no ``Location``. Sent through a proxy, the
+    request line would carry the absolute URL (urllib rewrites the selector
+    to it), so a check keyed on the selector no longer saw the claim route
+    and quoted the nonce the ``Location`` echoed. Coordinator requests now
+    skip any configured proxy, so the claim keeps its route on the request
+    line — and no refusal reads the route any more (none names its
+    ``Location``), so neither shape of the request line changes what this
+    one names."""
     from ccs.core.exceptions import RedirectRefused
 
     workspace, raw = raw_workspace
@@ -1483,7 +1487,11 @@ def test_a_claim_sent_through_a_proxy_still_withholds_the_location(
             {"session_id": _sid(), "mint_nonce": _value("N")},
         )
 
-    assert raw.seen[0][0].startswith("http://"), "control: it went through the proxy"
+    # The proxy is this same server: had the claim gone through it, the
+    # request line would carry the absolute URL instead of the route.
+    assert raw.seen[0][0] == _coherence_client.PRINCIPAL_CLAIM_ROUTE, (
+        "control: the claim skipped the configured proxy"
+    )
     assert raised.value.location == _coherence_client.REDIRECT_LOCATION_WITHHELD
     _assert_nothing_leaks(_rendered(raised.value), _value("N"))
 

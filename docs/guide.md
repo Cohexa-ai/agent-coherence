@@ -624,6 +624,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 | `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+| `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
 
 `vol.session_id` is the volume's session with the coordinator, and it stays the
 same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
@@ -646,16 +647,48 @@ identical update — a plain file loses one write, `write_cas` preserves both.
 
 A volume can `write()` a file and then commit it through the optimistic lane. A
 successful `write()` leaves the volume holding that file's write grant after it
-returns; `write_cas`, `write_cas_at`, `atomic_publish` and `reacquire()` release
-it before they go further, so the volume is not refused by its own grant. The
-release is one extra request, made only after a `write()`: a volume that only
-reads and commits optimistically never pays for it.
+returns; a `write_cas` of that file, `write_cas_at`, `atomic_publish` and
+`reacquire()` release it before they go further, so the volume is not refused by
+its own grant. A `write_cas` of another file leaves it held unless it has to
+retry, because that grant cannot refuse it. The release is one extra request, made only after a `write()`:
+a volume that only reads and commits optimistically never pays for it. Each of
+these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
+and a fresh attempt clears every refusal the volume had, not only the one on the
+file it commits. Re-read any other file before a plain `write()` of it.
 
-When a commit loses its race on the volume (or MCP) path, the raised
-`CommitPreempted` is **terminal for that attempt, not a transient to retry blindly**:
-the version the write assumed no longer holds. Recover by `reacquire()`-ing,
-re-reading the fresh version, and reconciling your change onto it before committing
-again — a plain retry of the same bytes just loses the same race.
+When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
+`last_conflict_reason` says why the last attempt was refused:
+
+- `version_mismatch`: other `write_cas` callers kept committing first. A later
+  retry can win.
+- `other_holder`: another agent wrote the file with a plain `write()` and still
+  holds it. The version has not moved, so re-reading returns the same bytes.
+- `caller_in_transient_state`: another agent's plain `write()` landed between
+  your read and your commit. That agent may still hold the file, as with
+  `other_holder`.
+- `stale_read_generation`: your read was taken under a grant the coordinator has
+  since reclaimed. `reacquire()` and re-read.
+
+A `CoherentVolume` that wrote a file keeps holding it until its own next
+`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
+`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
+neither does a `session-stop` that names only `vol.session_id`, because each
+attempt holds its grants under its own `agent_id`. The coordinator
+takes the file back once the holder has made no coordinator calls for
+`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+`grant_max_hold_sec` (1800 s by default).
+Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
+the coordinator. A Claude Code session releases what it holds when its turn ends.
+So after `other_holder`, retry once the holder has released, not in a tight loop,
+or use a plain `write()`, which takes the file over (the previous holder's next
+write is then refused until it re-reads).
+
+When a plain `write()` loses its commit to a peer on the volume (or MCP) path,
+the raised `CommitPreempted` is **terminal for that attempt, not a transient to
+retry blindly**: the version the write assumed no longer holds. Recover by
+`reacquire()`-ing, re-reading the fresh version, and reconciling your change onto
+it before committing again — a plain retry of the same bytes just loses the same
+race.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -689,8 +722,10 @@ disk fault fails before any rename (disk stays uniformly old) and a rename faili
 partway raises a typed `PublishMaterializationError` naming exactly which files
 landed — never a bare error implying nothing published. A crash between renames can
 still tear the on-disk set (no POSIX multi-file atomic rename exists); on that error
-the coordinator is ahead of disk, so re-read each member at its current version and
-re-materialize (don't retry the publish — it would version-mismatch). Run it:
+the coordinator is ahead of disk, so write each file that didn't land again with
+`write()`, using the bytes you published (until then, `read_with_version` refuses
+that file, because the bytes on disk are not what the coordinator recorded). Don't
+retry the publish — it would version-mismatch. Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 
@@ -1452,7 +1487,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |

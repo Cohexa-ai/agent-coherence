@@ -57,11 +57,27 @@ an insecure-https mode simply does not exist in the client's configuration. To
 trust a private certificate authority instead of the system trust store, point
 `CCS_REMOTE_CA_FILE` at a CA-bundle file; it is loaded fail-closed — a symlinked
 bundle is refused, and a group- or world-writable bundle is refused (a trust
-anchor an attacker can rewrite is not a trust anchor). The client also **refuses
+anchor an attacker can rewrite is not a trust anchor). That bundle is re-read on
+every request, so replacing it takes effect on the next one. Without it, the
+client loads the system trust store once per process, on its first https
+request. Until the process restarts, a certificate removed from that store stays
+trusted, and if the store was missing at that moment, every https request fails
+verification. The client also **refuses
 to follow redirects**: it talks to the one coordinator endpoint you configured, so
 any redirect response is rejected rather than followed with the bearer attached.
-The loopback path is unchanged — a plain `http://` loopback endpoint behaves
-exactly as before.
+TLS changes nothing for the loopback path: a plain `http://` loopback endpoint
+needs no certificate and no acknowledgement.
+
+**No coordinator request goes through an HTTP proxy.** The client ignores
+`http_proxy`, `https_proxy` and the system proxy settings for every coordinator
+endpoint, loopback or remote. On a machine with a proxy configured, honouring it
+would send loopback requests, bearer token included, to the proxy. A remote
+endpoint is the one host you configured and secured the link to, and a proxy is a
+hop that neither `CCS_REMOTE_INSECURE` nor https verification covers. A remote
+coordinator must therefore be reachable directly, for example over a tunnel or a
+VPN; one reachable only through a forward proxy fails with
+`CoordinatorUnavailable`. A TLS-terminating front is unaffected, because you point
+the client *at* it as the endpoint.
 
 **CA-profile requirements for the terminating proxy (read this before you
 provision a certificate).** Coordinator endpoints are almost always IP literals
@@ -178,14 +194,15 @@ What follows from that:
 
 What the coordinator does not publish: `/status` shows session names — which
 embed the raw session id — only in the operator view (`?detail=full` plus the
-`Coherence-Local-Operator: true` header, which `agent-coherence-status` sends by
-default). The default `minimal` view reports
+`Coherence-Local-Operator: true` header). The default `minimal` view reports
 `agent_name` as `null`, and the `metrics` view carries no sessions at all. Hook
 responses identify another session by its agent id, a one-way hash of the
-session id. This keeps session ids out of status output that gets pasted into bug
-reports or scraped into dashboards. It is disclosure hygiene rather than a
-boundary: under the model above, knowing a session id grants nothing the secret
-does not already grant.
+session id. The `agent-coherence-status` command is an operator tool and asks
+for the operator view by default, so its output does carry session names: run
+it with `--detail minimal` before pasting the output into a bug report, and
+point dashboards at `--detail metrics`. All of this is disclosure hygiene
+rather than a boundary: under the model above, knowing a session id grants
+nothing the secret does not already grant.
 
 ## Env-var kill switches
 
