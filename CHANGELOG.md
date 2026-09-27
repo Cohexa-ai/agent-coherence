@@ -165,7 +165,12 @@ Alpha — APIs may change before `v1.0`.
   preemption notice, and the last-writer field on every stale response and
   strict deny, carried a peer's raw session id — reversed back out of the
   agent id by a helper that now no longer exists. They carry the agent id
-  itself. Separately, a denial issued when a peer merely took the grant
+  itself. The last-writer field keeps its name, but the `notices[]` entries
+  that `POST /hooks/session-stop` returns rename their keys rather than alias
+  them: `preempter_session_id` and `preempter_session_short` are now
+  `preempter_agent_id` and `preempter_agent_short`, so a consumer that reads
+  the old keys finds them absent. Separately, a denial issued when a peer
+  merely took the grant
   claimed the artifact "was updated by" that peer, naming a timestamp for a
   write that never occurred; losing a grant and losing a race to a commit are
   now distinct messages. The grant-change text states only what the summary
