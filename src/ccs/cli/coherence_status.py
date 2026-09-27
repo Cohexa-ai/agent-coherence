@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # KTD-J (Unit 8): --detail mirrors the /status three-tier disclosure
     # model. Default 'full' so the local-operator CLI keeps surfacing pid
-    # + absolute root + all counters; 'metrics' for dashboard scrapers
+    # + absolute root + session names + all counters; 'metrics' for scrapers
     # that want only the counter block; 'minimal' for a redacted view
     # safe to paste in bug reports.
     parser.add_argument(
@@ -65,9 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["minimal", "full", "metrics"],
         default="full",
         help=(
-            "Disclosure tier (default: full). 'minimal' redacts coordinator_pid "
-            "and absolute paths; 'metrics' returns counters only; 'full' is the "
-            "operator view used by /agent-coherence status."
+            "Disclosure tier (default: full). 'minimal' redacts absolute paths, "
+            "session names and user-added tracked patterns, and still reports "
+            "per-session artifact state (the process id is reported at every "
+            "tier); 'metrics' returns counters only; 'full' is the operator "
+            "view used by /agent-coherence status."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
@@ -390,10 +392,18 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         print("Sessions:")
         for s in sessions:
             sid = s.get("agent_id", "?")
-            # A null agent_name means the coordinator holds the grant but has
-            # no name for its holder — the session id is a one-way uuid5 input,
-            # so it cannot be recovered. Say that, rather than printing "None".
-            name = s.get("agent_name") or "(name unknown — grant predates this coordinator)"
+            # A null agent_name has two causes and the renderer cannot tell
+            # them apart: the name was redacted because this response is below
+            # the operator tier (R6 — it embeds the raw session id), or the
+            # coordinator holds the grant but never knew a name for its holder
+            # (a grant that outlived the process that issued it). Either way
+            # the session id is a one-way uuid5 input and is not recoverable
+            # from agent_id, so name both causes and assert neither — and do
+            # not print "None".
+            name = s.get("agent_name") or (
+                "(name unknown — redacted below the operator tier, "
+                "or a grant predating this coordinator)"
+            )
             per_artifact = s.get("states", {})
             print(f"  {sid[:8]}  {name}")
             if not per_artifact:

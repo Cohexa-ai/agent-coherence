@@ -1749,6 +1749,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         source="pre_read_shared_hash_deny",
                     )
                 fresh["hash_differs"] = True
+            # The read is allowed. A SHARED grant that a denied Bash / Grep
+            # command re-armed certifies no read, so this one is the read to
+            # record. A verify_only fence read discards its bytes and must not.
+            if not verify_only and agent_state == MESIState.SHARED:
+                _record_held_read(
+                    coordinator, artifact_id, agent_id, trigger="held_read", tick=now,
+                )
             if want_generation and decision.owner_generation is not None:
                 fresh["owner_generation"] = decision.owner_generation
             return fresh
@@ -2439,8 +2446,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary: _payloads.StaleSummary = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if editor_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=editor_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
@@ -2499,9 +2508,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if holder_id is not None:
             # Existing collision surfacing path. If we also have preemption
             # notices for this session, prepend them.
-            holder_session = _agent_id_to_session(coordinator, holder_id)
+            # R7: name the incumbent by the agent id the registry holds it
+            # under, not by the session id that id was derived from.
             resp = _payloads.build_collision_response(
-                holder_session_id=holder_session or "<unknown>",
+                holder_session_id=holder_id.hex,
                 holder_acquired_at_unix_ts=float(holder_ts or _payloads.now_unix()),
                 path=path,
             )
@@ -2649,10 +2659,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         f"retry. Underlying coordinator error: {exc}"
                     )
                     return {"ok": False, "reason": reason, "reclaimed": True}
-                preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+                # R7: the popped notice carries the preempter's agent id.
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
-                    f"preempted by session {_payloads.short_session_id(preempter_session)} at "
+                    f"preempted by agent {_payloads.short_session_id(preempter_id.hex)} at "
                     f"{_iso_utc(preempted_at)}. Your edit landed in your local "
                     f"worktree but will not be reflected in the coordinator's "
                     f"version. Underlying coordinator error: {exc}"
@@ -2892,11 +2902,20 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
-            preempter_session = _agent_id_to_session(coordinator, preempter_id) or ""
+            # R7: this was the most reachable of the two paths — a structured
+            # field carrying the preempter's session id in FULL, not just its
+            # prose prefix. The keys are RENAMED rather than aliased, against
+            # the module's usual additive-evolution rule: keeping
+            # ``preempter_session_id`` alive would either go on emitting the
+            # session id or hand a consumer that parses by exact shape an
+            # agent id under a name promising a session id, which is the
+            # worse of the two. The value is never absent now — the notice
+            # row carries the agent id, so there is no unnamed-preempter arm
+            # left to sentinel.
             notices_payload.append({
                 "path": art.name if art else "<unknown-artifact>",
-                "preempter_session_id": preempter_session,
-                "preempter_session_short": (preempter_session[:8] if preempter_session else "<unknown>"),
+                "preempter_agent_id": preempter_id.hex,
+                "preempter_agent_short": preempter_id.hex[:8],
                 "preempted_at_unix_ts": ts,
                 "preempted_at_iso": _iso_utc(ts),
             })
@@ -3106,6 +3125,89 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
+def _record_held_read(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    trigger: str,
+    tick: int,
+) -> None:
+    """Record a read by a session that already holds SHARED on the path.
+
+    A held grant usually certifies the current bytes already, which makes this
+    a no-op. After a strict Bash / Grep deny it does not: that re-grant records
+    no observation (see ``_apply_bash_grep_regrants``), so a retried Bash
+    command -- or the Read the session takes instead -- finds the grant held,
+    answers fresh, and is the session's first read at this version. Left
+    unrecorded, the baseline stays at the version before the deny (never
+    observed, on a first touch), and every message computed from it errs
+    toward "nothing moved": a peer's commit loses its post-compaction flag and
+    a later grant handover is reported as a write the session already read.
+
+    The row is re-read under the registry lock because the caller classified
+    the path before its deny decision: a peer's pre-edit or commit landing
+    since leaves the row INVALID, and writing SHARED over it would clear a
+    stale flag the session has not seen. Only SHARED is credited, so an E/M
+    holder's grant is never touched, and the SHARED-to-SHARED write uses a
+    trigger outside ``CLAIM_CAPTURE_TRIGGERS``, so the one thing it moves is
+    ``last_observed_version``.
+    """
+    registry = coordinator.registry
+    with registry.abort_guard():
+        if registry.get_agent_state(artifact_id, agent_id) != MESIState.SHARED:
+            return
+        artifact = registry.get_artifact(artifact_id)
+        observed = registry.last_observed_version_for(artifact_id, agent_id)
+        if artifact is None or (observed is not None and observed >= artifact.version):
+            return
+        registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED, trigger=trigger, tick=tick,
+        )
+
+
+def _apply_bash_grep_regrants(
+    coordinator: CoordinatorHTTPServer,
+    agent_id: UUID,
+    regrants: list[tuple[UUID, str]],
+    *,
+    held: list[tuple[UUID, str]],
+    command_runs: bool,
+    tick: int,
+) -> None:
+    """Grant SHARED on every path a Bash / Grep command named, AFTER the deny
+    decision, and record an observation only if the command will run.
+
+    The grant is the same either way: strict pre-bash / pre-grep deny once and
+    re-arm the session (Node's ``pre_bash.ts`` pins the same contract), so a
+    retry of the command goes through. What depends on the decision is the
+    OBSERVATION. ``set_agent_state`` records the current version as the
+    agent's ``last_observed_version`` for any non-INVALID grant, and a denied
+    command never ran -- crediting it told a session that a later grant
+    handover left it at "the version you last saw", a version it was refused.
+    An allowed command does run and does read the current bytes, exactly like
+    pre-read's ``post_stale_read`` re-grant, so it must keep recording.
+
+    ``held`` lists the paths the session already held SHARED going in. They
+    need no grant, but a Bash command that runs reads them too, and the retry of
+    a denied command is exactly that run -- see ``_record_held_read``. Grep
+    passes none: its path set is every tracked file under its root, not what it
+    showed, so crediting a held file would advance a baseline the session was
+    just told to re-read.
+
+    Keyed on the COMMAND's outcome, not the trigger and not the path's own
+    strictness: a warn-only path inside a denied command was not read either.
+    """
+    for artifact_id, trigger in regrants:
+        coordinator.registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED,
+            trigger=trigger, tick=tick, observed=command_runs,
+        )
+    if command_runs:
+        for artifact_id, trigger in held:
+            _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
+
+
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-bash — KTD-N H4 mitigation.
 
@@ -3171,21 +3273,27 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # stale match in the path set triggers deny per the plan's edge-case
         # contract (cat a.md b.md where a.md is strict → deny).
         strict_stale_first: dict | None = None
+        # The SHARED grants this command earns, and the SHARED grants it
+        # already holds, both applied only once the deny decision is known --
+        # see _apply_bash_grep_regrants.
+        regrants: list[tuple[UUID, str]] = []
+        held: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
                 # First observation per KTD-9 — seed v1 + grant SHARED so
-                # subsequent reads see fresh.
+                # subsequent reads see fresh. ``detect_tracked_paths``
+                # deduplicates, so deferring the grant cannot make a later
+                # iteration read this path as stale.
                 artifact_id = coordinator.registry.resolve_or_register(
                     path, content_hash=""
                 )
-                coordinator.registry.set_agent_state(
-                    artifact_id, agent_id, MESIState.SHARED,
-                    trigger="first_bash_read", tick=now,
-                )
+                regrants.append((artifact_id, "first_bash_read"))
                 continue
             agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             if agent_state is not None and agent_state != MESIState.INVALID:
+                if agent_state == MESIState.SHARED:
+                    held.append((artifact_id, "held_bash_read"))
                 continue  # fresh on this path
             # Stale. Record summary; re-grant SHARED to suppress repeat fires.
             artifact = coordinator.registry.get_artifact(artifact_id)
@@ -3204,18 +3312,22 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_bash", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_bash"))
+
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            held=held, command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
         # the bash command is strict + stale, deny the whole command. The
@@ -3356,6 +3468,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # v0.2 KTD-Q: track the first strict + stale path encountered so we
         # can emit strict-mode deny on the whole grep command. Mirrors pre-bash.
         strict_stale_first: dict | None = None
+        regrants: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -3379,18 +3492,24 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_grep", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_grep"))
+
+        # No held paths: a Grep over a root does not read every file under it
+        # -- see _apply_bash_grep_regrants.
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            held=[], command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
         if strict_stale_first is not None:
@@ -4624,9 +4743,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
 
     ``minimal`` is the default and includes no absolute paths (workspace
-    root is reported as a sentinel ``.``). ``metrics`` returns only the
+    root is reported as a sentinel ``.``) and no session names (R6:
+    ``agent_name`` embeds the raw session id, so it is null below the
+    operator tier; the non-reversible ``agent_id`` and the per-artifact
+    ``states`` map stay). ``metrics`` returns only the
     counter block — useful for operators scraping /status into a
-    dashboard without leaking workspace state. ``full`` is the legacy
+    dashboard without leaking workspace state; it carries no sessions at
+    all and is unaffected by R6. ``full`` is the legacy
     everything-block plus absolute ``coordinator_root`` and ``coordinator_pid``,
     gated by the explicit ``Coherence-Local-Operator: true`` header so a
     same-user adversary (Adversary 1 in auth.py) cannot trivially grab
@@ -4742,12 +4865,23 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 continue
             states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
 
+    # R6: ``agent_name`` renders the raw session id verbatim
+    # (``session_to_agent_name`` → ``claude-session-<sid>``, and the SB-25
+    # subagent form carries it too), so every tier that listed a session row
+    # republished that session's identifier alongside its per-artifact state.
+    # Below the operator tier the row keeps ``agent_id`` — already a uuid5 of
+    # the session id and documented at ``session_to_agent_id`` as not
+    # reversible — and drops the name. Nothing new is derived here: a second
+    # derivation would duplicate the one the Node backend is parity-pinned to.
+    # The null-name row is the shape the unnamed-holder branch below already
+    # emits and the status CLI already renders.
+    name_visible = detail == "full"
     sessions: list[dict] = []
     named_ids: set[UUID] = set()
     for agent_id, name in named_agents:
         named_ids.add(agent_id)
         sessions.append({
-            "agent_name": name,
+            "agent_name": name if name_visible else None,
             "agent_id": str(agent_id),
             "states": states_by_agent.get(agent_id, {}),
         })
@@ -5320,10 +5454,14 @@ def _build_preemption_text(
                 f"Re-fetch via pre-read and retry."
             )
             continue
-        preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+        # R7: the notice row already carries the preempter's agent id, which
+        # is what the registry stores and what /status publishes. Rendering
+        # it directly also removes the restart degradation the reverse
+        # lookup had — the agent-name map is process-local and starts empty,
+        # so a preempter that survived a restart used to render "<unknown>".
         lines.append(
-            f"  • {path} — preempted/revoked by session "
-            f"{_payloads.short_session_id(preempter_session)} "
+            f"  • {path} — preempted/revoked by agent "
+            f"{_payloads.short_session_id(preempter_id.hex)} "
             f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
@@ -5670,7 +5808,7 @@ def _deliver_pending_reground(
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
-    """Return the session_id (not agent UUID) of the artifact's last writer, if any.
+    """Return the AGENT id (hex) of the artifact's last writer, if any.
 
     COR-09 (fixed): authoritative source is ``artifacts.last_writer_id``
     in the registry — set by the commit path on successful post-edit and
@@ -5680,11 +5818,23 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     successful commit). The previous state-map fallback could attribute
     the write to the very session receiving the warning (agent appears
     in state_map as SHARED, becomes the "first known agent").
+
+    R7: this used to run ``session_to_agent_id`` backwards through the
+    adapter's agent-name map and return the recovered session id, so the
+    stale/deny response handed to one session named a peer by that peer's
+    session id. It returns the registry's own handle instead. Nothing new is
+    derived — the agent id is a uuid5 of the session id that ``/status``
+    already emits, and a second derivation here would duplicate the one the
+    Node backend is parity-pinned to.
+
+    The hex form (32 lowercase chars, no hyphens) rather than ``str(uuid)``:
+    it is byte-identical to what Node's ``sessionToAgentId`` returns, and the
+    value lands in a corpus field compared verbatim across both backends.
     """
     # COR-09 primary path: authoritative last_writer_id from the registry.
     committed_writer = coordinator.registry.last_writer_for(artifact_id)
     if committed_writer is not None:
-        return _agent_id_to_session(coordinator, committed_writer)
+        return committed_writer.hex
     # Fallback for artifacts that exist but never had a successful commit
     # (first-observation seeding with no post-edit yet). Best signal: an
     # agent currently in MODIFIED state (mid-commit, in case the write
@@ -5692,12 +5842,56 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     state_map = coordinator.registry.get_state_map(artifact_id)
     for agent_id, state in state_map.items():
         if state == MESIState.MODIFIED:
-            return _agent_id_to_session(coordinator, agent_id)
+            return agent_id.hex
     # No committed writer + no MODIFIED holder → genuinely unknown.
     # Return None rather than the misleading "first state-map entry"
     # which could be the querying agent itself.
     return None
-    return None
+
+
+def _prior_version_observed(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    agent_state: MESIState | None,
+    current_version: int,
+) -> int | None:
+    """The version this agent last ACTUALLY observed, for the stale summary.
+
+    ``None`` for an agent that has never held a grant on the artifact — there
+    is no observation to report, and a 0-sentinel would read as "saw v0".
+
+    R8. Every stale summary used to compute this as ``current_version - 1``,
+    which is only correct if the invalidation came from a commit. When a peer
+    merely TAKES the grant (Cohexa-ai/agent-coherence#196) the version does
+    not move, so the inference reported a version the session never saw and
+    made an unchanged version look changed — which is also what hid the false
+    "was updated by" claim, because ``current > prior`` held unconditionally.
+
+    ``agent_states.last_observed_version`` is the durable per-agent record
+    (SB-10 R6/R7), written GIL-atomically with every non-INVALID grant and
+    deliberately PRESERVED across the transition to INVALID: the last version
+    whose bytes the agent actually held. The Node backend keeps the same
+    column and reads it the same way.
+
+    The old inference survives as the fallback for a NULL value, which two
+    rows produce: a row that predates the column (a v5 database migrated
+    forward leaves it NULL), and a row whose only grant certified no read
+    (``observed=False``: the agent's first grant on the path came from a
+    DENIED Bash/Grep command, see ``_apply_bash_grep_regrants``). That
+    degrades to the old behaviour rather than to a worse one: ``current - 1``
+    is always below current, so the summary takes the write wording and asks
+    for a re-read.
+    It cannot silently become the normal path, because both cases need an
+    INVALID agent that never recorded an observation.
+    """
+    if agent_state != MESIState.INVALID:
+        return None
+    observed = coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+    if observed is not None:
+        return observed
+    return current_version - 1 if current_version > 0 else 0
 
 
 def _last_writer_unix_ts(
@@ -5829,9 +6023,11 @@ class TrackedReadDecision:
         ``denied`` alone cannot tell the two deny arms apart.
     ``prior_version_seen``
         the summary's ``prior_version_seen_by_session``, already resolved for
-        the arm that ran: the current version for a still-granted holder, one
-        below it for an INVALIDated one, ``None`` for a session with no prior
-        grant.
+        the arm that ran: the current version for a still-granted holder, the
+        registry's recorded ``last_observed_version`` for an INVALIDated one
+        (R8 — see :func:`_prior_version_observed`; it used to be inferred as
+        one below current, which is wrong whenever a peer took the grant
+        without committing), ``None`` for a session with no prior grant.
 
     THE TWO HASH PREDICATES ARE NOT ONE PREDICATE, and folding them into one
     field silently moves the strict-deny gate in whichever direction the
@@ -5870,8 +6066,9 @@ def decide_tracked_read(
     Takes the values the caller has ALREADY read — the pair-atomic
     ``(artifact, owner_generation)`` snapshot, this agent's MESI state, the
     hash the caller offered — and reads nothing further except
-    ``policy.is_strict_mode`` and, on the one arm that consults it, the lag
-    gate's two registry lookups. It grants nothing, re-grants nothing,
+    ``policy.is_strict_mode``, the INVALIDated arm's ``last_observed_version``
+    lookup, and, on the one arm that consults it, the lag gate's two registry
+    lookups. All three are READS. It grants nothing, re-grants nothing,
     advances no observation baseline, bumps no counter, records no heartbeat,
     marks no stale pair, records no deny and pops no notice. That is the whole
     point: a read on the safety path must not mutate or heal what it checks,
@@ -5946,9 +6143,10 @@ def decide_tracked_read(
 
     # No valid grant: either a peer commit INVALIDated this session, or it has
     # never seen this artifact.
-    prior_version_seen = None
-    if agent_state == MESIState.INVALID:
-        prior_version_seen = artifact.version - 1 if artifact.version > 0 else 0
+    prior_version_seen = _prior_version_observed(
+        coordinator, artifact_id, agent_id,
+        agent_state=agent_state, current_version=artifact.version,
+    )
 
     # v0.2 KTD-O / KTD-P deny gate, unchanged: strict mode AND the session
     # demonstrably lacks a fresh view — a true preemption (INVALID), or no
@@ -5974,21 +6172,15 @@ def decide_tracked_read(
     )
 
 
-def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:
-    """Reverse the session_to_agent_id mapping via agent_names. R10 (Unit 6):
-    routes through the lock-aware public accessor instead of reaching into
-    the private dict directly."""
-    name = coordinator.agent_name_for(agent_id)
-    if name and name.startswith("claude-session-"):
-        rest = name[len("claude-session-"):]
-        # SB-25 (R2 attribution): a subagent identity attributes to the
-        # SUBAGENT id, not the parent session — the [:8] short form in
-        # deny/warn prose must name the actual writer. The parent linkage
-        # stays visible via the full agent_name on /status.
-        if ":subagent-" in rest:
-            return rest.split(":subagent-", 1)[1]
-        return rest
-    return None
+# R7: ``_agent_id_to_session`` used to live here — it reversed
+# ``session_to_agent_id`` through the agent-name map so the five renderers
+# below could print a session id. Every one of them now prints the agent id
+# the registry already holds, and the helper is DELETED rather than left
+# unused: kept around, the next renderer that wants a friendlier label reaches
+# for it and re-introduces the mapping. SB-25 attribution is unaffected — a
+# subagent's composite agent id is distinct per (session, subagent), so the
+# short form still names the actual writer, and the parent linkage stays
+# visible via ``agent_name`` on /status's operator tier.
 
 
 def _parse_yaml_pattern_lines(text: str) -> set[str]:

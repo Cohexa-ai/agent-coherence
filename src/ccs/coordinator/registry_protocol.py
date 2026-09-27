@@ -484,7 +484,20 @@ class RegistryBase(Protocol):
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
+        """Set one agent's MESI state on one artifact.
+
+        ``observed`` says whether this transition certifies that the agent now
+        holds the artifact's CURRENT bytes. Default ``True``: a non-INVALID
+        target records the current version as its ``last_observed_version``.
+        ``False`` is a grant that certifies no read -- the Claude Code
+        pre-bash / pre-grep re-grant issued alongside a DENIED command, which
+        never ran -- and leaves the recorded value exactly as a transition to
+        INVALID does: the prior value kept, a never-observed pair still None.
+        It never affects the state written, the grant tick, the epoch or the
+        read-generation capture.
+        """
         ...
 
     def set_agent_transient(

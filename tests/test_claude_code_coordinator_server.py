@@ -584,8 +584,11 @@ def test_collision_surfaces_via_additional_context(coordinator, client: _Client)
     assert out["permissionDecision"] == "allow"  # v0.1 warn only
     assert "Concurrent edit detected" in out["additionalContext"]
     assert "plan.md" in out["additionalContext"]
-    # The collision msg contains the holder's short session id (first 8 chars of A's UUID)
-    assert a_sid[:8] in out["additionalContext"]
+    # R7: the collision msg names the holder by the short form of its AGENT
+    # id -- the handle the registry keeps the grant under -- not by the
+    # session id that id was derived from.
+    assert session_to_agent_id(a_sid).hex[:8] in out["additionalContext"]
+    assert a_sid[:8] not in out["additionalContext"]
 
 
 # ----------------------------------------------------------------------
@@ -680,7 +683,12 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     restored here — pid is public on POSIX (any `ps` invocation lists
     it) so it does not exceed the threat model's accepted disclosure,
     and operators rely on it to verify "is the coordinator I think is
-    running actually mine"."""
+    running actually mine".
+
+    R6: the session row is keyed on ``agent_id`` here, not ``agent_name`` —
+    the name embeds the raw session id and is null below the operator tier.
+    The name itself is asserted at the full tier by
+    ``test_status_operator_tier_still_names_the_session``."""
     a_sid = _sid("A")
     client.post("/hooks/pre-read", {"session_id": a_sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": a_sid, "path": "spec.md"})
@@ -689,8 +697,8 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     tracked_paths = {a["path"] for a in b["tracked_artifacts"]}
     assert "plan.md" in tracked_paths
     assert "spec.md" in tracked_paths
-    sessions = {sess["agent_name"] for sess in b["sessions"]}
-    assert f"claude-session-{a_sid}" in sessions
+    sessions = {sess["agent_id"] for sess in b["sessions"]}
+    assert str(session_to_agent_id(a_sid)) in sessions
     # AC-02: canonical field; old _s alias also present for one release.
     assert b["coordinator_uptime_seconds"] > 0
     assert b["coordinator_uptime_s"] == b["coordinator_uptime_seconds"]
@@ -834,7 +842,10 @@ def test_a1_preemption_surfaces_on_victim_next_pre_read(client: _Client) -> None
         f"prose should name the preemption explicitly; got: {msg}"
     )
     assert "plan.md" in msg
-    assert y[:8] in msg, f"prose should name the preempter session prefix; got: {msg}"
+    assert session_to_agent_id(y).hex[:8] in msg, (
+        f"prose should name the preempter's agent-id prefix; got: {msg}"
+    )
+    assert y[:8] not in msg, f"prose must not carry Y's session-id prefix; got: {msg}"
 
 
 def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
@@ -868,7 +879,7 @@ def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
         f"fresh pre-read after a preemption must surface the notice; got {body}"
     )
     msg = body["hookSpecificOutput"]["additionalContext"]
-    assert "plan.md" in msg and y[:8] in msg, (
+    assert "plan.md" in msg and session_to_agent_id(y).hex[:8] in msg, (
         f"notice prose should name the preempted artifact + preempter; got: {msg}"
     )
     assert body.get("version") == 1, (
@@ -911,7 +922,10 @@ def test_a1_preemption_surfaces_in_post_edit_failure_reason(client: _Client) -> 
     assert any(w in reason_lower for w in ("preempted", "revoked", "acquired by")), (
         f"failure reason must name the preemption; got: {reason}"
     )
-    assert y[:8] in reason, f"reason should name preempter session prefix; got: {reason}"
+    assert session_to_agent_id(y).hex[:8] in reason, (
+        f"reason should name the preempter's agent-id prefix; got: {reason}"
+    )
+    assert y[:8] not in reason, f"reason must not carry Y's session-id prefix; got: {reason}"
 
 
 def test_a1_preemption_notice_consumed_after_one_surface(client: _Client) -> None:
@@ -983,7 +997,7 @@ def test_a1_stop_hook_surfaces_pending_notices(client: _Client) -> None:
     # Notice references the preempted artifact + preempter
     notice = notices[0]
     assert notice["path"] == "plan.md"
-    assert notice["preempter_session_id"].startswith(y[:8]) or notice["preempter_session_id"] == y
+    assert notice["preempter_agent_id"] == session_to_agent_id(y).hex
 
 
 def test_a1_stop_hook_consumes_notices_no_orphan(client: _Client) -> None:
@@ -1002,7 +1016,16 @@ def test_a1_stop_hook_consumes_notices_no_orphan(client: _Client) -> None:
         msg = body["hookSpecificOutput"]["additionalContext"]
         # Notice was consumed at Stop; pre-read may still show stale-read
         # warning (X is INVALID) but should not contain preemption prose.
-        assert "preempted" not in msg.lower() and "revoked" not in msg.lower(), (
+        # Keyed on the notice BLOCK's own header, not on the words
+        # "preempted"/"revoked": since R8 the stale-read warning for a grant
+        # handover says "was revoked" itself, so a bare word match can no
+        # longer tell a re-surfaced notice from the ordinary stale prose --
+        # it would fail on correct behaviour and, had the wording gone the
+        # other way, would have passed on a real re-surfacing.
+        assert "Coordinator notice" not in msg, (
+            f"notice should be consumed at Stop; pre-read re-surfaced: {msg}"
+        )
+        assert "preempted/revoked by agent" not in msg, (
             f"notice should be consumed at Stop; pre-read re-surfaced: {msg}"
         )
 
@@ -4594,8 +4617,8 @@ def test_warn_renderers_preserve_unknown_sentinel_verbatim() -> None:
         "current_version": 2,
         "your_version": 1,
     })
-    assert "session <unknown> at" in stale
-    assert "session <unknown at" not in stale
+    assert "agent <unknown> at" in stale
+    assert "agent <unknown at" not in stale
 
     # The guarded renderer is the reference behavior, not a third variant.
     deny = hp.emit_strict_deny(source="test", summary={
@@ -4635,7 +4658,7 @@ def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
         "current_version": 2,
         "your_version": 1,
     })
-    assert "session f2f7eab3 at" in stale
+    assert "agent f2f7eab3 at" in stale
     assert sid not in stale
 
 
@@ -4643,21 +4666,32 @@ def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
 # #200 -- which added ``short_session_id`` and the three tests above -- never
 # generalized the guard to them. Its commit message says so outright. That file
 # imports ``hook_payloads as _payloads`` but never called the helper, so the
-# docstring contract at hook_payloads.py:125-126 ("Every renderer that shortens
-# a session id for prose goes through here") was asserted and unenforced.
+# docstring contract at hook_payloads.py ("Every renderer that shortens an
+# identity handle for prose goes through here") was asserted and unenforced.
+#
+# Since R7 the preempter arm cannot reach the sentinel at all: the notice row
+# carries the preempter's agent id, so there is nothing to fail to look up.
+# The sentinel arm that IS still reachable is the last-writer one -- an
+# artifact with no committed writer -- and the two warn-renderer tests above
+# cover it.
 
 
-def test_preemption_prose_preserves_unknown_sentinel_verbatim() -> None:
-    """``_build_preemption_text`` must not slice the ``<unknown>`` sentinel.
+def test_preemption_prose_does_not_consult_the_agent_name_map() -> None:
+    """The preempter is named without any lookup, so a restart cannot blank it.
 
-    Reachable whenever the adapter cannot name the preempter, which is the
-    ordinary state after a coordinator restart: pending notices live in SQLite
-    while the agent-name map is an in-process dict seeded empty on every start.
-    A bare ``[:8]`` shipped ``session <unknown at ...`` into additionalContext,
-    where the dropped bracket reads as a truncated word rather than a
-    placeholder.
+    This test used to assert the opposite outcome: a coordinator that could
+    not name the preempter rendered ``session <unknown> at ...``, and the
+    assertion was that the sentinel kept its closing bracket. That degraded
+    state was the ORDINARY one after a restart -- pending notices live in
+    SQLite while the agent-name map is an in-process dict seeded empty on
+    every start -- so the attribution an operator most needed was the one
+    most likely to be missing.
+
+    The stub coordinator here has no ``agent_name_for`` at all. Rendering
+    still succeeds and still names the preempter, which is what proves the
+    lookup is gone rather than merely unused.
     """
-    from uuid import uuid4
+    from uuid import UUID
 
     from ccs.adapters.claude_code import coordinator_server as cs
 
@@ -4669,23 +4703,18 @@ def test_preemption_prose_preserves_unknown_sentinel_verbatim() -> None:
             return _Artifact()
 
     class _NamelessCoordinator:
-        """A coordinator with no name for the preempter -- ``agent_name_for``
-        returning None is what drives ``_agent_id_to_session`` to None."""
-
         registry = _Registry()
 
-        def agent_name_for(self, agent_id):  # noqa: ANN001, ANN201
-            return None
-
+    preempter = UUID("22222222-2222-4222-8222-222222222222")
     text = cs._build_preemption_text(
         _NamelessCoordinator(),
-        [(uuid4(), uuid4(), 1700000000.0)],
+        [(UUID("11111111-1111-4111-8111-111111111111"), preempter, 1700000000.0)],
     )
-    assert "session <unknown> at" in text
-    assert "session <unknown at" not in text
+    assert "preempted/revoked by agent 22222222 at" in text
+    assert "<unknown" not in text
 
 
-def test_preemption_prose_is_byte_stable_for_a_real_session_id() -> None:
+def test_preemption_prose_is_byte_stable_for_a_real_agent_id() -> None:
     """Pin the WHOLE rendered string, not substrings.
 
     This file is held at cross-backend wire parity and the sentinel fix reflowed
@@ -4714,12 +4743,9 @@ def test_preemption_prose_is_byte_stable_for_a_real_session_id() -> None:
             return _Artifact()
 
     class _NamedCoordinator:
-        """Resolvable preempter -- the REAL-id path, where bytes must not move."""
+        """A plain coordinator -- the REAL-id path, where bytes must not move."""
 
         registry = _Registry()
-
-        def agent_name_for(self, agent_id):  # noqa: ANN001, ANN201
-            return "claude-session-f2f7eab3-1111-4111-8111-111111111111"
 
     text = cs._build_preemption_text(
         _NamedCoordinator(),
@@ -4732,7 +4758,7 @@ def test_preemption_prose_is_byte_stable_for_a_real_session_id() -> None:
 
     assert text == (
         "\u26a0 Coordinator notice: your EXCLUSIVE grant was preempted:\n"
-        "  \u2022 docs/plan.md \u2014 preempted/revoked by session f2f7eab3 at "
+        "  \u2022 docs/plan.md \u2014 preempted/revoked by agent 22222222 at "
         "2023-11-14T22:13:20+00:00. Any local edit you made to this file will "
         "land in your worktree but is NOT reflected in the coordinator's version.\n"
         "Re-read affected files before continuing if you need the latest "
@@ -4745,12 +4771,12 @@ def test_post_edit_preemption_reason_survives_a_real_restart(tmp_path: Path) -> 
     """The second renderer, ``_handle_post_edit``'s ``commit_not_allowed`` reason,
     driven across an ACTUAL coordinator restart.
 
-    ``test_a1_preemption_surfaces_in_post_edit_failure_reason`` already walks this
-    path for a resolvable preempter and asserts ``y[:8] in reason``. What it never
-    reaches is the branch where the preempter cannot be named -- and that branch is
-    not hypothetical, it is what a restart produces: the preemption notice is
-    durable in SQLite, the agent-name map is process-local and starts empty, so
-    ``_agent_id_to_session`` returns None and the sentinel reaches the renderer.
+    This used to assert the restart DEGRADED the attribution: the preemption
+    notice is durable in SQLite while the agent-name map is process-local and
+    starts empty, so the reverse lookup returned None and the reason named
+    ``session <unknown>``. Since R7 the renderer reads the preempter's agent
+    id straight off the notice row, so the restart costs nothing and the
+    reason names Y on both sides of it. That is the assertion now.
 
     Restarting for real rather than clearing ``_agent_names`` in place keeps the
     test off a private attribute AND proves the half the simulation had to assume:
@@ -4787,12 +4813,15 @@ def test_post_edit_preemption_reason_survives_a_real_restart(tmp_path: Path) -> 
     assert body.get("ok") is False, f"post-edit on a preempted grant must fail; got {body}"
 
     reason = body.get("reason", "")
-    assert "preempted by session" in reason, (
+    assert "preempted by agent" in reason, (
         f"the notice did not survive the restart, so this asserts nothing; got: {reason}"
     )
-    assert "session <unknown> at" in reason, f"the sentinel must render whole; got: {reason}"
-    assert "session <unknown at" not in reason, (
-        f"the sentinel was sliced to 8 chars, dropping its bracket; got: {reason}"
+    assert f"preempted by agent {session_to_agent_id(y).hex[:8]} at" in reason, (
+        f"the restart must not cost the attribution; got: {reason}"
+    )
+    assert "<unknown" not in reason, (
+        f"there is no lookup left to fail, so nothing can degrade to a "
+        f"sentinel here; got: {reason}"
     )
 
 
@@ -5061,13 +5090,30 @@ def test_status_still_lists_a_registered_session_holding_nothing(
     client: _Client,
 ) -> None:
     """No regression on the live path: a session that registered but holds no
-    grant keeps its named entry with an empty state map."""
+    grant keeps its entry with an empty state map.
+
+    R6 split this across tiers. The row is keyed on ``agent_id`` at both, and
+    the operator tier is where the name proves the entry came from the
+    registration path rather than the registry's unnamed-holder branch — at
+    the default tier the two shapes are deliberately indistinguishable.
+    """
     sid = _sid("named-no-grants")
     client.post("/hooks/session-start", {"session_id": sid})
+    agent_id = str(session_to_agent_id(sid))
+
     _, body = client.get("/status")
-    named = {s["agent_name"]: s for s in body["sessions"]}
-    assert f"claude-session-{sid}" in named
-    assert named[f"claude-session-{sid}"]["states"] == {}
+    by_id = {s["agent_id"]: s for s in body["sessions"]}
+    assert agent_id in by_id
+    assert by_id[agent_id]["states"] == {}
+    assert by_id[agent_id]["agent_name"] is None
+
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    named = {s["agent_id"]: s for s in full["sessions"]}
+    assert named[agent_id]["agent_name"] == f"claude-session-{sid}"
+    assert named[agent_id]["states"] == {}
 
 
 def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
@@ -5087,6 +5133,196 @@ def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
     assert {k for s in body["sessions"] for k in s} == {
         "agent_name", "agent_id", "states",
     }
+
+
+# ======================================================================
+# R6 — per-artifact state below the operator tier carries no raw
+#       session identifier
+# ======================================================================
+#
+# ``agent_name`` renders ``claude-session-<session_id>`` verbatim, so every
+# tier that carried a session row also republished the raw session id beside
+# that session's per-artifact state. ``agent_id`` — a uuid5 of the same
+# session id, documented at ``session_to_agent_id`` as not reversible — is
+# already on the row and is the handle callers should attribute by. The
+# operator (full-detail) tier keeps the name; everything below it drops it
+# and renders through the null-name fallback the CLI already has.
+#
+# Each test here drives a LIVE session holding a real grant. An empty
+# workspace emits ``sessions: []``, which cannot observe any of this.
+
+
+def _session_id_appears_in(body: dict, sid: str) -> bool:
+    """True if the raw session id is reachable anywhere in the payload —
+    any key, any value, any nesting depth."""
+    return sid in json.dumps(body)
+
+
+def test_status_default_tier_reports_state_without_the_session_id(
+    client: _Client,
+) -> None:
+    """The default tier still answers "who holds what", and answers it with
+    the non-reversible ``agent_id`` only.
+
+    The control matters more than the assertion: an empty ``sessions`` list
+    would satisfy "no session id in the body" while observing nothing, so the
+    row and its per-artifact state are asserted present FIRST.
+    """
+    sid = _sid("r6-default-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get("/status")
+    assert body["detail"] == "minimal"
+
+    # Control: the case this test claims to inspect is actually present.
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1, f"no row for the live session; sessions={body['sessions']}"
+    assert rows[0]["states"] == {"docs/plan.md": "EXCLUSIVE"}, (
+        "per-artifact state must still be reported — dropping the whole row "
+        "would pass the redaction assertion while telling the operator nothing"
+    )
+
+    # The requirement.
+    assert rows[0]["agent_name"] is None
+    assert not _session_id_appears_in(body, sid), (
+        f"the raw session id is still reachable in the default-tier body: "
+        f"{json.dumps(body)[:400]}"
+    )
+
+
+def test_status_operator_tier_still_names_the_session(client: _Client) -> None:
+    """The positive control for the redaction above: at the operator
+    (full-detail) tier the name is present, in full, session id included.
+
+    Without this, a handler that dropped ``agent_name`` at EVERY tier would
+    look correct.
+    """
+    sid = _sid("r6-operator-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert body["detail"] == "full"
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1
+    assert rows[0]["agent_name"] == f"claude-session-{sid}"
+    assert _session_id_appears_in(body, sid), (
+        "the operator tier keeps the name; if this is false the test above "
+        "cannot distinguish redaction from an empty payload"
+    )
+
+
+def test_status_agent_id_is_identical_across_tiers(client: _Client) -> None:
+    """``agent_id`` is the handle callers attribute by, so it must not move.
+    Same value, same row, at the default tier and the operator tier."""
+    sid = _sid("r6-stable-agent-id")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, minimal = client.get("/status")
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+
+    expected = str(session_to_agent_id(sid))
+    minimal_ids = {s["agent_id"] for s in minimal["sessions"]}
+    full_ids = {s["agent_id"] for s in full["sessions"]}
+    assert expected in minimal_ids
+    assert minimal_ids == full_ids, (
+        "redacting the display name must not change which agents are listed"
+    )
+    by_id_minimal = {s["agent_id"]: s["states"] for s in minimal["sessions"]}
+    by_id_full = {s["agent_id"]: s["states"] for s in full["sessions"]}
+    assert by_id_minimal == by_id_full
+
+
+def test_status_cli_renders_a_redacted_row_without_the_session_id(
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The redacted row is a shape the CLI already handles: it renders the
+    existing null-name fallback rather than printing "None", and the rendered
+    text carries no raw session id.
+
+    Driven off a LIVE default-tier body so the renderer sees exactly what the
+    handler emits, not a shape this test invented.
+    """
+    from ccs.cli import coherence_status
+
+    monkeypatch.setenv("COLUMNS", "100")
+    sid = _sid("r6-cli-render")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    coherence_status._render_table(body)
+    out = capsys.readouterr().out
+
+    assert "Sessions:" in out
+    assert "docs/plan.md" in out and "EXCLUSIVE" in out
+    assert "name unknown" in out
+    assert "None" not in out
+    assert sid not in out
+    # The fallback must not assert a cause it cannot know. This row is a
+    # redacted live session, NOT a grant that outlived its coordinator, and
+    # the renderer cannot distinguish the two — so it names both.
+    assert "redacted below the operator tier" in out, (
+        "the fallback blamed a pre-restart grant for what is a tier redaction"
+    )
+
+
+def test_detail_help_text_names_only_redactions_the_handler_performs(
+    client: _Client,
+) -> None:
+    """R9: the ``--detail`` help text claimed the minimal tier redacts
+    ``coordinator_pid``. It never has — pid is emitted at every tier on
+    purpose (it is public on POSIX and operators verify ownership with it).
+
+    Each redaction the help text names is checked against a LIVE minimal-tier
+    body, and the one it used to name falsely is checked the other way.
+    """
+    from ccs.cli import coherence_status
+
+    sid = _sid("r6-help-text")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    action = next(
+        a for a in coherence_status.build_parser()._actions
+        if "--detail" in (a.option_strings or [])
+    )
+    help_text = action.help or ""
+
+    # The false claim is gone, and the behaviour that falsified it is pinned.
+    assert "coordinator_pid" not in help_text, (
+        "the help text must not claim a pid redaction the handler never does"
+    )
+    assert body["coordinator_pid"] == os.getpid()
+
+    # Each redaction the text now names is real at the minimal tier.
+    assert "absolute path" in help_text
+    assert body["coordinator_root"] == "."
+
+    assert "session name" in help_text
+    assert [s["agent_name"] for s in body["sessions"]] == [None]
+
+    assert "tracked pattern" in help_text
+    assert "user_added_patterns" not in body["policy_summary"]
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert "user_added_patterns" in full["policy_summary"], (
+        "control: the pattern list exists at the operator tier, so its "
+        "absence above is a redaction and not an empty policy"
+    )
 
 
 # ======================================================================
@@ -7307,3 +7543,219 @@ def test_fence_still_answers_for_an_absent_or_well_formed_agent_id(
     scoped_status, scoped_payload = client.post(_U4_ROUTE, scoped)
     assert scoped_status == 200, scoped_payload
     assert "verdict" in scoped_payload
+
+
+# ======================================================================
+# Hook responses name a peer by its agent id, not by its session id (R7)
+# ======================================================================
+#
+# ``session_to_agent_id`` is a one-way uuid5 of the session id and the
+# coordinator already publishes it on /status. The disclosure-bearing hook
+# paths used to run that mapping BACKWARDS through the adapter's agent-name
+# map -- ``_agent_id_to_session`` -- and render the recovered session id, so a
+# response handed to one session republished a peer's session id (in full on
+# the session-stop notice array, and as its 8-char prefix in prose). Naming
+# the peer by the handle the coordinator already emits keeps attribution
+# intact and stops re-deriving an identifier the response has no reason to
+# carry. Nothing new is derived: the agent id is what the registry stores.
+
+
+def test_session_stop_notice_names_the_preempting_agent_id(client: _Client) -> None:
+    """The stop-drain notice array names the preempter by agent id.
+
+    The whole response body is searched for the preempter's session id,
+    because the notice carries a structured field AND prose and either would
+    republish it.
+    """
+    x = _sid("R7-X")
+    y = _sid("R7-Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+
+    status, body = client.post("/hooks/session-stop", {"session_id": x})
+    assert status == 200
+    notices = body.get("notices")
+    assert notices, f"the stop drain must surface X's pending notice; got {body!r}"
+
+    y_agent = session_to_agent_id(y)
+    notice = notices[0]
+    assert notice["path"] == "plan.md"
+    assert notice["preempter_agent_id"] == y_agent.hex, (
+        f"the notice must name the preempting AGENT; got {notice!r}"
+    )
+    assert notice["preempter_agent_short"] == y_agent.hex[:8]
+
+    serialized = json.dumps(body)
+    assert y not in serialized, (
+        f"the stop response still carries Y's session id verbatim: {serialized!r}"
+    )
+    assert y[:8] not in serialized, (
+        f"the stop response still carries Y's session-id prefix: {serialized!r}"
+    )
+    # The notice is only worth anything if it still ATTRIBUTES: the agent id
+    # has to be in the prose too, not merely in the structured field.
+    assert y_agent.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stale_summary_names_the_writing_agent_id(client: _Client) -> None:
+    """``summary.last_writer_session_id`` carries the writer's agent id.
+
+    End-to-end, because the value is produced by ``_last_writer_for`` reading
+    the registry's ``last_writer_id`` -- which has always been an agent id.
+    """
+    a = _sid("R7-reader")
+    b = _sid("R7-writer")
+    client.post("/hooks/pre-read", {"session_id": a, "path": "plan.md",
+                                    "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": b, "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": b, "path": "plan.md",
+                                     "content_hash": _hash("v2"), "success": True})
+
+    status, body = client.post("/hooks/pre-read", {"session_id": a, "path": "plan.md",
+                                                   "content_hash": _hash("v2")})
+    assert status == 200
+    assert body["status"] == "stale", body
+    b_agent = session_to_agent_id(b)
+    assert body["summary"]["last_writer_session_id"] == b_agent.hex
+
+    serialized = json.dumps(body)
+    assert b not in serialized, f"the stale response carries B's session id: {serialized!r}"
+    assert b[:8] not in serialized, f"the stale response carries B's prefix: {serialized!r}"
+    assert b_agent.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_edit_collision_names_the_holding_agent_id(client: _Client) -> None:
+    """The pre-edit collision notice names the incumbent holder by agent id."""
+    x = _sid("R7-holder")
+    y = _sid("R7-challenger")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    status, body = client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    assert status == 200
+    assert body.get("collision") is True, body
+    context = body["hookSpecificOutput"]["additionalContext"]
+    assert f"({session_to_agent_id(x).hex[:8]})" in context, context
+    assert x[:8] not in json.dumps(body)
+
+
+def test_post_edit_preemption_reason_names_the_preempting_agent_id(
+    client: _Client,
+) -> None:
+    """The ``commit_not_allowed`` reason names the preempter by agent id."""
+    x = _sid("R7-loser")
+    y = _sid("R7-winner")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": x, "path": "plan.md",
+        "content_hash": _hash("v2"), "success": True,
+    })
+    assert status == 200
+    assert body.get("ok") is False, body
+    reason = body["reason"]
+    assert f"preempted by agent {session_to_agent_id(y).hex[:8]}" in reason, reason
+    assert y[:8] not in reason, reason
+
+
+def test_the_reverse_session_lookup_is_gone() -> None:
+    """``_agent_id_to_session`` is removed, not merely unused.
+
+    Left in place it is an invitation: the next renderer that wants a
+    human-ish label reaches for it and re-introduces exactly the mapping this
+    unit removed. Its absence is the enforcement.
+    """
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    assert not hasattr(cs, "_agent_id_to_session")
+
+
+# ======================================================================
+# A deny states what happened: a grant handover is not a write (R8)
+# ======================================================================
+#
+# Cohexa-ai/agent-coherence#196: a peer's pre-edit invalidates a live holder
+# WITHOUT committing anything. The holder's next read was denied with "was
+# updated by session <unknown> at <t>" -- a write that never happened, at a
+# timestamp when nothing was written. The renderers now branch on what the
+# summary can actually support: a version that moved past the one this
+# session last observed is a write; a version that did not is a grant that
+# changed hands.
+
+
+def _summary(**overrides: Any) -> dict:
+    base = {
+        "path": "docs/plan.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "aaaaaaaa11114111811111111111aaaa",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_summary_reports_a_write_only_when_the_version_moved() -> None:
+    """The discriminator, stated once and asserted on both sides.
+
+    Asserting only the admitting direction would pass for a predicate that
+    always returns True, which is the shape the old prose had.
+    """
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.summary_reports_a_write(_summary(current_version=2,
+                                               prior_version_seen_by_session=1))
+    assert not hp.summary_reports_a_write(_summary(current_version=1,
+                                                   prior_version_seen_by_session=1))
+    # Never observed: nothing to compare against, so no grant-change claim.
+    assert hp.summary_reports_a_write(_summary(prior_version_seen_by_session=None))
+    # Diverged bytes: something WAS written, in-band or not.
+    assert hp.summary_reports_a_write(_summary(current_version=1,
+                                               prior_version_seen_by_session=1,
+                                               hash_differs=True))
+
+
+def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    reason = hp.emit_strict_deny(
+        source="test", summary=_summary(),
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: docs/plan.md was updated by agent aaaaaaaa at "
+        "2023-11-14T22:13:20+00:00. Re-read docs/plan.md via the Read tool "
+        "before proceeding. This denial is structural (v0.2 strict mode); "
+        "retrying the same operation will produce the same denial."
+    )
+
+
+def test_deny_after_a_grant_handover_claims_no_write_and_names_the_version() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    reason = hp.emit_strict_deny(
+        source="test",
+        summary=_summary(current_version=1, prior_version_seen_by_session=1),
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: your grant on docs/plan.md was revoked and no new "
+        "version was committed — docs/plan.md is still at v1. Re-read "
+        "docs/plan.md via the Read tool before proceeding. This denial is "
+        "structural (v0.2 strict mode); retrying the same operation will "
+        "produce the same denial."
+    )
+    assert "was updated by" not in reason
+
+
+def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    text = hp.stale_read_warning(
+        _summary(current_version=1, prior_version_seen_by_session=1)
+    )
+    assert text == (
+        "⚠ Stale read [warning emitted 2023-11-14T22:13:21+00:00]: your "
+        "grant on docs/plan.md was revoked and no new version was committed. "
+        "docs/plan.md is still at v1, the version you last saw. "
+        "Re-acquire before writing to docs/plan.md."
+    )
+    assert "was updated by" not in text
