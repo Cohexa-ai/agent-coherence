@@ -232,8 +232,16 @@ Alpha — APIs may change before `v1.0`.
   command runs. That holds for every file the command named, including
   warn-only ones in a denied command, and for a first-seen file registered by
   a denied command. The grant itself is unchanged. An allowed command still
-  records the read, because it does read the current bytes. The Node
-  coordinator changes identically, and the protocol corpus pins both
+  records the read, because it does read the current bytes. So does the retry
+  the deny invites: a session that already holds the grant and reads the file
+  again, through a retried Bash command or a Read, now has the current version
+  recorded as seen. Without that, a strict session that recovered this way
+  kept its baseline from before the deny, or none at all on a first touch, so
+  a later grant handover was reported as a write it had already read and a
+  first-touch file lost its post-compaction stale flag. A Grep is not credited
+  for a file the session already holds: it names every tracked file under its
+  root, not what it showed, so the baseline stays behind until a Read. The
+  Node coordinator changes identically, and the protocol corpus pins both
   directions on both backends.
 
 - **The `<unknown>` holder placeholder is no longer truncated in the coordinator's
