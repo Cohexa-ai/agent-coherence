@@ -162,14 +162,15 @@ What follows from that:
 
 What the coordinator does not publish: `/status` shows session names — which
 embed the raw session id — only in the operator view (`?detail=full` plus the
-`Coherence-Local-Operator: true` header, which `agent-coherence-status` sends by
-default). The default `minimal` view reports
+`Coherence-Local-Operator: true` header). The default `minimal` view reports
 `agent_name` as `null`, and the `metrics` view carries no sessions at all. Hook
 responses identify another session by its agent id, a one-way hash of the
-session id. This keeps session ids out of status output that gets pasted into bug
-reports or scraped into dashboards. It is disclosure hygiene rather than a
-boundary: under the model above, knowing a session id grants nothing the secret
-does not already grant.
+session id. The `agent-coherence-status` command is an operator tool and asks
+for the operator view by default, so its output does carry session names: run
+it with `--detail minimal` before pasting the output into a bug report, and
+point dashboards at `--detail metrics`. All of this is disclosure hygiene
+rather than a boundary: under the model above, knowing a session id grants
+nothing the secret does not already grant.
 
 ## Env-var kill switches
 
