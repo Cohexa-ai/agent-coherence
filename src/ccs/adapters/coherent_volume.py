@@ -401,10 +401,12 @@ class CoherentVolume:
         # foreign / out-of-band edit. Cleared on remint/fork alongside the sibling.
         self._last_observed_hash: dict[str, str] = {}
         # Incarnations that write() may have left holding EXCLUSIVE/MODIFIED and
-        # that no confirmed release has cleared yet. The re-mint that abandons one
-        # releases it (see _remint); only write() adds to it, because it is the
-        # only path that takes a grant a later optimistic commit is refused on.
-        self._grant_incarnations: set[str] = set()
+        # that no confirmed release has cleared yet, each with the paths it wrote.
+        # The re-mint that abandons one releases it (see _remint); only write()
+        # adds to it, because it is the only path that takes a grant a later
+        # optimistic commit is refused on. The paths decide whether write_cas
+        # must rotate first: a held grant refuses a commit of that file only.
+        self._grant_incarnations: dict[str, set[str]] = {}
 
         self._mint_identity()
         self._attach()
@@ -924,15 +926,25 @@ class CoherentVolume:
         # lost, a degraded answer, and every failure after the grant (the disk
         # write, the post-edit POST) can each leave this incarnation holding
         # EXCLUSIVE with write() raising. The re-mint that abandons the incarnation
-        # releases it (see _remint). Only an explicit deny proves no grant was
-        # taken, and it withdraws the record only if this call made it — the same
-        # incarnation may still hold a grant from an earlier write() on another path.
-        recorded_before = self._incarnation in self._grant_incarnations
-        self._grant_incarnations.add(self._incarnation)
+        # releases it (see _remint). Only a stale deny proves no grant was taken:
+        # an ok:false with an "internal:" reason can follow an acquire that
+        # landed. It withdraws only what this call recorded — the same
+        # incarnation may still hold a grant from an earlier write() on another
+        # path. A file the coordinator does not track stays recorded too: its
+        # answer is the same bare ok:true as an acquire, so the volume cannot
+        # tell that no grant was taken.
+        written = self._grant_incarnations.setdefault(self._incarnation, set())
+        recorded_before = rel in written
+        written.add(rel)
         # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
         resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
-        if isinstance(resp, dict) and resp.get("ok") is False and not recorded_before:
-            self._grant_incarnations.discard(self._incarnation)
+        stale_deny = (
+            isinstance(resp, dict) and resp.get("ok") is False and resp.get("status") == "stale"
+        )
+        if stale_deny and not recorded_before:
+            written.discard(rel)
+            if not written:
+                self._grant_incarnations.pop(self._incarnation, None)
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
 
@@ -1123,7 +1135,7 @@ class CoherentVolume:
                         resp,
                     )
                 return
-            self._grant_incarnations.discard(incarnation)
+            self._grant_incarnations.pop(incarnation, None)
 
     def write_cas(
         self,
@@ -1151,7 +1163,11 @@ class CoherentVolume:
         bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
         :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
         NEVER a silent drop), whose ``last_conflict_reason`` names the refusal
-        that exhausted the budget.
+        that exhausted the budget. The first attempt also re-mints when this
+        volume's own ``write()`` may still hold ``path``, and only then. Any re-mint,
+        like :meth:`reacquire`'s, resets this instance's view of every path: a
+        refusal a peer's commit left on another path is gone, so re-read other
+        tracked paths before a plain ``write()`` of them.
 
         **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
         (=8 → 9 CAS attempts); each lost race (a peer winning the version)
@@ -1160,11 +1176,14 @@ class CoherentVolume:
         pessimistic ``write()`` keeps that grant until the coordinator reclaims it
         (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
         by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
-        the holder's session is stopped, which a ``CoherentVolume`` holder does
-        for itself only at its own next ``write_cas``, ``write_cas_at``,
-        ``atomic_publish`` or :meth:`reacquire` (the re-mint releases what its
-        ``write()`` left held; see :meth:`_remint`); a peer's reads and CAS
-        attempts never release it, and a peer's ``write()`` only takes it over.
+        the holder releases it, which a ``CoherentVolume`` holder does only at
+        its own next re-mint: a ``write_cas`` of that file or any ``write_cas``
+        retry, ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the
+        re-mint releases what its ``write()`` left held; see :meth:`_remint`). A
+        ``session-stop`` naming only its :attr:`session_id` releases nothing,
+        because each attempt holds its grants under its own incarnation. A
+        peer's reads and CAS attempts never release it, and a peer's ``write()``
+        only takes it over.
         So the loop does not wait between those attempts:
         no wait that fits in one call could outlast the grant, it would only make
         the terminal slower. A caller that gets ``last_conflict_reason ==
@@ -1237,13 +1256,19 @@ class CoherentVolume:
             self._record_own_write(rel, self._sha256_bytes(data))
             return
 
-        if self._incarnation in self._grant_incarnations:
-            # write() left this incarnation holding an EXCLUSIVE/MODIFIED grant.
-            # The loop's comparand read must run as a None-state identity (see
-            # below), and commit_cas refuses an E/M caller outright, so the first
-            # attempt would fail with no peer anywhere. Rotate first; the re-mint
-            # releases the abandoned grant. An incarnation without one skips this,
-            # so an optimistic-only write_cas still re-mints only on retry.
+        if any(rel in paths for paths in self._grant_incarnations.values()):
+            # This volume's write() may still hold THIS file: under the current
+            # incarnation, or under an abandoned one whose release was not
+            # confirmed. The loop's comparand read must run as a None-state
+            # identity (see below), and commit_cas refuses an E/M caller on the
+            # file it commits, so the current incarnation's grant would refuse
+            # the first attempt outright and an abandoned one's would refuse it
+            # as other_holder, with no peer anywhere. Rotate first; the re-mint
+            # releases every recorded incarnation. Only this file warrants it: a
+            # grant on another file refuses nothing here, and a rotation drops the
+            # refusal a peer's commit left on every other file, which is what
+            # stops a later write() of one of them from stale bytes. An
+            # optimistic-only write_cas still re-mints only on retry.
             self._remint()
 
         last_current_version = -1

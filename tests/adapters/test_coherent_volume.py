@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ccs.adapters.claude_code.coordinator_server as coordinator_server_module
 import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import (
     read_subagent_id,
@@ -3022,7 +3023,7 @@ def test_write_cas_directly_after_a_committed_write_on_the_same_volume_commits(
     the loop relies on, and the commit was refused outright
     (``commit_cas_not_allowed ... occ_is_shared_or_invalid_only``) — write_cas_at
     worked after a write() and write_cas did not. The loop now rotates first
-    when the current incarnation holds a write grant, and the grant is released."""
+    when the volume's write() may still hold that file, and the grant is released."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
@@ -3094,6 +3095,136 @@ def test_a_denied_write_on_another_path_keeps_the_grant_record(
 
         assert target.read_bytes() == b"p2+cas"
         assert _held(vol, writer_row) == {}, "the grant on the first path was never released"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_on_another_path_keeps_the_deny_a_peer_commit_left(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A write_cas right after a write() rotated to a new incarnation even when it
+    committed a DIFFERENT file than the one write() held. The rotation is the only
+    thing that shed the refusal a peer's commit had left on a third file, so a
+    later plain write() of that file from bytes read before the peer's commit was
+    admitted as a first write and replaced the peer's bytes. A commit is refused
+    for a held grant only on the file it commits, so only that file warrants the
+    rotation. ``on_stale_write="allow"`` switches off the local disk-hash check,
+    so the coordinator's refusal is the only guard left, as it is when the peer's
+    bytes have not reached disk yet or the volume is remote."""
+    p, q, r = "data/p.txt", "data/q.txt", "data/r.txt"
+    target = _seed(tmp_path, rel=p, content=b"p1")
+    _seed(tmp_path, rel=q, content=b"q1")
+    _seed(tmp_path, rel=r, content=b"r1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg
+    )
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(p)
+        vol.write(q, b"q2")  # the volume's incarnation now holds q
+        peer.read(p)
+        peer.write(p, b"p2-peer")  # the volume's row goes INVALID on p
+        _end_turn(peer)
+
+        vol.write_cas(r, lambda cur: cur + b"+cas")
+
+        with pytest.raises(StaleView):
+            vol.write(p, b"p1-stale")  # computed from the bytes read before the peer
+        assert target.read_bytes() == b"p2-peer", "a stale write replaced the peer's commit"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("recovery", ["write_cas", "reacquire then write_cas"])
+@pytest.mark.parametrize("earlier_write", [False, True])
+def test_an_error_answer_after_the_acquire_keeps_the_grant_record(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: str,
+    earlier_write: bool,
+) -> None:
+    """A pre-edit can take the grant and then fail inside the coordinator, which
+    answers ``ok: false`` with an ``internal:`` reason. Only a stale deny proves
+    no grant was taken. Read as one, that answer dropped the file from the
+    record, so the next re-mint released nothing and the volume was refused by
+    its own grant: a direct write_cas was refused outright, and after reacquire()
+    every retry met ``other_holder``. An earlier write() of another file on the
+    same attempt must not change that."""
+    p, q = "data/p.txt", "data/q.txt"
+    target = _seed(tmp_path, rel=p, content=b"p1")
+    _seed(tmp_path, rel=q, content=b"q1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(p)
+        if earlier_write:
+            vol.write(q, b"q2")
+        real_reground = coordinator_server_module._deliver_pending_reground
+        armed = [True]
+
+        def fail_after_the_acquire(coordinator, session_id, body, result, *, abort=None):
+            if armed[0] and body.get("path") == p and "content_hash" not in body:
+                armed[0] = False
+                raise RuntimeError("simulated: failure after the acquire")
+            return real_reground(coordinator, session_id, body, result, abort=abort)
+
+        monkeypatch.setattr(
+            coordinator_server_module, "_deliver_pending_reground", fail_after_the_acquire
+        )
+        with pytest.raises(StaleView, match="internal"):
+            vol.write(p, b"p2")
+        stranded = _agent_id(vol)
+        assert _held(vol, stranded).get(p) == "EXCLUSIVE", "precondition: the grant stands"
+
+        if recovery == "reacquire then write_cas":
+            vol.reacquire(p)
+        vol.write_cas(p, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"p1+cas"
+        assert p not in _held(vol, stranded), "the grant the failed write() took was never released"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_rotates_for_a_file_an_earlier_attempt_still_holds(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release that was not confirmed leaves an abandoned attempt holding the
+    file. A write_cas of that file must rotate first, as it does for the current
+    attempt's own grant, so the re-mint retries the release before the commit;
+    otherwise the first commit is refused ``other_holder`` by the volume's own
+    grant and spends one attempt of the budget. Counts the commits."""
+    p, q, x = "data/p.txt", "data/q.txt", "data/x.txt"
+    target = _seed(tmp_path, rel=p, content=b"p1")
+    _seed(tmp_path, rel=q, content=b"q1")
+    _seed(tmp_path, rel=x, content=b"x1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write(p, b"p2")
+        first_row = _agent_id(vol)
+        real_post = coherent_volume_module._coordinator_post
+        unconfirmed = [1]
+        commits: list[str] = []
+
+        def spy(endpoint: object, path: str, payload: dict) -> object:
+            if path == "/hooks/session-stop" and unconfirmed[0]:
+                unconfirmed[0] -= 1
+                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+            answer = real_post(endpoint, path, payload)
+            if path == "/hooks/post-edit-cas":
+                commits.append(str(answer.get("reason") if isinstance(answer, dict) else answer))
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+        vol.reacquire(x)  # re-mint: the release of the first attempt is not confirmed
+        vol.write(q, b"q2")  # the current attempt holds q, not p
+        assert _held(vol, first_row).get(p) == "MODIFIED", "precondition: p is still held"
+
+        vol.write_cas(p, lambda cur: cur + b"+cas")
+
+        assert target.read_bytes() == b"p2+cas"
+        assert len(commits) == 1, f"the volume's own grant refused a commit: {commits}"
+        assert p not in _held(vol, first_row)
     finally:
         stop_coordinator(tmp_path)
 
