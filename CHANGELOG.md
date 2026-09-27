@@ -163,6 +163,19 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A `CoherentVolume`'s `session_id` is now stable for its lifetime.** The
+  fresh identity each attempt needs — it is what clears a stale view — is now
+  carried as the request's `agent_id` under the same session, instead of
+  replacing the session. A forked child still gets a session of its own. Code
+  that compared `session_id` before and after `reacquire()` will now see it
+  unchanged. This needs a coordinator that reads `agent_id`: this package's from
+  0.13.0, or the Claude Code plugin's from 0.3.0. Against an older one every
+  attempt lands on the same coordinator entry, so a volume a peer invalidated
+  stays refused — nothing is overwritten, but `reacquire()` no longer clears the
+  refusal and `write_cas` gives up with `ViewWedged`. A `session-stop` that names
+  only the volume's `session_id` now releases nothing: each attempt holds its
+  write grants under its own `agent_id`, and the volume releases them itself.
+
 - **`/status` no longer publishes a raw session identifier below the operator
   tier.** Each session row already carried `agent_id` — a uuid5 of the session
   id, non-reversible by construction — beside `agent_name`, which rendered the
@@ -261,6 +274,35 @@ Alpha — APIs may change before `v1.0`.
   Node coordinator changes identically, and the protocol corpus pins both
   directions on both backends.
 
+- **A volume is no longer refused by the write grant its own `write()` left
+  behind.** A successful `write()` leaves the volume holding the file's write
+  grant after it returns, and every fresh attempt — `write_cas_at`,
+  `atomic_publish`, `reacquire()` and each retry inside `write_cas` — starts as
+  a new coordinator identity, so the grant the same volume had just taken
+  counted as someone else's. A `write()` followed by `write_cas_at` at the new
+  version was refused as `other_holder` with the two versions equal
+  (`expected=2 current=2`); so was a CAS at the unchanged version after a
+  `write()` that took the grant but never committed (`expected=1 current=1`);
+  a `write_cas` after a `write()` and a `reacquire()` exhausted its retries;
+  and a multi-file `atomic_publish` over a member the volume had just written
+  was held as a conflict. Every retry started another fresh identity and met
+  the same refusal. The first fresh attempt after a `write()` now releases
+  that grant before it goes further, with one release request — reads and
+  optimistic commits never trigger one, so they cost no extra round trip. A
+  release that does not go through is kept and retried at the next attempt,
+  never dropped: under `on_error="strict"` the call that needed it raises, and
+  under `"degrade"` it warns and the commit is refused as `other_holder` until
+  a later attempt releases it. A forked child releases nothing — the grants it
+  inherited belong to the parent, which still holds them. A `write()` followed
+  directly by `write_cas` on the same file used to be refused outright
+  (`commit_cas_not_allowed`), because the loop's first attempt ran under the
+  identity still holding the grant; it now starts from a fresh one in that case
+  only. A `write_cas` of any other file makes no extra request on its first
+  attempt and keeps the refusals a peer's commit left on the volume's other
+  files; a retry starts a fresh attempt like `reacquire()`, which releases the
+  grant and clears those refusals. This is the secondary report in #196; its main request, an acquire that can fail instead
+  of displacing the holder, is not addressed here.
+
 - **A `CoherentVolume` you drop is now garbage-collected, and a constructor that
   raises leaves nothing behind.** Each volume registered its own fork handler
   with `os.register_at_fork`, which cannot unregister and holds a strong
@@ -307,11 +349,13 @@ Alpha — APIs may change before `v1.0`.
   exactly as before. The retry loop is unchanged: `other_holder` retries still
   do not wait. A `CoherentVolume` keeps a file it wrote until the coordinator
   takes it back (after 600 s without a coordinator call, or 1800 s of holding,
-  by default) or its session is stopped, while the whole retry budget takes
-  tens of milliseconds, so a wait that fits in one call would only make the
-  failure slower. The wire reason `cas_exhausted` and the MCP deny mapping are
-  unchanged. The guide now lists the four reasons, what releases a held file,
-  and the volume's `config` parameter that sets those timeouts.
+  by default) or its own next `write_cas` of that file or any `write_cas`
+  retry, `write_cas_at`, `atomic_publish` or `reacquire()` releases it, while
+  the whole retry budget takes tens of milliseconds, so a wait that fits in one
+  call would only make the failure slower. The wire reason `cas_exhausted` and
+  the MCP deny mapping are unchanged. The guide now lists the four reasons,
+  what releases a held file, and the volume's `config` parameter that sets
+  those timeouts.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the

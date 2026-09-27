@@ -612,7 +612,7 @@ from ccs.adapters.coherent_volume import CoherentVolume
 vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
-data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh read
+data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fresh read
 ```
 
 | Parameter | Default | Meaning |
@@ -623,6 +623,13 @@ data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh re
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
+
+`vol.session_id` is the volume's session with the coordinator, and it stays the
+same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
+clear a stale view by starting a fresh attempt under that same session. A forked
+child gets a session of its own. The fresh attempt travels in the request's
+`agent_id` field, so the volume needs a coordinator that reads it: this package's
+from 0.13.0, or the Claude Code plugin's from 0.3.0.
 
 ### Concurrent writers: `write_cas`
 
@@ -635,6 +642,17 @@ silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
 content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
+
+A volume can `write()` a file and then commit it through the optimistic lane. A
+successful `write()` leaves the volume holding that file's write grant after it
+returns; a `write_cas` of that file, `write_cas_at`, `atomic_publish` and
+`reacquire()` release it before they go further, so the volume is not refused by
+its own grant. A `write_cas` of another file leaves it held unless it has to
+retry, because that grant cannot refuse it. The release is one extra request, made only after a `write()`:
+a volume that only reads and commits optimistically never pays for it. Each of
+these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
+and a fresh attempt clears every refusal the volume had, not only the one on the
+file it commits. Re-read any other file before a plain `write()` of it.
 
 When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 `last_conflict_reason` says why the last attempt was refused:
@@ -649,10 +667,14 @@ When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 - `stale_read_generation`: your read was taken under a grant the coordinator has
   since reclaimed. `reacquire()` and re-read.
 
-A `CoherentVolume` that wrote a file keeps holding it; closing the volume or
-exiting the process does not release it. The coordinator takes the file back
-once the holder has made no coordinator calls for `grant_heartbeat_timeout_sec`
-(600 s by default), or has held it for `grant_max_hold_sec` (1800 s by default).
+A `CoherentVolume` that wrote a file keeps holding it until its own next
+`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
+`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
+neither does a `session-stop` that names only `vol.session_id`, because each
+attempt holds its grants under its own `agent_id`. The coordinator
+takes the file back once the holder has made no coordinator calls for
+`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+`grant_max_hold_sec` (1800 s by default).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
 the coordinator. A Claude Code session releases what it holds when its turn ends.
 So after `other_holder`, retry once the holder has released, not in a tight loop,
@@ -1292,7 +1314,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 |---|---|
 | `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
-| `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
+| `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
 | `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |

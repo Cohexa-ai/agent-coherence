@@ -252,10 +252,11 @@ class CoherentVolume:
     .. warning::
 
        **An instance is NOT thread-safe — one operation at a time, one instance
-       per thread (A5).** ``read``/``write``/``write_cas`` read ``_session_id``
-       lock-free while ``reacquire``/``_after_fork`` re-mint it, so overlapping
-       calls on a SINGLE instance from different threads could split an in-flight
-       CAS across identities. This is misuse, and it is made LOUD: a public op
+       per thread (A5).** ``read``/``write``/``write_cas`` read the coordinator
+       identity lock-free while a re-mint (``reacquire``, the OCC retry) or
+       ``_after_fork`` rotates it, so overlapping calls on a SINGLE instance
+       from different threads could split an in-flight CAS across identities.
+       This is misuse, and it is made LOUD: a public op
        that detects another op already in flight on the same instance raises
        :class:`~ccs.core.exceptions.CoherenceError` rather than corrupting
        silently. Each thread (and each forked child) must own its OWN instance —
@@ -399,6 +400,13 @@ class CoherentVolume:
         # write time a current disk hash that differs from this baseline is a
         # foreign / out-of-band edit. Cleared on remint/fork alongside the sibling.
         self._last_observed_hash: dict[str, str] = {}
+        # Incarnations that write() may have left holding EXCLUSIVE/MODIFIED and
+        # that no confirmed release has cleared yet, each with the paths it wrote.
+        # The re-mint that abandons one releases it (see _remint); only write()
+        # adds to it, because it is the only path that takes a grant a later
+        # optimistic commit is refused on. The paths decide whether write_cas
+        # must rotate first: a held grant refuses a commit of that file only.
+        self._grant_incarnations: dict[str, set[str]] = {}
 
         self._mint_identity()
         self._attach()
@@ -412,10 +420,23 @@ class CoherentVolume:
 
     def _mint_identity(self) -> None:
         # A v4 UUID string satisfies the coordinator's session_id regex
-        # (``_SESSION_ID_RE``); the server derives a stable agent id from it via
-        # ``session_to_agent_id``. Per-instance (not per-process): two volumes in
-        # one process are distinct writers.
+        # (``_SESSION_ID_RE``). Per-instance (not per-process): two volumes in
+        # one process are distinct writers. The session id is stable for the
+        # volume's lifetime; what a re-mint changes is the incarnation, which
+        # every request carries in the subagent field, so the coordinator's
+        # grant-row key ``session_to_agent_id(session_id, incarnation)`` is new
+        # per attempt while the session id is not.
         self._session_id = str(uuid.uuid4())
+        self._incarnation = self._new_incarnation()
+
+    @staticmethod
+    def _new_incarnation() -> str:
+        # 32 lowercase hex characters, inside the coordinator's subagent-id shape
+        # (``^[A-Za-z0-9_-]{1,64}$``). The shape is load-bearing: the coordinator
+        # reads an out-of-shape value as "no subagent", which would put every
+        # attempt on the ONE parent row and bring back the sticky deny a re-mint
+        # exists to shed.
+        return uuid.uuid4().hex
 
     def _after_fork(self) -> None:
         # Runs in the child after fork, where the forking thread is the only
@@ -427,10 +448,15 @@ class CoherentVolume:
         self._guard_meta_lock = threading.Lock()
         self._guard_owner_ident = None
         self._guard_depth = 0
-        # Re-mint identity, drop the inherited endpoint (its connection/secret
-        # context belongs to the parent), and clear per-path beliefs the child
-        # has not established itself.
+        # Re-mint identity (a forked child is a new writer, so it gets its own
+        # session id, not just a new incarnation), drop the inherited endpoint
+        # (its connection/secret context belongs to the parent), and clear
+        # per-path beliefs the child has not established itself. Releases
+        # NOTHING, and forgets the grants write() recorded: those belong to the
+        # parent's identity, which is still live in the parent.
         self._session_id = str(uuid.uuid4())
+        self._incarnation = self._new_incarnation()
+        self._grant_incarnations.clear()
         self._endpoint = None
         self._needs_reattach = True
         self._last_committed_hash.clear()
@@ -484,7 +510,11 @@ class CoherentVolume:
 
     @property
     def session_id(self) -> str:
-        """The per-instance coordinator session id (a v4 UUID string)."""
+        """The per-instance coordinator session id (a v4 UUID string).
+
+        Stable for the volume's lifetime: :meth:`reacquire` and the optimistic
+        retries shed stale coordinator state without changing it. A forked child
+        gets its own."""
         return self._session_id
 
     @property
@@ -501,10 +531,11 @@ class CoherentVolume:
         A :class:`CoherentVolume` instance is single-threaded by contract: one
         operation at a time. Concurrent ``read``/``write``/``write_cas`` on the
         same instance from different threads could split an in-flight CAS across
-        identities (``reacquire``/``_after_fork`` re-mint ``_session_id`` while
-        the lock-free op path reads it). This guard makes that misuse LOUD rather
-        than silently corrupting: a second thread entering while another holds the
-        guard raises ``InternalConcurrencyError`` (a ``CoherenceError`` subclass).
+        identities (a re-mint or ``_after_fork`` rotates the coordinator identity
+        while the lock-free op path reads it). This guard makes that misuse LOUD
+        rather than silently corrupting: a second thread entering while another
+        holds the guard raises ``InternalConcurrencyError`` (a ``CoherenceError``
+        subclass).
 
         Re-entrant for the SAME thread so internal nesting works (``write_cas``
         calls :meth:`reacquire`, which calls :meth:`read`): the owning thread
@@ -891,8 +922,29 @@ class CoherentVolume:
             self._record_own_write(rel, self._sha256_bytes(data))
             return
 
+        # Record the grant BEFORE the acquire is sent: an acquire whose answer is
+        # lost, a degraded answer, and every failure after the grant (the disk
+        # write, the post-edit POST) can each leave this incarnation holding
+        # EXCLUSIVE with write() raising. The re-mint that abandons the incarnation
+        # releases it (see _remint). Only a stale deny proves no grant was taken:
+        # an ok:false with an "internal:" reason can follow an acquire that
+        # landed. It withdraws only what this call recorded — the same
+        # incarnation may still hold a grant from an earlier write() on another
+        # path. A file the coordinator does not track stays recorded too: its
+        # answer is the same bare ok:true as an acquire, so the volume cannot
+        # tell that no grant was taken.
+        written = self._grant_incarnations.setdefault(self._incarnation, set())
+        recorded_before = rel in written
+        written.add(rel)
         # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID.
         resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+        stale_deny = (
+            isinstance(resp, dict) and resp.get("ok") is False and resp.get("status") == "stale"
+        )
+        if stale_deny and not recorded_before:
+            written.discard(rel)
+            if not written:
+                self._grant_incarnations.pop(self._incarnation, None)
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
 
@@ -928,12 +980,19 @@ class CoherentVolume:
         except Exception:
             # Release the grant so it is not orphaned until the sweep, then
             # re-raise the original error. Best-effort release — a release failure
-            # must not mask it.
+            # must not mask it. It names the incarnation that holds the grant: a
+            # release without one addresses the session's parent row, which holds
+            # nothing, and releases nothing.
             with contextlib.suppress(Exception):
                 _coordinator_post(
                     self._endpoint,
                     "/hooks/post-edit",
-                    {"session_id": self._session_id, "path": rel, "success": False},
+                    {
+                        "session_id": self._session_id,
+                        "agent_id": self._incarnation,
+                        "path": rel,
+                        "success": False,
+                    },
                 )
             raise
 
@@ -960,7 +1019,8 @@ class CoherentVolume:
         NOT clear it (KTD-T). Recovery requires a fresh coordinator identity AND
         a fresh read under that identity, atomically: the new identity carries
         no ``INVALID`` state, and the mandatory read registers it as
-        SHARED@current.
+        SHARED@current. The fresh identity is a new per-attempt incarnation
+        under the same :attr:`session_id`, which does not change.
 
         **The forced read is non-optional.** Re-minting identity *without*
         reading would merely rename the stale-buffer hole — the next write would
@@ -976,12 +1036,15 @@ class CoherentVolume:
         ``on_stale_read="raise"`` — recovery must never be blocked by the deny
         that triggered it.
         """
-        self._remint()  # fresh identity -> no INVALID; has committed nothing
-        # MANDATORY fresh read under the new identity -> SHARED@current.
-        # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
-        # reacquire after a foreign edit returns the current bytes rather than
-        # re-raising and blocking recovery.
+        # The re-mint runs under the guard with the read: it can send a request
+        # (the release of an abandoned grant), and every request this instance
+        # sends is one operation's.
         with self._single_op_guard():
+            self._remint()  # fresh identity -> no INVALID; has committed nothing
+            # MANDATORY fresh read under the new identity -> SHARED@current.
+            # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
+            # reacquire after a foreign edit returns the current bytes rather than
+            # re-raising and blocking recovery.
             return self._read_impl(path, _enforce_stale=False)
 
     def _remint(self) -> None:
@@ -1001,10 +1064,27 @@ class CoherentVolume:
         keeps the loop's next ``_read_with_version`` a **None-state, HASH-CHECKED**
         read (warn on hash match, deny on mismatch), so its ``(bytes, version)``
         comparand pair is always validated.
+
+        What rotates is the per-attempt incarnation, not :attr:`session_id`: the
+        coordinator keys a grant row on ``session_to_agent_id(session_id,
+        incarnation)``, so a new incarnation is a new row with no ``INVALID``,
+        no invalidation transient and no read generation — which is all the
+        shedding above needs.
+
+        The abandoned incarnation is a different agent to the coordinator, so a
+        grant it still holds is FOREIGN to this volume: an EXCLUSIVE/MODIFIED
+        grant left by :meth:`write` would refuse this volume's next optimistic
+        commit as ``other_holder`` with equal versions, and every retry re-mints
+        into the same refusal. So every incarnation :meth:`write` recorded is
+        released here, one ``session-stop`` naming it, and leaves the record only
+        on a confirmed release. An incarnation that did only reads and
+        optimistic commits holds at most SHARED/INVALID, blocks nothing, and is
+        never released — no request is spent on it.
         """
         with self._lock:
-            self._session_id = str(uuid.uuid4())  # fresh identity -> no INVALID
+            self._incarnation = self._new_incarnation()  # fresh row -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
+            abandoned = sorted(self._grant_incarnations)
             # SB-23: do NOT clear _last_observed_hash here. The observed-disk
             # baselines are DISK-scoped (what disk looked like when this instance
             # last read/wrote a path), not identity-scoped — a re-mint changes the
@@ -1013,6 +1093,49 @@ class CoherentVolume:
             # remint (the CAS path is re-seeded by the loop's next _read_with_version
             # anyway). _after_fork still clears them — a forked child is a new
             # process that must re-establish its own view.
+        # The release runs OUTSIDE self._lock. That lock is a plain (non-
+        # reentrant) threading.Lock guarding identity mutation, and a failed
+        # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
+        # -> _record_degraded takes self._lock), so holding it here would
+        # deadlock on the first failed release.
+        self._release_abandoned_grants(abandoned)
+
+    def _release_abandoned_grants(self, incarnations: list[str]) -> None:
+        """Release every grant each abandoned incarnation holds: one
+        ``session-stop`` naming it in ``agent_id``, which releases all of that
+        row's EXCLUSIVE/MODIFIED grants (every path it wrote) and nothing else.
+
+        An incarnation leaves the record only on a confirmed release — ``ok:
+        true`` without ``degraded`` (a watchdog-degraded stop answers ``ok:
+        true`` whether or not the release ran). Anything else keeps it, so the
+        next re-mint retries it, and the failure routes through ``on_error``
+        like every other coordinator request: strict raises, degrade warns once.
+        The pass stops at the first failure — the rest would meet the same
+        coordinator — so one re-mint spends at most one failed request.
+        """
+        if self._endpoint is None:
+            return  # nothing to send it to; the record waits for an attached re-mint
+        for incarnation in incarnations:
+            resp = self._post(
+                "/hooks/session-stop",
+                {"session_id": self._session_id, "agent_id": incarnation},
+            )
+            if isinstance(resp, dict) and resp.get("degraded"):
+                self._fail_closed_or_degrade(
+                    "coordinator watchdog timeout releasing an abandoned write grant"
+                )
+                return
+            if not (isinstance(resp, dict) and resp.get("ok") is True):
+                # None follows a degrade-mode transport failure _post already
+                # warned about; any other answer is not a shape session-stop has.
+                if resp is not None:
+                    logger.warning(
+                        "release of an abandoned write grant was not confirmed; "
+                        "it will be retried at the next re-mint: %r",
+                        resp,
+                    )
+                return
+            self._grant_incarnations.pop(incarnation, None)
 
     def write_cas(
         self,
@@ -1040,7 +1163,11 @@ class CoherentVolume:
         bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
         :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
         NEVER a silent drop), whose ``last_conflict_reason`` names the refusal
-        that exhausted the budget.
+        that exhausted the budget. The first attempt also re-mints when this
+        volume's own ``write()`` may still hold ``path``, and only then. Any re-mint,
+        like :meth:`reacquire`'s, resets this instance's view of every path: a
+        refusal a peer's commit left on another path is gone, so re-read other
+        tracked paths before a plain ``write()`` of them.
 
         **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
         (=8 → 9 CAS attempts); each lost race (a peer winning the version)
@@ -1049,10 +1176,15 @@ class CoherentVolume:
         pessimistic ``write()`` keeps that grant until the coordinator reclaims it
         (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
         by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
-        the holder's session is stopped, which a ``CoherentVolume`` never does
-        for itself; a peer's reads and CAS attempts never release it, and a
-        peer's ``write()`` only takes it over. So the loop does not wait between
-        those attempts:
+        the holder releases it, which a ``CoherentVolume`` holder does only at
+        its own next re-mint: a ``write_cas`` of that file or any ``write_cas``
+        retry, ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the
+        re-mint releases what its ``write()`` left held; see :meth:`_remint`). A
+        ``session-stop`` naming only its :attr:`session_id` releases nothing,
+        because each attempt holds its grants under its own incarnation. A
+        peer's reads and CAS attempts never release it, and a peer's ``write()``
+        only takes it over.
+        So the loop does not wait between those attempts:
         no wait that fits in one call could outlast the grant, it would only make
         the terminal slower. A caller that gets ``last_conflict_reason ==
         "other_holder"`` retries after the holder releases, not in a loop.
@@ -1123,6 +1255,21 @@ class CoherentVolume:
             self._atomic_write(_abs_path, data)
             self._record_own_write(rel, self._sha256_bytes(data))
             return
+
+        if any(rel in paths for paths in self._grant_incarnations.values()):
+            # This volume's write() may still hold THIS file: under the current
+            # incarnation, or under an abandoned one whose release was not
+            # confirmed. The loop's comparand read must run as a None-state
+            # identity (see below), and commit_cas refuses an E/M caller on the
+            # file it commits, so the current incarnation's grant would refuse
+            # the first attempt outright and an abandoned one's would refuse it
+            # as other_holder, with no peer anywhere. Rotate first; the re-mint
+            # releases every recorded incarnation. Only this file warrants it: a
+            # grant on another file refuses nothing here, and a rotation drops the
+            # refusal a peer's commit left on every other file, which is what
+            # stops a later write() of one of them from stale bytes. An
+            # optimistic-only write_cas still re-mints only on retry.
+            self._remint()
 
         last_current_version = -1
         max_attempts = MAX_CAS_REACQUIRES + 1  # commit (CAS POST) budget
@@ -1813,7 +1960,13 @@ class CoherentVolume:
     def _post(self, endpoint_path: str, payload: dict) -> dict | None:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses
         route through ``on_error`` (strict raises, degrade warns + returns
-        ``None``). Otherwise returns the parsed 200 body."""
+        ``None``). Otherwise returns the parsed 200 body.
+
+        Every request names the current incarnation in the subagent field
+        (``agent_id``), which the coordinator folds into the grant-row key; a
+        body that already names one — the release of an abandoned incarnation —
+        keeps its own."""
+        payload = {"agent_id": self._incarnation, **payload}
         try:
             return _coordinator_post(self._endpoint, endpoint_path, payload)
         except urllib.error.HTTPError as exc:
