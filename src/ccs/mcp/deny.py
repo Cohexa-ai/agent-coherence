@@ -13,7 +13,10 @@ first deliverable, built and tested before any tool binding.
 Two input types (plan §"Deny reason-flow"):
 
 - **Type A** — typed adapter exceptions, matched by EXACT ``type(exc)`` and read
-  via the ``.reason`` constant carried on the exception class. The exception
+  via the ``.reason`` constant carried on the exception class — or, for the two
+  types that carry the coordinator's reason per INSTANCE (``CasVersionConflict``,
+  ``CallerPrincipalRefused``), by that reason's exact membership in its
+  vocabulary. The exception
   *message* stays the verbatim coordinator ``permissionDecisionReason`` (it is
   surfaced as ``detail``; the model's retry loop depends on that byte-stability,
   auto-memory ``project_cc_strict_mode_retry_hazard``). An unrecognized
@@ -33,11 +36,13 @@ from dataclasses import dataclass
 from mcp.types import CallToolResult, TextContent
 
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_REASONS,
     CAS_EXHAUSTED_REASON,
     COORDINATOR_UNAVAILABLE_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
+    CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
     CommitPreempted,
@@ -89,6 +94,29 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
     ),
 }
 
+# A caller-principal refusal is three terminals wearing one exception type,
+# keyed like the CAS refusals on the reason the instance carries (one of
+# ``CALLER_PRINCIPAL_REASONS``, matched by exact membership). One recover verb
+# fits all three when the refusal is SETTLED (``exc.settled``, the default):
+# the coordinator's answer is definite and durable for this server session —
+# the volume presents the one principal it holds, and once its session is
+# known to be bound under another nonce it claims nothing again — so no tool
+# call in the session can regain coordination; a new server session claims its
+# own. ``retryable`` is false for the same reason. Without this branch every
+# later swg_* call read ``internal_error`` / ``none``, the shape of a
+# coordinator bug, for a state that is typed and the session's own.
+PRINCIPAL_REFUSED_RECOVER = "restart_session"
+
+# The refusal that is NOT settled: the request was refused, but the recovery
+# claim's answer was lost, so the volume adopted ``unconfirmed`` and its very
+# next request claims again with the same nonce by itself — the next tool call
+# may simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
+# meanwhile. The verb is the existing one for "the state clears on its own,
+# call again" (``other_holder`` uses it), ``retryable`` true. Answering this arm
+# ``restart_session`` over-claimed durability: it sent the agent to a new
+# session for a state the next call cures.
+PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
+
 # Fallback for any unrecognized exception (an unexpected ``CoherenceError`` such
 # as a CAS corruption raise or a path escape): fail closed as a generic internal
 # error — never a success, never a recoverable ``stale_view``.
@@ -133,6 +161,15 @@ def deny_result(exc: BaseException) -> CallToolResult:
             str(exc),
             {"expected_version": exc.expected_version, "current_version": exc.current_version},
         )
+    if type(exc) is CallerPrincipalRefused and exc.reason in CALLER_PRINCIPAL_REASONS:
+        # Exact type, like ``_TERMINALS``; the reason by exact membership, so
+        # a string outside the vocabulary never rides to the model as a
+        # ``reason`` (it falls to ``_UNRECOGNIZED`` below). The message is the
+        # client's own prose, built from constants: no principal, no nonce.
+        # Whether the refusal is settled is the typed attribute, never prose.
+        if exc.settled:
+            return _result(_Terminal(exc.reason, PRINCIPAL_REFUSED_RECOVER, False), str(exc))
+        return _result(_Terminal(exc.reason, PRINCIPAL_UNSETTLED_RECOVER, True), str(exc))
     terminal = _TERMINALS.get(type(exc), _UNRECOGNIZED)
     return _result(terminal, str(exc))
 

@@ -482,11 +482,28 @@ class CallerPrincipalRefused(CoherenceError):
     it, never on the message. The message never carries a principal or a mint
     nonce: it is written to logs and response ``detail`` fields, and a principal
     appears on exactly one response — the mint response that issues it.
+
+    ``settled`` says whether the refusal is the session's settled state.
+    ``True`` (the default): claiming again with the session's own nonce
+    cannot cure it — the session is bound under another nonce, or the claim
+    handed back the very principal that was refused — so every later request
+    from this session meets the same answer, and only a new session claims
+    its own. ``False``: the request was refused, but the recovery claim's
+    ANSWER was lost (a transport blip, a watchdog-degraded claim), so nothing
+    is known about the session's standing; the client claims again with the
+    same nonce by itself — a long-lived volume, and a one-shot hook client
+    holding no stored principal, before the next request; the substrate
+    session, and a hook client whose stored principal is stale, when that
+    request is refused — and the request may then be admitted. A consumer that tells an
+    agent what to do next branches on this, never on the message: read as
+    settled, a lost answer sends the agent to a new session for a state its
+    next call cures.
     """
 
-    def __init__(self, reason: str, message: str) -> None:
+    def __init__(self, reason: str, message: str, *, settled: bool = True) -> None:
         super().__init__(message)
         self.reason = reason
+        self.settled = settled
 
 
 class CoherenceDegradedWarning(UserWarning):

@@ -686,7 +686,13 @@ class SubstrateCoordinatorSession:
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
         else:
             detail = recovery.detail
-        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, detail))
+        # ``settled`` is False only when the recovery claim's answer was lost:
+        # nothing was adopted, and this session's next refused request claims
+        # again with the retained nonce by itself — so the refusal is not the
+        # session's settled state, and a consumer must not report it as one.
+        raise CallerPrincipalRefused(
+            reason, principal_refusal_message(reason, detail), settled=recovery.settled
+        )
 
     def _send(
         self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]

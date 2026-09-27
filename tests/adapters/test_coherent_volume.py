@@ -3056,6 +3056,7 @@ def test_a_refusal_the_same_nonce_cannot_cure_raises_the_typed_refusal(
             vol.write(rel, b"v2")
 
         assert raised.value.reason == "caller_principal_foreign"
+        assert raised.value.settled is True, "a claim that answered is a settled refusal"
         assert sent.count("/hooks/pre-edit") == 1
         assert claims == [vol.session_id]
         assert (tmp_path / rel).read_bytes() == b"v1"
@@ -3099,6 +3100,7 @@ def test_a_session_bound_under_another_nonce_is_reported_and_never_re_claimed(
                 with pytest.raises(CallerPrincipalRefused) as raised:
                     vol.write(rel, b"v2")
                 assert raised.value.reason == "caller_principal_absent"
+                assert raised.value.settled is True, "bound under another nonce never changes"
                 raised_text += str(raised.value)
         assert claims == [vol.session_id]
         assert (tmp_path / rel).read_bytes() == b"v1", "nothing was written unrecorded"
@@ -3252,6 +3254,48 @@ def test_a_degrade_mode_write_lands_no_bytes_when_the_gates_store_read_fails(
         server.shutdown()
 
 
+def test_the_principal_claim_outcome_is_readable_on_every_arm(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``principal_claim_outcome`` is the read-only view of the session's last
+    claim — what the MCP ``swg_status`` reports so an agent can tell "this
+    session lost coordination" from a transient before its next write is
+    refused. ``bound`` after attach; ``unsupported`` against a coordinator
+    that issues none; ``refused`` once the session is known to be bound under
+    another nonce (durable: nothing is claimed again); ``not_attempted``
+    while no claim has been made for the session — a forked child before it
+    re-attaches. Never a principal, never a nonce."""
+    from ccs.cli._coherence_client import PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.principal_claim_outcome == "bound"
+        bound, nonce = vol._principal, vol._mint_nonce
+        assert bound and nonce and bound not in ("bound", "refused")  # control
+
+        vol._mint_nonce, vol._principal = "Z" * 43, None
+        with pytest.raises(CallerPrincipalRefused):
+            vol.write(rel, b"v2")
+        assert vol.principal_claim_outcome == "refused"
+
+        vol._after_fork()  # the child's session: nothing claimed yet
+        assert vol.principal_claim_outcome == "not_attempted"
+
+        monkeypatch.setattr(
+            coherent_volume_module, "claim_caller_principal",
+            lambda *_a: PrincipalClaim("unsupported"),
+        )
+        vol._ensure_attached()
+        assert vol.principal_claim_outcome == "unsupported"
+        with pytest.raises(AttributeError):
+            vol.principal_claim_outcome = "bound"  # type: ignore[misc]
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_a_refused_acquire_leaves_no_grant_for_a_re_mint_to_release(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3320,8 +3364,67 @@ def test_a_request_refused_again_after_recovery_is_retried_exactly_once(
         assert sent.count("/hooks/pre-edit") == 2, sent
         assert claims == [vol._mint_nonce]
         assert raised.value.reason == "caller_principal_foreign"
+        assert raised.value.settled is True, "refused again after a confirmed claim is settled"
         assert PRINCIPAL_REFUSED_AGAIN in str(raised.value)
         assert (tmp_path / rel).read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("route", ["/hooks/pre-edit", "/hooks/post-edit"])
+def test_a_refusal_whose_recovery_claim_is_unconfirmed_is_not_settled_and_the_next_request_claims_again(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, route: str,
+) -> None:
+    """A request is refused for its principal and the recovery claim's answer
+    is lost (a transport blip): the refused request still raises the typed
+    refusal, but one that says it is NOT settled — the volume adopted
+    ``unconfirmed``, and its very next request claims again with the SAME
+    nonce by itself, obtains the bound principal, and lands. The durable arms
+    (bound under another nonce; the claim handed back the refused principal)
+    raise ``settled`` refusals. On the ``post-edit`` arm the not-settled value
+    survives the re-raise that prefixes what the write left behind.
+
+    Prevents the refusal over-claiming durability: a consumer that reads every
+    principal refusal as "this session can never regain coordination" tells
+    the agent to start a new session for a state the next call cures."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        bound, nonce = vol._principal, vol._mint_nonce
+        assert bound and nonce, "control: the session claimed at attach"
+        nonces: list[str] = []
+        answers = _lose_the_first_claims_answer(monkeypatch, nonces)
+        sent: list[str] = []
+        refusal = {"error": "refused (caller_principal_foreign)", "reason": "caller_principal_foreign"}
+        # Only the FIRST request to ``route`` is refused; the coordinator
+        # itself admits every one, so the next write lands once the claim is
+        # settled — a refusal of the request, not of the session.
+        _answer_route(
+            monkeypatch, route, sent,
+            lambda n: _http_error(route, 400, refusal) if n == 0 else None,
+        )
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            vol.write(rel, b"v2")
+
+        assert raised.value.reason == "caller_principal_foreign"
+        assert raised.value.settled is False, "an unconfirmed recovery claim is not a settled refusal"
+        assert vol.principal_claim_outcome == "unconfirmed"
+        assert nonces == [nonce], "the recovery claim presented the binding's own nonce"
+        assert sent.count(route) == 1, "an unconfirmed claim retried nothing"
+
+        vol.write(rel, b"v2")
+
+        assert nonces == [nonce, nonce], "the next request claimed again by itself, same nonce"
+        assert vol._principal == bound == answers[0].principal  # type: ignore[attr-defined]
+        assert vol.principal_claim_outcome == "bound"
+        assert target.read_bytes() == b"v2"
+        _assert_no_secret_in(str(raised.value) + caplog.text, bound, nonce)
     finally:
         stop_coordinator(tmp_path)
 

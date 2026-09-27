@@ -27,7 +27,17 @@ Alpha — APIs may change before `v1.0`.
   presents the wrong one. A client whose claim answer is lost, or whose binding
   disappears with a deleted `state.db`, claims again with the nonce it kept. A
   coordinator that issues no principals (the plugin's Node coordinator, or an
-  older release) answers `404`, and clients proceed without one.
+  older release) answers `404`, and clients proceed without one. The MCP server
+  answers a refusal it cannot recover from as a typed deny — `reason:
+  caller_principal_absent` / `caller_principal_foreign` /
+  `caller_principal_claimed` — on every later tool call with `recover:
+  restart_session` when the refusal is settled (the session is bound under
+  another nonce, or claiming again handed back the refused principal), and
+  with `recover: wait_and_retry`, `retryable: true`, when the recovery claim's
+  answer was lost, since the next tool call claims again by itself;
+  `swg_status` reports the session's `principal_claim` (`unconfirmed` in that
+  second case) beside the coordinator's two caller-principal counters, and
+  `CallerPrincipalRefused` carries the distinction as `settled`.
 
   This is not a security boundary: the bearer secret still grants full
   authority, and every principal is stored in `.coherence/state.db`, which any

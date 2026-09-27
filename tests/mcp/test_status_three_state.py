@@ -18,15 +18,68 @@ from ccs.mcp.status import _coordinator_state, _per_path, build_status
 
 
 class _StubVolume:
-    def __init__(self, attached: bool, degraded: bool = False, session: str = "sess-1") -> None:
+    def __init__(
+        self,
+        attached: bool,
+        degraded: bool = False,
+        session: str = "sess-1",
+        claim: str = "bound",
+        doc: dict | None = None,
+    ) -> None:
         self.is_attached = attached
         self.is_degraded = degraded
         self.session_id = session
+        self.principal_claim_outcome = claim
+        self._doc = doc
+
+    def coordinator_status(self) -> dict | None:
+        return self._doc
 
 
 def _doc(count: int | None) -> dict:
     summary = {} if count is None else {"strict_mode_pattern_count": count}
     return {"policy_summary": summary}
+
+
+def test_build_status_reports_the_claim_outcome_and_forwards_the_principal_counters() -> None:
+    """``principal_claim`` is the volume's own claim outcome, so an agent can
+    tell "this session lost coordination" (``refused``) ahead of its next
+    refused call; the two counters are forwarded from the coordinator's
+    ``/status`` document verbatim. A reported zero is a zero."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+    doc = {**_doc(1), "caller_principal_absent_total": 3, "caller_principal_refused_total": 0}
+
+    status = build_status(_StubVolume(True, claim="refused", doc=doc), config)
+
+    assert status["coordinator"] == "on"
+    assert status["principal_claim"] == "refused"
+    assert status["caller_principal_absent_total"] == 3
+    assert status["caller_principal_refused_total"] == 0
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        None,
+        _doc(1),
+        {**_doc(1), "caller_principal_absent_total": "3", "caller_principal_refused_total": True},
+    ],
+    ids=["unreachable", "older-coordinator", "not-an-integer"],
+)
+def test_build_status_never_reports_an_unreported_principal_counter_as_zero(doc) -> None:
+    """Cannot-tell never collapses into zero (the SC5 rule, applied to the
+    counters): an unreachable coordinator, an older one that publishes no
+    principal counters, and a value that is not an integer (a bool is an int
+    subclass and is excluded) each read ``None`` — a reader that saw ``0``
+    would take it for "no refusals". The claim outcome is the volume's own
+    and is reported regardless."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+
+    status = build_status(_StubVolume(True, claim="unconfirmed", doc=doc), config)
+
+    assert status["caller_principal_absent_total"] is None
+    assert status["caller_principal_refused_total"] is None
+    assert status["principal_claim"] == "unconfirmed"
 
 
 def test_state_on_when_reachable_with_strict_patterns() -> None:
@@ -99,5 +152,10 @@ def test_build_status_live_reports_on(tmp_path: Path, fast_cfg: LifecycleConfig)
         assert status["single_host_only"] is True
         assert status["heterogeneous_scope_detectable"] is False
         assert status["managed"] == ["data/**"]
+        # A healthy session: its principal is bound, and the live coordinator
+        # reports both counters as integers (zero here — nothing was refused).
+        assert status["principal_claim"] == "bound"
+        assert status["caller_principal_absent_total"] == 0
+        assert status["caller_principal_refused_total"] == 0
     finally:
         stop_coordinator(tmp_path)

@@ -174,6 +174,14 @@ MAX_CAS_REACQUIRES = 8
 DENIED_READ_BACKOFF_BASE_SEC = 0.002
 DENIED_READ_BACKOFF_CAP_SEC = 0.05
 
+PRINCIPAL_CLAIM_NOT_ATTEMPTED = "not_attempted"
+"""What :attr:`CoherentVolume.principal_claim_outcome` reads while no claim
+has been made for the session: before attach, after an attach that reached no
+coordinator, and in a forked child until it re-attaches. The fifth arm beside
+the four a claim itself can settle (``PrincipalClaim.outcome``)."""
+
+PrincipalClaimOutcome = Literal["bound", "unsupported", "refused", "unconfirmed", "not_attempted"]
+
 # SB-23 content-CAS deny message. Byte-stable (no path/hash interpolation) so a
 # model's retry loop sees identical text each attempt (KTD-P), and distinct from
 # the coordinator's INVALID-deny prose so the two are not conflated.
@@ -522,6 +530,24 @@ class CoherentVolume:
     def is_attached(self) -> bool:
         """True if a coordinator endpoint was resolved (strict-mode owner)."""
         return self._endpoint is not None
+
+    @property
+    def principal_claim_outcome(self) -> PrincipalClaimOutcome:
+        """What this session's last caller-principal claim settled — the
+        ``PrincipalClaim`` vocabulary, plus :data:`PRINCIPAL_CLAIM_NOT_ATTEMPTED`
+        while no claim has been made for the session.
+
+        ``bound``: the session holds its principal and presents it on every
+        request. ``unsupported``: the coordinator issues none, so none is
+        presented. ``unconfirmed``: the last claim's answer was lost; the same
+        nonce is claimed again before the next request. ``refused``: the
+        session is bound under another nonce, nothing is claimed again, and
+        every request a require-class route (or, for a presented principal, any
+        route) refuses raises :class:`~ccs.core.exceptions.CallerPrincipalRefused`
+        — durable for this session, so a reader can tell "this session lost
+        coordination" from a transient ahead of its next write. Read by the
+        MCP ``swg_status``. Never the principal or the nonce."""
+        return self._claim_outcome or PRINCIPAL_CLAIM_NOT_ATTEMPTED
 
     # --- single-instance concurrency guard (A5) -----------------------------
 
@@ -1095,7 +1121,11 @@ class CoherentVolume:
             state = _unrecorded_write_state(
                 rel, wrote=not already_on_disk, grant_confirmed=grant_confirmed
             )
-            raise CallerPrincipalRefused(refusal.reason, f"{state} {refusal}") from None
+            # The re-raise keeps what the refusal typed: its reason, and
+            # whether it is settled (a lost recovery answer is not).
+            raise CallerPrincipalRefused(
+                refusal.reason, f"{state} {refusal}", settled=refusal.settled
+            ) from None
         if redirect_status is not None:
             self._fail_closed_or_degrade(
                 f"coordinator request to /hooks/post-edit failed: HTTP {redirect_status}, "
@@ -2087,7 +2117,14 @@ class CoherentVolume:
             if sent.principal_refusal is None:
                 return sent.body
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
-        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, detail))
+        # ``settled`` is False only when the recovery claim's answer was lost:
+        # the volume adopted ``unconfirmed``, and its next request claims again
+        # with the same nonce by itself (_settle_unconfirmed_claim) — so this
+        # refusal is not the session's settled state, and a consumer must not
+        # report it as one. A retry refused again follows a confirmed claim.
+        raise CallerPrincipalRefused(
+            reason, principal_refusal_message(reason, detail), settled=recovery.settled
+        )
 
     def _recover_principal(self) -> PrincipalRecovery:
         """Claim again with the session's SAME nonce after a principal refusal

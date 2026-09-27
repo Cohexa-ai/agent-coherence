@@ -261,6 +261,44 @@ def test_a_reclaim_refused_as_claimed_reports_and_never_re_mints(
     _assert_nothing_leaks(out + err, _value("P"), _value("N"))
 
 
+def test_a_reclaim_whose_answer_is_lost_raises_a_refusal_that_is_not_settled(scripted) -> None:
+    """The one-shot client's refusal is typed on ``settled`` like the
+    long-lived clients': a reclaim answered with the coordinator's degraded
+    claim envelope (its answer lost) stops, but the refusal it raises is NOT
+    settled — the next invocation claims again with the stored nonce by
+    itself — while a reclaim that hands back the refused principal raises a
+    settled one. Neither message carries the principal or the nonce."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    workspace, sid = scripted
+    endpoint = _coherence_client.resolve_endpoint(workspace)
+    _Scripted.route = staticmethod(lambda _h: _refusal(_FOREIGN))
+    _Scripted.claims = [(200, {"ok": False, "degraded": True, "reason": "claim_unconfirmed"})]
+
+    with pytest.raises(CallerPrincipalRefused) as lost:
+        _coherence_client.post_with_stored_principal(
+            endpoint, workspace, "/hooks/session-stop", {"session_id": sid}, report=lambda _m: None
+        )
+
+    assert lost.value.reason == _FOREIGN
+    assert lost.value.settled is False, "a lost reclaim answer is not a settled refusal"
+    assert _Scripted.seen == [
+        ("/hooks/session-stop", _value("P")),
+        ("/principal/claim", _value("N")),
+    ], "the request was retried after an unconfirmed reclaim"
+
+    _Scripted.seen.clear()
+    _Scripted.claims = [(200, {"ok": True, "principal": _value("P")})]
+    with pytest.raises(CallerPrincipalRefused) as answered:
+        _coherence_client.post_with_stored_principal(
+            endpoint, workspace, "/hooks/session-stop", {"session_id": sid}, report=lambda _m: None
+        )
+
+    assert answered.value.reason == _FOREIGN
+    assert answered.value.settled is True, "a reclaim that answered is a settled refusal"
+    _assert_nothing_leaks(str(lost.value) + str(answered.value), _value("P"), _value("N"))
+
+
 def test_a_reclaim_answered_404_retries_once_without_the_header(
     scripted, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

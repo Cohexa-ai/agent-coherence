@@ -1374,9 +1374,63 @@ def test_a_definite_principal_refusal_is_typed_on_both_legs_never_commit_unconfi
 
         for refusal in (read_leg.value, commit_leg.value):
             assert refusal.reason == "caller_principal_foreign"
+            assert refusal.settled is True, "bound under another nonce never changes"
             assert not isinstance(refusal, CommitUnconfirmed)
             for secret in (bound, "Z" * 43, "X" * 43):
                 assert secret and secret not in str(refusal)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_refusal_whose_recovery_claim_is_unconfirmed_is_not_settled_and_the_next_request_claims_again(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The session presents a principal that is not the bound one; the request
+    is refused and the recovery claim's answer is lost (a transport blip).
+    The refusal raises typed but NOT settled: nothing was adopted from an
+    unconfirmed claim, and the next request — refused again — claims again
+    with the RETAINED nonce by itself, adopts the bound principal and lands.
+    A refusal the claim answered (the bound-under-another-nonce arm, pinned
+    above) is settled. Nothing rendered carries a principal or the nonce."""
+    from ccs.cli._coherence_client import PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    caplog.set_level(logging.DEBUG)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        bound, nonce = sa._principal, sa._mint_nonce
+        assert bound and nonce, "control: the session claimed at construction"
+        sa._principal = "X" * 43
+        real = substrate_module.claim_caller_principal
+        nonces: list[str] = []
+
+        def lossy(endpoint, session_id, presented_nonce):  # noqa: ANN001, ANN202
+            nonces.append(presented_nonce)
+            claim = real(endpoint, session_id, presented_nonce)
+            assert claim.outcome == "bound", "control: the lost claim really answered"
+            if len(nonces) == 1:
+                return PrincipalClaim("unconfirmed", detail="answer lost")
+            return claim
+
+        monkeypatch.setattr(substrate_module, "claim_caller_principal", lossy)
+
+        with pytest.raises(CallerPrincipalRefused) as raised:
+            sa.pre_read(REF, None)
+
+        assert raised.value.reason == "caller_principal_foreign"
+        assert raised.value.settled is False, "an unconfirmed recovery claim is not a settled refusal"
+        assert sa._principal == "X" * 43, "a principal was adopted from an unconfirmed claim"
+        assert nonces == [nonce], "the recovery claim presented the retained nonce"
+
+        result = sa.pre_read(REF, None)
+
+        assert result.version >= 0 and result.stale_denied is False
+        assert nonces == [nonce, nonce], "the next request claimed again by itself, same nonce"
+        assert sa._principal == bound
+        rendered = str(raised.value) + caplog.text
+        for secret in (bound, nonce, "X" * 43):
+            assert secret not in rendered, "a principal or nonce was rendered"
     finally:
         stop_coordinator(tmp_path)
 
@@ -1604,6 +1658,7 @@ def test_a_request_refused_again_after_recovery_is_retried_exactly_once(
         assert sent == [held, "1".zfill(43)], "the refused request, then ONE retry under the new principal"
         assert claims == [sa._mint_nonce]
         assert raised.value.reason == "caller_principal_foreign"
+        assert raised.value.settled is True, "refused again after a claim that answered is settled"
         assert "(caller_principal_foreign)" in str(raised.value)
         assert PRINCIPAL_REFUSED_AGAIN in str(raised.value)
     finally:

@@ -772,6 +772,19 @@ class PrincipalRecovery:
     principal: str | None = None
     detail: str = ""
 
+    @property
+    def settled(self) -> bool:
+        """Whether a refusal this recovery could not cure is the session's
+        settled state — what the raised
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` carries as
+        ``settled``. ``False`` only when the claim did NOT confirm: its answer
+        was lost, so the session's standing is unknown and the next claim
+        with the same nonce may still cure the refusal. Every other stop is
+        settled: the session is bound under another nonce, the claim handed
+        back the refused principal, or no nonce was held to claim with; and a
+        request refused again after a confirmed claim is settled too."""
+        return self.claim is None or self.claim.outcome != "unconfirmed"
+
 
 def decide_principal_recovery(claim: PrincipalClaim, presented: str | None) -> PrincipalRecovery:
     """Map the claim a refused client made with its held nonce to the next step:
@@ -865,7 +878,11 @@ def post_with_stored_principal(
         return answer
     recovery = recover_stored_principal(endpoint, coordinator_root, session_id, principal, report)
     if recovery.action == "stop":
-        raise CallerPrincipalRefused(reason, principal_refusal_message(reason, recovery.detail))
+        # A one-shot client's next invocation claims again with the stored
+        # nonce by itself, so a stop on an unconfirmed claim is not settled.
+        raise CallerPrincipalRefused(
+            reason, principal_refusal_message(reason, recovery.detail), settled=recovery.settled
+        )
     answer, reason = _send_presenting(send, endpoint, path, payload, recovery.principal)
     if reason is None:
         return answer

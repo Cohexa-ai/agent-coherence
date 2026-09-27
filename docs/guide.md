@@ -1443,7 +1443,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim` and the coordinator's two caller-principal counters |
 | `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](#effect-fence-over-http) |
 
 Denials are machine-readable: an agent parses the typed payload (for example
@@ -1451,6 +1451,27 @@ Denials are machine-readable: an agent parses the typed payload (for example
 blindly. The server validates every file URI — path traversal and any access to
 the coordinator's own state directory are rejected — and fails closed on IO
 errors. Strict-mode, managed-path scoped.
+
+**A session the coordinator refuses.** The server claims a
+[caller principal](#caller-principal) for its session at start. When a later
+request is refused for it and claiming again with the same nonce cannot cure
+that — the session is bound under another nonce, or the claim hands back the
+principal that was just refused — the tool call answers `reason:
+caller_principal_absent`, `caller_principal_foreign` or
+`caller_principal_claimed` with `recover: restart_session` and
+`retryable: false`, and so does every `swg_write`, `swg_read` and `swg_gate`
+after it: no tool call in that server session can regain coordination, and a
+new server session claims its own principal. `swg_status` says so ahead of time
+as `principal_claim: refused`. When instead the *answer* to that claim is lost
+(a transport blip), the refusal is not yet settled: the tool call answers the
+same `reason` with `recover: wait_and_retry` and `retryable: true`, the next
+tool call claims again with the same nonce by itself before it runs — and
+usually just succeeds — and `swg_status` reads `principal_claim: unconfirmed`
+until it does. The other values are `bound`, `unsupported` (the coordinator
+issues no principals) and `not_attempted`. `swg_status` also forwards the
+coordinator's `caller_principal_absent_total` and
+`caller_principal_refused_total`, `null` rather than `0` when the coordinator
+is unreachable or does not report them.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
