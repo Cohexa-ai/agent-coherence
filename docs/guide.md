@@ -622,6 +622,7 @@ data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh re
 | `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+| `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
 
 ### Concurrent writers: `write_cas`
 
@@ -635,11 +636,35 @@ content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
 
-When a commit loses its race on the volume (or MCP) path, the raised
-`CommitPreempted` is **terminal for that attempt, not a transient to retry blindly**:
-the version the write assumed no longer holds. Recover by `reacquire()`-ing,
-re-reading the fresh version, and reconciling your change onto it before committing
-again — a plain retry of the same bytes just loses the same race.
+When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
+`last_conflict_reason` says why the last attempt was refused:
+
+- `version_mismatch`: other `write_cas` callers kept committing first. A later
+  retry can win.
+- `other_holder`: another agent wrote the file with a plain `write()` and still
+  holds it. The version has not moved, so re-reading returns the same bytes.
+- `caller_in_transient_state`: another agent's plain `write()` landed between
+  your read and your commit. That agent may still hold the file, as with
+  `other_holder`.
+- `stale_read_generation`: your read was taken under a grant the coordinator has
+  since reclaimed. `reacquire()` and re-read.
+
+A `CoherentVolume` that wrote a file keeps holding it; closing the volume or
+exiting the process does not release it. The coordinator takes the file back
+once the holder has made no coordinator calls for `grant_heartbeat_timeout_sec`
+(600 s by default), or has held it for `grant_max_hold_sec` (1800 s by default).
+Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
+the coordinator. A Claude Code session releases what it holds when its turn ends.
+So after `other_holder`, retry once the holder has released, not in a tight loop,
+or use a plain `write()`, which takes the file over (the previous holder's next
+write is then refused until it re-reads).
+
+When a plain `write()` loses its commit to a peer on the volume (or MCP) path,
+the raised `CommitPreempted` is **terminal for that attempt, not a transient to
+retry blindly**: the version the write assumed no longer holds. Recover by
+`reacquire()`-ing, re-reading the fresh version, and reconciling your change onto
+it before committing again — a plain retry of the same bytes just loses the same
+race.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 

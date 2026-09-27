@@ -1039,11 +1039,24 @@ class CoherentVolume:
         re-derives the bytes from that view via ``make_content``, and retries —
         bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
         :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
-        NEVER a silent drop).
+        NEVER a silent drop), whose ``last_conflict_reason`` names the refusal
+        that exhausted the budget.
 
         **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
         (=8 → 9 CAS attempts); each lost race (a peer winning the version)
-        costs one. Under very high single-host contention — more concurrent
+        costs one. So does each ``other_holder`` refusal, which is not a race:
+        another agent still holds the grant at an unchanged version. A
+        pessimistic ``write()`` keeps that grant until the coordinator reclaims it
+        (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
+        by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
+        the holder's session is stopped, which a ``CoherentVolume`` never does
+        for itself; a peer's reads and CAS attempts never release it, and a
+        peer's ``write()`` only takes it over. So the loop does not wait between
+        those attempts:
+        no wait that fits in one call could outlast the grant, it would only make
+        the terminal slower. A caller that gets ``last_conflict_reason ==
+        "other_holder"`` retries after the holder releases, not in a loop.
+        Under very high single-host contention — more concurrent
         writers racing the SAME key than the budget — a writer can exhaust it
         and raise :class:`~ccs.core.exceptions.CasRetriesExhausted`. A
         stale-denied comparand read (the transient window where a peer's commit
@@ -1216,13 +1229,17 @@ class CoherentVolume:
             if outcome == "conflict":
                 last_current_version = self._cas_current_version(resp, last_current_version)
                 if cas_attempts >= max_attempts:
-                    # Every allowed commit attempt lost the race — typed
-                    # terminal, never a silent drop. (last_current_version is
-                    # the latest version the loser observed.)
+                    # Every allowed commit attempt was refused — typed terminal,
+                    # never a silent drop. (last_current_version is the latest
+                    # version the loser observed.) The last refusal's reason
+                    # tells a lost race (version_mismatch) from a grant another
+                    # agent holds (other_holder, or caller_in_transient_state
+                    # when that agent's write() landed mid-attempt).
                     raise CasRetriesExhausted(
                         artifact_id=rel,
                         attempts=cas_attempts,
                         last_current_version=last_current_version,
+                        last_conflict_reason=resp.get("reason"),
                     )
                 # Re-mint (NOT reacquire) before the next attempt so the next
                 # comparand read is a hash-checked None-state read that sees the

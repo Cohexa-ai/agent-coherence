@@ -243,6 +243,24 @@ Alpha — APIs may change before `v1.0`.
   use the volume; and the exhaustion counter's lock, checking the child can
   still count.
 
+- **`CasRetriesExhausted` now says which refusal used up the retry budget.**
+  Its message always read "every commit_cas attempt lost the race", even when
+  no race happened: every attempt was refused `other_holder` because another
+  agent had written the file with a plain `write()` and still held it, at an
+  unchanged version. The exception now carries `last_conflict_reason`, the
+  reason for the last refusal (keyword-only, `None` by default;
+  `ConditionalPutRetriesExhausted` inherits it as `None`), and both
+  `CoherentVolume.write_cas` and `AgentRuntime.write_cas` set it. The message
+  names that reason and what it means for a retry; without a reason it reads
+  exactly as before. The retry loop is unchanged: `other_holder` retries still
+  do not wait. A `CoherentVolume` keeps a file it wrote until the coordinator
+  takes it back (after 600 s without a coordinator call, or 1800 s of holding,
+  by default) or its session is stopped, while the whole retry budget takes
+  tens of milliseconds, so a wait that fits in one call would only make the
+  failure slower. The wire reason `cas_exhausted` and the MCP deny mapping are
+  unchanged. The guide now lists the four reasons, what releases a held file,
+  and the volume's `config` parameter that sets those timeouts.
+
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the
   parent's coordinator connection and re-attaches on its next `read` or write.

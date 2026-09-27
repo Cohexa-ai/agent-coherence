@@ -459,12 +459,22 @@ class CasRetriesExhausted(CoherenceError):
     """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
 
     The typed terminal failure for the OCC write path (plan Unit 5, R6 /
-    R-OCC-6). When ``AgentRuntime.write_cas`` has retried ``commit_cas`` the
-    strategy-allowed number of times and every attempt lost the race
-    (``ConflictDetail``), the loop surfaces THIS rather than silently dropping
-    the write. A ``CasRetriesExhausted`` therefore means *no mutation landed for
-    this caller* — the cache is left at the latest observed (refreshed) version,
-    never corrupted with an unconfirmed write.
+    R-OCC-6). When ``AgentRuntime.write_cas`` or ``CoherentVolume.write_cas`` has
+    retried ``commit_cas`` the allowed number of times and every attempt was
+    refused (``ConflictDetail``), the loop surfaces THIS rather than silently
+    dropping the write. A ``CasRetriesExhausted`` therefore means *no mutation
+    landed for this caller* — the cache is left at the latest observed
+    (refreshed) version, never corrupted with an unconfirmed write.
+
+    :attr:`last_conflict_reason` is the coordinator's reason for the LAST
+    refusal, when the raise site has it; earlier attempts may have been refused
+    for other reasons. ``version_mismatch`` is a lost race. ``other_holder`` is
+    not: another agent holds the grant at an unchanged version. Against the
+    cross-process coordinator (``CoherentVolume``) nothing the caller does
+    releases it; the holder's session-stop or the coordinator's reclaim does. In
+    process (``AgentRuntime``) the loop's own re-fetch downgrades the holder, so
+    ``other_holder`` there clears on the next attempt unless the holder
+    re-acquires.
 
     A subclass of :class:`CoherenceError` so the deny-always-raises consumers
     (CoherentVolume / CCSStore strict mode) already treat it as a hard failure.
@@ -475,12 +485,36 @@ class CasRetriesExhausted(CoherenceError):
     """
 
     reason = CAS_EXHAUSTED_REASON
+    #: Class default, so a subclass that bypasses ``__init__``
+    #: (``ConditionalPutRetriesExhausted``) still has the attribute.
+    last_conflict_reason: str | None = None
 
-    def __init__(self, artifact_id: object, attempts: int, last_current_version: int) -> None:
+    def __init__(
+        self,
+        artifact_id: object,
+        attempts: int,
+        last_current_version: int,
+        *,
+        last_conflict_reason: str | None = None,
+    ) -> None:
+        # isinstance, not truthiness alone: the reason arrives from a JSON body,
+        # and an exception constructor must never raise (see CasVersionConflict).
+        if isinstance(last_conflict_reason, str) and last_conflict_reason:
+            self.last_conflict_reason = last_conflict_reason
+        if self.last_conflict_reason is None:
+            # No reason known (a raise site that does not pass one): the text
+            # this message has always had.
+            outcome = "(no write landed — every commit_cas attempt lost the race)"
+        else:
+            # .get, never []: a reason the advice table has not learned yet still
+            # produces a usable terminal.
+            outcome = (
+                f"last_reason={self.last_conflict_reason} "
+                f"{_CAS_EXHAUSTED_ADVICE.get(self.last_conflict_reason, _CAS_CONFLICT_ADVICE_FALLBACK)}"
+            )
         super().__init__(
             f"cas_retries_exhausted artifact={artifact_id} attempts={attempts} "
-            f"last_current_version={last_current_version} "
-            f"(no write landed — every commit_cas attempt lost the race)"
+            f"last_current_version={last_current_version} {outcome}"
         )
         self.artifact_id = artifact_id
         self.attempts = attempts
@@ -722,6 +756,31 @@ _CAS_CONFLICT_ADVICE: dict[str, str] = {
 
 #: Used when the coordinator reports a reason this table does not know.
 _CAS_CONFLICT_ADVICE_FALLBACK = "(no write landed; re-read before retrying)"
+
+#: Per-reason text for :class:`CasRetriesExhausted`, keyed on the LAST refusal.
+#: It differs from the single-refusal advice above: the retry loop has already
+#: re-read and re-minted, so it says what the last refusal means for a caller
+#: deciding whether to try again. Only ``version_mismatch`` is a lost race;
+#: ``caller_in_transient_state`` also arrives when a peer's ``write()`` has
+#: acquired the file and still holds it, with the version unmoved.
+_CAS_EXHAUSTED_ADVICE: dict[str, str] = {
+    VERSION_MISMATCH_REASON: (
+        "(no write landed — the last commit_cas attempt lost the race: a peer "
+        "committed first)"
+    ),
+    "other_holder": (
+        "(no write landed — another agent still holds the grant at an unchanged "
+        "version; retry after it releases, not in a loop)"
+    ),
+    STALE_READ_GENERATION_REASON: (
+        "(no write landed — the grant the last read was taken under was "
+        "reclaimed; reacquire and re-read)"
+    ),
+    OCC_CALLER_TRANSIENT_REASON: (
+        "(no write landed — a peer's write() invalidated this caller between its "
+        "last read and its CAS; that peer may still hold the grant)"
+    ),
+}
 
 
 class CasVersionConflict(CoherenceError):

@@ -1268,8 +1268,9 @@ def test_write_cas_exhaustion_raises_typed_terminal(
 ) -> None:
     """Bounded progress (R6): if every attempt loses the race, write_cas raises
     CasRetriesExhausted (a typed terminal) rather than silently dropping the
-    write. Simulated by a peer that commits a fresh version on EVERY attempt, so
-    B's expected_version is always stale by commit time."""
+    write. Simulated by a peer that commits a fresh version on EVERY attempt,
+    between B's read and B's CAS, so every refusal is
+    ``caller_in_transient_state`` (the peer's pre-edit invalidated B)."""
     import ccs.adapters.coherent_volume as cv_mod
 
     target = _seed(tmp_path, content=b"v1")
@@ -1282,8 +1283,8 @@ def test_write_cas_exhaustion_raises_typed_terminal(
         counter = {"n": 1}
 
         def make(current: bytes) -> bytes:
-            # On every B attempt, A commits a NEW version first → B's read is
-            # immediately stale → guaranteed version_mismatch each attempt.
+            # On every B attempt, A commits a NEW version between B's read and
+            # B's CAS → A's pre-edit invalidates B → caller_in_transient_state.
             counter["n"] += 1
             vol_a.reacquire("data/shared.txt")
             vol_a.write("data/shared.txt", f"vA-{counter['n']}".encode())
@@ -1293,10 +1294,52 @@ def test_write_cas_exhaustion_raises_typed_terminal(
             vol_b.write_cas("data/shared.txt", make)
         # The terminal records the artifact + that no write landed for B.
         assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_conflict_reason == "caller_in_transient_state"
+        assert "may still hold the grant" in str(exc.value)
         # B's stale buffer never clobbered A's latest.
         assert b"B-attempt" not in target.read_bytes()
     finally:
         cv_mod.MAX_CAS_REACQUIRES = original_max
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_exhausted_by_a_held_grant_names_other_holder(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pessimistic write() leaves its writer MODIFIED until the coordinator
+    reclaims the grant or the holder's session is stopped, so a peer's write_cas
+    is refused ``other_holder`` at an unchanged version on every remaining
+    attempt. Each refusal costs one unit of budget, the loop does not wait
+    between them (no in-call wait could outlast the grant), and the terminal
+    names the LAST refusal: here A writes during B's first attempt, so the first
+    refusal is ``caller_in_transient_state`` and the other eight are
+    ``other_holder``."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(cv_mod, "time", SimpleNamespace(sleep=sleeps.append))
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        calls = {"n": 0}
+
+        def make(current: bytes) -> bytes:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                vol_a.write("data/shared.txt", b"v2-from-A")  # A now holds MODIFIED
+            return current + b"\nB"
+
+        with pytest.raises(CasRetriesExhausted) as exc:
+            vol_b.write_cas("data/shared.txt", make)
+        assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_current_version == 2
+        assert exc.value.last_conflict_reason == "other_holder"
+        assert "last_reason=other_holder" in str(exc.value)
+        assert "lost the race" not in str(exc.value)
+        assert sleeps == []
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
         stop_coordinator(tmp_path)
 
 
