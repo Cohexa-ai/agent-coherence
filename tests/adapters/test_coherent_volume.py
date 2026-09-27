@@ -538,6 +538,52 @@ def test_failed_degrade_reattach_counts_once_and_keeps_its_error_when_warnings_a
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [
+        (_fail_spawn, OSError),
+        (_interrupt_strict_check, _Interrupted),
+        (_fail_resolve, CoherenceDegradedWarning),
+    ],
+    ids=["unhandled-error", "interrupt", "coordinator-unavailable"],
+)
+def test_failed_degrade_reattach_still_logs_when_warnings_are_errors(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """The degradation log line must not depend on the warning being shown. An
+    escalated warning raises out of ``warnings.warn``; for an unhandled error or
+    interrupt it is then suppressed so the original propagates, and for a handled
+    failure it propagates as the error itself. Either way the degradation is
+    counted, so the log is the only record left for an operator who filters
+    warnings into errors."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+        caplog.set_level(logging.WARNING, logger="ccs.adapters.coherent_volume")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceDegradedWarning)
+            with pytest.raises(raised):
+                vol.read("data/shared.txt")
+        degraded_logs = [
+            r
+            for r in caplog.records
+            if r.name == "ccs.adapters.coherent_volume"
+            and r.levelno == logging.WARNING
+            and "CoherentVolume degraded" in r.getMessage()
+        ]
+        assert len(degraded_logs) == 1
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_foreign_coordinator_strict_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
     """A coordinator already running (not spawned by the appliance) cannot have
     strict mode enabled on it (load-once policy); strict mode fails closed."""
