@@ -1140,3 +1140,266 @@ def test_allowed_pre_bash_does_not_raise_a_false_post_compaction_stale_flag(
     text = _reground_text(strict_client)
     assert "docs/plans/x.md is at v2." in text, text
     assert "advanced to" not in text, text
+
+
+# ----------------------------------------------------------------------
+# The retry a deny invites is a read
+# ----------------------------------------------------------------------
+#
+# The flip side of the section above. A strict Bash or Grep deny re-grants
+# SHARED without recording an observation, and it does so to let the retry go
+# through: strict mode never re-grants on a denied Read (KTD-T), so running
+# the command again is how a strict session recovers. That retry, and any Read
+# the session takes instead, finds the grant already held and returns fresh.
+# The command then runs and reads the current bytes, so the read has to be
+# recorded there. Otherwise the session's baseline stays at the version before
+# the deny (or at never-observed, on a first touch), and every later message
+# computed from it is wrong in the unsafe direction: a peer's commit loses its
+# "advanced past your last-observed" flag, and a later grant handover is
+# reported as a write the session already read.
+#
+# Only a SHARED holder is credited, and only when the command runs. An E/M
+# holder keeps its grant untouched, and a verify_only fence read records
+# nothing, because it discards the bytes it read. A Grep credits no held file
+# at all: its path set is every tracked file under its root, not what it
+# showed, and crediting that would clear the flag on a file the deny just
+# told the session to re-read. The safe side is the baseline staying behind
+# until a Read or a retried Bash command records the read.
+
+
+def test_the_bash_retry_a_deny_invites_advances_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    _setup_stale(strict_client, "plan.md")
+    _, denied = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+    artifact_id = strict_coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    read_generation = strict_coordinator.registry.get_read_generation(artifact_id, _agent("A"))
+
+    status, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert status == 200
+    assert body == {"status": "fresh"}, body
+    assert _observed(strict_coordinator, "plan.md", "A") == 2, (
+        "the retry ran and read v2; leaving the baseline at v1 makes every "
+        "later stale message report a version A has since read"
+    )
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED
+    # The credit moves the baseline and nothing else: a claim-capture trigger
+    # here would also re-arm the read-generation fence for a read it did not
+    # take through the effect gate.
+    assert strict_coordinator.registry.get_read_generation(
+        artifact_id, _agent("A")
+    ) == read_generation
+
+
+def test_a_bash_retry_then_a_grant_handover_reports_no_write(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The retry's end-to-end consequence, prose and summary both: A read v2
+    through the retry, so when B takes the grant and writes nothing, A's next
+    read must take the grant-change arm, not name a write A already read."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
+
+    status, body = strict_client.post(
+        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "was updated by" not in reason, reason
+    assert "your grant on plan.md was revoked and no new version was committed" in reason, reason
+    assert "plan.md is still at v2" in reason, reason
+    assert body["summary"]["current_version"] == 2, body["summary"]
+    assert body["summary"]["prior_version_seen_by_session"] == 2, body["summary"]
+
+
+def test_a_first_touch_bash_retry_keeps_the_post_compaction_stale_flag(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """A's first contact with plan.md is a denied ``cat``: the deny records no
+    observation, so the retry is A's only read of v1. If it goes unrecorded,
+    A's baseline stays never-observed, and after B commits v2 the
+    re-grounding says only "is at v2" -- the flag for a file A read at v1 and
+    that moved since is gone."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("B"), "path": "plan.md", "content_hash": _hash("v1")},
+    )
+    _, denied = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert _observed(strict_coordinator, "plan.md", "A") is None
+
+    _, retried = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert retried == {"status": "fresh"}, retried
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+    strict_client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
+    strict_client.post(
+        "/hooks/post-edit",
+        {"session_id": _sid("B"), "path": "plan.md",
+         "content_hash": _hash("v2"), "success": True},
+    )
+    text = _reground_text(strict_client)
+    assert "plan.md advanced to v2 past your last-observed v1" in text, text
+
+
+def test_a_grep_after_a_denied_bash_does_not_count_as_reading_the_file(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """A's ``cat plan.md`` is denied; A's next call is a Grep with no path,
+    which lists every tracked file under the root. The Grep never showed
+    plan.md, so it must not stand in for the re-read the deny asked for: the
+    baseline stays at v1, and after a grant handover A is still told about the
+    write it has not read, prose and summary both."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+
+    _, body = strict_client.post(
+        "/hooks/pre-grep", {"session_id": _sid("A"), "search_root": ""},
+    )
+    assert body == {"status": "fresh"}, body
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+    _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
+    _, read = strict_client.post(
+        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert read["hookSpecificOutput"]["permissionDecision"] == "deny", read
+    reason = read["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "plan.md was updated by agent " in reason, reason
+    assert read["summary"]["prior_version_seen_by_session"] == 1, read["summary"]
+
+
+def test_a_grep_retry_leaves_the_baseline_for_the_read_to_record(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """A denied Grep's own retry goes through without crediting the held file;
+    the Read that follows is what records v2."""
+    _setup_stale(strict_client, "plan.md")
+    _, denied = strict_client.post(
+        "/hooks/pre-grep", {"session_id": _sid("A"), "search_root": ""},
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+
+    _, retried = strict_client.post(
+        "/hooks/pre-grep", {"session_id": _sid("A"), "search_root": ""},
+    )
+    assert retried == {"status": "fresh"}, retried
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+    _, read = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
+    )
+    assert read["status"] == "fresh", read
+    assert _observed(strict_coordinator, "plan.md", "A") == 2
+
+
+def test_a_read_after_a_denied_bash_advances_the_observation_baseline(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The other way to recover: after the denied ``cat``, A uses Read. The
+    grant is already held, so pre-read answers fresh, and that read ran too."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
+    )
+    assert status == 200
+    assert body["status"] == "fresh", body
+    assert "hookSpecificOutput" not in body, body
+    assert _observed(strict_coordinator, "plan.md", "A") == 2
+
+
+def test_a_verify_only_read_after_a_denied_bash_records_no_observation(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The effect gate's verification read compares comparands and throws the
+    bytes away, so it must not stand in for the read A still owes."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+
+    status, body = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "verify_only": True},
+    )
+    assert status == 200
+    assert body["status"] == "fresh", body
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+
+def test_a_bash_retry_that_is_denied_again_records_no_observation(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """A held path inside a command that is denied on ANOTHER path was not
+    read either: the credit follows the command's outcome, as the grants do."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    _setup_stale(strict_client, "CLAUDE.md")
+
+    _, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md CLAUDE.md"},
+    )
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert "CLAUDE.md" in body["hookSpecificOutput"]["permissionDecisionReason"], body
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+
+def test_a_bash_read_leaves_a_held_exclusive_grant_alone(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """Only a SHARED holder is credited. Re-granting SHARED to every held path
+    would downgrade a session's own write grant under it.
+
+    Every hook-issued E/M grant records the current version, so no hook
+    sequence leaves an E holder behind; the row is built through the registry
+    instead, because a guard that only a behind baseline reaches is otherwise
+    pinned by nothing."""
+    _setup_stale(strict_client, "plan.md")
+    artifact_id = strict_coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    strict_coordinator.registry.set_agent_state(
+        artifact_id, _agent("A"), MESIState.EXCLUSIVE, trigger="test", tick=0, observed=False,
+    )
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+    _, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert body == {"status": "fresh"}, body
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.EXCLUSIVE
+
+
+def test_crediting_a_held_read_never_restores_a_revoked_grant(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The handler reads the grant before the deny decision and credits the
+    read after it, so a peer can revoke the grant in between. The credit must
+    re-check under the registry lock and leave the INVALID row alone: writing
+    SHARED over it would clear a stale flag A has not seen yet."""
+    from ccs.adapters.claude_code.coordinator_server import _record_held_read
+
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED
+    _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
+
+    artifact_id = strict_coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    _record_held_read(
+        strict_coordinator, artifact_id, _agent("A"), trigger="held_bash_read", tick=0,
+    )
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.INVALID
+    assert _observed(strict_coordinator, "plan.md", "A") == 1

@@ -1749,6 +1749,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         source="pre_read_shared_hash_deny",
                     )
                 fresh["hash_differs"] = True
+            # The read is allowed. A SHARED grant that a denied Bash / Grep
+            # command re-armed certifies no read, so this one is the read to
+            # record. A verify_only fence read discards its bytes and must not.
+            if not verify_only and agent_state == MESIState.SHARED:
+                _record_held_read(
+                    coordinator, artifact_id, agent_id, trigger="held_read", tick=now,
+                )
             if want_generation and decision.owner_generation is not None:
                 fresh["owner_generation"] = decision.owner_generation
             return fresh
@@ -3127,11 +3134,53 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
+def _record_held_read(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    trigger: str,
+    tick: int,
+) -> None:
+    """Record a read by a session that already holds SHARED on the path.
+
+    A held grant usually certifies the current bytes already, which makes this
+    a no-op. After a strict Bash / Grep deny it does not: that re-grant records
+    no observation (see ``_apply_bash_grep_regrants``), so a retried Bash
+    command -- or the Read the session takes instead -- finds the grant held,
+    answers fresh, and is the session's first read at this version. Left
+    unrecorded, the baseline stays at the version before the deny (never
+    observed, on a first touch), and every message computed from it errs
+    toward "nothing moved": a peer's commit loses its post-compaction flag and
+    a later grant handover is reported as a write the session already read.
+
+    The row is re-read under the registry lock because the caller classified
+    the path before its deny decision: a peer's pre-edit or commit landing
+    since leaves the row INVALID, and writing SHARED over it would clear a
+    stale flag the session has not seen. Only SHARED is credited, so an E/M
+    holder's grant is never touched, and the SHARED-to-SHARED write uses a
+    trigger outside ``CLAIM_CAPTURE_TRIGGERS``, so the one thing it moves is
+    ``last_observed_version``.
+    """
+    registry = coordinator.registry
+    with registry.abort_guard():
+        if registry.get_agent_state(artifact_id, agent_id) != MESIState.SHARED:
+            return
+        artifact = registry.get_artifact(artifact_id)
+        observed = registry.last_observed_version_for(artifact_id, agent_id)
+        if artifact is None or (observed is not None and observed >= artifact.version):
+            return
+        registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED, trigger=trigger, tick=tick,
+        )
+
+
 def _apply_bash_grep_regrants(
     coordinator: CoordinatorHTTPServer,
     agent_id: UUID,
     regrants: list[tuple[UUID, str]],
     *,
+    held: list[tuple[UUID, str]],
     command_runs: bool,
     tick: int,
 ) -> None:
@@ -3148,6 +3197,13 @@ def _apply_bash_grep_regrants(
     An allowed command does run and does read the current bytes, exactly like
     pre-read's ``post_stale_read`` re-grant, so it must keep recording.
 
+    ``held`` lists the paths the session already held SHARED going in. They
+    need no grant, but a Bash command that runs reads them too, and the retry of
+    a denied command is exactly that run -- see ``_record_held_read``. Grep
+    passes none: its path set is every tracked file under its root, not what it
+    showed, so crediting a held file would advance a baseline the session was
+    just told to re-read.
+
     Keyed on the COMMAND's outcome, not the trigger and not the path's own
     strictness: a warn-only path inside a denied command was not read either.
     """
@@ -3156,6 +3212,9 @@ def _apply_bash_grep_regrants(
             artifact_id, agent_id, MESIState.SHARED,
             trigger=trigger, tick=tick, observed=command_runs,
         )
+    if command_runs:
+        for artifact_id, trigger in held:
+            _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
 
 
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -3223,9 +3282,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # stale match in the path set triggers deny per the plan's edge-case
         # contract (cat a.md b.md where a.md is strict → deny).
         strict_stale_first: dict | None = None
-        # The SHARED grants this command earns, applied only once the deny
-        # decision is known -- see _apply_bash_grep_regrants.
+        # The SHARED grants this command earns, and the SHARED grants it
+        # already holds, both applied only once the deny decision is known --
+        # see _apply_bash_grep_regrants.
         regrants: list[tuple[UUID, str]] = []
+        held: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -3240,6 +3301,8 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 continue
             agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             if agent_state is not None and agent_state != MESIState.INVALID:
+                if agent_state == MESIState.SHARED:
+                    held.append((artifact_id, "held_bash_read"))
                 continue  # fresh on this path
             # Stale. Record summary; re-grant SHARED to suppress repeat fires.
             artifact = coordinator.registry.get_artifact(artifact_id)
@@ -3272,7 +3335,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
         _apply_bash_grep_regrants(
             coordinator, agent_id, regrants,
-            command_runs=strict_stale_first is None, tick=now,
+            held=held, command_runs=strict_stale_first is None, tick=now,
         )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
@@ -3450,9 +3513,11 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 }
             regrants.append((artifact_id, "post_stale_grep"))
 
+        # No held paths: a Grep over a root does not read every file under it
+        # -- see _apply_bash_grep_regrants.
         _apply_bash_grep_regrants(
             coordinator, agent_id, regrants,
-            command_runs=strict_stale_first is None, tick=now,
+            held=[], command_runs=strict_stale_first is None, tick=now,
         )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
@@ -4769,10 +4834,31 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
     named_agents = coordinator.agent_names_snapshot()
 
-    tracked: list[dict] = [
-        {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
-        for artifact_id, meta in artifact_by_id.items()
-    ]
+    tracked: list[dict] = []
+    for artifact_id, meta in artifact_by_id.items():
+        entry: dict[str, Any] = {
+            "path": meta["name"],
+            "version": meta["version"],
+            "id": str(artifact_id),
+        }
+        if detail == "full":
+            # #199 §2: writer attribution is workspace-state disclosure (it
+            # names which session wrote what), so it rides the operator-gated
+            # tier only — the minimal-tier question is #198's to settle.
+            # Read from the same status_snapshot row, not per-artifact
+            # last_writer_for calls, which would reopen the PERF-1 N+1.
+            # ``last_writer_agent_id`` is the registry's own handle: it joins
+            # against ``sessions[].agent_id`` (whose ``agent_name`` this tier
+            # already shows) and survives a restart. No session id is derived
+            # from it: the only way back from an agent id to a session is the
+            # process-local name map, which the ``sessions[]`` join already
+            # consults, and which is empty for a writer from before a restart.
+            # The timestamp is null when nothing has committed: ``updated_at``
+            # then stamps the first observation, not a write.
+            writer = meta.get("last_writer_id")
+            entry["last_writer_agent_id"] = str(writer) if writer else None
+            entry["last_writer_at_unix_ts"] = meta.get("updated_at") if writer else None
+        tracked.append(entry)
 
     # The HOLDER set comes from the registry; a NAME comes from the adapter.
     # They are not the same set. ``_agent_names`` is process-local, seeded

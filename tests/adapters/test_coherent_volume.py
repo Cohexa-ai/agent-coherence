@@ -12,6 +12,8 @@ separately.
 from __future__ import annotations
 
 import builtins
+import contextlib
+import gc
 import io
 import logging
 import os
@@ -21,6 +23,8 @@ import subprocess
 import threading
 import time
 import warnings
+import weakref
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +46,7 @@ from ccs.adapters.coherent_volume import (
     MAX_CAS_REACQUIRES,
     CoherentVolume,
     coherent_workspace,
+    denied_read_backoff_sec,
     install,
     uninstall,
 )
@@ -182,6 +187,581 @@ def test_real_fork_child_has_distinct_identity(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_real_fork_resets_every_live_volume(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """One fork handler walks every live volume: with two alive at fork time,
+    the child re-mints both, not only the first one the weak set yields."""
+    ws_a = tmp_path / "a"
+    ws_b = tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    vol_a = CoherentVolume(ws_a, managed=("data/**",), config=fast_cfg)
+    vol_b = CoherentVolume(ws_b, managed=("data/**",), config=fast_cfg)
+    parent_ids = (vol_a.session_id, vol_b.session_id)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, f"{vol_a.session_id} {vol_b.session_id}".encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    # parent
+    os.close(write_fd)
+    try:
+        child_ids = tuple(os.read(read_fd, 128).decode("utf-8").split())
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert len(child_ids) == 2
+        assert child_ids[0] != parent_ids[0]
+        assert child_ids[1] != parent_ids[1]
+        assert child_ids[0] != child_ids[1]
+    finally:
+        stop_coordinator(ws_a)
+        stop_coordinator(ws_b)
+
+
+def test_fork_reset_continues_past_a_failing_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A volume whose reset raises must not leave the rest unreset: each volume
+    once had its own fork handler, and CPython runs every handler even after one
+    raises. The shared handler resets them all, then raises what failed so the
+    child still reports it. CPython's default unraisable hook prints only a
+    group's own message, so that message must name each failure. Every stub
+    raises, so a loop that stops at the first failure resets exactly one,
+    whichever the weak set yields first."""
+    reset_calls: list[str] = []
+
+    class _FailingReset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+            raise RuntimeError(f"reset {self.name} failed")
+
+    stubs = [_FailingReset("a"), _FailingReset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+    assert sorted(str(exc) for exc in excinfo.value.exceptions) == ["reset a failed", "reset b failed"]
+    printed = str(excinfo.value)
+    assert "RuntimeError: reset a failed" in printed
+    assert "RuntimeError: reset b failed" in printed
+
+
+def test_fork_reset_raises_nothing_when_every_volume_resets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The handler runs in every forked child of a process that imported the
+    adapter, so a clean pass must raise nothing: anything it raises is printed as
+    an ignored exception in that child."""
+    reset_calls: list[str] = []
+
+    class _Reset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+
+    stubs = [_Reset("a"), _Reset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+
+
+@contextlib.contextmanager
+def _held_by_another_thread(enter: Callable[[], contextlib.AbstractContextManager[object]]) -> Iterator[None]:
+    """Keep ``enter()`` entered on a second thread for the duration of the block."""
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with enter():
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        yield
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def _report_from_fork_child(child: Callable[[], str], timeout: float = 5.0) -> str | None:
+    """Fork, run ``child`` in the child, and return what it reported: ``""`` if it
+    raised, ``None`` if the child produced nothing within ``timeout`` (a hang). The
+    child is killed and reaped either way, so a hung child cannot stall the suite."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, child().encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], timeout)
+        return os.read(read_fd, 256).decode("utf-8") if ready else None
+    finally:
+        os.close(read_fd)
+        os.kill(pid, signal.SIGKILL)  # no-op on a child that already exited
+        os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+@pytest.mark.parametrize("held", ["lock", "single_op_guard", "guard_meta_lock"])
+def test_fork_while_another_thread_holds_volume_state_leaves_child_usable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, held: str
+) -> None:
+    """Only the forking thread survives a fork, so a lock or guard another parent
+    thread held at that moment stays held in the child with nothing left to
+    release it. The child must neither hang, in the fork handler or on a later
+    ``_lock`` or ``_guard_meta_lock``, nor refuse every operation as concurrent
+    use by a thread that no longer exists (the single-op guard)."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    enter = {
+        "lock": lambda: vol._lock,
+        "single_op_guard": vol._single_op_guard,
+        "guard_meta_lock": lambda: vol._guard_meta_lock,
+    }[held]
+
+    def child() -> str:
+        # A real read and write re-attach under the child's identity through the
+        # single-op guard; taking _lock covers reacquire and the degradation path.
+        if vol.read("data/seed.txt") != b"seed":
+            return ""
+        vol.write("data/seed.txt", b"child")
+        with vol._lock:
+            return vol.session_id
+
+    try:
+        vol.write("data/seed.txt", b"seed")
+        parent_id = vol.session_id
+        with _held_by_another_thread(enter):
+            reported = _report_from_fork_child(child)
+        assert reported is not None, "the forked child hung"
+        assert reported not in ("", parent_id)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[..., object]:
+    """Wrap ``real`` so its next call raises ``error`` and later calls pass through."""
+    pending_failures = [error]
+
+    def flaky(*args: object, **kwargs: object) -> object:
+        if pending_failures:
+            raise pending_failures.pop()
+        return real(*args, **kwargs)
+
+    return flaky
+
+
+def _fail_first_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the next ``resolve_endpoint`` raise once, as when ``server.pid`` or
+    ``hook.secret`` is briefly missing during a coordinator restart."""
+    unavailable = CoordinatorUnavailable("server.pid missing (coordinator restarting)")
+    flaky_resolve = _raise_once(coherent_volume_module.resolve_endpoint, unavailable)
+    monkeypatch.setattr(coherent_volume_module, "resolve_endpoint", flaky_resolve)
+
+
+class _Interrupted(BaseException):
+    """Stands in for an interrupt (KeyboardInterrupt, SystemExit) mid-attach."""
+
+
+def _coordinator_version(vol: CoherentVolume, rel: str) -> int | None:
+    """The coordinator's recorded version of ``rel`` (None if untracked)."""
+    status = vol.coordinator_status() or {}
+    versions = {a.get("path"): a.get("version") for a in status.get("tracked_artifacts", [])}
+    return versions.get(rel)
+
+
+@pytest.mark.parametrize(
+    ("failing", "error", "raised"),
+    [
+        ("resolve_endpoint", CoordinatorUnavailable("server.pid missing"), CoherenceError),
+        ("connect_or_spawn", OSError("simulated spawn failure"), OSError),
+    ],
+    ids=["coordinator-unavailable", "unhandled-error"],
+)
+def test_failed_reattach_after_fork_is_retried_in_strict_mode(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    error: BaseException,
+    raised: type[BaseException],
+) -> None:
+    """A forked child whose first re-attach fails must retry it on the next
+    read or write, whatever the failure raised — the handled CoherenceError or
+    an error from the coordinator spawn the fail-closed path never sees.
+    Dropping the pending re-attach when the attempt failed left a strict child
+    detached for life: every later op took the unattached branch, so an
+    ordinary write landed on disk without an error while the coordinator
+    recorded nothing and peers were never invalidated."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol.write("data/shared.txt", b"parent")
+        version_before = _coordinator_version(vol, "data/shared.txt")
+        assert version_before is not None
+
+        vol._after_fork()  # simulate the child-side fork handler
+        real = getattr(coherent_volume_module, failing)
+        monkeypatch.setattr(coherent_volume_module, failing, _raise_once(real, error))
+
+        with pytest.raises(raised):
+            vol.read("data/shared.txt")  # re-attach fails -> strict raises
+        assert not vol.is_attached
+
+        assert vol.read("data/shared.txt") == b"parent"  # retries the re-attach
+        assert vol.is_attached
+
+        vol.write("data/shared.txt", b"child")
+        assert _coordinator_version(vol, "data/shared.txt") > version_before
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda vol: vol.read("data/shared.txt"),
+        lambda vol: vol.read_with_version("data/shared.txt"),
+        lambda vol: vol.read_with_version_generation("data/shared.txt"),
+        lambda vol: vol.write("data/shared.txt", b"child"),
+        lambda vol: vol.write_cas("data/shared.txt", lambda current: current + b"+child"),
+    ],
+    ids=["read", "read_with_version", "read_with_version_generation", "write", "write_cas"],
+)
+def test_strict_child_fails_closed_on_every_op_while_reattach_fails(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Callable[[CoherentVolume], object],
+) -> None:
+    """While the re-attach keeps failing, each read (plain or versioned), write
+    and write_cas of a strict forked child raises and nothing lands on disk —
+    none of them may fall through to the unattached branch, first call or
+    retry."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+
+        def unavailable(*_args: object) -> None:
+            raise CoordinatorUnavailable("server.pid missing (coordinator restarting)")
+
+        monkeypatch.setattr(coherent_volume_module, "resolve_endpoint", unavailable)
+
+        for _ in range(2):
+            with pytest.raises(CoherenceError):
+                operation(vol)
+        assert target.read_bytes() == b"v1"
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("method", ["read_with_version", "read_with_version_generation"])
+def test_versioned_read_reattaches_after_fork(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """The versioned reads are reads too. A forked child's first one must
+    re-attach and register the view — failing closed while it cannot — not
+    return version 0 with the coordinator never asked."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol.write("data/shared.txt", b"parent")
+        coordinator_version = _coordinator_version(vol, "data/shared.txt")
+        assert coordinator_version  # non-zero, so the version-0 fallback cannot pass
+
+        vol._after_fork()
+        _fail_first_resolve(monkeypatch)
+        versioned_read = getattr(vol, method)
+
+        with pytest.raises(CoherenceError):
+            versioned_read("data/shared.txt")
+        data, version, *_ = versioned_read("data/shared.txt")
+        assert vol.is_attached
+        assert (data, version) == (b"parent", coordinator_version)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forked child that re-attaches to a coordinator not enforcing its managed
+    paths must fail closed on every op, not just the first. The strict check
+    raised with the endpoint to that coordinator still set, so the next op saw
+    an endpoint, skipped the re-attach, and ran through it unenforced."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+        monkeypatch.setattr(vol, "strict_mode_active", lambda: False)
+
+        for _ in range(2):
+            with pytest.raises(CoherenceError):
+                vol.read("data/shared.txt")
+            assert not vol.is_attached
+
+        monkeypatch.undo()  # the coordinator enforces the managed paths again
+        assert vol.read("data/shared.txt") == b"v1"
+        assert vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_interrupted_reattach_after_fork_leaves_the_child_detached(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt that escapes the re-attach after the endpoint was resolved —
+    here during the strict-enforcement check — must not leave that endpoint set.
+    The retry runs only while the endpoint is None, so a kept endpoint would
+    carry every later op through a coordinator whose enforcement was never
+    checked."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+        flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
+        monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+
+        with pytest.raises(_Interrupted):
+            vol.read("data/shared.txt")
+        assert not vol.is_attached
+
+        assert vol.read("data/shared.txt") == b"v1"  # retries, checks, attaches
+        assert vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_failed_reattach_after_fork_stays_best_effort_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under on_error='degrade' the same failed re-attach warns and the op runs
+    best-effort, as a failed attach at construction does — it does not raise."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        _fail_first_resolve(monkeypatch)
+
+        with pytest.warns(CoherenceDegradedWarning):
+            assert vol.read("data/shared.txt") == b"v1"
+        vol.write("data/shared.txt", b"child")
+        assert target.read_bytes() == b"child"
+        assert vol.is_degraded
+        assert not vol.is_attached  # one attempt: the write did not re-attach
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_unexpected_reattach_error_after_fork_is_not_retried_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Degrade keeps its one attempt even when the re-attach fails with an error
+    the degrade path does not handle: that op raises it, and later ops run
+    best-effort instead of retrying (and re-raising) on every call. Running
+    best-effort for life, the child must warn and count like the handled
+    failures — re-raising alone left is_degraded False while enforcement was off."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        attempts: list[object] = []
+
+        def failing_connect_or_spawn(*args: object, **kwargs: object) -> None:
+            attempts.append(args)
+            _raise_oserror()
+
+        monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", failing_connect_or_spawn)
+
+        with pytest.warns(CoherenceDegradedWarning, match="OSError"):
+            with pytest.raises(OSError):
+                vol.read("data/shared.txt")
+        assert vol.is_degraded
+
+        vol.write("data/shared.txt", b"child")  # best-effort, no second attempt
+        assert target.read_bytes() == b"child"
+        assert len(attempts) == 1
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _fail_spawn(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An error the degrade path does not handle, before the child connects."""
+    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", _raise_oserror)
+
+
+def _interrupt_strict_check(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt after the child connected, during the strict-mode check."""
+    flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
+    monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+
+
+def _fail_resolve(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure the degrade path handles: the coordinator briefly unreachable."""
+    _fail_first_resolve(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [(_fail_spawn, OSError), (_interrupt_strict_check, _Interrupted)],
+    ids=["unhandled-error", "interrupt"],
+)
+def test_failed_reattach_after_fork_never_reports_degraded_in_strict_mode(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """Strict fails closed on these failures and retries on the next op, so it is
+    never running best-effort and must not report itself degraded."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+
+        with pytest.raises(raised):
+            vol.read("data/shared.txt")
+        assert not vol.is_degraded
+
+        monkeypatch.undo()
+        assert vol.read("data/shared.txt") == b"v1"  # retries the re-attach
+        assert vol.is_attached
+        assert not vol.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_interrupted_reattach_after_fork_is_detached_and_degraded_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Degrade reports the escaped interrupt as degraded, so it must also drop the
+    endpoint resolved before it. Keeping it would report degraded while later
+    ops ran through a coordinator whose enforcement was never checked."""
+    target = _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
+        monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+
+        with pytest.warns(CoherenceDegradedWarning):
+            with pytest.raises(_Interrupted):
+                vol.read("data/shared.txt")
+        assert vol.is_degraded
+        assert not vol.is_attached
+
+        vol.write("data/shared.txt", b"child")  # best-effort, no second attempt
+        assert target.read_bytes() == b"child"
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [
+        (_fail_spawn, OSError),
+        (_interrupt_strict_check, _Interrupted),
+        (_fail_resolve, CoherenceDegradedWarning),
+    ],
+    ids=["unhandled-error", "interrupt", "coordinator-unavailable"],
+)
+def test_failed_degrade_reattach_counts_once_and_keeps_its_error_when_warnings_are_errors(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """With CoherenceDegradedWarning escalated to an error, a failed re-attach
+    still counts once and raises what it raised before. An unhandled error or
+    interrupt propagates as itself, not as the warning (which ``except
+    Exception`` would catch in place of an interrupt). A handled failure already
+    raised the escalated warning from inside the attempt and must not be
+    counted a second time on the way out."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceDegradedWarning)
+            with pytest.raises(raised):
+                vol.read("data/shared.txt")
+        assert vol.degradation_count == 1
+        assert not vol.is_attached
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("inject_failure", "raised"),
+    [
+        (_fail_spawn, OSError),
+        (_interrupt_strict_check, _Interrupted),
+        (_fail_resolve, CoherenceDegradedWarning),
+    ],
+    ids=["unhandled-error", "interrupt", "coordinator-unavailable"],
+)
+def test_failed_degrade_reattach_still_logs_when_warnings_are_errors(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inject_failure: Callable[[CoherentVolume, pytest.MonkeyPatch], None],
+    raised: type[BaseException],
+) -> None:
+    """The degradation log line must not depend on the warning being shown. An
+    escalated warning raises out of ``warnings.warn``; for an unhandled error or
+    interrupt it is then suppressed so the original propagates, and for a handled
+    failure it propagates as the error itself. Either way the degradation is
+    counted, so the log is the only record left for an operator who filters
+    warnings into errors."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._after_fork()
+        inject_failure(vol, monkeypatch)
+        caplog.set_level(logging.WARNING, logger="ccs.adapters.coherent_volume")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceDegradedWarning)
+            with pytest.raises(raised):
+                vol.read("data/shared.txt")
+        degraded_logs = [
+            r
+            for r in caplog.records
+            if r.name == "ccs.adapters.coherent_volume"
+            and r.levelno == logging.WARNING
+            and "CoherentVolume degraded" in r.getMessage()
+        ]
+        assert len(degraded_logs) == 1
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_foreign_coordinator_strict_raises(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
     """A coordinator already running (not spawned by the appliance) cannot have
     strict mode enabled on it (load-once policy); strict mode fails closed."""
@@ -203,6 +783,75 @@ def test_foreign_coordinator_degrade_warns(tmp_path: Path, fast_cfg: LifecycleCo
         with pytest.warns(CoherenceDegradedWarning):
             vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
         assert vol.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _fail_strict_construction(root: Path, cfg: LifecycleConfig) -> list[CoherentVolume]:
+    """Construct a strict volume over a coordinator it did not spawn, so ``_attach``
+    raises, and return the half-built instance captured just before it did."""
+    half_built: list[CoherentVolume] = []
+
+    class _CapturingVolume(CoherentVolume):
+        def _attach(self) -> None:
+            half_built.append(self)
+            super()._attach()
+
+    with pytest.raises(CoherenceError):
+        _CapturingVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    return half_built
+
+
+def test_volume_is_collected_once_unreferenced(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """The fork handler must not own the volume: os.register_at_fork cannot be
+    undone, so registering a bound method there kept every volume alive (and
+    reset in every forked child) for the life of the process."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(vol)
+        del vol
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_failed_construction_is_collected(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A constructor that raised hands the caller nothing, so nothing may keep
+    the half-built instance alive either."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(_fail_strict_construction(tmp_path, fast_cfg).pop())
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_failed_construction_is_not_reset_in_fork_child(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A construction that raised leaves nothing registered for fork: even while
+    something still references the half-built instance, a forked child does not
+    re-mint its identity. Being collectable alone would not show this — a weak
+    registration made before ``_attach`` and never withdrawn still resets it."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        (half_built,) = _fail_strict_construction(tmp_path, fast_cfg)
+        parent_id = half_built.session_id
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            os.close(read_fd)
+            try:
+                os.write(write_fd, half_built.session_id.encode("utf-8"))
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        child_id = os.read(read_fd, 64).decode("utf-8")
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert child_id == parent_id
     finally:
         stop_coordinator(tmp_path)
 
@@ -663,8 +1312,9 @@ def test_write_cas_exhaustion_raises_typed_terminal(
 ) -> None:
     """Bounded progress (R6): if every attempt loses the race, write_cas raises
     CasRetriesExhausted (a typed terminal) rather than silently dropping the
-    write. Simulated by a peer that commits a fresh version on EVERY attempt, so
-    B's expected_version is always stale by commit time."""
+    write. Simulated by a peer that commits a fresh version on EVERY attempt,
+    between B's read and B's CAS, so every refusal is
+    ``caller_in_transient_state`` (the peer's pre-edit invalidated B)."""
     import ccs.adapters.coherent_volume as cv_mod
 
     target = _seed(tmp_path, content=b"v1")
@@ -677,8 +1327,8 @@ def test_write_cas_exhaustion_raises_typed_terminal(
         counter = {"n": 1}
 
         def make(current: bytes) -> bytes:
-            # On every B attempt, A commits a NEW version first → B's read is
-            # immediately stale → guaranteed version_mismatch each attempt.
+            # On every B attempt, A commits a NEW version between B's read and
+            # B's CAS → A's pre-edit invalidates B → caller_in_transient_state.
             counter["n"] += 1
             vol_a.reacquire("data/shared.txt")
             vol_a.write("data/shared.txt", f"vA-{counter['n']}".encode())
@@ -688,10 +1338,52 @@ def test_write_cas_exhaustion_raises_typed_terminal(
             vol_b.write_cas("data/shared.txt", make)
         # The terminal records the artifact + that no write landed for B.
         assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_conflict_reason == "caller_in_transient_state"
+        assert "may still hold the grant" in str(exc.value)
         # B's stale buffer never clobbered A's latest.
         assert b"B-attempt" not in target.read_bytes()
     finally:
         cv_mod.MAX_CAS_REACQUIRES = original_max
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_exhausted_by_a_held_grant_names_other_holder(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pessimistic write() leaves its writer MODIFIED until the coordinator
+    reclaims the grant or the holder's session is stopped, so a peer's write_cas
+    is refused ``other_holder`` at an unchanged version on every remaining
+    attempt. Each refusal costs one unit of budget, the loop does not wait
+    between them (no in-call wait could outlast the grant), and the terminal
+    names the LAST refusal: here A writes during B's first attempt, so the first
+    refusal is ``caller_in_transient_state`` and the other eight are
+    ``other_holder``."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(cv_mod, "time", SimpleNamespace(sleep=sleeps.append))
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        calls = {"n": 0}
+
+        def make(current: bytes) -> bytes:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                vol_a.write("data/shared.txt", b"v2-from-A")  # A now holds MODIFIED
+            return current + b"\nB"
+
+        with pytest.raises(CasRetriesExhausted) as exc:
+            vol_b.write_cas("data/shared.txt", make)
+        assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_current_version == 2
+        assert exc.value.last_conflict_reason == "other_holder"
+        assert "last_reason=other_holder" in str(exc.value)
+        assert "lost the race" not in str(exc.value)
+        assert sleeps == []
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
         stop_coordinator(tmp_path)
 
 
@@ -714,9 +1406,15 @@ def test_write_cas_deny_raises_in_both_on_error_modes(
             assert vol.read("data/shared.txt") == b"v1"
             # Force expected_version far above current → corruption body
             # ({ok:false, reason:commit_cas_corruption...}) which must raise.
-            # (bytes, version, stale_denied, generation, stale_status) — not
-            # stale, so no reacquire.
-            vol._read_with_version = lambda rel: (b"v1", 999, False, 0, False)  # type: ignore[assignment]
+            # Not stale, so no reacquire.
+            vol._read_with_version = lambda rel: coherent_volume_module._ReadResult(  # type: ignore[assignment]
+                data=b"v1",
+                version=999,
+                stale_denied=False,
+                owner_generation=0,
+                stale_status=False,
+                content_differs=False,
+            )
             with pytest.raises(CoherenceError):
                 vol.write_cas("data/shared.txt", lambda cur: b"should-not-land")
             assert not vol.is_degraded, (
@@ -1004,7 +1702,7 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
 
         # Confirm B really is in the sticky-deny state BEFORE write_cas: a bare
         # version-aware read reports stale_denied=True (INVALID, not re-granted).
-        _bytes, _ver, stale_denied, _gen, _stale = vol_b._read_with_version(
+        _bytes, _ver, stale_denied, _gen, _stale, _differs = vol_b._read_with_version(
             "data/shared.txt"
         )
         assert stale_denied is True, "precondition: B must be a sticky strict-deny"
@@ -1048,11 +1746,17 @@ def test_write_cas_fails_closed_with_typed_terminal_when_reads_stay_denied(
         calls = {"n": 0}
 
         def always_denied(rel: str):
-            # (bytes, version, stale_denied, generation, stale_status) — every
-            # comparand read is a deny (a deny carries no confirmed generation
-            # and is a stale-status read).
+            # Every comparand read is a deny (a deny carries no confirmed
+            # generation and is a stale-status read).
             calls["n"] += 1
-            return (b"v1", 1, True, None, True)
+            return coherent_volume_module._ReadResult(
+                data=b"v1",
+                version=1,
+                stale_denied=True,
+                owner_generation=None,
+                stale_status=True,
+                content_differs=False,
+            )
 
         vol._read_with_version = always_denied  # type: ignore[assignment]
 
@@ -1194,13 +1898,18 @@ def test_shim_lost_update_is_denied_through_open(
         stop_coordinator(tmp_path)
 
 
-def test_shim_reattaches_after_fork(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+@pytest.mark.parametrize("managed", [("data/**",), ("**",)], ids=["data-glob", "all-glob"])
+def test_shim_reattaches_after_fork(
+    tmp_path: Path, fast_cfg: LifecycleConfig, managed: tuple[str, ...]
+) -> None:
     """After a fork drops the endpoint, the next shim'd open lazily re-attaches
     under the child's fresh identity (simulated via a direct _after_fork call to
-    avoid forking the coordinator's threads)."""
+    avoid forking the coordinator's threads). Under ``**`` the re-attach's own
+    reads of ``.coherence/`` files are shim'd opens of managed paths too — they
+    must not re-enter the re-attach and recurse."""
     _seed(tmp_path, content=b"v1")
     try:
-        with coherent_workspace(tmp_path, managed=("data/**",), config=fast_cfg) as vol:
+        with coherent_workspace(tmp_path, managed=managed, config=fast_cfg) as vol:
             assert vol.is_attached
             old_sid = vol.session_id
             vol._after_fork()  # simulate the child-side fork handler
@@ -1528,6 +2237,186 @@ def test_reacquire_recovers_under_on_stale_read_raise(
         with pytest.raises(StaleView):
             vol.read("data/x.txt")
         assert vol.reacquire("data/x.txt") == b"v2"  # recovery does not raise
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_refused_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A read refused with StaleView hands the caller no bytes, so it must not
+    advance the foreign-edit baseline: a write built from the pre-edit buffer is
+    still denied and the foreign bytes survive."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")              # FOREIGN edit (not via the volume)
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")                # refused: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_read_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails closed on a watchdog degrade (on_error='strict') also
+    hands the caller no bytes, so it must not advance the baseline either."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_refused_first_read_still_guards_a_peer_commit_landing_after_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused FIRST read returns no bytes, but it must still leave a baseline:
+    without one, a write built from no read overwrites a peer's commit that reached
+    disk after the refusal."""
+    target = _seed_file(tmp_path, content=b"0")
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    reader = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    committed, release = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    real_write = peer._atomic_write
+
+    def lagging_write(abs_path: Path, data: bytes) -> None:
+        committed.set()                           # CAS confirmed at the coordinator,
+        if not release.wait(10):                  # held off disk until released
+            raise AssertionError("peer disk write was never released")
+        real_write(abs_path, data)
+
+    monkeypatch.setattr(peer, "_atomic_write", lagging_write)
+
+    def peer_commit(version: int) -> None:
+        try:
+            peer.write_cas_at("data/x.txt", version, b"1")
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+            committed.set()
+
+    thread: threading.Thread | None = None
+    try:
+        _data, version = peer.read_with_version("data/x.txt")
+        thread = threading.Thread(target=peer_commit, args=(version,))
+        thread.start()
+        assert committed.wait(10) and not errors, errors
+        with pytest.raises(StaleView):
+            reader.read("data/x.txt")             # first read, inside the window
+        release.set()
+        thread.join(10)
+        assert not errors, errors
+        assert target.read_bytes() == b"1"        # the peer's commit is on disk
+        with pytest.raises(StaleView):
+            reader.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"1"        # ... and NOT overwritten
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(10)
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_first_read_still_guards_a_later_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FIRST read that fails closed on a watchdog degrade returns no bytes but
+    still leaves a baseline, so a write built from no read cannot overwrite an
+    out-of-band edit made after it."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.read("data/x.txt")                # first read fails closed
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        target.write_bytes(b"HUMAN")              # FOREIGN edit after the refusal
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", b"blind")
+        assert target.read_bytes() == b"HUMAN"    # foreign edit NOT clobbered
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_reacquire_after_refused_read_reseeds_then_write_succeeds(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """reacquire() returns the bytes it reads, so it DOES advance the baseline: a
+    write rebuilt from those bytes after a refused read is not false-denied."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_stale_read="raise", config=fast_cfg
+    )
+    try:
+        vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        with pytest.raises(StaleView):
+            vol.read("data/x.txt")
+        fresh = vol.reacquire("data/x.txt")
+        assert fresh == b"HUMAN"
+        vol.write("data/x.txt", fresh + b"+agent")
+        assert target.read_bytes() == b"HUMAN+agent"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_fail_closed_reacquire_does_not_absolve_foreign_edit_for_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reacquire() takes a fresh identity before it reads, so the coordinator
+    grants the next write. When that read fails closed (on_error='strict') the
+    caller gets no bytes, and the baseline is the only guard left: it must not
+    advance, or a write from the pre-edit buffer clobbers the foreign edit."""
+    target = _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)  # strict
+    real_post = coherent_volume_module._coordinator_post
+
+    def degraded_pre_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read":
+            return {"ok": True, "degraded": True}  # watchdog-timeout envelope
+        return real_post(endpoint, path, payload, **kwargs)
+
+    try:
+        buf = vol.read("data/x.txt")
+        target.write_bytes(b"HUMAN")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded_pre_read)
+        with pytest.raises(CoherenceError):
+            vol.reacquire("data/x.txt")           # fails closed: caller never sees HUMAN
+        with pytest.raises(StaleView):
+            vol.write("data/x.txt", buf + b"+agent")
+        assert target.read_bytes() == b"HUMAN"
     finally:
         stop_coordinator(tmp_path)
 
@@ -1902,6 +2791,8 @@ def test_write_cas_waits_between_denied_comparand_reads(
         min(DENIED_READ_BACKOFF_BASE_SEC * 2**i, DENIED_READ_BACKOFF_CAP_SEC)
         for i in range(MAX_CAS_REACQUIRES)  # one wait per denied read before the bound trips
     ]
+    # The restore leg of WorkspaceVersioner waits on the same helper, counted from 1.
+    assert [denied_read_backoff_sec(n) for n in range(1, MAX_CAS_REACQUIRES + 1)] == schedule
 
     # Record what the loop asks to wait, and still wait it. ``time`` is used nowhere
     # else in the adapter, so shimming that module-level name leaves the real
