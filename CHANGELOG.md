@@ -346,11 +346,13 @@ Alpha — APIs may change before `v1.0`.
   exactly as before. The retry loop is unchanged: `other_holder` retries still
   do not wait. A `CoherentVolume` keeps a file it wrote until the coordinator
   takes it back (after 600 s without a coordinator call, or 1800 s of holding,
-  by default) or its session is stopped, while the whole retry budget takes
-  tens of milliseconds, so a wait that fits in one call would only make the
-  failure slower. The wire reason `cas_exhausted` and the MCP deny mapping are
-  unchanged. The guide now lists the four reasons, what releases a held file,
-  and the volume's `config` parameter that sets those timeouts.
+  by default), its session is stopped, or its own next `write_cas`,
+  `write_cas_at`, `atomic_publish` or `reacquire()` releases it, while the
+  whole retry budget takes tens of milliseconds, so a wait that fits in one
+  call would only make the failure slower. The wire reason `cas_exhausted` and
+  the MCP deny mapping are unchanged. The guide now lists the four reasons,
+  what releases a held file, and the volume's `config` parameter that sets
+  those timeouts.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the

@@ -663,10 +663,12 @@ When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 - `stale_read_generation`: your read was taken under a grant the coordinator has
   since reclaimed. `reacquire()` and re-read.
 
-A `CoherentVolume` that wrote a file keeps holding it; closing the volume or
-exiting the process does not release it. The coordinator takes the file back
-once the holder has made no coordinator calls for `grant_heartbeat_timeout_sec`
-(600 s by default), or has held it for `grant_max_hold_sec` (1800 s by default).
+A `CoherentVolume` that wrote a file keeps holding it until its own next
+`write_cas`, `write_cas_at`, `atomic_publish` or `reacquire()` releases it;
+closing the volume or exiting the process does not release it. The coordinator
+takes the file back once the holder has made no coordinator calls for
+`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+`grant_max_hold_sec` (1800 s by default).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
 the coordinator. A Claude Code session releases what it holds when its turn ends.
 So after `other_holder`, retry once the holder has released, not in a tight loop,

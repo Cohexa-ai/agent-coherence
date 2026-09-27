@@ -1085,10 +1085,7 @@ class CoherentVolume:
         # reentrant) threading.Lock guarding identity mutation, and a failed
         # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
         # -> _record_degraded takes self._lock), so holding it here would
-        # deadlock on the first failed release. It would also stretch the
-        # fork-handler hazard: _after_fork takes the same lock in the child, so a
-        # fork while another thread held it across a round trip would leave the
-        # child's copy held forever.
+        # deadlock on the first failed release.
         self._release_abandoned_grants(abandoned)
 
     def _release_abandoned_grants(self, incarnations: list[str]) -> None:
@@ -1163,10 +1160,12 @@ class CoherentVolume:
         pessimistic ``write()`` keeps that grant until the coordinator reclaims it
         (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
         by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
-        the holder's session is stopped, which a ``CoherentVolume`` never does
-        for itself; a peer's reads and CAS attempts never release it, and a
-        peer's ``write()`` only takes it over. So the loop does not wait between
-        those attempts:
+        the holder's session is stopped, which a ``CoherentVolume`` holder does
+        for itself only at its own next ``write_cas``, ``write_cas_at``,
+        ``atomic_publish`` or :meth:`reacquire` (the re-mint releases what its
+        ``write()`` left held; see :meth:`_remint`); a peer's reads and CAS
+        attempts never release it, and a peer's ``write()`` only takes it over.
+        So the loop does not wait between those attempts:
         no wait that fits in one call could outlast the grant, it would only make
         the terminal slower. A caller that gets ``last_conflict_reason ==
         "other_holder"`` retries after the holder releases, not in a loop.
