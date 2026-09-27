@@ -222,11 +222,16 @@ Alpha — APIs may change before `v1.0`.
   joins that set only after its constructor succeeds. What a forked child does
   to a live volume is unchanged: it re-mints the identity, drops the inherited
   coordinator endpoint, clears the per-path baselines, and re-attaches on the
-  next read or write, never inside the fork handler. Three regression tests pin
+  next read or write, never inside the fork handler. A volume whose reset
+  fails in the child no longer stops the others: every live volume is reset,
+  and the child still reports what failed: one failure exactly as before,
+  several as one entry that names each of them. Five regression tests pin
   this. Two check that a dropped volume and a failed construction are
-  collected. The third keeps a failed construction alive across a real fork
-  and checks that the child leaves it untouched: collection alone would not
-  catch a weak registration made before attach and never withdrawn.
+  collected. One keeps a failed construction alive across a real fork and
+  checks that the child leaves it untouched: collection alone would not catch
+  a weak registration made before attach and never withdrawn. One forks with
+  two live volumes and checks the child resets both. One checks that a failing
+  reset does not stop the next.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the

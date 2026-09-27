@@ -214,6 +214,37 @@ def test_real_fork_resets_every_live_volume(tmp_path: Path, fast_cfg: LifecycleC
         stop_coordinator(ws_b)
 
 
+def test_fork_reset_continues_past_a_failing_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A volume whose reset raises must not leave the rest unreset: each volume
+    once had its own fork handler, and CPython runs every handler even after one
+    raises. The shared handler resets them all, then raises what failed so the
+    child still reports it. CPython's default unraisable hook prints only a
+    group's own message, so that message must name each failure. Every stub
+    raises, so a loop that stops at the first failure resets exactly one,
+    whichever the weak set yields first."""
+    reset_calls: list[str] = []
+
+    class _FailingReset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+            raise RuntimeError(f"reset {self.name} failed")
+
+    stubs = [_FailingReset("a"), _FailingReset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+    assert sorted(str(exc) for exc in excinfo.value.exceptions) == ["reset a failed", "reset b failed"]
+    printed = str(excinfo.value)
+    assert "RuntimeError: reset a failed" in printed
+    assert "RuntimeError: reset b failed" in printed
+
+
 def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[..., object]:
     """Wrap ``real`` so its next call raises ``error`` and later calls pass through."""
     pending_failures = [error]

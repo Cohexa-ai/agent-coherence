@@ -222,8 +222,22 @@ _FORK_RESET_VOLUMES: weakref.WeakSet[CoherentVolume] = weakref.WeakSet()
 
 
 def _reset_volumes_after_fork() -> None:
+    # One volume's failure must not skip the rest: each volume used to have its
+    # own handler, and CPython reports a failing handler and still runs the next.
+    # Reset every volume, then raise what failed so the child still reports it.
+    failures: list[BaseException] = []
     for volume in _FORK_RESET_VOLUMES:
-        volume._after_fork()
+        try:
+            volume._after_fork()
+        except BaseException as exc:
+            failures.append(exc)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        # CPython's default unraisable hook prints only a group's own message,
+        # not its sub-exceptions, so the message names every failure.
+        details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+        raise BaseExceptionGroup(f"resetting volumes after fork failed: {details}", failures)
 
 
 # Guarded like lifecycle's fcntl import: registering at import on a platform
