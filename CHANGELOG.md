@@ -266,6 +266,24 @@ Alpha — APIs may change before `v1.0`.
   operation. Code that relied on getting `(bytes, 0)` back from a forked child
   should expect that error instead.
 
+- **With `CoherenceDegradedWarning` turned into an error, a degraded OpenAI
+  Agents adapter now still logs, and a degraded `CCSStore` now still records
+  the degradation.** When warnings are escalated to errors (`python -W error`,
+  pytest's `filterwarnings = error`, or `warnings.simplefilter("error", ...)`),
+  the first degradation's warning raises. `OpenAIAgentsAdapter` warned before
+  logging its "OpenAI Agents adapter degraded" line, so the line was never
+  logged; it is now logged first. `CCSStore` warned partway through a degraded
+  get or put, before counting it, emitting its `"degraded"` metric, or, for a
+  put, adding its namespace to `list_namespaces`. So a store that had fallen
+  back reported `is_degraded` as `False` and `degradation_count` as 0, and
+  because its warn-once latch never closed, every later failure raised again
+  instead of serving the fallback. It now warns last, after all of that: the
+  first failure raises the escalated warning with the degradation fully
+  recorded, and later ones fall back without warning, as they do when the
+  warning is not escalated. A degraded put still writes its value to the
+  fallback before the warning raises. `on_error="strict"`, the warning and log
+  text, and which frame the warning is attributed to are unchanged.
+
 - **A read inside a peer's commit→disk window no longer hands out a comparand
   that loses that peer's update.** A peer's `write_cas_at` confirms its CAS at
   the coordinator and only then writes its bytes to disk. A read landing between
