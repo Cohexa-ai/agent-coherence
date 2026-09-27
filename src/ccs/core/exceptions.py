@@ -404,6 +404,13 @@ STALE_VIEW_REASON = "stale_view"
 COMMIT_PREEMPTED_REASON = "commit_preempted"
 VIEW_WEDGED_REASON = "view_wedged"
 COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
+#: The prefix of the reason in the coordinator's failure envelope, HTTP 200
+#: ``{"ok": false, "reason": "internal: <Type>"}``: what it answers when a
+#: route's work, or the caller-principal gate's store read, raised. The answer
+#: decides nothing, so a client reads the request's outcome as unknown. The
+#: exception's type follows the prefix, which is why this one reason is matched
+#: as a prefix; the prefix itself is fixed.
+HANDLER_FAILURE_REASON_PREFIX = "internal: "
 CAS_EXHAUSTED_REASON = "cas_exhausted"
 INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
 # Option-A single-shot CAS (MCP-C Unit 5): the caller's expected_version no

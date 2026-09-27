@@ -1715,3 +1715,198 @@ def test_no_coordinator_supplied_text_rides_the_chain_of_what_the_session_raises
             assert secret and secret not in rendered
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- the coordinator answers a pre-read with its failure envelope --------------
+#
+# The coordinator answers a pre-read it could not decide as HTTP 200 ``{ok:
+# false, reason: "internal: <Type>"}``: the caller-principal gate's store read
+# raising (a bound session whose binding is not cached, which is what a
+# coordinator restart leaves, under a locked registry) or the pre-read work body
+# raising. That answer confirms nothing: no version, no deny, no recorded hash.
+# The substrate session presents its principal on every request, so a cold
+# cache sends its every pre-read through the gate's store read.
+
+#: FROZEN duplicate of the reason the coordinator's failure envelope carries
+#: for the registry's own transient error (only the exception's type).
+_INTERNAL_OPERATIONAL_ERROR = "internal: OperationalError"
+
+
+def _serve_in_process(tmp_path: Path, instance_id: str):
+    """A strict coordinator for ``workspace/**`` running in THIS process,
+    reachable through the usual pid file, so a test can reach into its
+    registry. Policy is loaded once at construction, so the YAML is written
+    first; a substrate session then attaches to it as to any spawned one."""
+    import time
+
+    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    for name in ("tracked.yaml", "strict_mode.yaml"):
+        (coherence / name).write_text("- workspace/**\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
+    server.serve_in_thread()
+    time.sleep(0.05)
+    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    return server
+
+
+def _fail_the_next(
+    server, monkeypatch: pytest.MonkeyPatch, route: str = "/hooks/pre-read"
+) -> None:
+    """Make the coordinator answer the next request on ``route`` any session
+    sends with its failure envelope, from the gate: the principal cache is
+    emptied (a restart) and the one store read that follows raises (a locked
+    registry). Every other request, before and after, is answered as usual."""
+    import sqlite3
+
+    real_post = substrate_module._coordinator_post
+    real_lookup = server.registry.get_caller_principal
+    armed = [True]
+    lookup_fails = [False]
+
+    def lookup(identity):  # noqa: ANN001, ANN202
+        if lookup_fails[0]:
+            lookup_fails[0] = False
+            raise sqlite3.OperationalError("database is locked")
+        return real_lookup(identity)
+
+    def post(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if path == route and armed[0]:
+            armed[0] = False
+            with server.service._caller_principal_lock:
+                server.service._caller_principals.clear()
+            lookup_fails[0] = True
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(server.registry, "get_caller_principal", lookup)
+    monkeypatch.setattr(substrate_module, "_coordinator_post", post)
+
+
+def test_a_read_answered_with_the_failure_envelope_fails_closed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read whose pre-read the coordinator answers with its failure envelope
+    raises the read leg's infrastructure failure, naming the envelope's
+    reason, and records no observed hash. It is not a deny (``StaleView``):
+    nothing was decided about this reader's view.
+
+    Prevents the answer passing as a clean pre-read: version 0, no deny, so
+    the read returned bytes whose registration nobody confirmed."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-read-envelope")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, _fake = _agent(store, sa)
+        _fail_the_next(server, monkeypatch)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.read(REF)
+
+        assert type(raised.value) is CoherenceError, type(raised.value)
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
+        assert REF in str(raised.value)
+        assert REF not in a._observed_hash, "an observed hash was recorded for an unconfirmed read"
+    finally:
+        server.shutdown()
+
+
+def test_a_commit_whose_pre_read_is_answered_with_the_failure_envelope_writes_nothing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit whose pre-read the coordinator answers with its failure
+    envelope raises before the substrate is touched.
+
+    Prevents a double-applied write: the envelope read as a clean pre-read
+    skipped the peer-invalidation deny and seeded the bump with version 0, so
+    the substrate write landed, the bump then lost with ``version_mismatch``,
+    and the caller got ``CasVersionConflict``, whose text says no write
+    landed. A caller that re-merges and retries applies the write twice."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-commit-envelope")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, fake = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        _fail_the_next(server, monkeypatch)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        assert not isinstance(raised.value, CasVersionConflict), raised.value
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
+        assert fake.cas_calls == [], "the substrate was written on an unconfirmed pre-read"
+        assert store.get(REF)[0] == b"v1"
+    finally:
+        server.shutdown()
+
+
+def test_a_converged_commit_that_cannot_check_the_coordinators_hash_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A converged write whose bump lost to a peer checks whether the
+    coordinator already holds its hash. When that check's pre-read is answered
+    with the failure envelope the outcome is unknown, so the commit raises
+    ``CommitUnconfirmed``: the bytes have landed and the bump was not proven.
+
+    Prevents a COMPLETE nobody verified: the envelope carries no
+    ``hash_differs``, which read as "the hashes match", so the commit reported
+    itself converged and complete."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-converge-envelope")
+    try:
+        sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
+        a, fake_a = _agent(store, sa)
+        b, _fb = _agent(store, sb)
+        _ab, a_tok = a.read(REF)
+        _bb, _b_tok = b.read(REF)
+        intended = _sha256(b"v2")
+
+        def peer_bumps_first_then_the_check_fails() -> None:
+            sb.commit_cas(REF, expected_version=1, content_hash=intended)
+            _fail_the_next(server, monkeypatch)
+
+        fake_a.script_unknown(landed=True)
+        fake_a.reconcile_hook = peer_bumps_first_then_the_check_fails
+
+        with pytest.raises(CommitUnconfirmed) as raised:
+            a.commit(REF, expected_token=a_tok, new_bytes=b"v2")
+
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
+        assert len(fake_a.cas_calls) == 1, "a landed write was re-driven"
+    finally:
+        server.shutdown()
+
+
+def test_a_bump_answered_with_the_failure_envelope_after_the_write_landed_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bump is sent only after the substrate write landed. When the
+    coordinator answers it with its failure envelope, whether the bump landed
+    is unknown, so the commit raises ``CommitUnconfirmed``: re-read before
+    retrying, never re-drive. The write is not re-driven.
+
+    Prevents a definite "rejected" for an outcome nobody knows: a caller told
+    the commit was refused retries it and applies the write twice, or gives up
+    while the substrate holds bytes the coordinator may never have recorded."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-bump-envelope")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, fake = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        _fail_the_next(server, monkeypatch, "/hooks/post-edit-cas")
+
+        with pytest.raises(CommitUnconfirmed) as raised:
+            a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
+        assert len(fake.cas_calls) == 1, "a landed write was re-driven"
+        assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+    finally:
+        server.shutdown()

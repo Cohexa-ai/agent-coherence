@@ -86,6 +86,7 @@ from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
+    HANDLER_FAILURE_REASON_PREFIX,
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
@@ -6023,7 +6024,7 @@ def _answer_handler_error(
         coordinator.increment_effect_fence_hold()
         req._json(200, dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE))
         return
-    req._json(200, {"ok": False, "reason": f"internal: {type(exc).__name__}"})
+    req._json(200, {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}{type(exc).__name__}"})
 
 
 def _exclusive_holder(

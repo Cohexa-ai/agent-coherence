@@ -51,6 +51,7 @@ from ccs.cli._coherence_client import (
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
+    HANDLER_FAILURE_REASON_PREFIX,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
@@ -477,6 +478,17 @@ def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
         )
     if reason in _RETRYABLE_COMMIT_REASONS:
         return CoordinatorConflict(current_version=_maybe_int(resp.get("current_version")))
+    if reason.startswith(HANDLER_FAILURE_REASON_PREFIX):
+        # The coordinator's failure envelope: the bump's work, or the
+        # caller-principal gate's store read, raised. It decides nothing, and
+        # a body that raised may have recorded the bump first, so the outcome
+        # is unknown, never a rejection: read as one, a caller would retry a
+        # write that already landed on the substrate.
+        raise CommitUnconfirmed(
+            f"coordinator commit_cas was answered with a failure ({reason}); whether "
+            "the bump landed is unknown — reconcile by re-reading before retrying, "
+            "never blind re-drive"
+        )
     raise CoherenceError(f"coordinator commit_cas rejected (fail-closed): {reason}")
 
 
@@ -618,6 +630,22 @@ class SubstrateCoordinatorSession:
         resp = self._post("/hooks/pre-read", payload, unknown=unknown)
         if resp.get("degraded"):
             raise unknown("coordinator watchdog timeout on pre-read (fail-closed)")
+        if resp.get("ok") is False:
+            # The coordinator's failure envelope, HTTP 200 ``{"ok": false,
+            # "reason": "internal: <Type>"}``: its caller-principal gate's store
+            # read or the pre-read work body raised. It decides nothing (no
+            # version, no deny, no hash comparison), so it is ``unknown`` like
+            # an unanswered request, never a clean pre-read: read as one, a
+            # commit skipped the deny and bumped from version 0, and a
+            # converged commit's hash check read "no difference". The pre-read
+            # handler never answers an ``ok`` key otherwise. Only the
+            # envelope's reason is named: the exception's type, nothing else.
+            reason = resp.get("reason")
+            named = reason if isinstance(reason, str) and reason else "no reason given"
+            raise unknown(
+                f"coordinator answered the pre-read of {artifact_ref!r} with a failure "
+                f"({named}); not confirmed (fail-closed)"
+            )
         return PreReadResult(
             version=_pre_read_version(resp),
             stale_denied=_pre_read_denied(resp),

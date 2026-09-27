@@ -218,8 +218,14 @@ Alpha — APIs may change before `v1.0`.
   degrades a degrade-mode one (a warning, `is_degraded`), as an unanswered
   request does; before, the read went through with its bytes as though it
   were registered, when the gate's error had registered nothing, so a peer's
-  later commit invalidated nothing. The Node
-  coordinator enforces none of this.
+  later commit invalidated nothing. The substrate session now treats that
+  answer as unconfirmed as well: a read raises, a commit raises before it
+  touches the substrate, and a commit whose bump, or whose converged hash
+  check, is answered that way after its write landed raises
+  `CommitUnconfirmed` instead of a definite rejection or a completion. Before, a commit took the
+  answer as a clean pre-read at version 0, so its substrate write landed and
+  the bump was refused as a `CasVersionConflict` that says no write landed.
+  The Node coordinator enforces none of this.
 
 - **Registry schema version 8 (forward-only).** Principals get their own table,
   which the grant sweep, the session-liveness sweep, the session cap and
