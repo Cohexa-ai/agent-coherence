@@ -179,6 +179,41 @@ def test_real_fork_child_has_distinct_identity(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_real_fork_resets_every_live_volume(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """One fork handler walks every live volume: with two alive at fork time,
+    the child re-mints both, not only the first one the weak set yields."""
+    ws_a = tmp_path / "a"
+    ws_b = tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    vol_a = CoherentVolume(ws_a, managed=("data/**",), config=fast_cfg)
+    vol_b = CoherentVolume(ws_b, managed=("data/**",), config=fast_cfg)
+    parent_ids = (vol_a.session_id, vol_b.session_id)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, f"{vol_a.session_id} {vol_b.session_id}".encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    # parent
+    os.close(write_fd)
+    try:
+        child_ids = tuple(os.read(read_fd, 128).decode("utf-8").split())
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert len(child_ids) == 2
+        assert child_ids[0] != parent_ids[0]
+        assert child_ids[1] != parent_ids[1]
+        assert child_ids[0] != child_ids[1]
+    finally:
+        stop_coordinator(ws_a)
+        stop_coordinator(ws_b)
+
+
 def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[..., object]:
     """Wrap ``real`` so its next call raises ``error`` and later calls pass through."""
     pending_failures = [error]
