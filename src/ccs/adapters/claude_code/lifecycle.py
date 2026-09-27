@@ -88,6 +88,19 @@ def _reset_spawn_join_exhaustion() -> None:  # pragma: no cover - test hook
         _spawn_join_exhaustion_by_reason.clear()
 
 
+def _reset_exhaustion_lock_in_child() -> None:
+    # A fork while another thread is counting an exhaustion copies this lock
+    # held, and no thread in the child will ever release it: the child's next
+    # exhaustion (a post-fork re-attach can reach one) or counter read would
+    # block forever. Each count is a single dict store, so the child keeps them.
+    global _EXHAUSTION_LOCK
+    _EXHAUSTION_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_exhaustion_lock_in_child)
+
+
 # G8 fix (subagent finding #8): fcntl is POSIX-only. On Windows, import-time
 # failure would crash hook handlers with a stack trace on every hook event.
 # Guard the import and provide a stub that degrades gracefully — hook handlers

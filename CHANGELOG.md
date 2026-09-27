@@ -229,16 +229,19 @@ Alpha — APIs may change before `v1.0`.
   hangs, or refuses every operation as concurrent use, when another thread of
   the parent held one of a volume's locks or had an operation in flight at the
   moment of the fork: the child replaces those locks and drops that
-  operation's claim instead of waiting on a thread that no longer exists.
-  Regression tests pin all of this. Two check that a dropped volume and a
-  failed construction are collected. One keeps a failed construction alive
-  across a real fork and checks that the child leaves it untouched: collection
-  alone would not catch a weak registration made before attach and never
-  withdrawn. One forks with two live volumes and checks the child resets both.
-  Two check that a failing reset does not stop the next and that a clean pass
-  raises nothing. One forks while a second thread holds each lock, or the
-  single-operation guard, in turn and checks the child can still use the
-  volume.
+  operation's claim instead of waiting on a thread that no longer exists. The
+  coordinator lifecycle's spawn-or-join exhaustion counter gets the same
+  treatment, since a re-attach in the child can reach its lock. Regression
+  tests pin all of this. Two check that a dropped volume and a failed
+  construction are collected. One keeps a failed construction alive across a
+  real fork and checks that the child leaves it untouched: collection alone
+  would not catch a weak registration made before attach and never withdrawn.
+  One forks with two live volumes and checks the child resets both. Two check
+  that a failing reset does not stop the next and that a clean pass raises
+  nothing. Two fork while a second thread holds a lock: each of a volume's
+  locks or its single-operation guard, in turn, checking the child can still
+  use the volume; and the exhaustion counter's lock, checking the child can
+  still count.
 
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the
