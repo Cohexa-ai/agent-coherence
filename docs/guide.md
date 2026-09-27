@@ -645,10 +645,14 @@ identical update — a plain file loses one write, `write_cas` preserves both.
 
 A volume can `write()` a file and then commit it through the optimistic lane. A
 successful `write()` leaves the volume holding that file's write grant after it
-returns; `write_cas`, `write_cas_at`, `atomic_publish` and `reacquire()` release
-it before they go further, so the volume is not refused by its own grant. The
-release is one extra request, made only after a `write()`: a volume that only
-reads and commits optimistically never pays for it.
+returns; a `write_cas` of that file, `write_cas_at`, `atomic_publish` and
+`reacquire()` release it before they go further, so the volume is not refused by
+its own grant. A `write_cas` of another file leaves it held unless it has to
+retry, because that grant cannot refuse it. The release is one extra request, made only after a `write()`:
+a volume that only reads and commits optimistically never pays for it. Each of
+these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
+and a fresh attempt clears every refusal the volume had, not only the one on the
+file it commits. Re-read any other file before a plain `write()` of it.
 
 When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 `last_conflict_reason` says why the last attempt was refused:
@@ -664,8 +668,10 @@ When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
   since reclaimed. `reacquire()` and re-read.
 
 A `CoherentVolume` that wrote a file keeps holding it until its own next
-`write_cas`, `write_cas_at`, `atomic_publish` or `reacquire()` releases it;
-closing the volume or exiting the process does not release it. The coordinator
+`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
+`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
+neither does a `session-stop` that names only `vol.session_id`, because each
+attempt holds its grants under its own `agent_id`. The coordinator
 takes the file back once the holder has made no coordinator calls for
 `grant_heartbeat_timeout_sec` (600 s by default), or has held it for
 `grant_max_hold_sec` (1800 s by default).
