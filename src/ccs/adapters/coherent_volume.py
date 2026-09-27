@@ -918,6 +918,12 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
+        # SB-23: a path this volume has no baseline for takes these bytes as its
+        # first one even if the read is refused below. Without it a refused first
+        # read leaves a later write unchecked, and an edit that reached disk
+        # after the refusal is overwritten. setdefault never replaces an earlier
+        # observation, so the refused bytes cannot absolve an edit made after one.
+        self._last_observed_hash.setdefault(rel, content_hash)
         if self._endpoint is not None:
             resp = self._post(
                 "/hooks/pre-read",
@@ -952,13 +958,14 @@ class CoherentVolume:
                     and hook_output.get("permissionDecision") == "deny"
                 ):
                     raise StaleView(self._deny_reason(resp))
-        # SB-23: seed the foreign-edit baseline with what we observed on disk —
+        # SB-23: ADVANCE the foreign-edit baseline to what we observed on disk —
         # only HERE, where the bytes reach the caller. Every raise above leaves
         # the caller without them: a request refused for its caller principal
         # (raised out of _post in both on_error modes), a strict-mode transport
         # or watchdog failure, a StaleView. A baseline advanced on any of those
         # would absolve an out-of-band edit the caller never saw, and its next
-        # write() would clobber it instead of being denied.
+        # write() would clobber it instead of being denied. (The first baseline
+        # recorded before the request only fills an absent one.)
         self._last_observed_hash[rel] = content_hash
         return data
 
@@ -2304,14 +2311,14 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
-        if observe and not seed_baseline:
-            # A CAS comparand read never MOVES a baseline the caller already
-            # has (see the seeding note below). On a path this instance has
-            # never observed there is none to move: this read is its first
-            # observation and records one, before the request, as a refused
-            # first read() does. Without it a CAS that fails, followed by an
-            # out-of-band edit, leaves write() nothing to compare against, and
-            # write() overwrites the edit.
+        if observe:
+            # A path's FIRST observing read records what the disk held, before
+            # the response can refuse or fail it, exactly as read() does. It
+            # never replaces a baseline (a CAS comparand read never MOVES one;
+            # see the seeding note below), so it cannot absolve an edit made
+            # after an earlier read; it only keeps a path whose first read was
+            # refused, or whose CAS failed, from having no baseline at all,
+            # which would let a later write() land over an out-of-band edit.
             self._last_observed_hash.setdefault(_rel, content_hash)
         version = 0
         stale_denied = False
@@ -2366,11 +2373,12 @@ class CoherentVolume:
                 # Any stale-status response — warn re-grant or deny alike —
                 # means this instance's prior grant did not stand at this read.
                 stale_status = resp.get("status") == "stale"
-        # SB-23: the OCC read path also seeds the foreign-edit baseline — but
-        # ONLY when the caller actually OBSERVES these bytes: here, where they
-        # are returned to it (a raise above — a request refused for its caller
+        # SB-23: the OCC read path ADVANCES the foreign-edit baseline ONLY when
+        # the caller actually OBSERVES these bytes: here, where they are
+        # returned to it (a raise above — a request refused for its caller
         # principal, a strict-mode transport or watchdog failure — leaves the
-        # caller without them). A verification read (``observe=False``, used
+        # caller without them; the first baseline recorded before the request
+        # only fills an absent one). A verification read (``observe=False``, used
         # by the effect fence) reads the file to compare comparands and then
         # DISCARDS the bytes, and a CAS comparand read (``seed_baseline=False``)
         # hands them on only if it is clean, and then itself. Advancing the

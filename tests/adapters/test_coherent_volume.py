@@ -3310,7 +3310,8 @@ def test_a_strict_read_the_coordinator_answers_with_a_failure_fails_closed_unreg
     """A strict volume whose pre-read the coordinator answers with its failure
     envelope raises the typed infrastructure failure, naming the envelope's
     reason (the exception's type, nothing else), and hands back nothing: no
-    bytes, no baseline, no artifact row or SHARED view on the coordinator.
+    bytes, no artifact row or SHARED view on the coordinator. The path's first
+    baseline still records what the disk held, so the next write is checked.
     Once the coordinator recovers the same read registers as usual.
 
     Prevents the read going through as REGISTERED: the volume returned the
@@ -3337,12 +3338,81 @@ def test_a_strict_read_the_coordinator_answers_with_a_failure_fails_closed_unreg
         # did not happen.
         assert str(raised.value).endswith("the read is not confirmed as registered"), str(raised.value)
         assert vol.degradation_count == 0, "a strict volume degraded instead of raising"
-        assert vol._last_observed_hash == {}, "the baseline was seeded for bytes never returned"
+        # A path's first read records what the disk held before the answer can
+        # fail it, so a refused first read still guards the next write; it
+        # never replaces an earlier baseline (see the first-read test below).
+        assert vol._last_observed_hash == {rel: _sha(b"v1")}, "a failed first read left no baseline"
         assert server.registry.lookup_artifact_id_by_name(rel) is None, "the read registered"
         _assert_no_secret_in(str(raised.value) + caplog.text, vol._principal, vol._mint_nonce)
 
         assert vol.read(rel) == b"v1", "control: the coordinator recovered, the read registers"
         assert server.registry.lookup_artifact_id_by_name(rel) is not None
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("reader", sorted(_READERS))
+@pytest.mark.parametrize("fault", ["gate", "body"])
+def test_a_first_read_that_fails_still_guards_the_next_write_against_an_out_of_band_edit(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    fault: str, reader: str,
+) -> None:
+    """A path's first read records what the disk held before the coordinator's
+    answer can fail it. A strict read of a path this volume never read is
+    answered with the failure envelope and raises; the file is then edited out
+    of band; a later ``write()`` of it must be refused as a foreign edit and
+    leave the edit on disk.
+
+    Prevents a failed first read leaving no baseline at all: ``write()`` then
+    had nothing to compare the disk against and overwrote the edit, where the
+    same sequence after a successful first read is refused. The first
+    baseline never replaces an earlier one, so it cannot absolve an edit made
+    after an earlier read."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    server = _serve_in_process(tmp_path, f"first-read-{fault}-{reader}")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        with monkeypatch.context() as faulted:
+            _fail_the_pre_read(server, faulted, fault)
+            with pytest.raises(CoherenceError):
+                _READERS[reader](vol, rel)
+        target.write_bytes(b"out-of-band")
+
+        with pytest.raises(StaleView):
+            vol.write(rel, b"from-the-volume")
+
+        assert target.read_bytes() == b"out-of-band", "write() overwrote the out-of-band edit"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_verification_read_of_a_path_never_read_records_no_baseline(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    """A verification read (``observe=False``, what the effect fence re-reads
+    with) of a path this volume never read records no first baseline, whether
+    its pre-read succeeds or is answered with the failure envelope. Only an
+    observing read records one.
+
+    Prevents a check that heals what it checks: the first-baseline seed is
+    guarded by ``observe`` alone, and a seed from a verification read would
+    make the fence's comparison an observation."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    server = _serve_in_process(tmp_path, f"verify-read-{fails}")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        with monkeypatch.context() as faulted:
+            if fails:
+                _fail_the_pre_read(server, faulted, "gate")
+                with pytest.raises(CoherenceError):
+                    vol.read_with_version_generation(rel, observe=False)
+            else:
+                vol.read_with_version_generation(rel, observe=False)
+
+        assert rel not in vol._last_observed_hash, "a verification read recorded a baseline"
     finally:
         server.shutdown()
 
