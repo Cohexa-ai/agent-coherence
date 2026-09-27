@@ -191,6 +191,36 @@ def test_tool_descriptions_state_the_scope() -> None:
     assert "heterogeneous_scope_detectable=false" in _STATUS_DESC
 
 
+#: FROZEN duplicates of what the registered ``swg_status`` description must
+#: name (never imported from the code under test): the session's
+#: ``principal_claim`` with its five values, and the two coordinator counters.
+_PRINCIPAL_CLAIM_VALUES = ("bound", "unsupported", "unconfirmed", "refused", "not_attempted")
+_PRINCIPAL_COUNTERS = ("caller_principal_absent_total", "caller_principal_refused_total")
+
+
+def test_the_registered_status_description_names_the_principal_claim_and_counters() -> None:
+    """The description the model reads for ``swg_status`` — the registered
+    tool's, as a client lists it — names ``principal_claim``, each of its
+    five values, what ``refused`` means for every later tool call, and the
+    two caller-principal counters as ``null`` when unreported. A model that
+    only sees the description cannot otherwise tell a session that lost
+    coordination from a coordinator that is off."""
+    import asyncio
+
+    from ccs.mcp.server import build_server
+
+    tools = {tool.name: tool for tool in asyncio.run(build_server().list_tools())}
+    description = tools["swg_status"].description or ""
+
+    assert "principal_claim" in description
+    for value in _PRINCIPAL_CLAIM_VALUES:
+        assert value in description, value
+    assert "refused" in description and "restart_session" in description
+    for counter in _PRINCIPAL_COUNTERS:
+        assert counter in description, counter
+    assert "null" in description
+
+
 def test_instructions_state_forbidden_and_trust_boundary() -> None:
     text = INSTRUCTIONS.lower()
     assert "different hosts" in text

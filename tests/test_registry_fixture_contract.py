@@ -45,6 +45,7 @@ EXPECTED_LOCAL_FIXTURES: dict[str, tuple[str, ...] | None] = {
 
 # Modules that deliberately resolve the shared fixture from conftest.
 EXPECTED_SHARED_CONSUMERS: frozenset[str] = frozenset({
+    "coordinator/test_caller_principal.py",
     "test_conflict_instrumentation.py",
 })
 

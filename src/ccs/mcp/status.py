@@ -14,6 +14,19 @@ THIS server's managed globs — not a cross-checked coordinator fact. A sibling
 volume with different managed globs is indistinguishable
 (``heterogeneous_scope_detectable=false``); v1 makes that gap loud, not
 detectable.
+
+``principal_claim`` is the session's own caller-principal state
+(:attr:`~ccs.adapters.coherent_volume.CoherentVolume.principal_claim_outcome`):
+``refused`` means every later ``swg_write`` / ``swg_read`` / ``swg_gate`` is
+answered with the typed ``caller_principal_*`` deny while the coordinator is
+still ``on`` — the session, not the coordinator, lost coordination — so an
+agent can tell that from a transient before its next call; ``unconfirmed`` is
+that transient — the last claim's answer was lost, and the next tool call
+claims again with the same nonce by itself before it runs. The two
+``caller_principal_*_total`` counters are forwarded from the coordinator's
+``/status`` document and, under the same SC5 rule as the three states, are
+``None`` (never ``0``) when the coordinator is unreachable or does not report
+them.
 """
 
 from __future__ import annotations
@@ -36,6 +49,9 @@ def build_status(volume: CoherentVolume, config: SessionConfig) -> dict:
         "is_attached": volume.is_attached,
         "is_degraded": volume.is_degraded,
         "session_id": volume.session_id,
+        "principal_claim": volume.principal_claim_outcome,
+        "caller_principal_absent_total": _counter(status_doc, "caller_principal_absent_total"),
+        "caller_principal_refused_total": _counter(status_doc, "caller_principal_refused_total"),
         "managed": list(config.managed),
         "per_path": _per_path(config, status_doc),
         "single_host_only": True,
@@ -57,6 +73,20 @@ def _coordinator_state(volume: CoherentVolume, status_doc: dict | None) -> str:
     if not isinstance(count, int) or isinstance(count, bool):
         return "unknown"
     return "on" if count > 0 else "off"
+
+
+def _counter(status_doc: dict | None, key: str) -> int | None:
+    """A ``/status`` counter forwarded verbatim, or ``None`` when the
+    coordinator is unreachable or reports none (an older coordinator) or
+    reports something that is not an integer — never ``0``, which a reader
+    would take for "nothing was counted". ``bool`` is an ``int`` subclass and
+    is excluded like everywhere else on this surface."""
+    if not isinstance(status_doc, dict):
+        return None
+    value = status_doc.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:

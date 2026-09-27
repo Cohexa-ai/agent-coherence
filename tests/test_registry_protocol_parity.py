@@ -11,7 +11,7 @@ module pins the WHOLE surface:
 
 - both registries are ``isinstance`` of :class:`RegistryBase`, and the SQLite one
   is additionally ``isinstance`` of :class:`SqliteExtended`;
-- the exact expected method names (45 base + 13 extended) are present + callable
+- the exact expected method names (47 base + 13 extended) are present + callable
   on each registry, and the base **property** members (e.g. ``coordinator_epoch``)
   are present as properties — the callable checks cannot see them, so they are
   pinned separately;
@@ -53,6 +53,7 @@ BASE_METHODS = frozenset(
         "adjust_checkpoint_pin_refcount",
         "all_session_meta",
         "artifact_ids",
+        "bind_caller_principal",
         "capture_version_vector",
         "clear_agent_transient",
         "commit_all",
@@ -62,6 +63,7 @@ BASE_METHODS = frozenset(
         "get_agent_transient",
         "get_artifact",
         "get_artifact_and_generation",
+        "get_caller_principal",
         "get_checkpoint",
         "get_checkpoint_members",
         "get_content",

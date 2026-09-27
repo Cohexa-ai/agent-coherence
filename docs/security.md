@@ -163,13 +163,29 @@ request body, which the coordinator checks for shape and nothing else.
 
 What follows from that:
 
-- Any process that can read the secret can act as any session: release that
-  session's grants, or commit a version recorded as written by it. This is the
-  intended trust model — every process running as your OS user is trusted alike,
-  the same boundary as your shell history or SSH agent socket.
+- Any process that can read the secret has full authority over the workspace.
+  This is the intended trust model — every process running as your OS user is
+  trusted alike, the same boundary as your shell history or SSH agent socket.
+- A session whose client has claimed a [caller principal](guide.md#caller-principal)
+  is refused, on the routes that release grants, commit, record who wrote, answer
+  the effect fence or record workspace ownership, when a request names it without
+  that principal or with another. That stops one writer's mistake — a copied
+  request, a stale session id, a wrong id in a retry — from ending another
+  writer's work or writing under its name. A session that never claimed one
+  behaves as before: any holder of the secret can act as it.
+- The principal separates writers that follow the protocol, and nothing more.
+  Every principal is stored in `.coherence/state.db`, which any process running
+  as your OS user can read. `CoherentVolume`, the MCP server and the substrate
+  session present only the principal issued for their own session, so a request
+  from them naming another session is refused. The Claude Code hook client finds
+  its principal by the session id in each hook event, so on that surface a wrong
+  session id can find a matching principal; there the principal exposes a client
+  that never claimed or presents the wrong principal, but does not tell sessions
+  apart.
 - `last_writer_id`, and the sessions listed by `/status`, record which session a
-  caller *said* it was. Treat them as a record of cooperating writers' claims —
-  useful for debugging and display — not as proof of who wrote.
+  caller *said* it was — verified against its principal when it has one. Treat
+  them as a record of cooperating writers, useful for debugging and display, not
+  as proof of who wrote.
 - The snapshot-session routes (`/session/read`, `/session/commit`,
   `/session/commit_all`, `/session/heartbeat`) also require the token that
   `/session/begin` returns, and attribute a commit to the session that token was
@@ -245,6 +261,29 @@ The capture path **refuses to start** when `<path>/manifest.json` already
 exists (`SessionDirectoryNotEmptyError`) to prevent silent multi-instance
 trace interleave. No content is read by `agent-coherence-replay` from any
 location other than the explicit `session_dir` argument.
+
+### Caller-principal files (Claude Code hook client)
+
+The Claude Code hook client runs one process per hook event, so it keeps each
+session's [caller principal](guide.md#caller-principal) on disk beside
+`hook.secret`, keyed by the session's agent id — the one-way hash of the session
+id that `/status` shows, never the raw session id. `CoherentVolume`, the MCP
+server and the substrate session hold theirs in memory and write neither file.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Mint nonce | `<workspace>/.coherence/caller-principal-<agent-id>.nonce` | `0600` | The session's first hook event with no stored principal, unless `server.pid` names the plugin's Node backend — *before* the claim is sent, so an older Python coordinator that then answers `404` leaves the file behind too. Created exclusively (`O_CREAT` with `O_EXCL`) and never rewritten; two hook processes racing on a new session share the winner's nonce |
+| Caller principal | `<workspace>/.coherence/caller-principal-<agent-id>.principal` | `0600` | When the claim binds. Written to a private temporary file (`O_CREAT` with `O_EXCL`, `0600`) and renamed over the stored file, and replaced the same way when a refused request is recovered by claiming again |
+
+The nonce is what lets the session re-obtain its principal after a lost claim
+answer or a reset `state.db`; the principal is what every hook of the session
+presents. Treat both like `hook.secret`: any process running as your OS user can
+read them, and one that holds them together with `hook.secret` can act as that
+session on every route. The client never deletes them. Remove them only when no
+hook of that session can still run: a session whose nonce file is gone claims
+again under a new nonce, which the coordinator refuses
+(`caller_principal_claimed`), and from then on the routes that require a
+principal refuse that session.
 
 ### Durable version retention (opt-in)
 

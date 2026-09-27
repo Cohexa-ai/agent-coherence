@@ -106,6 +106,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 🧩 [Claude Code plugin](https://github.com/Cohexa-ai/agent-coherence-plugin) — cross-session coherence for the prose rules (CLAUDE.md, plan.md) parallel Claude Code sessions share
 - 🔍 [Why coherence matters](docs/why-coherence-matters.md) — the gap across LangGraph, CrewAI, AutoGen, and Claude Agent SDK
 - 🧭 [The MESI-derived approach](docs/agent-coherence-approach.md) — how the protocol maps each documented gap to a shipped surface, with boundaries
+- 🪪 [Caller principal](docs/guide.md#caller-principal) — once a writer claims one, a request naming its session without it cannot release its grants or commit under its name; clients that never claim keep working
 - 🔐 [Security & supply chain](docs/security.md) — kill switches, hash-pinned install, attestation verification, threat model
 - 📜 [Changelog](CHANGELOG.md) — version history
 - 📄 [Paper on arXiv (2603.15183)](https://arxiv.org/abs/2603.15183) — formal protocol, TLA+ verification, simulation results

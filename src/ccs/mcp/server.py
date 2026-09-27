@@ -137,9 +137,17 @@ _REACQUIRE_DESC = (
 )
 _STATUS_DESC = (
     "Report coherence state: coordinator on|off|unknown (unknown is NOT off), "
-    "per-path enforced|not_registered, is_attached/is_degraded/session_id, and "
-    "heterogeneous_scope_detectable=false (a multi-host or differently-scoped "
-    "setup is NOT distinguishable in v1)." + _SCOPE_CLAUSE
+    "per-path enforced|not_registered, is_attached/is_degraded/session_id, "
+    "principal_claim (this session's caller-principal state: bound; unsupported "
+    "= the coordinator issues none; unconfirmed = the last claim's answer was "
+    "lost and the next call claims again by itself; refused = the session is "
+    "bound under another nonce, so every later swg_read/swg_write/swg_gate "
+    "answers the typed caller_principal_* deny with recover=restart_session "
+    "while the coordinator stays on; not_attempted = nothing claimed yet), "
+    "caller_principal_absent_total and caller_principal_refused_total (the "
+    "coordinator's counters; null, never 0, when it is unreachable or does not "
+    "report them), and heterogeneous_scope_detectable=false (a multi-host or "
+    "differently-scoped setup is NOT distinguishable in v1)." + _SCOPE_CLAUSE
 )
 
 _WRITE_CAS_DESC = (

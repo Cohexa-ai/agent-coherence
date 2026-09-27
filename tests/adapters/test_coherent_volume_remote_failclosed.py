@@ -15,7 +15,7 @@ import pytest
 
 import ccs.adapters.coherent_volume as cv
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.cli._coherence_client import resolve_remote_endpoint
+from ccs.cli._coherence_client import PrincipalClaim, resolve_remote_endpoint
 from ccs.core.exceptions import CoherenceError, RemoteAuthFailed
 
 
@@ -32,10 +32,17 @@ _INSECURE_ACK = {"CCS_REMOTE_INSECURE": "1"}
 def _remote_volume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, probe=None
 ) -> CoherentVolume:
-    """Construct a remote-mode volume with a stubbed-reachable attach probe."""
+    """Construct a remote-mode volume with a stubbed-reachable attach probe.
+
+    Attach also claims the session's caller principal (plan U5); the stub
+    coordinator binds it, so construction reaches the op under test."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     monkeypatch.setattr(
         cv, "_coordinator_get", probe or (lambda ep, path, **k: {"ok": True})
+    )
+    monkeypatch.setattr(
+        cv, "claim_caller_principal",
+        lambda ep, sid, nonce: PrincipalClaim("bound", principal="P" * 43),
     )
     remote = resolve_remote_endpoint("10.0.0.5", 8080, "secret", env=_INSECURE_ACK)
     return CoherentVolume(tmp_path, on_error="strict", remote_endpoint=remote)
