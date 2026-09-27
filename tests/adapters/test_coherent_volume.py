@@ -3940,6 +3940,103 @@ def test_write_cas_seeds_the_baseline_with_the_bytes_it_hands_make_content(
         stop_coordinator(tmp_path)
 
 
+#: A pre-read answer a strict volume cannot take as registered, so the read
+#: raises without handing its bytes on: the coordinator's watchdog timed out,
+#: the request never reached it (``None``: the transport raises), or the
+#: coordinator answered with its failure envelope.
+_UNCONFIRMED_PRE_READ_ANSWERS: dict[str, dict[str, object] | None] = {
+    "watchdog": {"ok": True, "degraded": True},
+    "transport": None,
+    "envelope": {"ok": False, "reason": _INTERNAL_OPERATIONAL_ERROR},
+}
+
+
+def _answer_the_second_pre_read(
+    monkeypatch: pytest.MonkeyPatch, answer: dict[str, object] | None, answers: list[object]
+) -> None:
+    """The next pre-read goes to the coordinator; the one after it gets
+    ``answer`` instead (``None``: the transport raises); every other request
+    goes to the coordinator. Records what each pre-read got back."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/hooks/pre-read" and len(answers) == 1:
+            answers.append(answer)
+            if answer is None:
+                raise CoordinatorUnavailable("connection refused")
+            return answer
+        got = real_post(endpoint, path, payload, **kwargs)
+        if path == "/hooks/pre-read":
+            answers.append(got)
+        return got
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", post)
+
+
+@pytest.mark.parametrize("retry_answer", sorted(_UNCONFIRMED_PRE_READ_ANSWERS))
+def test_a_cas_whose_retry_read_fails_after_a_denied_read_still_guards_the_next_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    retry_answer: str,
+) -> None:
+    """The volume reads v1 and a peer commits v2, so this instance is
+    INVALID. write_cas's first comparand read is DENIED for that alone — the
+    disk holds exactly the bytes the coordinator records — so the CAS
+    re-mints and reads again, and that read fails closed: the coordinator's
+    watchdog timed out, the request never reached it, or the coordinator
+    answered with its failure envelope. write_cas raises and make_content
+    never runs, so the caller was never handed v2. A write() of content
+    derived from v1 then goes out under the re-minted identity, which is not
+    INVALID, so the coordinator admits it; only the foreign-edit baseline
+    stands between it and the peer's commit. It must be denied, and the disk
+    must keep v2.
+
+    Prevents a denied comparand read moving the baseline whenever the
+    coordinator did not dispute its bytes: here that set the baseline to v2,
+    and the write() landed over the peer's commit without an error — a lost
+    update."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.read(rel) == b"v1"
+        peer.read(rel)
+        peer.write(rel, b"v2")
+        answers: list[object] = []
+        _answer_the_second_pre_read(
+            monkeypatch, _UNCONFIRMED_PRE_READ_ANSWERS[retry_answer], answers
+        )
+        handed: list[bytes] = []
+
+        def derive(current: bytes) -> bytes:
+            handed.append(current)
+            return current + b"+cas"
+
+        with pytest.raises(CoherenceError) as failed:
+            vol.write_cas(rel, derive)
+
+        assert type(failed.value) is CoherenceError, "not the fail-closed read: " + repr(failed.value)
+        first = answers[0]
+        assert isinstance(first, dict), first
+        assert first["hookSpecificOutput"]["permissionDecision"] == "deny", (
+            "control: the first comparand read was admitted"
+        )
+        assert first["summary"]["hash_differs"] is False, (
+            "control: the deny disputed the bytes, not this instance's standing"
+        )
+        assert len(answers) == 2, "control: the CAS read again after its read failed"
+        assert handed == [], "control: make_content was handed bytes"
+        assert vol._last_observed_hash[rel] == _sha(b"v1"), "the denied read moved the baseline"
+
+        with pytest.raises(StaleView) as denied:
+            vol.write(rel, b"mine-derived-from-v1")
+
+        assert str(denied.value) == coherent_volume_module._STALE_WRITE_DENY_REASON
+        assert target.read_bytes() == b"v2", "the peer's commit was overwritten"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 @pytest.mark.parametrize("cas", ["write_cas_at", "atomic_publish"])
 def test_a_cas_that_never_hands_its_comparand_bytes_on_never_seeds_the_baseline(
     tmp_path: Path, fast_cfg: LifecycleConfig, cas: str,
