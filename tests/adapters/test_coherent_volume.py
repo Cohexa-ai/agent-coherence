@@ -12,14 +12,19 @@ separately.
 from __future__ import annotations
 
 import builtins
+import contextlib
+import gc
 import io
 import logging
 import os
+import select
+import signal
 import subprocess
 import threading
 import time
 import warnings
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -173,6 +178,174 @@ def test_real_fork_child_has_distinct_identity(
         os.waitpid(pid, 0)
         assert child_id != parent_id
         assert len(child_id) == 36
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_real_fork_resets_every_live_volume(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """One fork handler walks every live volume: with two alive at fork time,
+    the child re-mints both, not only the first one the weak set yields."""
+    ws_a = tmp_path / "a"
+    ws_b = tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    vol_a = CoherentVolume(ws_a, managed=("data/**",), config=fast_cfg)
+    vol_b = CoherentVolume(ws_b, managed=("data/**",), config=fast_cfg)
+    parent_ids = (vol_a.session_id, vol_b.session_id)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, f"{vol_a.session_id} {vol_b.session_id}".encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    # parent
+    os.close(write_fd)
+    try:
+        child_ids = tuple(os.read(read_fd, 128).decode("utf-8").split())
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert len(child_ids) == 2
+        assert child_ids[0] != parent_ids[0]
+        assert child_ids[1] != parent_ids[1]
+        assert child_ids[0] != child_ids[1]
+    finally:
+        stop_coordinator(ws_a)
+        stop_coordinator(ws_b)
+
+
+def test_fork_reset_continues_past_a_failing_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A volume whose reset raises must not leave the rest unreset: each volume
+    once had its own fork handler, and CPython runs every handler even after one
+    raises. The shared handler resets them all, then raises what failed so the
+    child still reports it. CPython's default unraisable hook prints only a
+    group's own message, so that message must name each failure. Every stub
+    raises, so a loop that stops at the first failure resets exactly one,
+    whichever the weak set yields first."""
+    reset_calls: list[str] = []
+
+    class _FailingReset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+            raise RuntimeError(f"reset {self.name} failed")
+
+    stubs = [_FailingReset("a"), _FailingReset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+    assert sorted(str(exc) for exc in excinfo.value.exceptions) == ["reset a failed", "reset b failed"]
+    printed = str(excinfo.value)
+    assert "RuntimeError: reset a failed" in printed
+    assert "RuntimeError: reset b failed" in printed
+
+
+def test_fork_reset_raises_nothing_when_every_volume_resets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The handler runs in every forked child of a process that imported the
+    adapter, so a clean pass must raise nothing: anything it raises is printed as
+    an ignored exception in that child."""
+    reset_calls: list[str] = []
+
+    class _Reset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def _after_fork(self) -> None:
+            reset_calls.append(self.name)
+
+    stubs = [_Reset("a"), _Reset("b")]
+    monkeypatch.setattr(coherent_volume_module, "_FORK_RESET_VOLUMES", weakref.WeakSet(stubs))
+
+    coherent_volume_module._reset_volumes_after_fork()
+
+    assert sorted(reset_calls) == ["a", "b"]
+
+
+@contextlib.contextmanager
+def _held_by_another_thread(enter: Callable[[], contextlib.AbstractContextManager[object]]) -> Iterator[None]:
+    """Keep ``enter()`` entered on a second thread for the duration of the block."""
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with enter():
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        yield
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def _report_from_fork_child(child: Callable[[], str], timeout: float = 5.0) -> str | None:
+    """Fork, run ``child`` in the child, and return what it reported: ``""`` if it
+    raised, ``None`` if the child produced nothing within ``timeout`` (a hang). The
+    child is killed and reaped either way, so a hung child cannot stall the suite."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, child().encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], timeout)
+        return os.read(read_fd, 256).decode("utf-8") if ready else None
+    finally:
+        os.close(read_fd)
+        os.kill(pid, signal.SIGKILL)  # no-op on a child that already exited
+        os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+@pytest.mark.parametrize("held", ["lock", "single_op_guard", "guard_meta_lock"])
+def test_fork_while_another_thread_holds_volume_state_leaves_child_usable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, held: str
+) -> None:
+    """Only the forking thread survives a fork, so a lock or guard another parent
+    thread held at that moment stays held in the child with nothing left to
+    release it. The child must neither hang, in the fork handler or on a later
+    ``_lock`` or ``_guard_meta_lock``, nor refuse every operation as concurrent
+    use by a thread that no longer exists (the single-op guard)."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    enter = {
+        "lock": lambda: vol._lock,
+        "single_op_guard": vol._single_op_guard,
+        "guard_meta_lock": lambda: vol._guard_meta_lock,
+    }[held]
+
+    def child() -> str:
+        # A real read and write re-attach under the child's identity through the
+        # single-op guard; taking _lock covers reacquire and the degradation path.
+        if vol.read("data/seed.txt") != b"seed":
+            return ""
+        vol.write("data/seed.txt", b"child")
+        with vol._lock:
+            return vol.session_id
+
+    try:
+        vol.write("data/seed.txt", b"seed")
+        parent_id = vol.session_id
+        with _held_by_another_thread(enter):
+            reported = _report_from_fork_child(child)
+        assert reported is not None, "the forked child hung"
+        assert reported not in ("", parent_id)
     finally:
         stop_coordinator(tmp_path)
 
@@ -609,6 +782,75 @@ def test_foreign_coordinator_degrade_warns(tmp_path: Path, fast_cfg: LifecycleCo
         stop_coordinator(tmp_path)
 
 
+def _fail_strict_construction(root: Path, cfg: LifecycleConfig) -> list[CoherentVolume]:
+    """Construct a strict volume over a coordinator it did not spawn, so ``_attach``
+    raises, and return the half-built instance captured just before it did."""
+    half_built: list[CoherentVolume] = []
+
+    class _CapturingVolume(CoherentVolume):
+        def _attach(self) -> None:
+            half_built.append(self)
+            super()._attach()
+
+    with pytest.raises(CoherenceError):
+        _CapturingVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    return half_built
+
+
+def test_volume_is_collected_once_unreferenced(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """The fork handler must not own the volume: os.register_at_fork cannot be
+    undone, so registering a bound method there kept every volume alive (and
+    reset in every forked child) for the life of the process."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(vol)
+        del vol
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_failed_construction_is_collected(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A constructor that raised hands the caller nothing, so nothing may keep
+    the half-built instance alive either."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        vol_ref = weakref.ref(_fail_strict_construction(tmp_path, fast_cfg).pop())
+        gc.collect()
+        assert vol_ref() is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_failed_construction_is_not_reset_in_fork_child(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """A construction that raised leaves nothing registered for fork: even while
+    something still references the half-built instance, a forked child does not
+    re-mint its identity. Being collectable alone would not show this — a weak
+    registration made before ``_attach`` and never withdrawn still resets it."""
+    ensure_coordinator(tmp_path, config=fast_cfg)
+    try:
+        (half_built,) = _fail_strict_construction(tmp_path, fast_cfg)
+        parent_id = half_built.session_id
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            os.close(read_fd)
+            try:
+                os.write(write_fd, half_built.session_id.encode("utf-8"))
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        child_id = os.read(read_fd, 64).decode("utf-8")
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+        assert child_id == parent_id
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Unit 2 — sequential enforce-on-INVALID read/write/reacquire contract.
 #
@@ -1026,8 +1268,9 @@ def test_write_cas_exhaustion_raises_typed_terminal(
 ) -> None:
     """Bounded progress (R6): if every attempt loses the race, write_cas raises
     CasRetriesExhausted (a typed terminal) rather than silently dropping the
-    write. Simulated by a peer that commits a fresh version on EVERY attempt, so
-    B's expected_version is always stale by commit time."""
+    write. Simulated by a peer that commits a fresh version on EVERY attempt,
+    between B's read and B's CAS, so every refusal is
+    ``caller_in_transient_state`` (the peer's pre-edit invalidated B)."""
     import ccs.adapters.coherent_volume as cv_mod
 
     target = _seed(tmp_path, content=b"v1")
@@ -1040,8 +1283,8 @@ def test_write_cas_exhaustion_raises_typed_terminal(
         counter = {"n": 1}
 
         def make(current: bytes) -> bytes:
-            # On every B attempt, A commits a NEW version first → B's read is
-            # immediately stale → guaranteed version_mismatch each attempt.
+            # On every B attempt, A commits a NEW version between B's read and
+            # B's CAS → A's pre-edit invalidates B → caller_in_transient_state.
             counter["n"] += 1
             vol_a.reacquire("data/shared.txt")
             vol_a.write("data/shared.txt", f"vA-{counter['n']}".encode())
@@ -1051,10 +1294,52 @@ def test_write_cas_exhaustion_raises_typed_terminal(
             vol_b.write_cas("data/shared.txt", make)
         # The terminal records the artifact + that no write landed for B.
         assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_conflict_reason == "caller_in_transient_state"
+        assert "may still hold the grant" in str(exc.value)
         # B's stale buffer never clobbered A's latest.
         assert b"B-attempt" not in target.read_bytes()
     finally:
         cv_mod.MAX_CAS_REACQUIRES = original_max
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_exhausted_by_a_held_grant_names_other_holder(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pessimistic write() leaves its writer MODIFIED until the coordinator
+    reclaims the grant or the holder's session is stopped, so a peer's write_cas
+    is refused ``other_holder`` at an unchanged version on every remaining
+    attempt. Each refusal costs one unit of budget, the loop does not wait
+    between them (no in-call wait could outlast the grant), and the terminal
+    names the LAST refusal: here A writes during B's first attempt, so the first
+    refusal is ``caller_in_transient_state`` and the other eight are
+    ``other_holder``."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(cv_mod, "time", SimpleNamespace(sleep=sleeps.append))
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        calls = {"n": 0}
+
+        def make(current: bytes) -> bytes:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                vol_a.write("data/shared.txt", b"v2-from-A")  # A now holds MODIFIED
+            return current + b"\nB"
+
+        with pytest.raises(CasRetriesExhausted) as exc:
+            vol_b.write_cas("data/shared.txt", make)
+        assert exc.value.attempts == cv_mod.MAX_CAS_REACQUIRES + 1
+        assert exc.value.last_current_version == 2
+        assert exc.value.last_conflict_reason == "other_holder"
+        assert "last_reason=other_holder" in str(exc.value)
+        assert "lost the race" not in str(exc.value)
+        assert sleeps == []
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
         stop_coordinator(tmp_path)
 
 

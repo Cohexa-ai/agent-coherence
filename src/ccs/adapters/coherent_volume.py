@@ -42,6 +42,7 @@ import time
 import urllib.error
 import uuid
 import warnings
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -212,6 +213,38 @@ _SPLIT_READ_DENY_REASON = (
     "overwritten when that commit lands."
 )
 
+# Live volumes a forked child must reset (CoherentVolume._after_fork). One
+# process-wide handler walks this set because os.register_at_fork cannot
+# unregister: a per-instance registration holds its volume, even one whose
+# constructor raised, for the life of the process. Weak, so a volume its caller
+# drops is collected and a later fork no longer touches it.
+_FORK_RESET_VOLUMES: weakref.WeakSet[CoherentVolume] = weakref.WeakSet()
+
+
+def _reset_volumes_after_fork() -> None:
+    # One volume's failure must not skip the rest: each volume used to have its
+    # own handler, and CPython reports a failing handler and still runs the next.
+    # Reset every volume, then raise what failed so the child still reports it.
+    failures: list[BaseException] = []
+    for volume in _FORK_RESET_VOLUMES:
+        try:
+            volume._after_fork()
+        except BaseException as exc:
+            failures.append(exc)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        # CPython's default unraisable hook prints only a group's own message,
+        # not its sub-exceptions, so the message names every failure.
+        details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+        raise BaseExceptionGroup(f"resetting volumes after fork failed: {details}", failures)
+
+
+# Guarded like lifecycle's fcntl import: registering at import on a platform
+# without fork would make merely importing the adapter fail.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_volumes_after_fork)
+
 
 class CoherentVolume:
     """Coherent shared workspace for a single-host agent fleet (v1).
@@ -342,7 +375,8 @@ class CoherentVolume:
 
         self._lock = threading.Lock()
         # A5: single-instance concurrency guard, SEPARATE from self._lock (which
-        # protects identity mutation in reacquire/_after_fork). A non-reentrant
+        # protects identity mutation in reacquire and the degradation count;
+        # _after_fork replaces both locks instead of taking them). A non-reentrant
         # threading.Lock here would deadlock with the reacquire-within-write_cas
         # path; instead we track the owning thread + a re-entry depth so the SAME
         # thread's nested internal calls (write_cas → reacquire → read) pass while
@@ -367,11 +401,12 @@ class CoherentVolume:
         self._last_observed_hash: dict[str, str] = {}
 
         self._mint_identity()
-        # A forked child must not share the parent's identity (single-writer
-        # would conflate them) or its cached endpoint/connection.
-        os.register_at_fork(after_in_child=self._after_fork)
-
         self._attach()
+        # A forked child must not share the parent's identity (single-writer
+        # would conflate them) or its cached endpoint/connection. Joined only
+        # once construction succeeded, so a constructor that raised leaves
+        # nothing behind for a forked child to reset.
+        _FORK_RESET_VOLUMES.add(self)
 
     # --- identity -----------------------------------------------------------
 
@@ -383,15 +418,23 @@ class CoherentVolume:
         self._session_id = str(uuid.uuid4())
 
     def _after_fork(self) -> None:
-        # Runs in the child after fork. Re-mint identity, drop the inherited
-        # endpoint (its connection/secret context belongs to the parent), and
-        # clear per-path beliefs the child has not established itself.
-        with self._lock:
-            self._session_id = str(uuid.uuid4())
-            self._endpoint = None
-            self._needs_reattach = True
-            self._last_committed_hash.clear()
-            self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
+        # Runs in the child after fork, where the forking thread is the only
+        # thread. A lock another parent thread held at the fork stays held here
+        # with nothing left to release it, and an operation it had in flight
+        # never finishes, so replace the locks instead of taking them and drop
+        # that operation's claim on the single-op guard.
+        self._lock = threading.Lock()
+        self._guard_meta_lock = threading.Lock()
+        self._guard_owner_ident = None
+        self._guard_depth = 0
+        # Re-mint identity, drop the inherited endpoint (its connection/secret
+        # context belongs to the parent), and clear per-path beliefs the child
+        # has not established itself.
+        self._session_id = str(uuid.uuid4())
+        self._endpoint = None
+        self._needs_reattach = True
+        self._last_committed_hash.clear()
+        self._last_observed_hash.clear()  # SB-23: child re-seeds its own baselines
 
     def _ensure_attached(self) -> None:
         """Lazily re-attach after a fork dropped the endpoint.
@@ -996,11 +1039,24 @@ class CoherentVolume:
         re-derives the bytes from that view via ``make_content``, and retries —
         bounded by :data:`MAX_CAS_REACQUIRES`. On exhaustion it raises
         :class:`~ccs.core.exceptions.CasRetriesExhausted` (a typed terminal,
-        NEVER a silent drop).
+        NEVER a silent drop), whose ``last_conflict_reason`` names the refusal
+        that exhausted the budget.
 
         **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
         (=8 → 9 CAS attempts); each lost race (a peer winning the version)
-        costs one. Under very high single-host contention — more concurrent
+        costs one. So does each ``other_holder`` refusal, which is not a race:
+        another agent still holds the grant at an unchanged version. A
+        pessimistic ``write()`` keeps that grant until the coordinator reclaims it
+        (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
+        by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
+        the holder's session is stopped, which a ``CoherentVolume`` never does
+        for itself; a peer's reads and CAS attempts never release it, and a
+        peer's ``write()`` only takes it over. So the loop does not wait between
+        those attempts:
+        no wait that fits in one call could outlast the grant, it would only make
+        the terminal slower. A caller that gets ``last_conflict_reason ==
+        "other_holder"`` retries after the holder releases, not in a loop.
+        Under very high single-host contention — more concurrent
         writers racing the SAME key than the budget — a writer can exhaust it
         and raise :class:`~ccs.core.exceptions.CasRetriesExhausted`. A
         stale-denied comparand read (the transient window where a peer's commit
@@ -1173,13 +1229,17 @@ class CoherentVolume:
             if outcome == "conflict":
                 last_current_version = self._cas_current_version(resp, last_current_version)
                 if cas_attempts >= max_attempts:
-                    # Every allowed commit attempt lost the race — typed
-                    # terminal, never a silent drop. (last_current_version is
-                    # the latest version the loser observed.)
+                    # Every allowed commit attempt was refused — typed terminal,
+                    # never a silent drop. (last_current_version is the latest
+                    # version the loser observed.) The last refusal's reason
+                    # tells a lost race (version_mismatch) from a grant another
+                    # agent holds (other_holder, or caller_in_transient_state
+                    # when that agent's write() landed mid-attempt).
                     raise CasRetriesExhausted(
                         artifact_id=rel,
                         attempts=cas_attempts,
                         last_current_version=last_current_version,
+                        last_conflict_reason=resp.get("reason"),
                     )
                 # Re-mint (NOT reacquire) before the next attempt so the next
                 # comparand read is a hash-checked None-state read that sees the

@@ -144,6 +144,45 @@ def test_cas_exhausted_reason_constant_lives_on_the_type():
     assert "cas_retries_exhausted" in str(exc)
 
 
+def test_cas_exhausted_message_names_the_refusal_that_exhausted_it():
+    """A budget exhausted on ``other_holder`` was reported as "every commit_cas
+    attempt lost the race". Nobody won a race: another agent still held the
+    grant at an unchanged version. The message now names the LAST refusal and
+    what it means for a caller deciding whether to retry. With no reason the
+    text is byte-identical to before, the wire reason is unchanged, and a
+    reason the table does not know, or a non-string one from a JSON body, still
+    builds a terminal."""
+    def text(reason):
+        return str(CasRetriesExhausted("data/x", 9, 3, last_conflict_reason=reason))
+
+    held = CasRetriesExhausted("data/x", 9, 3, last_conflict_reason="other_holder")
+    assert held.last_conflict_reason == "other_holder"
+    assert deny_result(held).structuredContent["reason"] == "cas_exhausted"
+    assert "cas_retries_exhausted" in str(held)
+    assert "last_reason=other_holder" in str(held)
+    assert "retry after it releases" in str(held)
+    assert "lost the race" not in str(held)
+
+    assert "the last commit_cas attempt lost the race" in text("version_mismatch")
+    # caller_in_transient_state also arrives when a peer's write() still holds
+    # the grant at an unmoved version, so it is not reported as a lost race.
+    assert "may still hold the grant" in text("caller_in_transient_state")
+    assert "lost the race" not in text("caller_in_transient_state")
+    assert "reacquire and re-read" in text("stale_read_generation")
+    assert "last_reason=a_new_reason" in text("a_new_reason")
+
+    assert str(CasRetriesExhausted("data/x", 9, 3)) == (
+        "cas_retries_exhausted artifact=data/x attempts=9 last_current_version=3 "
+        "(no write landed — every commit_cas attempt lost the race)"
+    )
+    # A class default, so a subclass that bypasses __init__
+    # (ConditionalPutRetriesExhausted) still has the attribute.
+    assert CasRetriesExhausted.last_conflict_reason is None
+    not_a_str = CasRetriesExhausted("data/x", 9, 3, last_conflict_reason=["other_holder"])
+    assert not_a_str.last_conflict_reason is None
+    assert str(not_a_str) == str(CasRetriesExhausted("data/x", 9, 3))
+
+
 def test_cas_refusal_reasons_map_to_distinct_recovery_verbs():
     """All four CAS refusals used to arrive as ``version_mismatch`` +
     ``read_then_merge``. Re-merging cannot make progress on three of them, so

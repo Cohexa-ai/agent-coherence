@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import select
+import signal
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -1017,3 +1020,48 @@ def test_l3_retry_exhaustion_increments_per_reason_counter(
         fcntl.flock(hold_fd, fcntl.LOCK_UN)
         os.close(hold_fd)
         lifecycle._reset_spawn_join_exhaustion()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_l3_counter_lock_held_at_fork_does_not_hang_the_child() -> None:
+    """Only the forking thread survives a fork. If another thread held the
+    counter lock at that moment, the child inherited it held with no thread left
+    to release it, so its next exhaustion (a post-fork re-attach can reach one)
+    or counter read blocked forever."""
+    lifecycle._reset_spawn_join_exhaustion()
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with lifecycle._EXHAUSTION_LOCK:
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            os.close(read_fd)
+            try:
+                lifecycle._record_spawn_join_exhaustion("retry_budget")
+                os.write(write_fd, str(lifecycle.get_spawn_join_exhaustion_total()).encode())
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        try:
+            # A hung child never writes: stop waiting, then kill and reap it.
+            ready, _, _ = select.select([read_fd], [], [], 5.0)
+            reported = os.read(read_fd, 16).decode() if ready else None
+        finally:
+            os.close(read_fd)
+            os.kill(pid, signal.SIGKILL)  # no-op on a child that already exited
+            os.waitpid(pid, 0)
+    finally:
+        release.set()
+        holder.join(5)
+        lifecycle._reset_spawn_join_exhaustion()
+    assert reported == "1", "the forked child hung on the inherited counter lock"

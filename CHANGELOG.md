@@ -209,6 +209,58 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A `CoherentVolume` you drop is now garbage-collected, and a constructor that
+  raises leaves nothing behind.** Each volume registered its own fork handler
+  with `os.register_at_fork`, which cannot unregister and holds a strong
+  reference to the handler it is given. So every volume a process ever built
+  stayed alive until the process exited, and its handler ran in every forked
+  child, re-minting the identity of a volume nothing used any more. The
+  registration also came before the volume attached to its coordinator, so a
+  construction that raised (strict mode against a coordinator the volume did
+  not spawn, for example) still pinned the half-built instance. One
+  process-wide handler now walks a weak set of live volumes, and a volume
+  joins that set only after its constructor succeeds. What a forked child does
+  to a live volume is unchanged: it re-mints the identity, drops the inherited
+  coordinator endpoint, clears the per-path baselines, and re-attaches on the
+  next read or write, never inside the fork handler. A volume whose reset
+  fails in the child no longer stops the others: every live volume is reset,
+  and the child still reports what failed: one failure exactly as before,
+  several as one entry that names each of them. A forked child also no longer
+  hangs, or refuses every operation as concurrent use, when another thread of
+  the parent held one of a volume's locks or had an operation in flight at the
+  moment of the fork: the child replaces those locks and drops that
+  operation's claim instead of waiting on a thread that no longer exists. The
+  coordinator lifecycle's spawn-or-join exhaustion counter gets the same
+  treatment, since a re-attach in the child can reach its lock. Regression
+  tests pin all of this. Two check that a dropped volume and a failed
+  construction are collected. One keeps a failed construction alive across a
+  real fork and checks that the child leaves it untouched: collection alone
+  would not catch a weak registration made before attach and never withdrawn.
+  One forks with two live volumes and checks the child resets both. Two check
+  that a failing reset does not stop the next and that a clean pass raises
+  nothing. Two fork while a second thread holds a lock: each of a volume's
+  locks or its single-operation guard, in turn, checking the child can still
+  use the volume; and the exhaustion counter's lock, checking the child can
+  still count.
+
+- **`CasRetriesExhausted` now says which refusal used up the retry budget.**
+  Its message always read "every commit_cas attempt lost the race", even when
+  no race happened: every attempt was refused `other_holder` because another
+  agent had written the file with a plain `write()` and still held it, at an
+  unchanged version. The exception now carries `last_conflict_reason`, the
+  reason for the last refusal (keyword-only, `None` by default;
+  `ConditionalPutRetriesExhausted` inherits it as `None`), and both
+  `CoherentVolume.write_cas` and `AgentRuntime.write_cas` set it. The message
+  names that reason and what it means for a retry; without a reason it reads
+  exactly as before. The retry loop is unchanged: `other_holder` retries still
+  do not wait. A `CoherentVolume` keeps a file it wrote until the coordinator
+  takes it back (after 600 s without a coordinator call, or 1800 s of holding,
+  by default) or its session is stopped, while the whole retry budget takes
+  tens of milliseconds, so a wait that fits in one call would only make the
+  failure slower. The wire reason `cas_exhausted` and the MCP deny mapping are
+  unchanged. The guide now lists the four reasons, what releases a held file,
+  and the volume's `config` parameter that sets those timeouts.
+
 - **A forked `CoherentVolume` whose first re-attach fails now retries it
   instead of running unenforced.** After `os.fork` the child drops the
   parent's coordinator connection and re-attaches on its next `read` or write.
