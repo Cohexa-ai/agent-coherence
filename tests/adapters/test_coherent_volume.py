@@ -3254,6 +3254,130 @@ def test_a_degrade_mode_write_lands_no_bytes_when_the_gates_store_read_fails(
         server.shutdown()
 
 
+# --- the coordinator answers a pre-read with a failure envelope ----------------
+#
+# Two coordinator-side failures answer a pre-read as HTTP 200 ``{ok: false,
+# reason: "internal: <Type>"}``: the caller-principal gate's store read raising
+# (a BOUND session whose binding is not cached — what a coordinator restart
+# leaves — under a locked registry) and the pre-read work body raising. Neither
+# confirms the read was registered: the gate's raise registered nothing, and a
+# body raise can fail after one of its registry calls already recorded a grant.
+# The volume treats that answer as it treats an unanswered request: strict
+# fails closed, degrade warns and counts.
+
+#: FROZEN duplicate of the reason the coordinator's failure envelope carries
+#: for the registry's own transient error (only the exception's type).
+_INTERNAL_OPERATIONAL_ERROR = "internal: OperationalError"
+
+
+def _cold_cache(server) -> None:
+    """What a coordinator restart leaves behind: every binding durable, the
+    in-process principal cache empty, so a bound session's next request is
+    the gate's store read."""
+    with server.service._caller_principal_lock:
+        server.service._caller_principals.clear()
+
+
+def _fail_the_pre_read(server, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    """Make the coordinator answer the next pre-read with its failure envelope
+    from one of its two arms: ``gate`` — the caller-principal gate's store
+    read raises (cold cache, locked registry); ``body`` — the pre-read work
+    body raises (the watchdog call itself)."""
+    import sqlite3
+
+    def raising(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    if fault == "gate":
+        _cold_cache(server)
+        monkeypatch.setattr(server.registry, "get_caller_principal", raising)
+    else:
+        monkeypatch.setattr(server, "run_with_watchdog", raising)
+
+
+_READERS = {
+    "read": lambda vol, rel: vol.read(rel),
+    "read_with_version": lambda vol, rel: vol.read_with_version(rel),
+}
+
+
+@pytest.mark.parametrize("reader", sorted(_READERS))
+@pytest.mark.parametrize("fault", ["gate", "body"])
+def test_a_strict_read_the_coordinator_answers_with_a_failure_fails_closed_unregistered(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, fault: str, reader: str,
+) -> None:
+    """A strict volume whose pre-read the coordinator answers with its failure
+    envelope raises the typed infrastructure failure, naming the envelope's
+    reason (the exception's type, nothing else), and hands back nothing: no
+    bytes, no baseline, no artifact row or SHARED view on the coordinator.
+    Once the coordinator recovers the same read registers as usual.
+
+    Prevents the read going through as REGISTERED: the volume returned the
+    bytes with no view recorded, so a peer's later commit invalidated nothing
+    and this instance's next write landed over it — the lost update the
+    strict mode exists to refuse — while ``read()``'s contract that a read
+    whose coherence cannot be registered fails closed read as true."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    server = _serve_in_process(tmp_path, f"pre-read-{fault}-strict")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert vol.is_attached and vol.principal_claim_outcome == "bound", "control: bound"
+        with monkeypatch.context() as faulted:
+            _fail_the_pre_read(server, faulted, fault)
+            with pytest.raises(CoherenceError) as raised:
+                _READERS[reader](vol, rel)
+
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value), "the envelope's reason is named"
+        assert rel in str(raised.value)
+        # A body raise can fail after part of the read was registered, so the
+        # message may only say the registration is unconfirmed, never that it
+        # did not happen.
+        assert str(raised.value).endswith("the read is not confirmed as registered"), str(raised.value)
+        assert vol.degradation_count == 0, "a strict volume degraded instead of raising"
+        assert vol._last_observed_hash == {}, "the baseline was seeded for bytes never returned"
+        assert server.registry.lookup_artifact_id_by_name(rel) is None, "the read registered"
+        _assert_no_secret_in(str(raised.value) + caplog.text, vol._principal, vol._mint_nonce)
+
+        assert vol.read(rel) == b"v1", "control: the coordinator recovered, the read registers"
+        assert server.registry.lookup_artifact_id_by_name(rel) is not None
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("fault", ["gate", "body"])
+def test_a_degrade_read_the_coordinator_answers_with_a_failure_degrades_like_an_unanswered_one(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """A degrade-mode volume returns the bytes, warns once and counts the
+    degradation — exactly what it does for a request the coordinator never
+    answered — and its OCC read reports the unconfirmed version ``0`` so a
+    CAS from it loses cleanly. Before, the read went through with no signal
+    at all: ``is_degraded`` stayed False while no view was registered."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    server = _serve_in_process(tmp_path, f"pre-read-{fault}-degrade")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        assert vol.principal_claim_outcome == "bound" and not vol.is_degraded, "control"
+        _fail_the_pre_read(server, monkeypatch, fault)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            data = vol.read(rel)
+            _data, version = vol.read_with_version(rel)
+
+        assert data == b"v1"
+        assert version == 0, "an unregistered OCC read reported a confirmed version"
+        assert vol.is_degraded and vol.degradation_count == 2
+        degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert len(degraded) == 1, "warned once per instance"
+        assert _INTERNAL_OPERATIONAL_ERROR in str(degraded[0].message)
+    finally:
+        server.shutdown()
+
+
 def test_the_principal_claim_outcome_is_readable_on_every_arm(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

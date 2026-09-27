@@ -896,9 +896,9 @@ class CoherentVolume:
 
         Raises ``FileNotFoundError`` for a missing file (no phantom artifact is
         seeded). Under ``on_error="strict"`` a coordinator-infrastructure
-        failure (unavailable coordinator, watchdog timeout) raises
-        ``CoherenceError`` — a read whose coherence cannot be registered fails
-        closed.
+        failure (unavailable coordinator, watchdog timeout, a coordinator-side
+        error answering the pre-read) raises ``CoherenceError`` — a read whose
+        coherence cannot be registered fails closed.
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard) — one instance per
@@ -928,12 +928,15 @@ class CoherentVolume:
                 },
             )
             # A stale / strict-deny response is expected and changes nothing here
-            # (read returns current bytes; INVALID stays sticky). Only a watchdog
-            # timeout is an infra failure that fails closed.
+            # (read returns current bytes; INVALID stays sticky). Two answers
+            # are infra failures that take the unanswered-request seam: a
+            # watchdog timeout, and the coordinator's failure envelope.
             if isinstance(resp, dict) and resp.get("degraded"):
                 self._fail_closed_or_degrade(
                     f"coordinator watchdog timeout during read of {rel}"
                 )
+            elif isinstance(resp, dict) and resp.get("ok") is False:
+                self._fail_closed_or_degrade(self._pre_read_failure(resp, rel))
             elif _enforce_stale and self._on_stale_read == "raise":
                 # PH-A read-surface instance (opt-in): surface a strict
                 # foreign-edit / stale-view deny as StaleView so the caller can
@@ -2344,6 +2347,10 @@ class CoherentVolume:
                     self._fail_closed_or_degrade(
                         f"coordinator watchdog timeout during read of {_rel}"
                     )
+                elif resp.get("ok") is False:
+                    # Degrade mode falls through with the fail-closed
+                    # comparands: no version key → 0, no generation → None.
+                    self._fail_closed_or_degrade(self._pre_read_failure(resp, _rel))
                 version = self._pre_read_version(resp)
                 owner_generation = self._pre_read_owner_generation(resp)
                 # A strict-deny (INVALID, NOT re-granted — KTD-T) is the only
@@ -2373,6 +2380,35 @@ class CoherentVolume:
         if observe and seed_baseline:
             self._last_observed_hash[_rel] = content_hash
         return _ReadResult(data, version, stale_denied, owner_generation, stale_status)
+
+    @staticmethod
+    def _pre_read_failure(resp: dict, rel: str) -> str:
+        """The message for a pre-read the coordinator answered with its
+        failure envelope, HTTP 200 ``{"ok": false, "reason": "internal:
+        <Type>"}`` — what it answers when the caller-principal gate's store
+        read or the pre-read work body raised. The gate's raise registered
+        nothing; a body raise may have, since the handler's registry calls are
+        separate statements and one can fail after another has recorded a
+        SHARED grant. Either way the client cannot know the read's standing,
+        so the answer is an unanswered request with a name: it goes through
+        ``_fail_closed_or_degrade`` exactly as a transport failure does
+        (strict raises, degrade warns and counts), never through the deny
+        arm (a deny is enforcement working and the read stays registered)
+        and never through as a registered read. Before this arm existed a
+        strict volume returned the bytes with no view recorded, so a peer's
+        later commit invalidated nothing and this instance's next write
+        landed over it. The pre-read handler itself never answers an ``ok``
+        key, so the family is exactly the envelope.
+
+        Only the envelope's ``reason`` is named — the coordinator's, relayed
+        verbatim as ``_deny_reason`` relays a deny's, and carrying only an
+        exception's type — never the rest of the body."""
+        reason = resp.get("reason")
+        named = reason if isinstance(reason, str) and reason else "no reason given"
+        return (
+            f"coordinator answered the read of {rel} with a failure ({named}); "
+            "the read is not confirmed as registered"
+        )
 
     @staticmethod
     def _pre_read_version(resp: dict) -> int:

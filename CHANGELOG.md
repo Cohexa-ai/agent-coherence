@@ -207,8 +207,13 @@ Alpha — APIs may change before `v1.0`.
   `caller_principal_refused_total`. A registry error while the principal is
   being checked is answered exactly as a failure inside that route's handler
   is — HTTP `200` with the route's own error shape, never a `500` — so a client
-  never reads it as an absent coordinator. The Node coordinator enforces none
-  of this.
+  never reads it as an absent coordinator. On `pre-read`, either
+  coordinator-side error now fails a strict `CoherentVolume` read closed and
+  degrades a degrade-mode one (a warning, `is_degraded`), as an unanswered
+  request does; before, the read went through with its bytes as though it
+  were registered, when the gate's error had registered nothing, so a peer's
+  later commit invalidated nothing. The Node
+  coordinator enforces none of this.
 
 - **Registry schema version 8 (forward-only).** Principals get their own table,
   which the grant sweep, the session-liveness sweep, the session cap and
