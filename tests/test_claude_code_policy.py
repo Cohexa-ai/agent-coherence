@@ -251,7 +251,7 @@ def test_summary_includes_counts(root: Path) -> None:
     (root / ".coherence" / "tracked.yaml").write_text("- runbook.md\n- '/etc/passwd'\n")
     (root / ".coherence" / "ignored.yaml").write_text("- docs/brainstorms/**/*.md\n")
     policy = TrackedArtifactPolicy.load(root)
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["default_pattern_count"] == len(DEFAULT_TRACKED_PATTERNS)
     assert summary["user_added_pattern_count"] == 1  # runbook.md
     assert summary["ignored_pattern_count"] == 1  # docs/brainstorms/**/*.md
@@ -261,5 +261,5 @@ def test_summary_includes_counts(root: Path) -> None:
 
 def test_summary_user_added_patterns_empty_by_default(root: Path) -> None:
     policy = TrackedArtifactPolicy.load(root)
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["user_added_patterns"] == []
