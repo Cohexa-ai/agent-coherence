@@ -443,8 +443,8 @@ class CoherentVolume:
       coordinated peer change can hit the disk without an INVALID deny, so a
       mismatch is not necessarily foreign.
 
-    **Fleet requirement.** Every instance coordinating a given workspace MUST
-    declare the **same** ``managed`` globs: strict mode is loaded once, when the
+    **Fleet requirement (hard, v1).** Every instance coordinating a given
+    workspace MUST declare the **same** ``managed`` globs: strict mode is loaded once, when the
     coordinator starts, so a later instance cannot add globs to it. At attach
     each instance checks every glob it declared against the glob sets the
     coordinator publishes in its operator view (:meth:`managed_glob_enforcement`)

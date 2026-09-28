@@ -57,7 +57,7 @@ PINS: tuple[Pin, ...] = (
         doc_phrase="two restores of **different** checkpoints that overlap on a member",
     ),
     Pin(
-        name="volume: a mixed-globs fleet is unsupported and fails quietly",
+        name="volume: a mixed-globs fleet is unsupported and refused at attach",
         source="src/ccs/adapters/coherent_volume.py",
         source_marker="Fleet requirement (hard, v1)",
         doc="docs/guide.md",
