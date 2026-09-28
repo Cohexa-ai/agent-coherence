@@ -294,13 +294,15 @@ class _Coordinator(http.server.BaseHTTPRequestHandler):
     server: _ScriptedServer
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib name
-        # The volume checks each glob it declared against the published strict
-        # and tracked sets, not the count; publish the one glob these volumes
-        # declare so the attach is confirmed and the protocol under test runs.
+        # The volume checks each glob it declared against the published strict,
+        # tracked and ignored sets, not the count; publish the one glob these
+        # volumes declare, and no ignored pattern, so the attach is confirmed
+        # and the protocol under test runs.
         self._answer(200, {"policy_summary": {
             "strict_mode_pattern_count": 1,
             "tracked_patterns": ["data/**"],
             "user_added_patterns": [],
+            "ignored_patterns": [],
             "strict_mode_patterns": ["data/**"],
         }})
 

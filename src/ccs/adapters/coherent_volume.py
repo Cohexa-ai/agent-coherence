@@ -444,13 +444,15 @@ class CoherentVolume:
       mismatch is not necessarily foreign.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
-    workspace MUST declare the **same** ``managed`` globs: strict mode is loaded once, when the
-    coordinator starts, so a later instance cannot add globs to it. At attach
-    each instance checks every glob it declared against the glob sets the
-    coordinator publishes in its operator view (:meth:`managed_glob_enforcement`)
-    and fails closed — strict raises, degrade warns and runs detached — when
-    any is not enforced, naming the globs, or when the sets cannot be read at
-    all. Before this check existed a sibling whose globs differed from the
+    workspace MUST declare the **same** ``managed`` globs: an attaching instance
+    adds no globs to a running coordinator's policy (only the track and untrack
+    commands change it). At attach each instance checks every glob it declared
+    against the glob sets the coordinator publishes in its operator view
+    (:meth:`managed_glob_enforcement`) and fails closed — strict raises,
+    degrade warns and runs detached — when any is not enforced (not tracked,
+    not strict, or ignored), naming the globs, or when the sets cannot be read
+    at all. The check is a literal, attach-time comparison; a later untrack of
+    a managed path is not seen. Before this check existed a sibling whose globs differed from the
     spawner's passed on the spawner's pattern *count*, and its stale writes
     landed with no signal (#190).
     """
@@ -841,9 +843,12 @@ class CoherentVolume:
         # post-attach check covers the cases:
         #   * we spawned the coordinator      -> it loaded our YAML -> enforced
         #   * a sibling spawned it with the SAME globs -> the fleet case: enforced
-        #   * a sibling spawned it with OTHER globs, or a foreign coordinator
-        #     (e.g. a Claude Code session) -> our globs are not in its policy and
-        #     cannot be added (load-once) -> fail closed, naming them
+        #   * a sibling spawned it with OTHER globs, a foreign coordinator
+        #     (e.g. a Claude Code session), or a policy that ignores our globs
+        #     -> our globs are not enforced and an attach adds none -> fail
+        #     closed, naming them. The comparison is literal and the answer is
+        #     an attach-time snapshot: a covering ignore pattern or a later
+        #     /policy/untrack is not seen (managed_glob_enforcement says so).
         #   * the sets cannot be read (an older coordinator publishing counts
         #     only, the Node coordinator, a failed /status) -> cannot tell ->
         #     fail closed, saying so; never read as enforced.
@@ -869,9 +874,9 @@ class CoherentVolume:
         globs are not enforced, or why enforcement could not be told."""
         tail = (
             " Every volume on a workspace must declare the globs the coordinator was "
-            "started with; a running coordinator takes no new strict globs. Stop it, "
-            "or use a dedicated workspace root. In degrade mode the volume operates "
-            "best-effort with coherence enforcement off."
+            "started with; an attaching volume adds none to a running coordinator's "
+            "policy. Stop it, or use a dedicated workspace root. In degrade mode the "
+            "volume operates best-effort with coherence enforcement off."
         )
         if enforcement.unavailable is not None:
             globs = ", ".join(self._managed)
@@ -882,7 +887,8 @@ class CoherentVolume:
         globs = ", ".join(enforcement.unenforced)
         return (
             "attached to a coordinator whose policy does not enforce strict mode for "
-            f"managed glob(s) {globs}: they are not in its strict set, or not tracked."
+            f"managed glob(s) {globs}: they are not in its strict set, not tracked, "
+            "or ignored."
             + tail
         )
 
@@ -1006,13 +1012,24 @@ class CoherentVolume:
     def managed_glob_enforcement(self) -> ManagedGlobEnforcement:
         """Check every managed glob against the glob sets the coordinator
         publishes in its operator view (``/status?detail=full``, the same view
-        the status command reads). A glob is enforced when the coordinator
-        carries it in its strict set and its tracked set (defaults or
-        user-added). The globs are compared as the strings this volume wrote to
-        the policy files, which is what a sibling that declared the same globs
-        wrote too. An ``ignored.yaml`` entry is not part of the check: it untracks
-        paths for every volume alike, the coordinator answers it per path, and a
-        managed-but-ignored glob is a configuration the volume already supports.
+        the status command reads), by the coordinator's own rule: a path is
+        enforced when it is tracked (a default or user-added pattern), matches
+        a strict pattern, and matches no ignored pattern. So a glob is enforced
+        when the coordinator carries it in its strict set and its tracked set
+        and not in its ignored set. The globs are compared as the strings this
+        volume wrote to the policy files, which is what a sibling that declared
+        the same globs wrote too; a coordinator that enforces the same paths
+        under another spelling, or ignores them under a covering pattern, is
+        not matched, so the answer is as literal as the comparison.
+
+        The attach checks this answer once. ``/policy/track`` and
+        ``/policy/untrack`` reload the coordinator's policy while it runs, and
+        nothing re-runs the check: a path under a managed glob that is
+        untracked after attach answers every hook as untracked — a read reports
+        version 0 and a CAS commit is accepted at any expected version — with
+        no signal unless a caller asks this method again (a literal untrack is
+        reported then; :data:`_GRANT_REQUEST_ADMITTED` says why nothing the
+        volume holds can tell on its own).
 
         The view is read for this check only. When it cannot be read, or carries
         no glob sets, the result is ``unavailable`` with the reason, and nothing
@@ -1044,7 +1061,9 @@ class CoherentVolume:
             )
         summary = status.get("policy_summary") if isinstance(status, dict) else None
         sets: dict[str, set[str]] = {}
-        for key in ("tracked_patterns", "user_added_patterns", "strict_mode_patterns"):
+        for key in (
+            "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+        ):
             value = summary.get(key) if isinstance(summary, dict) else None
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 return ManagedGlobEnforcement(
@@ -1054,9 +1073,10 @@ class CoherentVolume:
                 )
             sets[key] = set(value)
         tracked = sets["tracked_patterns"] | sets["user_added_patterns"]
+        ignored = sets["ignored_patterns"]
         enforced = tuple(
             g for g in globs
-            if g in sets["strict_mode_patterns"] and g in tracked
+            if g in sets["strict_mode_patterns"] and g in tracked and g not in ignored
         )
         unenforced = tuple(g for g in globs if g not in enforced)
         return ManagedGlobEnforcement(enforced, unenforced, None)

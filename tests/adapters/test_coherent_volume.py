@@ -1049,27 +1049,74 @@ def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
         stop_coordinator(tmp_path)
 
 
-@pytest.mark.parametrize("sets", ["absent", "refused"])
+def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The coordinator enforces a path only when it is tracked, strict, and
+    matches no ignored pattern, and its hooks answer an ignored path as
+    untracked: a read reports version 0 and a CAS commit is accepted at any
+    expected version. A volume whose managed glob the coordinator's policy
+    ignores is therefore refused at attach, by name, like one it does not
+    track.
+
+    Prevents the attach check confirming a glob the coordinator ignores: with
+    ``ignored.yaml`` carrying the glob before the spawn, the check answered
+    enforced while a stale CAS write landed with nothing raised."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("data/**",))
+    try:
+        with pytest.raises(CoherenceError) as raised:
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        message = str(raised.value)
+        assert "does not enforce strict mode for managed glob(s) data/**" in message, message
+        assert "ignored" in message, message
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# How the operator view fails to answer, and the reason the volume must name.
+_UNCONFIRMABLE_VIEWS = {
+    "absent": "publishes no glob sets",
+    "refused": "the operator view was refused (HTTP 501)",
+    "refused-node": "the Node coordinator does not serve the operator view (HTTP 501)",
+    "transport": "URLError reading the operator view",
+}
+
+
+@pytest.mark.parametrize("sets", list(_UNCONFIRMABLE_VIEWS))
 def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforcement(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, sets: str
 ) -> None:
-    """When the coordinator publishes no glob sets in its operator view — an
-    older Python coordinator whose summary carries only counts, or the Node
-    coordinator, which answers 501 to the operator view — the volume cannot
-    tell whether its globs are enforced. It fails closed, detached, and says
-    so: "cannot tell" is never reported as "not enforced", nor as enforced.
+    """When the operator view cannot be read — an older Python coordinator
+    whose summary carries only counts, a coordinator that refuses the view,
+    the Node coordinator (which answers 501, and is named from the pid file's
+    backend line), or a transport failure during that one GET — the volume
+    cannot tell whether its globs are enforced. It fails closed, detached, and
+    says which: "cannot tell" is never reported as "not enforced", nor as
+    enforced.
 
-    Prevents a count, or nothing at all, being read as confirmation."""
+    Prevents a count, nothing at all, or a raised transport error being read
+    as confirmation; the generic exception arm is what keeps a coordinator
+    dying mid-attach from escaping the constructor as a raw error."""
     import urllib.error
 
     _seed(tmp_path, content=b"v1")
     real_get = coherent_volume_module._coordinator_get
+    if sets == "refused-node":
+        monkeypatch.setattr(
+            coherent_volume_module, "coordinator_backend",
+            lambda root: coherent_volume_module.NODE_BACKEND,
+        )
 
     def operator_view_unavailable(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if "detail=full" not in path:
             return real_get(endpoint, path, **kwargs)
-        if sets == "refused":
+        if sets in ("refused", "refused-node"):
             raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
+        if sets == "transport":
+            raise urllib.error.URLError("connection refused")
         doc = real_get(endpoint, path, **kwargs)
         summary = dict(doc["policy_summary"])
         for key in ("tracked_patterns", "strict_mode_patterns", "ignored_patterns"):
@@ -1082,12 +1129,47 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
             CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         message = str(raised.value)
         assert "cannot be confirmed" in message, message
+        assert _UNCONFIRMABLE_VIEWS[sets] in message, message
         assert "does not enforce strict mode for" not in message, message
         assert "data/**" in message, message
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_get", real_get)
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         assert vol.is_attached, "control: with the sets published, the same volume attaches"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_an_unconfirmable_enforcement_answer_runs_detached_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``on_error="degrade"`` an operator view that carries no glob sets
+    warns once that enforcement cannot be confirmed and leaves the volume
+    detached and degraded — the same outcome as an unenforced glob, so
+    "cannot tell" never keeps a live endpoint to a coordinator that may not
+    enforce the paths.
+
+    Prevents the degrade branch of the cannot-tell answer going unpinned: the
+    unenforced branch is pinned in both modes, this one was only in strict."""
+    _seed(tmp_path, content=b"v1")
+    real_get = coherent_volume_module._coordinator_get
+
+    def counts_only(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        doc = real_get(endpoint, path, **kwargs)
+        if "detail=full" not in path:
+            return doc
+        summary = {k: v for k, v in doc["policy_summary"].items() if not k.endswith("_patterns")}
+        return {**doc, "policy_summary": summary}
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", counts_only)
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as warned:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        assert vol.is_degraded and not vol.is_attached, (
+            "a degraded volume kept a live endpoint to a coordinator whose enforcement "
+            "could not be confirmed")
+        message = str(warned[0].message)
+        assert "cannot be confirmed" in message and "data/**" in message, message
     finally:
         stop_coordinator(tmp_path)
 
@@ -5581,12 +5663,14 @@ def _tracked_version(vol: CoherentVolume, rel: str) -> int | None:
 
 
 # Where the refused write goes: a path the coordinator tracks, one it does not
-# track, and one the VOLUME manages but the coordinator is told to ignore — so
-# nothing the volume holds says whether the coordinator tracks a path.
+# track, and one the VOLUME manages but the coordinator is told to ignore AFTER
+# the attach (the attach check sees the policy the coordinator started with; the
+# untrack command reloads it) — so nothing the volume holds says whether the
+# coordinator tracks a path.
 _REFUSED_WRITE_PATHS = {
     "tracked": ("data/shared.txt", None),
     "untracked": ("notes/free.txt", None),
-    "managed-but-ignored": ("data/shared.txt", "- data/**\n"),
+    "managed-but-ignored": ("data/shared.txt", "data/**"),
 }
 
 # What the refused write puts, against what the file and the volume already
@@ -5629,15 +5713,18 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
 
     rel, ignored = _REFUSED_WRITE_PATHS[where]
     data, expected_disk_writes = _REFUSED_WRITE_BYTES[rewrite]
-    if ignored is not None:
-        coherence_dir = tmp_path / ".coherence"
-        coherence_dir.mkdir(mode=0o700, exist_ok=True)
-        (coherence_dir / "ignored.yaml").write_text(ignored, encoding="utf-8")
     target = _seed(tmp_path, rel=rel, content=b"v1")
     on_stale_write = "allow" if rewrite == "committed-over-foreign" else "raise"
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write=on_stale_write, config=fast_cfg)
     peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
     try:
+        if ignored is not None:
+            # Ignored after the attach: the coordinator reloads its policy and
+            # untracks the managed path, and neither volume sees that.
+            untracked = coherent_volume_module._coordinator_post(
+                vol._endpoint, "/policy/untrack", {"paths": [ignored]}
+            )
+            assert untracked.get("ok") is True and untracked.get("removed") == [ignored], untracked
         vol.read(rel)
         if rewrite in ("same-bytes", "committed-over-foreign"):
             vol.write(rel, b"v2")  # recorded: the refused write below writes these bytes again
