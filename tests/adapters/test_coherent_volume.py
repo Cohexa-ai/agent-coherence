@@ -47,6 +47,7 @@ from ccs.adapters.coherent_volume import (
     DENIED_READ_BACKOFF_CAP_SEC,
     MAX_CAS_REACQUIRES,
     CoherentVolume,
+    ManagedGlobEnforcement,
     coherent_workspace,
     denied_read_backoff_sec,
     install,
@@ -513,7 +514,10 @@ def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     try:
         vol._after_fork()
-        monkeypatch.setattr(vol, "strict_mode_active", lambda: False)
+        monkeypatch.setattr(
+            vol, "managed_glob_enforcement",
+            lambda: ManagedGlobEnforcement((), ("data/**",), None),
+        )
 
         for _ in range(2):
             with pytest.raises(CoherenceError):
@@ -539,8 +543,8 @@ def test_interrupted_reattach_after_fork_leaves_the_child_detached(
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     try:
         vol._after_fork()
-        flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
-        monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+        flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
+        monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
 
         with pytest.raises(_Interrupted):
             vol.read("data/shared.txt")
@@ -613,8 +617,8 @@ def _fail_spawn(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _interrupt_strict_check(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt after the child connected, during the strict-mode check."""
-    flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
-    monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+    flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
+    monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
 
 
 def _fail_resolve(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -664,8 +668,8 @@ def test_interrupted_reattach_after_fork_is_detached_and_degraded_in_degrade_mod
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
     try:
         vol._after_fork()
-        flaky_check = _raise_once(vol.strict_mode_active, _Interrupted())
-        monkeypatch.setattr(vol, "strict_mode_active", flaky_check)
+        flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
+        monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
 
         with pytest.warns(CoherenceDegradedWarning):
             with pytest.raises(_Interrupted):
@@ -954,6 +958,136 @@ def test_sibling_volume_attaches_to_strict_coordinator(
         assert vol_a.strict_mode_active() and vol_b.strict_mode_active()
         assert vol_a.session_id != vol_b.session_id
         assert not vol_a.is_degraded and not vol_b.is_degraded
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_sibling_with_different_managed_globs_is_refused_not_silently_unenforced(
+    tmp_path: Path, fast_cfg: LifecycleConfig, on_error: str
+) -> None:
+    """A volume that attaches to a coordinator a sibling spawned with DIFFERENT
+    managed globs is refused: strict raises, degrade warns and runs detached.
+    The message names the globs the coordinator does not enforce.
+
+    Prevents the silent lost update in #190: the sibling passed the attach
+    check because the coordinator's /status reported only a COUNT of strict
+    patterns, and the spawner's one pattern satisfied it. Its own paths were
+    untracked, so its reads registered nothing, read_with_version answered 0,
+    and a CAS at any expected_version was accepted; nothing raised and
+    is_degraded stayed False."""
+    for rel, content in (("a/plan.md", b"v0\n"), ("b/notes.md", b"v0\n")):
+        (tmp_path / rel).parent.mkdir(exist_ok=True)
+        (tmp_path / rel).write_bytes(content)
+    spawner = CoherentVolume(tmp_path, managed=("a/**",), config=fast_cfg)
+    try:
+        if on_error == "strict":
+            with pytest.raises(CoherenceError) as raised:
+                CoherentVolume(tmp_path, managed=("b/**",), on_error="strict", config=fast_cfg)
+            message = str(raised.value)
+        else:
+            with pytest.warns(CoherenceDegradedWarning) as warned:
+                sibling = CoherentVolume(
+                    tmp_path, managed=("b/**",), on_error="degrade", config=fast_cfg
+                )
+            assert sibling.is_degraded and not sibling.is_attached, (
+                "a degraded sibling kept a live endpoint to a coordinator that does "
+                "not enforce its paths")
+            message = str(warned[0].message)
+        assert "b/**" in message, message
+        assert "does not enforce strict mode for" in message, message
+        # Control: the spawner's own glob is enforced by the same coordinator.
+        assert spawner.is_attached and spawner.strict_mode_active()
+        _data, version = spawner.read_with_version("a/plan.md")
+        assert version >= 1, "control: the spawner's path is version-tracked"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_sibling_with_the_same_managed_globs_still_attaches_enforced(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The per-glob check must not refuse the supported fleet: a sibling
+    declaring exactly the spawner's globs attaches, and its paths are
+    version-tracked by the shared coordinator."""
+    _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol_a.is_attached and vol_b.is_attached
+        assert not vol_a.is_degraded and not vol_b.is_degraded
+        vol_a.write("data/shared.txt", b"v2")
+        _data, version = vol_b.read_with_version("data/shared.txt")
+        assert version >= 1, "the sibling's path is version-tracked"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("policy", ["tracked-not-strict", "strict-not-tracked"])
+def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
+    tmp_path: Path, fast_cfg: LifecycleConfig, policy: str
+) -> None:
+    """Strict mode is an intersection on the coordinator: a path is enforced
+    only when it is tracked AND matches a strict pattern. A running
+    coordinator that carries this volume's glob in just one of the two sets
+    does not enforce it, and the volume is refused by name in strict mode.
+
+    Prevents the per-glob check testing only half of that rule: a glob found
+    in the tracked set alone (an operator tracked it but never opted it into
+    strict mode), or in the strict set alone (a hand-written strict_mode.yaml
+    with no tracked.yaml entry), read as enforced."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    only = "tracked.yaml" if policy == "tracked-not-strict" else "strict_mode.yaml"
+    CoherentVolume._merge_yaml_list(coherence_dir / only, ("data/**",))
+    assert ensure_coordinator(tmp_path, config=fast_cfg) > 0  # loads that policy
+    try:
+        with pytest.raises(CoherenceError) as raised:
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert "does not enforce strict mode for managed glob(s) data/**" in str(raised.value)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("sets", ["absent", "refused"])
+def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforcement(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, sets: str
+) -> None:
+    """When the coordinator publishes no glob sets in its operator view — an
+    older Python coordinator whose summary carries only counts, or the Node
+    coordinator, which answers 501 to the operator view — the volume cannot
+    tell whether its globs are enforced. It fails closed, detached, and says
+    so: "cannot tell" is never reported as "not enforced", nor as enforced.
+
+    Prevents a count, or nothing at all, being read as confirmation."""
+    import urllib.error
+
+    _seed(tmp_path, content=b"v1")
+    real_get = coherent_volume_module._coordinator_get
+
+    def operator_view_unavailable(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if "detail=full" not in path:
+            return real_get(endpoint, path, **kwargs)
+        if sets == "refused":
+            raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
+        doc = real_get(endpoint, path, **kwargs)
+        summary = dict(doc["policy_summary"])
+        for key in ("tracked_patterns", "strict_mode_patterns", "ignored_patterns"):
+            summary.pop(key, None)
+        return {**doc, "policy_summary": summary}
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", operator_view_unavailable)
+    try:
+        with pytest.raises(CoherenceError) as raised:
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        message = str(raised.value)
+        assert "cannot be confirmed" in message, message
+        assert "does not enforce strict mode for" not in message, message
+        assert "data/**" in message, message
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_get", real_get)
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert vol.is_attached, "control: with the sets published, the same volume attaches"
     finally:
         stop_coordinator(tmp_path)
 

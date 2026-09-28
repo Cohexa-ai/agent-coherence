@@ -601,12 +601,18 @@ another process at the same workspace and it attaches to the same coordinator, s
 every process on the host shares one coherent view.
 
 **Every volume coordinating a workspace must declare the same `managed` globs.**
-This is a hard requirement in v1, and it fails quietly if you break it: the
-coordinator checks only how *many* strict patterns a volume declared, not which
-ones, so a sibling whose globs differ from the spawner's constructs successfully
-and reports itself healthy — while its own paths are not guarded and its stale
-writes land with no signal. Until a per-glob check exists, a fleet with mixed
-globs is unsupported.
+Strict mode is loaded once, when the coordinator starts, so a volume that
+attaches later cannot add globs to it. At attach, each volume checks every glob
+it declared against the glob sets the coordinator publishes in its operator
+view: a glob is enforced when it is in the coordinator's strict set and its
+tracked set. A glob that is not fails the volume closed, naming it: under
+`on_error="strict"` construction raises, and under `"degrade"` the volume warns
+once and runs detached. When the sets cannot be read at all, because the
+coordinator is older and publishes only counts, or is the Node coordinator, the
+volume fails closed the same way and says that enforcement could not be
+confirmed. `vol.managed_glob_enforcement()` returns the same three-way answer.
+A fleet with mixed globs is still unsupported; it now refuses instead of running
+unguarded.
 
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume

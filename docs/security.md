@@ -193,9 +193,13 @@ What follows from that:
   token; it does not verify the `session_id` named at `/session/begin`.
 
 What the coordinator does not publish: `/status` shows session names — which
-embed the raw session id — only in the operator view (`?detail=full` plus the
-`Coherence-Local-Operator: true` header). The default `minimal` view reports
-`agent_name` as `null`, and the `metrics` view carries no sessions at all. Hook
+embed the raw session id — and the policy's pattern lists (the tracked, user-added,
+ignored and strict globs, which are the operator's directory layout) only in the
+operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header). A
+`CoherentVolume` reads that view once, at attach, to check that the coordinator
+enforces the globs it declared. The default `minimal` view reports `agent_name`
+as `null` and the pattern counts without the patterns, and the `metrics` view
+carries no sessions at all. Hook
 responses identify another session by its agent id, a one-way hash of the
 session id. The `agent-coherence-status` command is an operator tool and asks
 for the operator view by default, so its output does carry session names: run

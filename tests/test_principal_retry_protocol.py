@@ -294,7 +294,15 @@ class _Coordinator(http.server.BaseHTTPRequestHandler):
     server: _ScriptedServer
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib name
-        self._answer(200, {"policy_summary": {"strict_mode_pattern_count": 1}})
+        # The volume checks each glob it declared against the published strict
+        # and tracked sets, not the count; publish the one glob these volumes
+        # declare so the attach is confirmed and the protocol under test runs.
+        self._answer(200, {"policy_summary": {
+            "strict_mode_pattern_count": 1,
+            "tracked_patterns": ["data/**"],
+            "user_added_patterns": [],
+            "strict_mode_patterns": ["data/**"],
+        }})
 
     def do_POST(self) -> None:  # noqa: N802 — stdlib name
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")

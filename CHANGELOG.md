@@ -340,6 +340,24 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A `CoherentVolume` whose managed globs the coordinator does not enforce now
+  fails closed instead of running unguarded.** Strict mode is loaded once, when
+  the coordinator starts, so a volume that attached later with different globs
+  could not add them; its attach check read only how *many* strict patterns the
+  coordinator had, which the spawner's globs satisfied, and its own paths were
+  untracked. Every hook then answered them as if enforced: `read_with_version`
+  reported version 0, `write_cas` accepted any `expected_version`, and a stale
+  write landed with nothing raised and `is_degraded` still False (#190). The
+  coordinator now publishes its pattern lists (`tracked_patterns`,
+  `user_added_patterns`, `ignored_patterns`, `strict_mode_patterns`) in the
+  operator view of `/status`, next to the counts it already reports at every
+  tier, and at attach the volume checks each glob it declared against the strict
+  and tracked sets. A glob the coordinator does not enforce fails the volume
+  closed, naming it; a coordinator that publishes no sets, an older one or the
+  Node coordinator, fails it closed as "cannot be confirmed" rather than being
+  read as enforced. `CoherentVolume.managed_glob_enforcement()` returns that
+  three-way answer. Volumes declaring the coordinator's own globs are unaffected.
+
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
   session SHARED. It does this in strict mode too: the deny fires once, and a
