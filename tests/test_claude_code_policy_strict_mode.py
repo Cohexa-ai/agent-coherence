@@ -298,7 +298,7 @@ def test_summary_exposes_strict_mode_pattern_count(root: Path) -> None:
     )
     policy = TrackedArtifactPolicy.load(root)
 
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["strict_mode_pattern_count"] == 2
     # The patterns themselves, so a client can check the globs it declared
     # against the coordinator's policy instead of a count (#190).

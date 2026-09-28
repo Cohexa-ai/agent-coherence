@@ -5527,15 +5527,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             "states": states_by_agent[agent_id],
         })
 
-    policy_summary = coordinator.policy.summary()
-    if detail != "full":
-        # The pattern lists are workspace-relative paths and globs. Leaking
-        # them at the minimal/metrics tiers would expose the operator's
-        # directory layout to non-operator callers — keep them full-tier
-        # only; the counts stay at every tier.
-        policy_summary = {
-            k: v for k, v in policy_summary.items() if k not in _POLICY_PATTERN_LISTS
-        }
+    # The pattern lists are workspace-relative paths and globs. Publishing
+    # them at the minimal/metrics tiers would expose the operator's directory
+    # layout to non-operator callers — ask for them only at the full tier;
+    # the counts are in the summary at every tier.
+    policy_summary = coordinator.policy.summary(include_patterns=detail == "full")
     base = {
         "detail": detail,
         "tracked_artifacts": tracked,
@@ -5562,14 +5558,6 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         # default tier never leaks $HOME or directory layout.
         base["coordinator_root"] = "."
     req._json(200, base)
-
-
-#: The ``policy_summary`` keys that carry pattern lists rather than counts.
-#: Published in the operator view only (``/status?detail=full``); a client
-#: verifying its declared globs reads them there.
-_POLICY_PATTERN_LISTS: frozenset[str] = frozenset({
-    "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
-})
 
 
 def _parse_detail_query(query: str) -> str:
