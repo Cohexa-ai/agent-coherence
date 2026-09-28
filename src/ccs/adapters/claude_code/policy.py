@@ -252,14 +252,24 @@ class TrackedArtifactPolicy:
         return self.rejected_patterns
 
     def summary(self) -> dict[str, object]:
-        """Compact summary for the ``/status`` endpoint and CLI display."""
+        """Compact summary for the ``/status`` endpoint and CLI display.
+
+        The four pattern lists (``tracked_patterns``, ``user_added_patterns``,
+        ``ignored_patterns``, ``strict_mode_patterns``) are what a client checks
+        its own declared globs against; ``/status`` publishes them only in the
+        operator view, since a pattern list is the operator's directory layout.
+        The counts are published at every tier. A count alone let a volume whose
+        globs differed from the spawner's pass its attach check (#190)."""
         return {
             "coordinator_root": str(self.coordinator_root),
             "default_pattern_count": len(self.tracked_patterns),
+            "tracked_patterns": list(self.tracked_patterns),
             "user_added_pattern_count": len(self.user_added_patterns),
             "user_added_patterns": list(self.user_added_patterns),
             "ignored_pattern_count": len(self.ignored_patterns),
+            "ignored_patterns": list(self.ignored_patterns),
             "strict_mode_pattern_count": len(self.strict_mode_paths),
+            "strict_mode_patterns": list(self.strict_mode_paths),
             "rejected_pattern_count": len(self.rejected_patterns),
         }
 

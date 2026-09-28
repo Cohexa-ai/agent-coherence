@@ -5547,6 +5547,44 @@ def test_detail_help_text_names_only_redactions_the_handler_performs(
     )
 
 
+def test_policy_glob_sets_are_published_only_at_the_operator_tier(
+    client: _Client,
+) -> None:
+    """The operator view carries the coordinator's glob sets — the default
+    tracked patterns, the user-added ones, the ignored ones and the strict
+    ones — so a client can check the globs it declared against the policy the
+    coordinator actually loaded (#190). Below that tier ``policy_summary``
+    keeps its counts and no pattern list: a pattern list is the operator's
+    directory layout.
+
+    Prevents a client having only a COUNT to verify enforcement with: a
+    sibling volume whose managed globs differed from the spawner's passed on
+    the spawner's count while its own paths were untracked."""
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    pattern_lists = (
+        "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+    )
+
+    _, minimal = client.get("/status")
+    for key in pattern_lists:
+        assert key not in minimal["policy_summary"], key
+    assert minimal["policy_summary"]["strict_mode_pattern_count"] == 0
+    assert minimal["policy_summary"]["user_added_pattern_count"] == 1
+
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    summary = full["policy_summary"]
+    for key in pattern_lists:
+        assert isinstance(summary[key], list), key
+    assert summary["user_added_patterns"] == ["docs/plan.md"]
+    assert "CLAUDE.md" in summary["tracked_patterns"], "the defaults are published too"
+    assert summary["strict_mode_patterns"] == []
+    assert summary["ignored_patterns"] == []
+    assert summary["strict_mode_pattern_count"] == len(summary["strict_mode_patterns"])
+
+
 # ======================================================================
 # Preemption notices past the render cap must survive, not be destroyed
 # ======================================================================
