@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.policy import (
+    DEFAULT_TRACKED_PATTERNS,
     STRICT_MODE_PATH_WARN_THRESHOLD,
     TrackedArtifactPolicy,
 )
@@ -297,8 +298,13 @@ def test_summary_exposes_strict_mode_pattern_count(root: Path) -> None:
     )
     policy = TrackedArtifactPolicy.load(root)
 
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["strict_mode_pattern_count"] == 2
+    # The patterns themselves, so a client can check the globs it declared
+    # against the coordinator's policy instead of a count (#190).
+    assert summary["strict_mode_patterns"] == ["CLAUDE.md", "docs/plans/feature-x.md"]
+    assert summary["tracked_patterns"] == list(DEFAULT_TRACKED_PATTERNS)
+    assert summary["ignored_patterns"] == []
     # Existing summary keys preserved.
     assert "default_pattern_count" in summary
     assert "user_added_pattern_count" in summary

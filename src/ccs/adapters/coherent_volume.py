@@ -45,6 +45,7 @@ import uuid
 import warnings
 import weakref
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -58,6 +59,7 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.policy import matches_any
 from ccs.cli._coherence_client import (
+    NODE_BACKEND,
     PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
@@ -66,6 +68,7 @@ from ccs.cli._coherence_client import (
     RemoteCoordinatorConfig,
     caller_principal_headers,
     claim_caller_principal,
+    coordinator_backend,
     decide_principal_recovery,
     principal_refusal_message,
     principal_refusal_reason,
@@ -353,6 +356,32 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_volumes_after_fork)
 
 
+@dataclass(frozen=True)
+class ManagedGlobEnforcement:
+    """What the coordinator's published policy says about a volume's managed
+    globs: three answers, never collapsed into two.
+
+    ``enforced`` are the globs the coordinator carries in both its strict set
+    and its tracked set. ``unenforced`` are the declared globs it does not carry
+    that way. (An ``ignored.yaml`` entry untracks paths for every volume alike,
+    and the coordinator answers that per path; it is not part of this check.)
+    ``unavailable`` is set when the sets could not be read at all — an older
+    coordinator whose summary publishes only counts, the Node coordinator, which
+    does not serve the operator view, or a ``/status`` that failed — and then
+    both lists are empty and say nothing: "cannot tell" is not "not enforced",
+    and it is never "enforced".
+    """
+
+    enforced: tuple[str, ...]
+    unenforced: tuple[str, ...]
+    unavailable: str | None
+
+    @property
+    def confirmed(self) -> bool:
+        """True only when the sets were read and every declared glob is enforced."""
+        return self.unavailable is None and not self.unenforced
+
+
 class CoherentVolume:
     """Coherent shared workspace for a single-host agent fleet (v1).
 
@@ -415,13 +444,17 @@ class CoherentVolume:
       mismatch is not necessarily foreign.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
-    workspace MUST declare the **same** ``managed`` globs. Strict enforcement is
-    verified only coarsely (the coordinator's ``/status`` exposes a strict-pattern
-    *count*, not the patterns), so a sibling whose globs **differ** from the
-    spawner's passes construction yet its own paths are **not** strict — its stale
-    writes then land **with no signal** (``is_degraded`` stays ``False``). A
-    precise per-glob check needs coordinator support; until then a
-    heterogeneous-globs fleet is unsupported (v1.1).
+    workspace MUST declare the **same** ``managed`` globs: an attaching instance
+    adds no globs to a running coordinator's policy (only the track and untrack
+    commands change it). At attach each instance checks every glob it declared
+    against the glob sets the coordinator publishes in its operator view
+    (:meth:`managed_glob_enforcement`) and fails closed — strict raises,
+    degrade warns and runs detached — when any is not enforced (not tracked,
+    not strict, or ignored), naming the globs, or when the sets cannot be read
+    at all. The check is a literal, attach-time comparison; a later untrack of
+    a managed path is not seen. Before this check existed a sibling whose globs differed from the
+    spawner's passed on the spawner's pattern *count*, and its stale writes
+    landed with no signal (#190).
     """
 
     def __init__(
@@ -805,40 +838,59 @@ class CoherentVolume:
             self._endpoint = None
             return
 
-        # Verify strict mode is actually enforceable for the managed paths. One
-        # post-attach check covers three cases:
-        #   * we spawned the coordinator     -> it loaded our YAML -> strict on
-        #   * a sibling appliance spawned it  -> strict already on  -> the FLEET
-        #     case (two volumes coordinating one workspace): attaching is correct
-        #   * a foreign coordinator (e.g. a Claude Code session) -> strict OFF and
-        #     we cannot enable it (load-once) -> fail closed.
-        # NB: strict_mode_active() is a COARSE "any strict pattern present" check
-        # (the /status summary exposes only a count, not the patterns). HARD v1
-        # REQUIREMENT: every instance coordinating a workspace must declare the
-        # SAME managed globs. A sibling whose globs differ from the spawner's
-        # passes this check (count > 0 from the spawner's globs) yet its own paths
-        # are NOT strict — its stale writes then land with NO signal (is_degraded
-        # stays False). A precise per-glob check needs coordinator support; until
-        # then a heterogeneous-globs fleet is unsupported (v1.1).
-        if self._managed and not self.strict_mode_active():
-            # Detach BEFORE failing, in both modes. Do NOT keep a live endpoint to
-            # a coordinator that does not enforce our paths — that would route
-            # reads/writes through a non-strict coordinator while is_attached
-            # reported True. Degrade falls through detached, mirroring the other
-            # two degrade branches; strict raises detached rather than relying
-            # on the caller to drop the endpoint.
-            self._endpoint = None
-            self._fail_closed_or_degrade(
-                "attached to a coordinator that does not enforce strict mode for the "
-                "managed paths. CoherentVolume v1 can enable strict mode only on a "
-                "coordinator it (or a sibling appliance) spawned — not on a foreign / "
-                "already-running coordinator (load-once policy). Stop the existing "
-                "coordinator, use a dedicated workspace root, or wait for foreign-attach "
-                "(v1.1). In degrade mode the volume operates best-effort with coherence "
-                "enforcement off."
-            )
-            return
+        # Verify that the coordinator enforces strict mode for EVERY managed
+        # glob, from the glob sets it publishes in its operator view. One
+        # post-attach check covers the cases:
+        #   * we spawned the coordinator      -> it loaded our YAML -> enforced
+        #   * a sibling spawned it with the SAME globs -> the fleet case: enforced
+        #   * a sibling spawned it with OTHER globs, a foreign coordinator
+        #     (e.g. a Claude Code session), or a policy that ignores our globs
+        #     -> our globs are not enforced and an attach adds none -> fail
+        #     closed, naming them. The comparison is literal and the answer is
+        #     an attach-time snapshot: a covering ignore pattern or a later
+        #     /policy/untrack is not seen (managed_glob_enforcement says so).
+        #   * the sets cannot be read (an older coordinator publishing counts
+        #     only, the Node coordinator, a failed /status) -> cannot tell ->
+        #     fail closed, saying so; never read as enforced.
+        # A pattern COUNT is not a check: the spawner's one pattern satisfied
+        # every later attacher, whose untracked paths then answered every hook
+        # as if enforced, so its stale writes landed with no signal (#190).
+        if self._managed:
+            enforcement = self.managed_glob_enforcement()
+            if not enforcement.confirmed:
+                # Detach BEFORE failing, in both modes. Do NOT keep a live
+                # endpoint to a coordinator that does not enforce our paths —
+                # that would route reads/writes through it while is_attached
+                # reported True. Degrade falls through detached, mirroring the
+                # other two degrade branches; strict raises detached rather
+                # than relying on the caller to drop the endpoint.
+                self._endpoint = None
+                self._fail_closed_or_degrade(self._enforcement_failure(enforcement))
+                return
         self._claim_principal()
+
+    def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
+        """The message for an attach the per-glob check did not confirm: which
+        globs are not enforced, or why enforcement could not be told."""
+        tail = (
+            " Every volume on a workspace must declare the globs the coordinator was "
+            "started with; an attaching volume adds none to a running coordinator's "
+            "policy. Stop it, or use a dedicated workspace root. In degrade mode the "
+            "volume operates best-effort with coherence enforcement off."
+        )
+        if enforcement.unavailable is not None:
+            globs = ", ".join(self._managed)
+            return (
+                f"enforcement of managed glob(s) {globs} cannot be confirmed: "
+                f"{enforcement.unavailable}; failing closed." + tail
+            )
+        globs = ", ".join(enforcement.unenforced)
+        return (
+            "attached to a coordinator whose policy does not enforce strict mode for "
+            f"managed glob(s) {globs}: they are not in its strict set, not tracked, "
+            "or ignored."
+            + tail
+        )
 
     def _claim_principal(self) -> None:
         """Obtain this session's caller principal: once per session, at attach.
@@ -957,13 +1009,86 @@ class CoherentVolume:
 
     # --- strict-mode verification (used by tests + callers) -----------------
 
+    def managed_glob_enforcement(self) -> ManagedGlobEnforcement:
+        """Check every managed glob against the glob sets the coordinator
+        publishes in its operator view (``/status?detail=full``, the same view
+        the status command reads), by the coordinator's own rule: a path is
+        enforced when it is tracked (a default or user-added pattern), matches
+        a strict pattern, and matches no ignored pattern. So a glob is enforced
+        when the coordinator carries it in its strict set and its tracked set
+        and not in its ignored set. The globs are compared as the strings this
+        volume wrote to the policy files, which is what a sibling that declared
+        the same globs wrote too; a coordinator that enforces the same paths
+        under another spelling, or ignores them under a covering pattern, is
+        not matched, so the answer is as literal as the comparison.
+
+        The attach checks this answer once. ``/policy/track`` and
+        ``/policy/untrack`` reload the coordinator's policy while it runs, and
+        nothing re-runs the check: a path under a managed glob that is
+        untracked after attach answers every hook as untracked — a read reports
+        version 0 and a CAS commit is accepted at any expected version — with
+        no signal unless a caller asks this method again (a literal untrack is
+        reported then; :data:`_GRANT_REQUEST_ADMITTED` says why nothing the
+        volume holds can tell on its own).
+
+        The view is read for this check only. When it cannot be read, or carries
+        no glob sets, the result is ``unavailable`` with the reason, and nothing
+        is concluded about the globs: the attach fails closed on it, and never
+        takes a count for confirmation.
+        """
+        globs = self._managed
+        if self._endpoint is None:
+            return ManagedGlobEnforcement((), (), "the volume is not attached")
+        try:
+            status = _coordinator_get(
+                self._endpoint,
+                "/status?detail=full",
+                extra_headers={"Coherence-Local-Operator": "true"},
+            )
+        except urllib.error.HTTPError as exc:
+            # The Node coordinator answers 501 to the operator view and
+            # publishes no strict patterns at any tier; name it when the pid
+            # file says so. Only the status code is relayed, never the body.
+            who = (
+                "the Node coordinator does not serve the operator view"
+                if coordinator_backend(self._root) == NODE_BACKEND
+                else "the operator view was refused"
+            )
+            return ManagedGlobEnforcement((), (), f"{who} (HTTP {exc.code})")
+        except Exception as exc:  # any failure to read the view is "cannot tell"
+            return ManagedGlobEnforcement(
+                (), (), f"{type(exc).__name__} reading the operator view"
+            )
+        summary = status.get("policy_summary") if isinstance(status, dict) else None
+        sets: dict[str, set[str]] = {}
+        for key in (
+            "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+        ):
+            value = summary.get(key) if isinstance(summary, dict) else None
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                return ManagedGlobEnforcement(
+                    (), (),
+                    "the coordinator publishes no glob sets in its operator view "
+                    "(an older coordinator, whose summary carries only counts)",
+                )
+            sets[key] = set(value)
+        tracked = sets["tracked_patterns"] | sets["user_added_patterns"]
+        ignored = sets["ignored_patterns"]
+        enforced = tuple(
+            g for g in globs
+            if g in sets["strict_mode_patterns"] and g in tracked and g not in ignored
+        )
+        unenforced = tuple(g for g in globs if g not in enforced)
+        return ManagedGlobEnforcement(enforced, unenforced, None)
+
     def strict_mode_active(self) -> bool:
         """True if the attached coordinator reports any strict-mode patterns.
 
-        Queries the coordinator ``/status`` policy summary. A freshly spawned
-        coordinator that loaded our ``strict_mode.yaml`` reports
-        ``strict_mode_pattern_count > 0``. Returns False if unattached or if the
-        status surface is unavailable.
+        A COARSE check: it reads ``strict_mode_pattern_count > 0`` from the
+        default-tier ``/status`` summary, so it says nothing about WHICH patterns
+        are strict. The attach check uses :meth:`managed_glob_enforcement`, which
+        compares this volume's own globs against the published sets. Returns
+        False if unattached or if the status surface is unavailable.
         """
         if self._endpoint is None:
             return False

@@ -601,12 +601,22 @@ another process at the same workspace and it attaches to the same coordinator, s
 every process on the host shares one coherent view.
 
 **Every volume coordinating a workspace must declare the same `managed` globs.**
-This is a hard requirement in v1, and it fails quietly if you break it: the
-coordinator checks only how *many* strict patterns a volume declared, not which
-ones, so a sibling whose globs differ from the spawner's constructs successfully
-and reports itself healthy — while its own paths are not guarded and its stale
-writes land with no signal. Until a per-glob check exists, a fleet with mixed
-globs is unsupported.
+An attaching volume adds no globs to a running coordinator's policy; only the
+track and untrack commands change it. At attach, each volume checks every glob
+it declared against the glob sets the coordinator publishes in its operator
+view, by the coordinator's own rule: a glob is enforced when it is in the
+coordinator's strict set and its tracked set and not in its ignored set. A glob
+that is not fails the volume closed, naming it: under `on_error="strict"`
+construction raises, and under `"degrade"` the volume warns once and runs
+detached. When the sets cannot be read at all, because the coordinator is older
+and publishes only counts, or is the Node coordinator, the volume fails closed
+the same way and says that enforcement could not be confirmed.
+`vol.managed_glob_enforcement()` returns the same three-way answer. The
+comparison is literal and taken once, at attach: a coordinator that ignores the
+paths under a broader pattern, or a path untracked after attach with the untrack
+command, is not detected, and such paths answer every operation as untracked. A
+fleet with mixed globs is still unsupported; it now refuses instead of running
+unguarded.
 
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume

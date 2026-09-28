@@ -251,17 +251,32 @@ class TrackedArtifactPolicy:
         """Return (pattern, reason) pairs rejected by the path-traversal guard."""
         return self.rejected_patterns
 
-    def summary(self) -> dict[str, object]:
-        """Compact summary for the ``/status`` endpoint and CLI display."""
-        return {
+    def summary(self, *, include_patterns: bool = False) -> dict[str, object]:
+        """Compact summary for the ``/status`` endpoint and CLI display.
+
+        The counts are always present. With ``include_patterns`` the four
+        pattern lists (``tracked_patterns``, ``user_added_patterns``,
+        ``ignored_patterns``, ``strict_mode_patterns``) are added: they are what
+        a client checks its own declared globs against, and ``/status`` asks for
+        them only in the operator view, since a pattern list is the operator's
+        directory layout. A count alone let a volume whose globs differed from
+        the spawner's pass its attach check (#190)."""
+        summary: dict[str, object] = {
             "coordinator_root": str(self.coordinator_root),
             "default_pattern_count": len(self.tracked_patterns),
             "user_added_pattern_count": len(self.user_added_patterns),
-            "user_added_patterns": list(self.user_added_patterns),
             "ignored_pattern_count": len(self.ignored_patterns),
             "strict_mode_pattern_count": len(self.strict_mode_paths),
             "rejected_pattern_count": len(self.rejected_patterns),
         }
+        if include_patterns:
+            summary.update({
+                "tracked_patterns": list(self.tracked_patterns),
+                "user_added_patterns": list(self.user_added_patterns),
+                "ignored_patterns": list(self.ignored_patterns),
+                "strict_mode_patterns": list(self.strict_mode_paths),
+            })
+        return summary
 
 
 # ----------------------------------------------------------------------

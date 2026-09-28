@@ -10,10 +10,10 @@ must NOT collapse to that. The shipped ``strict_mode_active()`` returns ``False`
 for both, so this composes the raw ``/status`` instead.
 
 ``per_path`` enforcement is the CLIENT's belief — a tracked artifact that matches
-THIS server's managed globs — not a cross-checked coordinator fact. A sibling
-volume with different managed globs is indistinguishable
-(``heterogeneous_scope_detectable=false``); v1 makes that gap loud, not
-detectable.
+THIS server's managed globs — not a cross-checked coordinator fact. This
+server's own globs are checked against the coordinator's published policy when
+its volume attaches (a mismatch fails the volume closed), but a PEER's differing
+scope is still not visible here (``heterogeneous_scope_detectable=false``).
 
 ``principal_claim`` is the session's own caller-principal state
 (:attr:`~ccs.adapters.coherent_volume.CoherentVolume.principal_claim_outcome`):
