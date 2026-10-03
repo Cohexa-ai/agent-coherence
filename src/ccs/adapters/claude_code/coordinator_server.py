@@ -95,6 +95,7 @@ from ccs.core.exceptions import (
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
     CallerPrincipalRefused,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
@@ -4871,10 +4872,18 @@ def _handle_workspace_checkpoint(
 
     Request: ``{session_id, name, window_min, window_max, members: [{
     member_path, native_token?, fingerprint?, captured_at, absent?,
-    dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
+    dirty_during_window?, arbitration_tier?, restore_tier?}, ...],
+    receiver_session_id?}``.
 
     The OWNER is derived from the caller-asserted ``session_id`` (R9/R13); the
-    ``checkpoint_id`` is minted server-side. The registration is ONE registry
+    ``checkpoint_id`` is minted server-side. The OPTIONAL
+    ``receiver_session_id`` (#191) names the one session allowed to register a
+    restore of this checkpoint: its controller identity is derived with the
+    same function ``/workspace/restore/register`` applies to ITS
+    ``session_id``, so the binding holds exactly as far as that derivation
+    does — when the receiver session claims a caller principal, a register
+    naming it must present that principal (the route is require-class). Absent
+    or null admits any session, the pre-#191 behaviour. The registration is ONE registry
     transaction (header + owner + every member — the Unit-2 API), so a typed
     failure means NO partial manifest.
 
@@ -4885,7 +4894,8 @@ def _handle_workspace_checkpoint(
 
     Responses:
       - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
-        coordinator_epoch}``
+        receiver, coordinator_epoch}`` (``receiver`` is the derived controller
+        id as a string, or null)
       - validation / registry rejection → ``{ok: false, reason}``; a typed
         ``CoherenceError`` carries its identity-stable ``reason`` token with
         the prose in ``detail``
@@ -4901,10 +4911,16 @@ def _handle_workspace_checkpoint(
     window_min = body.get("window_min")
     window_max = body.get("window_max")
     members = body.get("members")
+    receiver_session_id = body.get("receiver_session_id")
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
+    if receiver_session_id is not None:
+        rsid_err = validate_session_id(receiver_session_id)
+        if rsid_err:
+            req._json(400, {"error": f"receiver_session_id: {rsid_err[1]}"})
+            return
     if not isinstance(name, str) or not name.strip():
         req._json(400, {"error": "name must be a non-empty string"})
         return
@@ -4941,6 +4957,13 @@ def _handle_workspace_checkpoint(
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
     owner = _session_owner_from_request(coordinator, session_id)
+    # The receiver is derived, never registered: naming a session as the
+    # receiver is not that session acting.
+    receiver = (
+        session_to_agent_id(receiver_session_id)
+        if receiver_session_id is not None
+        else None
+    )
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -4953,6 +4976,7 @@ def _handle_workspace_checkpoint(
                 window_max=float(window_max),
                 issued_at_tick=now,
                 abort=abort,
+                receiver=receiver,
             )
         except ValueError as exc:
             # Service/registry validation (defense-in-depth behind the
@@ -4968,6 +4992,7 @@ def _handle_workspace_checkpoint(
             "name": record.name,
             "window_min": record.window_min,
             "window_max": record.window_max,
+            "receiver": str(record.receiver) if record.receiver is not None else None,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
@@ -5029,6 +5054,17 @@ def _handle_workspace_checkpoints(
                     "restore_status": record.restore_status,
                     "restore_updated_at": record.restore_updated_at,
                     "pin_refcount": record.pin_refcount,
+                    # #191: who may register a restore (null = anyone) and
+                    # who did (null = nobody yet). Both are controller ids of
+                    # the same class as ``owner``.
+                    "receiver": (
+                        str(record.receiver) if record.receiver is not None else None
+                    ),
+                    "registered_by": (
+                        str(record.registered_by)
+                        if record.registered_by is not None
+                        else None
+                    ),
                     "members": [_render_checkpoint_member(m) for m in members],
                 }
             )
@@ -5074,6 +5110,12 @@ timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
 posture — it is a version-bumping commit path), never as success."""
 
 
+def _restore_controller_refused_response(exc: CheckpointRegistrationRefused) -> dict:
+    """The typed #191 refusal envelope shared by the restore routes:
+    ``{ok: false, reason, detail, member_paths}``."""
+    return {**_typed_reason_response(exc), "member_paths": list(exc.member_paths)}
+
+
 def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
     """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
     if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
@@ -5099,6 +5141,12 @@ def _handle_workspace_restore_status(
     durable metadata with no version bump — it lands durably or fails typed.
     An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
     detail}`` — the register route's stable token, matched by identity.
+
+    Who may write it (#191): the controller derived from ``session_id``, as
+    on the register route. A checkpoint naming another receiver answers
+    ``{ok: false, reason: "not_the_receiver", detail, member_paths: []}``;
+    one another controller registered answers ``already_registered``. No
+    claim is made here.
     """
     body = req._read_json()
     if body is None:
@@ -5119,16 +5167,24 @@ def _handle_workspace_restore_status(
         return
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
         try:
             coordinator.service.set_workspace_checkpoint_restore_status(
-                checkpoint_id, status, updated_at=float(now), abort=abort
+                checkpoint_id,
+                status,
+                updated_at=float(now),
+                abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown checkpoint — the register route's stable token, not prose.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -5162,6 +5218,9 @@ def _handle_workspace_restore_member(
     never through ``commit_all`` (which has no delete semantics). An unknown
     (checkpoint, member) pair answers ``{ok: false, reason:
     "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
+    Gated like ``/workspace/restore/status`` (#191): ``not_the_receiver`` /
+    ``already_registered`` for a controller the checkpoint excludes, so the
+    delete half of a registration has the same gate as the commit half.
     """
     body = req._read_json()
     if body is None:
@@ -5202,6 +5261,8 @@ def _handle_workspace_restore_member(
         return
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
         try:
@@ -5213,11 +5274,14 @@ def _handle_workspace_restore_member(
                     float(deleted_at_restore) if deleted_at_restore is not None else None
                 ),
                 abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown (checkpoint, member) pair — same stable token as the
             # register route's unknown-checkpoint class; "detail" says which.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -5261,12 +5325,26 @@ def _handle_workspace_restore_register(
     In ``_MIGRATION_REJECTED_ROUTES``: this is a version-bumping write
     initiation (the post-edit-cas strand hazard applies mid-drain).
 
+    Who may register, and what (#191): the write-set must name members of
+    the checkpoint at their captured fingerprints, the controller must be the
+    checkpoint's receiver when it names one, and the first registering
+    controller claims the checkpoint — see
+    ``CoordinatorService.register_workspace_restore``.
+
     Responses:
       - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
-        refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
-        from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
-        on ``status == "refused"`` — nothing mutated then, all-or-nothing)
+        refused: {path: reason}, invalidated, retry_of_own_registration,
+        coordinator_epoch}`` (``status`` from the closed WORKSPACE_REGISTRATION
+        set; ``refused`` non-empty only on ``status == "refused"`` — nothing
+        mutated then, all-or-nothing; ``retry_of_own_registration`` is true
+        when this session's controller had already claimed the checkpoint)
       - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
+      - registration refused → ``{ok: false, reason, detail, member_paths}``
+        with ``reason`` one of ``not_a_checkpoint_member`` /
+        ``fingerprint_mismatch`` (``member_paths`` names the offending writes)
+        or ``not_the_receiver`` / ``already_registered`` (``member_paths``
+        empty; neither names another controller). Nothing resolved, minted or
+        committed.
       - watchdog degrade → fail-closed
         :data:`_RESTORE_REGISTER_DEGRADED_RESPONSE`
     """
@@ -5330,6 +5408,8 @@ def _handle_workspace_restore_register(
             )
         except CheckpointUnknown as exc:
             return {"ok": False, "reason": exc.reason}
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         except OccCallerTransientError:
@@ -5349,6 +5429,7 @@ def _handle_workspace_restore_register(
                 path: conflict.reason for path, conflict in result.refused.items()
             },
             "invalidated": len(result.signals),
+            "retry_of_own_registration": result.retry_of_own_registration,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
